@@ -1,13 +1,78 @@
 use std::path::Path;
 
 use aes_gcm::KeyInit;
-use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use freenet_stdlib::client_api::DelegateRequest;
+use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::OsRng};
 
 use super::*;
 
 const NONCE_SIZE: usize = 24;
 const CIPHER_SIZE: usize = 32;
+
+/// Filename (relative to `secrets_dir`) of the auto-persisted per-node
+/// delegate cipher introduced in freenet-core PR after the removal of
+/// `DelegateRequest::DEFAULT_CIPHER` from freenet-stdlib 0.8.0. Nodes
+/// generate this on first start (if no `--cipher` flag is supplied) and
+/// reuse it across restarts.
+pub(crate) const DELEGATE_CIPHER_FILENAME: &str = "delegate_cipher";
+
+/// Historical `DelegateRequest::DEFAULT_NONCE` value, retained in core
+/// purely for **read-side legacy decrypt** of on-disk delegate secret
+/// files that pre-date the per-write-nonce format (freenet-core PR #4143).
+///
+/// New writes never use this value — every `store_secret` generates a
+/// fresh random 24-byte nonce via `OsRng` and persists it inline with
+/// the ciphertext under the version-prefixed format. This constant
+/// exists only to populate `Secrets::nonce` so the existing
+/// `Encryption::legacy_nonce` fallback in `SecretsStore::get_secret`
+/// can still decrypt pre-#4143 files written under the old default
+/// fallback path.
+///
+/// Removed from `freenet-stdlib` public API in 0.8.0 because exposing
+/// it as a public const was what allowed default-configured nodes to
+/// encrypt under a world-known nonce.
+pub(crate) const LEGACY_DEFAULT_NONCE: [u8; 24] = [
+    57, 18, 79, 116, 63, 134, 93, 39, 208, 161, 156, 229, 222, 247, 111, 79, 210, 126, 127, 55,
+    224, 150, 139, 80,
+];
+
+/// Historical `DelegateRequest::DEFAULT_CIPHER` value, retained in core
+/// purely for **read-side legacy decrypt**. See [`LEGACY_DEFAULT_NONCE`].
+///
+/// Tests in this module use this constant directly to construct legacy
+/// `Secrets` snapshots; production code never seeds `Secrets::cipher`
+/// from it — `SecretArgs::build` auto-generates a fresh cipher per node
+/// and persists it to `secrets_dir/delegate_cipher`.
+pub(crate) const LEGACY_DEFAULT_CIPHER: [u8; 32] = [
+    0, 24, 22, 150, 112, 207, 24, 65, 182, 161, 169, 227, 66, 182, 237, 215, 206, 164, 58, 161, 64,
+    108, 157, 195, 0, 0, 0, 0, 0, 0, 0, 0,
+];
+
+/// Generate a fresh 32-byte XChaCha20-Poly1305 key via `OsRng`.
+fn generate_cipher_key() -> [u8; CIPHER_SIZE] {
+    let key = XChaCha20Poly1305::generate_key(&mut OsRng);
+    let mut out = [0u8; CIPHER_SIZE];
+    out.copy_from_slice(key.as_slice());
+    out
+}
+
+/// Persist a cipher key to disk with 0o600 permissions on Unix.
+fn save_cipher(path: &Path, key: &[u8; CIPHER_SIZE]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = File::create(path)?;
+    file.write_all(key)?;
+    file.sync_all()?;
+    drop(file);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(path, perms)?;
+    }
+    Ok(())
+}
 
 impl ConfigArgs {
     pub(super) fn read_secrets(
@@ -20,15 +85,30 @@ impl ConfigArgs {
         } else {
             TransportKeypair::new()
         };
+        // Nonces became per-write in PR #4143 — the file-based nonce is no
+        // longer used for encryption. If the operator still has an explicit
+        // `--nonce` path on their config, honor the file content for legacy
+        // decrypt; otherwise use the historical default so pre-#4143 on-disk
+        // files written under the old fallback path remain readable.
         let nonce = if let Some(ref path_to_nonce) = path_to_nonce {
+            tracing::warn!(
+                "`nonce` config is deprecated since per-write nonces landed; the file at \
+                 {path:?} is used only as a legacy-decrypt nonce for pre-existing secrets.",
+                path = path_to_nonce
+            );
             read_nonce(path_to_nonce)?
         } else {
-            DelegateRequest::DEFAULT_NONCE
+            LEGACY_DEFAULT_NONCE
         };
+        // No `--cipher` path → caller is using the legacy "read_secrets"
+        // entry that does not know about secrets_dir; preserve legacy
+        // semantics by populating with the historical default so existing
+        // ciphertexts remain decryptable. New nodes go through
+        // `SecretArgs::build`, which auto-generates a fresh cipher.
         let cipher = if let Some(ref path_to_cipher) = path_to_cipher {
             read_cipher(path_to_cipher)?
         } else {
-            DelegateRequest::DEFAULT_CIPHER
+            LEGACY_DEFAULT_CIPHER
         };
 
         Ok(Secrets {
@@ -91,17 +171,53 @@ impl SecretArgs {
             };
         let nonce = self.nonce.as_ref().map(read_nonce).transpose()?;
         let (nonce_path, nonce) = if let Some(nonce) = nonce {
+            tracing::warn!(
+                "`--nonce` / NONCE config is deprecated since per-write nonces landed; the \
+                 supplied value is used only as a legacy-decrypt nonce for pre-existing secrets."
+            );
             (self.nonce, nonce)
         } else {
-            (None, DelegateRequest::DEFAULT_NONCE)
+            // Pre-#4143 on-disk files were written under the historical
+            // default nonce when the operator did not supply one; keep
+            // it as the legacy-decrypt fallback so upgrades stay
+            // readable. New writes generate per-write random nonces.
+            (None, LEGACY_DEFAULT_NONCE)
         };
 
-        let cipher = self.cipher.as_ref().map(read_cipher).transpose()?;
-
-        let (cipher_path, cipher) = if let Some(cipher) = cipher {
+        // Cipher: explicit `--cipher` path wins. Otherwise auto-generate
+        // and persist under `secrets_dir/delegate_cipher`, mirroring the
+        // existing `transport_keypair` auto-persist pattern. Without a
+        // `secrets_dir` (in tests), fall back to an ephemeral random
+        // cipher — explicitly NOT the historical default, since the
+        // default was a world-known key.
+        let explicit_cipher = self.cipher.as_ref().map(read_cipher).transpose()?;
+        let (cipher_path, cipher) = if let Some(cipher) = explicit_cipher {
             (self.cipher, cipher)
+        } else if let Some(dir) = secrets_dir {
+            let default_path = dir.join(DELEGATE_CIPHER_FILENAME);
+            if default_path.exists() {
+                tracing::info!(
+                    path = %default_path.display(),
+                    "Loading persisted delegate cipher"
+                );
+                let cipher = read_cipher(&default_path)?;
+                (Some(default_path), cipher)
+            } else {
+                std::fs::create_dir_all(dir)?;
+                let cipher = generate_cipher_key();
+                save_cipher(&default_path, &cipher)?;
+                tracing::info!(
+                    path = %default_path.display(),
+                    "Generated and saved new delegate cipher"
+                );
+                (Some(default_path), cipher)
+            }
         } else {
-            (None, DelegateRequest::DEFAULT_CIPHER)
+            // No secrets_dir (tests): ephemeral random cipher. Crucially
+            // NOT the historical world-known default — the whole point of
+            // dropping `DelegateRequest::DEFAULT_CIPHER` was to ensure no
+            // code path silently encrypts under a public constant.
+            (None, generate_cipher_key())
         };
 
         Ok(Secrets {
@@ -150,8 +266,15 @@ pub struct Secrets {
 impl Default for Secrets {
     fn default() -> Self {
         let transport_keypair = TransportKeypair::new();
-        let nonce = DelegateRequest::DEFAULT_NONCE;
-        let cipher = DelegateRequest::DEFAULT_CIPHER;
+        // Random cipher per test instance — explicitly NOT the historical
+        // world-known constant. Production `SecretArgs::build` auto-
+        // generates + persists; tests don't need persistence.
+        let cipher = generate_cipher_key();
+        // Pin the nonce to the legacy default so any test that hand-
+        // crafts a legacy on-disk blob and then calls `SecretsStore::new`
+        // with `Default::default()` exercises the same legacy-decrypt
+        // path that production upgrades use.
+        let nonce = LEGACY_DEFAULT_NONCE;
 
         Secrets {
             transport_keypair,
@@ -307,12 +430,99 @@ mod tests {
         assert_eq!(secrets, loaded_secrets);
     }
 
+    /// `SecretArgs::default().build(None)` (no `--cipher`, no `secrets_dir`)
+    /// MUST produce a random ephemeral cipher — NOT the historical
+    /// `LEGACY_DEFAULT_CIPHER` constant. The whole point of removing
+    /// `DelegateRequest::DEFAULT_CIPHER` from freenet-stdlib 0.8.0 was to
+    /// guarantee that no code path silently encrypts under a public
+    /// constant. This test pins that invariant.
     #[test]
-    fn test_load_default() {
+    fn test_load_default_generates_random_cipher() {
         let secret_args = SecretArgs::default();
         let loaded_secrets = secret_args.build(None).unwrap();
-        assert_eq!(DelegateRequest::DEFAULT_CIPHER, loaded_secrets.cipher);
-        assert_eq!(DelegateRequest::DEFAULT_NONCE, loaded_secrets.nonce);
+        assert_ne!(
+            LEGACY_DEFAULT_CIPHER, loaded_secrets.cipher,
+            "build(None) must NOT seed the historical default cipher"
+        );
+        assert_ne!(
+            [0u8; CIPHER_SIZE], loaded_secrets.cipher,
+            "build(None) must produce a non-zero cipher"
+        );
+        // Two invocations must produce DIFFERENT ciphers — confirms the
+        // RNG is actually being consulted per call.
+        let another = SecretArgs::default().build(None).unwrap();
+        assert_ne!(
+            loaded_secrets.cipher, another.cipher,
+            "two ephemeral builds must produce distinct random ciphers"
+        );
+        // Nonce stays at LEGACY_DEFAULT_NONCE (read-side fallback only).
+        assert_eq!(LEGACY_DEFAULT_NONCE, loaded_secrets.nonce);
+    }
+
+    /// `SecretArgs::default().build(Some(dir))` auto-persists a cipher
+    /// to `dir/delegate_cipher` on first call and reloads the same
+    /// bytes on the second call. Mirrors the existing `transport_keypair`
+    /// auto-persist behavior and is the upgrade path that replaces the
+    /// removed `DEFAULT_CIPHER` fallback.
+    #[test]
+    fn test_cipher_auto_persist_and_reload() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let secrets_dir = tmp_dir.path();
+        let args1 = SecretArgs::default();
+        let secrets1 = args1.build(Some(secrets_dir)).unwrap();
+
+        let cipher_path = secrets_dir.join(DELEGATE_CIPHER_FILENAME);
+        assert!(cipher_path.exists(), "cipher file should be created");
+        assert_eq!(
+            secrets1.cipher_path.as_deref(),
+            Some(cipher_path.as_path()),
+            "cipher_path should point at the persisted file"
+        );
+        assert_ne!(
+            LEGACY_DEFAULT_CIPHER, secrets1.cipher,
+            "auto-generated cipher must NOT equal the historical default"
+        );
+        // File permissions on Unix must be 0o600 (owner read/write only).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&cipher_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "cipher file must be 0o600, got {mode:o}");
+        }
+
+        let args2 = SecretArgs::default();
+        let secrets2 = args2.build(Some(secrets_dir)).unwrap();
+        assert_eq!(
+            secrets1.cipher, secrets2.cipher,
+            "second build must reload the persisted cipher"
+        );
+    }
+
+    /// Passing `--cipher /path/that/does/not/exist` MUST error rather
+    /// than silently fall back to any default. The whole behavioral
+    /// contract of removing `DEFAULT_CIPHER` is that there is no
+    /// silent fallback to a known-bad key.
+    #[test]
+    fn test_missing_cipher_path_is_hard_error() {
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let missing = tmp_dir.path().join("does-not-exist");
+        let args = SecretArgs {
+            cipher: Some(missing),
+            ..Default::default()
+        };
+        let err = args
+            .build(None)
+            .expect_err("missing cipher path must error");
+        // Surface as a file-not-found IO error from read_cipher.
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "expected NotFound, got {err:?}"
+        );
     }
 
     #[test]

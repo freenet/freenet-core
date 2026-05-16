@@ -1617,7 +1617,7 @@ mod test {
     #[tokio::test]
     async fn register_with_default_cipher_decrypts_legacy_default_blob()
     -> Result<(), Box<dyn std::error::Error>> {
-        use freenet_stdlib::client_api::DelegateRequest;
+        use crate::config::{LEGACY_DEFAULT_CIPHER, LEGACY_DEFAULT_NONCE};
 
         let temp_dir = tempfile::tempdir()?;
         let secrets_dir = temp_dir.path().join("secrets-store-test");
@@ -1626,8 +1626,8 @@ mod test {
         let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
 
         let delegate = Delegate::from((&vec![92].into(), &vec![].into()));
-        let default_cipher = XChaCha20Poly1305::new((&DelegateRequest::DEFAULT_CIPHER).into());
-        let default_nonce: XNonce = DelegateRequest::DEFAULT_NONCE.into();
+        let default_cipher = XChaCha20Poly1305::new((&LEGACY_DEFAULT_CIPHER).into());
+        let default_nonce: XNonce = LEGACY_DEFAULT_NONCE.into();
 
         // Register with the historical defaults. Under the old code this
         // was a silent no-op (skipped). Under the new code the cipher is

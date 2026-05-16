@@ -921,7 +921,7 @@ mod tests {
         );
         let mut contract_states = HashMap::new();
         contract_states.insert(
-            key1,
+            key1.to_string(),
             ContractState {
                 subscribers: 2,
                 subscriber_peer_ids: vec!["peer-a".to_string(), "peer-b".to_string()],
@@ -929,7 +929,7 @@ mod tests {
             },
         );
         contract_states.insert(
-            key2,
+            key2.to_string(),
             ContractState {
                 subscribers: 0,
                 subscriber_peer_ids: vec![],
@@ -984,7 +984,7 @@ mod tests {
         );
         let mut contract_states = HashMap::new();
         contract_states.insert(
-            key,
+            key.to_string(),
             ContractState {
                 subscribers: 0,
                 subscriber_peer_ids: vec![],
@@ -1052,7 +1052,7 @@ mod tests {
         );
         let mut contract_states = HashMap::new();
         contract_states.insert(
-            key,
+            key.to_string(),
             ContractState {
                 subscribers: 5,
                 subscriber_peer_ids: vec!["peer-z".to_string()],
