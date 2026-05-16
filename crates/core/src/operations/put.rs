@@ -423,29 +423,26 @@ mod tests {
     }
 
     /// Regression guard for the freenet-stdlib mirror demo 180s timeout
-    /// (2026-05-14). `finalize_put_at_originator` MUST call
-    /// `mark_local_client_access` so PUT'd-but-never-GET'd contracts get
-    /// the local-client flag set on their hosting cache entry. Without
-    /// this, `contracts_needing_renewal` excludes them, the subscription
+    /// (2026-05-14). `finalize_put_at_originator` MUST call the
+    /// originator-side mark so PUT'd-but-never-GET'd contracts get the
+    /// local-client flag set on their hosting cache entry. Without this,
+    /// `contracts_needing_renewal` excludes them, the subscription
     /// expires, the entry eventually gets evicted, and the next cold
     /// remote GET fails the `is_locally_hosted` shortcut and routes to
     /// the network — where, for a contract no other peer subscribes to,
     /// the GetOp hangs until the WS client's 180s timeout fires.
     ///
-    /// The GET path already calls `mark_local_client_access` (see
-    /// `client_events::serve_get`); this PR adds the symmetric call on
-    /// the originator-PUT path so the flag is no longer GET-only.
+    /// Implementation note: matches on the exact executable call syntax
+    /// AFTER stripping line comments, so the assertion can't be satisfied
+    /// by a doc comment that merely mentions the function name (Codex
+    /// caught this in PR #4133's first review iteration).
     #[test]
     fn finalize_put_at_originator_marks_local_client_access() {
         const SOURCE: &str = include_str!("put.rs");
 
-        // Locate the function definition.
         let fn_start = SOURCE
             .find("pub(super) async fn finalize_put_at_originator(")
             .expect("finalize_put_at_originator definition not found");
-        // Body extent: from the opening `{` of the body to the matching
-        // closing `}\n`. Use a coarse scan that's robust enough for the
-        // small function — we just need the call site to be inside.
         let body_start = SOURCE[fn_start..]
             .find('{')
             .map(|p| fn_start + p)
@@ -456,14 +453,23 @@ mod tests {
             .expect("function body closing brace not found");
         let body = &SOURCE[body_start..body_end];
 
+        // Strip line comments before matching so a doc comment that
+        // mentions the function name doesn't false-pass the assertion.
+        let executable: String = body
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
         assert!(
-            body.contains("mark_local_client_access"),
-            "finalize_put_at_originator MUST call mark_local_client_access \
-             so self-hosted contracts get the local-client flag set on the \
-             hosting cache entry. Without this call, the freenet-stdlib \
-             mirror demo cold-GET timeout (2026-05-14) returns. See \
-             contracts_needing_renewal at hosting.rs:971-991 for the \
-             downstream gate that depends on this flag."
+            executable.contains("ring.mark_local_client_access(&key)"),
+            "finalize_put_at_originator MUST call \
+             `op_manager.ring.mark_local_client_access(&key)` (executable \
+             code, not just a comment mention) so self-hosted contracts \
+             get the local-client flag set. Without this call, the \
+             freenet-stdlib mirror demo 180s cold-GET timeout (2026-05-14) \
+             returns. See contracts_needing_renewal at hosting.rs:971-991 \
+             for the downstream gate that depends on this flag."
         );
     }
 }
