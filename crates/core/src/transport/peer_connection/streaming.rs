@@ -170,6 +170,17 @@ impl StreamHandle {
         self.buffer.inserted_count()
     }
 
+    /// Test-only accessor for the underlying buffer's `Arc::strong_count`.
+    ///
+    /// Used by issue #4079's regression test to assert that sweeping
+    /// `streaming_handles` actually releases the `Arc<LockFreeStreamBuffer>`
+    /// pre-allocation (and isn't just leaving an extra clone alive
+    /// somewhere upstream).
+    #[cfg(test)]
+    pub(crate) fn buffer_strong_count(&self) -> usize {
+        Arc::strong_count(&self.buffer)
+    }
+
     /// Returns the total expected number of fragments.
     pub fn total_fragments(&self) -> usize {
         self.buffer.total_fragments()
