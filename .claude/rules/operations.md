@@ -35,9 +35,13 @@ for every inbound wire message. Pattern per op:
 
 1. **Reply bypass.** If a terminal reply variant arrives and a
    `pending_op_results` callback is registered, forward it via
-   `try_forward_task_per_tx_reply` and return. For GET/PUT/SUBSCRIBE
-   the gate is `Response | ResponseStreaming` only. CONNECT forwards
-   all four non-`Request` variants (multi-reply fan-in).
+   `try_forward_task_per_tx_reply` and return. For GET/SUBSCRIBE the
+   gate is `Response | ResponseStreaming` only. PUT additionally
+   accepts `PutMsg::Error` so the originator-loopback failure path
+   (issue #4111) delivers the contract-side cause via the same bypass
+   instead of timing out the retry loop on a closed reply channel.
+   CONNECT forwards all four non-`Request` variants (multi-reply
+   fan-in).
 2. **Relay dispatch.** Spawn the matching `start_relay_*` driver.
    Originator-loopback (`source_addr=None`) is mapped to
    `upstream_addr=own_addr` for GET/PUT/SUBSCRIBE so the same driver

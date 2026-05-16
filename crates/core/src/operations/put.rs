@@ -21,6 +21,47 @@ use crate::{
 };
 use either::Either;
 
+/// Internal classification for a terminal PUT failure, used inside the
+/// retry-loop driver in [`op_ctx_task`].
+///
+/// The wire field [`PutMsg::Error::cause`] stays as a raw `String` (see
+/// the doc-comment there) to preserve bincode wire-compat across
+/// versions. This newtype is the in-process counterpart: it gives the
+/// retry-loop's `Terminal` type a domain-specific name (vs. opaque
+/// `Result<_, String>`) and a single place to add categorization later
+/// — e.g., distinguishing local-loopback `put_contract` rejection from
+/// remote-relayed cause if/when their delivery paths diverge from a
+/// shared `PutMsg::Error` envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PutTerminalError {
+    cause: String,
+}
+
+impl PutTerminalError {
+    /// Construct from a [`PutMsg::Error`]-delivered cause (wire or
+    /// originator-loopback — both reach the classifier through the
+    /// same envelope today).
+    pub(crate) fn from_wire(cause: String) -> Self {
+        Self { cause }
+    }
+
+    /// Borrow the cause string for display / serialization.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.cause
+    }
+
+    /// Consume the wrapper and return the inner cause string.
+    pub(crate) fn into_string(self) -> String {
+        self.cause
+    }
+}
+
+impl std::fmt::Display for PutTerminalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Telemetry data for originator-side PUT finalization.
 pub(super) struct PutFinalizationData {
     pub sender: PeerKeyLocation,
@@ -246,6 +287,8 @@ mod messages {
             /// `ClientError` / `OpError`) so the wire variant stays
             /// dependency-free for `bincode` and so future serde-incompat
             /// changes in those types do not break wire compatibility.
+            /// The internal retry-driver wraps this in
+            /// [`super::PutTerminalError`] for in-process classification.
             cause: String,
         },
     }

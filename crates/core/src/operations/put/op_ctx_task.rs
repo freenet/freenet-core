@@ -42,7 +42,7 @@ use crate::router::{RouteEvent, RouteOutcome};
 use crate::tracing::{NetEventLog, OperationFailure, state_hash_full};
 use crate::transport::peer_connection::StreamId;
 
-use super::{PutFinalizationData, PutMsg, PutStreamingPayload};
+use super::{PutFinalizationData, PutMsg, PutStreamingPayload, PutTerminalError};
 
 /// Start a client-initiated PUT, returning as soon as the task has been
 /// spawned (mirrors legacy `request_put` timing).
@@ -219,12 +219,12 @@ async fn drive_client_put_inner(
 
     impl RetryDriver for PutRetryDriver<'_> {
         // Carries either the stored `ContractKey` (success) OR the
-        // contract-side cause (terminal failure) so the driver can
-        // surface a precise `HostResult::Err` for issue #4111
-        // without growing a new `AttemptOutcome` variant. The retry
-        // loop still treats both as a single `Terminal(_)` arm; the
-        // caller below switches on the inner `Result`.
-        type Terminal = Result<ContractKey, String>;
+        // typed terminal-failure cause so the driver can surface a
+        // precise `HostResult::Err` for issue #4111 without growing a
+        // new `AttemptOutcome` variant. The retry loop still treats
+        // both as a single `Terminal(_)` arm; the caller below
+        // switches on the inner `Result`.
+        type Terminal = Result<ContractKey, PutTerminalError>;
 
         fn new_attempt_tx(&mut self) -> Transaction {
             Transaction::new::<PutMsg>()
@@ -250,7 +250,10 @@ async fn drive_client_put_inner(
             })
         }
 
-        fn classify(&mut self, reply: NetMessage) -> AttemptOutcome<Result<ContractKey, String>> {
+        fn classify(
+            &mut self,
+            reply: NetMessage,
+        ) -> AttemptOutcome<Result<ContractKey, PutTerminalError>> {
             match classify_reply(&reply) {
                 ReplyClass::Stored { key } | ReplyClass::LocalCompletion { key } => {
                     AttemptOutcome::Terminal(Ok(key))
@@ -367,7 +370,7 @@ async fn drive_client_put_inner(
         RetryLoopOutcome::Done(Err(cause)) => {
             op_manager.completed(client_tx);
             Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
-                cause: cause.into(),
+                cause: cause.into_string().into(),
             }
             .into())))
         }
@@ -402,7 +405,7 @@ enum ReplyClass {
     /// state on the originator's own node) and re-running the same
     /// validation will fail identically.
     TerminalError {
-        cause: String,
+        cause: PutTerminalError,
     },
     Unexpected,
 }
@@ -420,10 +423,13 @@ fn classify_reply(msg: &NetMessage) -> ReplyClass {
             key: contract.key(),
         },
         // Issue #4111: terminal failure delivered via send_local_loopback
-        // from the originator-loopback error path.
+        // from the originator-loopback error path. The wire cause is a
+        // raw `String` (intentional, see `PutMsg::Error`); we wrap it in
+        // `PutTerminalError` here so the retry-loop's `Terminal` type
+        // stays typed.
         NetMessage::V1(NetMessageV1::Put(PutMsg::Error { cause, .. })) => {
             ReplyClass::TerminalError {
-                cause: cause.clone(),
+                cause: PutTerminalError::from_wire(cause.clone()),
             }
         }
         _ => ReplyClass::Unexpected,
@@ -2005,14 +2011,13 @@ mod tests {
             cause: cause.clone(),
         }));
         match classify_reply(&msg) {
-            ReplyClass::TerminalError { cause: c } => {
-                assert_eq!(
-                    c, cause,
-                    "TerminalError must carry the verbatim cause string from \
-                     the wire envelope so the client sees the real reason \
-                     (not the generic 'failed notifying, channel closed')"
-                );
-            }
+            ReplyClass::TerminalError { cause: c } => assert_eq!(
+                c.as_str(),
+                cause.as_str(),
+                "TerminalError must carry the verbatim cause string from \
+                 the wire envelope so the client sees the real reason \
+                 (not the generic 'failed notifying, channel closed')"
+            ),
             ReplyClass::Stored { .. } => panic!(
                 "Error envelope must NOT classify as Stored — Stored is \
                  success and would suppress the cause"
@@ -2041,7 +2046,8 @@ mod tests {
         }));
         match classify_reply(&msg) {
             ReplyClass::TerminalError { cause } => assert_eq!(
-                cause, "",
+                cause.as_str(),
+                "",
                 "empty cause must round-trip as empty — replacing it with a \
                  placeholder hides the wire shape from the client"
             ),
@@ -2068,11 +2074,15 @@ mod tests {
         match classify_reply(&msg) {
             ReplyClass::TerminalError { cause: c } => {
                 assert_eq!(
-                    c.len(),
+                    c.as_str().len(),
                     cause.len(),
                     "large cause must NOT be truncated by the classifier"
                 );
-                assert_eq!(c, cause, "large cause must round-trip byte-for-byte");
+                assert_eq!(
+                    c.as_str(),
+                    cause.as_str(),
+                    "large cause must round-trip byte-for-byte"
+                );
             }
             ReplyClass::Stored { .. }
             | ReplyClass::LocalCompletion { .. }
@@ -2112,7 +2122,8 @@ mod tests {
                 panic!("Error reply must NOT classify as Terminal(Ok(_))")
             }
             AttemptOutcome::Terminal(Err(c)) => assert_eq!(
-                c, cause,
+                c.as_str(),
+                cause.as_str(),
                 "Terminal(Err(cause)) must carry the verbatim cause string"
             ),
             AttemptOutcome::Retry => panic!(
@@ -2128,8 +2139,8 @@ mod tests {
 
     /// Companion to `put_retry_driver_classify_error_returns_terminal_err`:
     /// a successful `Response` still maps to `Terminal(Ok(key))`.
-    /// Pins that the Result<ContractKey, String> Terminal type didn't
-    /// accidentally invert the Ok/Err mapping in classify.
+    /// Pins that the `Result<ContractKey, PutTerminalError>` Terminal
+    /// type didn't accidentally invert the Ok/Err mapping in classify.
     #[test]
     fn put_retry_driver_classify_response_returns_terminal_ok() {
         use crate::operations::op_ctx::{AttemptOutcome, RetryDriver};
@@ -2188,7 +2199,7 @@ mod tests {
     struct InTestPutClassifier;
 
     impl crate::operations::op_ctx::RetryDriver for InTestPutClassifier {
-        type Terminal = Result<ContractKey, String>;
+        type Terminal = Result<ContractKey, PutTerminalError>;
 
         fn new_attempt_tx(&mut self) -> Transaction {
             Transaction::new::<PutMsg>()
@@ -2314,13 +2325,17 @@ mod tests {
              retry loop exits via the Done(Err(_)) path rather than \
              advancing to a fresh attempt."
         );
-        // Pin the Terminal type — Result<ContractKey, String> is what
-        // lets the retry-loop carry both shapes through a single arm.
+        // Pin the Terminal type — Result<ContractKey, PutTerminalError>
+        // is what lets the retry-loop carry both shapes through a
+        // single arm AND keeps the failure cause structured rather
+        // than an opaque String.
         assert!(
-            impl_body.contains("type Terminal = Result<ContractKey, String>;"),
-            "PutRetryDriver::Terminal must be Result<ContractKey, String>; \
+            impl_body.contains("type Terminal = Result<ContractKey, PutTerminalError>;"),
+            "PutRetryDriver::Terminal must be Result<ContractKey, PutTerminalError>; \
              changing this back to bare ContractKey re-introduces the issue \
-             #4111 failure mode (no way to express a terminal error)."
+             #4111 failure mode (no way to express a terminal error); \
+             changing the error half back to `String` drops the structured \
+             classification (LocalRejection vs Relayed)."
         );
     }
 
