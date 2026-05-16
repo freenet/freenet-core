@@ -348,6 +348,12 @@ jobs:
       - name: Create and push tag
         if: ${{ !inputs.dry_run }}
         run: |
+          # `git tag -a` needs user.name/email. The `update_versions` job
+          # set these in its runner, but this job runs on a fresh runner
+          # where git config is empty — without these two lines the tag
+          # step fails with `fatal: empty ident name not allowed`.
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           VERSION="${{ needs.validate.outputs.version }}"
           git tag -a "v$VERSION" -m "Release v$VERSION"
           git push origin "v$VERSION"
