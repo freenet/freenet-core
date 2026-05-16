@@ -784,3 +784,20 @@ pub async fn get_all_ping_states(
 
     Ok((ping_gw, ping_node1, ping_node2))
 }
+
+/// 32-byte XChaCha20-Poly1305 cipher used by the freenet-ping integration
+/// tests when issuing `RegisterDelegate` calls. Servers running
+/// freenet-core >= 0.2.59 generate per-write nonces (PR #4143) and replaced
+/// the world-known `DelegateRequest::DEFAULT_CIPHER` constant in
+/// freenet-stdlib 0.8.0 with per-node auto-persisted ciphers. Tests no
+/// longer have a stdlib constant to seed `RegisterDelegate`, so they
+/// supply this arbitrary-but-fixed value instead.
+pub const TEST_DELEGATE_CIPHER: [u8; 32] = [
+    0x5b, 0x73, 0x12, 0xe8, 0xc4, 0x9a, 0x60, 0x2f, 0x88, 0x14, 0xd7, 0x33, 0x16, 0xaa, 0x4e, 0x91,
+    0x07, 0x6b, 0x55, 0xd2, 0x3e, 0xfb, 0x80, 0x29, 0x1c, 0xa5, 0xee, 0x44, 0x6f, 0x32, 0x18, 0xbd,
+];
+
+/// 24-byte registration nonce. Per-write nonces (PR #4143) mean the
+/// server ignores this field for encryption; only legacy-decrypt of
+/// pre-0.2.59 on-disk files consults it. Any constant works.
+pub const TEST_DELEGATE_NONCE: [u8; 24] = [0u8; 24];

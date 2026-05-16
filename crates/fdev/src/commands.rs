@@ -269,13 +269,19 @@ async fn put_delegate(
     let delegate = DelegateContainer::try_from((config.code.as_path(), params))?;
 
     let (cipher, nonce) = if delegate_config.cipher.is_empty() && delegate_config.nonce.is_empty() {
+        // freenet-stdlib 0.8.0 removed the public `DEFAULT_CIPHER` /
+        // `DEFAULT_NONCE` constants (they seeded a world-known key).
+        // Generate a fresh random cipher per fdev invocation. The nonce
+        // field on the wire is unused by servers running freenet-core
+        // >= 0.2.59 (per-write nonces landed in PR #4143); send zeros.
+        use rand::RngCore;
+        let mut cipher = [0u8; 32];
+        rand::rng().fill_bytes(&mut cipher);
         println!(
-"Using default cipher and nonce.
-For additional hardening is recommended to use a different cipher and nonce to encrypt secrets in storage.");
-        (
-            ::freenet_stdlib::client_api::DelegateRequest::DEFAULT_CIPHER,
-            ::freenet_stdlib::client_api::DelegateRequest::DEFAULT_NONCE,
-        )
+            "No --cipher specified; generated a fresh random delegate cipher for this \
+             session. Pass --cipher / --nonce explicitly to reuse a key across runs."
+        );
+        (cipher, [0u8; 24])
     } else {
         let mut cipher = [0; 32];
         bs58::decode(delegate_config.cipher.as_bytes())

@@ -921,7 +921,7 @@ mod tests {
         );
         let mut contract_states = HashMap::new();
         contract_states.insert(
-            key1,
+            key1.to_string(),
             ContractState {
                 subscribers: 2,
                 subscriber_peer_ids: vec!["peer-a".to_string(), "peer-b".to_string()],
@@ -929,7 +929,7 @@ mod tests {
             },
         );
         contract_states.insert(
-            key2,
+            key2.to_string(),
             ContractState {
                 subscribers: 0,
                 subscriber_peer_ids: vec![],
@@ -967,13 +967,22 @@ mod tests {
         assert_eq!(states[&key1.to_string()]["size_bytes"], 1234);
     }
 
+    // Superseded by freenet-stdlib 0.8.0: stringified
+    // `NodeDiagnosticsResponse.contract_states` map keys
+    // (freenet-stdlib#70). The pre-condition this test documented —
+    // "native serde_json rejects ContractKey-keyed map, hence
+    // diagnostics_to_json workaround" — no longer holds: the upstream
+    // type now uses String keys and `serde_json::to_string(&diag)`
+    // succeeds, so the `.expect_err` assertion fails. Kept as
+    // `#[ignore]` historical documentation per the superseded-test
+    // convention in `.claude/rules/git-workflow.md`. The
+    // `diagnostics_to_json` helper itself is retained because its
+    // sibling tests still exercise round-trip + field-coverage
+    // properties; a separate refactor could replace it with a direct
+    // `serde_json::to_string` call. See PR #4144.
+    #[ignore]
     #[test]
     fn test_native_serde_json_on_contract_states_fails_documents_root_cause() {
-        // Pin the failure mode so a stdlib-side fix that switches the key type
-        // surfaces here as a tightening, not a silent change. If this test
-        // starts passing, NodeDiagnosticsResponse.contract_states no longer
-        // requires the diagnostics_to_json workaround above and the helper can
-        // be removed in favour of a direct serde_json::to_string call.
         use freenet_stdlib::client_api::ContractState;
         use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
         use std::collections::HashMap;
@@ -984,7 +993,7 @@ mod tests {
         );
         let mut contract_states = HashMap::new();
         contract_states.insert(
-            key,
+            key.to_string(),
             ContractState {
                 subscribers: 0,
                 subscriber_peer_ids: vec![],
@@ -1052,7 +1061,7 @@ mod tests {
         );
         let mut contract_states = HashMap::new();
         contract_states.insert(
-            key,
+            key.to_string(),
             ContractState {
                 subscribers: 5,
                 subscriber_peer_ids: vec!["peer-z".to_string()],

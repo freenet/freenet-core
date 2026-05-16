@@ -12,6 +12,7 @@ use std::{
     time::SystemTime,
 };
 
+use aes_gcm::KeyInit;
 use chacha20poly1305::{
     AeadCore, Error as EncryptionError, XChaCha20Poly1305, XNonce,
     aead::{Aead, OsRng},
@@ -104,6 +105,24 @@ pub struct SecretsStore {
     /// ReDb storage for persistent index
     db: Storage,
     default_encryption: Encryption,
+    /// Last-resort decrypt fallback seeded with the historical
+    /// `LEGACY_DEFAULT_CIPHER` + `LEGACY_DEFAULT_NONCE` pair (the world-
+    /// known constants that `freenet-stdlib` 0.8.0 removed).
+    ///
+    /// Used ONLY by `decrypt_secret_blob` for pre-#4143 on-disk files
+    /// that were written under the default-cipher fallback path.
+    /// Without this, a node that auto-generated a fresh cipher on
+    /// upgrade (the new `SecretArgs::build` behavior) would be unable
+    /// to read pre-existing default-encrypted delegate secrets across
+    /// the restart, because `default_encryption.cipher` is now the
+    /// auto-generated value and `register_delegate` (which would
+    /// otherwise supply the legacy cipher) has not yet been called by
+    /// any client.
+    ///
+    /// `None` only when the build path explicitly disabled migration
+    /// (currently never; reserved for a future "drop migration support"
+    /// release).
+    legacy_migration_encryption: Option<Encryption>,
     /// Snapshot retention policy. Snapshots are taken before any overwrite
     /// of an existing secret so a buggy delegate or accidental write cannot
     /// silently destroy prior values.
@@ -136,6 +155,19 @@ impl SecretsStore {
             }
         }
 
+        // Seed the legacy-migration fallback with the historical
+        // (LEGACY_DEFAULT_CIPHER, LEGACY_DEFAULT_NONCE) pair regardless
+        // of what the operator's configured `secrets` carries. This is
+        // the only path that lets pre-#4143 on-disk files written under
+        // the world-known default constants remain decryptable on a
+        // node whose `default_encryption.cipher` is now the
+        // auto-generated random cipher (post-stdlib-0.8.0 upgrade).
+        use crate::config::{LEGACY_DEFAULT_CIPHER, LEGACY_DEFAULT_NONCE};
+        let legacy_migration_encryption = Some(Encryption {
+            cipher: XChaCha20Poly1305::new((&LEGACY_DEFAULT_CIPHER).into()),
+            legacy_nonce: LEGACY_DEFAULT_NONCE.into(),
+        });
+
         Ok(Self {
             base_path: secrets_dir,
             ciphers: std::collections::HashMap::new(),
@@ -145,6 +177,7 @@ impl SecretsStore {
                 cipher: secrets.cipher(),
                 legacy_nonce: secrets.nonce(),
             },
+            legacy_migration_encryption,
             secrets,
             retention: RetentionPolicy::default(),
             snapshots_enabled: std::env::var_os(DISABLE_SNAPSHOTS_ENV).is_none(),
@@ -409,7 +442,12 @@ impl SecretsStore {
 
         let blob =
             fs::read(secret_path).map_err(|_| SecretStoreError::MissingSecret(key.clone()))?;
-        decrypt_secret_blob(encryption, &blob, key)
+        decrypt_secret_blob(
+            encryption,
+            self.legacy_migration_encryption.as_ref(),
+            &blob,
+            key,
+        )
     }
 
     /// Enumerate the snapshot history for a given `(delegate, secret_id)`
@@ -548,17 +586,30 @@ impl SecretsStore {
     }
 }
 
-/// Decrypt an on-disk secret blob, transparently supporting both the new
-/// per-write-nonce format (`[VERSION_V1][nonce][AEAD]`) and the legacy
-/// shared-nonce format (raw `[AEAD]` decrypted with the registration nonce).
+/// Decrypt an on-disk secret blob, transparently supporting:
 ///
-/// Ambiguity handling: a legacy blob's first byte is the first byte of AEAD
-/// output (uniformly random), so 1/256 of legacy files start with
-/// `VERSION_V1`. If the new-format parse fails AEAD validation, we fall back
-/// to the legacy path. This keeps reads working through the migration
-/// window without requiring a separate rewrite step.
+/// 1. New per-write-nonce format `[VERSION_V1][nonce][AEAD]` decrypted
+///    with the registered (or default) cipher.
+/// 2. Legacy shared-nonce format (raw `[AEAD]`) decrypted with the
+///    registered cipher + registration nonce.
+/// 3. Legacy shared-nonce format decrypted with the historical
+///    `LEGACY_DEFAULT_CIPHER` + `LEGACY_DEFAULT_NONCE` pair (the
+///    world-known constants `freenet-stdlib` 0.8.0 removed). This is
+///    the migration path for nodes upgraded past the removal of the
+///    default-cipher fallback: pre-#4143 on-disk files were written
+///    under those constants, and on a fresh restart the in-memory
+///    `ciphers` map is empty until `register_delegate` is called.
+///    Without this fallback, default-configured nodes would lose
+///    access to existing delegate secrets across upgrade.
+///
+/// Ambiguity handling: a legacy blob's first byte is the first byte of
+/// AEAD output (uniformly random), so 1/256 of legacy files start with
+/// `VERSION_V1`. If the new-format parse fails AEAD validation, we fall
+/// back through the legacy paths. Each path is independent — failure of
+/// one does not mask success of another.
 fn decrypt_secret_blob(
     encryption: &Encryption,
+    legacy_migration: Option<&Encryption>,
     blob: &[u8],
     key: &SecretsId,
 ) -> Result<Vec<u8>, SecretStoreError> {
@@ -567,21 +618,39 @@ fn decrypt_secret_blob(
         if let Ok(pt) = encryption.cipher.decrypt(nonce, &blob[HEADER_LEN..]) {
             return Ok(pt);
         }
-        // Falls through to the legacy path: either the file is genuinely
-        // legacy and happened to start with 0x01, or the file is corrupt.
-        // The legacy path will return a precise error if both attempts fail.
+        // Falls through to the legacy paths: either the file is
+        // genuinely legacy and happened to start with 0x01, the
+        // delegate's cipher rotated, or the file is corrupt. Below
+        // returns a precise error only if every attempt fails.
     }
-    encryption
-        .cipher
-        .decrypt(&encryption.legacy_nonce, blob)
-        .inspect(|_| {
-            tracing::debug!(
-                key = %key,
-                "Decrypted legacy-format secret blob; will be migrated to per-write-nonce \
-                 format on next write."
-            );
-        })
-        .map_err(SecretStoreError::Encryption)
+    if let Ok(pt) = encryption.cipher.decrypt(&encryption.legacy_nonce, blob) {
+        tracing::debug!(
+            key = %key,
+            "Decrypted legacy-format secret blob with the registered cipher; \
+             will be migrated to per-write-nonce format on next write."
+        );
+        return Ok(pt);
+    }
+    // Last-resort migration path: try the historical world-known
+    // (LEGACY_DEFAULT_CIPHER, LEGACY_DEFAULT_NONCE) pair. Reads here
+    // are exactly the pre-#4143 "default-configured node" case.
+    if let Some(migration) = legacy_migration
+        && let Ok(pt) = migration.cipher.decrypt(&migration.legacy_nonce, blob)
+    {
+        tracing::warn!(
+            key = %key,
+            "Decrypted secret blob via the legacy-default-cipher migration fallback; \
+             this file was written by a freenet-core version before PR #4143. It will \
+             be re-encrypted under the node's current cipher on next write."
+        );
+        return Ok(pt);
+    }
+    Err(SecretStoreError::Encryption(
+        // The error type is opaque; surface a generic AEAD failure.
+        // Callers cannot tell which of the three attempts failed last,
+        // but the log lines above record which paths were reached.
+        chacha20poly1305::Error,
+    ))
 }
 
 #[cfg(test)]
@@ -678,7 +747,7 @@ mod test {
             .ciphers
             .get(delegate.key())
             .expect("cipher registered");
-        let plaintext = decrypt_secret_blob(encryption, &blob, &secret_id)
+        let plaintext = decrypt_secret_blob(encryption, None, &blob, &secret_id)
             .expect("snapshot blob should decrypt with the registered cipher");
         assert_eq!(plaintext, b"v1".to_vec());
         Ok(())
@@ -1617,7 +1686,7 @@ mod test {
     #[tokio::test]
     async fn register_with_default_cipher_decrypts_legacy_default_blob()
     -> Result<(), Box<dyn std::error::Error>> {
-        use freenet_stdlib::client_api::DelegateRequest;
+        use crate::config::{LEGACY_DEFAULT_CIPHER, LEGACY_DEFAULT_NONCE};
 
         let temp_dir = tempfile::tempdir()?;
         let secrets_dir = temp_dir.path().join("secrets-store-test");
@@ -1626,8 +1695,8 @@ mod test {
         let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
 
         let delegate = Delegate::from((&vec![92].into(), &vec![].into()));
-        let default_cipher = XChaCha20Poly1305::new((&DelegateRequest::DEFAULT_CIPHER).into());
-        let default_nonce: XNonce = DelegateRequest::DEFAULT_NONCE.into();
+        let default_cipher = XChaCha20Poly1305::new((&LEGACY_DEFAULT_CIPHER).into());
+        let default_nonce: XNonce = LEGACY_DEFAULT_NONCE.into();
 
         // Register with the historical defaults. Under the old code this
         // was a silent no-op (skipped). Under the new code the cipher is
@@ -1656,6 +1725,63 @@ mod test {
             recovered, plaintext,
             "default-cipher legacy blob must remain readable after register_delegate \
              (behavioral equivalence with the removed skip-on-default-nonce branch)"
+        );
+        Ok(())
+    }
+
+    /// Critical migration regression pin: after the auto-cipher-gen
+    /// upgrade, a node restarts with `default_encryption.cipher` set to
+    /// a fresh random per-node cipher (NOT `LEGACY_DEFAULT_CIPHER`).
+    /// Pre-#4143 on-disk delegate secrets were written under the
+    /// world-known `(LEGACY_DEFAULT_CIPHER, LEGACY_DEFAULT_NONCE)` pair.
+    /// If no client has called `register_delegate` yet, `get_secret`
+    /// MUST still recover the plaintext via the
+    /// `legacy_migration_encryption` fallback.
+    ///
+    /// Without this guarantee, every default-configured node would lose
+    /// access to all existing delegate secrets across the
+    /// freenet-stdlib 0.6.1 -> 0.8.0 upgrade. This test is what catches
+    /// a regression of the B1 fix from PR #4144 review.
+    #[tokio::test]
+    async fn legacy_default_blob_decryptable_without_register_after_upgrade()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::config::{LEGACY_DEFAULT_CIPHER, LEGACY_DEFAULT_NONCE};
+
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        // `Secrets::default()` returns a RANDOM cipher (production
+        // upgrade behavior after PR #4144), NOT the historical default.
+        let secrets = Secrets::default();
+        assert_ne!(
+            secrets.cipher, LEGACY_DEFAULT_CIPHER,
+            "test precondition: Secrets::default() must be random per call (post-PR-#4144)"
+        );
+        let store = SecretsStore::new(secrets_dir.clone(), secrets, db)?;
+
+        // Hand-craft a pre-#4143 on-disk blob: raw AEAD under the
+        // historical world-known constants, no version header.
+        let delegate = Delegate::from((&vec![94].into(), &vec![].into()));
+        let legacy_cipher = XChaCha20Poly1305::new((&LEGACY_DEFAULT_CIPHER).into());
+        let legacy_nonce: XNonce = LEGACY_DEFAULT_NONCE.into();
+        let plaintext = b"survives-the-upgrade".to_vec();
+        let legacy_aead = legacy_cipher
+            .encrypt(&legacy_nonce, plaintext.as_ref())
+            .expect("legacy encrypt");
+        let secret_id = SecretsId::new(vec![95]);
+        let delegate_dir = secrets_dir.join(delegate.key().encode());
+        std::fs::create_dir_all(&delegate_dir)?;
+        std::fs::write(delegate_dir.join(secret_id.encode()), &legacy_aead)?;
+
+        // No `register_delegate` call — this simulates the first
+        // `get_secret` after restart, before any client has issued a
+        // new `RegisterDelegate`. Must still recover the plaintext.
+        let recovered = store.get_secret(delegate.key(), &secret_id)?;
+        assert_eq!(
+            recovered, plaintext,
+            "legacy-default blob MUST be decryptable via legacy_migration_encryption \
+             fallback, even without register_delegate having been called"
         );
         Ok(())
     }

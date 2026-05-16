@@ -1829,8 +1829,10 @@ impl P2pConnManager {
                                         let is_subscribed =
                                             op_manager.ring.is_subscribed(&contract_key);
                                         let subscriber_count = if is_subscribed { 1 } else { 0 };
+                                        // stdlib 0.8.0 keyed contract_states by String
+                                        // (`fix!: stringify NodeDiagnosticsResponse.contract_states keys`).
                                         response.contract_states.insert(
-                                            contract_key,
+                                            contract_key.to_string(),
                                             ContractState {
                                                 subscribers: subscriber_count as u32,
                                                 subscriber_peer_ids: Vec::new(),
@@ -1846,7 +1848,7 @@ impl P2pConnManager {
                                             op_manager.ring.is_subscribed(contract_key);
                                         let subscriber_count = if is_subscribed { 1 } else { 0 };
                                         response.contract_states.insert(
-                                            *contract_key,
+                                            contract_key.to_string(),
                                             ContractState {
                                                 subscribers: subscriber_count as u32,
                                                 subscriber_peer_ids: Vec::new(),
