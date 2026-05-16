@@ -250,6 +250,13 @@ secret in the freenet-core repo when you do. If `release.yml` prints
 the "RELEASE_PAT not set" warning unexpectedly, the secret has
 expired and the same rotation procedure applies.
 
+### Cutting a release
+
+End-to-end procedure for any maintainer is in
+[`docs/RELEASING.md`](docs/RELEASING.md). One-line summary:
+`gh workflow run release.yml --field version=X.Y.Z`. The `RELEASE_PAT`
+section above is the prerequisite for the cascade to fire automatically.
+
 ## External Resources
 
 - API docs: https://docs.rs/freenet
