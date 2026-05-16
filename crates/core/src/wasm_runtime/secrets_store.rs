@@ -1402,11 +1402,15 @@ mod test {
     }
 
     /// On-disk blob written by `store_secret` MUST begin with the
-    /// `VERSION_V1` header byte. This is the discriminator the read path
-    /// uses to tell new files from legacy files; if the writer ever stops
-    /// emitting it, the read path will silently fall back to legacy decrypt
-    /// (which would fail because there is no shared registered nonce in
-    /// the new model).
+    /// `VERSION_V1` header byte and carry a fresh random nonce in
+    /// bytes [1..25]. The version byte is the discriminator the read
+    /// path uses to tell new files from legacy files; if the writer
+    /// ever stops emitting it, the read path will silently fall back
+    /// to legacy decrypt (which would fail because there is no shared
+    /// registered nonce in the new model). The nonce-randomness check
+    /// catches a regression where someone hardcoded the nonce (e.g. to
+    /// zeros for "debugging") — `assert_ne!(first, second)` over whole
+    /// blobs would miss that if the ciphertext also varies.
     #[tokio::test]
     async fn store_secret_writes_version_header() -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempfile::tempdir()?;
@@ -1436,6 +1440,24 @@ mod test {
             blob.len() >= HEADER_LEN + 16,
             "blob too short: {} bytes",
             blob.len()
+        );
+
+        // Write a second secret and assert the nonce field differs. The
+        // nonce field is the [1..HEADER_LEN] slice. A regression that
+        // hardcoded the nonce to a constant (zeros, or anything else)
+        // would leave this slice identical across writes; whole-blob
+        // inequality alone could be satisfied by varying ciphertext.
+        let secret_id_2 = SecretsId::new(vec![84]);
+        store.store_secret(delegate.key(), &secret_id_2, b"hello".to_vec())?;
+        let blob_2 = std::fs::read(
+            secrets_dir
+                .join(delegate.key().encode())
+                .join(secret_id_2.encode()),
+        )?;
+        assert_ne!(
+            &blob[1..HEADER_LEN],
+            &blob_2[1..HEADER_LEN],
+            "nonce field must be random per write"
         );
         Ok(())
     }
@@ -1508,6 +1530,132 @@ mod test {
         assert!(
             matches!(err, SecretStoreError::Encryption(_)),
             "expected Encryption error, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// Backwards-compat for snapshots written before the per-write-nonce
+    /// format landed. `restore_snapshot` byte-copies the snapshot file
+    /// back to the active path without re-encryption, so a legacy
+    /// snapshot ends up at the active path in legacy format. The very
+    /// next `get_secret` MUST recover the plaintext through the legacy
+    /// fallback. Pins that the upgrade path works without a separate
+    /// migration of the snapshot history.
+    #[tokio::test]
+    async fn legacy_snapshot_survives_restore_and_get_secret()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::wasm_runtime::secret_snapshots::SNAPSHOT_NAME_WIDTH;
+
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![90].into(), &vec![].into()));
+        let (cipher, registration_nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher.clone(), registration_nonce)?;
+        let secret_id = SecretsId::new(vec![91]);
+
+        // Seed an active value (new format) so restore has something to
+        // overwrite and is allowed to snapshot the active first.
+        store.store_secret(delegate.key(), &secret_id, b"current".to_vec())?;
+
+        // Hand-craft a LEGACY snapshot file: raw AEAD with the registered
+        // nonce, no version header. The retention policy will not touch
+        // this stamp (well below `now`) because it sorts as the oldest.
+        let snap_dir = secrets_dir
+            .join(delegate.key().encode())
+            .join(".snapshots")
+            .join(secret_id.encode());
+        std::fs::create_dir_all(&snap_dir)?;
+        let stamp = 1_700_000_000_000u64;
+        let snap_path = snap_dir.join(format!("{stamp:0width$}", width = SNAPSHOT_NAME_WIDTH));
+        // Force a plaintext whose legacy AEAD does NOT happen to start with
+        // VERSION_V1, so the read path takes the plain legacy branch (the
+        // 1/256 ambiguity branch has its own dedicated test).
+        let plaintext = b"legacy-snapshot-payload".to_vec();
+        let legacy_aead = cipher
+            .encrypt(&registration_nonce, plaintext.as_ref())
+            .expect("legacy encrypt");
+        assert_ne!(
+            legacy_aead.first().copied(),
+            Some(VERSION_V1),
+            "test setup unlucky: legacy AEAD happens to start with VERSION_V1; \
+             pick a different plaintext"
+        );
+        std::fs::write(&snap_path, &legacy_aead)?;
+
+        // Permissive retention so thin_snapshots doesn't drop our ancient
+        // stamp before restore can find it.
+        store.set_retention_policy(RetentionPolicy {
+            keep_last: 100,
+            buckets: vec![],
+            max_age: None,
+        });
+
+        // Restore byte-copies legacy AEAD back to the active path.
+        store.restore_snapshot(delegate.key(), &secret_id, stamp)?;
+        // Active path now holds a legacy blob. `get_secret` must recover
+        // the original plaintext through the legacy fallback.
+        let recovered = store.get_secret(delegate.key(), &secret_id)?;
+        assert_eq!(
+            recovered, plaintext,
+            "legacy snapshot must remain decryptable after restore + get_secret"
+        );
+        Ok(())
+    }
+
+    /// Behavioral-change pin for the `register_delegate` simplification:
+    /// the old code skipped registration when the caller's nonce matched
+    /// the historical default nonce, falling through to
+    /// `default_encryption` on reads. The new code always registers the
+    /// cipher. The two paths MUST be equivalent for legacy blobs written
+    /// under the default `(cipher, nonce)` pair — otherwise existing
+    /// default-configured nodes' data would suddenly become unreadable
+    /// after upgrade.
+    #[tokio::test]
+    async fn register_with_default_cipher_decrypts_legacy_default_blob()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use freenet_stdlib::client_api::DelegateRequest;
+
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![92].into(), &vec![].into()));
+        let default_cipher = XChaCha20Poly1305::new((&DelegateRequest::DEFAULT_CIPHER).into());
+        let default_nonce: XNonce = DelegateRequest::DEFAULT_NONCE.into();
+
+        // Register with the historical defaults. Under the old code this
+        // was a silent no-op (skipped). Under the new code the cipher is
+        // registered and `legacy_nonce` holds DEFAULT_NONCE.
+        store.register_delegate(
+            delegate.key().clone(),
+            default_cipher.clone(),
+            default_nonce,
+        )?;
+
+        // Write a legacy blob using exactly those defaults — simulating a
+        // file written by an older freenet-core version that used the
+        // default-cipher fallback path.
+        let secret_id = SecretsId::new(vec![93]);
+        let plaintext = b"upgraded-from-default-config".to_vec();
+        let legacy_aead = default_cipher
+            .encrypt(&default_nonce, plaintext.as_ref())
+            .expect("legacy encrypt");
+        let delegate_dir = secrets_dir.join(delegate.key().encode());
+        std::fs::create_dir_all(&delegate_dir)?;
+        std::fs::write(delegate_dir.join(secret_id.encode()), &legacy_aead)?;
+
+        // Must recover plaintext via legacy fallback path.
+        let recovered = store.get_secret(delegate.key(), &secret_id)?;
+        assert_eq!(
+            recovered, plaintext,
+            "default-cipher legacy blob must remain readable after register_delegate \
+             (behavioral equivalence with the removed skip-on-default-nonce branch)"
         );
         Ok(())
     }
