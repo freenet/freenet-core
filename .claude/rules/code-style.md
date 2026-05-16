@@ -311,6 +311,39 @@ example (the `classify_suspend_jump` helper and its rustdoc). Do not
 add new call sites for any other purpose — every other "I need real
 time" urge in `crates/core/` should still go through `TimeSource`.
 
+#### Exception: `OsRng` for cryptographic key / nonce generation
+
+The other legitimate reason to bypass `GlobalRng` in `crates/core/` is
+cryptographic key material (AEAD keys, AEAD nonces, signing keys,
+ephemeral DH secrets, etc.). Cryptographic randomness MUST come from
+the OS entropy pool (`/dev/urandom`-equivalent), not from a
+deterministic simulation RNG: a `GlobalRng` seed leak would compromise
+every key derived from it, and tests that fix the seed for
+reproducibility would produce on-disk ciphertexts that any reader of
+the test source could decrypt.
+
+When you have this exact need:
+
+1. Use `chacha20poly1305::aead::OsRng` (or another `RngCore`-implementing
+   wrapper over the OS entropy pool — `rand::rngs::OsRng` works too).
+2. Restrict the call site to code that runs at node startup or
+   one-shot key generation paths — NEVER inside per-request hot loops
+   or anything the simulation harness would expect to control.
+3. Add a load-bearing comment on the helper function explaining *why*
+   `OsRng` is correct here (cite cryptographic-key-material reason —
+   a generic "we need randomness" justification is not sufficient).
+
+Canonical examples:
+
+- `crates/core/src/config/secret.rs::generate_cipher_key` — generates
+  the per-node XChaCha20-Poly1305 cipher seeded at first start.
+- `crates/core/src/wasm_runtime/secrets_store.rs::store_secret` —
+  generates a fresh per-write AEAD nonce.
+
+Do not add new `OsRng` call sites outside of crypto key/nonce
+generation. Every other "I need randomness" urge in `crates/core/`
+should still go through `GlobalRng`.
+
 ### WHEN writing documentation
 
 ```
