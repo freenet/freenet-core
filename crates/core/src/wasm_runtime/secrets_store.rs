@@ -1301,7 +1301,10 @@ mod test {
             .join(secret_id.encode());
         let first = std::fs::read(&active)?;
 
-        std::thread::sleep(Duration::from_millis(5));
+        // No sleep: the nonce uniqueness invariant comes from `OsRng`, not
+        // wall-clock time. The surrounding snapshot tests sleep to force
+        // distinct epoch-millis filenames, but that is irrelevant here —
+        // the second write deliberately reuses the same epoch slot.
         store.store_secret(delegate.key(), &secret_id, plaintext.clone())?;
         let second = std::fs::read(&active)?;
 
@@ -1309,8 +1312,92 @@ mod test {
             first, second,
             "two writes of the same plaintext under nonce-per-write MUST differ on disk"
         );
+        // Specifically pin the nonce field bytes: catches a regression where
+        // someone hardcoded the nonce (e.g. to zeros for "debugging") and
+        // the overall ciphertext only happens to differ for some other
+        // reason. `assert_ne!(first, second)` alone would miss that.
+        assert_ne!(
+            &first[1..HEADER_LEN],
+            &second[1..HEADER_LEN],
+            "nonce field must differ across writes"
+        );
         // Both must decrypt back to the same plaintext.
         assert_eq!(store.get_secret(delegate.key(), &secret_id)?, plaintext);
+        Ok(())
+    }
+
+    /// Regression for the documented 1/256 ambiguity in
+    /// `decrypt_secret_blob`: when a legacy blob happens to start with
+    /// `VERSION_V1`, the new-format AEAD parse is attempted first and MUST
+    /// fail closed; the legacy-decrypt fallback then MUST succeed and
+    /// return the original plaintext. Brute-forces the ambiguity by
+    /// re-encrypting with random per-attempt nonces until the AEAD output
+    /// begins with `VERSION_V1` — expected within ~256 attempts.
+    #[tokio::test]
+    async fn legacy_blob_with_version_byte_falls_through_to_legacy_decrypt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+        let delegate = Delegate::from((&vec![88].into(), &vec![].into()));
+        // We need a stable registration nonce so the legacy fallback in
+        // `get_secret` uses exactly the nonce we encrypted under.
+        let (cipher, registration_nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher.clone(), registration_nonce)?;
+        let secret_id = SecretsId::new(vec![89]);
+
+        // Find a plaintext whose legacy-format AEAD output starts with
+        // VERSION_V1 to force the read path into the documented ambiguity
+        // branch. AEAD output is deterministic in (key, nonce, plaintext),
+        // so varying only the suffix of the plaintext keeps the first
+        // ciphertext byte constant (it depends only on the first plaintext
+        // byte and the fixed keystream). Vary the FIRST plaintext byte
+        // instead: for the fixed (key, nonce) the relationship
+        // `aead[0] = plaintext[0] XOR keystream[0]` makes this a bijection
+        // over 0..=255, so exactly one byte value yields `aead[0] ==
+        // VERSION_V1`.
+        let mut legacy_blob: Option<(u8, Vec<u8>)> = None;
+        for first_byte in 0u8..=u8::MAX {
+            let plaintext = vec![first_byte; 16];
+            let aead = cipher
+                .encrypt(&registration_nonce, plaintext.as_ref())
+                .expect("legacy encrypt");
+            if aead.first().copied() == Some(VERSION_V1) {
+                legacy_blob = Some((first_byte, aead));
+                break;
+            }
+            if first_byte == u8::MAX {
+                break;
+            }
+        }
+        let (winning_byte, legacy_blob) = legacy_blob.expect(
+            "XChaCha20 keystream byte 0 should make aead[0]=0x01 reachable for some plaintext byte",
+        );
+        assert_eq!(legacy_blob.first().copied(), Some(VERSION_V1));
+        assert!(
+            legacy_blob.len() >= HEADER_LEN,
+            "legacy blob too short to even *look* like a new-format blob: {} bytes",
+            legacy_blob.len()
+        );
+
+        // Write the legacy blob directly at the active path. `get_secret`
+        // will see `blob[0] == VERSION_V1 && blob.len() >= HEADER_LEN`,
+        // try new-format decrypt (which fails because bytes [1..25] are
+        // not the nonce that produced bytes [25..]), and fall through
+        // to legacy decrypt (which must succeed).
+        let delegate_dir = secrets_dir.join(delegate.key().encode());
+        std::fs::create_dir_all(&delegate_dir)?;
+        std::fs::write(delegate_dir.join(secret_id.encode()), &legacy_blob)?;
+
+        let recovered = store.get_secret(delegate.key(), &secret_id)?;
+        assert_eq!(
+            recovered,
+            vec![winning_byte; 16],
+            "fallback must recover the original 16-byte plaintext"
+        );
         Ok(())
     }
 
