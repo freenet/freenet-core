@@ -53,6 +53,25 @@ pub(super) async fn finalize_put_at_originator(
         op_manager.ring.register_events(Either::Left(event)).await;
     }
 
+    // Mark the contract as locally-accessed now that the originator's PUT
+    // has succeeded and the local cache entry exists (created by the
+    // shared `relay_put_store_locally` path during `put_contract` +
+    // `host_contract`). Without this, self-hosted contracts that were
+    // PUT'd by a local client but never GET'd would never get the
+    // `local_client_access` flag — the GET path is the only other call
+    // site for `mark_local_client_access`. Missing the flag excludes the
+    // contract from `contracts_needing_renewal`, the subscription expires,
+    // the entry eventually gets evicted under byte-budget pressure, and
+    // the next cold remote GET fails the `is_locally_hosted` shortcut and
+    // routes to the network — where, for a contract no other peer is
+    // subscribed to, the GetOp hangs until the WS client times out.
+    // (freenet-stdlib mirror demo, 2026-05-14: 180s timeouts on
+    // freenet:96rknpy1GYhZ/freenet-stdlib for exactly this reason.)
+    //
+    // This is the originator-side mark the relay-helper doc-comment in
+    // `op_ctx_task::relay_put_store_locally` was waiting for.
+    op_manager.ring.mark_local_client_access(&key);
+
     if subscribe {
         start_subscription_after_put(op_manager, id, key, blocking_subscribe).await;
     }
@@ -400,6 +419,51 @@ mod tests {
         assert!(
             !src.contains(&needle),
             "ForwardingAck senders must not be reintroduced"
+        );
+    }
+
+    /// Regression guard for the freenet-stdlib mirror demo 180s timeout
+    /// (2026-05-14). `finalize_put_at_originator` MUST call
+    /// `mark_local_client_access` so PUT'd-but-never-GET'd contracts get
+    /// the local-client flag set on their hosting cache entry. Without
+    /// this, `contracts_needing_renewal` excludes them, the subscription
+    /// expires, the entry eventually gets evicted, and the next cold
+    /// remote GET fails the `is_locally_hosted` shortcut and routes to
+    /// the network — where, for a contract no other peer subscribes to,
+    /// the GetOp hangs until the WS client's 180s timeout fires.
+    ///
+    /// The GET path already calls `mark_local_client_access` (see
+    /// `client_events::serve_get`); this PR adds the symmetric call on
+    /// the originator-PUT path so the flag is no longer GET-only.
+    #[test]
+    fn finalize_put_at_originator_marks_local_client_access() {
+        const SOURCE: &str = include_str!("put.rs");
+
+        // Locate the function definition.
+        let fn_start = SOURCE
+            .find("pub(super) async fn finalize_put_at_originator(")
+            .expect("finalize_put_at_originator definition not found");
+        // Body extent: from the opening `{` of the body to the matching
+        // closing `}\n`. Use a coarse scan that's robust enough for the
+        // small function — we just need the call site to be inside.
+        let body_start = SOURCE[fn_start..]
+            .find('{')
+            .map(|p| fn_start + p)
+            .expect("function body opening brace not found");
+        let body_end = SOURCE[body_start..]
+            .find("\n}\n")
+            .map(|p| body_start + p)
+            .expect("function body closing brace not found");
+        let body = &SOURCE[body_start..body_end];
+
+        assert!(
+            body.contains("mark_local_client_access"),
+            "finalize_put_at_originator MUST call mark_local_client_access \
+             so self-hosted contracts get the local-client flag set on the \
+             hosting cache entry. Without this call, the freenet-stdlib \
+             mirror demo cold-GET timeout (2026-05-14) returns. See \
+             contracts_needing_renewal at hosting.rs:971-991 for the \
+             downstream gate that depends on this flag."
         );
     }
 }
