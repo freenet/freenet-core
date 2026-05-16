@@ -54,22 +54,19 @@ pub(super) async fn finalize_put_at_originator(
     }
 
     // Mark the contract as locally-accessed now that the originator's PUT
-    // has succeeded and the local cache entry exists (created by the
-    // shared `relay_put_store_locally` path during `put_contract` +
-    // `host_contract`). Without this, self-hosted contracts that were
-    // PUT'd by a local client but never GET'd would never get the
-    // `local_client_access` flag — the GET path is the only other call
-    // site for `mark_local_client_access`. Missing the flag excludes the
-    // contract from `contracts_needing_renewal`, the subscription expires,
-    // the entry eventually gets evicted under byte-budget pressure, and
-    // the next cold remote GET fails the `is_locally_hosted` shortcut and
-    // routes to the network — where, for a contract no other peer is
-    // subscribed to, the GetOp hangs until the WS client times out.
-    // (freenet-stdlib mirror demo, 2026-05-14: 180s timeouts on
+    // has succeeded and the local cache entry exists (created earlier by
+    // the put pipeline's `put_contract` + `host_contract`). Without this,
+    // self-hosted contracts that were PUT'd by a local client but never
+    // GET'd would never get the `local_client_access` flag — the GET path
+    // is the only other production call site for `mark_local_client_access`.
+    // Missing the flag excludes the contract from
+    // `contracts_needing_renewal`, the subscription expires, the entry
+    // eventually gets evicted under byte-budget pressure, and the next
+    // cold remote GET fails the `is_locally_hosted` shortcut and routes
+    // to the network — where, for a contract no other peer is subscribed
+    // to, the GetOp hangs until the WS client times out. (freenet-stdlib
+    // mirror demo, 2026-05-14: 180s timeouts on
     // freenet:96rknpy1GYhZ/freenet-stdlib for exactly this reason.)
-    //
-    // This is the originator-side mark the relay-helper doc-comment in
-    // `op_ctx_task::relay_put_store_locally` was waiting for.
     op_manager.ring.mark_local_client_access(&key);
 
     if subscribe {
