@@ -9,7 +9,10 @@ use freenet_stdlib::prelude::{
 };
 
 use super::engine::{InstanceHandle, WasmEngine};
-use super::native_api::{CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV, DelegateCallEnv, InstanceId};
+use super::native_api::{
+    self, CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV, DelegateCallEnv, DelegateContextEntry,
+    InstanceId,
+};
 use super::{Runtime, RuntimeResult};
 use crate::wasm_runtime::delegate_api::DelegateApiVersion;
 
@@ -504,8 +507,26 @@ impl DelegateRuntimeInterface for Runtime {
             "Starting delegate execution"
         );
 
-        // State maintained across process() calls within this conversation
-        let mut context: Vec<u8> = Vec::new();
+        // Context state maintained across process() calls.
+        //
+        // `self.delegate_contexts` persists the delegate's `ctx.write()` bytes
+        // across separate `inbound_app_message` invocations so that, e.g., the
+        // bytes a delegate writes when emitting `RequestUserInput` are still
+        // readable via `ctx.read()` when the executor re-enters with the
+        // matching `UserResponse`. Without this, the delegate hits "received
+        // UserResponse with no pending context" because the Vec only used to
+        // live for one `inbound_app_message` call. See
+        // `native_api::DelegateContextCache`.
+        //
+        // Amortised TTL sweep on every entry prevents the cache from holding
+        // bytes for prompts whose `UserResponse` never arrives (user
+        // dismisses, app crashes, network partition).
+        native_api::prune_expired_contexts(&self.delegate_contexts);
+        let mut context: Vec<u8> = self
+            .delegate_contexts
+            .get(delegate_key)
+            .map(|entry| entry.bytes.clone())
+            .unwrap_or_default();
 
         // Process all messages, collecting the result.
         // Cleanup happens after the loop regardless of success/failure.
@@ -674,6 +695,39 @@ impl DelegateRuntimeInterface for Runtime {
 
         process_result?;
 
+        // Persist the (possibly mutated) context so the next call into this
+        // delegate sees what `ctx.write()` left behind. Skip the insert when
+        // empty to keep the map sparse — `unwrap_or_default()` covers the
+        // unset case symmetrically on read.
+        //
+        // Drop contexts that exceed `DelegateContext::MAX_SIZE`: the wire
+        // format would assert on the next call when the runtime threads the
+        // bytes back through `DelegateContext::new(...)`. The `ctx.write()`
+        // host function has no size cap of its own, so a delegate with a
+        // bug — or one trying to wedge the runtime — can otherwise stash a
+        // value that would crash on the very next call. Treat oversize as
+        // "delegate misbehavior, forget it" rather than "crash the node."
+        if context.is_empty() {
+            self.delegate_contexts.remove(delegate_key);
+        } else if context.len() < freenet_stdlib::prelude::DelegateContext::MAX_SIZE {
+            self.delegate_contexts.insert(
+                delegate_key.clone(),
+                DelegateContextEntry {
+                    bytes: context,
+                    last_write: tokio::time::Instant::now(),
+                },
+            );
+        } else {
+            tracing::warn!(
+                delegate_key = %delegate_key,
+                bytes = context.len(),
+                max = freenet_stdlib::prelude::DelegateContext::MAX_SIZE,
+                "Delegate ctx.write() exceeded DelegateContext::MAX_SIZE; \
+                 dropping the persisted context to avoid a crash on the next call"
+            );
+            self.delegate_contexts.remove(delegate_key);
+        }
+
         tracing::debug!(
             count = results.len(),
             "Final results returned by inbound_app_message"
@@ -696,6 +750,9 @@ impl DelegateRuntimeInterface for Runtime {
     #[inline]
     fn unregister_delegate(&mut self, key: &DelegateKey) -> RuntimeResult<()> {
         self.delegate_modules.lock().unwrap().pop(key);
+        // Drop persisted ctx.write() bytes so an unregistered delegate can't
+        // hold onto stale state if it's later re-registered.
+        self.delegate_contexts.remove(key);
         self.delegate_store.remove_delegate(key)
     }
 }
@@ -1400,8 +1457,21 @@ mod test {
         Ok(())
     }
 
+    /// Regression test for harvest cross-app share / ghostkey RequestAnyAccess
+    /// flow: a delegate's `ctx.write()` MUST survive across separate
+    /// `inbound_app_message` calls. The canonical use is a permission prompt
+    /// where call #1 emits `RequestUserInput` (and stores `PendingPrompt` via
+    /// `ctx.write`), and call #2 receives the user's `UserResponse` and
+    /// expects `ctx.read()` to return that pending blob.
+    ///
+    /// Before the fix in this PR, every `inbound_app_message` started with a
+    /// fresh empty context Vec, so the second call saw nothing and the
+    /// ghostkey delegate hit "received UserResponse with no pending context".
+    /// This test exercises the same failure shape via `IncrementCounter`,
+    /// which reads the counter from context, increments, and writes back: if
+    /// context is reset between calls, the counter stays stuck at 1.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_context_reset_between_calls() -> Result<(), Box<dyn std::error::Error>> {
+    async fn test_context_persists_between_calls() -> Result<(), Box<dyn std::error::Error>> {
         use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
 
         let contract = WrappedContract::new(
@@ -1432,7 +1502,10 @@ mod test {
                 panic!("Expected ApplicationMessage")
             }
         };
-        assert!(matches!(response, OutboundAppMessage::CounterValue(1)));
+        assert!(
+            matches!(response, OutboundAppMessage::CounterValue(1)),
+            "first call: expected CounterValue(1), got {response:?}"
+        );
 
         let payload = bincode::serialize(&InboundAppMessage::IncrementCounter)?;
         let msg = ApplicationMessage::new(payload);
@@ -1455,7 +1528,157 @@ mod test {
                 panic!("Expected ApplicationMessage")
             }
         };
-        assert!(matches!(response, OutboundAppMessage::CounterValue(1)));
+        // Without context persistence this returns CounterValue(1) again
+        // because each call sees a fresh, empty context.
+        assert!(
+            matches!(response, OutboundAppMessage::CounterValue(2)),
+            "second call: expected CounterValue(2) (context persisted), got {response:?}"
+        );
+
+        // Unregister must clear the persisted context so a re-registered
+        // delegate with the same key starts from scratch.
+        let cache = runtime.delegate_contexts.clone();
+        runtime.unregister_delegate(delegate.key())?;
+        assert!(
+            !cache.contains_key(delegate.key()),
+            "unregister_delegate should clear delegate_contexts entry"
+        );
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Pin the oversize-context drop path: a delegate that writes a context
+    /// larger than `DelegateContext::MAX_SIZE` must NOT crash the runtime on
+    /// the subsequent call. The runtime drops the persisted bytes (with a
+    /// warn-level log) and the next call sees an empty context.
+    ///
+    /// Without this guard the next `inbound_app_message` would assert inside
+    /// `DelegateContext::new(...)` when threading the bytes back to the WASM
+    /// boundary, taking down the executor pool worker.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_context_oversize_is_dropped_not_crashed() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+        let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
+        // Write past MAX_SIZE — `ctx.write` host fn has no size cap of its
+        // own, so the WASM call itself succeeds even though the bytes won't
+        // fit in `DelegateContext`.
+        let oversize = freenet_stdlib::prelude::DelegateContext::MAX_SIZE + 1024;
+        let payload = bincode::serialize(&InboundAppMessage::WriteLargeContext(oversize))?;
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(payload),
+            )],
+        )?;
+        assert!(
+            matches!(&outbound[0], OutboundDelegateMsg::ApplicationMessage(_)),
+            "first call should still produce a normal ApplicationMessage outbound"
+        );
+
+        // The persisted entry must be dropped — readers don't get to see
+        // bytes that would crash on the next round-trip.
+        assert!(
+            !runtime.delegate_contexts.contains_key(delegate.key()),
+            "oversize ctx.write should be dropped from the persisted cache"
+        );
+
+        // A follow-up call must succeed (no crash) and the delegate must
+        // observe an empty context (NOT the oversize bytes).
+        let payload = bincode::serialize(&InboundAppMessage::ReadContext)?;
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(payload),
+            )],
+        )?;
+        let response: OutboundAppMessage = match &outbound[0] {
+            OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
+            other => panic!("Expected ApplicationMessage, got {other:?}"),
+        };
+        match response {
+            OutboundAppMessage::ContextData(data) => {
+                assert!(
+                    data.is_empty(),
+                    "after oversize drop, next call must read an empty context, got {} bytes",
+                    data.len()
+                );
+            }
+            other => panic!("Expected ContextData, got {other:?}"),
+        }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// Pin the TTL-based eviction: an entry whose `last_write` is older than
+    /// `DELEGATE_CONTEXT_TTL` is dropped on the next sweep, even if
+    /// `unregister_delegate` is never called. Without TTL the cache leaks
+    /// pending-state bytes for any delegate whose `RequestUserInput` doesn't
+    /// receive a matching `UserResponse` (prompt dismissed, app crash,
+    /// network partition) until process restart.
+    ///
+    /// Doesn't go through the WASM path; manipulates the cache and then
+    /// drives a no-op `inbound_app_message` so the loader's `prune_expired`
+    /// runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_context_ttl_evicts_stale_entry() -> Result<(), Box<dyn std::error::Error>> {
+        use delegate2_messages::InboundAppMessage;
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1])),
+            Parameters::from(vec![]),
+        );
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+        let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
+
+        // Plant an entry whose last_write is older than the TTL. Using
+        // `tokio::time::Instant` matches the entry's storage type and lets
+        // `tokio::time::pause` / `tokio::time::advance` drive the sweep
+        // deterministically in future tests if needed.
+        let stale_at = tokio::time::Instant::now()
+            .checked_sub(super::native_api::DELEGATE_CONTEXT_TTL)
+            .expect("Instant arithmetic on test platform")
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("Instant arithmetic on test platform");
+        runtime.delegate_contexts.insert(
+            delegate.key().clone(),
+            super::native_api::DelegateContextEntry {
+                bytes: vec![0xAA; 64],
+                last_write: stale_at,
+            },
+        );
+        assert!(runtime.delegate_contexts.contains_key(delegate.key()));
+
+        // Drive any inbound — the loader's prune sweep runs first.
+        let payload = bincode::serialize(&InboundAppMessage::ReadContext)?;
+        runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(payload),
+            )],
+        )?;
+
+        // The stale entry must be gone. The ReadContext call wrote nothing,
+        // so no fresh entry was inserted in its place.
+        assert!(
+            !runtime.delegate_contexts.contains_key(delegate.key()),
+            "TTL sweep should evict an entry older than DELEGATE_CONTEXT_TTL"
+        );
 
         std::mem::drop(temp_dir);
         Ok(())
@@ -2029,7 +2252,13 @@ mod test {
         let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
         let _app = ContractInstanceId::try_from(contract.key.to_string()).unwrap();
 
-        let large_size = 1024 * 1024;
+        // `DelegateContext::MAX_SIZE` caps the on-wire context size; pick the
+        // largest value that fits with a margin so the persisted bytes still
+        // round-trip through `DelegateContext::new(...)` on the next call.
+        // The pre-fix version of this test wrote 1 MiB, well past the cap;
+        // it only avoided the assertion because context didn't persist
+        // between calls (the bug this PR fixes).
+        let large_size = (freenet_stdlib::prelude::DelegateContext::MAX_SIZE / 2).min(256 * 1024);
 
         let payload = bincode::serialize(&InboundAppMessage::WriteLargeContext(large_size))?;
         let msg = ApplicationMessage::new(payload);
@@ -2093,7 +2322,15 @@ mod test {
         };
         match response {
             OutboundAppMessage::ContextData(data) => {
-                assert!(data.is_empty());
+                // Pre-fix this assertion expected `is_empty()` because the
+                // context was reset between calls. With persistence the
+                // bytes the delegate wrote on the previous call survive
+                // and the read on this call must return them.
+                assert_eq!(
+                    data.len(),
+                    large_size,
+                    "persisted context should round-trip the size the delegate wrote"
+                );
             }
             other @ OutboundAppMessage::CreateInboxResponse(_)
             | other @ OutboundAppMessage::MessageSigned(_)
