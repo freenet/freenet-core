@@ -10,13 +10,27 @@ go wrong.
 
 ## Quickstart
 
+For a routine patch release, just run the workflow with no input — it
+auto-bumps the patch from the latest crates.io version:
+
+```bash
+gh workflow run release.yml --repo freenet/freenet-core
+```
+
+For a minor or major bump (or to pin a specific version), pass `version`:
+
 ```bash
 gh workflow run release.yml \
     --repo freenet/freenet-core \
-    --field version=X.Y.Z
+    --field version=0.3.0
 ```
 
 That's it. Watch progress at <https://github.com/freenet/freenet-core/actions/workflows/release.yml>.
+
+The auto-bump reads `https://crates.io/api/v1/crates/freenet` to find the
+highest released version and increments the patch. So after `0.2.59` ships,
+the next bare run cuts `0.2.60`. Minor / major bumps are intentionally
+explicit — they're not auto-decidable from commit history.
 
 Within ~30–60 minutes you should see:
 

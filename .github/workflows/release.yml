@@ -4,9 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release (e.g., 0.1.31)'
-        required: true
+        description: 'Version to release (e.g., 0.1.31). Leave blank for auto-patch-bump from latest crates.io release.'
+        required: false
         type: string
+        default: ''
       skip_tests:
         description: 'Skip running tests before release'
         required: false
@@ -48,18 +49,33 @@ jobs:
             echo "✅ RELEASE_PAT is configured. Downstream workflows will be triggered automatically."
           fi
 
-      - name: Validate version format
+      - name: Resolve + validate version
         id: validate
         run: |
           VERSION="${{ inputs.version }}"
-
-          # Remove 'v' prefix if present
           VERSION="${VERSION#v}"
 
-          # Validate format X.Y.Z
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Error: Version must be in format X.Y.Z (e.g., 0.1.31)"
-            exit 1
+          if [[ -z "$VERSION" ]]; then
+            # Auto-bump: take the highest released version on crates.io for
+            # the `freenet` crate and increment the patch. Minor/major bumps
+            # still require explicit input.
+            LATEST=$(curl -sS -A 'github-actions' https://crates.io/api/v1/crates/freenet \
+              | jq -r '.crate.max_version')
+            if [[ ! "$LATEST" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Could not resolve latest version from crates.io (got: '$LATEST')"
+              exit 1
+            fi
+            MAJOR=$(echo "$LATEST" | cut -d. -f1)
+            MINOR=$(echo "$LATEST" | cut -d. -f2)
+            PATCH=$(echo "$LATEST" | cut -d. -f3)
+            NEW_PATCH=$((PATCH + 1))
+            VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
+            echo "::notice::No version input; auto-bumping patch from crates.io latest $LATEST → $VERSION"
+          else
+            if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Version must be in format X.Y.Z (e.g., 0.1.31). Got: $VERSION"
+              exit 1
+            fi
           fi
 
           echo "version=$VERSION" >> $GITHUB_OUTPUT
