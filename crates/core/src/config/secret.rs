@@ -48,6 +48,13 @@ pub(crate) const LEGACY_DEFAULT_CIPHER: [u8; 32] = [
 ];
 
 /// Generate a fresh 32-byte XChaCha20-Poly1305 key via `OsRng`.
+///
+/// `OsRng` is the documented exception to the project-wide
+/// `.claude/rules/code-style.md` ban on `rand::thread_rng()` /
+/// `rand::random()` in `crates/core/`: cryptographic key material MUST
+/// come from the OS entropy pool (e.g. `/dev/urandom`), not from a
+/// deterministic simulation RNG. This call runs at node startup, before
+/// any `TimeSource` / `GlobalRng` simulation harness would be in scope.
 fn generate_cipher_key() -> [u8; CIPHER_SIZE] {
     let key = XChaCha20Poly1305::generate_key(&mut OsRng);
     let mut out = [0u8; CIPHER_SIZE];
@@ -55,22 +62,31 @@ fn generate_cipher_key() -> [u8; CIPHER_SIZE] {
     out
 }
 
-/// Persist a cipher key to disk with 0o600 permissions on Unix.
-fn save_cipher(path: &Path, key: &[u8; CIPHER_SIZE]) -> std::io::Result<()> {
+/// Persist a cipher key to disk, creating the file atomically with
+/// 0o600 permissions on Unix (no window where another user could open
+/// the file at a more permissive mode).
+///
+/// Uses `OpenOptions::create_new(true)` so the call fails with
+/// `AlreadyExists` if the file appeared between the caller's existence
+/// check and this write — preventing a TOCTOU where two concurrent
+/// freenet processes starting against the same `secrets_dir` overwrite
+/// each other's cipher.
+fn save_cipher_new(path: &Path, key: &[u8; CIPHER_SIZE]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut file = File::create(path)?;
-    file.write_all(key)?;
-    file.sync_all()?;
-    drop(file);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(path)?.permissions();
-        perms.set_mode(0o600);
-        std::fs::set_permissions(path, perms)?;
+        use std::os::unix::fs::OpenOptionsExt;
+        // Atomic 0o600 — no window between create and chmod where the
+        // file is readable under the process umask.
+        opts.mode(0o600);
     }
+    let mut file = opts.open(path)?;
+    file.write_all(key)?;
+    file.sync_all()?;
     Ok(())
 }
 
@@ -205,12 +221,29 @@ impl SecretArgs {
             } else {
                 std::fs::create_dir_all(dir)?;
                 let cipher = generate_cipher_key();
-                save_cipher(&default_path, &cipher)?;
-                tracing::info!(
-                    path = %default_path.display(),
-                    "Generated and saved new delegate cipher"
-                );
-                (Some(default_path), cipher)
+                match save_cipher_new(&default_path, &cipher) {
+                    Ok(()) => {
+                        tracing::info!(
+                            path = %default_path.display(),
+                            "Generated and saved new delegate cipher"
+                        );
+                        (Some(default_path), cipher)
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                        // Race lost: another freenet process (or our own
+                        // earlier startup attempt) wrote the cipher file
+                        // in the window between `default_path.exists()`
+                        // returning false and our `save_cipher_new`. The
+                        // file is now authoritative — load it.
+                        tracing::info!(
+                            path = %default_path.display(),
+                            "Cipher file appeared concurrently; loading the winning copy"
+                        );
+                        let cipher = read_cipher(&default_path)?;
+                        (Some(default_path), cipher)
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         } else {
             // No secrets_dir (tests): ephemeral random cipher. Crucially
