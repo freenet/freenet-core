@@ -11,6 +11,7 @@ mod inspect;
 pub(crate) mod network_metrics_server;
 mod new_package;
 mod query;
+mod secrets_cmd;
 mod testing;
 mod util;
 mod verify_state;
@@ -101,6 +102,7 @@ fn main() -> anyhow::Result<()> {
             SubCommand::VerifyState(verify_config) => {
                 verify_state::verify_state(verify_config).await
             }
+            SubCommand::Secrets(secrets_config) => crate::secrets_cmd::run(secrets_config).await,
             SubCommand::Website { command } => match command {
                 website::WebsiteCommand::Init { name } => website::init(name),
                 website::WebsiteCommand::Publish {
