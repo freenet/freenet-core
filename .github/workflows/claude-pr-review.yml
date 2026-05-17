@@ -15,9 +15,24 @@ name: Claude PR Rule Review
 # - pull_request_target: runs for all PRs (including forks) with base-repo
 #   secrets available. Safe because we only read the diff — we never execute
 #   fork code (no cargo build/test on the PR head).
-# - labeled: re-run when a maintainer adds the 'claude-review' label, useful
-#   for fork PRs where the initial run may have been skipped. Also re-run
-#   when 'review-override' is added to update the commit status.
+# - labeled: re-run when 'review-override' is added to update the commit
+#   status, or when 'claude-review' is added to force a re-review.
+#
+# Fork PR security model:
+# - `allowed_non_write_users: '*'` lets the Claude action run on fork PRs
+#   without the actor (PR author) needing write access. Without this, the
+#   action exits with "Actor does not have write permissions" on every
+#   first-party fork PR run (see freenet/freenet-core#4129).
+# - This is safe HERE because: (a) the prompt is hardcoded in this YAML —
+#   fork PRs can't change it; (b) Claude's tools are locked down to
+#   read-only via `settings` below — no Write/Edit/Bash-shell; (c) the
+#   job token has only `pull-requests: write` + `issues: write` +
+#   `statuses: write` — worst case is a misleading comment, which a human
+#   reviewer will catch; (d) the action automatically scrubs Anthropic /
+#   cloud / GitHub Actions secrets from subprocess env when this input
+#   is set.
+# - Do NOT copy this `allowed_non_write_users: '*'` pattern to any workflow
+#   that grants Claude write/edit tools, commit signing, or contents:write.
 #
 # Complements (does not replace):
 # - ci.yml: cargo fmt, clippy, tests, conventional commits, rule lint
@@ -208,6 +223,44 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          # Allow fork PRs through. See the "Fork PR security model" block at
+          # the top of this file. Only safe in combination with the read-only
+          # `settings.permissions` lockdown below.
+          allowed_non_write_users: '*'
+          # Lock Claude to read-only tools — the rule review only needs to read
+          # rule files and inspect the diff. Defense-in-depth against prompt
+          # injection from fork PR diffs.
+          settings: |
+            {
+              "permissions": {
+                "allow": [
+                  "Read",
+                  "Glob",
+                  "Grep",
+                  "Bash(git diff:*)",
+                  "Bash(git log:*)",
+                  "Bash(git show:*)",
+                  "Bash(cat:*)",
+                  "Bash(wc:*)",
+                  "Bash(ls:*)"
+                ],
+                "deny": [
+                  "Write",
+                  "Edit",
+                  "MultiEdit",
+                  "NotebookEdit",
+                  "WebFetch",
+                  "WebSearch",
+                  "Task",
+                  "Bash(curl:*)",
+                  "Bash(wget:*)",
+                  "Bash(rm:*)",
+                  "Bash(git push:*)",
+                  "Bash(git commit:*)",
+                  "Bash(gh:*)"
+                ]
+              }
+            }
           claude_args: '--model sonnet --max-turns 25 --effort high'
           prompt: |
             You are reviewing PR #${{ github.event.pull_request.number }}: "${{ github.event.pull_request.title }}"
