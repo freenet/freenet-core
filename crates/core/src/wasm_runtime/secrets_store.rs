@@ -243,10 +243,20 @@ impl SecretsStore {
 
     /// Derive the per-delegate DEK from the node KEK via HKDF-SHA256.
     ///
-    /// `salt = delegate_key.encode()` (the unique 64-byte
-    /// `instance || code_hash` of the delegate). `info` is the versioned
-    /// constant [`DEK_HKDF_INFO`]; rotating the version is equivalent to
-    /// rotating every DEK without touching the KEK.
+    /// HKDF inputs:
+    ///
+    /// - `ikm` = node KEK (32 bytes from the configured backend).
+    /// - `salt` = `delegate_key.encode()`, the bs58 encoding of the
+    ///   32-byte instance key (`DelegateKey::key`), i.e.
+    ///   `blake3(params || wasm_code)`. The companion `code_hash`
+    ///   field is NOT included in the salt — it's redundant because
+    ///   the instance key already folds in the wasm code, and binding
+    ///   it separately would only matter if two distinct delegates
+    ///   ever shared an instance key (currently impossible by
+    ///   construction).
+    /// - `info` = the versioned constant [`DEK_HKDF_INFO`]. Bumping
+    ///   the version rotates every DEK without touching the KEK.
+    /// - `okm` = 32 bytes (XChaCha20-Poly1305 key size).
     ///
     /// Deterministic in `(kek, delegate_key)` — restarting the node and
     /// re-deriving yields the same DEK, which is what lets persisted
@@ -743,68 +753,70 @@ fn decrypt_secret_blob(
     blob: &[u8],
     key: &SecretsId,
 ) -> Result<Vec<u8>, SecretStoreError> {
-    // Build the chain of (cipher, log-label) candidates to try, in
-    // order of decreasing priority. Each candidate is attempted first
-    // against the new versioned format `[VERSION_V1][nonce][AEAD]`
-    // (when the blob is long enough and the header byte matches), then
-    // against the legacy raw-AEAD format using the candidate's
-    // `legacy_nonce`. A success at any level returns immediately; the
-    // outer error is the generic AEAD failure of the last attempt.
+    // Decryption strategy. The format and cipher have rotated three
+    // times across the secrets-at-rest hardening sequence; the chain
+    // below is tightly scoped so we attempt only the format that each
+    // historical writer actually produced.
     //
-    // Ordering rationale:
+    //   Tier 1 (`encryption`, the registered/derived DEK):
+    //     - try VERSION_V1 (`[0x01][nonce][AEAD]`) first
+    //     - fall back to raw-AEAD with `encryption.legacy_nonce` for
+    //       blobs written under this same cipher but before the
+    //       per-write-nonce format landed in #4143 (e.g. a delegate
+    //       whose cipher hasn't changed but whose oldest secret file
+    //       has not been overwritten since the upgrade).
     //
-    //   1. `encryption` — the current registered/derived DEK. Most
-    //      reads hit here (or tier 1 of it).
-    //   2. `legacy_chain[..]` — successive ciphers the node previously
-    //      used (e.g. the post-#4144 / pre-#4140 auto-persisted
-    //      `delegate_cipher` file, which is what `default_encryption`
-    //      carries on upgraded nodes).
-    //   3. `legacy_migration` — the historical world-known
-    //      `(LEGACY_DEFAULT_CIPHER, LEGACY_DEFAULT_NONCE)` pair.
-    //      Only used for pre-#4143 blobs written by default-configured
-    //      nodes before the stdlib const removal. Logged at WARN so
-    //      operators see migration progress.
-    let mut chain: Vec<&Encryption> = Vec::with_capacity(2 + legacy_chain.len());
-    chain.push(encryption);
-    chain.extend_from_slice(legacy_chain);
-    if let Some(m) = legacy_migration {
-        chain.push(m);
-    }
-    let migration_tail_start = 1 + legacy_chain.len();
-
-    for (idx, enc) in chain.iter().enumerate() {
-        let is_migration = legacy_migration.is_some() && idx >= migration_tail_start;
-
-        // Versioned format with this candidate's cipher.
-        if blob.first().copied() == Some(VERSION_V1) && blob.len() >= HEADER_LEN {
-            let nonce = XNonce::from_slice(&blob[1..HEADER_LEN]);
-            if let Ok(pt) = enc.cipher.decrypt(nonce, &blob[HEADER_LEN..]) {
-                if idx == 0 {
-                    return Ok(pt);
-                }
-                log_legacy_decrypt(key, idx, is_migration, "versioned");
+    //   Tier 2 (`legacy_chain[..]`, e.g. the post-#4144 / pre-#4140
+    //   auto-persisted `delegate_cipher` carried by `default_encryption`):
+    //     - try VERSION_V1 ONLY. Every release that wrote under these
+    //       ciphers was already at the per-write-nonce format (post
+    //       #4143). Attempting raw-AEAD here would never match a real
+    //       blob — only a bit-flipped or wildly-mistyped one — and
+    //       would burn a cipher op on every cold read.
+    //
+    //   Tier 3 (`legacy_migration`, the LEGACY_DEFAULT_* world-known
+    //   constants):
+    //     - try raw-AEAD ONLY. Nodes that wrote under these constants
+    //       (pre-#4143 default-configured nodes) never produced a
+    //       versioned blob — versioned + default-cipher only happens
+    //       during the brief #4143 release window, which is covered by
+    //       tier 1's VERSION_V1 attempt if the registered cipher is
+    //       the default. Trying VERSION_V1 here would catch nothing
+    //       real. Logged at WARN so operators see migration progress.
+    if blob.first().copied() == Some(VERSION_V1) && blob.len() >= HEADER_LEN {
+        let nonce = XNonce::from_slice(&blob[1..HEADER_LEN]);
+        // Tier 1 versioned.
+        if let Ok(pt) = encryption.cipher.decrypt(nonce, &blob[HEADER_LEN..]) {
+            return Ok(pt);
+        }
+        // Tier 2 versioned.
+        for (idx, fallback) in legacy_chain.iter().enumerate() {
+            if let Ok(pt) = fallback.cipher.decrypt(nonce, &blob[HEADER_LEN..]) {
+                log_legacy_decrypt(key, idx + 1, false, "versioned");
                 return Ok(pt);
             }
         }
-
-        // Legacy raw-AEAD format with this candidate's nonce.
-        if let Ok(pt) = enc.cipher.decrypt(&enc.legacy_nonce, blob) {
-            if idx == 0 {
-                tracing::debug!(
-                    key = %key,
-                    "Decrypted legacy-format secret blob with the registered/derived cipher; \
-                     will be migrated to per-write-nonce format on next write."
-                );
-            } else {
-                log_legacy_decrypt(key, idx, is_migration, "raw-aead");
-            }
-            return Ok(pt);
-        }
+    }
+    // Tier 1 raw-AEAD (cipher unchanged but format pre-dates #4143).
+    if let Ok(pt) = encryption.cipher.decrypt(&encryption.legacy_nonce, blob) {
+        tracing::debug!(
+            key = %key,
+            "Decrypted pre-#4143 raw-AEAD blob with the registered/derived cipher; \
+             will be migrated to per-write-nonce format on next write."
+        );
+        return Ok(pt);
+    }
+    // Tier 3 raw-AEAD (world-known LEGACY_DEFAULT_* migration path).
+    if let Some(migration) = legacy_migration
+        && let Ok(pt) = migration.cipher.decrypt(&migration.legacy_nonce, blob)
+    {
+        log_legacy_decrypt(key, 1 + legacy_chain.len(), true, "raw-aead");
+        return Ok(pt);
     }
     Err(SecretStoreError::Encryption(
         // The error type is opaque; surface a generic AEAD failure.
-        // Callers cannot tell which attempt failed last, but the log
-        // lines above record which paths were reached.
+        // Callers cannot tell which attempt failed last; the log lines
+        // above record which fallback paths were reached.
         chacha20poly1305::Error,
     ))
 }

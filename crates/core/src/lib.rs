@@ -65,7 +65,7 @@ pub mod dev_tool {
     use super::*;
     pub use crate::config::{
         Config, GlobalTestMetrics, KekBackend, KekBackendKind, KekError, ensure_kek_loaded,
-        load_from_backend, read_backend_marker,
+        load_from_backend, read_backend_marker, replace_backend_marker,
     };
     // Backend constructors live in the `kek` submodule rather than the
     // top-level `config` re-export to keep `Config`'s public surface
