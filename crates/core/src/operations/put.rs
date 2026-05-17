@@ -21,36 +21,51 @@ use crate::{
 };
 use either::Either;
 
-/// Internal classification for a terminal PUT failure, used inside the
-/// retry-loop driver in [`op_ctx_task`].
-///
-/// The wire field [`PutMsg::Error::cause`] stays as a raw `String` (see
-/// the doc-comment there) to preserve bincode wire-compat across
-/// versions. This newtype is the in-process counterpart: it gives the
-/// retry-loop's `Terminal` type a domain-specific name (vs. opaque
-/// `Result<_, String>`) and a single place to add categorization later
-/// — e.g., distinguishing local-loopback `put_contract` rejection from
-/// remote-relayed cause if/when their delivery paths diverge from a
-/// shared `PutMsg::Error` envelope.
+/// Upper bound on the `cause` carried by [`PutMsg::Error`] and
+/// [`PutTerminalError`]. Caps the DoS amplification surface when the
+/// envelope flows multi-hop (via [`relay_put_send_error`]).
+pub(crate) const PUT_TERMINAL_CAUSE_MAX_BYTES: usize = 2048;
+
+/// UTF-8-safe length cap with an ASCII truncation marker.
+pub(crate) fn bound_cause(cause: String) -> String {
+    const SUFFIX: &str = "...[truncated]";
+    if cause.len() <= PUT_TERMINAL_CAUSE_MAX_BYTES {
+        return cause;
+    }
+    let budget = PUT_TERMINAL_CAUSE_MAX_BYTES.saturating_sub(SUFFIX.len());
+    // Walk back to a char boundary — `str` indexing must not split a codepoint.
+    let mut cut = budget.min(cause.len());
+    while cut > 0 && !cause.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = String::with_capacity(cut + SUFFIX.len());
+    out.push_str(&cause[..cut]);
+    out.push_str(SUFFIX);
+    out
+}
+
+/// In-process counterpart of the wire [`PutMsg::Error::cause`].
+/// The wire side stays as a raw `String` for bincode compat;
+/// `PutTerminalError` gives the retry-loop `Terminal` type a named
+/// shape and a single point to enforce length caps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PutTerminalError {
     cause: String,
 }
 
 impl PutTerminalError {
-    /// Construct from a [`PutMsg::Error`]-delivered cause (wire or
-    /// originator-loopback — both reach the classifier through the
-    /// same envelope today).
+    /// Applies [`bound_cause`] so multi-hop forwarding can't amplify
+    /// attacker-controlled cause strings.
     pub(crate) fn from_wire(cause: String) -> Self {
-        Self { cause }
+        Self {
+            cause: bound_cause(cause),
+        }
     }
 
-    /// Borrow the cause string for display / serialization.
     pub(crate) fn as_str(&self) -> &str {
         &self.cause
     }
 
-    /// Consume the wrapper and return the inner cause string.
     pub(crate) fn into_string(self) -> String {
         self.cause
     }
@@ -199,6 +214,7 @@ mod messages {
     /// merged state differs from the input, an Update operation is triggered to
     /// propagate the change to other subscribers.
     #[derive(Debug, Serialize, Deserialize, Clone)]
+    #[non_exhaustive]
     pub(crate) enum PutMsg {
         /// Request to store a contract. Forwarded hop-by-hop toward contract location.
         /// Each receiving node:
@@ -263,32 +279,26 @@ mod messages {
         /// Terminal failure delivered to the originator's driver via the
         /// same `pending_op_results` bypass as `Response`. Carries the
         /// contract-side or local-validation reason as a string so the
-        /// originator's `start_client_put` can publish ONE
-        /// `HostResult::Err(OperationError { cause })` instead of:
-        ///
-        ///   * burning the retry budget on a deterministic failure
-        ///     (issue #4111: each retry repeats the same failing
-        ///     `put_contract` call locally), and
-        ///
-        ///   * racing the genuine error message against a misleading
-        ///     `"failed notifying, channel closed"` synthesised by the
-        ///     retry loop when the per-attempt callback closes early.
+        /// originator's `start_client_put` publishes a single
+        /// `HostResult::Err(OperationError { cause })` instead of
+        /// burning the retry budget on a deterministic failure and
+        /// racing the genuine reason against the synthesised
+        /// "failed notifying, channel closed" marker.
         ///
         /// Constructed by `run_relay_put` in the originator-loopback
-        /// failure path. The relay-side error path is unaffected — when
-        /// the failure is on a different node, the result of
-        /// `drive_relay_put` is reported via the normal upstream
-        /// reply channel, not this variant.
+        /// failure path; bubbled up multi-hop chains by
+        /// `relay_put_send_error` (see [`op_ctx_task`]).
         Error {
             id: Transaction,
-            /// Human-readable failure reason. Caller already has the
-            /// `Transaction` for correlation; the `cause` is what we
-            /// surface to the client. Kept as `String` (not
-            /// `ClientError` / `OpError`) so the wire variant stays
-            /// dependency-free for `bincode` and so future serde-incompat
-            /// changes in those types do not break wire compatibility.
-            /// The internal retry-driver wraps this in
-            /// [`super::PutTerminalError`] for in-process classification.
+            /// Human-readable failure reason surfaced to the client.
+            /// Kept as `String` (not `ClientError` / `OpError`) so the
+            /// wire variant stays dependency-free for `bincode` —
+            /// future serde changes in those types don't break wire
+            /// compatibility. Truncated to
+            /// [`PUT_TERMINAL_CAUSE_MAX_BYTES`] via [`bound_cause`] at
+            /// every entry point. Wrapped into
+            /// [`super::PutTerminalError`] for in-process
+            /// classification.
             cause: String,
         },
     }
@@ -406,11 +416,8 @@ mod tests {
         );
     }
 
-    /// Issue #4111: `PutMsg::Error` is the wire variant that the
-    /// originator-loopback failure path emits through `send_local_loopback`
-    /// so the originator's retry-loop classifier sees a terminal failure
-    /// once instead of retrying through a closed reply channel.
-    /// Verifies `id()` and Display work for the new variant.
+    /// `PutMsg::Error` honours `id()` and `Display` like every other
+    /// variant.
     #[test]
     fn put_msg_error_id_and_display() {
         let tx = Transaction::new::<PutMsg>();
@@ -424,9 +431,7 @@ mod tests {
         assert!(display.contains("version must be higher"), "Display cause");
     }
 
-    /// Issue #4111: wire-format round-trip for `PutMsg::Error`. The
-    /// variant rides the same `NetMessage::V1(Put)` envelope as every
-    /// other reply, so `bincode` must encode + decode it intact.
+    /// `PutMsg::Error` round-trips through bincode intact.
     #[test]
     fn put_msg_error_serde_roundtrip() {
         let tx = Transaction::new::<PutMsg>();
@@ -451,10 +456,8 @@ mod tests {
         }
     }
 
-    /// Issue #4111: the `Error` variant has no associated contract
-    /// key — the originator already knows the key it requested, and
-    /// the failure is keyed by tx only. Pin this so `requested_location`
-    /// doesn't gain a phantom location later.
+    /// `Error` is keyed by tx only — `requested_location` must not
+    /// gain a phantom location.
     #[test]
     fn put_msg_error_has_no_requested_location() {
         let tx = Transaction::new::<PutMsg>();
@@ -463,6 +466,120 @@ mod tests {
             cause: "x".into(),
         };
         assert!(msg.requested_location().is_none());
+    }
+
+    /// Wire-format pin: bincode encodes `PutMsg` variants as a u32 LE
+    /// tag in declaration order. Reordering or inserting before an
+    /// existing variant is a silent wire-break against deployed peers.
+    /// `#[non_exhaustive]` only protects Rust match arms; tag
+    /// stability is enforced here.
+    #[test]
+    fn put_msg_wire_format_variant_tags_are_stable() {
+        let tx = Transaction::new::<PutMsg>();
+        let key = make_contract_key(0);
+        // One minimal instance per variant, in declaration order.
+        let samples: [(u32, PutMsg); 6] = [
+            (
+                0,
+                PutMsg::Request {
+                    id: tx,
+                    contract: crate::operations::test_utils::make_test_contract(&[]),
+                    related_contracts: RelatedContracts::default(),
+                    value: WrappedState::new(vec![]),
+                    htl: 0,
+                    skip_list: Default::default(),
+                },
+            ),
+            (1, PutMsg::Response { id: tx, key }),
+            (
+                2,
+                PutMsg::RequestStreaming {
+                    id: tx,
+                    stream_id: crate::transport::StreamId::next(),
+                    contract_key: key,
+                    total_size: 0,
+                    htl: 0,
+                    skip_list: Default::default(),
+                    subscribe: false,
+                },
+            ),
+            (
+                3,
+                PutMsg::ResponseStreaming {
+                    id: tx,
+                    key,
+                    continue_forwarding: false,
+                },
+            ),
+            (
+                4,
+                PutMsg::ForwardingAck {
+                    id: tx,
+                    contract_key: key,
+                },
+            ),
+            (
+                5,
+                PutMsg::Error {
+                    id: tx,
+                    cause: String::new(),
+                },
+            ),
+        ];
+        for (expected_tag, msg) in samples {
+            let bytes = bincode::serialize(&msg).expect("serialize");
+            assert!(
+                bytes.len() >= 4,
+                "encoded PutMsg too short to carry a tag: {msg}"
+            );
+            let actual_tag = u32::from_le_bytes(bytes[..4].try_into().expect("first 4 bytes"));
+            assert_eq!(
+                actual_tag, expected_tag,
+                "PutMsg wire tag for `{msg}` shifted — reordering variants is a wire-format \
+                 break. If you intentionally renumbered, bump the freenet-stdlib major and \
+                 coordinate the upgrade."
+            );
+        }
+    }
+
+    /// `bound_cause` keeps short strings byte-identical and truncates
+    /// long strings to `PUT_TERMINAL_CAUSE_MAX_BYTES` with a
+    /// `...[truncated]` suffix. Used as the DoS-amplification guard
+    /// when `PutMsg::Error` flows multi-hop.
+    #[test]
+    fn bound_cause_short_string_passes_through() {
+        let s = "execution error: contract rejected".to_string();
+        assert_eq!(bound_cause(s.clone()), s);
+    }
+
+    #[test]
+    fn bound_cause_truncates_oversize_at_char_boundary() {
+        let s = "a".repeat(PUT_TERMINAL_CAUSE_MAX_BYTES * 2);
+        let bounded = bound_cause(s);
+        assert!(bounded.len() <= PUT_TERMINAL_CAUSE_MAX_BYTES);
+        assert!(bounded.ends_with("...[truncated]"));
+    }
+
+    #[test]
+    fn bound_cause_never_splits_utf8_codepoint() {
+        // 3-byte codepoints right at the boundary.
+        let mut s = "好".repeat(PUT_TERMINAL_CAUSE_MAX_BYTES); // 3 bytes each
+        s.push_str("好好好");
+        let bounded = bound_cause(s);
+        assert!(bounded.is_char_boundary(bounded.len()));
+        // Re-parsing must not panic.
+        let _ = bounded.chars().count();
+    }
+
+    /// `PutTerminalError::from_wire` applies `bound_cause`, so an
+    /// attacker-controlled upstream cannot inflate the per-hop cost
+    /// of `PutMsg::Error` by emitting multi-MB causes.
+    #[test]
+    fn put_terminal_error_from_wire_truncates() {
+        let oversize = "x".repeat(PUT_TERMINAL_CAUSE_MAX_BYTES * 3);
+        let err = PutTerminalError::from_wire(oversize);
+        assert!(err.as_str().len() <= PUT_TERMINAL_CAUSE_MAX_BYTES);
+        assert!(err.as_str().ends_with("...[truncated]"));
     }
 
     #[test]
