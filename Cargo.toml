@@ -154,14 +154,25 @@ freenet-stdlib = "0.8.0"
 # Crypto (secrets-at-rest KEK + DEK derivation, see crates/core/src/config/kek.rs).
 # `sha2` is already declared above (workspace-wide); only `hkdf` and `keyring`
 # are added here.
-hkdf = "0.13"
+#
+# `keyring` features are restricted to the per-platform native backends:
+# - apple-native: macOS Keychain (no system deps)
+# - windows-native: Credential Manager (no system deps)
+# - linux-native-sync-persistent: kernel keyutils (header-only; works on
+#   headless servers without a Secret Service daemon and without
+#   requiring libdbus-1-dev at build time)
+#
+# The D-Bus Secret Service backend (sync-secret-service) is deliberately
+# OMITTED — it requires libdbus-1-dev at build time, which is not present
+# on typical CI runners and is rarely present on production headless Linux
+# installs either. Operators who want the GNOME/KDE keyring backend can
+# install libdbus-1-dev and re-enable the feature in a downstream fork.
 keyring = { version = "3.6", default-features = false, features = [
     "apple-native",
     "windows-native",
-    "sync-secret-service",
-    "crypto-rust",
     "linux-native-sync-persistent",
 ] }
+hkdf = "0.13"
 
 [profile.dev.package."*"]
 opt-level = 3
