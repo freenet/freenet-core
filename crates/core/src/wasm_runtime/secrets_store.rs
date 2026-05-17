@@ -286,12 +286,17 @@ impl SecretsStore {
     /// `register_delegate` for this key, the registered cipher takes
     /// precedence over the derived one (legacy compatibility path).
     fn cipher_for(&mut self, delegate: &DelegateKey) -> &Encryption {
+        // Insert-if-absent then borrow. We can't use `Entry::or_insert_with`
+        // here because `derive_delegate_dek` needs `&self` (the KEK is on
+        // self) and the `Entry` API holds an exclusive borrow of the map.
+        // Split: insert via `&mut self` first, then a fresh `get` borrow.
         if !self.ciphers.contains_key(delegate) {
             let derived = self.derive_delegate_dek(delegate);
             self.ciphers.insert(delegate.clone(), derived);
         }
-        // unwrap: we just inserted if missing.
-        self.ciphers.get(delegate).unwrap()
+        self.ciphers
+            .get(delegate)
+            .expect("cipher entry inserted above; cannot be missing in the same &mut self call")
     }
 
     /// Read-side analogue of `cipher_for` that does not take `&mut self`.

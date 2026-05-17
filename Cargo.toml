@@ -155,22 +155,29 @@ freenet-stdlib = "0.8.0"
 # `sha2` is already declared above (workspace-wide); only `hkdf` and `keyring`
 # are added here.
 #
-# `keyring` features are restricted to the per-platform native backends:
-# - apple-native: macOS Keychain (no system deps)
-# - windows-native: Credential Manager (no system deps)
-# - linux-native-sync-persistent: kernel keyutils (header-only; works on
-#   headless servers without a Secret Service daemon and without
-#   requiring libdbus-1-dev at build time)
+# `keyring` features are deliberately restricted to the per-platform native
+# stores that have NO system-package build dependencies:
 #
-# The D-Bus Secret Service backend (sync-secret-service) is deliberately
-# OMITTED — it requires libdbus-1-dev at build time, which is not present
-# on typical CI runners and is rarely present on production headless Linux
-# installs either. Operators who want the GNOME/KDE keyring backend can
-# install libdbus-1-dev and re-enable the feature in a downstream fork.
+# - `apple-native`: macOS Keychain (Security framework, ships with macOS).
+# - `windows-native`: Credential Manager (Win32 API, ships with Windows).
+#
+# **Linux intentionally has no keyring feature here.** The only persistent
+# Linux options in `keyring 3.x` are `sync-secret-service` /
+# `async-secret-service` (D-Bus Secret Service, requires libdbus-1-dev at
+# build time) or `linux-native-sync-persistent` (which itself depends on
+# sync-secret-service for KEK persistence beyond process exit). Both
+# require libdbus-1-dev, which is absent on typical CI runners and
+# headless production servers. Linux nodes fall back to the file backend
+# (`secrets_dir/node_kek`, 0o600) or systemd credentials
+# (`$CREDENTIALS_DIRECTORY/freenet-kek`) — both header-only, no system deps.
+#
+# Operators on Linux who do have libdbus-1-dev and want GNOME/KDE keyring
+# integration can re-enable the feature in a downstream fork; the
+# `KekBackend` abstraction in `crates/core/src/config/kek.rs` is
+# backend-agnostic so the in-tree code remains identical.
 keyring = { version = "3.6", default-features = false, features = [
     "apple-native",
     "windows-native",
-    "linux-native-sync-persistent",
 ] }
 hkdf = "0.13"
 
