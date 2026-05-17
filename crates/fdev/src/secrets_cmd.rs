@@ -15,7 +15,9 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
-use freenet::dev_tool::{KekBackendKind, ensure_kek_loaded, read_backend_marker};
+use freenet::dev_tool::{
+    KekBackendKind, load_from_backend, read_backend_marker, replace_backend_marker,
+};
 use sha2::{Digest, Sha256};
 
 #[derive(clap::Parser, Clone, Debug)]
@@ -82,25 +84,25 @@ pub async fn run(config: SecretsCliConfig) -> Result<()> {
 }
 
 async fn kek_status(args: KekStatusArgs) -> Result<()> {
-    let marker =
-        read_backend_marker(&args.secrets_dir).context("failed to read kek_backend marker")?;
-    match marker {
-        Some(kind) => {
-            println!("KEK backend: {kind}");
-        }
+    let kind = match read_backend_marker(&args.secrets_dir)
+        .context("failed to read kek_backend marker")?
+    {
+        Some(k) => k,
         None => {
             println!("KEK backend: <not provisioned yet — first node start will resolve>");
             return Ok(());
         }
-    }
+    };
+    println!("KEK backend: {kind}");
 
-    // Load the KEK only to compute a fingerprint; the buffer is wiped
-    // when this scope exits (Zeroizing).
-    let (_kind, kek) = ensure_kek_loaded(&args.secrets_dir, || {
-        // Never invoked because the marker is present and load_from_backend wins.
-        unreachable!("first-start supplier called despite present marker")
-    })
-    .context("failed to load KEK from configured backend")?;
+    // Load the KEK only to compute a fingerprint; buffer wiped on
+    // scope exit (Zeroizing). Direct `load_from_backend` (not
+    // `ensure_kek_loaded`) so an operator who removes the marker
+    // between our read and the load gets a clean error instead of the
+    // resolver triggering provisioning + the previously-`unreachable!`
+    // supplier path.
+    let kek = load_from_backend(kind, &args.secrets_dir)
+        .with_context(|| format!("failed to load KEK from `{kind}` backend"))?;
 
     let mut hasher = Sha256::new();
     hasher.update(kek.as_slice());
@@ -207,12 +209,12 @@ async fn kek_migrate(args: KekMigrateArgs) -> Result<()> {
     // process crashes here, the source still holds the KEK and the
     // marker now points at the target — the next start will load from
     // target successfully (which has the same KEK bytes).
-    let marker_path = args.secrets_dir.join("kek_backend");
-    let marker_tmp = args.secrets_dir.join("kek_backend.tmp");
-    std::fs::write(&marker_tmp, format!("{target}\n").as_bytes())
-        .context("failed to write kek_backend.tmp")?;
-    std::fs::rename(&marker_tmp, &marker_path)
-        .context("failed to atomically rename kek_backend.tmp -> kek_backend")?;
+    //
+    // Uses `replace_backend_marker` (kek.rs) so the tmp file is written
+    // with the same 0o600 + sync_all discipline as the in-process
+    // first-start marker — no perms drift, no unsynced data.
+    replace_backend_marker(&args.secrets_dir, target)
+        .context("failed to atomically rewrite kek_backend marker to point at target")?;
 
     // Delete from source last. If this fails, the migration is still
     // valid (target has the KEK + marker points at target). Operator

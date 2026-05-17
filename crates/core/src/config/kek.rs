@@ -456,8 +456,8 @@ pub fn read_backend_marker(secrets_dir: &Path) -> Result<Option<KekBackendKind>,
 
 /// Write the chosen backend kind to `secrets_dir/kek_backend`. Uses
 /// `OpenOptions::create_new` so a pre-existing marker is preserved —
-/// callers performing migration are expected to delete the marker first
-/// (or use the dedicated migration path which handles atomicity).
+/// callers performing migration are expected to go through
+/// `replace_backend_marker`, which handles atomic overwrite.
 fn write_backend_marker(secrets_dir: &Path, kind: KekBackendKind) -> Result<(), KekError> {
     std::fs::create_dir_all(secrets_dir)?;
     let path = secrets_dir.join(KEK_BACKEND_MARKER_FILENAME);
@@ -472,6 +472,41 @@ fn write_backend_marker(secrets_dir: &Path, kind: KekBackendKind) -> Result<(), 
     let mut file = opts.open(&path)?;
     writeln!(file, "{}", kind.as_str())?;
     file.sync_all()?;
+    Ok(())
+}
+
+/// Atomically replace the persisted backend marker with `kind`. Used
+/// by `fdev secrets kek-migrate` after the target backend has
+/// successfully stored the migrated KEK. Writes to a sibling `.tmp`
+/// file with the same 0o600 perms + `sync_all` discipline as
+/// `write_backend_marker`, then `rename`s onto the live marker (atomic
+/// on POSIX, `MoveFileExW MOVEFILE_REPLACE_EXISTING` on Windows).
+///
+/// A crash between the tmp write and the rename leaves the OLD marker
+/// in place — the next node start loads from the (still-populated)
+/// source backend, which is the correct safe-fallback behavior. A
+/// crash after the rename leaves the NEW marker in place — the source
+/// backend may still hold the old KEK (cleanup happens after this call
+/// in `kek-migrate`), but the next node start loads from the new
+/// backend, which is the intended end state.
+pub fn replace_backend_marker(secrets_dir: &Path, kind: KekBackendKind) -> Result<(), KekError> {
+    std::fs::create_dir_all(secrets_dir)?;
+    let tmp = secrets_dir.join(format!("{KEK_BACKEND_MARKER_FILENAME}.tmp"));
+    let path = secrets_dir.join(KEK_BACKEND_MARKER_FILENAME);
+    use std::io::Write;
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp)?;
+        writeln!(file, "{}", kind.as_str())?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 
