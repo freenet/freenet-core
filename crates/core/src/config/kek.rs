@@ -126,13 +126,28 @@ pub enum KekError {
 /// when no KEK exists yet (first start); the resolver then calls
 /// `store` to seed one.
 pub trait KekBackend: Send + Sync {
+    /// Identify which backend this is. Surfaced via
+    /// `fdev secrets kek-status` and recorded in the
+    /// `secrets_dir/kek_backend` marker file.
     fn kind(&self) -> KekBackendKind;
+    /// Read the current KEK from this backend.
+    ///
+    /// Returns `Ok(None)` when no KEK has been provisioned yet
+    /// (first-start flow — the resolver then calls `store` to seed
+    /// one). Returns `Err` for transport / permission / format
+    /// failures so the caller can distinguish them from a clean
+    /// "absent" state.
     fn load(&self) -> Result<Option<Zeroizing<[u8; KEK_SIZE]>>, KekError>;
     /// Persist a new KEK. MUST fail with `KekError::AlreadyExists` if a
     /// KEK is already present — rotation goes through a dedicated path
     /// (`fdev secrets kek-rotate`) so accidental double-`store` cannot
     /// silently destroy the existing key.
     fn store(&self, kek: &[u8; KEK_SIZE]) -> Result<(), KekError>;
+    /// Remove the KEK from this backend.
+    ///
+    /// Idempotent: if no KEK was present, returns `Ok(())`. Used by
+    /// `fdev secrets kek-migrate` after the migration target has
+    /// successfully stored the KEK.
     fn delete(&self) -> Result<(), KekError>;
 }
 
@@ -146,6 +161,11 @@ pub struct KeyringKek {
 }
 
 impl KeyringKek {
+    /// Open a handle to the OS-keyring KEK entry under
+    /// `(KEYRING_SERVICE, KEYRING_USER)`. Does not actually contact the
+    /// keyring daemon — that happens on `load` / `store`. Failure here
+    /// indicates the `keyring` crate could not build an `Entry` at all
+    /// (e.g. missing feature support for the target platform).
     pub fn new() -> Result<Self, KekError> {
         let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
             .map_err(|e| KekError::Keyring(format!("Entry::new failed: {e}")))?;
@@ -207,8 +227,14 @@ pub struct SystemdCredentialKek {
 }
 
 impl SystemdCredentialKek {
-    /// Returns `Some(_)` if `CREDENTIALS_DIRECTORY` is set; otherwise
-    /// `None` (the systemd backend is not viable on this host).
+    /// Construct the backend handle if the systemd
+    /// `CREDENTIALS_DIRECTORY` environment variable is set (i.e. the
+    /// freenet process was started by systemd with
+    /// `LoadCredentialEncrypted=freenet-kek:...` on the unit).
+    ///
+    /// Returns `Some(_)` if viable; `None` if `CREDENTIALS_DIRECTORY`
+    /// is unset, in which case the resolver moves on to the next
+    /// backend in the fallback chain.
     pub fn new() -> Option<Self> {
         let dir = std::env::var_os("CREDENTIALS_DIRECTORY")?;
         Some(Self {
@@ -272,6 +298,9 @@ pub struct FileKek {
 }
 
 impl FileKek {
+    /// Construct the file-backend handle pointing at
+    /// `secrets_dir/node_kek` (NODE_KEK_FILENAME). Does not touch the
+    /// filesystem — that happens on `load` / `store`.
     pub fn new(secrets_dir: &Path) -> Self {
         Self {
             path: secrets_dir.join(NODE_KEK_FILENAME),
