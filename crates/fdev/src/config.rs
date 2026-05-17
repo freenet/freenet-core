@@ -75,6 +75,12 @@ pub enum SubCommand {
         #[clap(subcommand)]
         command: crate::website::WebsiteCommand,
     },
+    /// Manage the node KEK (Key Encryption Key) backend.
+    ///
+    /// The KEK is the master key from which every per-delegate DEK is
+    /// derived via HKDF. Subcommands report status, rotate, or migrate
+    /// the KEK between backends (OS keyring / systemd credential / file).
+    Secrets(crate::secrets_cmd::SecretsCliConfig),
 }
 
 impl SubCommand {
