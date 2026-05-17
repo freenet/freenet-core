@@ -6,7 +6,7 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::OsRng};
 use super::*;
 
 const NONCE_SIZE: usize = 24;
-const CIPHER_SIZE: usize = 32;
+pub(super) const CIPHER_SIZE: usize = 32;
 
 /// Filename (relative to `secrets_dir`) of the auto-persisted per-node
 /// delegate cipher introduced in freenet-core PR after the removal of

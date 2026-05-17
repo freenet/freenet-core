@@ -26,6 +26,7 @@ bin-dir = "fdev.exe"
 [dependencies]
 bytesize = "2.3"
 anyhow = { workspace = true }
+sha2 = { workspace = true }
 axum = { workspace = true, default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws"] }
 bincode = { workspace = true }
 bs58 = { workspace = true }
