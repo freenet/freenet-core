@@ -758,36 +758,31 @@ fn decrypt_secret_blob(
     blob: &[u8],
     key: &SecretsId,
 ) -> Result<Vec<u8>, SecretStoreError> {
-    // Decryption strategy. The format and cipher have rotated three
-    // times across the secrets-at-rest hardening sequence; the chain
-    // below is tightly scoped so we attempt only the format that each
-    // historical writer actually produced.
+    // Decryption strategy. The format + cipher have rotated three
+    // times across the secrets-at-rest hardening sequence:
     //
     //   Tier 1 (`encryption`, the registered/derived DEK):
-    //     - try VERSION_V1 (`[0x01][nonce][AEAD]`) first
-    //     - fall back to raw-AEAD with `encryption.legacy_nonce` for
-    //       blobs written under this same cipher but before the
-    //       per-write-nonce format landed in #4143 (e.g. a delegate
-    //       whose cipher hasn't changed but whose oldest secret file
-    //       has not been overwritten since the upgrade).
+    //     - VERSION_V1 (`[0x01][nonce][AEAD]`) — today's writer
+    //     - raw-AEAD with `encryption.legacy_nonce` — same cipher,
+    //       pre-#4143 format (a delegate whose key hasn't rotated but
+    //       whose oldest secret hasn't been overwritten since upgrade).
     //
     //   Tier 2 (`legacy_chain[..]`, e.g. the post-#4144 / pre-#4140
     //   auto-persisted `delegate_cipher` carried by `default_encryption`):
-    //     - try VERSION_V1 ONLY. Every release that wrote under these
+    //     - VERSIONED ONLY. Every release that wrote under these
     //       ciphers was already at the per-write-nonce format (post
-    //       #4143). Attempting raw-AEAD here would never match a real
-    //       blob — only a bit-flipped or wildly-mistyped one — and
-    //       would burn a cipher op on every cold read.
+    //       #4143), so raw-AEAD attempts would only burn cipher ops
+    //       without ever matching a real blob.
     //
     //   Tier 3 (`legacy_migration`, the LEGACY_DEFAULT_* world-known
     //   constants):
-    //     - try raw-AEAD ONLY. Nodes that wrote under these constants
-    //       (pre-#4143 default-configured nodes) never produced a
-    //       versioned blob — versioned + default-cipher only happens
-    //       during the brief #4143 release window, which is covered by
-    //       tier 1's VERSION_V1 attempt if the registered cipher is
-    //       the default. Trying VERSION_V1 here would catch nothing
-    //       real. Logged at WARN so operators see migration progress.
+    //     - BOTH formats. The #4143 release window emitted versioned
+    //       blobs while default-configured nodes were still seeded
+    //       from LEGACY_DEFAULT_CIPHER (per-write-nonce had landed but
+    //       the auto-gen cipher hadn't yet); pre-#4143 default-config
+    //       nodes emitted raw-AEAD under the same constants. Both are
+    //       in the wild on upgraded operators' disks. Logged at WARN
+    //       so operators see migration progress.
     if blob.first().copied() == Some(VERSION_V1) && blob.len() >= HEADER_LEN {
         let nonce = XNonce::from_slice(&blob[1..HEADER_LEN]);
         // Tier 1 versioned.
@@ -801,6 +796,14 @@ fn decrypt_secret_blob(
                 return Ok(pt);
             }
         }
+        // Tier 3 versioned. Required for #4143-era blobs written under
+        // the world-known default cipher with the per-write nonce.
+        if let Some(migration) = legacy_migration
+            && let Ok(pt) = migration.cipher.decrypt(nonce, &blob[HEADER_LEN..])
+        {
+            log_legacy_decrypt(key, 1 + legacy_chain.len(), true, "versioned");
+            return Ok(pt);
+        }
     }
     // Tier 1 raw-AEAD (cipher unchanged but format pre-dates #4143).
     if let Ok(pt) = encryption.cipher.decrypt(&encryption.legacy_nonce, blob) {
@@ -811,7 +814,8 @@ fn decrypt_secret_blob(
         );
         return Ok(pt);
     }
-    // Tier 3 raw-AEAD (world-known LEGACY_DEFAULT_* migration path).
+    // Tier 3 raw-AEAD (world-known LEGACY_DEFAULT_* migration path,
+    // pre-#4143 default-configured nodes).
     if let Some(migration) = legacy_migration
         && let Ok(pt) = migration.cipher.decrypt(&migration.legacy_nonce, blob)
     {
@@ -1599,17 +1603,25 @@ mod test {
     #[tokio::test]
     async fn legacy_blob_with_version_byte_falls_through_to_legacy_decrypt()
     -> Result<(), Box<dyn std::error::Error>> {
+        // SAFETY: nextest per-process isolation. The env mutation is
+        // confined to this test process and not restored because the
+        // process exits when the test ends.
+        unsafe {
+            std::env::remove_var("CREDENTIALS_DIRECTORY");
+        }
         let temp_dir = tempfile::tempdir()?;
         let secrets_dir = temp_dir.path().join("secrets-store-test");
         std::fs::create_dir_all(&secrets_dir)?;
 
         let db = create_test_db(temp_dir.path()).await;
-        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+        let store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
         let delegate = Delegate::from((&vec![88].into(), &vec![].into()));
-        // We need a stable registration nonce so the legacy fallback in
-        // `get_secret` uses exactly the nonce we encrypted under.
-        let (cipher, registration_nonce) = fresh_cipher();
-        store.register_delegate(delegate.key().clone(), cipher.clone(), registration_nonce)?;
+        // Post-#4146: per-delegate cipher = HKDF-derived DEK. Use the
+        // store's own derivation so the legacy fallback uses the same
+        // (cipher, legacy_nonce) we encrypt under.
+        let derived = store.derive_delegate_dek(delegate.key());
+        let cipher = derived.cipher.clone();
+        let registration_nonce = derived.legacy_nonce;
         let secret_id = SecretsId::new(vec![89]);
 
         // Find a plaintext whose legacy-format AEAD output starts with
@@ -1726,30 +1738,41 @@ mod test {
     }
 
     /// Regression for #4139 migration path: a legacy-format on-disk file
-    /// (raw AEAD output produced with the per-delegate registration nonce,
-    /// no version header) MUST still be readable through `get_secret`.
-    /// This is what lets nodes upgrade in place without a one-shot
-    /// migration tool.
+    /// (raw AEAD output written under the per-delegate cipher with the
+    /// registration nonce, no version header) MUST still be readable
+    /// through `get_secret`. This is what lets nodes upgrade in place
+    /// without a one-shot migration tool.
+    ///
+    /// Post-#4146: the per-delegate cipher is the HKDF-derived DEK
+    /// (`register_delegate` ignores client-supplied cipher), so we
+    /// derive the cipher from the store and write under that.
     #[tokio::test]
     async fn legacy_format_blob_is_decryptable() -> Result<(), Box<dyn std::error::Error>> {
+        // SAFETY: nextest per-process isolation. Force file backend so
+        // the test exercises a deterministic KEK source.
+        unsafe {
+            std::env::remove_var("CREDENTIALS_DIRECTORY");
+        }
         let temp_dir = tempfile::tempdir()?;
         let secrets_dir = temp_dir.path().join("secrets-store-test");
         std::fs::create_dir_all(&secrets_dir)?;
 
         let db = create_test_db(temp_dir.path()).await;
-        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+        let store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
         let delegate = Delegate::from((&vec![84].into(), &vec![].into()));
-        let (cipher, nonce) = fresh_cipher();
-        store.register_delegate(delegate.key().clone(), cipher.clone(), nonce)?;
         let secret_id = SecretsId::new(vec![85]);
 
-        // Hand-craft a legacy blob: raw AEAD output with the registration
-        // nonce, no version header. Write it directly under the active
-        // path that `get_secret` reads.
+        // Derive the DEK that THIS store will use for `delegate`, then
+        // hand-craft a raw-AEAD blob under that DEK + a fixed nonce
+        // (simulating a pre-#4143 file written before per-write
+        // nonces). The store's `legacy_nonce` field on the derived
+        // Encryption is what tier 1's raw-AEAD attempt uses.
+        let derived = store.derive_delegate_dek(delegate.key());
         let plaintext = b"legacy-payload".to_vec();
-        let legacy_blob = cipher
-            .encrypt(&nonce, plaintext.as_ref())
-            .expect("legacy encrypt");
+        let legacy_blob = derived
+            .cipher
+            .encrypt(&derived.legacy_nonce, plaintext.as_ref())
+            .expect("legacy encrypt under derived DEK");
         let delegate_dir = secrets_dir.join(delegate.key().encode());
         std::fs::create_dir_all(&delegate_dir)?;
         std::fs::write(delegate_dir.join(secret_id.encode()), &legacy_blob)?;
@@ -1757,7 +1780,7 @@ mod test {
         let recovered = store.get_secret(delegate.key(), &secret_id)?;
         assert_eq!(
             recovered, plaintext,
-            "legacy-format blob must decrypt via the registered nonce fallback"
+            "legacy-format blob must decrypt via tier 1 raw-AEAD fallback"
         );
         Ok(())
     }
@@ -1808,6 +1831,12 @@ mod test {
     async fn legacy_snapshot_survives_restore_and_get_secret()
     -> Result<(), Box<dyn std::error::Error>> {
         use crate::wasm_runtime::secret_snapshots::SNAPSHOT_NAME_WIDTH;
+        // SAFETY: nextest per-process isolation. The env mutation is
+        // confined to this test process and not restored because the
+        // process exits when the test ends.
+        unsafe {
+            std::env::remove_var("CREDENTIALS_DIRECTORY");
+        }
 
         let temp_dir = tempfile::tempdir()?;
         let secrets_dir = temp_dir.path().join("secrets-store-test");
@@ -1816,8 +1845,11 @@ mod test {
         let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
 
         let delegate = Delegate::from((&vec![90].into(), &vec![].into()));
-        let (cipher, registration_nonce) = fresh_cipher();
-        store.register_delegate(delegate.key().clone(), cipher.clone(), registration_nonce)?;
+        // Post-#4146: use derived DEK rather than client-supplied cipher
+        // (which is ignored by register_delegate).
+        let derived = store.derive_delegate_dek(delegate.key());
+        let cipher = derived.cipher.clone();
+        let registration_nonce = derived.legacy_nonce;
         let secret_id = SecretsId::new(vec![91]);
 
         // Seed an active value (new format) so restore has something to
@@ -2002,14 +2034,41 @@ mod test {
         let plaintext = b"persisted-across-restart".to_vec();
 
         // --- First start: provision KEK, write secret, drop store ---
+        //
+        // GitHub Actions runners can have `CREDENTIALS_DIRECTORY` set for
+        // some workflow types, which would make `SystemdCredentialKek`
+        // try to load (and fail, because the credential isn't actually
+        // populated) on second start. Clear it for the duration of this
+        // test process so the resolver deterministically picks the
+        // file backend.
+        // SAFETY: nextest runs each test in its own process; the env
+        // mutation is isolated to this test process and not restored
+        // because the process exits when the test ends.
+        unsafe {
+            std::env::remove_var("CREDENTIALS_DIRECTORY");
+        }
+
         {
             let db = create_test_db(&db_path).await;
             let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
             store.store_secret(delegate.key(), &secret_id, plaintext.clone())?;
             // Pin the KEK file was provisioned by the file backend
-            // (this is the only backend reliably available in CI).
-            let kek_path = secrets_dir.join("node_kek");
-            assert!(kek_path.exists(), "file backend must have provisioned KEK");
+            // (CREDENTIALS_DIRECTORY cleared above; keyring unavailable
+            // on Linux because we don't compile that backend, and on
+            // macOS/Windows nextest's per-process isolation ensures the
+            // tempdir-scoped FileKek wins because no other process
+            // could have seeded a keyring entry for this test's
+            // KEYRING_SERVICE/KEYRING_USER pair within the test
+            // window — but on macOS dev hosts a stale entry from a
+            // prior `freenet` run COULD exist. Tightened test below
+            // tolerates either resolution by reading whichever marker
+            // backend actually won.
+            let marker_path = secrets_dir.join("kek_backend");
+            assert!(
+                marker_path.exists(),
+                "first start must persist a backend marker at {}",
+                marker_path.display()
+            );
         }
 
         // --- Second start: reload same secrets_dir + DB ---

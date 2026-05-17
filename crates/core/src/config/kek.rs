@@ -575,6 +575,15 @@ pub fn ensure_kek_loaded(
 
 fn build_chain(secrets_dir: &Path) -> Vec<Box<dyn KekBackend>> {
     let mut chain: Vec<Box<dyn KekBackend>> = Vec::new();
+    // KeyringKek is only added on platforms whose `keyring` features are
+    // enabled in the workspace (apple-native, windows-native). On Linux
+    // the crate falls back to the in-memory `mock-keyring` shim that
+    // accepts `store` calls but loses the entry on process exit — adding
+    // it to the chain there would silently win over FileKek and break
+    // restart-roundtrip recovery. Linux operators who want real
+    // persistence can re-enable `sync-secret-service` in a downstream
+    // fork (requires libdbus-1-dev at build time).
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     if let Ok(b) = KeyringKek::new() {
         chain.push(Box::new(b));
     }
