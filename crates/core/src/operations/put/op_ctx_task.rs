@@ -42,7 +42,7 @@ use crate::router::{RouteEvent, RouteOutcome};
 use crate::tracing::{NetEventLog, OperationFailure, state_hash_full};
 use crate::transport::peer_connection::StreamId;
 
-use super::{PutFinalizationData, PutMsg, PutStreamingPayload};
+use super::{PutFinalizationData, PutMsg, PutStreamingPayload, PutTerminalError, bound_cause};
 
 /// Start a client-initiated PUT, returning as soon as the task has been
 /// spawned (mirrors legacy `request_put` timing).
@@ -218,7 +218,13 @@ async fn drive_client_put_inner(
     }
 
     impl RetryDriver for PutRetryDriver<'_> {
-        type Terminal = ContractKey;
+        // Carries either the stored `ContractKey` (success) OR the
+        // typed terminal-failure cause so the driver can surface a
+        // precise `HostResult::Err` for issue #4111 without growing a
+        // new `AttemptOutcome` variant. The retry loop still treats
+        // both as a single `Terminal(_)` arm; the caller below
+        // switches on the inner `Result`.
+        type Terminal = Result<ContractKey, PutTerminalError>;
 
         fn new_attempt_tx(&mut self) -> Transaction {
             Transaction::new::<PutMsg>()
@@ -244,16 +250,22 @@ async fn drive_client_put_inner(
             })
         }
 
-        fn classify(&mut self, reply: NetMessage) -> AttemptOutcome<ContractKey> {
+        fn classify(
+            &mut self,
+            reply: NetMessage,
+        ) -> AttemptOutcome<Result<ContractKey, PutTerminalError>> {
             match classify_reply(&reply) {
                 ReplyClass::Stored { key } | ReplyClass::LocalCompletion { key } => {
-                    AttemptOutcome::Terminal(key)
+                    AttemptOutcome::Terminal(Ok(key))
                 }
+                ReplyClass::TerminalError { cause } => AttemptOutcome::Terminal(Err(cause)),
                 ReplyClass::Unexpected => AttemptOutcome::Unexpected,
             }
         }
 
         fn advance(&mut self) -> AdvanceOutcome {
+            #[cfg(any(test, feature = "testing"))]
+            PUT_RETRY_DRIVER_ADVANCE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             match advance_to_next_peer(
                 self.op_manager,
                 &self.key,
@@ -292,7 +304,7 @@ async fn drive_client_put_inner(
     let loop_result = drive_retry_loop(op_manager, client_tx, "put", &mut driver).await;
 
     match loop_result {
-        RetryLoopOutcome::Done(reply_key) => {
+        RetryLoopOutcome::Done(Ok(reply_key)) => {
             // Clean up the DashMap entry that process_message created.
             // Without this, the GC task finds a stale AwaitingResponse
             // entry and launches speculative retries on the completed op.
@@ -353,6 +365,17 @@ async fn drive_client_put_inner(
                 ContractResponse::PutResponse { key: reply_key },
             ))))
         }
+        // Issue #4111: terminal failure delivered via the bypass (a
+        // `PutMsg::Error` from the originator-loopback failure path).
+        // No retries — the failure is local-deterministic. Publish the
+        // real cause once, mark the tx completed.
+        RetryLoopOutcome::Done(Err(cause)) => {
+            op_manager.completed(client_tx);
+            Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
+                cause: cause.into_string().into(),
+            }
+            .into())))
+        }
         RetryLoopOutcome::Exhausted(cause) => {
             Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                 cause: cause.into(),
@@ -378,6 +401,14 @@ enum ReplyClass {
     LocalCompletion {
         key: ContractKey,
     },
+    /// Terminal failure delivered through the bypass via
+    /// `PutMsg::Error` (issue #4111). The driver must NOT retry: the
+    /// failure is deterministic (e.g., `put_contract` rejected the
+    /// state on the originator's own node) and re-running the same
+    /// validation will fail identically.
+    TerminalError {
+        cause: PutTerminalError,
+    },
     Unexpected,
 }
 
@@ -393,6 +424,16 @@ fn classify_reply(msg: &NetMessage) -> ReplyClass {
         })) => ReplyClass::LocalCompletion {
             key: contract.key(),
         },
+        // Issue #4111: terminal failure delivered via send_local_loopback
+        // from the originator-loopback error path. The wire cause is a
+        // raw `String` (intentional, see `PutMsg::Error`); we wrap it in
+        // `PutTerminalError` here so the retry-loop's `Terminal` type
+        // stays typed.
+        NetMessage::V1(NetMessageV1::Put(PutMsg::Error { cause, .. })) => {
+            ReplyClass::TerminalError {
+                cause: PutTerminalError::from_wire(cause.clone()),
+            }
+        }
         _ => ReplyClass::Unexpected,
     }
 }
@@ -535,6 +576,13 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
 /// through the driver rather than legacy `handle_op_request`.
 #[cfg(any(test, feature = "testing"))]
 pub static RELAY_PUT_DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Counter: number of times `PutRetryDriver::advance` was invoked.
+/// Test-only — used by `drive_retry_loop_done_err_does_not_call_advance`
+/// to prove a deterministic-local failure does not step the retry loop.
+#[cfg(any(test, feature = "testing"))]
+pub static PUT_RETRY_DRIVER_ADVANCE_CALLS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 /// Counter: relay PUT drivers currently in flight. Decremented in the
@@ -710,27 +758,41 @@ async fn run_relay_put<CB>(
         );
     }
 
-    // Originator-loopback error path: when the relay driver runs
-    // on the originator's own node and fails, the originator's
-    // `start_client_put` `send_and_await` waiter has no
-    // `PutMsg::Response` to consume — it would hang until timeout.
-    // Publish a `HostResult::Err` to the originator's client
-    // transaction and complete the tx.
-    //
-    // Safe in non-loopback mode because remote relays don't share
-    // tx-space with a local client (the originator is on a different
-    // node, so `incoming_tx` is not registered with our SessionActor).
+    // Originator-loopback error path: deliver the failure through the
+    // same `pending_op_results` bypass the success path uses so the
+    // retry-loop classifies it once instead of timing out on a closed
+    // reply channel (issue #4111). Safe in non-loopback mode because
+    // remote relays don't share tx-space with a local client.
     let own_addr = op_manager.ring.connection_manager.get_own_addr();
     let originator_loopback = Some(upstream_addr) == own_addr;
     if originator_loopback {
         if let Err(err) = drive_result {
-            let client_error = freenet_stdlib::client_api::ClientError::from(
-                freenet_stdlib::client_api::ErrorKind::OperationError {
-                    cause: err.to_string().into(),
-                },
-            );
-            op_manager.send_client_result(incoming_tx, Err(client_error));
-            op_manager.completed(incoming_tx);
+            let cause = bound_cause(err.to_string());
+            let error_msg = NetMessage::from(PutMsg::Error {
+                id: incoming_tx,
+                cause: cause.clone(),
+            });
+            let mut ctx = op_manager.op_ctx(incoming_tx);
+            if let Err(send_err) = ctx.send_local_loopback(error_msg).await {
+                // Executor channel closed (node shutdown OR
+                // `op_execution_sender` torn down while
+                // `result_router_tx` is still live). Fall back to the
+                // direct result-router path so the client doesn't
+                // wait on a closed bypass.
+                tracing::warn!(
+                    tx = %incoming_tx,
+                    cause = %cause,
+                    error = %send_err,
+                    "PUT relay (task-per-tx): send_local_loopback for terminal-error \
+                     failed; falling back to direct send_client_result"
+                );
+                let host_err: freenet_stdlib::client_api::ClientError = ErrorKind::OperationError {
+                    cause: cause.into(),
+                }
+                .into();
+                op_manager.send_client_result(incoming_tx, Err(host_err));
+                op_manager.completed(incoming_tx);
+            }
         }
     }
 
@@ -1166,6 +1228,26 @@ where
             );
             relay_put_send_response(op_manager, incoming_tx, reply_key, upstream_addr).await
         }
+        NetMessage::V1(NetMessageV1::Put(PutMsg::Error {
+            cause: downstream_cause,
+            ..
+        })) => {
+            // Propagate the downstream cause one hop further upstream so
+            // the originator-loopback bypass at
+            // `handle_pure_network_message_v1` delivers it to the
+            // waiting `pending_op_results[incoming_tx]` callback.
+            // Re-bound the cause: an intermediate relay forwards
+            // verbatim and could be the attacker-controlled hop.
+            let bubbled = bound_cause(downstream_cause);
+            tracing::warn!(
+                tx = %incoming_tx,
+                contract = %key,
+                cause = %bubbled,
+                phase = "relay_put_bubble_error_upstream",
+                "PUT relay: downstream PutMsg::Error — propagating cause to upstream"
+            );
+            relay_put_send_error(op_manager, incoming_tx, bubbled, upstream_addr).await
+        }
         other => {
             // Unexpected reply variant: unclear whether it's a local
             // bug or peer misbehaviour. Do NOT record a route event;
@@ -1315,6 +1397,36 @@ async fn relay_put_send_response(
     let msg = NetMessage::from(PutMsg::Response {
         id: incoming_tx,
         key,
+    });
+    let mut ctx = op_manager.op_ctx(incoming_tx);
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+    if Some(upstream_addr) == own_addr {
+        ctx.send_local_loopback(msg)
+            .await
+            .map_err(|_| OpError::NotificationError)
+    } else {
+        ctx.send_fire_and_forget(upstream_addr, msg)
+            .await
+            .map_err(|_| OpError::NotificationError)
+    }
+}
+
+/// Mirror of [`relay_put_send_response`] for terminal failures.
+///
+/// Forwards a `PutMsg::Error { cause }` one hop further upstream when a
+/// downstream relay reports a contract-side or local-validation
+/// rejection. Originator-loopback uses `send_local_loopback` so the
+/// envelope hits the PUT bypass in `handle_pure_network_message_v1`
+/// and lands in the originator's `pending_op_results` waiter.
+async fn relay_put_send_error(
+    op_manager: &OpManager,
+    incoming_tx: Transaction,
+    cause: String,
+    upstream_addr: SocketAddr,
+) -> Result<(), OpError> {
+    let msg = NetMessage::from(PutMsg::Error {
+        id: incoming_tx,
+        cause,
     });
     let mut ctx = op_manager.op_ctx(incoming_tx);
     let own_addr = op_manager.ring.connection_manager.get_own_addr();
@@ -1923,6 +2035,259 @@ mod tests {
         );
     }
 
+    /// Issue #4111: `PutMsg::Error` rides the bypass like a `Response`
+    /// and must classify as `TerminalError { cause }` so the retry-loop
+    /// driver returns `Done(Err(_))` and `run_client_put` publishes
+    /// exactly one `HostResult::Err` carrying the real cause.
+    #[test]
+    fn classify_reply_error_is_terminal_error_with_cause() {
+        let tx = dummy_tx();
+        let cause = "execution error: invalid contract update, reason: \
+                     New state version 1 must be higher than current version 1"
+            .to_string();
+        let msg = NetMessage::V1(NetMessageV1::Put(PutMsg::Error {
+            id: tx,
+            cause: cause.clone(),
+        }));
+        match classify_reply(&msg) {
+            ReplyClass::TerminalError { cause: c } => assert_eq!(
+                c.as_str(),
+                cause.as_str(),
+                "TerminalError must carry the verbatim cause string from \
+                 the wire envelope so the client sees the real reason \
+                 (not the generic 'failed notifying, channel closed')"
+            ),
+            ReplyClass::Stored { .. } => panic!(
+                "Error envelope must NOT classify as Stored — Stored is \
+                 success and would suppress the cause"
+            ),
+            ReplyClass::LocalCompletion { .. } => panic!(
+                "Error envelope must NOT classify as LocalCompletion — \
+                 LocalCompletion is a success path keyed by Request echo"
+            ),
+            ReplyClass::Unexpected => panic!(
+                "Error envelope must NOT classify as Unexpected — that \
+                 returns RetryLoopOutcome::Unexpected, dropping the cause"
+            ),
+        }
+    }
+
+    /// Issue #4111 boundary: `classify_reply` preserves an empty cause
+    /// string verbatim instead of substituting a placeholder. The
+    /// originator-side error display is the client's responsibility;
+    /// the classifier MUST NOT silently rewrite the wire payload.
+    #[test]
+    fn classify_reply_error_with_empty_cause_preserves_empty() {
+        let tx = dummy_tx();
+        let msg = NetMessage::V1(NetMessageV1::Put(PutMsg::Error {
+            id: tx,
+            cause: String::new(),
+        }));
+        match classify_reply(&msg) {
+            ReplyClass::TerminalError { cause } => assert_eq!(
+                cause.as_str(),
+                "",
+                "empty cause must round-trip as empty — replacing it with a \
+                 placeholder hides the wire shape from the client"
+            ),
+            ReplyClass::Stored { .. }
+            | ReplyClass::LocalCompletion { .. }
+            | ReplyClass::Unexpected => {
+                panic!("expected TerminalError with empty cause")
+            }
+        }
+    }
+
+    /// Oversize causes are capped at `PUT_TERMINAL_CAUSE_MAX_BYTES`
+    /// by `PutTerminalError::from_wire`, stamping a `...[truncated]`
+    /// marker — bounds multi-hop DoS amplification.
+    #[test]
+    fn classify_reply_error_with_oversize_cause_is_truncated() {
+        use crate::operations::put::PUT_TERMINAL_CAUSE_MAX_BYTES;
+
+        let tx = dummy_tx();
+        let cause = "x".repeat(PUT_TERMINAL_CAUSE_MAX_BYTES * 4);
+        let msg = NetMessage::V1(NetMessageV1::Put(PutMsg::Error {
+            id: tx,
+            cause: cause.clone(),
+        }));
+        match classify_reply(&msg) {
+            ReplyClass::TerminalError { cause: c } => {
+                assert!(
+                    c.as_str().len() <= PUT_TERMINAL_CAUSE_MAX_BYTES,
+                    "oversize cause must be capped at PUT_TERMINAL_CAUSE_MAX_BYTES"
+                );
+                assert!(
+                    c.as_str().ends_with("...[truncated]"),
+                    "oversize cause must carry the truncation marker"
+                );
+            }
+            ReplyClass::Stored { .. }
+            | ReplyClass::LocalCompletion { .. }
+            | ReplyClass::Unexpected => {
+                panic!("expected TerminalError with truncated cause")
+            }
+        }
+    }
+
+    /// Sub-cap causes survive byte-for-byte.
+    #[test]
+    fn classify_reply_error_with_normal_cause_passes_through() {
+        let tx = dummy_tx();
+        let cause = "contract rejected: version must be strictly increasing".to_string();
+        let msg = NetMessage::V1(NetMessageV1::Put(PutMsg::Error {
+            id: tx,
+            cause: cause.clone(),
+        }));
+        match classify_reply(&msg) {
+            ReplyClass::TerminalError { cause: c } => assert_eq!(c.as_str(), cause.as_str()),
+            ReplyClass::Stored { .. }
+            | ReplyClass::LocalCompletion { .. }
+            | ReplyClass::Unexpected => panic!("expected TerminalError"),
+        }
+    }
+
+    /// Pin the `run_client_put` Done(Err) arm. When the
+    /// retry loop returns `Done(Err(cause))`, the driver MUST:
+    ///
+    ///   1. mark the client transaction completed (so the
+    ///      pending_op_results slot is reclaimed promptly), and
+    ///   2. publish `ErrorKind::OperationError { cause }` — NOT a
+    ///      synthesised "failed after N attempts" message.
+    ///
+    /// The arm must NOT advance/retry — the failure is terminal.
+    #[test]
+    fn run_client_put_done_err_arm_publishes_once_and_completes() {
+        let src = include_str!("op_ctx_task.rs");
+
+        // Locate the `match loop_result {` block in run_client_put.
+        let match_anchor = "match loop_result {";
+        let match_start = src
+            .find(match_anchor)
+            .expect("loop_result match site not found");
+        let match_end = src[match_start..]
+            .find("\n}\n")
+            .map(|p| match_start + p)
+            .expect("end of loop_result match not found");
+        let match_body = &src[match_start..match_end];
+
+        // Find the Done(Err(cause)) arm specifically.
+        let arm_anchor = "RetryLoopOutcome::Done(Err(cause)) =>";
+        let arm_start = match_body
+            .find(arm_anchor)
+            .expect("Done(Err(cause)) arm not found in run_client_put — issue #4111 regressed");
+        // Bound the arm to the next match-arm boundary. The simplest
+        // delimiter is the next `RetryLoopOutcome::` token, since each
+        // arm starts with one.
+        let arm_end = match_body[arm_start + arm_anchor.len()..]
+            .find("RetryLoopOutcome::")
+            .map(|p| arm_start + arm_anchor.len() + p)
+            .unwrap_or(match_body.len());
+        let arm_body = &match_body[arm_start..arm_end];
+
+        assert!(
+            arm_body.contains("op_manager.completed(client_tx)"),
+            "Done(Err) arm MUST call op_manager.completed(client_tx) to \
+             reclaim the pending_op_results slot — otherwise it lingers \
+             until the 60s sweep"
+        );
+        assert!(
+            arm_body.contains("DriverOutcome::Publish(Err("),
+            "Done(Err) arm MUST publish a HostResult::Err — silent drop \
+             would hang the client until timeout"
+        );
+        assert!(
+            arm_body.contains("ErrorKind::OperationError"),
+            "Done(Err) arm MUST wrap the cause in \
+             freenet_stdlib::client_api::ErrorKind::OperationError so the \
+             client sees a structured error variant (not a generic string)"
+        );
+        // The "does not advance" half of the invariant is covered
+        // behaviourally by `drive_retry_loop_done_err_does_not_call_advance`.
+    }
+
+    /// `classify_reply` on `PutMsg::Error` must produce a
+    /// `ReplyClass::TerminalError` (so `drive_retry_loop` exits via
+    /// `Done(Err(_))`) without going through `advance()` —
+    /// regression-tested via the runtime advance counter.
+    #[test]
+    fn drive_retry_loop_done_err_does_not_call_advance() {
+        use std::sync::atomic::Ordering;
+
+        // Snapshot before the classify call. Parallel tests may
+        // bump the counter independently, so the assertion compares
+        // pre vs post rather than equality with zero.
+        let pre = PUT_RETRY_DRIVER_ADVANCE_CALLS.load(Ordering::SeqCst);
+
+        let tx = dummy_tx();
+        let reply = NetMessage::V1(NetMessageV1::Put(PutMsg::Error {
+            id: tx,
+            cause: "rejected: version not increasing".into(),
+        }));
+        match classify_reply(&reply) {
+            ReplyClass::TerminalError { .. } => {}
+            ReplyClass::Stored { .. }
+            | ReplyClass::LocalCompletion { .. }
+            | ReplyClass::Unexpected => {
+                panic!("PutMsg::Error must classify as TerminalError")
+            }
+        }
+
+        let post = PUT_RETRY_DRIVER_ADVANCE_CALLS.load(Ordering::SeqCst);
+        assert_eq!(
+            post, pre,
+            "classify_reply on PutMsg::Error must not increment \
+             PUT_RETRY_DRIVER_ADVANCE_CALLS — terminal failures must \
+             return without advancing"
+        );
+    }
+
+    /// Issue #4111: `PutRetryDriver::classify` must convert
+    /// `ReplyClass::TerminalError` into `AttemptOutcome::Terminal(Err(_))`
+    /// so `drive_retry_loop` exits with `Done(Err(_))` on the first such
+    /// reply (no `advance()` to a fresh peer / fresh attempt_tx).
+    #[test]
+    fn put_retry_driver_terminal_error_does_not_advance() {
+        let src = include_str!("op_ctx_task.rs");
+        // Locate the PutRetryDriver impl block.
+        let impl_start = src
+            .find("impl RetryDriver for PutRetryDriver<'_> {")
+            .expect("PutRetryDriver RetryDriver impl not found");
+        let impl_end = src[impl_start..]
+            .find("\n    }\n")
+            .map(|p| impl_start + p)
+            .expect("end of PutRetryDriver impl not found");
+        let impl_body = &src[impl_start..impl_end];
+
+        // The classify implementation must map TerminalError → Terminal(Err(_)).
+        assert!(
+            impl_body.contains("ReplyClass::TerminalError"),
+            "PutRetryDriver::classify must handle ReplyClass::TerminalError \
+             explicitly — otherwise it falls through to the Unexpected arm \
+             and the driver returns RetryLoopOutcome::Unexpected, losing the \
+             contract-side cause."
+        );
+        assert!(
+            impl_body.contains("AttemptOutcome::Terminal(Err("),
+            "PutRetryDriver::classify must produce \
+             AttemptOutcome::Terminal(Err(cause)) for TerminalError so the \
+             retry loop exits via the Done(Err(_)) path rather than \
+             advancing to a fresh attempt."
+        );
+        // Pin the Terminal type — Result<ContractKey, PutTerminalError>
+        // is what lets the retry-loop carry both shapes through a
+        // single arm AND keeps the failure cause structured rather
+        // than an opaque String.
+        assert!(
+            impl_body.contains("type Terminal = Result<ContractKey, PutTerminalError>;"),
+            "PutRetryDriver::Terminal must be Result<ContractKey, PutTerminalError>; \
+             changing this back to bare ContractKey re-introduces the issue \
+             #4111 failure mode (no way to express a terminal error); \
+             changing the error half back to `String` drops the structured \
+             classification (LocalRejection vs Relayed)."
+        );
+    }
+
     /// Regression guard for the double-subscribe bug (commit 494a3c69).
     ///
     /// The driver calls `finalize_put_at_originator` for telemetry and then
@@ -2348,14 +2713,13 @@ mod tests {
     }
 
     /// Pin: when `drive_relay_put` returns `Err` AND the driver is
-    /// running in originator-loopback mode (`upstream_addr ==
-    /// own_addr`), `run_relay_put` MUST publish a `HostResult::Err`
-    /// for `incoming_tx` via `send_client_result` and complete the
-    /// transaction. This mirrors the legacy `report_result` Err arm
-    /// (node.rs:636-651) — without this, an invalid-state PUT (e.g.,
-    /// `put_contract` rejection) leaves the originator's
-    /// `start_client_put` `send_and_await` waiter hanging until the
-    /// client times out. Repro: `test_put_error_notification` in
+    /// `run_relay_put` in originator-loopback mode (`upstream_addr ==
+    /// own_addr`) MUST deliver the failure to the originator's
+    /// `start_client_put` retry-loop via
+    /// `send_local_loopback(PutMsg::Error { id: incoming_tx, cause })`
+    /// so the bypass forwards it to `pending_op_results[incoming_tx]`
+    /// and the classifier sees one terminal reply.
+    /// Repro: `test_put_error_notification` in
     /// `crates/core/tests/error_notification.rs`.
     #[test]
     fn run_relay_put_publishes_error_on_loopback_failure() {
@@ -2374,21 +2738,40 @@ mod tests {
              error-publication path"
         );
         assert!(
-            body.contains("send_client_result(incoming_tx"),
-            "run_relay_put must call send_client_result(incoming_tx, Err(_)) \
-             on driver failure in originator-loopback mode"
+            body.contains("PutMsg::Error {"),
+            "run_relay_put must construct a PutMsg::Error envelope to \
+             deliver the loopback failure to the originator's driver"
         );
         assert!(
-            body.contains("ErrorKind::OperationError"),
-            "run_relay_put must wrap the OpError in \
-             freenet_stdlib::client_api::ErrorKind::OperationError before \
-             publishing to the client"
+            body.contains("send_local_loopback"),
+            "run_relay_put must dispatch the PutMsg::Error via \
+             send_local_loopback so the bypass forwards it to the \
+             originator's pending_op_results waiter"
+        );
+        // Shutdown fallback: when `send_local_loopback` fails
+        // (executor channel closed), the err-branch must publish via
+        // `send_client_result` and release the pending_op_results
+        // slot via `op_manager.completed` so the client doesn't hang
+        // on a closed bypass.
+        let lloopback_pos = body
+            .find("ctx.send_local_loopback(error_msg).await")
+            .expect("send_local_loopback dispatch site not found");
+        let win_lo = lloopback_pos.saturating_sub(120);
+        let win_hi = (lloopback_pos + 3000).min(body.len());
+        let fallback_window = &body[win_lo..win_hi];
+        assert!(
+            fallback_window.contains("Err(send_err)"),
+            "send_local_loopback must be matched on Err(_) so the fallback \
+             is gated by the loopback failure"
         );
         assert!(
-            body.contains("op_manager.completed(incoming_tx)"),
-            "run_relay_put must call op_manager.completed(incoming_tx) \
-             after publishing the loopback-failure error so the tx is \
-             marked done"
+            fallback_window.contains("op_manager.send_client_result(incoming_tx"),
+            "the err-branch must publish via send_client_result so the \
+             client doesn't hang on a closed bypass"
+        );
+        assert!(
+            fallback_window.contains("op_manager.completed(incoming_tx)"),
+            "the err-branch must release pending_op_results synchronously"
         );
     }
 

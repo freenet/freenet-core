@@ -848,15 +848,25 @@ where
             return Ok(());
         }
         NetMessageV1::Put(ref op) => {
-            // Forward only **terminal** Response/ResponseStreaming
+            // Forward only **terminal** Response/ResponseStreaming/Error
             // messages to the originator's awaiting task via the
             // bypass. Non-terminal messages (Request,
             // RequestStreaming, ForwardingAck) must NOT be
             // forwarded: they would fill the capacity-1 reply
             // channel and cause `classify_reply` to fail.
+            //
+            // `Error` is terminal-by-construction (issue #4111): the
+            // originator-loopback failure path emits it via
+            // `send_local_loopback` so the originator's
+            // `start_client_put` retry loop classifies the local
+            // contract-side rejection as `Terminal(Err(cause))` once,
+            // rather than burning the retry budget against a closed
+            // per-attempt reply channel.
             if matches!(
                 op,
-                put::PutMsg::Response { .. } | put::PutMsg::ResponseStreaming { .. }
+                put::PutMsg::Response { .. }
+                    | put::PutMsg::ResponseStreaming { .. }
+                    | put::PutMsg::Error { .. }
             ) && try_forward_driver_reply(
                 pending_op_result.as_ref(),
                 NetMessage::V1(NetMessageV1::Put((*op).clone())),
@@ -947,8 +957,8 @@ where
                             tx = %op.id(),
                             ?op,
                             "PUT: non-dispatch variant ignored \
-                             (Response/ResponseStreaming already handled \
-                             by bypass; ForwardingAck is no-op)"
+                             (Response/ResponseStreaming/Error already \
+                             handled by bypass; ForwardingAck is no-op)"
                         );
                     }
                 }
@@ -2467,6 +2477,81 @@ mod tests {
                  be forwarded to the driver channel — they would fill \
                  the capacity-1 reply slot and block the real Response."
             );
+        }
+
+        /// Issue #4111 regression guard. The PUT branch of
+        /// `handle_pure_network_message_v1` must forward `PutMsg::Error`
+        /// through `try_forward_task_per_tx_reply` exactly like
+        /// `PutMsg::Response` / `PutMsg::ResponseStreaming`. Without
+        /// this, the originator-loopback failure path's
+        /// `send_local_loopback(PutMsg::Error)` would arrive at the
+        /// dispatch site, find no bypass match for `Error`, and the
+        /// catch-all wildcard would drop it as
+        /// "non-dispatch variant ignored" — re-introducing the bug
+        /// the fix addresses (retry-storm + `"failed notifying,
+        /// channel closed"` synthesised for a deterministic local
+        /// failure).
+        ///
+        /// Same pattern as
+        /// `bypass_is_wired_into_subscribe_branch_regression_guard`:
+        /// a structural source-scrape so a future refactor that
+        /// breaks the wiring fails at the unit-test level instead of
+        /// as an end-to-end hang.
+        #[test]
+        fn put_branch_bypass_includes_error_variant_regression_guard() {
+            const SOURCE: &str = include_str!("node.rs");
+
+            let put_branch_anchor: String = ["NetMessageV1::", "Put(ref op)", " => {"].concat();
+            let branch_start = SOURCE.find(&put_branch_anchor).expect(
+                "PUT branch of handle_pure_network_message_v1 not found; \
+                 the match arm has been renamed or moved — update this guard",
+            );
+
+            // The PUT branch ends at the GET branch start.
+            let next_anchor: String = ["NetMessageV1::", "Get(ref op)", " => {"].concat();
+            let window_end = SOURCE[branch_start..]
+                .find(&next_anchor)
+                .expect("end of PUT branch not found — update guard")
+                + branch_start;
+            let window = &SOURCE[branch_start..window_end];
+
+            assert!(
+                window.contains("try_forward_driver_reply("),
+                "PUT branch no longer calls try_forward_driver_reply \
+                 — either restore the bypass or update this guard."
+            );
+
+            // The terminal-reply gate MUST list `Error` alongside
+            // `Response` and `ResponseStreaming`. We check on the
+            // substring rather than the full `matches!` pattern so a
+            // line-wrap or arm-reorder doesn't trip the guard
+            // spuriously — the load-bearing claim is "Error appears
+            // inside the matches! that gates the bypass forward".
+            let gate_start = window
+                .find("matches!(\n                op,")
+                .or_else(|| window.find("matches!(op,"))
+                .expect("terminal-gate matches! not found in PUT branch");
+            let gate_end = window[gate_start..]
+                .find(") && try_forward_driver_reply(")
+                .expect("end of terminal-gate matches! not found")
+                + gate_start;
+            let gate = &window[gate_start..gate_end];
+
+            for expected in [
+                "put::PutMsg::Response { .. }",
+                "put::PutMsg::ResponseStreaming { .. }",
+                "put::PutMsg::Error { .. }",
+            ] {
+                assert!(
+                    gate.contains(expected),
+                    "PUT bypass terminal-gate missing `{expected}` — \
+                     issue #4111: without Error in the gate, the \
+                     originator-loopback failure path's \
+                     send_local_loopback(PutMsg::Error) lands in the \
+                     dispatch wildcard and the originator's retry-loop \
+                     re-runs the same deterministic local failure."
+                );
+            }
         }
 
         #[tokio::test]

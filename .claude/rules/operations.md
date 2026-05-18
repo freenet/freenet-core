@@ -35,9 +35,13 @@ for every inbound wire message. Pattern per op:
 
 1. **Reply bypass.** If a terminal reply variant arrives and a
    `pending_op_results` callback is registered, forward it via
-   `try_forward_task_per_tx_reply` and return. For GET/PUT/SUBSCRIBE
-   the gate is `Response | ResponseStreaming` only. CONNECT forwards
-   all four non-`Request` variants (multi-reply fan-in).
+   `try_forward_task_per_tx_reply` and return. For GET/SUBSCRIBE the
+   gate is `Response | ResponseStreaming` only. PUT additionally
+   accepts `PutMsg::Error` so the originator-loopback failure path
+   (issue #4111) delivers the contract-side cause via the same bypass
+   instead of timing out the retry loop on a closed reply channel.
+   CONNECT forwards all four non-`Request` variants (multi-reply
+   fan-in).
 2. **Relay dispatch.** Spawn the matching `start_relay_*` driver.
    Originator-loopback (`source_addr=None`) is mapped to
    `upstream_addr=own_addr` for GET/PUT/SUBSCRIBE so the same driver
@@ -188,6 +192,48 @@ WRONG:
 
 CORRECT:
   send_peer_list(connected_peers.filter(|p| is_live_connection(p)))
+```
+
+### WHEN publishing a terminal operation reply
+
+```
+Sync-failure paths (where the driver knows the operation is done and
+must publish a Result to the originator) MUST deliver via the SAME
+mechanism the success path uses — NOT via direct send_client_result.
+
+WRONG:
+  if put_contract(...).is_err() {
+      op_manager.send_client_result(tx, Err(host_err));  // M1
+      op_manager.completed(tx);                          // M2
+  }
+
+  M1 and M2 are independent try_send calls on different channels
+  (result_router_tx vs event-loop notification channel). When the
+  event loop processes M2 first, it removes pending_op_results[tx]
+  BEFORE send_and_await consumes M1; the retry-loop sees the closed
+  channel as NotificationError, advances, burns the retry budget on
+  the same deterministic failure, and the user gets the synthesised
+  "failed notifying, channel closed" instead of the real reason.
+
+CORRECT:
+  let err_msg = NetMessage::from(<Op>Msg::Error { id: tx, cause });
+  ctx.send_local_loopback(err_msg).await?;
+
+  Routing: handle_pure_network_message_v1 forwards <Op>Msg::Error
+  into pending_op_results[tx] like Response; classify_reply returns
+  ReplyClass::TerminalError { cause }; the driver returns
+  Terminal(Err(cause)) → Done(Err); run_client_<op> publishes ONE
+  HostResult::Err and calls op_manager.completed(client_tx)
+  synchronously — no race window.
+
+Multi-hop: when a downstream relay returns <Op>Msg::Error, the
+relay MUST propagate the cause one hop further upstream via a
+matching `relay_<op>_send_error` helper, not fall through to a
+generic OpError::UnexpectedOpState wildcard.
+
+DoS amplification: cap the cause length at the wire boundary.
+PUT uses PUT_TERMINAL_CAUSE_MAX_BYTES = 2048 + a UTF-8-safe
+truncator (see `bound_cause` in operations/put.rs).
 ```
 
 ## Error Handling

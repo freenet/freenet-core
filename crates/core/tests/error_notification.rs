@@ -142,15 +142,30 @@ async fn test_put_error_notification(ctx: &mut TestContext) -> TestResult {
     // Wait for response - should receive error response
     let put_result = timeout(Duration::from_secs(30), client.recv()).await;
 
+    // Synthesised marker emitted by the retry loop when the bypass
+    // closes early. Reject it explicitly: a response containing this
+    // string means the client got an infrastructure leak rather than
+    // the contract's real rejection reason.
+    const FORBIDDEN_MARKER: &str = "failed notifying, channel closed";
+
     match put_result {
         Ok(Ok(response)) => {
-            // Any response is good - means we're not hanging
-            info!("✓ Received response (not timing out): {:?}", response);
-            info!("✓ Client properly notified instead of hanging");
+            let rendered = format!("{response:?}");
+            assert!(
+                !rendered.contains(FORBIDDEN_MARKER),
+                "PUT failure response contained the forbidden marker \
+                 ({FORBIDDEN_MARKER:?}). Response was: {rendered}"
+            );
+            info!("✓ Received response without forbidden marker: {response:?}");
         }
         Ok(Err(e)) => {
-            // WebSocket error could indicate error was delivered
-            info!("✓ Received error notification: {}", e);
+            let rendered = e.to_string();
+            assert!(
+                !rendered.contains(FORBIDDEN_MARKER),
+                "PUT WS error contained the forbidden marker \
+                 ({FORBIDDEN_MARKER:?}). Error was: {rendered}"
+            );
+            info!("✓ Received error notification without forbidden marker: {rendered}");
         }
         Err(_) => {
             panic!(
