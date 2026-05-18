@@ -307,7 +307,7 @@ async fn register_subscription_listener(
 async fn report_op_init_error(
     op_manager: &OpManager,
     tx: crate::message::Transaction,
-    contract: &impl std::fmt::Display,
+    contract: &(impl std::fmt::Display + Sync),
     op_name: &str,
     err: &OpError,
     client_id: ClientId,

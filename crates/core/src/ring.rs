@@ -748,10 +748,13 @@ impl Ring {
 
             let mut snapshot = ring.router.read().snapshot();
 
-            // Try to include connect forward estimator data
+            // Try to include connect forward estimator data.
+            // Drop the read guard immediately after `snapshot()` so unrelated
+            // consumers don't queue behind us for the four field assignments
+            // (clippy: `significant_drop_tightening`).
             if let Some(op_manager) = ring.upgrade_op_manager() {
-                let cfe = op_manager.connect_forward_estimator.read();
-                let (curve, data_range, events, adjustments) = cfe.snapshot();
+                let (curve, data_range, events, adjustments) =
+                    op_manager.connect_forward_estimator.read().snapshot();
                 snapshot.connect_forward_curve = Some(curve);
                 snapshot.connect_forward_data_range = Some(data_range);
                 snapshot.connect_forward_events = Some(events);
@@ -1458,7 +1461,9 @@ impl Ring {
     where
         for<'a> Location: From<&'a K>,
     {
-        let router = self.router.read();
+        // Router read-lock is only needed for the final `select_*` call;
+        // building the candidate list does not need it. Acquire it late to
+        // keep the critical section short (clippy: `significant_drop_tightening`).
         let target_location = Location::from(contract_id);
 
         let mut seen = HashSet::new();
@@ -1522,8 +1527,13 @@ impl Ring {
         // which may fail (especially in NAT scenarios without coordination).
         // It's better to return fewer candidates than unreachable ones.
 
-        let (selected, decision) =
-            router.select_k_best_peers_with_telemetry(candidates.iter(), target_location, k);
+        let (selected, decision) = self.router.read().select_k_best_peers_with_telemetry(
+            candidates.iter(),
+            target_location,
+            k,
+        );
+        // `selected` borrows from `candidates`, not from the router guard, so
+        // the read lock is released here before the tracing/collect below.
 
         tracing::debug!(
             target_location = %target_location.as_f64(),
@@ -2436,8 +2446,8 @@ impl Ring {
                         pending_conn_adds.extend(target_locs.into_iter().take(allowed));
                     }
                 }
-                TopologyAdjustment::RemoveConnections(mut should_disconnect_peers) => {
-                    for peer in should_disconnect_peers.drain(..) {
+                TopologyAdjustment::RemoveConnections(should_disconnect_peers) => {
+                    for peer in should_disconnect_peers {
                         if let Some(addr) = peer.socket_addr() {
                             notifier
                                 .notifications_sender
@@ -2614,7 +2624,10 @@ impl Ring {
         );
 
         let query_target = {
-            let router = self.router.read();
+            // The router read-lock is only needed for the single
+            // `select_k_best_peers_with_telemetry` call; routing_candidates
+            // takes its own connection-manager locks. Acquire late to keep
+            // the critical section short (clippy: `significant_drop_tightening`).
             let num_connections = self.connection_manager.num_connections();
             tracing::debug!(
                 target_location = %ideal_location,
@@ -2636,8 +2649,11 @@ impl Ring {
                 false, // bypass readiness — this is a CONNECT for connection acquisition
             );
             let selected = if !candidates.is_empty() {
-                let (selected, _) =
-                    router.select_k_best_peers_with_telemetry(candidates.iter(), ideal_location, 1);
+                let (selected, _) = self.router.read().select_k_best_peers_with_telemetry(
+                    candidates.iter(),
+                    ideal_location,
+                    1,
+                );
                 selected.into_iter().next().cloned()
             } else {
                 None
@@ -2694,7 +2710,7 @@ impl Ring {
         live_tx_tracker.add_transaction(gateway_addr, tx);
 
         let op_manager_spawn = op_manager.clone();
-        let gateway = query_target.clone();
+        let gateway = query_target;
         let joiner_for_driver = joiner;
         GlobalExecutor::spawn(async move {
             if let Err(err) = crate::operations::connect::op_ctx_task::start_client_connect(

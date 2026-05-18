@@ -764,7 +764,7 @@ async fn drive_client_subscribe_inner(
                     .connection_manager
                     .get_peer_by_addr(current_target_addr)
                 {
-                    let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key.clone());
+                    let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key);
                     op_manager
                         .interest_manager
                         .register_peer_interest(&key, peer_key, None, true);

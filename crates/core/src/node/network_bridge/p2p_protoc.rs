@@ -1460,7 +1460,7 @@ impl P2pConnManager {
                                         "Cleaning up in-progress connection reservations"
                                     );
 
-                                    for (addr, mut callbacks) in state.awaiting_connection.drain() {
+                                    for (addr, callbacks) in state.awaiting_connection.drain() {
                                         tracing::debug!(
                                             peer_addr = %addr,
                                             callbacks = callbacks.len(),
@@ -1468,7 +1468,7 @@ impl P2pConnManager {
                                             "Notifying awaiting connection of shutdown"
                                         );
                                         // Best effort notification during shutdown - receiver may already be dropped
-                                        for mut callback in callbacks.drain(..) {
+                                        for mut callback in callbacks {
                                             #[allow(clippy::let_underscore_must_use)]
                                             let _ = callback.send_result(Err(())).await;
                                         }
@@ -1486,7 +1486,7 @@ impl P2pConnManager {
                                         for _ in 0..pending_count {
                                             crate::config::GlobalTestMetrics::record_pending_op_remove();
                                         }
-                                        state.pending_op_results.drain();
+                                        state.pending_op_results.clear();
                                     }
 
                                     tracing::info!(

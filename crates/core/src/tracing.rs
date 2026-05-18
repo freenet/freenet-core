@@ -1122,7 +1122,7 @@ impl<'a> NetEventLog<'a> {
                     .unwrap_or_else(|| own_loc.clone()); // Fallback to own location if target unknown
                 EventKind::Put(PutEvent::ResponseSent {
                     id: *id,
-                    from: own_loc.clone(),
+                    from: own_loc,
                     to,
                     key: *key,
                     timestamp: chrono::Utc::now().timestamp() as u64,
@@ -1143,7 +1143,7 @@ impl<'a> NetEventLog<'a> {
                     .unwrap_or_else(|| own_loc.clone()); // Fallback to own location if target unknown
                 EventKind::Get(GetEvent::ResponseSent {
                     id: *id,
-                    from: own_loc.clone(),
+                    from: own_loc,
                     to,
                     key,
                     timestamp: chrono::Utc::now().timestamp() as u64,
@@ -1163,7 +1163,7 @@ impl<'a> NetEventLog<'a> {
                     .unwrap_or_else(|| own_loc.clone()); // Fallback to own location if target unknown
                 EventKind::Subscribe(SubscribeEvent::ResponseSent {
                     id: *id,
-                    from: own_loc.clone(),
+                    from: own_loc,
                     to,
                     key,
                     timestamp: chrono::Utc::now().timestamp() as u64,
@@ -1179,7 +1179,7 @@ impl<'a> NetEventLog<'a> {
                 EventKind::Subscribe(SubscribeEvent::UnsubscribeSent {
                     id: *id,
                     instance_id: *instance_id,
-                    from: own_loc.clone(),
+                    from: own_loc,
                     to,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
@@ -1224,7 +1224,7 @@ impl<'a> NetEventLog<'a> {
                 let events = vec![
                     NetEventLog {
                         tx: msg.id(),
-                        peer_id: acceptor_peer_id.clone(),
+                        peer_id: acceptor_peer_id,
                         kind: EventKind::Connect(ConnectEvent::Connected {
                             this: acceptor.clone(),
                             connected: this_peer.clone(),
@@ -1567,7 +1567,7 @@ impl<'a> From<NetEventLog<'a>> for NetLogMessage {
             datetime: Utc::now(),
             tx: *log.tx,
             kind: log.kind,
-            peer_id: log.peer_id.clone(),
+            peer_id: log.peer_id,
         }
     }
 }
@@ -1675,7 +1675,7 @@ impl EventRegister {
         let (log_sender, log_recv) = mpsc::channel(1000);
         NEW_RECORDS_TS.get_or_init(SystemTime::now);
         let log_file = Arc::new(event_log_path.clone());
-        GlobalExecutor::spawn(Self::record_logs(log_recv, log_file.clone()));
+        GlobalExecutor::spawn(Self::record_logs(log_recv, log_file));
 
         let flush_handle = EventFlushHandle {
             sender: log_sender.clone(),
@@ -4412,7 +4412,7 @@ pub(super) mod test {
             let msg_log = NetLogMessage {
                 datetime: Utc::now(),
                 tx: *log.tx,
-                peer_id: peer_id.clone(),
+                peer_id,
                 kind,
             };
             (msg_log, log_id)

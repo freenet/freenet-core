@@ -121,8 +121,7 @@ where
         }
         let pick = loop {
             let pick = self.rng.random_range(0..self.size);
-            if !self.done.contains(&pick) {
-                self.done.insert(pick);
+            if self.done.insert(pick) {
                 break pick;
             }
         };

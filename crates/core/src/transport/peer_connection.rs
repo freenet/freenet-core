@@ -1091,7 +1091,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 // The .take() consumes the sleep future; the unwrap_or(ready()) fallback
                 // should be unreachable since the top-of-loop guard always refills it,
                 // but is kept as a defensive measure.
-                _ = async { resend_check_sleep.take().unwrap_or(Box::pin(std::future::ready(()))).await } => {
+                _ = async { resend_check_sleep.take().unwrap_or_else(|| Box::pin(std::future::ready(()))).await } => {
                     // Bound retransmissions per iteration to prevent monopolizing the
                     // select loop. Remaining resends are deferred by a short sleep
                     // (see top of loop) so inbound branches can interleave.

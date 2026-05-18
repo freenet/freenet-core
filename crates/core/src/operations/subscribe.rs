@@ -366,7 +366,7 @@ pub(crate) async fn register_downstream_subscriber(
                     source_addr
                         .and_then(|sa| op_manager.ring.connection_manager.get_peer_by_addr(sa))
                 })
-                .map(|pkl| crate::ring::interest::PeerKey::from(pkl.pub_key.clone()))
+                .map(|pkl| crate::ring::interest::PeerKey::from(pkl.pub_key))
         });
 
     if let Some(peer_key) = peer_key {
@@ -431,7 +431,7 @@ pub(crate) async fn handle_unsubscribe_inbound(
             .ring
             .connection_manager
             .get_peer_by_addr(addr)
-            .map(|pkl| crate::ring::interest::PeerKey::from(pkl.pub_key.clone()))
+            .map(|pkl| crate::ring::interest::PeerKey::from(pkl.pub_key))
     });
 
     let key = match super::has_contract(op_manager, instance_id).await {
