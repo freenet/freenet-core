@@ -1,4 +1,4 @@
-//! `fdev secrets` subcommand: manage the node KEK backend.
+//! `freenet secrets` subcommand: manage the node KEK backend.
 //!
 //! - `kek-status` — report current backend + KEK fingerprint
 //! - `kek-rotate` — generate a new KEK, re-encrypt every active
@@ -30,8 +30,8 @@ pub struct SecretsCliConfig {
 #[allow(
     clippy::enum_variant_names,
     reason = "every variant manages the KEK and the `Kek` prefix matches the user-facing \
-              CLI verbs (`fdev secrets kek-status`, `fdev secrets kek-rotate`, \
-              `fdev secrets kek-migrate`)."
+              CLI verbs (`freenet secrets kek-status`, `freenet secrets kek-rotate`, \
+              `freenet secrets kek-migrate`)."
 )]
 pub enum SecretsCommand {
     /// Print the active KEK backend and the KEK fingerprint
@@ -142,7 +142,7 @@ async fn kek_rotate(args: KekRotateArgs) -> Result<()> {
     bail!(
         "kek-rotate on-disk walk not yet implemented in this build. \
          Operators wanting to rotate today should: stop the node, run \
-         `fdev secrets kek-migrate --to file --yes` (or to a new backend), \
+         `freenet secrets kek-migrate --to file --yes` (or to a new backend), \
          move the existing secrets dir aside, start the node fresh, and \
          re-upload delegate secrets via clients. Tracked under #4137."
     );
