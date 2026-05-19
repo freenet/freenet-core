@@ -79,6 +79,10 @@ fn homepage_html() -> String {
                     <p class="note">You'll need an <a href="https://freenet.org/quickstart#invite-form" target="_blank" rel="noopener noreferrer">invite</a> to join the "Freenet Official" room.</p>
                 </li>
                 <li>
+                    <a href="/v1/contract/web/122f6AR7PyF8d8mhczuNQM4xrLtBf5t8g2iB7PEVT7KC/">Freenet Mail</a>
+                    <p class="note">Decentralized email built on Freenet. <a href="https://github.com/freenet/mail" target="_blank" rel="noopener noreferrer">Source</a>.</p>
+                </li>
+                <li>
                     <a href="/v1/contract/web/EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr/">Delta</a>
                     <p class="note">A website builder for Freenet.</p>
                 </li>
