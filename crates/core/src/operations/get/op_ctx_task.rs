@@ -1976,17 +1976,30 @@ async fn drive_relay_get_inner(
         // `RELATED_FETCH_TIMEOUT`). When that queue is backed up,
         // per-hop dwell can reach many seconds. Forwarding first drops
         // the upstream-visible per-hop dwell from O(validate_state) to
-        // O(channel_send). Caching still happens before this driver
-        // task returns, so local LRU/TTL bookkeeping and
-        // `announce_contract_hosted` semantics are preserved. The
-        // forwarded bytes get re-validated at the next hop / originator,
-        // so the relay doesn't need to validate locally to forward
-        // safely. `is_client_requester=false` on the cache call:
-        // relay peers must not set the sticky `local_client_access`
-        // flag — that's exclusively for the client-originating node.
-        // Legacy mirror: `get.rs:2260-2262` gates on
-        // `is_original_requester`.
-        relay_send_found(
+        // O(channel_send).
+        //
+        // Caching ALWAYS runs after forwarding, even when forwarding
+        // returns Err — this preserves the legacy invariant that LRU/TTL
+        // bookkeeping and `announce_contract_hosted` fire on any successful
+        // wire-level GET. The send error is deferred via `let send_result`
+        // and propagated after the cache call.
+        //
+        // R4 (this site) and R10 read from the local store, so the
+        // `state_matches` short-circuit inside `cache_contract_locally`
+        // skips the expensive PutQuery — the perf win is concentrated
+        // at R12a (downstream-Found bubble-up). We still reorder R4/R10
+        // uniformly so the invariant "forward before cache" holds across
+        // every relay-driver callsite and a future refactor can't
+        // accidentally re-introduce cache-before-forward at any one site.
+        //
+        // The forwarded bytes get re-validated at the next hop /
+        // originator, so the relay doesn't need to validate locally to
+        // forward safely. `is_client_requester=false` on the cache
+        // call: relay peers must not set the sticky
+        // `local_client_access` flag — that's exclusively for the
+        // client-originating node. Legacy mirror: `get.rs:2260-2262`
+        // gates on `is_original_requester`.
+        let send_result = relay_send_found(
             op_manager,
             incoming_tx,
             instance_id,
@@ -1995,8 +2008,9 @@ async fn drive_relay_get_inner(
             state.clone(),
             contract.clone(),
         )
-        .await?;
+        .await;
         cache_contract_locally(op_manager, key, state, contract, false).await;
+        send_result?;
         return Ok(());
     }
 
@@ -2034,9 +2048,11 @@ async fn drive_relay_get_inner(
                     );
                     // Forward upstream FIRST to keep cache off the critical
                     // path (issue #4155 — see top-of-loop comment above the
-                    // R4 callsite for the full rationale). Relay path:
+                    // R4 callsite for the full rationale). Cache ALWAYS
+                    // runs after forwarding so LRU/TTL bookkeeping fires
+                    // even when the forward errors. Relay path:
                     // `is_client_requester=false` on the cache call.
-                    relay_send_found(
+                    let send_result = relay_send_found(
                         op_manager,
                         incoming_tx,
                         instance_id,
@@ -2045,8 +2061,9 @@ async fn drive_relay_get_inner(
                         state.clone(),
                         contract.clone(),
                     )
-                    .await?;
+                    .await;
                     cache_contract_locally(op_manager, key, state, contract, false).await;
+                    send_result?;
                 } else {
                     tracing::warn!(
                         tx = %incoming_tx,
@@ -2232,7 +2249,7 @@ async fn drive_relay_get_inner(
                     %instance_id,
                     contract = %key,
                     phase = "relay_found",
-                    "GET relay: downstream returned Found — bubbling upstream and caching locally"
+                    "GET relay: downstream returned Found — forwarding upstream then caching locally"
                 );
 
                 // Feed the relay's successful peer choice into the local
@@ -2250,11 +2267,15 @@ async fn drive_relay_get_inner(
 
                 // Bubble up to upstream FIRST to keep cache off the
                 // critical path (issue #4155 — full rationale at the
-                // R4 callsite earlier in this fn). Caching still
-                // happens before this driver task returns, so local
-                // LRU/TTL bookkeeping and `announce_contract_hosted`
-                // semantics are preserved.
-                relay_send_found(
+                // R4 callsite earlier in this fn). This is THE site
+                // where the perf win matters: a freshly-arrived
+                // downstream payload has no `state_matches`
+                // short-circuit yet, so the PutQuery runs full WASM
+                // `validate_state` + `update_state`. Caching ALWAYS
+                // runs after forwarding so LRU/TTL and
+                // `announce_contract_hosted` semantics are preserved
+                // even on send error.
+                let send_result = relay_send_found(
                     op_manager,
                     incoming_tx,
                     instance_id,
@@ -2263,7 +2284,7 @@ async fn drive_relay_get_inner(
                     state.clone(),
                     contract.clone(),
                 )
-                .await?;
+                .await;
 
                 // Cache locally (relay opportunistically caches forwarded
                 // Found payloads). `is_client_requester=false` so this node
@@ -2275,6 +2296,7 @@ async fn drive_relay_get_inner(
                 // `get.rs:2370` which announces on any first-time relay
                 // cache).
                 cache_contract_locally(op_manager, key, state, contract, false).await;
+                send_result?;
                 return Ok(());
             }
             AttemptOutcome::Terminal(Terminal::Streaming { .. }) => {
