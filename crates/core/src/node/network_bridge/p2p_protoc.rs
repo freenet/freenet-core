@@ -3859,19 +3859,30 @@ impl P2pConnManager {
                     Some(target_addr) => {
                         // Track `tx → target_addr` so disconnect-cancellation in
                         // `prune_connection` / `handle_orphaned_transactions` can
-                        // wake the parked driver (#4154). The `P2pBridge::send`
-                        // path registers via `sending_transaction`; this branch
-                        // covers the `op_execution_sender` path
-                        // (`send_to_and_await` / `send_fire_and_forget`), which
-                        // bypasses `P2pBridge::send`. Cleanup happens in the
-                        // `TransactionCompleted` handler; duplicate entries from
-                        // CONNECT's `Ring::initiate_connect` registration are
-                        // tolerated by `remove_finished_transaction`.
-                        self.bridge
-                            .op_manager
-                            .ring
-                            .live_tx_tracker
-                            .add_transaction(target_addr, *msg.id());
+                        // wake the parked driver (#4154). Two cases register here:
+                        //   - `send_to_and_await`: this branch just installed a
+                        //     waiter into `pending_op_results` above.
+                        //   - `send_fire_and_forget` from a relay driver running
+                        //     on the originator: the callback is closed (no insert
+                        //     above) but the originator's client driver has an
+                        //     earlier `pending_op_results[tx]` waiter that needs
+                        //     waking.
+                        // Skip when no waiter is present (e.g. cancelled-driver
+                        // teardown races) — registering with nothing to wake would
+                        // leak a live_tx_tracker entry until the peer disconnects.
+                        // `add_transaction` is idempotent + rebind-safe, so the
+                        // CONNECT ride-along (also registered at
+                        // `Ring::initiate_connect`) does not double-count, and a
+                        // relay that response-sends back to its upstream after
+                        // forwarding downstream cleanly migrates the entry.
+                        let tx = *msg.id();
+                        if state.pending_op_results.contains_key(&tx) {
+                            self.bridge
+                                .op_manager
+                                .ring
+                                .live_tx_tracker
+                                .add_transaction(target_addr, tx);
+                        }
                         EventResult::Event(
                             ConnEvent::OutboundMessageWithTarget { target_addr, msg }.into(),
                         )
