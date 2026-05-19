@@ -1974,23 +1974,49 @@ async fn drive_relay_get_inner(
                 .register_peer_interest(&key, peer_key, None, false);
         }
 
-        // Cache locally first (relay already hosting, idempotent).
-        // `is_client_requester=false`: relay peers must not set the sticky
-        // `local_client_access` flag — that's exclusively for the client-
-        // originating node. Legacy mirror: `get.rs:2260-2262` gates on
-        // `is_original_requester`.
-        cache_contract_locally(op_manager, key, state.clone(), contract.clone(), false).await;
-
-        relay_send_found(
+        // Forward upstream FIRST to keep cache work off the critical
+        // path (issue #4155). `cache_contract_locally` enqueues a
+        // GetQuery + PutQuery on the single-threaded `contract_handling`
+        // event loop; the PutQuery runs WASM `validate_state` (and may
+        // recursively `RequestRelated` with a 10s
+        // `RELATED_FETCH_TIMEOUT`). When that queue is backed up,
+        // per-hop dwell can reach many seconds. Forwarding first drops
+        // the upstream-visible per-hop dwell from O(validate_state) to
+        // O(channel_send).
+        //
+        // Caching ALWAYS runs after forwarding, even when forwarding
+        // returns Err — this preserves the legacy invariant that LRU/TTL
+        // bookkeeping and `announce_contract_hosted` fire on any successful
+        // wire-level GET. The send error is deferred via `let send_result`
+        // and propagated after the cache call.
+        //
+        // R4 (this site) and R10 read from the local store, so the
+        // `state_matches` short-circuit inside `cache_contract_locally`
+        // skips the expensive PutQuery — the perf win is concentrated
+        // at R12a (downstream-Found bubble-up). We still reorder R4/R10
+        // uniformly so the invariant "forward before cache" holds across
+        // every relay-driver callsite and a future refactor can't
+        // accidentally re-introduce cache-before-forward at any one site.
+        //
+        // The forwarded bytes get re-validated at the next hop /
+        // originator, so the relay doesn't need to validate locally to
+        // forward safely. `is_client_requester=false` on the cache
+        // call: relay peers must not set the sticky
+        // `local_client_access` flag — that's exclusively for the
+        // client-originating node. Legacy mirror: `get.rs:2260-2262`
+        // gates on `is_original_requester`.
+        let send_result = relay_send_found(
             op_manager,
             incoming_tx,
             instance_id,
             upstream_addr,
             key,
-            state,
-            contract,
+            state.clone(),
+            contract.clone(),
         )
-        .await?;
+        .await;
+        cache_contract_locally(op_manager, key, state, contract, false).await;
+        send_result?;
         return Ok(());
     }
 
@@ -2026,20 +2052,24 @@ async fn drive_relay_get_inner(
                         contract = %key,
                         "GET relay: all peers exhausted — serving local fallback"
                     );
-                    // Relay path: is_client_requester=false (see top-of-loop
-                    // rationale).
-                    cache_contract_locally(op_manager, key, state.clone(), contract.clone(), false)
-                        .await;
-                    relay_send_found(
+                    // Forward upstream FIRST to keep cache off the critical
+                    // path (issue #4155 — see top-of-loop comment above the
+                    // R4 callsite for the full rationale). Cache ALWAYS
+                    // runs after forwarding so LRU/TTL bookkeeping fires
+                    // even when the forward errors. Relay path:
+                    // `is_client_requester=false` on the cache call.
+                    let send_result = relay_send_found(
                         op_manager,
                         incoming_tx,
                         instance_id,
                         upstream_addr,
                         key,
-                        state,
-                        contract,
+                        state.clone(),
+                        contract.clone(),
                     )
-                    .await?;
+                    .await;
+                    cache_contract_locally(op_manager, key, state, contract, false).await;
+                    send_result?;
                 } else {
                     tracing::warn!(
                         tx = %incoming_tx,
@@ -2225,8 +2255,42 @@ async fn drive_relay_get_inner(
                     %instance_id,
                     contract = %key,
                     phase = "relay_found",
-                    "GET relay: downstream returned Found — caching locally and bubbling upstream"
+                    "GET relay: downstream returned Found — forwarding upstream then caching locally"
                 );
+
+                // Feed the relay's successful peer choice into the local
+                // Router. Without this hook, only originator-side successes
+                // train the failure-probability model and per-peer dashboard
+                // panels stay empty on relay-heavy nodes. In-memory only,
+                // safe to run before forwarding.
+                crate::operations::record_relay_route_event(
+                    op_manager,
+                    peer.clone(),
+                    crate::ring::Location::from(&instance_id),
+                    crate::router::RouteOutcome::SuccessUntimed,
+                    crate::node::network_status::OpType::Get,
+                );
+
+                // Bubble up to upstream FIRST to keep cache off the
+                // critical path (issue #4155 — full rationale at the
+                // R4 callsite earlier in this fn). This is THE site
+                // where the perf win matters: a freshly-arrived
+                // downstream payload has no `state_matches`
+                // short-circuit yet, so the PutQuery runs full WASM
+                // `validate_state` + `update_state`. Caching ALWAYS
+                // runs after forwarding so LRU/TTL and
+                // `announce_contract_hosted` semantics are preserved
+                // even on send error.
+                let send_result = relay_send_found(
+                    op_manager,
+                    incoming_tx,
+                    instance_id,
+                    upstream_addr,
+                    key,
+                    state.clone(),
+                    contract.clone(),
+                )
+                .await;
 
                 // Cache locally (relay opportunistically caches forwarded
                 // Found payloads). `is_client_requester=false` so this node
@@ -2237,32 +2301,8 @@ async fn drive_relay_get_inner(
                 // hosting at a relay is still broadcast (matches legacy
                 // `get.rs:2370` which announces on any first-time relay
                 // cache).
-                cache_contract_locally(op_manager, key, state.clone(), contract.clone(), false)
-                    .await;
-
-                // Feed the relay's successful peer choice into the local
-                // Router. Without this hook, only originator-side successes
-                // train the failure-probability model and per-peer dashboard
-                // panels stay empty on relay-heavy nodes.
-                crate::operations::record_relay_route_event(
-                    op_manager,
-                    peer.clone(),
-                    crate::ring::Location::from(&instance_id),
-                    crate::router::RouteOutcome::SuccessUntimed,
-                    crate::node::network_status::OpType::Get,
-                );
-
-                // Bubble up to upstream.
-                relay_send_found(
-                    op_manager,
-                    incoming_tx,
-                    instance_id,
-                    upstream_addr,
-                    key,
-                    state,
-                    contract,
-                )
-                .await?;
+                cache_contract_locally(op_manager, key, state, contract, false).await;
+                send_result?;
                 return Ok(());
             }
             AttemptOutcome::Terminal(Terminal::Streaming { .. }) => {
@@ -2986,11 +3026,19 @@ mod tests {
         );
     }
 
-    /// T4: Downstream `Response{Found}` must call `cache_contract_locally`
-    /// before calling `relay_send_found`.  Ensures relay opportunistically
-    /// caches contract code.
+    /// T4: Downstream `Response{Found}` must forward upstream FIRST,
+    /// then cache locally. This pins the issue #4155 fix: caching runs
+    /// WASM `validate_state` on the single-threaded contract_handling
+    /// event loop and can take seconds. Forwarding first keeps cache
+    /// time off the upstream-visible critical path. The relay STILL
+    /// caches (just after forwarding) so local LRU/TTL and
+    /// `announce_contract_hosted` semantics are preserved.
+    ///
+    /// Reverting this ordering — putting `cache_contract_locally`
+    /// before `relay_send_found` — re-introduces the per-hop dwell
+    /// latency that #4155 was opened to fix.
     #[test]
-    fn relay_driver_caches_locally_on_found_response() {
+    fn relay_driver_forwards_upstream_before_caching_on_found_response() {
         let src = production_source();
         let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
         // Find the InlineFound arm inside the loop.
@@ -2998,15 +3046,84 @@ mod tests {
             .find("Terminal::InlineFound {")
             .expect("drive_relay_get_inner must handle Terminal::InlineFound");
         let tail = &body[found_arm..];
-        // Find cache and send in order within the arm.
+        // The arm must STILL cache locally — caching is opportunistic
+        // but load-bearing for hosting LRU/TTL.
         let cache_pos = tail.find("cache_contract_locally").unwrap_or(usize::MAX);
         let send_pos = tail.find("relay_send_found").unwrap_or(usize::MAX);
         assert!(
-            cache_pos < send_pos,
-            "cache_contract_locally must be called BEFORE relay_send_found \
-             in the InlineFound arm — the relay must cache the contract before \
-             bubbling the response upstream"
+            cache_pos != usize::MAX,
+            "relay InlineFound arm must STILL call cache_contract_locally — \
+             caching is opportunistic but load-bearing for LRU/TTL and \
+             `announce_contract_hosted` semantics"
         );
+        assert!(
+            send_pos != usize::MAX,
+            "relay InlineFound arm must call relay_send_found"
+        );
+        assert!(
+            send_pos < cache_pos,
+            "issue #4155: relay_send_found must be called BEFORE \
+             cache_contract_locally in the InlineFound arm. Caching first \
+             blocks the upstream-visible forward behind WASM validate_state \
+             on the single-threaded contract_handling event loop, which is \
+             the root cause of the per-hop dwell observed in #4155"
+        );
+    }
+
+    /// T4b: All three relay-driver callsites must forward upstream
+    /// BEFORE caching locally (issue #4155). Mirrors T4 for the other
+    /// two relay paths that the source-scrape
+    /// `all_relay_callsites_pass_is_client_requester_false` test already
+    /// recognizes (R4 immediate-serve, R10 exhaustion fallback, R12a
+    /// bubble-up).
+    #[test]
+    fn all_relay_callsites_forward_before_caching() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+
+        // For each relay-style block in the function, when both
+        // `relay_send_found(` and `cache_contract_locally(` appear, the
+        // forward must come first. We scan all paired occurrences.
+        let send_positions: Vec<usize> = body
+            .match_indices("relay_send_found(")
+            .map(|(i, _)| i)
+            .collect();
+        let cache_positions: Vec<usize> = body
+            .match_indices("cache_contract_locally(")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            send_positions.len(),
+            3,
+            "drive_relay_get_inner should have exactly three \
+             `relay_send_found(` callsites (R4 immediate, R10 fallback, \
+             R12a bubble-up). Found {} — a refactor has changed the shape.",
+            send_positions.len(),
+        );
+        assert_eq!(
+            cache_positions.len(),
+            3,
+            "drive_relay_get_inner should have exactly three \
+             `cache_contract_locally(` callsites. Found {} — a refactor \
+             has changed the shape.",
+            cache_positions.len(),
+        );
+        // Pair them up positionally and verify each `send` comes before
+        // its corresponding `cache`. The two slices are sorted by
+        // position by construction.
+        for (idx, (send_pos, cache_pos)) in send_positions
+            .iter()
+            .zip(cache_positions.iter())
+            .enumerate()
+        {
+            assert!(
+                send_pos < cache_pos,
+                "issue #4155: relay callsite #{idx} must forward upstream \
+                 (`relay_send_found`) BEFORE caching locally \
+                 (`cache_contract_locally`). Found send at {send_pos}, \
+                 cache at {cache_pos}."
+            );
+        }
     }
 
     /// T5: Exhaustion path must send NotFound upstream.

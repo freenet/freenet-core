@@ -63,6 +63,39 @@ calling `OpCtx::send_and_await`. The reply may arrive on the very
 next poll.
 ```
 
+## Critical Invariant: Forward Upstream Before Contract-Handling Work on Relay Paths
+
+On a relay driver's response path, any operation that enqueues on the
+single-threaded `contract_handling` event loop (GetQuery, PutQuery,
+validate_state, `RequestRelated` recursion, etc.) MUST be sequenced
+AFTER the upstream forward. Reversing this puts WASM `validate_state`
+and the 10s `RELATED_FETCH_TIMEOUT` directly on the upstream-visible
+critical path, where they stack across multi-hop traversals.
+
+```
+RIGHT (issue #4155 fix):
+  let send_result = relay_send_found(...).await;
+  cache_contract_locally(...).await;   // cache opportunistically
+  send_result?;                         // propagate forward error AFTER cache
+
+WRONG (re-introduces #4155):
+  cache_contract_locally(...).await;   // blocks the relay for seconds
+  relay_send_found(...).await?;        // upstream waits for the cache
+```
+
+This applies symmetrically to GET, PUT, UPDATE, SUBSCRIBE relay
+drivers. The source-scrape pin tests
+`all_relay_callsites_forward_before_caching` /
+`relay_driver_forwards_upstream_before_caching_on_found_response` in
+`crates/core/src/operations/get/op_ctx_task.rs` cover GET. Equivalent
+pin tests should be added if a relay driver in another op grows a
+post-forward contract-handling step.
+
+The originator (`drive_client_get_inner`, `drive_client_put_inner`,
+etc.) and sub-op drivers must STILL cache before completing to the
+client — they validate the state for the local client, and skipping
+that would expose unvalidated bytes to the application layer.
+
 ## State Machine Rules
 
 ### WHEN implementing a new operation state
