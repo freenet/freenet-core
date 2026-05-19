@@ -53,7 +53,7 @@ sha2 = "0.11"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 
 # Data structures/storage
-dashmap = "6.1"
+dashmap = "6.2"
 lru = "0.18.0"
 redb = "4"
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"] }
