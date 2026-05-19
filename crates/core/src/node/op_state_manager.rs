@@ -378,17 +378,13 @@ impl OpManager {
         }
     }
 
-    /// Non-blocking variant of [`Self::release_pending_op_slot`]: emits
-    /// `NodeEvent::TransactionCompleted(tx)` via `try_send`.
-    ///
-    /// Safe to call from the network event loop, where awaiting the
-    /// notification channel would risk deadlock. The notification is
-    /// best-effort: if the channel is momentarily full, the driver
-    /// parked in `OpCtx::send_and_await` for `tx` falls back to waiting
-    /// for the `OPERATION_TTL` timeout.
-    ///
-    /// Used by `P2pBridge::handle_orphaned_transactions` to wake
-    /// drivers whose downstream peer has just disconnected (#4154).
+    /// Non-blocking variant of [`Self::release_pending_op_slot`] for callers
+    /// that run on the network event loop (where `send().await` could
+    /// deadlock). Used by `P2pBridge::handle_orphaned_transactions` to wake
+    /// drivers whose downstream peer has just disconnected (#4154). The
+    /// notification is best-effort: on a transiently-full channel the
+    /// driver falls back to its `OPERATION_TTL` timeout. See
+    /// [`try_release_pending_op_slot_on`] for the underlying send logic.
     pub(crate) fn try_release_pending_op_slot(&self, tx: Transaction) {
         try_release_pending_op_slot_on(&self.to_event_listener.notifications_sender, tx);
     }
@@ -851,16 +847,12 @@ async fn release_pending_op_slot_on(
 }
 
 /// Non-blocking emit of `NodeEvent::TransactionCompleted(tx)` on the
-/// event-loop notification channel.
+/// event-loop notification channel; returns `true` when enqueued.
 ///
 /// Extracted from [`OpManager::try_release_pending_op_slot`] so it can be
-/// exercised in unit tests without building a full `OpManager`. Returns
-/// `true` when the notification was enqueued.
-///
-/// Safe to call from inside the network event loop (where `send().await`
-/// could deadlock). Best-effort: a momentarily-full channel produces a
-/// warning, and the parked driver falls back to its `OPERATION_TTL`
-/// timeout. See #4154 for the disconnect-orphan scenario this powers.
+/// exercised in unit tests without building a full `OpManager`. Best-effort:
+/// a momentarily-full or closed channel produces a warning and the parked
+/// driver falls back to its `OPERATION_TTL` timeout (#4154).
 fn try_release_pending_op_slot_on(
     notifications_sender: &mpsc::Sender<Either<NetMessage, NodeEvent>>,
     tx: Transaction,
@@ -1284,7 +1276,6 @@ mod tests {
             .expect("timed out waiting for TransactionCompleted emission")
             .expect("notification channel closed");
 
-        #[allow(clippy::wildcard_enum_match_arm)]
         match received {
             Either::Right(NodeEvent::TransactionCompleted(observed)) => {
                 assert_eq!(observed, tx, "emitted tx must match the argument");
@@ -1412,24 +1403,15 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────
-    // Regression tests for #4154: parked GET drivers must be woken
-    // when their downstream peer disconnects, not wait `OPERATION_TTL`.
-    //
-    // Before the fix, `P2pBridge::handle_orphaned_transactions` only
-    // logged the orphan list (`driver-owned cancellation` was
-    // aspirational — nothing ever cancelled). A GET op forwarded to a
-    // peer that then disconnected blocked in
-    // `OpCtx::send_and_await::response_receiver.recv()` for the full
-    // 60 s `OPERATION_TTL` before retrying — exactly the 62 s stall
-    // captured in the issue's telemetry.
-    //
-    // The fix wires `handle_orphaned_transactions` to emit
-    // `TransactionCompleted(tx)` for each orphan via the standalone
-    // helper `try_release_pending_op_slot_on`. The event-loop handler
-    // drops the matching `pending_op_results` sender, which closes the
-    // driver's response channel; `recv()` returns `None`, mapped to
-    // `OpError::NotificationError` by `send_and_await`; the retry loop
-    // advances to the next peer in milliseconds rather than seconds.
+    // Regression tests for #4154: parked drivers must be woken when
+    // their downstream peer disconnects, not wait `OPERATION_TTL`.
+    // Pre-fix, `handle_orphaned_transactions` only logged orphans and
+    // a forwarded GET blocked the full 60 s before retrying. The fix
+    // emits `TransactionCompleted(tx)` per orphan via
+    // `try_release_pending_op_slot_on`, the event loop drops the
+    // matching `pending_op_results` sender, and the driver's `recv()`
+    // returns `None` — `send_and_await` maps that to
+    // `OpError::NotificationError` and the retry loop advances.
     // ──────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1480,29 +1462,14 @@ mod tests {
 
     #[tokio::test]
     async fn orphaned_transaction_wakes_parked_pending_op_results_waiter() {
-        // End-to-end pipeline test for #4154 without standing up a
-        // full node:
-        //
-        // 1. Driver calls `OpCtx::send_and_await` → event loop installs
-        //    a `Sender<NetMessage>` in `pending_op_results[tx]`. The
-        //    driver holds the `Receiver` and awaits `recv()`.
-        // 2. Downstream peer disconnects → `prune_connection` returns
-        //    `[tx]` from `live_tx_tracker`.
-        // 3. `handle_orphaned_transactions` calls
-        //    `try_release_pending_op_slot(tx)` (via the helper) to emit
-        //    `TransactionCompleted(tx)`.
-        // 4. Event loop processes the event → drops the sender from
-        //    `pending_op_results`.
-        // 5. Driver's `Receiver::recv()` returns `None` immediately
-        //    (channel closed) — driver advances to the next peer.
-        //
-        // Pre-fix, step 3 was a no-op and step 5 never happened; the
-        // driver blocked the full `OPERATION_TTL` (60 s). This test
-        // forces the wake to complete in well under a second.
+        // End-to-end pipeline test for #4154 without standing up a full
+        // node. Reproduces the driver → notification-channel → event-
+        // loop → sender-drop → driver-wakeup sequence and asserts it
+        // completes in under 100 ms (pre-fix it would hang `OPERATION_TTL`).
         let (mut event_loop_receiver, notifier) = event_loop_notification_channel();
 
-        // (1) Simulate the `pending_op_results[tx] = sender` registration
-        // and the driver's pending `recv()`.
+        // Stand in for `pending_op_results[tx] = sender` and the driver's
+        // pending `recv()` on the matching receiver.
         let (response_sender, mut driver_response_rx) =
             tokio::sync::mpsc::channel::<crate::message::NetMessage>(1);
         let mut pending_op_results: std::collections::HashMap<
@@ -1512,12 +1479,12 @@ mod tests {
         let tx = Transaction::ttl_transaction();
         pending_op_results.insert(tx, response_sender);
 
-        // (3) Trigger the wake — the orphan-handler path under test.
+        // Trigger the wake — this is the orphan-handler path under test.
         let delivered = super::try_release_pending_op_slot_on(notifier.notifications_sender(), tx);
         assert!(delivered, "orphan-handler helper must enqueue notification");
 
-        // (4) Mimic the event loop's `TransactionCompleted` arm:
-        // drop the sender from `pending_op_results`.
+        // Mimic the event loop's `TransactionCompleted` arm by dropping the
+        // sender out of `pending_op_results`.
         let event = timeout(
             Duration::from_millis(100),
             event_loop_receiver.notifications_receiver.recv(),
@@ -1535,9 +1502,8 @@ mod tests {
             }
         }
 
-        // (5) The driver's `recv()` must now resolve to `None`
-        // immediately. Pre-fix this would have hung the full
-        // `OPERATION_TTL`; we cap the test at 100 ms to fail fast.
+        // The driver's `recv()` must now resolve to `None` immediately —
+        // pre-fix this hung the full `OPERATION_TTL`. Cap at 100 ms.
         let driver_wakeup = timeout(Duration::from_millis(100), driver_response_rx.recv()).await;
         match driver_wakeup {
             Ok(None) => {

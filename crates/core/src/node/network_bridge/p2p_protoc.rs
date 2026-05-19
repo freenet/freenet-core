@@ -1980,12 +1980,11 @@ impl P2pConnManager {
                                 if state.pending_op_results.remove(&tx).is_some() {
                                     crate::config::GlobalTestMetrics::record_pending_op_remove();
                                 }
-                                // Clean up live_tx_tracker too. `handle_op_execution`
-                                // registers `(tx → target_addr)` for messages with an
-                                // explicit target (#4154) so that disconnect-cancellation
-                                // can find the tx. Without this cleanup those entries
-                                // would leak past op completion. Idempotent with the
-                                // explicit `op_manager.completed(client_tx)` that
+                                // Clean up the `live_tx_tracker` entry registered
+                                // by `handle_op_execution` for messages with an
+                                // explicit target (#4154); otherwise per-attempt
+                                // entries leak past op completion. Idempotent with
+                                // the `op_manager.completed(client_tx)` that
                                 // drivers call on terminal exit.
                                 ctx.bridge
                                     .op_manager
@@ -3858,24 +3857,16 @@ impl P2pConnManager {
                 // register as a downstream subscriber on the home node.
                 match target_addr {
                     Some(target_addr) => {
-                        // Track `tx → target_addr` so that if the downstream
-                        // peer disconnects before the reply arrives,
-                        // `prune_connection` enumerates this tx and
-                        // `handle_orphaned_transactions` wakes the parked
-                        // driver (#4154). `send()`-path messages already
-                        // registered via `sending_transaction`; this
-                        // covers the `op_execution_sender` path used by
-                        // `send_to_and_await` / `send_fire_and_forget`
-                        // (originator-loopback relay forward), which
-                        // bypasses `P2pBridge::send` entirely.
-                        //
-                        // Cleanup happens in the `TransactionCompleted`
-                        // handler which calls `remove_finished_transaction`.
-                        // A duplicate entry from CONNECT (which also
-                        // registers at `Ring::initiate_connect`) is
-                        // tolerated — `remove_finished_transaction` /
-                        // `prune_transactions_from_peer` clear all matching
-                        // entries.
+                        // Track `tx → target_addr` so disconnect-cancellation in
+                        // `prune_connection` / `handle_orphaned_transactions` can
+                        // wake the parked driver (#4154). The `P2pBridge::send`
+                        // path registers via `sending_transaction`; this branch
+                        // covers the `op_execution_sender` path
+                        // (`send_to_and_await` / `send_fire_and_forget`), which
+                        // bypasses `P2pBridge::send`. Cleanup happens in the
+                        // `TransactionCompleted` handler; duplicate entries from
+                        // CONNECT's `Ring::initiate_connect` registration are
+                        // tolerated by `remove_finished_transaction`.
                         self.bridge
                             .op_manager
                             .ring
@@ -5462,25 +5453,16 @@ mod tests {
     }
 
     /// Regression guard for #4154: `handle_orphaned_transactions` must not
-    /// revert to a logging-only stub. The orphan handler must actively
-    /// wake parked drivers — otherwise a GET (or relayed op) issued just
-    /// before its downstream peer disconnects blocks the full
-    /// `OPERATION_TTL` (60 s) before retrying.
-    ///
-    /// We assert the function body calls `try_release_pending_op_slot`
-    /// (the standalone helper that emits `TransactionCompleted` so the
-    /// event loop drops the matching `pending_op_results` sender). If a
-    /// future refactor renames the helper, update both the call site and
-    /// this guard together.
+    /// revert to a logging-only stub. If a future refactor renames the
+    /// helper, update both the call site and this guard together.
     #[test]
     fn handle_orphaned_transactions_wakes_parked_drivers() {
         let src = include_str!("p2p_protoc.rs");
         let handler_start = src
             .find("pub(crate) async fn handle_orphaned_transactions(")
             .expect("handle_orphaned_transactions must exist");
-        // Take everything up to the end of the function (the next `}` at
-        // column 0 — `async fn` impl methods close at indent level 4, so
-        // `\n    }\n` reliably bounds it).
+        // Bound the body at the next `\n    }\n` — `async fn` impl methods
+        // close at indent level 4.
         let body_after = &src[handler_start..];
         let end = body_after
             .find("\n    }\n")
