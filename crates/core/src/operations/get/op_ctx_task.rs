@@ -25,8 +25,14 @@
 //!
 //! # Connection-drop latency
 //!
-//! Disconnect detection relies on `OPERATION_TTL` (60s) — accepted
-//! ceiling.
+//! Disconnect detection is event-driven: when a peer disconnects,
+//! `Ring::prune_connection` enumerates `LiveTransactionTracker` orphans
+//! and `P2pBridge::handle_orphaned_transactions` emits
+//! `NodeEvent::TransactionCompleted` for each, which closes the
+//! parked driver's `pending_op_results` waiter. Wake latency is
+//! sub-millisecond (#4154). `OPERATION_TTL` (60 s) remains the upper
+//! bound for cases where the downstream peer never formally
+//! disconnects — silent stalls, slow-loris, partition-without-prune.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

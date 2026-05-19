@@ -175,11 +175,20 @@ impl P2pBridge {
         }
     }
 
-    /// Log transactions orphaned by a pruned peer connection.
+    /// Wake any drivers whose downstream peer just disconnected.
     ///
-    /// Drivers own retry/cancellation; the orphan list is informational
-    /// only — used by callers to confirm prune occurred. No retry is
-    /// dispatched here.
+    /// For each orphaned `tx` we emit
+    /// `NodeEvent::TransactionCompleted(tx)` via `try_send`. The event-
+    /// loop handler at `NodeEvent::TransactionCompleted` drops the
+    /// matching `pending_op_results` sender, which closes the channel
+    /// the driver is awaiting in `OpCtx::send_and_await`. The driver
+    /// then sees `Err(OpError::NotificationError)`; the shared retry
+    /// loop (`drive_retry_loop`) routes that to `advance()` and tries
+    /// the next peer.
+    ///
+    /// Without this hop, a GET (or other relayed op) issued just before
+    /// its downstream peer disconnected would block for the full
+    /// `OPERATION_TTL` (60 s) before retrying — see #4154.
     pub(crate) async fn handle_orphaned_transactions(
         &self,
         transactions: Vec<Transaction>,
@@ -190,8 +199,11 @@ impl P2pBridge {
         }
         tracing::debug!(
             count = transactions.len(),
-            "Orphaned transactions from pruned connection (driver-owned cancellation)"
+            "Orphaned transactions from pruned connection — waking parked drivers"
         );
+        for tx in transactions {
+            self.op_manager.try_release_pending_op_slot(tx);
+        }
     }
 
     /// Send stream data with an explicit completion signal.
@@ -1968,6 +1980,17 @@ impl P2pConnManager {
                                 if state.pending_op_results.remove(&tx).is_some() {
                                     crate::config::GlobalTestMetrics::record_pending_op_remove();
                                 }
+                                // Clean up the `live_tx_tracker` entry registered
+                                // by `handle_op_execution` for messages with an
+                                // explicit target (#4154); otherwise per-attempt
+                                // entries leak past op completion. Idempotent with
+                                // the `op_manager.completed(client_tx)` that
+                                // drivers call on terminal exit.
+                                ctx.bridge
+                                    .op_manager
+                                    .ring
+                                    .live_tx_tracker
+                                    .remove_finished_transaction(tx);
                             }
                             NodeEvent::LocalSubscribeComplete {
                                 tx,
@@ -3833,9 +3856,39 @@ impl P2pConnManager {
                 // would otherwise short-circuit in `process_message` and never
                 // register as a downstream subscriber on the home node.
                 match target_addr {
-                    Some(target_addr) => EventResult::Event(
-                        ConnEvent::OutboundMessageWithTarget { target_addr, msg }.into(),
-                    ),
+                    Some(target_addr) => {
+                        // Track `tx → target_addr` so disconnect-cancellation in
+                        // `prune_connection` / `handle_orphaned_transactions` can
+                        // wake the parked driver (#4154). Two cases register here:
+                        //   - `send_to_and_await`: this branch just installed a
+                        //     waiter into `pending_op_results` above.
+                        //   - `send_fire_and_forget` from a relay driver running
+                        //     on the originator: the callback is closed (no insert
+                        //     above) but the originator's client driver has an
+                        //     earlier `pending_op_results[tx]` waiter that needs
+                        //     waking.
+                        // Skip when no waiter is present (e.g. cancelled-driver
+                        // teardown races) — registering with nothing to wake would
+                        // leak a live_tx_tracker entry until the peer disconnects.
+                        // Same-peer duplicates (e.g. CONNECT's parallel
+                        // `Ring::initiate_connect` registration) are tolerated by
+                        // `remove_finished_transaction`'s per-peer `retain`. Cross-
+                        // peer rebinds (same tx forwarded to two peers in turn) leave
+                        // a stale entry on the earlier peer until that peer
+                        // disconnects — a known limitation documented in
+                        // `LiveTransactionTracker::add_transaction`'s rustdoc.
+                        let tx = *msg.id();
+                        if state.pending_op_results.contains_key(&tx) {
+                            self.bridge
+                                .op_manager
+                                .ring
+                                .live_tx_tracker
+                                .add_transaction(target_addr, tx);
+                        }
+                        EventResult::Event(
+                            ConnEvent::OutboundMessageWithTarget { target_addr, msg }.into(),
+                        )
+                    }
                     None => EventResult::Event(ConnEvent::InboundMessage(msg.into()).into()),
                 }
             }
@@ -5409,6 +5462,30 @@ mod tests {
             GlobalTestMetrics::pending_op_removes() - removes_before,
             3,
             "Drop must record one pending_op_remove per resident entry"
+        );
+    }
+
+    /// Regression guard for #4154: `handle_orphaned_transactions` must not
+    /// revert to a logging-only stub. If a future refactor renames the
+    /// helper, update both the call site and this guard together.
+    #[test]
+    fn handle_orphaned_transactions_wakes_parked_drivers() {
+        let src = include_str!("p2p_protoc.rs");
+        let handler_start = src
+            .find("pub(crate) async fn handle_orphaned_transactions(")
+            .expect("handle_orphaned_transactions must exist");
+        // Bound the body at the next `\n    }\n` — `async fn` impl methods
+        // close at indent level 4.
+        let body_after = &src[handler_start..];
+        let end = body_after
+            .find("\n    }\n")
+            .expect("handle_orphaned_transactions must close cleanly");
+        let body = &body_after[..end];
+        assert!(
+            body.contains("try_release_pending_op_slot"),
+            "handle_orphaned_transactions must call \
+             try_release_pending_op_slot to wake parked drivers (#4154). \
+             Found body:\n{body}"
         );
     }
 
