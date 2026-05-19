@@ -3575,8 +3575,12 @@ pub(crate) enum GetEvent {
     /// An upstream peer received a ForwardingAck from a downstream relay.
     ///
     /// When received, `ack_received` is set to `true`, which prevents the GC task
-    /// from launching speculative retries. If the downstream chain then stalls,
-    /// the originator waits the full OPERATION_TTL with no recovery (#3570).
+    /// from launching speculative retries. If the downstream chain then stalls
+    /// (downstream peer never formally disconnects), the originator waits the full
+    /// OPERATION_TTL with no recovery (#3570). Formal disconnect of the immediate
+    /// downstream peer now wakes the parked driver sub-ms via
+    /// `handle_orphaned_transactions` (#4154); the no-recovery window remains for
+    /// silent stalls / slow-loris where no disconnect signal arrives.
     ForwardingAckReceived {
         id: Transaction,
         /// The peer that received the ACK (originator or intermediate relay).

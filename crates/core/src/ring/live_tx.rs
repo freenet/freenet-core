@@ -21,22 +21,29 @@ pub struct LiveTransactionTracker {
 impl LiveTransactionTracker {
     /// Register that transaction `tx` is in flight to `peer_addr`.
     ///
-    /// Idempotent and rebind-safe:
+    /// Single-writer-per-tx semantics: callers ARE expected to serialize
+    /// registrations for the same `tx` (typically a single driver task
+    /// owns each transaction). Under that contract:
     /// - Same `(peer_addr, tx)` re-registration is a no-op (no Vec duplication).
     /// - Re-registering `tx` to a different peer scrubs the previous
-    ///   peer's entry, so a tx that flows through multiple peers ends up
-    ///   tracked against exactly the most recent one. Pre-#4154 a CONNECT
-    ///   ride-along (`Ring::initiate_connect` + `handle_op_execution`)
-    ///   silently double-counted in `active_connect_transaction_count`;
-    ///   a relay re-sending response-side to its upstream after sending
-    ///   the request-side downstream left a stale entry on the
-    ///   downstream peer that only cleaned up on disconnect.
+    ///   peer's forward-index entry, so a tx that flows through multiple
+    ///   peers ends up tracked against exactly the most recent one.
+    ///   Pre-#4154 a CONNECT ride-along (`Ring::initiate_connect` +
+    ///   `handle_op_execution`) silently double-counted in
+    ///   `active_connect_transaction_count`; a relay re-sending
+    ///   response-side to its upstream after sending the request-side
+    ///   downstream left a stale entry on the downstream peer that only
+    ///   cleaned up on disconnect.
     ///
-    /// Concurrency note: the reverse-index insert happens first so a
-    /// racing `remove_finished_transaction` always sees a consistent
-    /// `(tx → peer)` mapping and cleans the matching forward-index
-    /// entry. The cross-peer scrub uses `remove_if_mut`'s atomic
-    /// retain-and-prune.
+    /// Concurrency caveat: the two DashMap operations (reverse-index
+    /// insert + forward-index push/scrub) are individually atomic but
+    /// NOT serialized as a pair. If a racing `remove_finished_transaction`
+    /// slips between them, an orphan forward-index entry can remain
+    /// until the peer disconnects — `prune_transactions_from_peer`
+    /// reaps it then. This matches the pre-#4154 fallback behavior,
+    /// not the wake-on-disconnect fast path. Hold single-writer
+    /// discipline or add per-tx serialization at the call site if the
+    /// race becomes problematic.
     pub fn add_transaction(&self, peer_addr: SocketAddr, tx: Transaction) {
         let prev = self.peer_for_tx.insert(tx, peer_addr);
         match prev {
