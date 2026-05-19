@@ -19,47 +19,23 @@ pub struct LiveTransactionTracker {
 }
 
 impl LiveTransactionTracker {
-    /// Register that transaction `tx` is in flight to `peer_addr`.
-    ///
-    /// Single-writer-per-tx semantics: callers ARE expected to serialize
-    /// registrations for the same `tx` (typically a single driver task
-    /// owns each transaction). Under that contract:
-    /// - Same `(peer_addr, tx)` re-registration is a no-op (no Vec duplication).
-    /// - Re-registering `tx` to a different peer scrubs the previous
-    ///   peer's forward-index entry, so a tx that flows through multiple
-    ///   peers ends up tracked against exactly the most recent one.
-    ///   Pre-#4154 a CONNECT ride-along (`Ring::initiate_connect` +
-    ///   `handle_op_execution`) silently double-counted in
-    ///   `active_connect_transaction_count`; a relay re-sending
-    ///   response-side to its upstream after sending the request-side
-    ///   downstream left a stale entry on the downstream peer that only
-    ///   cleaned up on disconnect.
-    ///
-    /// Concurrency caveat: the two DashMap operations (reverse-index
-    /// insert + forward-index push/scrub) are individually atomic but
-    /// NOT serialized as a pair. If a racing `remove_finished_transaction`
-    /// slips between them, an orphan forward-index entry can remain
-    /// until the peer disconnects — `prune_transactions_from_peer`
-    /// reaps it then. This matches the pre-#4154 fallback behavior,
-    /// not the wake-on-disconnect fast path. Hold single-writer
-    /// discipline or add per-tx serialization at the call site if the
-    /// race becomes problematic.
     pub fn add_transaction(&self, peer_addr: SocketAddr, tx: Transaction) {
-        let prev = self.peer_for_tx.insert(tx, peer_addr);
-        match prev {
-            Some(prev_addr) if prev_addr == peer_addr => {
-                // Idempotent re-registration; don't duplicate in tx_per_peer's Vec.
-                return;
-            }
-            Some(prev_addr) => {
-                // Different peer: scrub the stale forward-index entry.
-                self.tx_per_peer.remove_if_mut(&prev_addr, |_, v| {
-                    v.retain(|otx| otx != &tx);
-                    v.is_empty()
-                });
-            }
-            None => {}
-        }
+        // Insert to reverse index first to prevent race condition:
+        // If remove_finished_transaction runs concurrently, it will find the tx
+        // in peer_for_tx and clean up properly. If we did tx_per_peer first,
+        // a concurrent remove could miss the tx in peer_for_tx and leave orphans.
+        //
+        // NOTE: this is the pre-#4154 behavior. Re-registering the same
+        // `tx` against multiple peers leaves stale entries in the older
+        // peers' `tx_per_peer` Vec. Rebind-safe semantics were attempted
+        // in PR #4164 but interacted badly with topology maintenance:
+        // the "inflated" Vec entries acted as a soft signal that masked
+        // peers from neighbor consideration, and tightening that
+        // semantic caused `test_six_peer_contract_lifecycle` to diverge
+        // (CRDT broadcast missed one peer). Until topology maintenance
+        // is decoupled from `has_live_connection`, keep the loose
+        // semantics here.
+        self.peer_for_tx.insert(tx, peer_addr);
         self.tx_per_peer.entry(peer_addr).or_default().push(tx);
     }
 
@@ -284,72 +260,5 @@ mod tests {
         // Prune nonexistent peer returns empty
         let pruned = tracker.prune_transactions_from_peer(addr1);
         assert!(pruned.is_empty());
-    }
-
-    /// Regression for #4154: re-registering the same `(peer, tx)` pair
-    /// must be a no-op (no Vec duplication). The CONNECT ride-along
-    /// path (`Ring::initiate_connect` adds `(gw, tx)`, then
-    /// `handle_op_execution` re-adds the same pair when the request
-    /// flows through `send_to_and_collect_replies`) otherwise inflates
-    /// `active_connect_transaction_count` and throttles concurrent
-    /// CONNECT acquisitions.
-    #[test]
-    fn add_transaction_is_idempotent_for_same_pair() {
-        let tracker = LiveTransactionTracker::new();
-        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        let tx = Transaction::new::<ConnectMsg>();
-
-        tracker.add_transaction(addr, tx);
-        tracker.add_transaction(addr, tx);
-        tracker.add_transaction(addr, tx);
-
-        assert_eq!(tracker.active_transaction_count(), 1);
-        assert_eq!(tracker.active_connect_transaction_count(), 1);
-        assert_eq!(tracker.peer_for_tx.len(), 1);
-
-        // Single removal must clean both indices fully.
-        tracker.remove_finished_transaction(tx);
-        assert_eq!(tracker.active_transaction_count(), 0);
-        assert!(!tracker.has_live_connection(addr));
-        assert_eq!(tracker.peer_for_tx.len(), 0);
-    }
-
-    /// Regression for #4154: a relay that forwards a request downstream
-    /// then later sends a response back upstream re-registers the same
-    /// tx against a different peer. Before the fix, the old peer's
-    /// forward-index Vec retained the tx until that peer disconnected.
-    /// After the fix, the second registration scrubs the stale entry.
-    #[test]
-    fn add_transaction_rebinds_to_new_peer() {
-        let tracker = LiveTransactionTracker::new();
-        let downstream: SocketAddr = "127.0.0.1:9001".parse().unwrap();
-        let upstream: SocketAddr = "127.0.0.1:9002".parse().unwrap();
-        let tx = Transaction::new::<GetMsg>();
-
-        // Relay first forwards request to downstream.
-        tracker.add_transaction(downstream, tx);
-        assert!(tracker.has_live_connection(downstream));
-        assert!(!tracker.has_live_connection(upstream));
-
-        // Then forwards the response back to upstream — `tx` migrates.
-        tracker.add_transaction(upstream, tx);
-        assert!(
-            !tracker.has_live_connection(downstream),
-            "downstream's stale forward-index entry must be scrubbed"
-        );
-        assert!(tracker.has_live_connection(upstream));
-        assert_eq!(tracker.peer_for_tx.len(), 1);
-        assert_eq!(tracker.active_transaction_count(), 1);
-
-        // Pruning the (now-stale) downstream peer must NOT find `tx`.
-        let pruned = tracker.prune_transactions_from_peer(downstream);
-        assert!(
-            pruned.is_empty(),
-            "rebinding must leave the old peer with no orphan claim on tx"
-        );
-
-        // Upstream's prune still picks up tx as expected.
-        let pruned = tracker.prune_transactions_from_peer(upstream);
-        assert_eq!(pruned, vec![tx]);
     }
 }

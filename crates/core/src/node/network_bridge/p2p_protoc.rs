@@ -3870,11 +3870,9 @@ impl P2pConnManager {
                         // Skip when no waiter is present (e.g. cancelled-driver
                         // teardown races) — registering with nothing to wake would
                         // leak a live_tx_tracker entry until the peer disconnects.
-                        // `add_transaction` is idempotent + rebind-safe, so the
-                        // CONNECT ride-along (also registered at
-                        // `Ring::initiate_connect`) does not double-count, and a
-                        // relay that response-sends back to its upstream after
-                        // forwarding downstream cleanly migrates the entry.
+                        // Duplicate entries from CONNECT's `Ring::initiate_connect`
+                        // registration are tolerated by `remove_finished_transaction`,
+                        // which uses `retain` to clear all matching entries.
                         let tx = *msg.id();
                         if state.pending_op_results.contains_key(&tx) {
                             self.bridge
