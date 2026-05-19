@@ -154,6 +154,58 @@ CORRECT:
 - All `retain()` / sweep loops — verify exemption conditions have TTL or absolute age bounds
 - `ConnectionManager` fields — verify each map has a documented cleanup owner
 
+### Cross-DashMap Lock Discipline (`significant_drop_tightening` exception)
+
+```
+Some methods mutate a primary DashMap entry and then write to a SECOND
+DashMap that mirrors that state (a reverse index, a hash index, etc.).
+For those methods, the primary entry's shard guard MUST be held across
+the secondary write.
+
+This intentionally lifts the `significant_drop_tightening` clippy lint:
+the guard is load-bearing for atomicity against a concurrent remover,
+not for serializing unrelated callers. A blind `cargo clippy --fix` (or
+agent applying the lint) will silently re-introduce a race.
+
+WRONG (PR #4129 shape):
+  let became = {
+      let mut entry = self.primary.entry(key).or_default();
+      entry.add_reason()
+  };  // <-- guard dropped here
+  self.secondary_index.insert(key);  // <-- racy: a concurrent remover
+                                     //     can run `cleanup_if_no_reasons`
+                                     //     between the drop and the insert,
+                                     //     no-op-removing the not-yet-present
+                                     //     secondary entry, then this insert
+                                     //     leaks a zombie.
+
+CORRECT (PR #4171 shape):
+  let mut entry = self.primary.entry(key).or_default();
+  let became = entry.add_reason();
+  self.secondary_index.insert(key);  // <-- still under the primary guard
+  drop(entry);                       // explicit for documentation only
+  became
+```
+
+Concrete cases in this crate:
+- `InterestManager::{register_peer_interest, register_local_hosting,
+  add_local_client, add_downstream_subscriber, register_local_interest}`
+  hold `interested_peers` or `local_interests` across
+  `index_contract_hash` so a concurrent `remove_*` cannot run
+  `cleanup_contract_if_no_interest` → `unindex_contract_hash` in the
+  window between guard drop and indexing. See PR #4129 (introduced the
+  race) and PR #4171 (restored the discipline).
+
+Audit grep when adding a new method that touches multiple DashMaps:
+- Identify the primary map whose presence is the source of truth for
+  interest/membership.
+- Identify any secondary map that mirrors that state.
+- Confirm the primary guard is held across the secondary write.
+- Add an inline `// hold the X guard across Y to prevent the Z race`
+  comment so a future clippy pass leaves a footprint when it tries to
+  drop the guard.
+```
+
 ## Trigger-Action Rules
 
 ### BEFORE modifying ConnectionManager
