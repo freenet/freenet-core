@@ -3870,9 +3870,13 @@ impl P2pConnManager {
                         // Skip when no waiter is present (e.g. cancelled-driver
                         // teardown races) — registering with nothing to wake would
                         // leak a live_tx_tracker entry until the peer disconnects.
-                        // Duplicate entries from CONNECT's `Ring::initiate_connect`
-                        // registration are tolerated by `remove_finished_transaction`,
-                        // which uses `retain` to clear all matching entries.
+                        // Same-peer duplicates (e.g. CONNECT's parallel
+                        // `Ring::initiate_connect` registration) are tolerated by
+                        // `remove_finished_transaction`'s per-peer `retain`. Cross-
+                        // peer rebinds (same tx forwarded to two peers in turn) leave
+                        // a stale entry on the earlier peer until that peer
+                        // disconnects — a known limitation documented in
+                        // `LiveTransactionTracker::add_transaction`'s rustdoc.
                         let tx = *msg.id();
                         if state.pending_op_results.contains_key(&tx) {
                             self.bridge
