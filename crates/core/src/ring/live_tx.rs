@@ -261,4 +261,34 @@ mod tests {
         let pruned = tracker.prune_transactions_from_peer(addr1);
         assert!(pruned.is_empty());
     }
+
+    /// Pins the load-bearing invariant for `Ring::connection_maintenance`
+    /// (`crates/core/src/ring.rs:2360-2365`): once a `tx` has been
+    /// registered against a peer, `has_live_connection(that_peer)` must
+    /// remain `true` until the tx is explicitly cleared, even after the
+    /// same `tx` is re-registered against another peer.
+    ///
+    /// Tightening this (`add_transaction` made rebind-safe in an earlier
+    /// commit of #4164) caused `test_six_peer_contract_lifecycle` to
+    /// diverge: topology saw a wider candidate-neighbor set and made a
+    /// different RemoveConnections decision, breaking a CRDT broadcast
+    /// chain. See the topology-coupling note in
+    /// `LiveTransactionTracker::add_transaction`'s rustdoc.
+    #[test]
+    fn add_transaction_rebind_preserves_old_peer_has_live_connection() {
+        let tracker = LiveTransactionTracker::new();
+        let addr1: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        let tx = Transaction::new::<GetMsg>();
+
+        tracker.add_transaction(addr1, tx);
+        tracker.add_transaction(addr2, tx);
+
+        assert!(
+            tracker.has_live_connection(addr1),
+            "old peer must retain has_live_connection=true after rebind \
+             (topology-coupling invariant for Ring::connection_maintenance)"
+        );
+        assert!(tracker.has_live_connection(addr2));
+    }
 }
