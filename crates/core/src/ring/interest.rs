@@ -385,16 +385,16 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         is_upstream: bool,
     ) -> bool {
         let now = self.time_source.now();
-        // Release the `interested_peers` shard guard before touching
-        // `peer_contracts` and `index_contract_hash` — those acquire their
-        // own DashMap shards, so holding the first guard across them
-        // serializes unrelated callers (clippy: `significant_drop_tightening`).
-        let is_new = {
-            let mut entry = self.interested_peers.entry(*contract).or_default();
-            let is_new = !entry.contains_key(&peer);
-            entry.insert(peer.clone(), PeerInterest::new(summary, is_upstream, now));
-            is_new
-        };
+        // Hold the `interested_peers` shard guard across `peer_contracts`
+        // insertion and `index_contract_hash` to keep the three writes
+        // atomic against a concurrent `remove_peer_interest` (which would
+        // otherwise observe a fully-removed peer and unindex a contract
+        // we're about to re-index, leaving a zombie entry).
+        // This intentionally undoes the PR #4129 `significant_drop_tightening`
+        // change for these four sites — see PR notes.
+        let mut entry = self.interested_peers.entry(*contract).or_default();
+        let is_new = !entry.contains_key(&peer);
+        entry.insert(peer.clone(), PeerInterest::new(summary, is_upstream, now));
 
         // Maintain reverse index for O(1) peer disconnect cleanup
         self.peer_contracts
@@ -405,6 +405,7 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         // Also index by hash for fast lookup
         self.index_contract_hash(contract);
 
+        drop(entry);
         is_new
     }
 
@@ -642,16 +643,15 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// Register that we're hosting a contract locally.
     /// Returns true if this caused us to become interested (wasn't interested before).
     pub fn register_local_hosting(&self, contract: &ContractKey) -> bool {
-        // Drop the local_interests shard guard before index_contract_hash
-        // (which acquires a separate DashMap) so unrelated lookups don't
-        // serialize behind us (clippy: `significant_drop_tightening`).
-        let was_interested = {
-            let mut entry = self.local_interests.entry(*contract).or_default();
-            let was = entry.is_interested();
-            entry.hosting = true;
-            was
-        };
+        // Hold the `local_interests` shard guard across `index_contract_hash`
+        // so a concurrent `remove_local_client` / `unregister_local_hosting`
+        // for the last reason cannot run its cleanup (unindex no-op) before
+        // we index, leaving a zombie entry in `contract_hash_index`.
+        let mut entry = self.local_interests.entry(*contract).or_default();
+        let was_interested = entry.is_interested();
+        entry.hosting = true;
         self.index_contract_hash(contract);
+        drop(entry);
         !was_interested
     }
 
@@ -676,12 +676,14 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// Add a local client subscription.
     /// Returns true if this caused us to become interested.
     pub fn add_local_client(&self, contract: &ContractKey) -> bool {
-        // Same drop-before-index pattern as register_local_hosting.
-        let became_interested = {
-            let mut entry = self.local_interests.entry(*contract).or_default();
-            entry.add_client()
-        };
+        // Same lock-across-index discipline as `register_local_hosting`:
+        // hold the `local_interests` shard guard across
+        // `index_contract_hash` to prevent a concurrent
+        // `remove_local_client` from unindexing-before-we-index.
+        let mut entry = self.local_interests.entry(*contract).or_default();
+        let became_interested = entry.add_client();
         self.index_contract_hash(contract);
+        drop(entry);
         became_interested
     }
 
@@ -705,12 +707,11 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// Add a downstream subscriber.
     /// Returns true if this caused us to become interested.
     pub fn add_downstream_subscriber(&self, contract: &ContractKey) -> bool {
-        // Same drop-before-index pattern as register_local_hosting.
-        let became_interested = {
-            let mut entry = self.local_interests.entry(*contract).or_default();
-            entry.add_downstream()
-        };
+        // Same lock-across-index discipline as `register_local_hosting`.
+        let mut entry = self.local_interests.entry(*contract).or_default();
+        let became_interested = entry.add_downstream();
         self.index_contract_hash(contract);
+        drop(entry);
         became_interested
     }
 
@@ -2296,6 +2297,86 @@ mod tests {
             1,
             "Only 1 peer (B) should need syncing, not all {}",
             interested_peers.len()
+        );
+    }
+
+    /// Concurrent stress test for the PR #4129 add-then-index race in
+    /// `InterestManager`.
+    ///
+    /// Before the fix, `add_local_client` / `register_local_hosting` /
+    /// `add_downstream_subscriber` / `register_peer_interest` released
+    /// the `local_interests` (or `interested_peers`) shard guard before
+    /// calling `index_contract_hash`. A concurrent `remove_*` for the
+    /// same contract could then acquire the guard, decrement the last
+    /// reason, run `cleanup_contract_if_no_interest` → `unindex_contract_hash`
+    /// (a no-op because we haven't indexed yet), and the deferred index
+    /// would leak a zombie entry into `contract_hash_index` that
+    /// `cleanup_contract_if_no_interest` would never visit again.
+    /// `lookup_by_hash` and `get_all_interest_hashes` would then return
+    /// the stale entry forever.
+    ///
+    /// The fix holds the shard guard across `index_contract_hash`, so
+    /// the racy interleaving cannot occur. This test exercises the
+    /// production API under contention and asserts the
+    /// `lookup_by_hash(C).is_empty()` invariant once interest is drained.
+    /// The fix makes this hold deterministically; the bug shape is also
+    /// directly demonstrable via manual half-step interleaving (see the
+    /// PR description) but that demonstration is not a useful CI guard
+    /// because it bypasses the locking that the fix introduces.
+    #[test]
+    fn test_concurrent_add_remove_preserves_hash_index_invariant() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let (manager, _time) = make_manager();
+        let manager = Arc::new(manager);
+        let contract = make_contract_key(7);
+
+        let adders = 8;
+        let removers = 8;
+        let iters = 50_000;
+        let start = Arc::new(Barrier::new(adders + removers));
+
+        let mut handles = Vec::with_capacity(adders + removers);
+        for _ in 0..adders {
+            let m = Arc::clone(&manager);
+            let s = Arc::clone(&start);
+            handles.push(thread::spawn(move || {
+                s.wait();
+                for _ in 0..iters {
+                    m.add_local_client(&contract);
+                }
+            }));
+        }
+        for _ in 0..removers {
+            let m = Arc::clone(&manager);
+            let s = Arc::clone(&start);
+            handles.push(thread::spawn(move || {
+                s.wait();
+                for _ in 0..iters {
+                    m.remove_local_client(&contract);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Drain residual interest before checking the invariant.
+        while manager.has_local_interest(&contract) {
+            manager.remove_local_client(&contract);
+        }
+
+        let leaked = manager.lookup_by_hash(contract_hash(&contract));
+        assert!(
+            leaked.is_empty(),
+            "contract_hash_index has zombie entry after add/remove \
+             concurrency: {leaked:?}"
+        );
+        assert!(
+            manager.get_all_interest_hashes().is_empty(),
+            "get_all_interest_hashes leaks zombie: {:?}",
+            manager.get_all_interest_hashes()
         );
     }
 }
