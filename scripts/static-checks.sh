@@ -166,8 +166,10 @@ run_geiger() {
   printf ']\n' >> "$OUT/geiger.raw"
   local t1; t1=$(date +%s)
 
+  local geiger_status
+  if [[ $rc -eq 0 ]]; then geiger_status="ok"; else geiger_status="exit_${rc}"; fi
   jq -n \
-    --arg status "ok" \
+    --arg status "$geiger_status" \
     --argjson rc  "$rc" \
     --argjson dur "$((t1-t0))" \
     --arg raw     "$OUT/geiger.raw" \
