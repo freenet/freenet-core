@@ -87,7 +87,9 @@ pub(crate) const SYSTEMD_CRED_NAME: &str = "freenet-kek";
 /// Together with `KEYRING_USER` it uniquely names the KEK in the
 /// platform's secret store. Rotating these strings is a hard break and
 /// MUST coincide with a KEK migration step.
+#[cfg(not(target_os = "linux"))]
 pub(crate) const KEYRING_SERVICE: &str = "freenet-core";
+#[cfg(not(target_os = "linux"))]
 pub(crate) const KEYRING_USER: &str = "node-kek";
 
 /// Length of the node KEK in bytes. Matches XChaCha20-Poly1305 key
@@ -201,14 +203,14 @@ impl KeyringKek {
     pub fn new() -> Result<Self, KekError> {
         #[cfg(target_os = "linux")]
         {
-            return Err(KekError::Keyring(
+            Err(KekError::Keyring(
                 "keyring backend not supported on Linux in this build (the workspace ships \
                  `keyring` without `linux-native`/`sync-secret-service` to avoid the libdbus \
                  build dep; the crate would fall back to an in-process mock that orphans the \
                  KEK on process exit). Use `--backend systemd` (LoadCredentialEncrypted=...) \
                  or `--backend file`."
                     .to_string(),
-            ));
+            ))
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -846,13 +848,13 @@ mod tests {
         // back to an in-process mock store. Constructing the backend
         // MUST refuse here so kek-init cannot orphan a marker pointing
         // at an unreachable KEK.
-        let err = KeyringKek::new().expect_err("must refuse on Linux");
-        match err {
-            KekError::Keyring(msg) => assert!(
+        match KeyringKek::new() {
+            Ok(_) => panic!("KeyringKek::new() must refuse on Linux but returned Ok"),
+            Err(KekError::Keyring(msg)) => assert!(
                 msg.contains("not supported on Linux"),
                 "expected Linux-refusal message, got: {msg}"
             ),
-            other => panic!("expected KekError::Keyring, got {other:?}"),
+            Err(other) => panic!("expected KekError::Keyring, got {other:?}"),
         }
     }
 
