@@ -44,7 +44,19 @@ silent demotion.
 | macOS (signed) | silent | silent | Keychain prompt (signature changed) |
 | macOS (unsigned / dev) | silent | prompts each start | prompts each start |
 | Windows | silent | silent | silent |
-| Linux | requires Secret Service daemon | depends on daemon | depends on daemon |
+| Linux | **not supported** in this build | — | — |
+
+Linux note: the workspace ships `keyring 3.x` without `linux-native` /
+`sync-secret-service` to avoid the `libdbus-1-dev` build dependency.
+The crate would otherwise fall back to an in-process mock store that
+silently accepts writes and discards them on process exit — orphaning
+the `kek_backend` marker and bricking the next node start with no
+recovery path. `KeyringKek::new()` therefore refuses on Linux with an
+explicit `KekError::Keyring("not supported on Linux in this build…")`.
+Linux operators use `--backend systemd` (with
+`LoadCredentialEncrypted=`) or `--backend file`. A future release may
+add an opt-in cargo feature that pulls in `linux-native` for operators
+who have libdbus available.
 
 The macOS / dev-build prompt-per-start behavior is the main reason
 keyring is opt-in: every auto-update changes the binary signature, and

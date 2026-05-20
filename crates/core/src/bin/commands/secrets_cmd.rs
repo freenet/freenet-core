@@ -141,15 +141,18 @@ async fn kek_init(args: KekInitArgs) -> Result<()> {
 
     if !args.yes {
         eprintln!(
-            "About to provision a new node KEK into the `{target}` backend at {}.\n\
-             - `keyring`: writes to the OS secret store. On macOS this binds the entry to\n\
-               the current binary signature; ad-hoc / dev builds will re-prompt on every\n\
-               start. On Linux it requires a Secret Service daemon. On Windows it writes\n\
-               silently to Credential Manager.\n\
-             - `systemd`: ONLY valid when the freenet unit was started with\n\
-               `LoadCredentialEncrypted=freenet-kek:/path` — this command will fail otherwise.\n\
+            "About to opt in to the `{target}` backend for the node KEK at {}.\n\
+             - `keyring`: writes a freshly generated KEK to the OS secret store.\n\
+               * macOS:   binds to current binary signature; ad-hoc / dev builds re-prompt\n\
+                          every start; signed builds re-prompt after each upgrade.\n\
+               * Windows: silent write to Credential Manager.\n\
+               * Linux:   NOT supported in this build (workspace ships `keyring` without\n\
+                          Linux-native features to avoid the libdbus build dep).\n\
+             - `systemd`: marker-only opt-in; the credential MUST be provisioned out-of-band\n\
+                          via `LoadCredentialEncrypted=freenet-kek:/path` on the unit.\n\
+                          The node will fail to start if the credential is not present.\n\
              - `file`:    writes `node_kek` (0o600) to the secrets dir. Weakest option;\n\
-               operator is responsible for protecting the directory.\n\
+                          operator must protect the directory.\n\
              Re-run with --yes to proceed.",
             args.secrets_dir.display()
         );
@@ -163,33 +166,79 @@ async fn kek_init(args: KekInitArgs) -> Result<()> {
         )
     })?;
 
-    let backend = build_backend_for(target, &args.secrets_dir).with_context(|| {
-        format!("failed to construct `{target}` backend handle (is it available on this platform?)")
-    })?;
+    match target {
+        KekBackendKind::Systemd => {
+            // Systemd credentials are populated by the service manager.
+            // `kek-init --backend systemd` is a marker-only opt-in: it
+            // records the operator's intent so the node loads from the
+            // systemd credential on first start instead of running the
+            // auto-resolver and provisioning to file. The credential
+            // itself MUST exist by the time the node boots, set up via
+            // `LoadCredentialEncrypted=freenet-kek:/path` on the unit.
+            write_backend_marker(&args.secrets_dir, target).context(
+                "failed to write kek_backend marker for systemd opt-in (no KEK was provisioned)",
+            )?;
+            println!(
+                "Opted in to `systemd` backend by writing kek_backend marker. \
+                 The KEK itself MUST be provisioned by the service manager via \
+                 `LoadCredentialEncrypted=freenet-kek:/path` on the freenet unit. \
+                 The node will fail to start if the credential is absent."
+            );
+            Ok(())
+        }
+        KekBackendKind::Keyring | KekBackendKind::File => {
+            let backend = build_backend_for(target, &args.secrets_dir).with_context(|| {
+                format!(
+                    "failed to construct `{target}` backend handle (is it available on this \
+                     platform?)"
+                )
+            })?;
 
-    // Cryptographic key material — `OsRng` (not `GlobalRng`) is the
-    // right choice here: KEK is the node's root secret, must come from
-    // the OS entropy pool, never from a seedable simulation RNG.
-    let mut kek_bytes = Zeroizing::new([0u8; KEK_SIZE]);
-    OsRng.fill_bytes(kek_bytes.as_mut_slice());
+            // Cryptographic key material — `OsRng` (not `GlobalRng`)
+            // is the right choice here: KEK is the node's root secret,
+            // must come from the OS entropy pool, never from a
+            // seedable simulation RNG.
+            let mut kek_bytes = Zeroizing::new([0u8; KEK_SIZE]);
+            OsRng.fill_bytes(kek_bytes.as_mut_slice());
 
-    backend.store(&kek_bytes).with_context(|| {
-        format!(
-            "failed to store KEK in `{target}` backend (existing entry? delete first via OS tools)"
-        )
-    })?;
+            backend.store(&kek_bytes).with_context(|| {
+                format!(
+                    "failed to store KEK in `{target}` backend (existing entry? delete first \
+                     via OS tools)"
+                )
+            })?;
 
-    write_backend_marker(&args.secrets_dir, target)
-        .context("failed to write kek_backend marker after provisioning")?;
+            // Atomic with rollback: if the marker write fails AFTER
+            // `backend.store` succeeded, the KEK is orphaned in the
+            // backend. Roll it back via `backend.delete()` and report
+            // the compound failure so the operator can re-run cleanly
+            // instead of hitting `KekError::AlreadyExists` next time.
+            if let Err(marker_err) = write_backend_marker(&args.secrets_dir, target) {
+                let scrub = backend.delete();
+                let scrub_msg = match scrub {
+                    Ok(()) => format!(
+                        "Rolled back the orphaned KEK in `{target}` backend; safe to re-run."
+                    ),
+                    Err(e) => format!(
+                        "Marker write failed AND rollback of the stored KEK in `{target}` \
+                         backend also failed ({e}); scrub the entry manually before re-running."
+                    ),
+                };
+                return Err(anyhow!(
+                    "failed to write kek_backend marker after provisioning: {marker_err}. {scrub_msg}"
+                ));
+            }
 
-    let mut hasher = Sha256::new();
-    hasher.update(kek_bytes.as_slice());
-    let fp = hasher.finalize();
-    let fp_hex: String = fp[..8].iter().map(|b| format!("{b:02x}")).collect();
+            let mut hasher = Sha256::new();
+            hasher.update(kek_bytes.as_slice());
+            let fp = hasher.finalize();
+            let fp_hex: String = fp[..8].iter().map(|b| format!("{b:02x}")).collect();
 
-    println!("Provisioned KEK into `{target}` backend.");
-    println!("KEK fingerprint (SHA-256[..8]): {fp_hex}");
-    Ok(())
+            println!("Provisioned KEK into `{target}` backend.");
+            println!("KEK fingerprint (SHA-256[..8]): {fp_hex}");
+            Ok(())
+        }
+    }
 }
 
 async fn kek_status(args: KekStatusArgs) -> Result<()> {
@@ -222,32 +271,21 @@ async fn kek_status(args: KekStatusArgs) -> Result<()> {
     Ok(())
 }
 
-async fn kek_rotate(args: KekRotateArgs) -> Result<()> {
+async fn kek_rotate(_args: KekRotateArgs) -> Result<()> {
     // KEK rotation requires walking every secret + snapshot on disk,
     // re-deriving DEKs under the new KEK, decrypting under the OLD
     // DEKs, re-encrypting under the new DEKs with fresh nonces, and
     // swapping the KEK in the backend.
     //
+    // Bail BEFORE checking `--yes`. Without this ordering an operator
+    // who runs `kek-rotate` once, reads the safety blurb, takes a
+    // backup, and re-runs with `--yes` is rewarded with a "not
+    // implemented" error — actively misleading. The not-implemented
+    // status is unconditional, so it must surface unconditionally.
+    //
     // Two-phase crash-safe variant (write `.rot` shadow files, swap
     // KEK only after all shadows exist, then atomically rename shadows
     // → active on next start) is tracked in a follow-up under #4137.
-    // This first cut is operator-supervised: the node MUST be stopped
-    // and a full backup of `secrets_dir` MUST be taken before running.
-    // A crash mid-walk leaves a partial state (some blobs under old
-    // KEK, some under new) that requires restoring from backup.
-    if !args.yes {
-        eprintln!(
-            "kek-rotate is operator-supervised in this release:\n\
-             - Stop the freenet node before running.\n\
-             - Take a full backup of {} (this rotation is not crash-safe yet).\n\
-             - A failure mid-rewrite leaves a mixed-KEK state requiring restore from backup.\n\
-             A crash-safe two-phase variant is tracked in a follow-up under #4137.\n\
-             Re-run with --yes to proceed.",
-            args.secrets_dir.display()
-        );
-        bail!("aborted (no --yes)");
-    }
-
     bail!(
         "kek-rotate on-disk walk not yet implemented in this build. \
          Operators wanting to rotate today should: stop the node, run \
@@ -327,4 +365,107 @@ async fn kek_migrate(args: KekMigrateArgs) -> Result<()> {
 
     println!("Migrated KEK from `{current}` to `{target}`.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(dir: &std::path::Path, backend: &str, yes: bool) -> KekInitArgs {
+        KekInitArgs {
+            secrets_dir: dir.to_path_buf(),
+            backend: backend.to_string(),
+            yes,
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_backend_kind_accepts_valid_and_rejects_garbage() {
+        assert!(matches!(
+            parse_backend_kind("keyring").unwrap(),
+            KekBackendKind::Keyring
+        ));
+        assert!(matches!(
+            parse_backend_kind("systemd").unwrap(),
+            KekBackendKind::Systemd
+        ));
+        assert!(matches!(
+            parse_backend_kind("file").unwrap(),
+            KekBackendKind::File
+        ));
+        let err = parse_backend_kind("garbage").unwrap_err().to_string();
+        assert!(
+            err.contains("unrecognized backend"),
+            "expected unrecognized-backend error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kek_init_refuses_when_marker_already_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path()).unwrap();
+        write_backend_marker(dir.path(), KekBackendKind::File).expect("seed marker");
+
+        let err = kek_init(args(dir.path(), "file", true))
+            .await
+            .expect_err("must refuse when marker exists");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("already provisioned"),
+            "expected already-provisioned error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kek_init_without_yes_aborts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = kek_init(args(dir.path(), "file", false))
+            .await
+            .expect_err("must abort without --yes");
+        assert!(err.to_string().contains("aborted"));
+        // No marker written.
+        assert!(read_backend_marker(dir.path()).unwrap().is_none());
+        // No node_kek file written either.
+        assert!(!dir.path().join("node_kek").exists());
+    }
+
+    #[tokio::test]
+    async fn kek_init_file_backend_writes_kek_and_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        kek_init(args(dir.path(), "file", true))
+            .await
+            .expect("file kek-init must succeed");
+        // Marker exists and points at file.
+        assert_eq!(
+            read_backend_marker(dir.path()).unwrap(),
+            Some(KekBackendKind::File)
+        );
+        // node_kek file exists and is KEK_SIZE bytes.
+        let kek_path = dir.path().join("node_kek");
+        let bytes = std::fs::read(&kek_path).expect("read node_kek");
+        assert_eq!(bytes.len(), KEK_SIZE);
+        // Second invocation must refuse (marker now present).
+        let err = kek_init(args(dir.path(), "file", true))
+            .await
+            .expect_err("second kek-init must refuse");
+        assert!(err.to_string().contains("already provisioned"));
+    }
+
+    #[tokio::test]
+    async fn kek_init_systemd_writes_marker_only_without_storing_kek() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        kek_init(args(dir.path(), "systemd", true))
+            .await
+            .expect("systemd marker-only opt-in must succeed");
+        assert_eq!(
+            read_backend_marker(dir.path()).unwrap(),
+            Some(KekBackendKind::Systemd)
+        );
+        // node_kek MUST NOT have been written — systemd credentials
+        // are populated by the service manager.
+        assert!(
+            !dir.path().join("node_kek").exists(),
+            "systemd opt-in must not write a file-backend KEK"
+        );
+    }
 }

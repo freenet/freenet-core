@@ -7,24 +7,40 @@
 //!
 //! ## Backends
 //!
-//! Three backends, tried in order during the first-start resolver:
+//! Three backends are available, but only TWO are in the auto-resolver
+//! chain. The OS keyring is opt-in only — see "Opt-in keyring" below.
 //!
-//! 1. **OS keyring** (`KeyringKek`) — `keyring` crate over the platform
-//!    secret store (macOS Keychain, Windows Credential Manager, Linux
-//!    Secret Service / kernel keyutils). Disk never sees the key.
-//! 2. **Systemd credential** (`SystemdCredentialKek`) —
+//! Auto-resolver order (first-start):
+//!
+//! 1. **Systemd credential** (`SystemdCredentialKek`) —
 //!    `$CREDENTIALS_DIRECTORY/freenet-kek` populated by systemd
 //!    `LoadCredentialEncrypted=`. Decrypted by systemd before unit start;
-//!    backs the typical headless-Linux deployment.
-//! 3. **File** (`FileKek`) — `secrets_dir/node_kek` (0o600,
-//!    atomic-create). The "no better option" fallback for unmanaged
-//!    headless installs. Emits a one-line WARN at start so operators
-//!    know they are running with the weakest backend.
+//!    backs the typical headless-Linux deployment. Only enters the
+//!    chain when `CREDENTIALS_DIRECTORY` is set — i.e. the operator
+//!    already opted in by configuring the systemd unit.
+//! 2. **File** (`FileKek`) — `secrets_dir/node_kek` (0o600,
+//!    atomic-create). Always-available fallback for unmanaged headless
+//!    installs. Emits a one-line WARN at first-start so operators know
+//!    they are running with the weakest backend.
+//!
+//! ### Opt-in: OS keyring
+//!
+//! **OS keyring** (`KeyringKek`) — `keyring` crate over the platform
+//! secret store (macOS Keychain, Windows Credential Manager). Disk
+//! never sees the key. NOT in the auto-resolver: touching the OS
+//! keyring on first node start surfaces a platform consent dialog the
+//! operator did not initiate (they ran `freenet`, not a credential
+//! request), and on macOS every release auto-update changes the binary
+//! signature and re-prompts. Operators who want this backend opt in
+//! explicitly via `freenet secrets kek-init --backend keyring`
+//! BEFORE first start (or `kek-migrate --to keyring` after) — the
+//! act of running the CLI is the consent capture. On Linux this
+//! backend refuses to construct entirely (see `KeyringKek::new`).
 //!
 //! The resolver runs only on first start with no `kek_backend` recorded
 //! in the node config. Once chosen, the backend is persisted (see
 //! `KekBackendKind`) and subsequent starts use it exclusively — a
-//! transient keyring-daemon outage surfaces as a hard error, never a
+//! transient backend outage surfaces as a hard error, never a
 //! silent demotion to a weaker backend.
 //!
 //! ## Security model
@@ -55,7 +71,7 @@ pub(crate) const NODE_KEK_FILENAME: &str = "node_kek";
 /// transient keyring-daemon outage from silently demoting the node to
 /// a weaker backend on next start — the recorded backend MUST load
 /// successfully or the node fails to boot. Operators move between
-/// backends via `fdev secrets kek-migrate --to <kind>`, which atomically
+/// backends via `freenet secrets kek-migrate --to <kind>`, which atomically
 /// rewrites this marker after the new backend successfully stores the
 /// KEK.
 pub(crate) const KEK_BACKEND_MARKER_FILENAME: &str = "kek_backend";
@@ -81,7 +97,7 @@ pub const KEK_SIZE: usize = CIPHER_SIZE;
 /// Tag identifying which backend currently holds the KEK. Persisted in
 /// the node config so a transient outage of a stronger backend cannot
 /// silently demote to a weaker one. To change backends, operators run
-/// `fdev secrets kek-migrate --to <kind>`.
+/// `freenet secrets kek-migrate --to <kind>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum KekBackendKind {
@@ -127,7 +143,7 @@ pub enum KekError {
 /// `store` to seed one.
 pub trait KekBackend: Send + Sync {
     /// Identify which backend this is. Surfaced via
-    /// `fdev secrets kek-status` and recorded in the
+    /// `freenet secrets kek-status` and recorded in the
     /// `secrets_dir/kek_backend` marker file.
     fn kind(&self) -> KekBackendKind;
     /// Read the current KEK from this backend.
@@ -140,13 +156,13 @@ pub trait KekBackend: Send + Sync {
     fn load(&self) -> Result<Option<Zeroizing<[u8; KEK_SIZE]>>, KekError>;
     /// Persist a new KEK. MUST fail with `KekError::AlreadyExists` if a
     /// KEK is already present — rotation goes through a dedicated path
-    /// (`fdev secrets kek-rotate`) so accidental double-`store` cannot
+    /// (`freenet secrets kek-rotate`) so accidental double-`store` cannot
     /// silently destroy the existing key.
     fn store(&self, kek: &[u8; KEK_SIZE]) -> Result<(), KekError>;
     /// Remove the KEK from this backend.
     ///
     /// Idempotent: if no KEK was present, returns `Ok(())`. Used by
-    /// `fdev secrets kek-migrate` after the migration target has
+    /// `freenet secrets kek-migrate` after the migration target has
     /// successfully stored the KEK.
     fn delete(&self) -> Result<(), KekError>;
 }
@@ -156,6 +172,10 @@ pub trait KekBackend: Send + Sync {
 // linux Secret Service or kernel keyutils)
 // =============================================================================
 
+/// `KekBackend` impl backed by the OS keyring (Apple Keychain,
+/// Windows Credential Manager, Linux Secret Service / kernel keyutils
+/// when built with the matching `keyring` feature). The KEK never
+/// touches disk on this backend.
 pub struct KeyringKek {
     entry: keyring::Entry,
 }
@@ -166,10 +186,36 @@ impl KeyringKek {
     /// keyring daemon — that happens on `load` / `store`. Failure here
     /// indicates the `keyring` crate could not build an `Entry` at all
     /// (e.g. missing feature support for the target platform).
+    ///
+    /// On Linux this constructor refuses immediately. The workspace
+    /// build of `keyring 3.x` is `default-features = false` with only
+    /// `apple-native` + `windows-native` enabled, which means on Linux
+    /// the crate falls back to its in-process **mock** store
+    /// (`pub use mock as default;` in keyring's lib.rs). The mock
+    /// silently accepts `set_secret`/`get_secret` and dies with the
+    /// process — provisioning under it would orphan the marker, brick
+    /// the node's next boot, and leave the operator no recovery path.
+    /// Operators who want a real Linux keyring must rebuild `keyring`
+    /// with `linux-native` or `sync-secret-service`; an explicit error
+    /// here is far better than a silent mock.
     pub fn new() -> Result<Self, KekError> {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
-            .map_err(|e| KekError::Keyring(format!("Entry::new failed: {e}")))?;
-        Ok(Self { entry })
+        #[cfg(target_os = "linux")]
+        {
+            return Err(KekError::Keyring(
+                "keyring backend not supported on Linux in this build (the workspace ships \
+                 `keyring` without `linux-native`/`sync-secret-service` to avoid the libdbus \
+                 build dep; the crate would fall back to an in-process mock that orphans the \
+                 KEK on process exit). Use `--backend systemd` (LoadCredentialEncrypted=...) \
+                 or `--backend file`."
+                    .to_string(),
+            ));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
+                .map_err(|e| KekError::Keyring(format!("Entry::new failed: {e}")))?;
+            Ok(Self { entry })
+        }
     }
 }
 
@@ -222,6 +268,11 @@ impl KekBackend for KeyringKek {
 // Backend: systemd credential ($CREDENTIALS_DIRECTORY/freenet-kek)
 // =============================================================================
 
+/// `KekBackend` impl reading the KEK from
+/// `$CREDENTIALS_DIRECTORY/freenet-kek`, the path systemd exposes when
+/// a unit is started with `LoadCredentialEncrypted=freenet-kek:...`.
+/// Read-only from freenet's perspective — provisioning and decryption
+/// are handled by the service manager.
 pub struct SystemdCredentialKek {
     path: PathBuf,
 }
@@ -284,7 +335,7 @@ impl KekBackend for SystemdCredentialKek {
     fn delete(&self) -> Result<(), KekError> {
         // Same reasoning as `store`: deletion is the service manager's
         // responsibility. We surface as a no-op success so
-        // `fdev secrets kek-migrate --from systemd` can proceed.
+        // `freenet secrets kek-migrate --from systemd` can proceed.
         Ok(())
     }
 }
@@ -293,6 +344,10 @@ impl KekBackend for SystemdCredentialKek {
 // Backend: file (secrets_dir/node_kek, 0o600, atomic create)
 // =============================================================================
 
+/// `KekBackend` impl storing the KEK as `secrets_dir/node_kek` with
+/// 0o600 permissions. Always-available fallback used by the
+/// auto-resolver when no stronger backend is configured; emits a WARN
+/// at first-start so operators know the KEK is on disk.
 pub struct FileKek {
     path: PathBuf,
 }
@@ -421,7 +476,7 @@ pub fn resolve_first_start(
                          This is the weakest option — anyone with read access to the \
                          secrets directory can decrypt all delegate secrets. Configure \
                          a stronger backend (OS keyring or systemd credential) and \
-                         migrate with `fdev secrets kek-migrate`.",
+                         migrate with `freenet secrets kek-migrate`.",
                         secrets_dir.display()
                     );
                 } else {
@@ -508,7 +563,7 @@ pub fn write_backend_marker(secrets_dir: &Path, kind: KekBackendKind) -> Result<
 }
 
 /// Atomically replace the persisted backend marker with `kind`. Used
-/// by `fdev secrets kek-migrate` after the target backend has
+/// by `freenet secrets kek-migrate` after the target backend has
 /// successfully stored the migrated KEK. Writes to a sibling `.tmp`
 /// file with the same 0o600 perms + `sync_all` discipline as
 /// `write_backend_marker`, then `rename`s onto the live marker (atomic
@@ -602,7 +657,7 @@ fn build_chain(secrets_dir: &Path) -> Vec<Box<dyn KekBackend>> {
     chain
 }
 
-/// Public constructor used by `fdev secrets kek-migrate` and other
+/// Public constructor used by `freenet secrets kek-migrate` and other
 /// out-of-process tooling to build a backend handle for a specific
 /// `KekBackendKind`. In-process callers (e.g. `SecretsStore::new`)
 /// should prefer `ensure_kek_loaded`, which combines marker resolution
@@ -780,6 +835,87 @@ mod tests {
         assert!(
             matches!(err, KekError::NoBackend | KekError::Io(_)),
             "expected NoBackend or Io, got {err:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn keyring_kek_new_refuses_on_linux() {
+        // Linux builds of the workspace ship `keyring` without
+        // `linux-native`/`sync-secret-service`, which silently falls
+        // back to an in-process mock store. Constructing the backend
+        // MUST refuse here so kek-init cannot orphan a marker pointing
+        // at an unreachable KEK.
+        let err = KeyringKek::new().expect_err("must refuse on Linux");
+        match err {
+            KekError::Keyring(msg) => assert!(
+                msg.contains("not supported on Linux"),
+                "expected Linux-refusal message, got: {msg}"
+            ),
+            other => panic!("expected KekError::Keyring, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replace_backend_marker_overwrites_existing_atomically() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Seed: existing marker on file backend.
+        write_backend_marker(dir.path(), KekBackendKind::File).expect("seed marker");
+        assert_eq!(
+            read_backend_marker(dir.path()).expect("read"),
+            Some(KekBackendKind::File)
+        );
+
+        // replace: file → keyring. Must succeed even though marker
+        // already exists (write_backend_marker would refuse).
+        replace_backend_marker(dir.path(), KekBackendKind::Keyring).expect("replace");
+        assert_eq!(
+            read_backend_marker(dir.path()).expect("read"),
+            Some(KekBackendKind::Keyring)
+        );
+
+        // Second replace round-trips back, proving idempotency.
+        replace_backend_marker(dir.path(), KekBackendKind::Systemd).expect("replace 2");
+        assert_eq!(
+            read_backend_marker(dir.path()).expect("read"),
+            Some(KekBackendKind::Systemd)
+        );
+
+        // No stray .tmp file left over (atomic rename consumed it).
+        let tmp = dir
+            .path()
+            .join(format!("{KEK_BACKEND_MARKER_FILENAME}.tmp"));
+        assert!(
+            !tmp.exists(),
+            "replace_backend_marker must rename the tmp file, not leave it behind"
+        );
+
+        #[cfg(unix)]
+        {
+            // 0o600 on the live marker (the tmp went through the same
+            // OpenOptions discipline, but only the final file is
+            // user-visible).
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join(KEK_BACKEND_MARKER_FILENAME))
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "kek_backend marker must be 0o600 after replace, got {mode:o}"
+            );
+        }
+    }
+
+    #[test]
+    fn replace_backend_marker_creates_fresh_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(read_backend_marker(dir.path()).expect("read").is_none());
+        replace_backend_marker(dir.path(), KekBackendKind::File).expect("replace into empty dir");
+        assert_eq!(
+            read_backend_marker(dir.path()).expect("read"),
+            Some(KekBackendKind::File)
         );
     }
 
