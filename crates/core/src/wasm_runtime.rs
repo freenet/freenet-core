@@ -24,6 +24,7 @@ pub(crate) use error::{ContractError, RuntimeInnerError, RuntimeResult};
 pub use mock_state_storage::MockStateStorage;
 pub(crate) use native_api::{
     CREATED_DELEGATES_COUNT, DELEGATE_INHERITED_ORIGINS, DELEGATE_SUBSCRIPTIONS,
+    DelegateContextCache, new_delegate_context_cache,
 };
 pub use runtime::{ContractExecError, DEFAULT_MODULE_CACHE_CAPACITY, Runtime};
 pub(crate) use runtime::{RuntimeConfig, SharedModuleCache};
