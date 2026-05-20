@@ -212,9 +212,20 @@ index and works back to the primary — is NOT protected by this
 discipline. Those need their own atomicity story: either share a
 lock order with the add path, batch the primary-side updates under a
 single guard, or use a reconciliation/two-phase remove protocol.
-Example of an unprotected secondary-origin remover that still has a
-bidirectional-consistency race even with the rule applied:
-`InterestManager::remove_all_peer_interests` (issue #4174).
+
+A secondary-origin remover that broke this way was
+`InterestManager::remove_all_peer_interests` (issue #4174). Its old
+shape removed the `peer_contracts[peer]` reverse entry up front, then
+iterated a stale snapshot mutating `interested_peers` directly — a
+concurrent `register_peer_interest` could re-create one side after the
+snapshot, leaving a one-sided ghost. The fix (PR for #4174) does NOT
+add a new atomicity primitive: it makes the secondary-origin remover
+delegate each per-contract cleanup to the primary-origin remover
+`remove_peer_interest`, which already holds the
+`interested_peers[contract]` shard guard across its `peer_contracts`
+update. So the safe pattern for a secondary-origin bulk remover is:
+snapshot the secondary index (read-only, do NOT remove it up front),
+then call the existing per-key primary-origin remover for each entry.
 ```
 
 ## Trigger-Action Rules
