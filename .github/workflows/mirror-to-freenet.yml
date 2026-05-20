@@ -40,7 +40,7 @@ jobs:
     # under this caller's secrets. Acceptable today because we control
     # crates.io publishing for that crate; if that changes, override
     # `freenet_git_version` here with a pinned semver.
-    uses: freenet/freenet-git/.github/workflows/mirror-repo.yml@8f00293929f39aaee9f0ea7ab334c15856def8f6
+    uses: freenet/freenet-git/.github/workflows/mirror-repo.yml@61d5fea7631091ffc4493b6dfb4655d35496cf1f
     with:
       freenet_repo: "3GEERif5ihbf/freenet-core"
       mode: snapshot
