@@ -7,8 +7,8 @@ use tracing::Instrument;
 use super::{
     NetEventRegister, PeerId,
     network_bridge::{
-        EventLoopNotificationsReceiver,
-        event_loop_notification_channel_with_capacity, p2p_protoc::P2pConnManager,
+        EventLoopNotificationsReceiver, event_loop_notification_channel_with_capacity,
+        p2p_protoc::P2pConnManager,
     },
 };
 use crate::{

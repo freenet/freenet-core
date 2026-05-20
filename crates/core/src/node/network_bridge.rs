@@ -429,6 +429,48 @@ mod tests {
         }
         assert_eq!(received, 2, "Should receive both messages");
     }
+
+    /// Test that event_loop_notification_channel_with_capacity creates channels
+    /// with the specified capacity and that the capacity is respected.
+    #[tokio::test]
+    async fn test_channel_with_custom_capacity() {
+        let custom_capacity: usize = 5;
+        let (notification_channel, notification_tx) =
+            event_loop_notification_channel_with_capacity(custom_capacity);
+        let mut rx = notification_channel.notifications_receiver;
+
+        // Fill up to capacity without draining
+        for i in 0..custom_capacity {
+            let test_event = crate::message::NodeEvent::Disconnect {
+                cause: Some(format!("msg-{i}").into()),
+            };
+            notification_tx
+                .notifications_sender()
+                .send(Either::Right(test_event))
+                .await
+                .expect("Should not block within channel capacity");
+        }
+
+        // Verify we can drain all messages
+        let mut count = 0;
+        while count < custom_capacity {
+            match timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Some(_)) => count += 1,
+                Ok(None) => panic!("Channel closed unexpectedly"),
+                Err(_) => panic!(
+                    "Timeout draining message {}/{} — channel may have over-accepted",
+                    count + 1,
+                    custom_capacity
+                ),
+            }
+        }
+
+        assert_eq!(
+            count, custom_capacity,
+            "Should receive exactly {} messages (channel capacity)",
+            custom_capacity
+        );
+    }
 }
 
 // ConnectionError tests
