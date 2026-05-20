@@ -468,4 +468,101 @@ mod tests {
             "systemd opt-in must not write a file-backend KEK"
         );
     }
+
+    fn migrate_args(dir: &std::path::Path, to: &str, yes: bool) -> KekMigrateArgs {
+        KekMigrateArgs {
+            secrets_dir: dir.to_path_buf(),
+            to: to.to_string(),
+            yes,
+        }
+    }
+
+    #[tokio::test]
+    async fn kek_migrate_refuses_when_marker_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = kek_migrate(migrate_args(dir.path(), "file", true))
+            .await
+            .expect_err("must refuse when marker is absent");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no KEK provisioned"),
+            "expected no-KEK-provisioned error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kek_migrate_short_circuits_when_current_equals_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Seed marker only; do NOT write node_kek. The short-circuit
+        // must trip BEFORE touching either backend.
+        write_backend_marker(dir.path(), KekBackendKind::File).expect("seed marker");
+        kek_migrate(migrate_args(dir.path(), "file", true))
+            .await
+            .expect("idempotent migrate must succeed");
+        // Marker unchanged. No node_kek created.
+        assert_eq!(
+            read_backend_marker(dir.path()).unwrap(),
+            Some(KekBackendKind::File)
+        );
+        assert!(
+            !dir.path().join("node_kek").exists(),
+            "idempotent migrate must not touch backends"
+        );
+    }
+
+    #[tokio::test]
+    async fn kek_migrate_without_yes_aborts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Seed a real file-backend KEK so the abort happens at the
+        // --yes check, not earlier.
+        kek_init(args(dir.path(), "file", true))
+            .await
+            .expect("seed kek-init");
+        let err = kek_migrate(migrate_args(dir.path(), "systemd", false))
+            .await
+            .expect_err("must abort without --yes");
+        assert!(err.to_string().contains("aborted"));
+        // Marker still file; node_kek still present.
+        assert_eq!(
+            read_backend_marker(dir.path()).unwrap(),
+            Some(KekBackendKind::File)
+        );
+        assert!(dir.path().join("node_kek").exists());
+    }
+
+    #[tokio::test]
+    async fn kek_migrate_rejects_unknown_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_backend_marker(dir.path(), KekBackendKind::File).expect("seed marker");
+        let err = kek_migrate(migrate_args(dir.path(), "garbage", true))
+            .await
+            .expect_err("must reject unknown backend");
+        assert!(
+            err.to_string().contains("unrecognized backend"),
+            "expected unrecognized-backend error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kek_migrate_fails_when_source_backend_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Marker says file, but no node_kek exists. The load() must
+        // return Ok(None) (not panic), and kek_migrate must surface a
+        // clear error rather than writing garbage to the target.
+        write_backend_marker(dir.path(), KekBackendKind::File).expect("seed marker");
+        let err = kek_migrate(migrate_args(dir.path(), "systemd", true))
+            .await
+            .expect_err("must fail when source backend has no KEK");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("source backend reports no KEK present")
+                || msg.contains("failed to load KEK from source backend"),
+            "expected source-empty error, got: {msg}"
+        );
+        // Marker still file — must NOT have been rewritten on failure.
+        assert_eq!(
+            read_backend_marker(dir.path()).unwrap(),
+            Some(KekBackendKind::File)
+        );
+    }
 }
