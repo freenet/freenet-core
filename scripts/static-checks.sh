@@ -118,6 +118,64 @@ run_check bloat cargo-bloat \
 run_check machete cargo-machete \
   cargo machete
 
+# === extract outdated findings (JSON Lines format) =========================
+# cargo-outdated outputs one JSON object per workspace member, each with a
+# .crate_name and .dependencies array. We extract actionable updates where
+# .compat (semver-compatible) or .latest (any) indicates an available upgrade.
+if [[ -s "$OUT/outdated.raw" ]]; then
+  jq -s '
+    map(
+      {crate: .crate_name, deps: [.dependencies[] | select(
+        (.compat != null and .compat != "" and .compat != "Removed" and .compat != "---")
+        or (.latest != null and .latest != "" and .latest != "Removed" and .latest != "---")
+      )]}
+    ) |
+    map(. + {update_count: (.deps | length)})
+  ' "$OUT/outdated.raw" > "$OUT/outdated.findings.json" 2>/dev/null \
+    || echo '[]' > "$OUT/outdated.findings.json"
+
+  # Classify compat vs major updates by scanning all dep entries
+  jq -s '
+    [.[].dependencies[]] |
+    {
+      compat_updates: [.[] | select(.compat != null and .compat != "" and .compat != "Removed" and .compat != "---")],
+      major_updates:  [.[] | select(
+        (.compat == null or .compat == "" or .compat == "---" or .compat == "Removed")
+        and (.latest != null and .latest != "" and .latest != "Removed" and .latest != "---")
+      )]
+    } |
+    {compat_count: (.compat_updates | length), major_count: (.major_updates | length)}
+  ' "$OUT/outdated.raw" > "$OUT/outdated.classification.json" 2>/dev/null \
+    || echo '{}' > "$OUT/outdated.classification.json"
+
+  jq --slurpfile f "$OUT/outdated.findings.json" \
+     --slurpfile c "$OUT/outdated.classification.json" '
+    . + {
+      by_crate:            $f[0],
+      total_outdated:      ($f[0] | map(.update_count) | add // 0),
+      compat_updates:      $c[0].compat_count,
+      major_updates:       $c[0].major_count,
+      affected_crates:     [$f[0][] | select(.update_count > 0) | .crate]
+    }
+  ' "$OUT/outdated.summary.json" > "$OUT/.tmp" && mv "$OUT/.tmp" "$OUT/outdated.summary.json"
+fi
+
+# === extract bloat crate-size breakdown ====================================
+# cargo-bloat --message-format json outputs a single JSON object:
+#   {"file-size": N, "text-section-size": N, "crates": [{"name":.., "size":..}, ...]}
+if [[ -s "$OUT/bloat.raw" ]]; then
+  jq '{
+    file_size_bytes:      .["file-size"],
+    text_section_bytes:   .["text-section-size"],
+    total_crates:         (.crates | length),
+    top_crates:           [.crates[] | {name, size}] | sort_by(-.size)
+  }' "$OUT/bloat.raw" > "$OUT/bloat.findings.json" 2>/dev/null \
+    || echo '{}' > "$OUT/bloat.findings.json"
+
+  jq --slurpfile f "$OUT/bloat.findings.json" '. + $f[0]' \
+    "$OUT/bloat.summary.json" > "$OUT/.tmp" && mv "$OUT/.tmp" "$OUT/bloat.summary.json"
+fi
+
 # --- 7. cargo-geiger — unsafe footprint over the dep tree (slow) ----------
 # Geiger refuses virtual manifests; on a workspace we iterate per member and
 # assemble per-package JSON reports into one aggregate array.
@@ -308,11 +366,15 @@ log "summary:"
 jq -r '
   .checks | to_entries[] |
   "  \(.key | . + (" " * (10 - length))): status=\(.value.status)"
-  + (if .value.total_findings   != null then "  findings=\(.value.total_findings)"  else "" end)
-  + (if .value.vulnerabilities  != null then "  vulns=\(.value.vulnerabilities)"    else "" end)
-  + (if .value.warnings         != null then "  warns=\(.value.warnings)"           else "" end)
-  + (if .value.total_unused     != null then "  unused=\(.value.total_unused)"      else "" end)
-  + (if .value.mode             != null then "  mode=\(.value.mode)"                else "" end)
+  + (if .value.total_findings   != null then "  findings=\(.value.total_findings)"   else "" end)
+  + (if .value.vulnerabilities  != null then "  vulns=\(.value.vulnerabilities)"     else "" end)
+  + (if .value.warnings         != null then "  warns=\(.value.warnings)"            else "" end)
+  + (if .value.total_unused     != null then "  unused=\(.value.total_unused)"       else "" end)
+  + (if .value.total_outdated   != null then "  outdated=\(.value.total_outdated)"   else "" end)
+  + (if .value.compat_updates   != null then "  compat=\(.value.compat_updates)"     else "" end)
+  + (if .value.major_updates    != null then "  major=\(.value.major_updates)"       else "" end)
+  + (if .value.total_crates     != null then "  bloat_crates=\(.value.total_crates)" else "" end)
+  + (if .value.mode             != null then "  mode=\(.value.mode)"                 else "" end)
   + "  (\(.value.duration_seconds // 0)s)"
 ' "$OUT/report.json" >&2
 
