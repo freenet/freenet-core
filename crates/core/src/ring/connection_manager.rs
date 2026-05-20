@@ -1212,7 +1212,7 @@ impl ConnectionManager {
         // Hold the cbl write lock only for the actual mutation; drop it
         // before the optional tracing::warn! and before acquiring
         // connected_since / peer_health (clippy: `significant_drop_tightening`).
-        let missing_entry = {
+        let _missing_entry = {
             let mut cbl = self.connections_by_location.write();
             let entry = cbl.entry(loc).or_default();
             if let Some(conn) = entry
@@ -1224,17 +1224,17 @@ impl ConnectionManager {
                 conn.location.set_addr(new_addr);
                 false
             } else {
+                // Warn before push to preserve pre-#4129 ordering
+                // (observational only, but the order was intentional).
+                tracing::warn!(
+                    old_addr = %old_addr,
+                    peer_location = %loc,
+                    "update_peer_identity: connection entry missing; creating placeholder"
+                );
                 entry.push(Connection::new(PeerKeyLocation::new(new_pub_key, new_addr)));
                 true
             }
         };
-        if missing_entry {
-            tracing::warn!(
-                old_addr = %old_addr,
-                peer_location = %loc,
-                "update_peer_identity: connection entry missing; creating placeholder"
-            );
-        }
 
         // Migrate connected_since and peer_health to the new address.
         {
