@@ -6,6 +6,7 @@ rust-version = "1.85"
 publish = false
 description = "HTTP agent that lets the freenet-core release pipeline trigger gateway updates"
 repository = "https://github.com/freenet/freenet-core"
+license = "MIT OR Apache-2.0"
 
 [[bin]]
 name = "freenet-release-agent"
