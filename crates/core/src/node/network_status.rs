@@ -360,6 +360,19 @@ pub fn set_external_address(addr: SocketAddr) {
     }
 }
 
+/// Read this node's externally observed address.
+///
+/// Test-only accessor: production code reads `external_address` via
+/// [`get_snapshot`]. Used by the `set_own_addr` TOCTOU regression test in
+/// `connection_manager.rs` to verify `own_addr` and `external_address` stay
+/// consistent under concurrent writers (issue #4172).
+#[cfg(test)]
+pub(crate) fn external_address() -> Option<SocketAddr> {
+    NETWORK_STATUS
+        .get()
+        .and_then(|status| status.read().ok().and_then(|s| s.external_address))
+}
+
 // --- Snapshot types for rendering ---
 
 /// Snapshot of the current network status for rendering.
