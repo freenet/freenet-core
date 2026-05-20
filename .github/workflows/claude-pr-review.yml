@@ -23,26 +23,45 @@ name: Claude PR Rule Review
 #   without the actor (PR author) needing write access. Without this, the
 #   action exits with "Actor does not have write permissions" on every
 #   first-party fork PR run (see freenet/freenet-core#4129).
-# - This is safe HERE because: (a) the prompt is hardcoded in this YAML —
-#   fork PRs can't change it; (b) Claude is granted ONLY the `Read`,
-#   `Glob` and `Grep` tools via `settings` below — NO Bash, so a
-#   prompt-injected fork PR diff cannot execute ANY command. `Read`/`Glob`/
-#   `Grep` only inspect files; they cannot run a shell, spawn a process,
-#   or make a network request. There is therefore no execution surface to
-#   exfiltrate secrets through. (NOTE: `Bash(prefix:*)` allow-patterns are
-#   NOT a sandbox — a command starting with an allowed prefix can still
-#   chain arbitrary shell via `;`, `&&`, `|` or `$(...)`. We do not rely
-#   on them; Bash is denied entirely.); (c) the diff under review is
-#   precomputed by a TRUSTED plain-YAML step ("Compute PR diff" below) and
-#   written to a file — Claude reads that file with `Read`, it never runs
-#   `git diff` itself; (d) the job token has only `pull-requests: write` +
-#   `issues: write` + `statuses: write` — worst case is a misleading
-#   comment, which a human reviewer will catch; (e) the action
-#   automatically scrubs Anthropic / cloud / GitHub Actions secrets from
-#   subprocess env when this input is set; (f) the checkout step sets
-#   `persist-credentials: false` so the job's GITHUB_TOKEN is NOT written
-#   to .git/config — defense-in-depth so that even a `Read` of
-#   .git/config cannot surface a persisted token.
+# - The threat is prompt injection: a fork PR controls the diff content,
+#   and that content is fed to Claude. The defenses, in layers:
+#
+#   (a) PRIMARY — no execution surface. Claude is granted ONLY the `Read`,
+#       `Glob` and `Grep` tools via `settings` below — NO Bash. A
+#       prompt-injected diff therefore cannot run ANY command: no shell,
+#       no process spawn, no network request. (`Bash(prefix:*)`
+#       allow-patterns are deliberately NOT used — they are not a sandbox;
+#       a command starting with an allowed prefix can still chain
+#       arbitrary shell via `;`, `&&`, `|` or `$(...)`. Bash is denied
+#       outright.)
+#
+#   (b) The diff under review is precomputed by a TRUSTED plain-YAML step
+#       ("Compute PR diff" below) into `.pr-review-tmp/` in the workspace.
+#       Claude reads that file with `Read`; it never runs `git diff`.
+#
+#   (c) SECRET-EXFIL DEFENSE — even Read-only tools could otherwise be
+#       turned into an exfil channel: an injected prompt could ask Claude
+#       to `Read` a file holding this job's live tokens (notably
+#       `/proc/<pid>/environ`, since the Claude process env carries
+#       CLAUDE_CODE_OAUTH_TOKEN + GITHUB_TOKEN, or `~/.claude` on disk)
+#       and echo it into the review text. The `settings.permissions.deny`
+#       block scopes `Read`/`Glob`/`Grep` away from `/proc`, `/sys`,
+#       `/dev`, `/etc`, `/root`, the runner's home dotfiles and
+#       `$RUNNER_TEMP` — confining file access to the checked-out repo
+#       and the precomputed diff. This is defense-in-depth, not a perfect
+#       sandbox; the no-Bash lockdown in (a) is the load-bearing control.
+#
+#   (d) The job token has only `pull-requests: write` + `issues: write` +
+#       `statuses: write` — no `contents: write`. Worst case is a
+#       misleading sticky comment, which a human reviewer will catch.
+#
+#   (e) The action scrubs Anthropic / cloud / GitHub Actions secrets from
+#       *subprocess* env when `allowed_non_write_users` is set (this
+#       covers Bash subprocesses; moot here since Bash is denied).
+#
+#   (f) The checkout step sets `persist-credentials: false` so the job's
+#       GITHUB_TOKEN is NOT written to .git/config.
+#
 # - Do NOT copy this `allowed_non_write_users: '*'` pattern to any workflow
 #   that grants Claude write/edit tools, Bash, commit signing, or
 #   contents:write.
@@ -238,10 +257,13 @@ jobs:
 
       - name: Compute PR diff
         # TRUSTED step: runs in plain YAML, NOT controlled by Claude. Precomputes
-        # the PR diff so the Claude review step needs no Bash at all. The diff is
-        # written to files under $RUNNER_TEMP/pr-review/ which the Claude step then
-        # reads with the `Read` tool. This is what makes the fork-review path
-        # genuinely read-only: Claude is granted only Read/Glob/Grep below.
+        # the PR diff so the Claude review step needs no Bash at all.
+        #
+        # The diff is written INTO the workspace (.pr-review-tmp/) on purpose:
+        # the Claude step's read-only tools are confined to the repo tree, so
+        # the diff must live inside it. .pr-review-tmp/ is a fresh dir created
+        # here, never committed, and contains only data this trusted step
+        # produced (git diff/log output) — no secrets.
         id: diff
         if: github.event_name != 'merge_group' && steps.override.outputs.overridden != 'true' && steps.rules.outputs.skip != 'true'
         env:
@@ -249,7 +271,8 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          OUT_DIR="${RUNNER_TEMP}/pr-review"
+          OUT_DIR="${GITHUB_WORKSPACE}/.pr-review-tmp"
+          rm -rf "$OUT_DIR"
           mkdir -p "$OUT_DIR"
 
           # Three-dot diff: changes on the PR head relative to the merge base
@@ -279,7 +302,8 @@ jobs:
             echo "truncated=false" >> "$GITHUB_OUTPUT"
           fi
 
-          echo "dir=$OUT_DIR" >> "$GITHUB_OUTPUT"
+          # Path is relative to the workspace (Claude's working directory).
+          echo "dir=.pr-review-tmp" >> "$GITHUB_OUTPUT"
           echo "Diff: $DIFF_BYTES bytes; files: $(wc -l < "$NAMES_FILE"); commits: $(wc -l < "$LOG_FILE")"
 
       - name: Claude rule review
@@ -294,18 +318,40 @@ jobs:
           # the top of this file. Only safe in combination with the read-only
           # `settings.permissions` lockdown below.
           allowed_non_write_users: '*'
-          # Lock Claude to read-only file inspection. The `allow` list grants
-          # ONLY Read/Glob/Grep — no Bash. With no Bash granted and no
-          # permissive defaultMode, Bash is denied entirely, so a
+          # Lock Claude to read-only file inspection, scoped to the repo tree.
+          #
+          # `allow` grants ONLY Read/Glob/Grep — no Bash. With no Bash granted
+          # and no permissive defaultMode, Bash is denied entirely, so a
           # prompt-injected fork PR diff has NO command-execution surface.
-          # The diff itself is precomputed by the trusted "Compute PR diff"
-          # step above; Claude reads it from a file via `Read`.
           # `Bash(prefix:*)` allow-patterns are deliberately NOT used: they
           # are not a sandbox (a command can chain arbitrary shell after an
           # allowed prefix via `;`, `&&`, `|`, `$(...)`).
-          # The `deny` list is belt-and-suspenders — these tools are already
-          # denied by virtue of not being in `allow`, but listing them keeps
-          # the intent explicit if a future edit adds a permissive default.
+          #
+          # `deny` does two things:
+          #  1. Belt-and-suspenders denial of every non-read tool (already
+          #     denied by absence from `allow`, but explicit so a future edit
+          #     adding a permissive default can't silently re-enable them).
+          #  2. SECRET-EXFIL DEFENSE: even with only Read/Glob/Grep, an
+          #     injected prompt could otherwise ask Claude to read files that
+          #     hold the live tokens this job runs with and echo them into the
+          #     review text (which the trusted "Post review comment" step then
+          #     publishes). The concrete vectors and their denials:
+          #       - `/proc/<pid>/environ` — the Claude process env carries
+          #         CLAUDE_CODE_OAUTH_TOKEN + GITHUB_TOKEN. The action's env
+          #         scrub only covers *subprocess* env, not the in-process
+          #         Read tool. Denied via `/proc`, `/sys`, `/dev`.
+          #       - `~/.claude/**`, `~/.config/**`, `~/.netrc`, `~/.ssh/**`,
+          #         `~/.git-credentials` — OAuth creds / tokens on disk.
+          #       - `~/work/_temp/**` ($RUNNER_TEMP) — the GitHub event
+          #         payload and other steps' scratch files.
+          #       - `/etc`, `/root` — host config.
+          #     The precomputed diff lives INSIDE the workspace
+          #     (`.pr-review-tmp/`), and the repo's own `.claude/` rules and
+          #     `.github/` are part of the review, so the deny list targets
+          #     only paths OUTSIDE the repo tree. deny takes precedence over
+          #     allow. NOTE: this is defense-in-depth, not a perfect sandbox —
+          #     the no-Bash lockdown is the primary control; see the "Fork PR
+          #     security model" header.
           settings: |
             {
               "permissions": {
@@ -322,7 +368,34 @@ jobs:
                   "WebFetch",
                   "WebSearch",
                   "Task",
-                  "Bash"
+                  "Bash",
+                  "Read(//proc/**)",
+                  "Read(//sys/**)",
+                  "Read(//dev/**)",
+                  "Read(//etc/**)",
+                  "Read(//root/**)",
+                  "Read(~/.claude/**)",
+                  "Read(~/.config/**)",
+                  "Read(~/.netrc)",
+                  "Read(~/.ssh/**)",
+                  "Read(~/.git-credentials)",
+                  "Read(~/work/_temp/**)",
+                  "Grep(//proc/**)",
+                  "Grep(//sys/**)",
+                  "Grep(//etc/**)",
+                  "Grep(//root/**)",
+                  "Grep(~/.claude/**)",
+                  "Grep(~/.config/**)",
+                  "Grep(~/.ssh/**)",
+                  "Grep(~/work/_temp/**)",
+                  "Glob(//proc/**)",
+                  "Glob(//sys/**)",
+                  "Glob(//etc/**)",
+                  "Glob(//root/**)",
+                  "Glob(~/.claude/**)",
+                  "Glob(~/.config/**)",
+                  "Glob(~/.ssh/**)",
+                  "Glob(~/work/_temp/**)"
                 ]
               }
             }
