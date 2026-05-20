@@ -1604,10 +1604,16 @@ mod test {
                 ApplicationMessage::new(payload),
             )],
         )?;
+        // Wildcard satisfies #[non_exhaustive] on OutboundDelegateMsg so
+        // future stdlib variants don't break this test at compile time.
+        #[allow(clippy::wildcard_enum_match_arm)]
         let response: OutboundAppMessage = match &outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(m) => bincode::deserialize(&m.payload)?,
             other => panic!("Expected ApplicationMessage, got {other:?}"),
         };
+        // Wildcard satisfies #[non_exhaustive] on OutboundAppMessage so
+        // future stdlib variants don't break this test at compile time.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match response {
             OutboundAppMessage::ContextData(data) => {
                 assert!(
