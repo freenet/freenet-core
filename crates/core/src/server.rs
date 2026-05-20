@@ -282,6 +282,8 @@ pub mod local_node {
                     // Drop the iter() guard before remove() to avoid holding a
                     // DashMap shard guard across a mutating call on the same map
                     // (clippy: `significant_drop_in_scrutinee`).
+                    // Safe: the outer caller serialises by `id`, so no concurrent
+                    // iter+remove on this shard is possible.
                     let rm_token = gw.origin_contracts.iter().find_map(|entry| {
                         let (k, origin) = entry.pair();
                         (origin.client_id == id).then(|| k.clone())

@@ -166,8 +166,14 @@ run_geiger() {
   printf ']\n' >> "$OUT/geiger.raw"
   local t1; t1=$(date +%s)
 
+  # $rc is non-zero if ANY per-member run failed (set by `rc=$?` in the loop's
+  # else branch; the success branch never resets it). Derive `status` the same
+  # way run_check does so consumers checking only `status` don't see "ok" for
+  # a failed run.
+  local status; [[ $rc -eq 0 ]] && status=ok || status="exit_${rc}"
+
   jq -n \
-    --arg status "ok" \
+    --arg status "$status" \
     --argjson rc  "$rc" \
     --argjson dur "$((t1-t0))" \
     --arg raw     "$OUT/geiger.raw" \

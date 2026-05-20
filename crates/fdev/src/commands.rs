@@ -57,9 +57,6 @@ pub(crate) struct PutDelegate {
 }
 
 pub async fn put(config: PutConfig, other: BaseConfig) -> anyhow::Result<()> {
-    if config.release {
-        anyhow::bail!("Cannot publish contracts in the network yet");
-    }
     let params = if let Some(params) = &config.parameters {
         let mut buf = vec![];
         File::open(params)?.read_to_end(&mut buf)?;
@@ -366,9 +363,6 @@ pub async fn get_contract_id(config: GetContractIdConfig) -> anyhow::Result<()> 
 }
 
 pub async fn update(config: UpdateConfig, other: BaseConfig) -> anyhow::Result<()> {
-    if config.release {
-        anyhow::bail!("Cannot publish contracts in the network yet");
-    }
     // Create ContractKey with placeholder code hash - the node will look up the actual key
     let instance_id = ContractInstanceId::try_from(config.key)?;
     let key = ContractKey::from_id_and_code(instance_id, CodeHash::new([0u8; 32]));

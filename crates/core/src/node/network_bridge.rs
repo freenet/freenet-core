@@ -151,21 +151,32 @@ pub fn reset_channel_id_counter() {
     CHANNEL_ID_COUNTER.with(|c| c.set(idx * CHANNEL_ID_BLOCK));
 }
 
-/// Channel capacity for event loop notification and op execution channels.
-const EVENT_LOOP_CHANNEL_CAPACITY: usize = 2048;
+/// Default channel capacity for event loop notification and op execution channels.
+const DEFAULT_EVENT_LOOP_CHANNEL_CAPACITY: usize = 2048;
 
+/// Create an event loop notification channel pair with the default capacity.
 pub(crate) fn event_loop_notification_channel()
 -> (EventLoopNotificationsReceiver, EventLoopNotificationsSender) {
+    event_loop_notification_channel_with_capacity(DEFAULT_EVENT_LOOP_CHANNEL_CAPACITY)
+}
+
+/// Create an event loop notification channel pair with a specific capacity.
+///
+/// Use [`event_loop_notification_channel`] for the default capacity (2048).
+pub(crate) fn event_loop_notification_channel_with_capacity(
+    capacity: usize,
+) -> (EventLoopNotificationsReceiver, EventLoopNotificationsSender) {
     let _channel_id = CHANNEL_ID_COUNTER.with(|c| {
         let v = c.get();
         c.set(v + 1);
         v
     });
-    let (notification_tx, notification_rx) = mpsc::channel(EVENT_LOOP_CHANNEL_CAPACITY);
-    let (op_execution_tx, op_execution_rx) = mpsc::channel(EVENT_LOOP_CHANNEL_CAPACITY);
+    let (notification_tx, notification_rx) = mpsc::channel(capacity);
+    let (op_execution_tx, op_execution_rx) = mpsc::channel(capacity);
 
     tracing::info!(
         channel_id = _channel_id,
+        capacity,
         "Created event loop notification channel pair"
     );
 
@@ -417,6 +428,48 @@ mod tests {
             }
         }
         assert_eq!(received, 2, "Should receive both messages");
+    }
+
+    /// Test that event_loop_notification_channel_with_capacity creates channels
+    /// with the specified capacity and that the capacity is respected.
+    #[tokio::test]
+    async fn test_channel_with_custom_capacity() {
+        let custom_capacity: usize = 5;
+        let (notification_channel, notification_tx) =
+            event_loop_notification_channel_with_capacity(custom_capacity);
+        let mut rx = notification_channel.notifications_receiver;
+
+        // Fill up to capacity without draining
+        for i in 0..custom_capacity {
+            let test_event = crate::message::NodeEvent::Disconnect {
+                cause: Some(format!("msg-{i}").into()),
+            };
+            notification_tx
+                .notifications_sender()
+                .send(Either::Right(test_event))
+                .await
+                .expect("Should not block within channel capacity");
+        }
+
+        // Verify we can drain all messages
+        let mut count = 0;
+        while count < custom_capacity {
+            match timeout(Duration::from_millis(50), rx.recv()).await {
+                Ok(Some(_)) => count += 1,
+                Ok(None) => panic!("Channel closed unexpectedly"),
+                Err(_) => panic!(
+                    "Timeout draining message {}/{} — channel may have over-accepted",
+                    count + 1,
+                    custom_capacity
+                ),
+            }
+        }
+
+        assert_eq!(
+            count, custom_capacity,
+            "Should receive exactly {} messages (channel capacity)",
+            custom_capacity
+        );
     }
 }
 

@@ -1097,7 +1097,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     });
                 }
 
-                let old_missing = std::mem::replace(&mut delayed, Vec::with_capacity(200));
+                let old_missing = std::mem::take(&mut delayed);
                 for tx in old_missing {
                     if let Some(tx) = ops.completed.remove(&tx) {
                         if cfg!(feature = "trace-ot") {

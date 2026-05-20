@@ -147,6 +147,36 @@ zip = { version = "8", default-features = false, features = ["deflate", "time"] 
 # Freenet
 freenet-stdlib = "0.8.0"
 
+# Crypto (secrets-at-rest KEK + DEK derivation, see crates/core/src/config/kek.rs).
+# `sha2` is already declared above (workspace-wide); only `hkdf` and `keyring`
+# are added here.
+#
+# `keyring` features are deliberately restricted to the per-platform native
+# stores that have NO system-package build dependencies:
+#
+# - `apple-native`: macOS Keychain (Security framework, ships with macOS).
+# - `windows-native`: Credential Manager (Win32 API, ships with Windows).
+#
+# **Linux intentionally has no keyring feature here.** The only persistent
+# Linux options in `keyring 3.x` are `sync-secret-service` /
+# `async-secret-service` (D-Bus Secret Service, requires libdbus-1-dev at
+# build time) or `linux-native-sync-persistent` (which itself depends on
+# sync-secret-service for KEK persistence beyond process exit). Both
+# require libdbus-1-dev, which is absent on typical CI runners and
+# headless production servers. Linux nodes fall back to the file backend
+# (`secrets_dir/node_kek`, 0o600) or systemd credentials
+# (`$CREDENTIALS_DIRECTORY/freenet-kek`) — both header-only, no system deps.
+#
+# Operators on Linux who do have libdbus-1-dev and want GNOME/KDE keyring
+# integration can re-enable the feature in a downstream fork; the
+# `KekBackend` abstraction in `crates/core/src/config/kek.rs` is
+# backend-agnostic so the in-tree code remains identical.
+keyring = { version = "3.6", default-features = false, features = [
+    "apple-native",
+    "windows-native",
+] }
+hkdf = "0.13"
+
 [profile.dev.package."*"]
 opt-level = 3
 
