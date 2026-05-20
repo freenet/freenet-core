@@ -1512,6 +1512,72 @@ async fn process_open_request(
                     "Received delegate operation from client"
                 );
                 let delegate_key = req.key().clone();
+                // Derive a short discriminant tag for the INFO logs, but only when INFO is
+                // enabled — the Vec<&str> collect + format! would otherwise allocate on every
+                // delegate dispatch even when the log line is suppressed.
+                let msg_type: Option<String> = if tracing::enabled!(tracing::Level::INFO) {
+                    Some(match &req {
+                        freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                            inbound,
+                            ..
+                        } => {
+                            // Include the count of inbound message variants for observability.
+                            // Each variant name is a short discriminant so operators can tell
+                            // ApplicationMessage (from app) apart from GetContractResponse etc.
+                            let tags: Vec<&str> = inbound
+                                .iter()
+                                .map(|m| match m {
+                                    InboundDelegateMsg::ApplicationMessage(_) => {
+                                        "ApplicationMessage"
+                                    }
+                                    InboundDelegateMsg::UserResponse(_) => "UserResponse",
+                                    InboundDelegateMsg::GetContractResponse(_) => {
+                                        "GetContractResponse"
+                                    }
+                                    InboundDelegateMsg::PutContractResponse(_) => {
+                                        "PutContractResponse"
+                                    }
+                                    InboundDelegateMsg::UpdateContractResponse(_) => {
+                                        "UpdateContractResponse"
+                                    }
+                                    InboundDelegateMsg::SubscribeContractResponse(_) => {
+                                        "SubscribeContractResponse"
+                                    }
+                                    InboundDelegateMsg::ContractNotification(_) => {
+                                        "ContractNotification"
+                                    }
+                                    InboundDelegateMsg::DelegateMessage(_) => "DelegateMessage",
+                                    _ => "Unknown",
+                                })
+                                .collect();
+                            // Format as "ApplicationMessages[ApplicationMessage,DelegateMessage]"
+                            // when there are inbound messages, or bare "ApplicationMessages" when empty.
+                            if tags.is_empty() {
+                                "ApplicationMessages".to_string()
+                            } else {
+                                format!("ApplicationMessages[{}]", tags.join(","))
+                            }
+                        }
+                        freenet_stdlib::client_api::DelegateRequest::RegisterDelegate {
+                            ..
+                        } => "RegisterDelegate".to_string(),
+                        freenet_stdlib::client_api::DelegateRequest::UnregisterDelegate(_) => {
+                            "UnregisterDelegate".to_string()
+                        }
+                        _ => "Unknown".to_string(),
+                    })
+                } else {
+                    None
+                };
+                if let Some(ref mt) = msg_type {
+                    tracing::info!(
+                        delegate = %delegate_key,
+                        msg_type = %mt,
+                        request_id = %request_id,
+                        outcome = "queued",
+                        "DelegateRequest dispatch"
+                    );
+                }
                 let origin_contract = request.origin_contract;
 
                 let res = match op_manager
@@ -1521,7 +1587,18 @@ async fn process_open_request(
                     })
                     .await
                 {
-                    Ok(ContractHandlerEvent::DelegateResponse(res)) => res,
+                    Ok(ContractHandlerEvent::DelegateResponse(res)) => {
+                        if let Some(ref mt) = msg_type {
+                            tracing::info!(
+                                delegate = %delegate_key,
+                                msg_type = %mt,
+                                request_id = %request_id,
+                                outcome = "executed",
+                                "DelegateRequest dispatch"
+                            );
+                        }
+                        res
+                    }
                     Err(err) => {
                         tracing::error!(
                             client_id = %client_id,
