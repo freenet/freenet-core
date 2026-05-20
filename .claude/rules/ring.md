@@ -204,6 +204,17 @@ Audit grep when adding a new method that touches multiple DashMaps:
 - Add an inline `// hold the X guard across Y to prevent the Z race`
   comment so a future clippy pass leaves a footprint when it tries to
   drop the guard.
+
+CAVEAT — this rule only protects primary-origin removers (removers
+that take the primary map's guard first, then touch the secondary).
+A secondary-origin remover — one that starts from the secondary
+index and works back to the primary — is NOT protected by this
+discipline. Those need their own atomicity story: either share a
+lock order with the add path, batch the primary-side updates under a
+single guard, or use a reconciliation/two-phase remove protocol.
+Example of an unprotected secondary-origin remover that still has a
+bidirectional-consistency race even with the rule applied:
+`InterestManager::remove_all_peer_interests` (issue #4174).
 ```
 
 ## Trigger-Action Rules
