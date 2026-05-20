@@ -122,24 +122,20 @@ statrs = "0.18"
 test-log = "0.2"
 testresult = "0.4"
 turmoil = "0.7"
-ureq = { version = "3.3", features = ["json"] }
 which = "8.0"
 
 # Versioning
 semver = { version = "1", features = ["serde"] }
 
 # Proc macros
-darling = "0.23"
 proc-macro2 = "1.0"
 quote = "1.0"
 syn = { version = "2.0", features = ["full", "extra-traits", "parsing"] }
-trybuild = "1.0"
 
 # Platform-specific
 libc = "0.2"
 tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
-gag = "1"
 winapi = "0.3"
 tao = { version = "0.35", default-features = false, features = ["rwh_06"] }
 wry = { version = "0.55", default-features = false, features = ["os-webview"] }
