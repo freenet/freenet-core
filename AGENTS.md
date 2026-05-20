@@ -257,6 +257,11 @@ End-to-end procedure for any maintainer is in
 `gh workflow run release.yml --field version=X.Y.Z`. The `RELEASE_PAT`
 section above is the prerequisite for the cascade to fire automatically.
 
+## Delegate secrets-at-rest
+
+Operator-facing documentation (encryption model, migration matrix,
+`freenet secrets` CLI) lives in [`docs/secrets-at-rest.md`](docs/secrets-at-rest.md).
+
 ## External Resources
 
 - API docs: https://docs.rs/freenet

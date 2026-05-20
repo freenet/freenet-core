@@ -154,6 +154,80 @@ CORRECT:
 - All `retain()` / sweep loops — verify exemption conditions have TTL or absolute age bounds
 - `ConnectionManager` fields — verify each map has a documented cleanup owner
 
+### Cross-DashMap Lock Discipline (`significant_drop_tightening` exception)
+
+```
+Some methods mutate a primary DashMap entry and then write to a SECOND
+DashMap that mirrors that state (a reverse index, a hash index, etc.).
+For those methods, the primary entry's shard guard MUST be held across
+the secondary write.
+
+This intentionally lifts the `significant_drop_tightening` clippy lint:
+the guard is load-bearing for atomicity against a concurrent remover,
+not for serializing unrelated callers. A blind `cargo clippy --fix` (or
+agent applying the lint) will silently re-introduce a race.
+
+WRONG (PR #4129 shape):
+  let became = {
+      let mut entry = self.primary.entry(key).or_default();
+      entry.add_reason()
+  };  // <-- guard dropped here
+  self.secondary_index.insert(key);  // <-- racy: a concurrent remover
+                                     //     can run `cleanup_if_no_reasons`
+                                     //     between the drop and the insert,
+                                     //     no-op-removing the not-yet-present
+                                     //     secondary entry, then this insert
+                                     //     leaks a zombie.
+
+CORRECT (PR #4171 shape):
+  let mut entry = self.primary.entry(key).or_default();
+  let became = entry.add_reason();
+  self.secondary_index.insert(key);  // <-- still under the primary guard
+  drop(entry);                       // explicit for documentation only
+  became
+```
+
+Concrete cases in this crate:
+- `InterestManager::{register_peer_interest, register_local_hosting,
+  add_local_client, add_downstream_subscriber, register_local_interest}`
+  hold `interested_peers` or `local_interests` across
+  `index_contract_hash` so a concurrent `remove_*` cannot run
+  `cleanup_contract_if_no_interest` → `unindex_contract_hash` in the
+  window between guard drop and indexing. See PR #4129 (introduced the
+  race) and PR #4171 (restored the discipline).
+
+Audit grep when adding a new method that touches multiple DashMaps:
+- Identify the primary map whose presence is the source of truth for
+  interest/membership.
+- Identify any secondary map that mirrors that state.
+- Confirm the primary guard is held across the secondary write.
+- Add an inline `// hold the X guard across Y to prevent the Z race`
+  comment so a future clippy pass leaves a footprint when it tries to
+  drop the guard.
+
+CAVEAT — this rule only protects primary-origin removers (removers
+that take the primary map's guard first, then touch the secondary).
+A secondary-origin remover — one that starts from the secondary
+index and works back to the primary — is NOT protected by this
+discipline. Those need their own atomicity story: either share a
+lock order with the add path, batch the primary-side updates under a
+single guard, or use a reconciliation/two-phase remove protocol.
+
+A secondary-origin remover that broke this way was
+`InterestManager::remove_all_peer_interests` (issue #4174). Its old
+shape removed the `peer_contracts[peer]` reverse entry up front, then
+iterated a stale snapshot mutating `interested_peers` directly — a
+concurrent `register_peer_interest` could re-create one side after the
+snapshot, leaving a one-sided ghost. The fix (PR for #4174) does NOT
+add a new atomicity primitive: it makes the secondary-origin remover
+delegate each per-contract cleanup to the primary-origin remover
+`remove_peer_interest`, which already holds the
+`interested_peers[contract]` shard guard across its `peer_contracts`
+update. So the safe pattern for a secondary-origin bulk remover is:
+snapshot the secondary index (read-only, do NOT remove it up front),
+then call the existing per-key primary-origin remover for each entry.
+```
+
 ## Trigger-Action Rules
 
 ### BEFORE modifying ConnectionManager

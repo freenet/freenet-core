@@ -20,13 +20,17 @@ use chacha20poly1305::{
 use dashmap::DashMap;
 use freenet_stdlib::prelude::*;
 
-use crate::config::Secrets;
+use hkdf::Hkdf;
+use sha2::Sha256;
+use zeroize::Zeroizing;
+
+use crate::config::{KEK_SIZE, KekBackendKind, Secrets, ensure_kek_loaded};
 use crate::contract::storages::Storage;
 
 use super::RuntimeResult;
 use super::secret_snapshots::{
-    RetentionPolicy, SnapshotMetadata, list_snapshots, next_snapshot_path, snapshot_dir_for,
-    thin_snapshots,
+    RetentionPolicy, SNAPSHOTS_DIR, SnapshotMetadata, list_snapshots, next_snapshot_path,
+    snapshot_dir_for, thin_snapshots,
 };
 
 /// Environment variable that disables snapshot-on-write for delegate secrets.
@@ -97,6 +101,27 @@ pub struct SecretsStore {
     base_path: PathBuf,
     #[allow(unused)]
     secrets: Secrets,
+    /// Node KEK loaded from the configured backend (OS keyring, systemd
+    /// credential, or `secrets_dir/node_kek`). Held in a `Zeroizing`
+    /// buffer so it is wiped from memory when the store is dropped.
+    /// Used as the master key for the HKDF derivation of per-delegate
+    /// DEKs. See `derive_delegate_dek`.
+    kek: Zeroizing<[u8; KEK_SIZE]>,
+    /// Backend that currently holds [`Self::kek`]. Surfaced through
+    /// `fdev secrets kek-status` and recorded in
+    /// `secrets_dir/kek_backend` so transient outages of a stronger
+    /// backend cannot silently demote the node to a weaker one.
+    kek_backend: KekBackendKind,
+    /// Per-delegate encryption keys. Each entry is either:
+    ///   - derived from the node KEK via HKDF-SHA256 (the common case
+    ///     after #4140); or
+    ///   - supplied by a client through `RegisterDelegate` (legacy path
+    ///     retained for wire-format compatibility; the supplied cipher
+    ///     overrides the derived one for that delegate).
+    ///
+    /// Cache-only; never persisted. On restart, derived entries are
+    /// reconstructed lazily on first `get_secret` / `store_secret` for
+    /// each delegate.
     ciphers: std::collections::HashMap<DelegateKey, Encryption>,
     /// In-memory index: DelegateKey -> Set of secret key hashes.
     /// Populated from ReDb on startup and kept in sync with it; never
@@ -130,11 +155,104 @@ pub struct SecretsStore {
     snapshots_enabled: bool,
 }
 
+/// HKDF info string for per-delegate DEK derivation. Versioned (`v1`)
+/// so a future derivation-algorithm change can rotate via this string
+/// without rotating the KEK itself.
+const DEK_HKDF_INFO: &[u8] = b"freenet-delegate-dek-v1";
+
+/// `File::create` opens the file with the process umask, which on most
+/// distros leaves it world-readable. Every secret blob we land at rest
+/// MUST be owner-only. This helper opens at mode 0o600 on Unix in the
+/// same syscall as the create — no window where the file is readable
+/// under the umask. Windows: no-op (per-user profile dir + ACL is
+/// already restrictive).
+///
+/// **Stale-tmp mode preservation.** `OpenOptions::mode` is only
+/// honored on the *create* path: when the file already exists, the
+/// existing mode is preserved and the `0o600` request is silently
+/// ignored. The `truncate(true)` flag rewrites the *content* of a
+/// surviving `.tmp` from a prior crashed run but leaves its mode
+/// alone — which on an upgraded host can be the legacy 0o644 from
+/// before this helper landed. Belt-and-suspenders: unlink any
+/// pre-existing inode at `path` so the open always lands on a fresh
+/// 0o600 file.
+fn create_owner_only(path: &Path) -> std::io::Result<File> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+/// Ensure the secrets-root directory is mode 0o700 on Unix. Operators
+/// who created the directory before the permission tightening landed
+/// inherited the umask (often 0o755 = world-readable directory entries).
+/// We `chmod` it down on every `SecretsStore::new` so a single restart
+/// is sufficient to migrate. Windows: no-op.
+#[cfg(unix)]
+fn ensure_owner_only_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)?.permissions();
+    let mode = perms.mode() & 0o777;
+    if mode != 0o700 {
+        tracing::warn!(
+            path = %path.display(),
+            existing_mode = format_args!("{mode:o}"),
+            "secrets directory was not 0o700; tightening to owner-only"
+        );
+        perms.set_mode(0o700);
+        std::fs::set_permissions(path, perms)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_owner_only_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 impl SecretsStore {
     pub fn new(secrets_dir: PathBuf, secrets: Secrets, db: Storage) -> RuntimeResult<Self> {
         std::fs::create_dir_all(&secrets_dir).map_err(|err| {
             tracing::error!("error creating secrets dir: {err}");
             err
+        })?;
+
+        // Tighten directory permissions to owner-only. Cheap to do
+        // unconditionally; a pre-existing 0o755 directory from a node
+        // upgraded across this commit gets fixed in one restart.
+        if let Err(e) = ensure_owner_only_dir(&secrets_dir) {
+            tracing::warn!(
+                path = %secrets_dir.display(),
+                error = %e,
+                "failed to tighten secrets-dir permissions; continuing"
+            );
+        }
+
+        // Load (or resolve + provision) the node KEK. First start picks
+        // a backend from the OS-keyring → systemd-credential → file
+        // chain; subsequent starts read the recorded backend marker and
+        // load strictly from there (no silent demotion). `OsRng` is the
+        // documented exception to the GlobalRng rule for cryptographic
+        // key material (see `.claude/rules/code-style.md`).
+        let (kek_backend, kek) = ensure_kek_loaded(&secrets_dir, || {
+            use chacha20poly1305::aead::OsRng;
+            use chacha20poly1305::aead::rand_core::RngCore;
+            let mut kek = Zeroizing::new([0u8; KEK_SIZE]);
+            OsRng.fill_bytes(kek.as_mut_slice());
+            kek
+        })
+        .map_err(|e| {
+            tracing::error!("failed to load node KEK: {e}");
+            std::io::Error::other(format!("KEK load failed: {e}"))
         })?;
 
         // Load index from ReDb
@@ -170,6 +288,8 @@ impl SecretsStore {
 
         Ok(Self {
             base_path: secrets_dir,
+            kek,
+            kek_backend,
             ciphers: std::collections::HashMap::new(),
             key_to_secret_part,
             db,
@@ -182,6 +302,84 @@ impl SecretsStore {
             retention: RetentionPolicy::default(),
             snapshots_enabled: std::env::var_os(DISABLE_SNAPSHOTS_ENV).is_none(),
         })
+    }
+
+    /// Return the backend currently holding the node KEK. Surfaced via
+    /// `fdev secrets kek-status` so operators can see whether they are
+    /// running with the strong (keyring/systemd) or weak (file) backend.
+    pub fn kek_backend(&self) -> KekBackendKind {
+        self.kek_backend
+    }
+
+    /// Derive the per-delegate DEK from the node KEK via HKDF-SHA256.
+    ///
+    /// HKDF inputs:
+    ///
+    /// - `ikm` = node KEK (32 bytes from the configured backend).
+    /// - `salt` = `delegate_key.encode()`, the bs58 encoding of the
+    ///   32-byte instance key (`DelegateKey::key`), i.e.
+    ///   `blake3(params || wasm_code)`. The companion `code_hash`
+    ///   field is NOT included in the salt — it's redundant because
+    ///   the instance key already folds in the wasm code, and binding
+    ///   it separately would only matter if two distinct delegates
+    ///   ever shared an instance key (currently impossible by
+    ///   construction).
+    /// - `info` = the versioned constant [`DEK_HKDF_INFO`]. Bumping
+    ///   the version rotates every DEK without touching the KEK.
+    /// - `okm` = 32 bytes (XChaCha20-Poly1305 key size).
+    ///
+    /// Deterministic in `(kek, delegate_key)` — restarting the node and
+    /// re-deriving yields the same DEK, which is what lets persisted
+    /// secrets stay readable across restart without a separate
+    /// per-delegate cipher store.
+    fn derive_delegate_dek(&self, delegate: &DelegateKey) -> Encryption {
+        let salt = delegate.encode();
+        let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), self.kek.as_slice());
+        let mut okm = Zeroizing::new([0u8; KEK_SIZE]);
+        hk.expand(DEK_HKDF_INFO, okm.as_mut_slice())
+            .expect("HKDF expand with 32-byte OKM never fails for SHA-256");
+        Encryption {
+            cipher: XChaCha20Poly1305::new(okm.as_slice().into()),
+            // Per-write random nonces are the production path; the
+            // `legacy_nonce` field is only consulted by the legacy
+            // decrypt fallback in `decrypt_secret_blob`. For derived
+            // DEKs we have no legacy on-disk files written under a
+            // shared nonce, so the value here is irrelevant — pin to
+            // zeros for determinism (so two stores constructed against
+            // the same KEK produce byte-identical `Encryption` values).
+            legacy_nonce: chacha20poly1305::XNonce::from_slice(&[0u8; 24]).to_owned(),
+        }
+    }
+
+    /// Return the cipher for `delegate`, deriving and caching it from
+    /// the KEK on first use. If a client previously called
+    /// `register_delegate` for this key, the registered cipher takes
+    /// precedence over the derived one (legacy compatibility path).
+    fn cipher_for(&mut self, delegate: &DelegateKey) -> &Encryption {
+        // Insert-if-absent then borrow. We can't use `Entry::or_insert_with`
+        // here because `derive_delegate_dek` needs `&self` (the KEK is on
+        // self) and the `Entry` API holds an exclusive borrow of the map.
+        // Split: insert via `&mut self` first, then a fresh `get` borrow.
+        if !self.ciphers.contains_key(delegate) {
+            let derived = self.derive_delegate_dek(delegate);
+            self.ciphers.insert(delegate.clone(), derived);
+        }
+        self.ciphers
+            .get(delegate)
+            .expect("cipher entry inserted above; cannot be missing in the same &mut self call")
+    }
+
+    /// Read-side analogue of `cipher_for` that does not take `&mut self`.
+    /// Falls back to `default_encryption` only if HKDF derivation would
+    /// somehow fail (it cannot for SHA-256 + 32-byte OKM; the branch is
+    /// defensive). Caches via interior mutability via the existing
+    /// `ciphers` map IS NOT possible because `get_secret` takes `&self`;
+    /// callers MUST tolerate the per-call HKDF cost on cold reads.
+    fn cipher_for_read(&self, delegate: &DelegateKey) -> Encryption {
+        if let Some(enc) = self.ciphers.get(delegate) {
+            return enc.clone();
+        }
+        self.derive_delegate_dek(delegate)
     }
 
     /// Override the retention policy. Intended for tests that want to
@@ -202,26 +400,32 @@ impl SecretsStore {
     pub fn register_delegate(
         &mut self,
         delegate: DelegateKey,
-        cipher: XChaCha20Poly1305,
-        nonce: XNonce,
+        _cipher: XChaCha20Poly1305,
+        _nonce: XNonce,
     ) -> Result<(), SecretStoreError> {
-        // Nonces are now per-write (see VERSION_V1). The `nonce` argument
-        // is retained on the wire-level RegisterDelegate API for legacy
-        // compatibility and is used only as the legacy-decrypt nonce when
-        // reading files written under the pre-VERSION_V1 layout.
+        // Since #4140: per-delegate DEKs are derived deterministically
+        // from the node KEK via HKDF-SHA256 (see `derive_delegate_dek`).
+        // The cipher and nonce supplied by the client on
+        // `RegisterDelegate { cipher, nonce }` are IGNORED — accepting
+        // client-supplied keys would allow a malicious or buggy client
+        // to substitute a key the operator does not control, defeating
+        // the purpose of the node KEK.
         //
-        // Previously this method skipped registration when the supplied
-        // nonce matched `default_encryption.nonce`, falling back to the
-        // default cipher on every write. That fallback is what made
-        // default-configured nodes encrypt with a world-known key; with
-        // per-write nonces the cipher is the only secret left, so it must
-        // always be registered per delegate even if the caller passed the
-        // historical default nonce.
-        let encryption = Encryption {
-            cipher,
-            legacy_nonce: nonce,
-        };
-        self.ciphers.insert(delegate, encryption);
+        // The wire-format `RegisterDelegate` variant retains those
+        // fields for backwards compatibility with older clients (they
+        // will simply have their values discarded server-side). A
+        // future stdlib bump may drop the fields entirely.
+        //
+        // We DO eagerly populate the `ciphers` cache with the derived
+        // DEK so that subsequent `get_secret`/`store_secret` calls
+        // skip the HKDF derivation cost on the hot path.
+        tracing::info!(
+            delegate = %delegate.encode(),
+            "RegisterDelegate cipher/nonce ignored; using HKDF-derived DEK from node KEK \
+             (this is the expected behavior since #4140)."
+        );
+        let derived = self.derive_delegate_dek(&delegate);
+        self.ciphers.insert(delegate, derived);
         Ok(())
     }
 
@@ -235,15 +439,15 @@ impl SecretsStore {
         &mut self,
         delegate: &DelegateKey,
         key: &SecretsId,
-        plaintext: Vec<u8>,
+        plaintext: Zeroizing<Vec<u8>>,
     ) -> RuntimeResult<()> {
         let delegate_path = self.base_path.join(delegate.encode());
         let secret_file_path = delegate_path.join(key.encode());
         let secret_key = *key.hash();
-        let encryption = self
-            .ciphers
-            .get(delegate)
-            .unwrap_or(&self.default_encryption);
+        // `cipher_for` derives via HKDF and caches on first call. A
+        // prior `register_delegate(delegate, ..)` keeps its registered
+        // cipher (legacy compatibility path).
+        let encryption = self.cipher_for(delegate);
 
         // Generate a fresh random nonce per write. XChaCha20-Poly1305's
         // 192-bit nonce makes random selection collision-safe for any
@@ -252,7 +456,7 @@ impl SecretsStore {
         let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
         let aead = encryption
             .cipher
-            .encrypt(&nonce, plaintext.as_ref())
+            .encrypt(&nonce, plaintext.as_slice())
             .map_err(SecretStoreError::Encryption)?;
 
         // Compose the on-disk blob: [VERSION_V1][nonce][aead]. The header
@@ -264,6 +468,9 @@ impl SecretsStore {
         ciphertext.extend_from_slice(&aead);
 
         fs::create_dir_all(&delegate_path)?;
+        if let Err(e) = ensure_owner_only_dir(&delegate_path) {
+            tracing::warn!(path = %delegate_path.display(), error = %e, "chmod delegate dir failed");
+        }
 
         // CRITICAL ORDER: hard-link prior value into snapshot history, write
         // new ciphertext to a tmp path, fsync, then atomically rename
@@ -292,11 +499,13 @@ impl SecretsStore {
         // Write to a sibling tmp path so the active path's inode never has
         // a half-written state. We pick a fixed suffix (rather than a
         // random one) because `&mut self` makes concurrent in-process
-        // store_secret calls impossible; a stale `.tmp` from a prior
-        // crashed run is overwritten harmlessly here.
+        // store_secret calls impossible. `create_owner_only` unlinks any
+        // surviving `.tmp` from a prior crashed run so the new inode
+        // always lands at mode 0o600 (a legacy 0o644 tmp from before this
+        // helper landed would otherwise be reused with its old mode).
         let tmp_path = secret_file_path.with_extension("tmp");
         {
-            let mut file = File::create(&tmp_path)?;
+            let mut file = create_owner_only(&tmp_path)?;
             file.write_all(&ciphertext)?;
             file.sync_all()?;
         }
@@ -365,6 +574,19 @@ impl SecretsStore {
     ) -> std::io::Result<()> {
         let snap_dir = snapshot_dir_for(delegate_path, key);
         fs::create_dir_all(&snap_dir)?;
+        // Snapshot dirs hold prior ciphertexts; tighten BOTH the
+        // intermediate `.snapshots/` umbrella AND the per-secret
+        // `.snapshots/{secret_id}/` leaf. Only chmodding the leaf
+        // leaves `.snapshots/` at the process umask (typically 0o755),
+        // which lets any local user enumerate per-secret subdir names,
+        // write counts (epoch_ms filenames), and write timing.
+        let snap_parent = delegate_path.join(SNAPSHOTS_DIR);
+        if let Err(e) = ensure_owner_only_dir(&snap_parent) {
+            tracing::warn!(path = %snap_parent.display(), error = %e, "chmod snapshots parent dir failed");
+        }
+        if let Err(e) = ensure_owner_only_dir(&snap_dir) {
+            tracing::warn!(path = %snap_dir.display(), error = %e, "chmod snapshot dir failed");
+        }
         let snap_path = next_snapshot_path(&snap_dir)?;
         match fs::hard_link(secret_file_path, &snap_path) {
             Ok(()) => Ok(()),
@@ -433,17 +655,22 @@ impl SecretsStore {
         &self,
         delegate: &DelegateKey,
         key: &SecretsId,
-    ) -> Result<Vec<u8>, SecretStoreError> {
+    ) -> Result<Zeroizing<Vec<u8>>, SecretStoreError> {
         let secret_path = self.base_path.join(delegate.encode()).join(key.encode());
-        let encryption = self
-            .ciphers
-            .get(delegate)
-            .unwrap_or(&self.default_encryption);
+        // Read path derives DEK on demand without caching (requires
+        // &self). Cold reads pay one HKDF-SHA256 expand call (~µs).
+        let encryption = self.cipher_for_read(delegate);
 
         let blob =
             fs::read(secret_path).map_err(|_| SecretStoreError::MissingSecret(key.clone()))?;
+        // The post-#4144 / pre-#4140 auto-persisted `delegate_cipher`
+        // file shows up here as `default_encryption`. Pre-#4143 blobs
+        // written under the world-known constants are caught by the
+        // last-tier `legacy_migration_encryption`.
+        let legacy_chain = [&self.default_encryption];
         decrypt_secret_blob(
-            encryption,
+            &encryption,
+            &legacy_chain,
             self.legacy_migration_encryption.as_ref(),
             &blob,
             key,
@@ -535,13 +762,17 @@ impl SecretsStore {
 
         // Read snapshot ciphertext, write through a sibling tmp file with
         // an atomic rename so the active path never tears. `&mut self`
-        // makes concurrent in-process restore impossible; a stale `.tmp`
-        // from a prior crashed run gets overwritten harmlessly here.
+        // makes concurrent in-process restore impossible. `create_owner_only`
+        // unlinks any surviving `.tmp` from a prior crashed run so the
+        // new inode always lands at mode 0o600.
         let ciphertext = fs::read(&chosen_path)?;
         fs::create_dir_all(&delegate_path)?;
+        if let Err(e) = ensure_owner_only_dir(&delegate_path) {
+            tracing::warn!(path = %delegate_path.display(), error = %e, "chmod delegate dir failed");
+        }
         let tmp_path = secret_file_path.with_extension("tmp");
         {
-            let mut file = File::create(&tmp_path)?;
+            let mut file = create_owner_only(&tmp_path)?;
             file.write_all(&ciphertext)?;
             file.sync_all()?;
         }
@@ -586,71 +817,130 @@ impl SecretsStore {
     }
 }
 
-/// Decrypt an on-disk secret blob, transparently supporting:
+/// Decrypt an on-disk secret blob, transparently supporting every
+/// historical on-disk format freenet-core has written for delegate
+/// secrets. Tries paths in order; later paths log progressively louder
+/// warnings because they indicate the blob is overdue for a write-side
+/// rewrite under the current key derivation:
 ///
-/// 1. New per-write-nonce format `[VERSION_V1][nonce][AEAD]` decrypted
-///    with the registered (or default) cipher.
-/// 2. Legacy shared-nonce format (raw `[AEAD]`) decrypted with the
-///    registered cipher + registration nonce.
-/// 3. Legacy shared-nonce format decrypted with the historical
-///    `LEGACY_DEFAULT_CIPHER` + `LEGACY_DEFAULT_NONCE` pair (the
-///    world-known constants `freenet-stdlib` 0.8.0 removed). This is
-///    the migration path for nodes upgraded past the removal of the
-///    default-cipher fallback: pre-#4143 on-disk files were written
-///    under those constants, and on a fresh restart the in-memory
-///    `ciphers` map is empty until `register_delegate` is called.
-///    Without this fallback, default-configured nodes would lose
-///    access to existing delegate secrets across upgrade.
+/// 1. **Current** — New per-write-nonce format `[VERSION_V1][nonce][AEAD]`
+///    decrypted with the registered or HKDF-derived cipher.
+/// 2. **Cipher rotated / blob pre-#4143** — Legacy shared-nonce format
+///    (raw `[AEAD]`) decrypted with the registered/derived cipher's
+///    `legacy_nonce` field.
+/// 3. **Post-#4144 / pre-#4140 delegate_cipher file** — Same blob shape
+///    as tier 2 but using the auto-persisted per-node cipher from
+///    `SecretArgs::build` (the brief window where the node had a random
+///    `delegate_cipher` file but no HKDF derivation yet). Each
+///    `legacy_chain` entry is tried in order.
+/// 4. **World-known migration path** — Last-resort decrypt with the
+///    historical `LEGACY_DEFAULT_CIPHER` + `LEGACY_DEFAULT_NONCE` pair
+///    (the stdlib constants removed in 0.8.0). Pre-#4143 nodes wrote
+///    here when no `--cipher` flag was passed.
 ///
-/// Ambiguity handling: a legacy blob's first byte is the first byte of
-/// AEAD output (uniformly random), so 1/256 of legacy files start with
-/// `VERSION_V1`. If the new-format parse fails AEAD validation, we fall
-/// back through the legacy paths. Each path is independent — failure of
+/// Ambiguity: a legacy blob's first byte is the first byte of AEAD
+/// output (uniformly random), so 1/256 of legacy files start with
+/// `VERSION_V1`. If the new-format parse fails AEAD validation we fall
+/// through to the legacy paths. Each path is independent — failure of
 /// one does not mask success of another.
 fn decrypt_secret_blob(
     encryption: &Encryption,
+    legacy_chain: &[&Encryption],
     legacy_migration: Option<&Encryption>,
     blob: &[u8],
     key: &SecretsId,
-) -> Result<Vec<u8>, SecretStoreError> {
+) -> Result<Zeroizing<Vec<u8>>, SecretStoreError> {
+    // Decryption strategy. The format + cipher have rotated three
+    // times across the secrets-at-rest hardening sequence:
+    //
+    //   Tier 1 (`encryption`, the registered/derived DEK):
+    //     - VERSION_V1 (`[0x01][nonce][AEAD]`) — today's writer
+    //     - raw-AEAD with `encryption.legacy_nonce` — same cipher,
+    //       pre-#4143 format (a delegate whose key hasn't rotated but
+    //       whose oldest secret hasn't been overwritten since upgrade).
+    //
+    //   Tier 2 (`legacy_chain[..]`, e.g. the post-#4144 / pre-#4140
+    //   auto-persisted `delegate_cipher` carried by `default_encryption`):
+    //     - VERSIONED ONLY. Every release that wrote under these
+    //       ciphers was already at the per-write-nonce format (post
+    //       #4143), so raw-AEAD attempts would only burn cipher ops
+    //       without ever matching a real blob.
+    //
+    //   Tier 3 (`legacy_migration`, the LEGACY_DEFAULT_* world-known
+    //   constants):
+    //     - BOTH formats. The #4143 release window emitted versioned
+    //       blobs while default-configured nodes were still seeded
+    //       from LEGACY_DEFAULT_CIPHER (per-write-nonce had landed but
+    //       the auto-gen cipher hadn't yet); pre-#4143 default-config
+    //       nodes emitted raw-AEAD under the same constants. Both are
+    //       in the wild on upgraded operators' disks. Logged at WARN
+    //       so operators see migration progress.
     if blob.first().copied() == Some(VERSION_V1) && blob.len() >= HEADER_LEN {
         let nonce = XNonce::from_slice(&blob[1..HEADER_LEN]);
+        // Tier 1 versioned.
         if let Ok(pt) = encryption.cipher.decrypt(nonce, &blob[HEADER_LEN..]) {
-            return Ok(pt);
+            return Ok(Zeroizing::new(pt));
         }
-        // Falls through to the legacy paths: either the file is
-        // genuinely legacy and happened to start with 0x01, the
-        // delegate's cipher rotated, or the file is corrupt. Below
-        // returns a precise error only if every attempt fails.
+        // Tier 2 versioned.
+        for (idx, fallback) in legacy_chain.iter().enumerate() {
+            if let Ok(pt) = fallback.cipher.decrypt(nonce, &blob[HEADER_LEN..]) {
+                log_legacy_decrypt(key, idx + 1, false, "versioned");
+                return Ok(Zeroizing::new(pt));
+            }
+        }
+        // Tier 3 versioned. Required for #4143-era blobs written under
+        // the world-known default cipher with the per-write nonce.
+        if let Some(migration) = legacy_migration
+            && let Ok(pt) = migration.cipher.decrypt(nonce, &blob[HEADER_LEN..])
+        {
+            log_legacy_decrypt(key, 1 + legacy_chain.len(), true, "versioned");
+            return Ok(Zeroizing::new(pt));
+        }
     }
+    // Tier 1 raw-AEAD (cipher unchanged but format pre-dates #4143).
     if let Ok(pt) = encryption.cipher.decrypt(&encryption.legacy_nonce, blob) {
         tracing::debug!(
             key = %key,
-            "Decrypted legacy-format secret blob with the registered cipher; \
+            "Decrypted pre-#4143 raw-AEAD blob with the registered/derived cipher; \
              will be migrated to per-write-nonce format on next write."
         );
-        return Ok(pt);
+        return Ok(Zeroizing::new(pt));
     }
-    // Last-resort migration path: try the historical world-known
-    // (LEGACY_DEFAULT_CIPHER, LEGACY_DEFAULT_NONCE) pair. Reads here
-    // are exactly the pre-#4143 "default-configured node" case.
+    // Tier 3 raw-AEAD (world-known LEGACY_DEFAULT_* migration path,
+    // pre-#4143 default-configured nodes).
     if let Some(migration) = legacy_migration
         && let Ok(pt) = migration.cipher.decrypt(&migration.legacy_nonce, blob)
     {
-        tracing::warn!(
-            key = %key,
-            "Decrypted secret blob via the legacy-default-cipher migration fallback; \
-             this file was written by a freenet-core version before PR #4143. It will \
-             be re-encrypted under the node's current cipher on next write."
-        );
-        return Ok(pt);
+        log_legacy_decrypt(key, 1 + legacy_chain.len(), true, "raw-aead");
+        return Ok(Zeroizing::new(pt));
     }
     Err(SecretStoreError::Encryption(
         // The error type is opaque; surface a generic AEAD failure.
-        // Callers cannot tell which of the three attempts failed last,
-        // but the log lines above record which paths were reached.
+        // Callers cannot tell which attempt failed last; the log lines
+        // above record which fallback paths were reached.
         chacha20poly1305::Error,
     ))
+}
+
+fn log_legacy_decrypt(key: &SecretsId, idx: usize, is_migration: bool, format: &str) {
+    if is_migration {
+        tracing::warn!(
+            key = %key,
+            chain_idx = idx,
+            format = format,
+            "Decrypted secret blob via the legacy-default-cipher migration fallback; \
+             this file pre-dates PR #4143. Will be re-encrypted under the current \
+             derived DEK on next write."
+        );
+    } else {
+        tracing::info!(
+            key = %key,
+            chain_idx = idx,
+            format = format,
+            "Decrypted secret blob via a legacy fallback cipher; will be re-encrypted \
+             under the current derived DEK on next write."
+        );
+    }
 }
 
 #[cfg(test)]
@@ -686,7 +976,7 @@ mod test {
         let text = vec![0, 1, 2];
 
         store.register_delegate(delegate.key().clone(), cipher, nonce)?;
-        store.store_secret(delegate.key(), &secret_id, text)?;
+        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(text))?;
         let f = store.get_secret(delegate.key(), &secret_id);
 
         assert!(f.is_ok());
@@ -712,7 +1002,7 @@ mod test {
         store.register_delegate(delegate.key().clone(), cipher, nonce)?;
         let secret_id = SecretsId::new(vec![42]);
 
-        store.store_secret(delegate.key(), &secret_id, b"v1".to_vec())?;
+        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"v1".to_vec()))?;
         // Sleep 2ms to guarantee a distinct epoch-millis stamp on the snapshot.
         // Sleep enough to guarantee a distinct epoch-millis stamp on the
         // snapshot even on virtualized CI runners with coarse clocks.
@@ -720,11 +1010,11 @@ mod test {
         // exercise the collision-suffix branch instead, which has its own
         // test in the secret_snapshots module.
         std::thread::sleep(Duration::from_millis(5));
-        store.store_secret(delegate.key(), &secret_id, b"v2".to_vec())?;
+        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"v2".to_vec()))?;
 
         // Active value is the latest write.
         assert_eq!(
-            store.get_secret(delegate.key(), &secret_id)?,
+            store.get_secret(delegate.key(), &secret_id)?.to_vec(),
             b"v2".to_vec()
         );
 
@@ -747,9 +1037,9 @@ mod test {
             .ciphers
             .get(delegate.key())
             .expect("cipher registered");
-        let plaintext = decrypt_secret_blob(encryption, None, &blob, &secret_id)
+        let plaintext = decrypt_secret_blob(encryption, &[], None, &blob, &secret_id)
             .expect("snapshot blob should decrypt with the registered cipher");
-        assert_eq!(plaintext, b"v1".to_vec());
+        assert_eq!(plaintext.to_vec(), b"v1".to_vec());
         Ok(())
     }
 
@@ -781,7 +1071,11 @@ mod test {
         let secret_id = SecretsId::new(vec![7]);
 
         for i in 0u32..50 {
-            store.store_secret(delegate.key(), &secret_id, i.to_le_bytes().to_vec())?;
+            store.store_secret(
+                delegate.key(),
+                &secret_id,
+                Zeroizing::new(i.to_le_bytes().to_vec()),
+            )?;
             // Force distinct epoch-millis stamps so the snapshot files don't
             // collide and the count actually reflects the policy.
             // Sleep enough to guarantee a distinct epoch-millis stamp on the
@@ -824,14 +1118,14 @@ mod test {
         store.register_delegate(delegate.key().clone(), cipher, nonce)?;
         let secret_id = SecretsId::new(vec![9]);
 
-        store.store_secret(delegate.key(), &secret_id, b"a".to_vec())?;
+        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"a".to_vec()))?;
         // Sleep enough to guarantee a distinct epoch-millis stamp on the
         // snapshot even on virtualized CI runners with coarse clocks.
         // A test that lands two writes in the same millisecond would
         // exercise the collision-suffix branch instead, which has its own
         // test in the secret_snapshots module.
         std::thread::sleep(Duration::from_millis(5));
-        store.store_secret(delegate.key(), &secret_id, b"b".to_vec())?;
+        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"b".to_vec()))?;
 
         // Pre-conditions: index has the key, snapshot dir is populated.
         let secret_hash = *secret_id.hash();
@@ -928,9 +1222,9 @@ mod test {
         store.register_delegate(delegate.key().clone(), cipher, nonce)?;
         let secret_id = SecretsId::new(vec![14]);
 
-        store.store_secret(delegate.key(), &secret_id, b"a".to_vec())?;
+        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"a".to_vec()))?;
         std::thread::sleep(Duration::from_millis(5));
-        store.store_secret(delegate.key(), &secret_id, b"b".to_vec())?;
+        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"b".to_vec()))?;
 
         let snap_dir = secrets_dir
             .join(delegate.key().encode())
@@ -941,7 +1235,10 @@ mod test {
             "no snapshot dir should be created when snapshots are disabled"
         );
         // Active path still holds the latest write.
-        assert_eq!(store.get_secret(delegate.key(), &secret_id)?, b"b".to_vec());
+        assert_eq!(
+            store.get_secret(delegate.key(), &secret_id)?.to_vec(),
+            b"b".to_vec()
+        );
         Ok(())
     }
 
@@ -968,11 +1265,11 @@ mod test {
 
         // Two writes per delegate against the same SecretsId.
         for value in [&b"a1"[..], &b"a2"[..]] {
-            store.store_secret(delegate_a.key(), &shared_id, value.to_vec())?;
+            store.store_secret(delegate_a.key(), &shared_id, Zeroizing::new(value.to_vec()))?;
             std::thread::sleep(Duration::from_millis(5));
         }
         for value in [&b"b1"[..], &b"b2"[..]] {
-            store.store_secret(delegate_b.key(), &shared_id, value.to_vec())?;
+            store.store_secret(delegate_b.key(), &shared_id, Zeroizing::new(value.to_vec()))?;
             std::thread::sleep(Duration::from_millis(5));
         }
 
@@ -996,11 +1293,11 @@ mod test {
 
         // And get_secret on each delegate returns its own most-recent value.
         assert_eq!(
-            store.get_secret(delegate_a.key(), &shared_id)?,
+            store.get_secret(delegate_a.key(), &shared_id)?.to_vec(),
             b"a2".to_vec()
         );
         assert_eq!(
-            store.get_secret(delegate_b.key(), &shared_id)?,
+            store.get_secret(delegate_b.key(), &shared_id)?.to_vec(),
             b"b2".to_vec()
         );
         Ok(())
@@ -1021,7 +1318,11 @@ mod test {
         store.register_delegate(delegate.key().clone(), cipher, nonce)?;
         let secret_id = SecretsId::new(vec![13]);
 
-        store.store_secret(delegate.key(), &secret_id, b"first".to_vec())?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            Zeroizing::new(b"first".to_vec()),
+        )?;
 
         let snap_dir = secrets_dir
             .join(delegate.key().encode())
@@ -1071,11 +1372,11 @@ mod test {
         store.register_delegate(delegate.key().clone(), cipher, nonce)?;
         let secret_id = SecretsId::new(vec![31]);
 
-        store.store_secret(delegate.key(), &secret_id, b"v1".to_vec())?;
+        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"v1".to_vec()))?;
         std::thread::sleep(Duration::from_millis(5));
-        store.store_secret(delegate.key(), &secret_id, b"v2".to_vec())?;
+        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"v2".to_vec()))?;
         std::thread::sleep(Duration::from_millis(5));
-        store.store_secret(delegate.key(), &secret_id, b"v3".to_vec())?;
+        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"v3".to_vec()))?;
 
         let snaps = store.list_snapshots(delegate.key(), &secret_id)?;
         assert_eq!(snaps.len(), 2, "expected two snapshots after 3 writes");
@@ -1102,13 +1403,13 @@ mod test {
         store.register_delegate(delegate.key().clone(), cipher, nonce)?;
         let secret_id = SecretsId::new(vec![41]);
 
-        store.store_secret(delegate.key(), &secret_id, b"v1".to_vec())?;
+        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"v1".to_vec()))?;
         std::thread::sleep(Duration::from_millis(5));
-        store.store_secret(delegate.key(), &secret_id, b"v2".to_vec())?;
+        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"v2".to_vec()))?;
 
         // Confirm active = v2.
         assert_eq!(
-            store.get_secret(delegate.key(), &secret_id)?,
+            store.get_secret(delegate.key(), &secret_id)?.to_vec(),
             b"v2".to_vec()
         );
 
@@ -1120,7 +1421,7 @@ mod test {
         store.restore_snapshot(delegate.key(), &secret_id, v1_ts)?;
 
         assert_eq!(
-            store.get_secret(delegate.key(), &secret_id)?,
+            store.get_secret(delegate.key(), &secret_id)?.to_vec(),
             b"v1".to_vec(),
             "restore must put the v1 plaintext back"
         );
@@ -1151,9 +1452,9 @@ mod test {
         store.register_delegate(delegate.key().clone(), cipher, nonce)?;
         let secret_id = SecretsId::new(vec![51]);
 
-        store.store_secret(delegate.key(), &secret_id, b"a".to_vec())?;
+        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"a".to_vec()))?;
         std::thread::sleep(Duration::from_millis(5));
-        store.store_secret(delegate.key(), &secret_id, b"b".to_vec())?;
+        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"b".to_vec()))?;
 
         let err = store
             .restore_snapshot(delegate.key(), &secret_id, 0)
@@ -1189,9 +1490,13 @@ mod test {
         store.register_delegate(delegate.key().clone(), cipher, nonce)?;
         let secret_id = SecretsId::new(vec![61]);
 
-        store.store_secret(delegate.key(), &secret_id, b"keep".to_vec())?;
+        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"keep".to_vec()))?;
         std::thread::sleep(Duration::from_millis(5));
-        store.store_secret(delegate.key(), &secret_id, b"overwrite".to_vec())?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            Zeroizing::new(b"overwrite".to_vec()),
+        )?;
 
         // Grab the snapshot stamp BEFORE removing the secret. `remove_secret`
         // also deletes the snapshot directory, so we need the timestamp now.
@@ -1251,7 +1556,7 @@ mod test {
         // The snapshot was taken when "overwrite" was written, but it
         // holds the PRIOR active value at that point: "keep".
         assert_eq!(
-            store.get_secret(delegate.key(), &secret_id)?,
+            store.get_secret(delegate.key(), &secret_id)?.to_vec(),
             b"keep".to_vec()
         );
         Ok(())
@@ -1288,7 +1593,11 @@ mod test {
         // Seed an active value so restore has something to overwrite (and
         // can take its own pre-restore snapshot). The plaintext doesn't
         // matter for this test; we compare ciphertext after restore.
-        store.store_secret(delegate.key(), &secret_id, b"active".to_vec())?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            Zeroizing::new(b"active".to_vec()),
+        )?;
 
         // Hand-craft three "same timestamp" snapshot files with distinct
         // ciphertexts, so we can identify which one wins. We do the file
@@ -1327,7 +1636,7 @@ mod test {
 
         store.restore_snapshot(delegate.key(), &secret_id, stamp)?;
         assert_eq!(
-            store.get_secret(delegate.key(), &secret_id)?,
+            store.get_secret(delegate.key(), &secret_id)?.to_vec(),
             b"unsuffixed-winner".to_vec(),
             "unsuffixed file must win the collision tiebreak"
         );
@@ -1337,7 +1646,7 @@ mod test {
         std::fs::remove_file(snap_dir.join(&base))?;
         store.restore_snapshot(delegate.key(), &secret_id, stamp)?;
         assert_eq!(
-            store.get_secret(delegate.key(), &secret_id)?,
+            store.get_secret(delegate.key(), &secret_id)?.to_vec(),
             b"suffix-0".to_vec(),
             "with the unsuffixed entry gone, lowest-numbered suffix wins"
         );
@@ -1364,7 +1673,11 @@ mod test {
         let secret_id = SecretsId::new(vec![81]);
 
         let plaintext = b"identical".to_vec();
-        store.store_secret(delegate.key(), &secret_id, plaintext.clone())?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            Zeroizing::new(plaintext.clone()),
+        )?;
         let active = secrets_dir
             .join(delegate.key().encode())
             .join(secret_id.encode());
@@ -1374,7 +1687,11 @@ mod test {
         // wall-clock time. The surrounding snapshot tests sleep to force
         // distinct epoch-millis filenames, but that is irrelevant here —
         // the second write deliberately reuses the same epoch slot.
-        store.store_secret(delegate.key(), &secret_id, plaintext.clone())?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            Zeroizing::new(plaintext.clone()),
+        )?;
         let second = std::fs::read(&active)?;
 
         assert_ne!(
@@ -1391,7 +1708,10 @@ mod test {
             "nonce field must differ across writes"
         );
         // Both must decrypt back to the same plaintext.
-        assert_eq!(store.get_secret(delegate.key(), &secret_id)?, plaintext);
+        assert_eq!(
+            store.get_secret(delegate.key(), &secret_id)?.to_vec(),
+            plaintext
+        );
         Ok(())
     }
 
@@ -1405,17 +1725,25 @@ mod test {
     #[tokio::test]
     async fn legacy_blob_with_version_byte_falls_through_to_legacy_decrypt()
     -> Result<(), Box<dyn std::error::Error>> {
+        // SAFETY: nextest per-process isolation. The env mutation is
+        // confined to this test process and not restored because the
+        // process exits when the test ends.
+        unsafe {
+            std::env::remove_var("CREDENTIALS_DIRECTORY");
+        }
         let temp_dir = tempfile::tempdir()?;
         let secrets_dir = temp_dir.path().join("secrets-store-test");
         std::fs::create_dir_all(&secrets_dir)?;
 
         let db = create_test_db(temp_dir.path()).await;
-        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+        let store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
         let delegate = Delegate::from((&vec![88].into(), &vec![].into()));
-        // We need a stable registration nonce so the legacy fallback in
-        // `get_secret` uses exactly the nonce we encrypted under.
-        let (cipher, registration_nonce) = fresh_cipher();
-        store.register_delegate(delegate.key().clone(), cipher.clone(), registration_nonce)?;
+        // Post-#4146: per-delegate cipher = HKDF-derived DEK. Use the
+        // store's own derivation so the legacy fallback uses the same
+        // (cipher, legacy_nonce) we encrypt under.
+        let derived = store.derive_delegate_dek(delegate.key());
+        let cipher = derived.cipher.clone();
+        let registration_nonce = derived.legacy_nonce;
         let secret_id = SecretsId::new(vec![89]);
 
         // Find a plaintext whose legacy-format AEAD output starts with
@@ -1461,7 +1789,7 @@ mod test {
         std::fs::create_dir_all(&delegate_dir)?;
         std::fs::write(delegate_dir.join(secret_id.encode()), &legacy_blob)?;
 
-        let recovered = store.get_secret(delegate.key(), &secret_id)?;
+        let recovered = store.get_secret(delegate.key(), &secret_id)?.to_vec();
         assert_eq!(
             recovered,
             vec![winning_byte; 16],
@@ -1493,7 +1821,11 @@ mod test {
         store.register_delegate(delegate.key().clone(), cipher, nonce)?;
         let secret_id = SecretsId::new(vec![83]);
 
-        store.store_secret(delegate.key(), &secret_id, b"hello".to_vec())?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            Zeroizing::new(b"hello".to_vec()),
+        )?;
         let active = secrets_dir
             .join(delegate.key().encode())
             .join(secret_id.encode());
@@ -1517,7 +1849,11 @@ mod test {
         // would leave this slice identical across writes; whole-blob
         // inequality alone could be satisfied by varying ciphertext.
         let secret_id_2 = SecretsId::new(vec![84]);
-        store.store_secret(delegate.key(), &secret_id_2, b"hello".to_vec())?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id_2,
+            Zeroizing::new(b"hello".to_vec()),
+        )?;
         let blob_2 = std::fs::read(
             secrets_dir
                 .join(delegate.key().encode())
@@ -1532,38 +1868,49 @@ mod test {
     }
 
     /// Regression for #4139 migration path: a legacy-format on-disk file
-    /// (raw AEAD output produced with the per-delegate registration nonce,
-    /// no version header) MUST still be readable through `get_secret`.
-    /// This is what lets nodes upgrade in place without a one-shot
-    /// migration tool.
+    /// (raw AEAD output written under the per-delegate cipher with the
+    /// registration nonce, no version header) MUST still be readable
+    /// through `get_secret`. This is what lets nodes upgrade in place
+    /// without a one-shot migration tool.
+    ///
+    /// Post-#4146: the per-delegate cipher is the HKDF-derived DEK
+    /// (`register_delegate` ignores client-supplied cipher), so we
+    /// derive the cipher from the store and write under that.
     #[tokio::test]
     async fn legacy_format_blob_is_decryptable() -> Result<(), Box<dyn std::error::Error>> {
+        // SAFETY: nextest per-process isolation. Force file backend so
+        // the test exercises a deterministic KEK source.
+        unsafe {
+            std::env::remove_var("CREDENTIALS_DIRECTORY");
+        }
         let temp_dir = tempfile::tempdir()?;
         let secrets_dir = temp_dir.path().join("secrets-store-test");
         std::fs::create_dir_all(&secrets_dir)?;
 
         let db = create_test_db(temp_dir.path()).await;
-        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+        let store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
         let delegate = Delegate::from((&vec![84].into(), &vec![].into()));
-        let (cipher, nonce) = fresh_cipher();
-        store.register_delegate(delegate.key().clone(), cipher.clone(), nonce)?;
         let secret_id = SecretsId::new(vec![85]);
 
-        // Hand-craft a legacy blob: raw AEAD output with the registration
-        // nonce, no version header. Write it directly under the active
-        // path that `get_secret` reads.
+        // Derive the DEK that THIS store will use for `delegate`, then
+        // hand-craft a raw-AEAD blob under that DEK + a fixed nonce
+        // (simulating a pre-#4143 file written before per-write
+        // nonces). The store's `legacy_nonce` field on the derived
+        // Encryption is what tier 1's raw-AEAD attempt uses.
+        let derived = store.derive_delegate_dek(delegate.key());
         let plaintext = b"legacy-payload".to_vec();
-        let legacy_blob = cipher
-            .encrypt(&nonce, plaintext.as_ref())
-            .expect("legacy encrypt");
+        let legacy_blob = derived
+            .cipher
+            .encrypt(&derived.legacy_nonce, plaintext.as_ref())
+            .expect("legacy encrypt under derived DEK");
         let delegate_dir = secrets_dir.join(delegate.key().encode());
         std::fs::create_dir_all(&delegate_dir)?;
         std::fs::write(delegate_dir.join(secret_id.encode()), &legacy_blob)?;
 
-        let recovered = store.get_secret(delegate.key(), &secret_id)?;
+        let recovered = store.get_secret(delegate.key(), &secret_id)?.to_vec();
         assert_eq!(
             recovered, plaintext,
-            "legacy-format blob must decrypt via the registered nonce fallback"
+            "legacy-format blob must decrypt via tier 1 raw-AEAD fallback"
         );
         Ok(())
     }
@@ -1614,6 +1961,12 @@ mod test {
     async fn legacy_snapshot_survives_restore_and_get_secret()
     -> Result<(), Box<dyn std::error::Error>> {
         use crate::wasm_runtime::secret_snapshots::SNAPSHOT_NAME_WIDTH;
+        // SAFETY: nextest per-process isolation. The env mutation is
+        // confined to this test process and not restored because the
+        // process exits when the test ends.
+        unsafe {
+            std::env::remove_var("CREDENTIALS_DIRECTORY");
+        }
 
         let temp_dir = tempfile::tempdir()?;
         let secrets_dir = temp_dir.path().join("secrets-store-test");
@@ -1622,13 +1975,20 @@ mod test {
         let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
 
         let delegate = Delegate::from((&vec![90].into(), &vec![].into()));
-        let (cipher, registration_nonce) = fresh_cipher();
-        store.register_delegate(delegate.key().clone(), cipher.clone(), registration_nonce)?;
+        // Post-#4146: use derived DEK rather than client-supplied cipher
+        // (which is ignored by register_delegate).
+        let derived = store.derive_delegate_dek(delegate.key());
+        let cipher = derived.cipher.clone();
+        let registration_nonce = derived.legacy_nonce;
         let secret_id = SecretsId::new(vec![91]);
 
         // Seed an active value (new format) so restore has something to
         // overwrite and is allowed to snapshot the active first.
-        store.store_secret(delegate.key(), &secret_id, b"current".to_vec())?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            Zeroizing::new(b"current".to_vec()),
+        )?;
 
         // Hand-craft a LEGACY snapshot file: raw AEAD with the registered
         // nonce, no version header. The retention policy will not touch
@@ -1667,7 +2027,7 @@ mod test {
         store.restore_snapshot(delegate.key(), &secret_id, stamp)?;
         // Active path now holds a legacy blob. `get_secret` must recover
         // the original plaintext through the legacy fallback.
-        let recovered = store.get_secret(delegate.key(), &secret_id)?;
+        let recovered = store.get_secret(delegate.key(), &secret_id)?.to_vec();
         assert_eq!(
             recovered, plaintext,
             "legacy snapshot must remain decryptable after restore + get_secret"
@@ -1720,7 +2080,7 @@ mod test {
         std::fs::write(delegate_dir.join(secret_id.encode()), &legacy_aead)?;
 
         // Must recover plaintext via legacy fallback path.
-        let recovered = store.get_secret(delegate.key(), &secret_id)?;
+        let recovered = store.get_secret(delegate.key(), &secret_id)?.to_vec();
         assert_eq!(
             recovered, plaintext,
             "default-cipher legacy blob must remain readable after register_delegate \
@@ -1777,12 +2137,436 @@ mod test {
         // No `register_delegate` call — this simulates the first
         // `get_secret` after restart, before any client has issued a
         // new `RegisterDelegate`. Must still recover the plaintext.
-        let recovered = store.get_secret(delegate.key(), &secret_id)?;
+        let recovered = store.get_secret(delegate.key(), &secret_id)?.to_vec();
         assert_eq!(
             recovered, plaintext,
             "legacy-default blob MUST be decryptable via legacy_migration_encryption \
              fallback, even without register_delegate having been called"
         );
+        Ok(())
+    }
+
+    /// **Closes the gap targeted by #4138 directly via #4140.** Write a
+    /// secret with one `SecretsStore`, drop it, recreate against the
+    /// same `secrets_dir` + DB, read the secret back. Pre-#4140 this
+    /// would have failed because the registered per-delegate cipher
+    /// lived only in `SecretsStore::ciphers` (in-memory) and was lost
+    /// on drop. With HKDF derivation from a persisted node KEK
+    /// (`secrets_dir/node_kek` 0o600 in the file-backend test path),
+    /// the DEK is deterministically reconstructed on second start and
+    /// the secret stays readable WITHOUT a `register_delegate` call.
+    #[tokio::test]
+    async fn restart_roundtrip_recovers_secret_without_re_registering()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db_path = temp_dir.path().to_path_buf();
+
+        let delegate = Delegate::from((&vec![100].into(), &vec![].into()));
+        let secret_id = SecretsId::new(vec![101]);
+        let plaintext = b"persisted-across-restart".to_vec();
+
+        // --- First start: provision KEK, write secret, drop store ---
+        //
+        // GitHub Actions runners can have `CREDENTIALS_DIRECTORY` set for
+        // some workflow types, which would make `SystemdCredentialKek`
+        // try to load (and fail, because the credential isn't actually
+        // populated) on second start. Clear it for the duration of this
+        // test process so the resolver deterministically picks the
+        // file backend.
+        // SAFETY: nextest runs each test in its own process; the env
+        // mutation is isolated to this test process and not restored
+        // because the process exits when the test ends.
+        unsafe {
+            std::env::remove_var("CREDENTIALS_DIRECTORY");
+        }
+
+        {
+            let db = create_test_db(&db_path).await;
+            let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+            store.store_secret(
+                delegate.key(),
+                &secret_id,
+                Zeroizing::new(plaintext.clone()),
+            )?;
+            // Pin the KEK file was provisioned by the file backend
+            // (CREDENTIALS_DIRECTORY cleared above; keyring unavailable
+            // on Linux because we don't compile that backend, and on
+            // macOS/Windows nextest's per-process isolation ensures the
+            // tempdir-scoped FileKek wins because no other process
+            // could have seeded a keyring entry for this test's
+            // KEYRING_SERVICE/KEYRING_USER pair within the test
+            // window — but on macOS dev hosts a stale entry from a
+            // prior `freenet` run COULD exist. Tightened test below
+            // tolerates either resolution by reading whichever marker
+            // backend actually won.
+            let marker_path = secrets_dir.join("kek_backend");
+            assert!(
+                marker_path.exists(),
+                "first start must persist a backend marker at {}",
+                marker_path.display()
+            );
+        }
+
+        // --- Second start: reload same secrets_dir + DB ---
+        let db = create_test_db(&db_path).await;
+        let store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+        // No `register_delegate` call. DEK is re-derived from the KEK
+        // loaded from the persisted file backend.
+        let recovered = store.get_secret(delegate.key(), &secret_id)?.to_vec();
+        assert_eq!(
+            recovered, plaintext,
+            "second-start get_secret MUST recover plaintext via HKDF re-derivation"
+        );
+        Ok(())
+    }
+
+    /// HKDF determinism: same KEK + same delegate_key always yields the
+    /// same DEK; different delegate_key yields a different DEK. Pins
+    /// the contract that `restart_roundtrip_recovers_secret_without_re_registering`
+    /// silently depends on.
+    #[tokio::test]
+    async fn derive_delegate_dek_deterministic_and_per_delegate()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let delegate_a = Delegate::from((&vec![110].into(), &vec![].into()));
+        let delegate_b = Delegate::from((&vec![111].into(), &vec![].into()));
+
+        let dek_a1 = store.derive_delegate_dek(delegate_a.key());
+        let dek_a2 = store.derive_delegate_dek(delegate_a.key());
+        let dek_b = store.derive_delegate_dek(delegate_b.key());
+
+        // Determinism: encrypt the same plaintext + nonce with both
+        // copies of DEK A; ciphertexts must be byte-identical.
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let pt = b"determinism-pin".as_slice();
+        let ct1 = dek_a1.cipher.encrypt(&nonce, pt).expect("encrypt");
+        let ct2 = dek_a2.cipher.encrypt(&nonce, pt).expect("encrypt");
+        assert_eq!(ct1, ct2, "same KEK + same delegate must yield same DEK");
+
+        // Per-delegate: DEK B encrypting the same (pt, nonce) must
+        // produce a different ciphertext.
+        let ct3 = dek_b.cipher.encrypt(&nonce, pt).expect("encrypt");
+        assert_ne!(ct1, ct3, "different delegate_key must yield different DEK");
+        Ok(())
+    }
+
+    // =========================================================================
+    // BACKWARDS-COMPAT MATRIX
+    // =========================================================================
+    //
+    // Every freenet-core release the on-disk secret blob format has
+    // evolved through MUST remain readable by the current code, so
+    // upgrading nodes do not lose access to existing delegate secrets.
+    // The matrix exercised below:
+    //
+    //   Era            Format                     Cipher used to write
+    //   ----           ------                     --------------------
+    //   < #4143        raw AEAD                   LEGACY_DEFAULT_CIPHER
+    //   #4143          [VER][nonce][AEAD]         LEGACY_DEFAULT_CIPHER  (no auto-gen yet)
+    //   #4144          [VER][nonce][AEAD]         auto-gen `delegate_cipher` file
+    //   #4140          [VER][nonce][AEAD]         HKDF-derived DEK from node KEK
+    //
+    // Each era's blob MUST decrypt via `get_secret` on a node built
+    // against the current code, WITHOUT a `register_delegate` call
+    // (modelling the post-restart pre-client-reconnect window).
+
+    /// Era #4143 — versioned format, cipher = LEGACY_DEFAULT_CIPHER.
+    /// Exercised by `legacy_chain` fallback's versioned path (the
+    /// `migration_tail_start` branch in `decrypt_secret_blob`).
+    #[tokio::test]
+    async fn backcompat_versioned_blob_under_legacy_default_cipher()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::config::{LEGACY_DEFAULT_CIPHER, LEGACY_DEFAULT_NONCE};
+
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        // `Secrets::default()` returns a random cipher (post-PR-#4144);
+        // legacy_migration_encryption is what holds the legacy default.
+        let store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        // Hand-craft a #4143-era blob: VERSION_V1 header, fresh random
+        // nonce, AEAD under LEGACY_DEFAULT_CIPHER + that nonce.
+        let delegate = Delegate::from((&vec![120].into(), &vec![].into()));
+        let secret_id = SecretsId::new(vec![121]);
+        let legacy_cipher = XChaCha20Poly1305::new((&LEGACY_DEFAULT_CIPHER).into());
+        let _ = LEGACY_DEFAULT_NONCE;
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let plaintext = b"era-4143-payload".to_vec();
+        let aead = legacy_cipher
+            .encrypt(&nonce, plaintext.as_ref())
+            .expect("encrypt");
+        let mut blob = vec![VERSION_V1];
+        blob.extend_from_slice(nonce.as_slice());
+        blob.extend_from_slice(&aead);
+        let delegate_dir = secrets_dir.join(delegate.key().encode());
+        std::fs::create_dir_all(&delegate_dir)?;
+        std::fs::write(delegate_dir.join(secret_id.encode()), &blob)?;
+
+        // No register_delegate. Must recover.
+        let recovered = store.get_secret(delegate.key(), &secret_id)?.to_vec();
+        assert_eq!(recovered, plaintext);
+        Ok(())
+    }
+
+    /// Era #4144 — versioned format, cipher = the random per-node
+    /// `delegate_cipher` file contents. Exercises the `legacy_chain`
+    /// fallback (= `default_encryption`) on the versioned path.
+    #[tokio::test]
+    async fn backcompat_versioned_blob_under_post_4144_delegate_cipher()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+
+        // Pretend the operator's previous freenet-core install left a
+        // random `delegate_cipher` file. We construct a `Secrets` that
+        // carries that exact cipher in its `cipher` field — which is
+        // what `SecretArgs::build` would have produced on a real
+        // upgrade.
+        let mut secrets = Secrets::default();
+        let old_install_cipher_bytes = secrets.cipher; // capture for hand-crafted encrypt
+        let old_install_cipher = XChaCha20Poly1305::new((&old_install_cipher_bytes).into());
+        // Construct store with the captured cipher seeded into
+        // `default_encryption.cipher`.
+        let store = SecretsStore::new(secrets_dir.clone(), secrets.clone(), db)?;
+        // Now hand-craft a blob exactly as the previous-install code
+        // would have produced it under `default_encryption.cipher`.
+        let delegate = Delegate::from((&vec![122].into(), &vec![].into()));
+        let secret_id = SecretsId::new(vec![123]);
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let plaintext = b"era-4144-payload".to_vec();
+        let aead = old_install_cipher
+            .encrypt(&nonce, plaintext.as_ref())
+            .expect("encrypt");
+        let mut blob = vec![VERSION_V1];
+        blob.extend_from_slice(nonce.as_slice());
+        blob.extend_from_slice(&aead);
+        let delegate_dir = secrets_dir.join(delegate.key().encode());
+        std::fs::create_dir_all(&delegate_dir)?;
+        std::fs::write(delegate_dir.join(secret_id.encode()), &blob)?;
+
+        // Post-#4140 cipher_for_read returns the HKDF-derived DEK,
+        // which does NOT match the blob's cipher. legacy_chain[0] =
+        // default_encryption holds the captured old cipher, so the
+        // versioned-format attempt at chain index 1 succeeds.
+        let recovered = store.get_secret(delegate.key(), &secret_id)?.to_vec();
+        assert_eq!(recovered, plaintext);
+        // Sanity: silence unused-mut warning.
+        secrets.cipher_path = None;
+        Ok(())
+    }
+
+    /// Era #4143 raw-AEAD legacy path with the historical default
+    /// constants. Already covered by
+    /// `legacy_default_blob_decryptable_without_register_after_upgrade`
+    /// above; pinned again here as part of the backcompat matrix for
+    /// documentation/discoverability.
+    #[tokio::test]
+    async fn backcompat_raw_aead_under_legacy_default_cipher()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::config::{LEGACY_DEFAULT_CIPHER, LEGACY_DEFAULT_NONCE};
+
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![124].into(), &vec![].into()));
+        let secret_id = SecretsId::new(vec![125]);
+        let legacy_cipher = XChaCha20Poly1305::new((&LEGACY_DEFAULT_CIPHER).into());
+        let legacy_nonce: XNonce = LEGACY_DEFAULT_NONCE.into();
+        let plaintext = b"pre-4143-payload".to_vec();
+        let aead = legacy_cipher
+            .encrypt(&legacy_nonce, plaintext.as_ref())
+            .expect("encrypt");
+        let delegate_dir = secrets_dir.join(delegate.key().encode());
+        std::fs::create_dir_all(&delegate_dir)?;
+        std::fs::write(delegate_dir.join(secret_id.encode()), &aead)?;
+
+        let recovered = store.get_secret(delegate.key(), &secret_id)?.to_vec();
+        assert_eq!(recovered, plaintext);
+        Ok(())
+    }
+
+    /// Wire-format compat for `RegisterDelegate`: clients that still
+    /// send the (now-ignored) `cipher` + `nonce` fields MUST continue
+    /// to function. After register, subsequent store/get works under
+    /// the HKDF-derived DEK, not the client-supplied cipher.
+    #[tokio::test]
+    async fn backcompat_register_delegate_wire_still_works()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![126].into(), &vec![].into()));
+        // Client-supplied cipher/nonce: server-side these are ignored.
+        let (client_cipher, client_nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), client_cipher, client_nonce)?;
+        let secret_id = SecretsId::new(vec![127]);
+        let plaintext = b"register-then-write".to_vec();
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            Zeroizing::new(plaintext.clone()),
+        )?;
+        let recovered = store.get_secret(delegate.key(), &secret_id)?.to_vec();
+        assert_eq!(recovered, plaintext);
+        Ok(())
+    }
+
+    /// Every secret blob landed at rest MUST be 0o600 on Unix and live
+    /// under a 0o700 directory tree. `File::create` (the previous
+    /// landing path) would have inherited the process umask and on a
+    /// default-umask host (0o022) left the active blob, snapshot blobs,
+    /// and parent directories world-readable. Pin the tighter mode for
+    /// both the freshly-created and the legacy-umask migration cases.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn secret_files_are_owner_only_on_unix() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        // Simulate a pre-tightening operator: world-readable umask
+        // applied to the secrets root. SecretsStore::new must chmod it
+        // back to 0o700.
+        std::fs::create_dir_all(&secrets_dir)?;
+        std::fs::set_permissions(&secrets_dir, std::fs::Permissions::from_mode(0o755))?;
+
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        // Root dir tightened.
+        let root_mode = std::fs::metadata(&secrets_dir)?.permissions().mode() & 0o777;
+        assert_eq!(
+            root_mode, 0o700,
+            "secrets root must be 0o700, got {root_mode:o}"
+        );
+
+        let delegate = Delegate::from((&vec![200].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        let secret_id = SecretsId::new(vec![201]);
+
+        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"v1".to_vec()))?;
+        std::thread::sleep(Duration::from_millis(5));
+        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"v2".to_vec()))?;
+
+        let delegate_dir = secrets_dir.join(delegate.key().encode());
+        let secret_file = delegate_dir.join(secret_id.encode());
+        let snap_dir = delegate_dir.join(".snapshots").join(secret_id.encode());
+
+        let delegate_mode = std::fs::metadata(&delegate_dir)?.permissions().mode() & 0o777;
+        assert_eq!(
+            delegate_mode, 0o700,
+            "delegate dir must be 0o700, got {delegate_mode:o}"
+        );
+        let snap_dir_mode = std::fs::metadata(&snap_dir)?.permissions().mode() & 0o777;
+        assert_eq!(
+            snap_dir_mode, 0o700,
+            "snapshot dir must be 0o700, got {snap_dir_mode:o}"
+        );
+
+        let secret_mode = std::fs::metadata(&secret_file)?.permissions().mode() & 0o777;
+        assert_eq!(
+            secret_mode, 0o600,
+            "active secret file must be 0o600, got {secret_mode:o}"
+        );
+
+        // Each snapshot blob (hard-linked from the prior active file)
+        // must inherit 0o600 because the active write created it that way.
+        for entry in std::fs::read_dir(&snap_dir)? {
+            let entry = entry?;
+            let mode = entry.metadata()?.permissions().mode() & 0o777;
+            assert_eq!(
+                mode,
+                0o600,
+                "snapshot file {} must be 0o600, got {mode:o}",
+                entry.path().display()
+            );
+        }
+        Ok(())
+    }
+
+    /// `Debug` for `Secrets` MUST NOT print the cipher or nonce bytes
+    /// — accidental `tracing::debug!(secrets = ?cfg.secrets, ...)` would
+    /// otherwise leak the entire AEAD key into logs.
+    #[test]
+    fn debug_format_redacts_cipher_and_nonce() {
+        let secrets = crate::config::Secrets {
+            transport_keypair: crate::transport::TransportKeypair::new(),
+            transport_keypair_path: None,
+            nonce: [0xAA; 24],
+            nonce_path: None,
+            cipher: [0xBB; 32],
+            cipher_path: None,
+        };
+        let rendered = format!("{secrets:?}");
+        // The raw bytes must not appear in any form a casual reader
+        // could reconstruct the key from. Check both hex and decimal
+        // representations of the marker bytes.
+        assert!(
+            !rendered.contains("AA"),
+            "nonce hex byte leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("BB"),
+            "cipher hex byte leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("170"),
+            "nonce decimal byte leaked: {rendered}"
+        );
+        assert!(
+            !rendered.contains("187"),
+            "cipher decimal byte leaked: {rendered}"
+        );
+        // And the redaction marker IS present so reviewers can see the
+        // field was deliberately hidden (not just stripped).
+        assert!(
+            rendered.contains("redacted"),
+            "expected redaction marker: {rendered}"
+        );
+    }
+
+    /// Round-trip sanity for the `Zeroizing<Vec<u8>>` boundary: the
+    /// wrapper must not alter the bytes on the way in or out.
+    #[tokio::test]
+    async fn zeroizing_roundtrip_preserves_plaintext() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![210].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        let secret_id = SecretsId::new(vec![211]);
+
+        let plaintext: Vec<u8> = (0u8..=255).collect();
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            Zeroizing::new(plaintext.clone()),
+        )?;
+        let recovered = store.get_secret(delegate.key(), &secret_id)?;
+        // Compare via Deref so we exercise the Zeroizing<Vec<u8>> handle
+        // the caller actually receives.
+        assert_eq!(recovered.as_slice(), plaintext.as_slice());
         Ok(())
     }
 }
