@@ -34,6 +34,11 @@ pub(crate) enum UpdateOverride {
     /// whether RelatedState entries are already populated. Drives the
     /// depth-limit branch in `bridged_upsert_contract_state`.
     AlwaysRequiresRelated(Vec<ContractInstanceId>),
+    /// Always return `ContractError::InvalidUpdateWithInfo` with the given
+    /// reason string. Used to test same-version / idempotent-push rejection
+    /// paths (issue #4151): the returned error must be classified as
+    /// `is_invalid_update_rejection()` and logged at DEBUG, not INFO.
+    RejectInvalidUpdate { reason: String },
 }
 
 /// A lightweight mock runtime at the `ContractRuntimeInterface` level that lets
@@ -126,6 +131,18 @@ impl ContractRuntimeInterface for MockWasmRuntime {
                         .collect();
                     return Ok(UpdateModification::requires(related)
                         .map_err(|e| anyhow::anyhow!("{e}"))?);
+                }
+                UpdateOverride::RejectInvalidUpdate { reason } => {
+                    // Simulate the WASM contract returning InvalidUpdateWithInfo
+                    // (e.g., "New state version X must be higher than current version X").
+                    // This produces an error that `ExecutorError::is_invalid_update_rejection()`
+                    // must classify as a benign idempotent-push rejection.
+                    use crate::wasm_runtime::ContractExecError;
+                    use freenet_stdlib::prelude::ContractError as StdlibContractError;
+                    let inner_err = StdlibContractError::InvalidUpdateWithInfo { reason };
+                    return Err(crate::wasm_runtime::ContractError::from(
+                        ContractExecError::ContractError(inner_err),
+                    ));
                 }
             }
         }
