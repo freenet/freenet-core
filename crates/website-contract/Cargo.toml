@@ -11,7 +11,6 @@ byteorder = { workspace = true }
 ciborium = "0.2"
 freenet-stdlib = { workspace = true }
 serde = { workspace = true }
-bs58 = { workspace = true }
 
 # Fully remove `rand_core` from `ed25519-dalek` for wasm builds
 ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "serde"] }

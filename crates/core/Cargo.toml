@@ -114,7 +114,6 @@ lru = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }  # For sendmmsg syscall batching on Linux
-gag = { workspace = true }  # For suppressing libunwind stderr warnings during WASM execution
 
 # jemalloc replaces glibc malloc to prevent memory fragmentation in long-running processes.
 # Only for linux-gnu targets — musl has its own allocator and jemalloc doesn't build on musl.
@@ -154,7 +153,6 @@ test-log = { workspace = true }
 testresult = { workspace = true }
 tokio-tungstenite = { workspace = true }
 # console-subscriber = { version = "0.4" }
-ureq = { workspace = true }
 which = { workspace = true }
 regex = { workspace = true }
 serial_test = { workspace = true }
