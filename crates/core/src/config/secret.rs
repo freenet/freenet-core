@@ -638,6 +638,55 @@ mod tests {
         );
     }
 
+    /// `TransportKeypair::save` (private half) MUST land at 0o600 on
+    /// Unix. Before the file-permission tightening, the tmp file was
+    /// created via `File::create` which inherited the process umask
+    /// (typically 0o022 → 0o644, world-readable). Pin the tight mode
+    /// here so a future regression that drops the `OpenOptions::mode`
+    /// call would fail this test instead of silently leaking the X25519
+    /// private key to other local users.
+    #[cfg(unix)]
+    #[test]
+    fn test_transport_keypair_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let secrets_dir = tmp_dir.path();
+
+        // Auto-persist path: SecretArgs::build writes via TransportKeypair::save.
+        let args = SecretArgs::default();
+        let secrets = args.build(Some(secrets_dir)).unwrap();
+        let keypair_path = secrets
+            .transport_keypair_path
+            .as_deref()
+            .expect("auto-persisted keypair has a path");
+
+        let mode = std::fs::metadata(keypair_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "auto-persisted transport_keypair must be 0o600, got {mode:o}"
+        );
+
+        // Direct save path: also pin the mode for callers that hit
+        // TransportKeypair::save outside SecretArgs::build (e.g. the
+        // RSA-PEM legacy upgrade path in read_transport_keypair).
+        let direct_path = secrets_dir.join("direct_keypair");
+        TransportKeypair::new().save(&direct_path).unwrap();
+        let direct_mode = std::fs::metadata(&direct_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            direct_mode, 0o600,
+            "direct TransportKeypair::save must produce 0o600, got {direct_mode:o}"
+        );
+    }
+
     #[test]
     fn test_explicit_keypair_overrides_secrets_dir() {
         let tmp_dir = tempfile::tempdir().unwrap();

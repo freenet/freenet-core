@@ -29,8 +29,8 @@ use crate::contract::storages::Storage;
 
 use super::RuntimeResult;
 use super::secret_snapshots::{
-    RetentionPolicy, SnapshotMetadata, list_snapshots, next_snapshot_path, snapshot_dir_for,
-    thin_snapshots,
+    RetentionPolicy, SNAPSHOTS_DIR, SnapshotMetadata, list_snapshots, next_snapshot_path,
+    snapshot_dir_for, thin_snapshots,
 };
 
 /// Environment variable that disables snapshot-on-write for delegate secrets.
@@ -166,9 +166,24 @@ const DEK_HKDF_INFO: &[u8] = b"freenet-delegate-dek-v1";
 /// same syscall as the create — no window where the file is readable
 /// under the umask. Windows: no-op (per-user profile dir + ACL is
 /// already restrictive).
+///
+/// **Stale-tmp mode preservation.** `OpenOptions::mode` is only
+/// honored on the *create* path: when the file already exists, the
+/// existing mode is preserved and the `0o600` request is silently
+/// ignored. The `truncate(true)` flag rewrites the *content* of a
+/// surviving `.tmp` from a prior crashed run but leaves its mode
+/// alone — which on an upgraded host can be the legacy 0o644 from
+/// before this helper landed. Belt-and-suspenders: unlink any
+/// pre-existing inode at `path` so the open always lands on a fresh
+/// 0o600 file.
 fn create_owner_only(path: &Path) -> std::io::Result<File> {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -484,8 +499,10 @@ impl SecretsStore {
         // Write to a sibling tmp path so the active path's inode never has
         // a half-written state. We pick a fixed suffix (rather than a
         // random one) because `&mut self` makes concurrent in-process
-        // store_secret calls impossible; a stale `.tmp` from a prior
-        // crashed run is overwritten harmlessly here.
+        // store_secret calls impossible. `create_owner_only` unlinks any
+        // surviving `.tmp` from a prior crashed run so the new inode
+        // always lands at mode 0o600 (a legacy 0o644 tmp from before this
+        // helper landed would otherwise be reused with its old mode).
         let tmp_path = secret_file_path.with_extension("tmp");
         {
             let mut file = create_owner_only(&tmp_path)?;
@@ -557,8 +574,16 @@ impl SecretsStore {
     ) -> std::io::Result<()> {
         let snap_dir = snapshot_dir_for(delegate_path, key);
         fs::create_dir_all(&snap_dir)?;
-        // Snapshot dirs hold prior ciphertexts; tighten to owner-only
-        // for the same reason the active dir is 0o700.
+        // Snapshot dirs hold prior ciphertexts; tighten BOTH the
+        // intermediate `.snapshots/` umbrella AND the per-secret
+        // `.snapshots/{secret_id}/` leaf. Only chmodding the leaf
+        // leaves `.snapshots/` at the process umask (typically 0o755),
+        // which lets any local user enumerate per-secret subdir names,
+        // write counts (epoch_ms filenames), and write timing.
+        let snap_parent = delegate_path.join(SNAPSHOTS_DIR);
+        if let Err(e) = ensure_owner_only_dir(&snap_parent) {
+            tracing::warn!(path = %snap_parent.display(), error = %e, "chmod snapshots parent dir failed");
+        }
         if let Err(e) = ensure_owner_only_dir(&snap_dir) {
             tracing::warn!(path = %snap_dir.display(), error = %e, "chmod snapshot dir failed");
         }
@@ -737,8 +762,9 @@ impl SecretsStore {
 
         // Read snapshot ciphertext, write through a sibling tmp file with
         // an atomic rename so the active path never tears. `&mut self`
-        // makes concurrent in-process restore impossible; a stale `.tmp`
-        // from a prior crashed run gets overwritten harmlessly here.
+        // makes concurrent in-process restore impossible. `create_owner_only`
+        // unlinks any surviving `.tmp` from a prior crashed run so the
+        // new inode always lands at mode 0o600.
         let ciphertext = fs::read(&chosen_path)?;
         fs::create_dir_all(&delegate_path)?;
         if let Err(e) = ensure_owner_only_dir(&delegate_path) {

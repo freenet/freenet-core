@@ -43,8 +43,18 @@ impl TransportKeypair {
         // Atomic write: tmp file at 0o600 (owner-only) on Unix, then rename.
         // Process-wide umask used to leave this world-readable.
         let temp_path = path.with_extension("tmp");
+        // Unlink any surviving `.tmp` from a prior crashed save so
+        // `mode(0o600)` is applied to a fresh inode. Without this, a
+        // legacy 0o644 tmp file from before this helper landed would
+        // be reused with its old mode (OpenOptions::mode is honored
+        // only on file creation).
+        match std::fs::remove_file(&temp_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
+        opts.write(true).create_new(true);
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
@@ -172,17 +182,34 @@ impl TransportPublicKey {
     }
 
     /// Save the public key to a file in hex format.
+    ///
+    /// File mode is deliberately `0o644` on Unix (world-readable):
+    /// X25519 public keys are public and other tools / operators may
+    /// need to read them. The explicit mode avoids depending on the
+    /// process umask so a `find $SECRETS_DIR -perm -004 -type f`
+    /// audit by an operator distinguishes "intentionally world-
+    /// readable public key" from "accidentally world-readable secret".
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        use std::fs::File;
         use std::io::Write;
 
         let path = path.as_ref();
-        // Use atomic write: write to temp file, then rename
         let temp_path = path.with_extension("tmp");
-        let mut file = File::create(&temp_path)?;
+        match std::fs::remove_file(&temp_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o644);
+        }
+        let mut file = opts.open(&temp_path)?;
         let hex = hex::encode(self.0.as_bytes());
         file.write_all(hex.as_bytes())?;
-        file.sync_all()?; // Ensure data is flushed to disk
+        file.sync_all()?;
         std::fs::rename(&temp_path, path)?;
         Ok(())
     }

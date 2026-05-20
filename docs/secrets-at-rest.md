@@ -113,3 +113,49 @@ Node MUST be stopped before running migrate. `kek-rotate` currently
 bails with a clear error pointing operators at the temporary
 kek-migrate workflow; crash-safe two-phase rotation (`.rot` shadow
 files + recovery on next start) is tracked as a follow-up under #4137.
+
+## File permissions (PR #4195 / issue #4141)
+
+The secrets tree is owner-only on Unix:
+
+| Path                                            | Mode  |
+|-------------------------------------------------|-------|
+| `<secrets_dir>/`                                | 0o700 |
+| `<secrets_dir>/transport_keypair`               | 0o600 |
+| `<secrets_dir>/node_kek` (file backend)         | 0o600 |
+| `<secrets_dir>/delegate_cipher` (legacy)        | 0o600 |
+| `<secrets_dir>/kek_backend` (marker)            | 0o600 |
+| `<secrets_dir>/<delegate>/`                     | 0o700 |
+| `<secrets_dir>/<delegate>/<secret_id>`          | 0o600 |
+| `<secrets_dir>/<delegate>/.snapshots/`          | 0o700 |
+| `<secrets_dir>/<delegate>/.snapshots/<sec>/`    | 0o700 |
+| `<secrets_dir>/<delegate>/.snapshots/<sec>/*`   | 0o600 |
+
+Modes are set in the same syscall as `O_CREAT` (via
+`OpenOptions::mode`), so there is no race window where a file is
+readable under the process umask.
+
+### Migration from pre-#4195 nodes
+
+Nodes upgraded across this PR may have inherited the process umask
+(typically `0o022` → directories at `0o755`, files at `0o644`) on the
+secrets tree. `SecretsStore::new` chmods the secrets root, every
+delegate directory, and every `.snapshots/` directory down to `0o700`
+on each restart. A single restart of the new binary is sufficient to
+migrate. Operators will see one `tracing::warn!` per restart per
+already-tightened directory, e.g.
+
+```
+WARN secrets directory was not 0o700; tightening to owner-only
+     path="/var/lib/freenet/secrets" existing_mode=755
+```
+
+The warn line includes the prior mode so an operator who needed a
+non-default mode (e.g. group-readable for a backup tool) can recover
+the original policy from logs.
+
+Files written under the pre-#4195 binary are NOT auto-migrated to
+`0o600` — the chmod logic only touches directories. Operators with
+existing per-secret blobs on disk should run a one-time
+`chmod -R u=rwX,go= <secrets_dir>` after upgrading to close that gap.
+Files written by the post-#4195 binary land at `0o600` directly.
