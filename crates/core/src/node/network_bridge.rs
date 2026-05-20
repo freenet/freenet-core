@@ -151,21 +151,32 @@ pub fn reset_channel_id_counter() {
     CHANNEL_ID_COUNTER.with(|c| c.set(idx * CHANNEL_ID_BLOCK));
 }
 
-/// Channel capacity for event loop notification and op execution channels.
-const EVENT_LOOP_CHANNEL_CAPACITY: usize = 2048;
+/// Default channel capacity for event loop notification and op execution channels.
+const DEFAULT_EVENT_LOOP_CHANNEL_CAPACITY: usize = 2048;
 
+/// Create an event loop notification channel pair with the default capacity.
 pub(crate) fn event_loop_notification_channel()
 -> (EventLoopNotificationsReceiver, EventLoopNotificationsSender) {
+    event_loop_notification_channel_with_capacity(DEFAULT_EVENT_LOOP_CHANNEL_CAPACITY)
+}
+
+/// Create an event loop notification channel pair with a specific capacity.
+///
+/// Use [`event_loop_notification_channel`] for the default capacity (2048).
+pub(crate) fn event_loop_notification_channel_with_capacity(
+    capacity: usize,
+) -> (EventLoopNotificationsReceiver, EventLoopNotificationsSender) {
     let _channel_id = CHANNEL_ID_COUNTER.with(|c| {
         let v = c.get();
         c.set(v + 1);
         v
     });
-    let (notification_tx, notification_rx) = mpsc::channel(EVENT_LOOP_CHANNEL_CAPACITY);
-    let (op_execution_tx, op_execution_rx) = mpsc::channel(EVENT_LOOP_CHANNEL_CAPACITY);
+    let (notification_tx, notification_rx) = mpsc::channel(capacity);
+    let (op_execution_tx, op_execution_rx) = mpsc::channel(capacity);
 
     tracing::info!(
         channel_id = _channel_id,
+        capacity,
         "Created event loop notification channel pair"
     );
 

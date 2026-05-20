@@ -7,7 +7,8 @@ use tracing::Instrument;
 use super::{
     NetEventRegister, PeerId,
     network_bridge::{
-        EventLoopNotificationsReceiver, event_loop_notification_channel, p2p_protoc::P2pConnManager,
+        EventLoopNotificationsReceiver,
+        event_loop_notification_channel_with_capacity, p2p_protoc::P2pConnManager,
     },
 };
 use crate::{
@@ -309,7 +310,9 @@ impl NodeP2P {
         CH: ContractHandler + Send + 'static,
         ER: NetEventRegister + Clone,
     {
-        let (notification_channel, notification_tx) = event_loop_notification_channel();
+        let channel_capacity = config.config.network_api.event_loop_channel_capacity;
+        let (notification_channel, notification_tx) =
+            event_loop_notification_channel_with_capacity(channel_capacity);
         let (mut ch_outbound, ch_inbound, wait_for_event) = contract::contract_handler_channel();
         let (client_responses, cli_response_sender) = contract::client_responses_channel();
 
