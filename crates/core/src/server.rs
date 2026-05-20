@@ -11,7 +11,6 @@ pub(crate) mod client_api;
 pub(crate) mod errors;
 mod home_page;
 pub(crate) mod path_handlers;
-pub(crate) mod web_permissions;
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
@@ -554,17 +553,10 @@ async fn serve_client_api_in_impl(
     );
 
     // Pass the shared map to both the HTTP client API and WebSocketProxy
-    let permission_store = web_permissions::WebAppPermissionStore::new(
-        config
-            .webapp_permissions_dir
-            .clone()
-            .unwrap_or_else(|| std::env::temp_dir().join("freenet")),
-    );
     let (gw, gw_router) = HttpClientApi::as_router_with_origin_contracts(
         &ws_socket,
         origin_contracts.clone(),
         crate::contract::user_input::pending_prompts(),
-        permission_store,
     );
     let (ws_proxy, ws_router) =
         WebSocketProxy::create_router_with_origin_contracts(gw_router, origin_contracts);
