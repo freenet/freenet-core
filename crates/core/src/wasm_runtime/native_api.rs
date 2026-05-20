@@ -4,6 +4,7 @@ use dashmap::DashMap;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, DelegateKey, SecretsId};
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -37,6 +38,76 @@ pub(super) static DELEGATE_ENV: LazyLock<DashMap<InstanceId, DelegateCallEnv>> =
 pub(crate) static DELEGATE_SUBSCRIPTIONS: LazyLock<
     DashMap<ContractInstanceId, HashSet<DelegateKey>>,
 > = LazyLock::new(DashMap::default);
+
+/// Shared, in-memory cache of `DelegateContext` bytes keyed by `DelegateKey`.
+///
+/// The delegate ABI exposes `ctx.write(...)` and `ctx.read()` as a way for a
+/// delegate to stash state across `process()` calls — the canonical use is a
+/// permission prompt: the delegate writes its `PendingPrompt` blob during the
+/// call that emits `RequestUserInput`, then reads it back when the executor
+/// re-enters with the user's `UserResponse`.
+///
+/// The runtime's per-call context `Vec` lives only for the duration of one
+/// `inbound_app_message` invocation, so without persistence between calls
+/// every prompt round-trip would lose its pending state and the delegate
+/// would hit "received UserResponse with no pending context". This cache
+/// closes that gap: `inbound_app_message` seeds its local `Vec` from here on
+/// entry and stores the (possibly-mutated) `Vec` back on exit. Cleared on
+/// `UnregisterDelegate` so an unregistered delegate can't accumulate state.
+///
+/// Concurrency: the runtime serializes calls into a given delegate instance
+/// (one WASM `process()` at a time), so two prompt round-trips on the same
+/// delegate cannot interleave context writes. Wrapped in `Arc` so a
+/// `RuntimePool` of `Runtime`s shares one cache: a delegate's first call
+/// might run on executor A and its `UserResponse` follow-up on executor B,
+/// so per-`Runtime` storage would have the same locality bug as the
+/// per-call `Vec`.
+///
+/// TTL: each entry stores the `Instant` it was last written. On every
+/// `inbound_app_message` call the loader prunes entries older than
+/// `DELEGATE_CONTEXT_TTL`. Without this, a `RequestUserInput` whose
+/// `UserResponse` never arrives (user dismisses the prompt, app crashes,
+/// network partition) leaves bytes pinned until the matching
+/// `UnregisterDelegate` — which may be never for long-lived delegates. The
+/// AGENTS.md GC rule requires that any cleanup-exemption be time-bounded.
+pub(crate) type DelegateContextCache = Arc<DashMap<DelegateKey, DelegateContextEntry>>;
+
+#[derive(Clone)]
+pub(crate) struct DelegateContextEntry {
+    pub bytes: Vec<u8>,
+    /// Last-write timestamp for TTL eviction. `tokio::time::Instant` (not
+    /// `std::time::Instant`) so test code using `tokio::time::pause` /
+    /// `tokio::time::advance` can drive the eviction sweep deterministically,
+    /// matching the convention used by `RealTime` in `simulation/time.rs`.
+    pub last_write: tokio::time::Instant,
+}
+
+/// How long an unconsumed delegate context survives in the cache.
+///
+/// 10 minutes is comfortably longer than any reasonable interactive
+/// `RequestUserInput → UserResponse` round-trip (the prompt itself
+/// auto-denies at 60 s; users who walk away typically come back within
+/// seconds-to-minutes), and shorter than the lifetime of any real
+/// long-lived registered delegate, so genuine in-flight prompts never
+/// expire prematurely. If a future delegate needs context to survive
+/// across longer gaps, that's a sign it should persist via its own
+/// secret store rather than relying on this ephemeral cache.
+pub(crate) const DELEGATE_CONTEXT_TTL: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
+
+pub(crate) fn new_delegate_context_cache() -> DelegateContextCache {
+    Arc::new(DashMap::default())
+}
+
+/// Drop entries whose last write is older than `DELEGATE_CONTEXT_TTL`.
+///
+/// Called from `inbound_app_message` so eviction is amortised across normal
+/// delegate activity — no background sweep task and no extra lock contention
+/// when the node is idle.
+pub(crate) fn prune_expired_contexts(cache: &DelegateContextCache) {
+    let now = tokio::time::Instant::now();
+    cache.retain(|_, entry| now.duration_since(entry.last_write) < DELEGATE_CONTEXT_TTL);
+}
 
 /// Tracks message origins inherited by child delegates from their parent.
 /// When a delegate with an origin contract creates a child, the child inherits
@@ -990,6 +1061,16 @@ pub(super) mod delegate_secrets {
                 // SAFETY: `dst` was validated by `validate_and_compute_ptr` to point to
                 // `secret_len` bytes within WASM linear memory, and `plaintext` is a
                 // valid byte slice of that length.
+                //
+                // Memory hygiene boundary: the host-side `plaintext` is
+                // `Zeroizing<Vec<u8>>` so its allocation is wiped when
+                // this function returns. The copy destination — WASM
+                // linear memory inside the delegate instance — is NOT
+                // wiped by us; the delegate is responsible for zeroing
+                // its own buffer when done. The corresponding stdlib-
+                // side `Zeroize` derive is tracked under #4137 and will
+                // ship in a follow-up once a freenet-stdlib release is
+                // cut for it (stdlib-first release policy).
                 unsafe {
                     std::ptr::copy_nonoverlapping(plaintext.as_ptr(), dst, secret_len);
                 }
@@ -1062,7 +1143,9 @@ pub(super) mod delegate_secrets {
         };
         // SAFETY: `val_src` was validated by `validate_and_compute_ptr` to point to
         // `val_len` bytes within the WASM linear memory.
-        let value = unsafe { std::slice::from_raw_parts(val_src, val_len as usize) }.to_vec();
+        let value = zeroize::Zeroizing::new(
+            unsafe { std::slice::from_raw_parts(val_src, val_len as usize) }.to_vec(),
+        );
 
         match env
             .secret_store_mut()

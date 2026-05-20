@@ -1,19 +1,15 @@
 #[cfg(debug_assertions)]
 use std::backtrace::Backtrace as StdTrace;
-use std::{pin::Pin, time::Duration};
+use std::time::Duration;
 
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
-use futures::Future;
 use tokio::sync::mpsc::error::SendError;
 
-use std::net::SocketAddr;
-
 use crate::{
-    client_events::HostResult,
     config::GlobalExecutor,
     contract::{ContractError, ExecutorError},
-    message::{InnerMessage, MessageStats, NetMessage, NetMessageV1, Transaction, TransactionType},
-    node::{ConnectionError, NetworkBridge, OpManager, OpNotAvailable},
+    message::{Transaction, TransactionType},
+    node::{ConnectionError, OpManager},
     ring::{Location, PeerKeyLocation, RingError},
 };
 
@@ -31,293 +27,12 @@ pub(crate) mod visited_peers;
 pub(crate) use op_ctx::OpCtx;
 pub(crate) use visited_peers::VisitedPeers;
 
-pub(crate) trait Operation
-where
-    Self: Sized,
-{
-    type Message: InnerMessage + std::fmt::Display;
-
-    type Result;
-
-    fn load_or_init<'a>(
-        op_manager: &'a OpManager,
-        msg: &'a Self::Message,
-        source_addr: Option<SocketAddr>,
-    ) -> impl Future<Output = Result<OpInitialization<Self>, OpError>> + 'a;
-
-    fn id(&self) -> &Transaction;
-
-    #[allow(clippy::type_complexity)]
-    fn process_message<'a, CB: NetworkBridge>(
-        self,
-        conn_manager: &'a mut CB,
-        op_manager: &'a OpManager,
-        input: &'a Self::Message,
-        source_addr: Option<SocketAddr>,
-    ) -> Pin<Box<dyn Future<Output = Result<OperationResult, OpError>> + Send + 'a>>;
-}
-
-/// Result of processing an operation message.
-///
-/// This enum encodes the *only* valid result combinations at the type level,
-/// replacing the previous struct-of-Options where illegal combinations (e.g.
-/// `stream_data: Some` but `return_msg: None`) were representable but
-/// meaningless. Each variant documents exactly what the operation layer
-/// expects the caller to do next.
-///
-/// See `handle_op_result` for how each variant is dispatched.
-#[must_use]
-#[allow(clippy::large_enum_variant)] // Hot path — boxing `OpEnum` would add indirection overhead
-pub(crate) enum OperationResult {
-    /// Operation is fully complete on this node — nothing to send, no state to keep.
-    Completed,
-
-    /// Keep processing: save state but don't send any message to peers.
-    /// Used for intermediate states and locally-finalized operations.
-    ContinueOp(OpEnum),
-
-    /// Send a message to a peer AND keep the operation state.
-    /// Used for forwarding requests and sending responses while the operation
-    /// continues (e.g., awaiting sub-operations).
-    SendAndContinue {
-        msg: NetMessage,
-        /// Target peer. `None` for operations that handle their own routing
-        /// (connect) or that re-queue locally (update broadcasting).
-        next_hop: Option<SocketAddr>,
-        state: OpEnum,
-        /// Optional stream payload to send alongside the message.
-        stream_data: Option<(crate::transport::peer_connection::StreamId, bytes::Bytes)>,
-    },
-
-    /// Send a final message and complete the operation on this node.
-    /// Used for sending responses upstream when this node is done.
-    SendAndComplete {
-        msg: NetMessage,
-        /// Target peer. `None` for operations that handle their own routing.
-        next_hop: Option<SocketAddr>,
-        /// Optional stream payload to send alongside the message.
-        stream_data: Option<(crate::transport::peer_connection::StreamId, bytes::Bytes)>,
-    },
-}
-
-pub(crate) struct OpInitialization<Op> {
-    /// The source address of the peer that sent this message.
-    /// Used for sending error responses (Aborted) and as upstream_addr.
-    #[allow(dead_code)]
-    pub source_addr: Option<SocketAddr>,
-    pub op: Op,
-}
-
-pub(crate) async fn handle_op_request<Op, NB>(
-    op_manager: &OpManager,
-    network_bridge: &mut NB,
-    msg: &Op::Message,
-    source_addr: Option<SocketAddr>,
-) -> Result<Option<OpEnum>, OpError>
-where
-    Op: Operation,
-    NB: NetworkBridge,
-{
-    let tx = *msg.id();
-    let result = {
-        let OpInitialization { source_addr: _, op } =
-            Op::load_or_init(op_manager, msg, source_addr).await?;
-        op.process_message(network_bridge, op_manager, msg, source_addr)
-            .await
-    };
-
-    handle_op_result(op_manager, network_bridge, result, tx, source_addr).await
-}
-
-#[inline(always)]
-async fn handle_op_result<CB>(
-    op_manager: &OpManager,
-    network_bridge: &mut CB,
-    result: Result<OperationResult, OpError>,
-    tx_id: Transaction,
-    source_addr: Option<SocketAddr>,
-) -> Result<Option<OpEnum>, OpError>
-where
-    CB: NetworkBridge,
-{
-    match result {
-        Err(OpError::OpNotPresent(tx)) => {
-            // OpNotPresent is benign — it means a duplicate message arrived for an
-            // operation that was already completed or claimed (e.g., duplicate metadata
-            // from embedded fragment #1 + separate message). Do NOT send Aborted, as
-            // the primary processing path is still active and will complete normally.
-            tracing::debug!(
-                tx = %tx,
-                "Ignoring duplicate message for already-handled operation"
-            );
-            return Ok(None);
-        }
-        Err(err) => {
-            tracing::error!(
-                tx = %tx_id,
-                error = %err,
-                error_debug = ?err,
-                source = ?source_addr,
-                "handle_op_result: sending Aborted due to operation error"
-            );
-            if let Some(addr) = source_addr {
-                network_bridge
-                    .send(addr, NetMessage::V1(NetMessageV1::Aborted(tx_id)))
-                    .await?;
-            }
-            return Err(err);
-        }
-
-        // ── No message, no state → fully done ──────────────────────────
-        Ok(OperationResult::Completed) => {
-            op_manager.completed(tx_id);
-        }
-
-        // ── No message, has state → keep processing ────────────────────
-        Ok(OperationResult::ContinueOp(state)) => {
-            if state.finalized() {
-                tracing::debug!(%tx_id, "operation complete");
-                op_manager.completed(tx_id);
-                return Ok(Some(state));
-            } else {
-                // Non-finalized: push state for later processing.
-                let id = *state.id();
-                op_manager.push(id, state).await?;
-            }
-        }
-
-        // ── Has message + state → send and keep processing ─────────────
-        Ok(OperationResult::SendAndContinue {
-            msg,
-            next_hop,
-            state: updated_state,
-            stream_data,
-        }) => {
-            if updated_state.finalized() {
-                let id = *msg.id();
-                tracing::debug!(%id, "operation finalized with outgoing message");
-                op_manager.completed(id);
-                if let Some(target) = next_hop {
-                    tracing::debug!(%id, ?target, "sending final message to target");
-                    send_with_stream(network_bridge, target, msg, stream_data).await?;
-                }
-                return Ok(Some(updated_state));
-            } else {
-                let id = *msg.id();
-                tracing::debug!(%id, "operation in progress");
-                let target = next_hop.ok_or_else(|| {
-                    // Only UPDATE's deprecated `Broadcasting` variant produced
-                    // SendAndContinue without a next_hop, and it has been
-                    // removed. Reaching this branch indicates a bug in an
-                    // operation's process_message implementation.
-                    OpError::UnexpectedOpState
-                })?;
-                tracing::debug!(%id, ?target, "sending updated op state");
-                // IMPORTANT: Push state BEFORE sending message to avoid race condition.
-                // If we send first, a fast response might arrive before the state is saved,
-                // causing load_or_init to fail to find the operation.
-                op_manager.push(id, updated_state).await?;
-                send_with_stream(network_bridge, target, msg, stream_data).await?;
-            }
-        }
-
-        // ── Has message, no state → send final response and complete ───
-        // Complete AFTER send to avoid response-lost: if send fails (peer
-        // disconnected), the op stays in under_progress for GC retry (#3590).
-        Ok(OperationResult::SendAndComplete {
-            msg,
-            next_hop,
-            stream_data,
-        }) => {
-            if let Some(target) = next_hop {
-                tracing::debug!(%tx_id, ?target, "sending back message to target");
-                match send_with_stream(network_bridge, target, msg, stream_data).await {
-                    Ok(()) => {
-                        op_manager.completed(tx_id);
-                    }
-                    Err(e) => {
-                        // Return directly — bypasses the Aborted-sending error
-                        // handler at the top of this function intentionally.
-                        // For relay nodes: the op state was already consumed by
-                        // process_message, so the tx sits in under_progress until
-                        // the 5× TTL cutoff cleans it up. The originator recovers
-                        // independently via its own speculative retry (ACK_TIMEOUT
-                        // or PROGRESS_TIMEOUT in the GC task).
-                        tracing::warn!(
-                            %tx_id, %target, error = %e,
-                            "Response send failed — originator will retry via speculative path"
-                        );
-                        return Err(e);
-                    }
-                }
-            } else {
-                op_manager.completed(tx_id);
-            }
-        }
-    }
-    Ok(None)
-}
-
-/// Send a message to a peer, optionally followed by stream data.
-///
-/// Extracts the repeated send-with-optional-stream pattern from `handle_op_result`.
-async fn send_with_stream<CB: NetworkBridge>(
-    network_bridge: &mut CB,
-    target: SocketAddr,
-    msg: NetMessage,
-    stream_data: Option<(crate::transport::peer_connection::StreamId, bytes::Bytes)>,
-) -> Result<(), OpError> {
-    let id = *msg.id();
-    // Serialize metadata for embedding in fragment #1 (fix #2757)
-    let metadata = if stream_data.is_some() {
-        match bincode::serialize(&msg) {
-            Ok(bytes) => Some(bytes::Bytes::from(bytes)),
-            Err(e) => {
-                tracing::warn!(%id, error = %e, "Failed to serialize metadata for embedding");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    network_bridge.send(target, msg).await?;
-    if let Some((stream_id, data)) = stream_data {
-        tracing::debug!(%id, %stream_id, ?target, "sending stream data");
-        network_bridge
-            .send_stream(target, stream_id, data, metadata)
-            .await?;
-    }
-    Ok(())
-}
-
-#[must_use]
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum OpEnum {
-    Connect(Box<connect::ConnectOp>),
-    // `Get` variant retired in #1454 phase 5 final (GET slice) together
-    // with the `ops.get` DashMap. GET wire flows now run on task-per-tx
-    // drivers in `get::op_ctx_task::*` and never produce an
-    // `OpEnum::Get`.
-    // `Put` retired in the prior PUT slice; `Update` in the UPDATE slice.
-    // `Subscribe` retired in the SUBSCRIBE slice; SUBSCRIBE wire flows
-    // run on task-per-tx drivers in `subscribe::op_ctx_task::*` and the
-    // surviving Unsubscribe send-site goes through `OpCtx::send_fire_and_forget`.
-}
-
-impl OpEnum {
-    delegate::delegate! {
-        to match self {
-            OpEnum::Connect(op) => op,
-        } {
-            pub fn id(&self) -> &Transaction;
-            pub fn outcome(&self) -> OpOutcome<'_>;
-            pub fn finalized(&self) -> bool;
-            pub fn to_host_result(&self) -> HostResult;
-        }
-    }
-}
+// Driver finalization paths publish `HostResult` directly via
+// `result_router_tx` (see `op_ctx_task::*`); no central carrier
+// is required.
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) enum OpOutcome<'a> {
     /// An op which involves a contract completed successfully.
     ContractOpSuccess {
@@ -374,12 +89,12 @@ pub(crate) enum OpError {
     NotificationError,
     #[error("notification channel error: {0}")]
     NotificationChannelError(String),
+    #[allow(dead_code)]
     #[error("unspected transaction type, trying to get a {0:?} from a {1:?}")]
     IncorrectTxType(TransactionType, TransactionType),
+    #[allow(dead_code)]
     #[error("op not present: {0}")]
     OpNotPresent(Transaction),
-    #[error("op not available")]
-    OpNotAvailable(#[from] OpNotAvailable),
 
     // Streaming-related errors
     #[error("stream was cancelled")]
@@ -456,68 +171,6 @@ pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &Contr
             );
         }
     }
-}
-
-/// Set up subscription forwarding at a relay node during GET response propagation.
-///
-/// Relay nodes only set up forwarding (upstream/downstream registration) -- they
-/// do NOT call `ring.subscribe()` or `announce_contract_hosted()`, which would
-/// cause a subscription storm.
-///
-/// Registers:
-/// 1. Upstream peer (response sender) as interest source for Unsubscribe routing
-/// 2. Downstream peer (GET requester) as downstream subscriber for UPDATE propagation
-// Sole caller (legacy GET relay `process_message::Response{Found}` branch)
-// retired in #1454 phase 5 final (GET slice). The task-per-tx GET relay
-// driver inlines its own subscription-forwarding side effect path. This
-// helper is kept for symmetry with similar relay-side helpers and as
-// reference for any future legacy-style relay reintroduction.
-#[allow(dead_code)]
-pub(crate) async fn setup_subscription_forwarding_at_relay(
-    op_manager: &OpManager,
-    key: &ContractKey,
-    tx: &crate::message::Transaction,
-    upstream_response_addr: std::net::SocketAddr,
-    downstream_requester_addr: std::net::SocketAddr,
-) {
-    // Register upstream peer (response sender) as interest source
-    if let Some(upstream_pkl) = op_manager
-        .ring
-        .connection_manager
-        .get_peer_by_addr(upstream_response_addr)
-    {
-        let peer_key = crate::ring::interest::PeerKey::from(upstream_pkl.pub_key.clone());
-        op_manager
-            .interest_manager
-            .register_peer_interest(key, peer_key, None, true);
-    } else {
-        tracing::debug!(
-            tx = %tx,
-            contract = %key,
-            upstream = %upstream_response_addr,
-            "Piggyback relay: upstream peer not in ring, skipping interest registration"
-        );
-    }
-
-    // Register downstream peer (GET requester) as downstream subscriber
-    subscribe::register_downstream_subscriber(
-        op_manager,
-        key,
-        downstream_requester_addr,
-        None,
-        None,
-        tx,
-        " (relay, piggybacked on GET response)",
-    )
-    .await;
-
-    tracing::debug!(
-        tx = %tx,
-        contract = %key,
-        upstream = %upstream_response_addr,
-        downstream = %downstream_requester_addr,
-        "Set up subscription forwarding at relay via GET piggyback"
-    );
 }
 
 /// Complete subscription at the originator node via GET piggyback.
@@ -625,16 +278,13 @@ pub(crate) async fn broadcast_change_interests(
 }
 
 /// Initiates a subscription after a PUT or GET, routing through the
-/// task-per-tx subscribe driver.
+/// subscribe driver as a fire-and-forget background task.
 ///
 /// `blocking` is accepted for API stability (callers may inspect it for
-/// telemetry), but post-#1454 sub-op SUBSCRIBE migration it has no
-/// behavioral effect: the subscribe runs as a fire-and-forget background
-/// task in either case. The legacy `SubOperationTracker`-based blocking
-/// semantics (parent waits for child via tracker DashMap) are retired —
-/// task-per-tx PUT/GET drivers handle blocking by `await`ing
-/// `subscribe::run_client_subscribe` inline (see `maybe_subscribe_child`
-/// in `put/op_ctx_task.rs` and `get/op_ctx_task.rs`).
+/// telemetry) but has no behavioral effect here: PUT/GET drivers that
+/// want to wait for completion `await` `subscribe::run_client_subscribe`
+/// inline (see `maybe_subscribe_child` in `put/op_ctx_task.rs` and
+/// `get/op_ctx_task.rs`).
 pub(super) fn start_subscription_request(
     op_manager: &OpManager,
     parent_tx: Transaction,
@@ -648,7 +298,7 @@ pub(super) fn start_subscription_request(
         %child_tx,
         %key,
         blocking,
-        "spawning child subscription operation (task-per-tx driver)"
+        "spawning child subscription operation (driver)"
     );
 
     // `run_client_subscribe` requires `Arc<OpManager>`. Callers on
@@ -1175,20 +825,10 @@ mod streaming_tests {
 }
 
 #[cfg(test)]
-mod sub_op_subscribe_migration_pin_tests {
-    //! Pin tests for the #1454 sub-op SUBSCRIBE migration.
-    //!
-    //! These tests scrape the source of `start_subscription_request` to
-    //! prove that:
-    //! 1. The legacy `subscribe::request_subscribe` driver and the legacy
-    //!    `expect_and_register_sub_operation` registration call are gone
-    //!    from the production sub-op SUBSCRIBE entry point.
-    //! 2. The function spawns the task-per-tx
-    //!    `subscribe::run_client_subscribe` driver instead.
-    //!
-    //! If a future refactor reintroduces the legacy paths, these tests
-    //! will fail loudly and force a re-evaluation against the rationale
-    //! recorded in `.claude/rules/operations.md`.
+mod sub_op_subscribe_pin_tests {
+    //! Pin tests that prove `start_subscription_request` spawns
+    //! `subscribe::run_client_subscribe` and does not register with a
+    //! sub-operation tracker.
 
     fn extract_start_subscription_request_body() -> &'static str {
         let src = include_str!("operations.rs");
@@ -1228,14 +868,12 @@ mod sub_op_subscribe_migration_pin_tests {
     }
 
     #[test]
-    fn start_subscription_request_does_not_call_legacy_request_subscribe() {
+    fn start_subscription_request_uses_run_client_subscribe() {
         let body = extract_start_subscription_request_body();
         assert!(
             !body.contains("subscribe::request_subscribe"),
-            "`start_subscription_request` must NOT route through the \
-             legacy `subscribe::request_subscribe` driver — sub-op \
-             SUBSCRIBE migrated to `subscribe::run_client_subscribe` \
-             (see #1454 follow-up)."
+            "`start_subscription_request` must route through \
+             `subscribe::run_client_subscribe`, not `request_subscribe`."
         );
     }
 
@@ -1244,25 +882,23 @@ mod sub_op_subscribe_migration_pin_tests {
         let body = extract_start_subscription_request_body();
         assert!(
             !body.contains("expect_and_register_sub_operation"),
-            "`start_subscription_request` must NOT call \
-             `expect_and_register_sub_operation` — `SubOperationTracker` \
-             was deleted in #1454 Phase 3c. Reintroducing it would be a \
-             regression."
+            "`start_subscription_request` must NOT register with a \
+             sub-operation tracker."
         );
         assert!(
             !body.contains("sub_operation_failed"),
             "`start_subscription_request` must NOT propagate failures \
-             via `sub_operation_failed` — the task-per-tx subscribe \
-             driver publishes its own `HostResult::Err`."
+             via `sub_operation_failed` — the subscribe driver \
+             publishes its own `HostResult::Err`."
         );
     }
 
     #[test]
-    fn start_subscription_request_spawns_task_per_tx_driver() {
+    fn start_subscription_request_spawns_driver_driver() {
         let body = extract_start_subscription_request_body();
         assert!(
             body.contains("subscribe::run_client_subscribe"),
-            "`start_subscription_request` must spawn the task-per-tx \
+            "`start_subscription_request` must spawn the driver \
              subscribe driver `subscribe::run_client_subscribe` — \
              matches the `maybe_subscribe_child` pattern in \
              `put/op_ctx_task.rs` and `get/op_ctx_task.rs`."

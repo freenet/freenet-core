@@ -315,10 +315,10 @@ impl HostingManager {
 
     /// Snapshot of every active subscription for the local-peer dashboard.
     ///
-    /// Reads directly from the canonical lease map (no parallel mirror).
-    /// The earlier `network_status::subscribed_contracts` mirror silently
-    /// drifted after SUBSCRIBE moved to the task-per-tx driver and lost
-    /// its recording hook.
+    /// Reads directly from the canonical lease map (no parallel
+    /// mirror). The earlier `network_status::subscribed_contracts`
+    /// mirror silently drifted when SUBSCRIBE migrated to its driver
+    /// and lost its recording hook.
     pub fn dashboard_subscription_snapshot(&self) -> Vec<SubscribedContractSnapshot> {
         let now = self.time_source.now();
         let mut snapshot: Vec<SubscribedContractSnapshot> = self
@@ -494,13 +494,16 @@ impl HostingManager {
         for instance_id in instance_ids_with_client {
             self.remove_client_subscription(&instance_id, client_id);
 
-            // Find matching ContractKey in active_subscriptions
-            if let Some(contract) = self
+            // Find matching ContractKey in active_subscriptions.
+            // Drop the DashMap iter() guard before `affected_contracts.push`
+            // so an unrelated caller cannot deadlock on the same shard
+            // (clippy: `significant_drop_in_scrutinee`).
+            let contract = self
                 .active_subscriptions
                 .iter()
                 .find(|entry| *entry.key().id() == instance_id)
-                .map(|entry| *entry.key())
-            {
+                .map(|entry| *entry.key());
+            if let Some(contract) = contract {
                 affected_contracts.push(contract);
             }
         }
@@ -551,10 +554,11 @@ impl HostingManager {
     /// Remove a downstream peer's subscription for a contract.
     /// Returns true if the peer was found and removed.
     pub fn remove_downstream_subscriber(&self, contract: &ContractKey, peer: &PeerKey) -> bool {
-        let mut removed = false;
-        if let Some(mut peers) = self.downstream_subscribers.get_mut(contract) {
-            removed = peers.remove(peer).is_some();
-        }
+        let removed = if let Some(mut peers) = self.downstream_subscribers.get_mut(contract) {
+            peers.remove(peer).is_some()
+        } else {
+            false
+        };
         if removed {
             // Remove the map entry if no peers remain
             self.downstream_subscribers
@@ -956,13 +960,16 @@ impl HostingManager {
                 .iter()
                 .any(|sub| sub.key().id() == &instance_id && sub.value().expires_at > now);
             if !has_active {
-                // Need to find the ContractKey - check hosting cache
-                if let Some(contract) = self
+                // Need to find the ContractKey - check hosting cache.
+                // Materialize the lookup into an owned value before the read
+                // guard's scope ends so we don't hold the lock across the
+                // hash insertion (clippy: `significant_drop_in_scrutinee`).
+                let contract = self
                     .hosting_cache
                     .read()
                     .iter()
-                    .find(|k| k.id() == &instance_id)
-                {
+                    .find(|k| k.id() == &instance_id);
+                if let Some(contract) = contract {
                     needs_renewal_set.insert(contract);
                 }
             }
@@ -1500,11 +1507,10 @@ mod tests {
         assert!(subscribed.contains(&c3));
     }
 
-    /// Pins the dashboard contract: `subscribe(...)` must be visible in
-    /// `dashboard_subscription_snapshot()` immediately, with no separate
-    /// recording call. The previous parallel `network_status` mirror
-    /// silently drifted when SUBSCRIBE migrated to the task-per-tx driver
-    /// (PR #3806 → #3981); this test prevents the regression.
+    /// Pin: `subscribe(...)` must be visible in
+    /// `dashboard_subscription_snapshot()` immediately. The
+    /// previous parallel `network_status` mirror silently drifted
+    /// after the SUBSCRIBE migration (PR #3806 → #3981).
     #[tokio::test]
     async fn dashboard_snapshot_reflects_active_subscriptions() {
         let manager = HostingManager::new();

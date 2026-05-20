@@ -18,7 +18,6 @@ use crate::{
     contract::{
         self, ContractHandler, MemoryContractHandler, MockWasmContractHandler,
         MockWasmHandlerBuilder, SimulationContractHandler, SimulationHandlerBuilder,
-        mediator_channels, op_request_channel, run_op_request_mediator,
     },
     node::{
         EventLoopExitReason, NetEventRegister,
@@ -98,21 +97,8 @@ impl<ER> Builder<ER> {
         op_manager.ring.attach_op_manager(&op_manager);
         std::mem::drop(_guard);
 
-        // Create channels for the mediator pattern
-        let (op_request_receiver, op_sender) = op_request_channel();
-        let (executor_listener, to_event_loop_tx, from_event_loop_rx) =
-            mediator_channels(op_manager.clone());
-
-        // Spawn the mediator task
-        GlobalExecutor::spawn({
-            let mediator_task =
-                run_op_request_mediator(op_request_receiver, to_event_loop_tx, from_event_loop_rx);
-            mediator_task.instrument(tracing::info_span!("op_request_mediator"))
-        });
-
         let contract_handler = MemoryContractHandler::build(
             ch_channel,
-            op_sender,
             op_manager.clone(),
             self.contract_handler_name,
         )
@@ -172,7 +158,6 @@ impl<ER> Builder<ER> {
                 op_manager,
                 wait_for_event,
                 notification_channel,
-                executor_listener,
                 node_controller_rx,
             )
             .instrument(parent_span)
@@ -234,22 +219,9 @@ impl<ER> Builder<ER> {
         op_manager.ring.attach_op_manager(&op_manager);
         std::mem::drop(_guard);
 
-        // Create channels for the mediator pattern
-        let (op_request_receiver, op_sender) = op_request_channel();
-        let (executor_listener, to_event_loop_tx, from_event_loop_rx) =
-            mediator_channels(op_manager.clone());
-
-        // Spawn the mediator task
-        GlobalExecutor::spawn({
-            let mediator_task =
-                run_op_request_mediator(op_request_receiver, to_event_loop_tx, from_event_loop_rx);
-            mediator_task.instrument(tracing::info_span!("op_request_mediator"))
-        });
-
         // Use SimulationContractHandler with shared in-memory storage
         let contract_handler = SimulationContractHandler::build(
             ch_channel,
-            op_sender,
             op_manager.clone(),
             SimulationHandlerBuilder {
                 identifier: self.contract_handler_name,
@@ -312,7 +284,6 @@ impl<ER> Builder<ER> {
                 op_manager,
                 wait_for_event,
                 notification_channel,
-                executor_listener,
                 node_controller_rx,
             )
             .instrument(parent_span)
@@ -372,22 +343,9 @@ impl<ER> Builder<ER> {
         op_manager.ring.attach_op_manager(&op_manager);
         std::mem::drop(_guard);
 
-        // Create channels for the mediator pattern
-        let (op_request_receiver, op_sender) = op_request_channel();
-        let (executor_listener, to_event_loop_tx, from_event_loop_rx) =
-            mediator_channels(op_manager.clone());
-
-        // Spawn the mediator task
-        GlobalExecutor::spawn({
-            let mediator_task =
-                run_op_request_mediator(op_request_receiver, to_event_loop_tx, from_event_loop_rx);
-            mediator_task.instrument(tracing::info_span!("op_request_mediator"))
-        });
-
         // Use MockWasmContractHandler — exercises the production ContractExecutor code path
         let contract_handler = MockWasmContractHandler::build(
             ch_channel,
-            op_sender,
             op_manager.clone(),
             MockWasmHandlerBuilder {
                 identifier: self.contract_handler_name,
@@ -450,7 +408,6 @@ impl<ER> Builder<ER> {
                 op_manager,
                 wait_for_event,
                 notification_channel,
-                executor_listener,
                 node_controller_rx,
             )
             .instrument(parent_span)

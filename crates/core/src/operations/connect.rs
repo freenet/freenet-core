@@ -96,30 +96,27 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use futures::{StreamExt, stream::FuturesUnordered};
+#[cfg(test)]
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use either::Either;
-
-use crate::client_events::HostResult;
 use crate::config::{GlobalExecutor, GlobalRng};
 use crate::dev_tool::Location;
-use crate::message::{InnerMessage, NetMessage, NetMessageV1, NodeEvent, Transaction};
-use crate::node::{ConnectionError, IsOperationCompleted, NetworkBridge, OpManager};
-use crate::operations::{OpEnum, OpError, OpInitialization, OpOutcome, Operation, OperationResult};
-use crate::ring::{ConnectionFailureReason, KnownPeerKeyLocation, PeerAddr, PeerKeyLocation};
+use crate::message::{InnerMessage, NodeEvent, Transaction};
+use crate::node::OpManager;
+use crate::operations::OpError;
+use crate::ring::{KnownPeerKeyLocation, PeerAddr, PeerKeyLocation};
 use crate::router::{EstimatorType, IsotonicEstimator, IsotonicEvent};
-use crate::tracing::NetEventLog;
 use crate::transport::TransportKeypair;
-use crate::util::{Contains, IterExt, time_source::InstantTimeSrc};
-use freenet_stdlib::client_api::HostResponse;
+use crate::util::{Contains, IterExt};
 
 use super::VisitedPeers;
 
 pub(crate) mod op_ctx_task;
 
+#[cfg(test)]
 const FORWARD_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
 const RECENCY_COOLDOWN: Duration = Duration::from_secs(30);
 
@@ -307,25 +304,26 @@ pub(crate) struct ConnectResponse {
     pub acceptor: PeerKeyLocation,
 }
 
-/// New minimal state machine the joiner tracks.
+/// State machine retained for in-file relay/joiner unit tests
+/// (`tests::*` in this file). Production CONNECT runs entirely on the
+/// drivers in `op_ctx_task.rs` and rebuilds `RelayState`
+/// in task locals; nothing constructs `ConnectState::Relaying` or
+/// `Completed` outside the test module.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub(crate) enum ConnectState {
-    /// Joiner waiting for acceptances.
     WaitingForResponses(JoinerState),
-    /// Intermediate peer evaluating and forwarding requests.
     Relaying(Box<RelayState>),
-    /// Joiner obtained the required neighbours.
     Completed,
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // Fields only read by in-file unit tests.
 pub(crate) struct JoinerState {
     pub target_connections: usize,
     pub observed_address: Option<SocketAddr>,
     pub accepted: HashSet<PeerKeyLocation>,
     pub last_progress: Instant,
-    /// True if the joiner started without knowing their external address.
-    /// Used for invariant checking: if true, we must receive ObservedAddress.
     pub started_without_address: bool,
 }
 
@@ -414,8 +412,11 @@ pub(crate) struct RelayActions {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ForwardAttempt {
+    #[cfg_attr(not(test), allow(dead_code))]
     peer: PeerKeyLocation,
+    #[cfg_attr(not(test), allow(dead_code))]
     desired: Location,
+    #[cfg_attr(not(test), allow(dead_code))]
     sent_at: Instant,
 }
 
@@ -636,9 +637,7 @@ impl RelayState {
                                         self_loc.pub_key().clone(),
                                     );
                                     actions.accept = Some(AcceptOutcome {
-                                        response: ConnectResponse {
-                                            acceptor: acceptor.clone(),
-                                        },
+                                        response: ConnectResponse { acceptor },
                                         joiner: self.request.joiner.clone(),
                                     });
                                     tracing::info!(
@@ -692,9 +691,7 @@ impl RelayState {
             let acceptor = PeerKeyLocation::with_unknown_addr(self_loc.pub_key().clone());
             let dist = ring_distance(self_loc.location(), self.request.joiner.location());
             actions.accept = Some(AcceptOutcome {
-                response: ConnectResponse {
-                    acceptor: acceptor.clone(),
-                },
+                response: ConnectResponse { acceptor },
                 joiner: self.request.joiner.clone(),
             });
             // Response is routed hop-by-hop via upstream_addr, no target embedded in message
@@ -1048,17 +1045,20 @@ impl RelayContext for RelayEnv<'_> {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)] // Constructed only by in-file unit tests.
 pub struct AcceptedPeer {
     pub peer: PeerKeyLocation,
 }
 
 #[derive(Debug, Default)]
+#[allow(dead_code)] // Constructed only by in-file unit tests.
 pub struct JoinerAcceptance {
     pub new_acceptor: Option<AcceptedPeer>,
     pub satisfied: bool,
     pub assigned_location: bool,
 }
 
+#[allow(dead_code)] // Methods used only by in-file unit tests.
 impl JoinerState {
     pub(crate) fn register_acceptance(
         &mut self,
@@ -1083,45 +1083,19 @@ impl JoinerState {
     }
 }
 
-/// Placeholder operation wrapper so we can exercise the logic in isolation in
-/// forthcoming commits. For now this simply captures the shared state we will
-/// migrate to.
+/// Test-only fixture wrapping the relay/joiner state machine.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct ConnectOp {
     pub(crate) id: Transaction,
     pub(crate) state: Option<ConnectState>,
-    /// The peer we sent/forwarded the connect request to (first hop from joiner's perspective).
-    pub(crate) first_hop: Option<Box<PeerKeyLocation>>,
-    pub(crate) desired_location: Option<Location>,
-    /// Tracks when we last forwarded this connect to a peer, to avoid hammering the same
-    /// neighbors when no acceptors are available. Peers without an entry are treated as
-    /// immediately eligible.
     recency: HashMap<PeerKeyLocation, Instant>,
     forward_attempts: HashMap<PeerKeyLocation, ForwardAttempt>,
     connect_forward_estimator: Arc<RwLock<ConnectForwardEstimator>>,
-    /// Injectable time source. Using `util::TimeSource` (which returns `tokio::time::Instant`)
-    /// lets tests supply `SharedMockTimeSource` for fine-grained time control without needing
-    /// to pause the entire tokio runtime.
-    time_source: Arc<dyn crate::util::time_source::TimeSource + Send + Sync>,
 }
 
+#[cfg(test)]
 impl ConnectOp {
-    /// Creates a ConnectOp with just a state, for unit-testing GC timeout logic.
-    #[cfg(test)]
-    pub(crate) fn with_state(state: ConnectState) -> Self {
-        use crate::util::time_source::InstantTimeSrc;
-        Self {
-            id: Transaction::new::<ConnectMsg>(),
-            state: Some(state),
-            first_hop: None,
-            desired_location: None,
-            recency: HashMap::new(),
-            forward_attempts: HashMap::new(),
-            connect_forward_estimator: Arc::new(RwLock::new(ConnectForwardEstimator::new())),
-            time_source: Arc::new(InstantTimeSrc::new()),
-        }
-    }
-
     fn record_forward_outcome(&mut self, peer: &PeerKeyLocation, desired: Location, success: bool) {
         self.forward_attempts.remove(peer);
         if !success {
@@ -1152,13 +1126,10 @@ impl ConnectOp {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_joiner(
         id: Transaction,
-        desired_location: Location,
         target_connections: usize,
         observed_address: Option<SocketAddr>,
-        gateway: Option<PeerKeyLocation>,
         connect_forward_estimator: Arc<RwLock<ConnectForwardEstimator>>,
     ) -> Self {
         let started_without_address = observed_address.is_none();
@@ -1172,29 +1143,13 @@ impl ConnectOp {
         Self {
             id,
             state: Some(state),
-            first_hop: gateway.map(Box::new),
-            desired_location: Some(desired_location),
             recency: HashMap::new(),
             forward_attempts: HashMap::new(),
             connect_forward_estimator,
-            time_source: Arc::new(InstantTimeSrc::new()),
         }
     }
 
-    /// Construct a new relay-side `ConnectOp` from an inbound `Request`.
-    ///
-    /// **Phase 2c slice 1 (#1454):** this constructor is no longer called
-    /// from production. The relay-CONNECT dispatch site at
-    /// `node.rs::handle_pure_network_message_v1` routes fresh inbound
-    /// `Request`s through `op_ctx_task::start_relay_connect`, which
-    /// builds an equivalent `RelayState` in driver task locals and never
-    /// calls this constructor.
-    ///
-    /// Retained for in-file unit tests under `#[cfg(test)] mod tests`
-    /// that exercise `RelayState::handle_request` semantics inline.
-    /// Phase 6 cleanup will migrate those tests to drive the task-per-tx
-    /// driver and delete this constructor (along with `RelayState`,
-    /// `RelayState::handle_request`, and `RelayActions`).
+    /// Construct a relay-side `ConnectOp` from an inbound `Request`.
     pub(crate) fn new_relay(
         id: Transaction,
         upstream_addr: SocketAddr,
@@ -1221,49 +1176,10 @@ impl ConnectOp {
         Self {
             id,
             state: Some(state),
-            first_hop: None,
-            desired_location: None,
             recency: HashMap::new(),
             forward_attempts: HashMap::new(),
             connect_forward_estimator,
-            time_source: Arc::new(InstantTimeSrc::new()),
         }
-    }
-
-    pub(crate) fn is_completed(&self) -> bool {
-        matches!(self.state, Some(ConnectState::Completed))
-    }
-
-    pub(crate) fn id(&self) -> &Transaction {
-        &self.id
-    }
-
-    pub(crate) fn outcome(&self) -> OpOutcome<'_> {
-        OpOutcome::Irrelevant
-    }
-
-    pub(crate) fn finalized(&self) -> bool {
-        self.is_completed()
-    }
-
-    pub(crate) fn to_host_result(&self) -> HostResult {
-        Ok(HostResponse::Ok)
-    }
-
-    pub(crate) fn gateway(&self) -> Option<&PeerKeyLocation> {
-        self.first_hop.as_deref()
-    }
-
-    /// Get the next hop address if this operation is in a state that needs to send
-    /// an outbound message. For Connect, this is the first hop peer we're connecting through.
-    pub(crate) fn get_next_hop_addr(&self) -> Option<std::net::SocketAddr> {
-        self.first_hop.as_deref().and_then(|g| g.socket_addr())
-    }
-
-    /// Get the full target peer (including public key) for connection establishment.
-    /// For Connect operations, this returns the gateway peer.
-    pub(crate) fn get_target_peer(&self) -> Option<crate::ring::PeerKeyLocation> {
-        self.first_hop.as_deref().cloned()
     }
 
     pub(crate) fn initiate_join_request(
@@ -1276,120 +1192,16 @@ impl ConnectOp {
         exclude_addrs: &[SocketAddr],
     ) -> (Transaction, Self, ConnectMsg) {
         let tx = Transaction::new::<ConnectMsg>();
-
-        // Initialize bloom filter with transaction-specific hash keys.
-        // Mark ourself and the target gateway as visited.
-        let mut visited = VisitedPeers::new(&tx);
-        if let Some(own_addr) = own.socket_addr() {
-            visited.mark_visited(own_addr);
-        }
-        if let Some(target_addr) = target.socket_addr() {
-            visited.mark_visited(target_addr);
-        }
-
-        // Exclude already-connected peers and recently-failed NAT addresses so routing
-        // nodes don't forward back to peers we already have a ring connection with.
-        //
-        // Bloom filter saturation note: VisitedPeers uses a 512-bit filter with k=4 hash
-        // functions. Pre-loading N entries raises the false-positive rate; at typical
-        // network sizes (≤ 20 connections in current deployments) the FP rate is negligible
-        // (~0.01%). At DEFAULT_MAX_CONNECTIONS (200), the rate reaches ~39%, which would
-        // cause routing to occasionally skip reachable peers. This is an accepted trade-off
-        // for current network sizes. If production nodes routinely reach high connection
-        // counts, consider capping pre-populated entries to the N closest connected peers
-        // (since greedy routing preferentially selects nearby peers anyway).
-        for addr in exclude_addrs {
-            visited.mark_visited(*addr);
-        }
-        if !exclude_addrs.is_empty() {
-            tracing::debug!(
-                excluded_addrs = exclude_addrs.len(),
-                "connect: pre-populated visited filter with excluded peer addresses (failed + connected)"
-            );
-        }
-
-        // Create joiner with PeerAddr::Unknown - the joiner doesn't know their own
-        // external address (especially behind NAT). The first recipient (gateway)
-        // will fill this in from the packet source address.
-        let joiner = PeerKeyLocation::with_unknown_addr(own.pub_key.clone());
-        let request = ConnectRequest {
-            desired_location,
-            joiner,
-            ttl,
-            visited,
-            uphill_budget: DEFAULT_UPHILL_BUDGET,
-        };
+        let msg = prepare_join_request(tx, &own, &target, desired_location, ttl, exclude_addrs);
 
         let op = ConnectOp::new_joiner(
             tx,
-            desired_location,
             target_connections,
             own.socket_addr(),
-            Some(target.clone()),
             connect_forward_estimator,
         );
 
-        let msg = ConnectMsg::Request {
-            id: tx,
-            payload: request,
-        };
-
         (tx, op, msg)
-    }
-
-    pub(crate) fn handle_response(
-        &mut self,
-        response: &ConnectResponse,
-        now: Instant,
-    ) -> Option<JoinerAcceptance> {
-        match self.state.as_mut() {
-            Some(ConnectState::WaitingForResponses(state)) => {
-                tracing::info!(
-                    acceptor_pub_key = %response.acceptor.pub_key(),
-                    acceptor_loc = ?response.acceptor.location(),
-                    target_connections = state.target_connections,
-                    accepted_count = state.accepted.len(),
-                    "connect: joiner received ConnectResponse"
-                );
-                let result = state.register_acceptance(response, now);
-                if let Some(new_acceptor) = &result.new_acceptor {
-                    self.recency.remove(&new_acceptor.peer);
-                }
-                tracing::info!(
-                    tx = %self.id,
-                    satisfied = result.satisfied,
-                    accepted_count = state.accepted.len(),
-                    target_connections = state.target_connections,
-                    "connect: register_acceptance result"
-                );
-                if result.satisfied {
-                    // INVARIANT: If the joiner started without knowing their external address,
-                    // they must have received ObservedAddress by the time the connect completes.
-                    // This catches bugs where ObservedAddress is not emitted (e.g., if the
-                    // transport layer prematurely fills in the address).
-                    debug_assert!(
-                        !state.started_without_address || state.observed_address.is_some(),
-                        "BUG: Connect completed but joiner never received ObservedAddress. \
-                         This indicates the transport layer may have prematurely filled in \
-                         the joiner's address, preventing ObservedAddress emission."
-                    );
-                    tracing::info!(
-                        tx = %self.id,
-                        elapsed_ms = self.id.elapsed().as_millis(),
-                        "Connect operation completed"
-                    );
-                    self.state = Some(ConnectState::Completed);
-                }
-                Some(result)
-            }
-            _ => None,
-        }
-    }
-
-    pub(crate) fn handle_observed_address(&mut self, address: SocketAddr, now: Instant) {
-        if let Some(ConnectState::WaitingForResponses(state)) = self.state.as_mut() {
-            state.update_observed_address(address, now);
-        }
     }
 
     pub(crate) fn handle_request<C: RelayContext>(
@@ -1441,910 +1253,6 @@ impl ConnectOp {
     }
 }
 
-impl IsOperationCompleted for ConnectOp {
-    fn is_completed(&self) -> bool {
-        self.is_completed()
-    }
-}
-
-impl Operation for ConnectOp {
-    type Message = ConnectMsg;
-    type Result = ();
-
-    fn id(&self) -> &Transaction {
-        &self.id
-    }
-
-    async fn load_or_init<'a>(
-        op_manager: &'a OpManager,
-        msg: &'a Self::Message,
-        source_addr: Option<std::net::SocketAddr>,
-    ) -> Result<OpInitialization<Self>, OpError> {
-        let tx = *msg.id();
-        match op_manager.pop(msg.id()) {
-            Ok(Some(OpEnum::Connect(op))) => Ok(OpInitialization {
-                op: *op,
-                source_addr,
-            }),
-            Ok(None) => {
-                let op = match (msg, source_addr) {
-                    // Phase 2c slice 1 (#1454): the dispatch site at
-                    // `node.rs::handle_pure_network_message_v1` already
-                    // routed fresh `Request`s with `source_addr.is_some()`
-                    // through `op_ctx_task::start_relay_connect`, so this
-                    // arm should be unreachable in production. It remains
-                    // as defense-in-depth and to keep `process_message`'s
-                    // joiner-side branches usable from in-file unit tests
-                    // that construct relay ops directly. Phase 6 cleanup
-                    // deletes this arm (along with `ConnectOp::new_relay`
-                    // and the relay arms of `process_message`).
-                    (ConnectMsg::Request { payload, .. }, Some(upstream_addr)) => {
-                        ConnectOp::new_relay(
-                            tx,
-                            upstream_addr,
-                            payload.clone(),
-                            op_manager.connect_forward_estimator.clone(),
-                        )
-                    }
-                    (ConnectMsg::Request { .. }, None) => {
-                        tracing::warn!(tx = %tx, phase = "error", "connect request received without source address");
-                        return Err(OpError::OpNotPresent(tx));
-                    }
-                    (ConnectMsg::ObservedAddress { address, .. }, _) => {
-                        // ObservedAddress arrived but no operation exists - this can happen if:
-                        // 1. We're not the joiner (wrong recipient)
-                        // 2. The operation was never created (shouldn't happen)
-                        // Still try to update our address since this might be meant for us
-                        let location = Location::from_address(address);
-                        op_manager.ring.connection_manager.set_own_addr(*address);
-                        op_manager
-                            .ring
-                            .connection_manager
-                            .update_location(Some(location));
-                        tracing::info!(
-                            tx = %tx,
-                            observed_address = %address,
-                            location = %location,
-                            "connect: updated own_addr from ObservedAddress (no op state found)"
-                        );
-                        return Err(OpError::OpNotPresent(tx));
-                    }
-                    _ => {
-                        tracing::debug!(%tx, "connect received message without existing state");
-                        return Err(OpError::OpNotPresent(tx));
-                    }
-                };
-                Ok(OpInitialization { op, source_addr })
-            }
-            Err(err) => {
-                // Special case: ObservedAddress can arrive when the operation is in various states:
-                // - Completed: The joiner received Response before ObservedAddress
-                // - Running: The operation is currently being processed elsewhere
-                // We still need to update our external address in both cases.
-                if let ConnectMsg::ObservedAddress { address, .. } = msg {
-                    let location = Location::from_address(address);
-                    op_manager.ring.connection_manager.set_own_addr(*address);
-                    op_manager
-                        .ring
-                        .connection_manager
-                        .update_location(Some(location));
-                    tracing::info!(
-                        tx = %tx,
-                        observed_address = %address,
-                        location = %location,
-                        error = ?err,
-                        "connect: updated own_addr from ObservedAddress (op state: {:?})",
-                        err
-                    );
-                }
-                Err(err.into())
-            }
-        }
-    }
-
-    /// **Phase 2c slice 1 (#1454):** the relay branches of this method
-    /// (`ConnectState::Relaying(_)` matches in each variant arm) are
-    /// dead from production after the dispatch site at
-    /// `node.rs::handle_pure_network_message_v1` started routing every
-    /// fresh inbound `ConnectMsg::Request` (with `source_addr.is_some()`
-    /// AND `!has_connect_op(id)`) through `op_ctx_task::start_relay_connect`.
-    ///
-    /// The legacy relay arms are preserved here for two reasons:
-    ///
-    /// 1. Unit tests in this file (`relay_accepts_when_policy_allows`,
-    ///    `relay_forwards_when_not_accepting`, etc.) construct
-    ///    `ConnectOp::new_relay` directly and exercise `handle_request`
-    ///    and `process_message` inline. Migrating those tests to drive
-    ///    the task-per-tx driver requires standing up a mock OpManager
-    ///    with a real `op_execution_sender` — out of scope for this
-    ///    slice; tracked for phase 6 cleanup.
-    /// 2. The joiner branches (`ConnectState::WaitingForResponses(_)`)
-    ///    of each arm remain LIVE for the legacy `load_or_init`
-    ///    stateless `ObservedAddress` side-effect path at
-    ///    connect.rs:1473-1490 (defensive belt-and-suspenders; the
-    ///    joiner driver also handles ObservedAddress).
-    ///
-    /// Phase 6 cleanup will delete the relay arms, `ConnectOp::new_relay`,
-    /// `RelayState`, `RelayState::handle_request`, and `RelayActions`.
-    fn process_message<'a, NB: NetworkBridge>(
-        mut self,
-        network_bridge: &'a mut NB,
-        op_manager: &'a OpManager,
-        msg: &'a Self::Message,
-        source_addr: Option<std::net::SocketAddr>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<OperationResult, OpError>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            // Capture a single timestamp for the entire message handler so that all
-            // time-sensitive operations within one message exchange see a consistent
-            // "now". Using `self.time_source` (rather than `Instant::now()` directly)
-            // allows tests to supply a `SharedMockTimeSource` for fine-grained time
-            // control without needing to pause the entire tokio runtime.
-            let now = self.time_source.now();
-            match msg {
-                ConnectMsg::Request { payload, .. } => {
-                    let env = RelayEnv::new(op_manager);
-                    let estimator = {
-                        let estimator_guard = self.connect_forward_estimator.read();
-                        estimator_guard.clone()
-                    };
-                    // Use source_addr from transport layer as upstream address
-                    let upstream_addr = source_addr.ok_or_else(|| {
-                        OpError::from(ConnectionError::TransportError(
-                            "ConnectMsg::Request received without source_addr".into(),
-                        ))
-                    })?;
-
-                    // Admission control: limit concurrent connects at gateways.
-                    // The guard is RAII — the slot is released when _guard is dropped,
-                    // even on early returns from ? operators below.
-                    let _guard = match op_manager.ring.connection_manager.try_admit_connect() {
-                        Some(guard) => guard,
-                        None => {
-                            tracing::info!(
-                                tx = %self.id,
-                                desired_location = %payload.desired_location,
-                                upstream = %upstream_addr,
-                                "connect: gateway overloaded, rejecting request"
-                            );
-                            // Emit telemetry: connect rejected (gateway overloaded)
-                            if let Some(event) = NetEventLog::connect_rejected(
-                                &self.id,
-                                &op_manager.ring,
-                                payload.desired_location,
-                                "gateway overloaded",
-                            ) {
-                                op_manager.ring.register_events(Either::Left(event)).await;
-                            }
-                            let reject_msg = ConnectMsg::Rejected {
-                                id: self.id,
-                                desired_location: payload.desired_location,
-                            };
-                            network_bridge
-                                .send(
-                                    upstream_addr,
-                                    NetMessage::V1(NetMessageV1::Connect(reject_msg)),
-                                )
-                                .await?;
-                            self.state = Some(ConnectState::Completed);
-                            return Ok(store_operation_state(&mut self));
-                        }
-                    };
-
-                    let actions =
-                        self.handle_request(&env, upstream_addr, payload.clone(), &estimator, now);
-
-                    // Emit telemetry for request received
-                    if let Some(event) = NetEventLog::connect_request_received(
-                        &self.id,
-                        &op_manager.ring,
-                        payload.desired_location,
-                        payload.joiner.clone(),
-                        upstream_addr,
-                        actions.forward.as_ref().map(|(peer, _)| peer.clone()),
-                        actions.accept.is_some(),
-                        payload.ttl,
-                    ) {
-                        op_manager.ring.register_events(Either::Left(event)).await;
-                    }
-
-                    if let Some((_target, address)) = actions.observed_address {
-                        let msg = ConnectMsg::ObservedAddress {
-                            id: self.id,
-                            address,
-                        };
-                        // Route through upstream (where the request came from) using hop-by-hop routing.
-                        // Note: upstream_addr is already validated from source_addr at the start of this match arm.
-                        tracing::debug!(
-                            tx = %self.id,
-                            observed_address = %address,
-                            sending_to = %upstream_addr,
-                            "Sending ObservedAddress to joiner"
-                        );
-                        network_bridge
-                            .send(upstream_addr, NetMessage::V1(NetMessageV1::Connect(msg)))
-                            .await?;
-                    }
-
-                    // Promote the joiner BEFORE sending the `Response` upstream:
-                    // once the joiner receives our Response it may immediately
-                    // start subscribing through us, and `get_peer_by_addr` on
-                    // the acceptor side only finds ring connections. Dispatch
-                    // here (using a ref borrow) and let the `accept_response`
-                    // site below consume the owned value for the actual send.
-                    // (The `forward` branch below is uphill to the next relay,
-                    // not to the joiner, so its ordering relative to dispatch
-                    // doesn't matter — it's placed here mainly to match the
-                    // near-terminus "forward + accept" code path.)
-                    if let Some(ref accept) = actions.accept {
-                        dispatch_expect_connection_from(op_manager, self.id, accept.joiner.clone())
-                            .await?;
-                    }
-
-                    if let Some((next, request)) = actions.forward {
-                        // Record recency for this forward to avoid hammering the same neighbor.
-                        self.recency.insert(next.clone(), now);
-                        let forward_msg = ConnectMsg::Request {
-                            id: self.id,
-                            payload: request,
-                        };
-                        if let Some(next_addr) = next.socket_addr() {
-                            network_bridge
-                                .send(
-                                    next_addr,
-                                    NetMessage::V1(NetMessageV1::Connect(forward_msg)),
-                                )
-                                .await?;
-                        }
-                    }
-
-                    if actions.rejected {
-                        // Emit telemetry: connect rejected
-                        if let Some(event) = NetEventLog::connect_rejected(
-                            &self.id,
-                            &op_manager.ring,
-                            payload.desired_location,
-                            "rejected by handle_request",
-                        ) {
-                            op_manager.ring.register_events(Either::Left(event)).await;
-                        }
-                        let reject_msg = ConnectMsg::Rejected {
-                            id: self.id,
-                            desired_location: payload.desired_location,
-                        };
-                        tracing::debug!(
-                            tx = %self.id,
-                            desired_location = %payload.desired_location,
-                            upstream = %upstream_addr,
-                            "connect: sending explicit rejection upstream"
-                        );
-                        network_bridge
-                            .send(
-                                upstream_addr,
-                                NetMessage::V1(NetMessageV1::Connect(reject_msg)),
-                            )
-                            .await?;
-                        // _guard is dropped here, releasing the admission slot
-                        self.state = Some(ConnectState::Completed);
-                        return Ok(store_operation_state(&mut self));
-                    }
-
-                    if let Some(accept) = actions.accept {
-                        // Emit telemetry for response sent
-                        if let Some(event) = NetEventLog::connect_response_sent(
-                            &self.id,
-                            &op_manager.ring,
-                            accept.response.acceptor.clone(),
-                            payload.joiner.clone(),
-                        ) {
-                            op_manager.ring.register_events(Either::Left(event)).await;
-                        }
-
-                        let response_msg = ConnectMsg::Response {
-                            id: self.id,
-                            payload: accept.response,
-                        };
-                        // Route the response through upstream (where the request came from)
-                        // using hop-by-hop routing. We don't embed target in the message.
-                        // Note: upstream_addr is already validated from source_addr at the start of this match arm.
-                        network_bridge
-                            .send(
-                                upstream_addr,
-                                NetMessage::V1(NetMessageV1::Connect(response_msg)),
-                            )
-                            .await?;
-                        // _guard is dropped here, releasing the admission slot
-                        return Ok(store_operation_state(&mut self));
-                    }
-
-                    // _guard is dropped here, releasing the admission slot
-                    Ok(store_operation_state(&mut self))
-                }
-                ConnectMsg::Response { payload, .. } => {
-                    // Fill in acceptor's external address from source_addr if unknown.
-                    // The acceptor doesn't know their own external address (especially behind NAT),
-                    // so the first peer that receives the response fills it in from the
-                    // transport layer's source address.
-                    let payload = if payload.acceptor.peer_addr.is_unknown() {
-                        if let Some(acceptor_addr) = source_addr {
-                            let mut updated = payload.clone();
-                            updated.acceptor.peer_addr = PeerAddr::Known(acceptor_addr);
-                            tracing::debug!(
-                                acceptor_pub_key = %updated.acceptor.pub_key(),
-                                acceptor_addr = %acceptor_addr,
-                                "connect: filled acceptor address from source_addr"
-                            );
-                            updated
-                        } else {
-                            tracing::warn!(
-                                acceptor_pub_key = %payload.acceptor.pub_key(),
-                                "connect: response received without source_addr, cannot fill acceptor address"
-                            );
-                            payload.clone()
-                        }
-                    } else {
-                        payload.clone()
-                    };
-
-                    if let Some(ConnectState::WaitingForResponses(_)) = &self.state {
-                        // Joiner: process the response and connect to acceptor
-                        // Emit telemetry for response received at joiner
-                        if let Some(event) = NetEventLog::connect_response_received(
-                            &self.id,
-                            &op_manager.ring,
-                            payload.acceptor.clone(),
-                        ) {
-                            op_manager.ring.register_events(Either::Left(event)).await;
-                        }
-
-                        if let Some(mut acceptance) = self.handle_response(&payload, now) {
-                            // Note: Location assignment happens in ObservedAddress handler,
-                            // not here. The joiner's ring location is derived from their
-                            // external IP address (observed by the gateway), not from
-                            // the routing target (desired_location).
-
-                            if let Some(new_acceptor) = acceptance.new_acceptor {
-                                if let Some(addr) = new_acceptor.peer.socket_addr() {
-                                    op_manager
-                                        .notify_node_event(
-                                            crate::message::NodeEvent::ExpectPeerConnection {
-                                                addr,
-                                            },
-                                        )
-                                        .await?;
-                                }
-
-                                let (callback, mut rx) = mpsc::channel(1);
-                                op_manager
-                                    .notify_node_event(NodeEvent::ConnectPeer {
-                                        peer: new_acceptor.peer.clone(),
-                                        tx: self.id,
-                                        callback,
-                                        is_gw: false,
-                                    })
-                                    .await?;
-
-                                let hole_punch_ok = if let Some(result) = rx.recv().await {
-                                    if let Ok((peer_id, _remaining)) = result {
-                                        tracing::info!(
-                                            %peer_id,
-                                            tx=%self.id,
-                                            elapsed_ms = self.id.elapsed().as_millis(),
-                                            "connect joined peer"
-                                        );
-                                        // Record success for this acceptor's reliability score
-                                        if let Some(addr) = new_acceptor.peer.socket_addr() {
-                                            let now = Instant::now();
-                                            op_manager
-                                                .ring
-                                                .connection_manager
-                                                .record_acceptor_outcome(addr, true, now);
-                                        }
-                                        true
-                                    } else {
-                                        tracing::warn!(
-                                            tx=%self.id,
-                                            elapsed_ms = self.id.elapsed().as_millis(),
-                                            "connect ConnectPeer failed"
-                                        );
-                                        false
-                                    }
-                                } else {
-                                    tracing::warn!(
-                                        tx=%self.id,
-                                        acceptor = %new_acceptor.peer,
-                                        elapsed_ms = self.id.elapsed().as_millis(),
-                                        "ConnectPeer callback channel closed without result; \
-                                         peer promotion may not have completed"
-                                    );
-                                    false
-                                };
-
-                                // On hole-punch failure, send ConnectFailed to the gateway
-                                // so the relay chain can try re-routing to a different acceptor.
-                                // Stay in WaitingForResponses to receive a new ConnectResponse.
-                                if !hole_punch_ok {
-                                    // Remove the failed acceptor from accepted set so we don't
-                                    // declare satisfied prematurely (the hole-punch didn't work).
-                                    if let Some(ConnectState::WaitingForResponses(joiner_state)) =
-                                        self.state.as_mut()
-                                    {
-                                        joiner_state.accepted.remove(&new_acceptor.peer);
-                                        acceptance.satisfied = joiner_state.accepted.len()
-                                            >= joiner_state.target_connections;
-                                    }
-
-                                    if let Some(failed_addr) = new_acceptor.peer.socket_addr() {
-                                        if let Some(gw_addr) = self.get_next_hop_addr() {
-                                            let failed_msg = ConnectMsg::ConnectFailed {
-                                                id: self.id,
-                                                failed_acceptor_addr: failed_addr,
-                                            };
-                                            tracing::info!(
-                                                tx = %self.id,
-                                                failed_acceptor = %failed_addr,
-                                                gateway = %gw_addr,
-                                                "connect: sending ConnectFailed to gateway for re-routing"
-                                            );
-                                            network_bridge
-                                                .send(
-                                                    gw_addr,
-                                                    NetMessage::V1(NetMessageV1::Connect(
-                                                        failed_msg,
-                                                    )),
-                                                )
-                                                .await?;
-                                        }
-                                    }
-                                }
-                            }
-
-                            if acceptance.satisfied {
-                                self.state = Some(ConnectState::Completed);
-                                // Reset jitter counter on successful connect
-                                op_manager
-                                    .ring
-                                    .connection_manager
-                                    .reset_connect_jitter_failures();
-                                // Clear gateway backoff on successful connect completion
-                                // This ensures successful gateways aren't penalized by previous failures
-                                if let Some(gw_addr) = self.get_next_hop_addr() {
-                                    let mut backoff = op_manager.gateway_backoff.lock();
-                                    backoff.record_success(gw_addr);
-                                    tracing::debug!(
-                                        gateway_addr = %gw_addr,
-                                        tx = %self.id,
-                                        "Cleared gateway backoff on successful connect"
-                                    );
-                                }
-                                // Clear connection location backoff on successful completion
-                                if let Some(target_loc) = self.desired_location {
-                                    op_manager.ring.record_connection_success(target_loc);
-                                    tracing::debug!(
-                                        target_location = %target_loc,
-                                        tx = %self.id,
-                                        "Cleared connection location backoff on successful connect"
-                                    );
-                                }
-                            }
-                        }
-
-                        Ok(store_operation_state(&mut self))
-                    } else if let Some(ConnectState::Relaying(state)) = self.state.as_mut() {
-                        // Relay: forward response toward joiner via hop-by-hop routing
-                        let (forwarded, desired, upstream_addr) = {
-                            let st = state;
-                            (
-                                st.forwarded_to.clone(),
-                                st.request.desired_location,
-                                st.upstream_addr,
-                            )
-                        };
-                        if let Some(ref fwd) = forwarded {
-                            self.record_forward_outcome(fwd, desired, true);
-                        }
-
-                        tracing::debug!(
-                            tx = %self.id,
-                            upstream_addr = %upstream_addr,
-                            acceptor_pub_key = %payload.acceptor.pub_key(),
-                            forwarded_from = ?forwarded,
-                            "connect: relay forwarding response towards joiner"
-                        );
-                        // Forward response toward the joiner via upstream using hop-by-hop routing
-                        let forward_msg = ConnectMsg::Response {
-                            id: self.id,
-                            payload,
-                        };
-                        network_bridge
-                            .send(
-                                upstream_addr,
-                                NetMessage::V1(NetMessageV1::Connect(forward_msg)),
-                            )
-                            .await?;
-                        // Mark that we've forwarded a response so GC doesn't log
-                        // a false "uphill route timed out" for this completed relay.
-                        if let Some(ConnectState::Relaying(state)) = self.state.as_mut() {
-                            state.response_forwarded = true;
-                        }
-                        Ok(store_operation_state(&mut self))
-                    } else {
-                        tracing::warn!(
-                            tx = %self.id,
-                            state = ?self.state,
-                            "connect: received Response but not in WaitingForResponses or Relaying state"
-                        );
-                        Ok(store_operation_state(&mut self))
-                    }
-                }
-                ConnectMsg::ObservedAddress { address, .. } => {
-                    // DEBUG: Log what state we're in when receiving ObservedAddress
-                    let state_desc = match &self.state {
-                        Some(ConnectState::WaitingForResponses(_)) => {
-                            "WaitingForResponses (joiner)"
-                        }
-                        Some(ConnectState::Relaying(_)) => "Relaying (relay/gateway)",
-                        Some(ConnectState::Completed) => "Completed",
-                        None => "None",
-                    };
-                    let current_addr = op_manager.ring.connection_manager.get_own_addr();
-                    tracing::debug!(
-                        tx = %self.id,
-                        state = state_desc,
-                        current_own_addr = ?current_addr,
-                        received_observed_address = %address,
-                        "ObservedAddress received"
-                    );
-
-                    self.handle_observed_address(*address, now);
-                    // Update this node's external address and ring location based on the observed
-                    // address. The joiner doesn't know their external IP (behind NAT), so the
-                    // gateway observes it from the UDP packet source and sends it back.
-                    // We must update both:
-                    // 1. own_addr - so diagnostics reports the correct address
-                    // 2. own_location - so routing uses the correct ring location
-                    let location = Location::from_address(address);
-                    op_manager.ring.connection_manager.set_own_addr(*address);
-                    op_manager
-                        .ring
-                        .connection_manager
-                        .update_location(Some(location));
-                    tracing::info!(
-                        tx = %self.id,
-                        observed_address = %address,
-                        location = %location,
-                        "connect: updated own_addr and location from observed address"
-                    );
-                    Ok(store_operation_state(&mut self))
-                }
-                ConnectMsg::Rejected {
-                    desired_location, ..
-                } => {
-                    if let Some(ConnectState::WaitingForResponses(_)) = &self.state {
-                        // Joiner: explicit rejection received — record backoff and complete
-                        tracing::info!(
-                            tx = %self.id,
-                            desired_location = %desired_location,
-                            "connect: received explicit rejection from relay"
-                        );
-                        op_manager.ring.record_connection_failure(
-                            *desired_location,
-                            ConnectionFailureReason::Rejected,
-                        );
-                        if let Some(gw_addr) = self.get_next_hop_addr() {
-                            let mut backoff = op_manager.gateway_backoff.lock();
-                            backoff.record_failure(gw_addr);
-                            tracing::debug!(
-                                gateway_addr = %gw_addr,
-                                tx = %self.id,
-                                "Recorded gateway backoff on explicit rejection"
-                            );
-                        }
-                        self.state = Some(ConnectState::Completed);
-                        Ok(store_operation_state(&mut self))
-                    } else if let Some(ConnectState::Relaying(state)) = self.state.as_mut() {
-                        // Relay: received rejection from uphill peer — try another before giving up
-                        let upstream_addr = state.upstream_addr;
-                        let failed_peer = state.forwarded_to.clone();
-
-                        // Record failure in estimator so future routing avoids this peer.
-                        // This requires &mut self, so we must drop the state borrow first.
-                        if let Some(ref fwd) = failed_peer {
-                            self.record_forward_outcome(fwd, *desired_location, false);
-                        }
-
-                        // Re-borrow state to reset forwarded_to and retry with a new peer.
-                        // The previously-tried peer is in recency, so select_uphill_hop skips it.
-                        // Capture now once to avoid multiple Instant::now() calls in this handler.
-                        let now = Instant::now();
-                        let env = RelayEnv::new(op_manager);
-                        let estimator = self.connect_forward_estimator.read().clone();
-                        let retry_actions =
-                            if let Some(ConnectState::Relaying(state)) = self.state.as_mut() {
-                                state.forwarded_to = None;
-                                state.forwarded_at = None;
-                                state.handle_request(
-                                    &env,
-                                    &self.recency,
-                                    &mut self.forward_attempts,
-                                    &estimator,
-                                    now,
-                                )
-                            } else {
-                                unreachable!("state was Relaying at branch entry")
-                            };
-
-                        if let Some((peer, forward_req)) = retry_actions.forward {
-                            // Found a different uphill peer — forward to it
-                            self.recency.insert(peer.clone(), now);
-                            tracing::debug!(
-                                tx = %self.id,
-                                failed_peer = ?failed_peer,
-                                retry_peer = %peer.pub_key(),
-                                "connect: relay retrying with different uphill peer after rejection"
-                            );
-                            let forward_msg = ConnectMsg::Request {
-                                id: self.id,
-                                payload: forward_req,
-                            };
-                            if let Some(addr) = peer.socket_addr() {
-                                network_bridge
-                                    .send(addr, NetMessage::V1(NetMessageV1::Connect(forward_msg)))
-                                    .await?;
-                            }
-                        } else if let Some(accept) = retry_actions.accept {
-                            // Relay decided to accept on retry — send response upstream
-                            // AND promote the joiner's transient connection into a ring
-                            // connection. The `AcceptOutcome` bundles both halves so they
-                            // cannot drift apart again (#3838).
-                            tracing::info!(
-                                tx = %self.id,
-                                failed_peer = ?failed_peer,
-                                acceptor = %accept.response.acceptor.pub_key(),
-                                "connect: relay accepting locally after uphill rejection"
-                            );
-                            // Emit `connect_response_sent` telemetry, matching the
-                            // happy-path accept branch (#3893 review: close the telemetry
-                            // gap between accept sites so analytics can count retry
-                            // acceptances alongside first-pass acceptances).
-                            if let Some(event) = NetEventLog::connect_response_sent(
-                                &self.id,
-                                &op_manager.ring,
-                                accept.response.acceptor.clone(),
-                                accept.joiner.clone(),
-                            ) {
-                                op_manager.ring.register_events(Either::Left(event)).await;
-                            }
-                            dispatch_expect_connection_from(op_manager, self.id, accept.joiner)
-                                .await?;
-                            let response_msg = ConnectMsg::Response {
-                                id: self.id,
-                                payload: accept.response,
-                            };
-                            network_bridge
-                                .send(
-                                    upstream_addr,
-                                    NetMessage::V1(NetMessageV1::Connect(response_msg)),
-                                )
-                                .await?;
-                        } else {
-                            // No more uphill peers and can't accept — forward rejection upstream
-                            tracing::debug!(
-                                tx = %self.id,
-                                upstream_addr = %upstream_addr,
-                                failed_peer = ?failed_peer,
-                                "connect: relay forwarding rejection upstream (no retry peers available)"
-                            );
-                            // Emit telemetry: relay forwarding rejection upstream
-                            if let Some(event) = NetEventLog::connect_rejected(
-                                &self.id,
-                                &op_manager.ring,
-                                *desired_location,
-                                "relay no retry peers available",
-                            ) {
-                                op_manager.ring.register_events(Either::Left(event)).await;
-                            }
-                            let reject_msg = ConnectMsg::Rejected {
-                                id: self.id,
-                                desired_location: *desired_location,
-                            };
-                            network_bridge
-                                .send(
-                                    upstream_addr,
-                                    NetMessage::V1(NetMessageV1::Connect(reject_msg)),
-                                )
-                                .await?;
-                        }
-                        Ok(store_operation_state(&mut self))
-                    } else {
-                        tracing::warn!(
-                            tx = %self.id,
-                            state = ?self.state,
-                            "connect: received Rejected but not in expected state"
-                        );
-                        Ok(store_operation_state(&mut self))
-                    }
-                }
-                ConnectMsg::ConnectFailed {
-                    failed_acceptor_addr,
-                    ..
-                } => {
-                    if let Some(ConnectState::Relaying(state)) = self.state.as_mut() {
-                        // Relay received ConnectFailed. Strategy: if we have a downstream
-                        // peer that already forwarded a response, send ConnectFailed there
-                        // first (closer relay has better local knowledge for re-routing).
-                        // Capture timestamp once for consistent use across this handler.
-                        let now = Instant::now();
-                        if state.response_forwarded {
-                            if let Some(ref fwd) = state.forwarded_to {
-                                if let Some(fwd_addr) = fwd.socket_addr() {
-                                    // Record failure so this relay down-weights the bad acceptor in future CONNECTs.
-                                    op_manager.ring.connection_manager.record_acceptor_outcome(
-                                        *failed_acceptor_addr,
-                                        false,
-                                        now,
-                                    );
-
-                                    let fwd_msg = ConnectMsg::ConnectFailed {
-                                        id: self.id,
-                                        failed_acceptor_addr: *failed_acceptor_addr,
-                                    };
-                                    tracing::debug!(
-                                        tx = %self.id,
-                                        forwarded_to_addr = %fwd_addr,
-                                        failed_acceptor = %failed_acceptor_addr,
-                                        "connect: forwarding ConnectFailed downstream"
-                                    );
-                                    network_bridge
-                                        .send(
-                                            fwd_addr,
-                                            NetMessage::V1(NetMessageV1::Connect(fwd_msg)),
-                                        )
-                                        .await?;
-                                    state.response_forwarded = false;
-                                    return Ok(store_operation_state(&mut self));
-                                }
-                            }
-                        }
-
-                        // No downstream available — try re-routing locally.
-                        // Extract fields before dropping state borrow (same pattern as Rejected).
-                        let upstream_addr = state.upstream_addr;
-                        let failed_peer = state.forwarded_to.clone();
-                        let desired_location = state.request.desired_location;
-
-                        // Record failure in acceptor reliability tracker
-                        op_manager.ring.connection_manager.record_acceptor_outcome(
-                            *failed_acceptor_addr,
-                            false,
-                            now,
-                        );
-
-                        // Record forward failure in estimator (drops state borrow via self)
-                        if let Some(ref fwd) = failed_peer {
-                            self.record_forward_outcome(fwd, desired_location, false);
-                        }
-
-                        // Re-borrow state, add failed acceptor to bloom filter, re-route
-                        let env = RelayEnv::new(op_manager);
-                        let estimator = self.connect_forward_estimator.read().clone();
-                        let retry_actions =
-                            if let Some(ConnectState::Relaying(state)) = self.state.as_mut() {
-                                state.request.visited.mark_visited(*failed_acceptor_addr);
-                                state.forwarded_to = None;
-                                state.forwarded_at = None;
-                                state.response_forwarded = false;
-                                state.handle_request(
-                                    &env,
-                                    &self.recency,
-                                    &mut self.forward_attempts,
-                                    &estimator,
-                                    now,
-                                )
-                            } else {
-                                unreachable!("state was Relaying at branch entry")
-                            };
-
-                        if let Some((peer, forward_req)) = retry_actions.forward {
-                            self.recency.insert(peer.clone(), now);
-                            tracing::debug!(
-                                tx = %self.id,
-                                failed_acceptor = %failed_acceptor_addr,
-                                retry_peer = %peer.pub_key(),
-                                "connect: relay re-routing to different peer after ConnectFailed"
-                            );
-                            let forward_msg = ConnectMsg::Request {
-                                id: self.id,
-                                payload: forward_req,
-                            };
-                            if let Some(addr) = peer.socket_addr() {
-                                network_bridge
-                                    .send(addr, NetMessage::V1(NetMessageV1::Connect(forward_msg)))
-                                    .await?;
-                            }
-                        } else if let Some(accept) = retry_actions.accept {
-                            // Same rationale as the `Rejected` retry branch: the
-                            // `AcceptOutcome` bundles the response and the joiner so we
-                            // cannot forget to promote the transient connection when
-                            // accepting locally (#3838).
-                            tracing::info!(
-                                tx = %self.id,
-                                failed_acceptor = %failed_acceptor_addr,
-                                acceptor = %accept.response.acceptor.pub_key(),
-                                "connect: relay accepting locally after ConnectFailed"
-                            );
-                            // Emit `connect_response_sent` telemetry, matching the
-                            // happy-path accept branch (#3893 review).
-                            if let Some(event) = NetEventLog::connect_response_sent(
-                                &self.id,
-                                &op_manager.ring,
-                                accept.response.acceptor.clone(),
-                                accept.joiner.clone(),
-                            ) {
-                                op_manager.ring.register_events(Either::Left(event)).await;
-                            }
-                            dispatch_expect_connection_from(op_manager, self.id, accept.joiner)
-                                .await?;
-                            let response_msg = ConnectMsg::Response {
-                                id: self.id,
-                                payload: accept.response,
-                            };
-                            network_bridge
-                                .send(
-                                    upstream_addr,
-                                    NetMessage::V1(NetMessageV1::Connect(response_msg)),
-                                )
-                                .await?;
-                        } else {
-                            // No options — propagate ConnectFailed upstream
-                            tracing::debug!(
-                                tx = %self.id,
-                                upstream_addr = %upstream_addr,
-                                failed_acceptor = %failed_acceptor_addr,
-                                "connect: relay propagating ConnectFailed upstream (no re-route available)"
-                            );
-                            let upstream_msg = ConnectMsg::ConnectFailed {
-                                id: self.id,
-                                failed_acceptor_addr: *failed_acceptor_addr,
-                            };
-                            network_bridge
-                                .send(
-                                    upstream_addr,
-                                    NetMessage::V1(NetMessageV1::Connect(upstream_msg)),
-                                )
-                                .await?;
-                        }
-                        Ok(store_operation_state(&mut self))
-                    } else if let Some(ConnectState::WaitingForResponses(_)) = &self.state {
-                        // Joiner received ConnectFailed propagated all the way back —
-                        // no relay could re-route. Record failure and complete so the
-                        // retry loop (with jitter) can try again.
-                        tracing::info!(
-                            tx = %self.id,
-                            failed_acceptor = %failed_acceptor_addr,
-                            "connect: all relays exhausted, ConnectFailed reached joiner"
-                        );
-                        op_manager.ring.record_connection_failure(
-                            self.desired_location.unwrap_or_else(Location::random),
-                            ConnectionFailureReason::Rejected,
-                        );
-                        self.state = Some(ConnectState::Completed);
-                        Ok(store_operation_state(&mut self))
-                    } else {
-                        tracing::warn!(
-                            tx = %self.id,
-                            state = ?self.state,
-                            "connect: received ConnectFailed but not in expected state"
-                        );
-                        Ok(store_operation_state(&mut self))
-                    }
-                }
-            }
-        })
-    }
-}
-
 /// Skip list that combines visited peers and own address.
 /// Ensures we never select ourselves as a forwarding target and avoids
 /// peers already visited in this CONNECT transaction.
@@ -2367,44 +1275,6 @@ impl Contains<SocketAddr> for SkipListWithSelf<'_> {
 impl Contains<&SocketAddr> for SkipListWithSelf<'_> {
     fn has_element(&self, target: &SocketAddr) -> bool {
         self.has_element(*target)
-    }
-}
-
-fn store_operation_state(op: &mut ConnectOp) -> OperationResult {
-    store_operation_state_with_msg(op, None)
-}
-
-fn store_operation_state_with_msg(op: &mut ConnectOp, msg: Option<ConnectMsg>) -> OperationResult {
-    let state_clone = op.state.clone();
-    // Hop-by-hop routing: messages are sent directly via network_bridge.send() with
-    // explicit target addresses. No next_hop is embedded in the result.
-    let return_msg = msg.map(|m| NetMessage::V1(NetMessageV1::Connect(m)));
-    let state = state_clone.map(|state| {
-        OpEnum::Connect(Box::new(ConnectOp {
-            id: op.id,
-            state: Some(state),
-            first_hop: op.first_hop.clone(),
-            desired_location: op.desired_location,
-            recency: op.recency.clone(),
-            forward_attempts: op.forward_attempts.clone(),
-            connect_forward_estimator: op.connect_forward_estimator.clone(),
-            time_source: op.time_source.clone(),
-        }))
-    });
-    match (return_msg, state) {
-        (Some(msg), Some(state)) => OperationResult::SendAndContinue {
-            msg,
-            next_hop: None,
-            state,
-            stream_data: None,
-        },
-        (Some(msg), None) => OperationResult::SendAndComplete {
-            msg,
-            next_hop: None,
-            stream_data: None,
-        },
-        (None, Some(state)) => OperationResult::ContinueOp(state),
-        (None, None) => OperationResult::Completed,
     }
 }
 
@@ -2484,6 +1354,62 @@ pub(super) async fn dispatch_expect_connection_from(
     });
 
     Ok(())
+}
+
+/// Build a `ConnectMsg::Request` for a joiner-initiated CONNECT.
+///
+/// Pure helper so `op_ctx_task::start_client_connect` and
+/// `ring::Ring::acquire_new` can construct the wire message without
+/// allocating a legacy `ConnectOp` carrier. Caller owns the
+/// `Transaction`.
+///
+/// Bloom filter saturation note: `VisitedPeers` uses a 512-bit filter
+/// with k=4 hash functions. Pre-loading N entries raises the false-positive
+/// rate; at typical network sizes (≤ 20 connections in current deployments)
+/// the FP rate is negligible (~0.01%). At DEFAULT_MAX_CONNECTIONS (200),
+/// the rate reaches ~39%, which would cause routing to occasionally skip
+/// reachable peers. This is an accepted trade-off for current network sizes.
+pub(crate) fn prepare_join_request(
+    tx: Transaction,
+    own: &PeerKeyLocation,
+    target: &PeerKeyLocation,
+    desired_location: Location,
+    ttl: u8,
+    exclude_addrs: &[SocketAddr],
+) -> ConnectMsg {
+    let mut visited = VisitedPeers::new(&tx);
+    if let Some(own_addr) = own.socket_addr() {
+        visited.mark_visited(own_addr);
+    }
+    if let Some(target_addr) = target.socket_addr() {
+        visited.mark_visited(target_addr);
+    }
+    for addr in exclude_addrs {
+        visited.mark_visited(*addr);
+    }
+    if !exclude_addrs.is_empty() {
+        tracing::debug!(
+            excluded_addrs = exclude_addrs.len(),
+            "connect: pre-populated visited filter with excluded peer addresses (failed + connected)"
+        );
+    }
+
+    // Create joiner with PeerAddr::Unknown - the joiner doesn't know their own
+    // external address (especially behind NAT). The first recipient (gateway)
+    // will fill this in from the packet source address.
+    let joiner = PeerKeyLocation::with_unknown_addr(own.pub_key.clone());
+    let request = ConnectRequest {
+        desired_location,
+        joiner,
+        ttl,
+        visited,
+        uphill_budget: DEFAULT_UPHILL_BUDGET,
+    };
+
+    ConnectMsg::Request {
+        id: tx,
+        payload: request,
+    }
 }
 
 #[tracing::instrument(fields(peer = %op_manager.ring.connection_manager.pub_key), skip_all)]
@@ -2601,7 +1527,9 @@ pub(crate) async fn join_ring_request(
         // Bootstrap mode: target own location with jitter after failures.
         apply_bootstrap_jitter(base_location)
     };
+    let tx = Transaction::new::<ConnectMsg>();
     op_ctx_task::start_client_connect(
+        tx,
         gateway.clone(),
         gateway_addr,
         op_manager,
@@ -2643,7 +1571,9 @@ pub(crate) async fn gateway_version_probe(
     let own = op_manager.ring.connection_manager.own_location();
     let desired_location = own.location().unwrap_or_else(Location::random);
 
+    let tx = Transaction::new::<ConnectMsg>();
     op_ctx_task::start_client_connect(
+        tx,
         gateway.clone(),
         gateway_addr,
         op_manager,
@@ -2661,8 +1591,8 @@ pub(crate) async fn gateway_version_probe(
 /// intervals lets `initial_join_procedure` notice when `min_connections`
 /// is reached without waiting for the full gateway backoff to expire.
 ///
-/// Also applied in `handle_aborted_op` for the same reason.  ±20% jitter is
-/// applied at each call site to prevent thundering herd.  See issue #3304.
+/// ±20% jitter is applied at each call site to prevent thundering herd.
+/// See issue #3304.
 pub(crate) const GATEWAY_BACKOFF_POLL_CAP: Duration = Duration::from_secs(30);
 
 pub(crate) async fn initial_join_procedure(
@@ -3153,9 +2083,7 @@ mod tests {
     fn expired_forward_attempts_are_cleared() {
         let mut op = ConnectOp::new_joiner(
             Transaction::new::<ConnectMsg>(),
-            Location::new(0.1),
             1,
-            None,
             None,
             Arc::new(RwLock::new(ConnectForwardEstimator::new())),
         );
@@ -3175,14 +2103,8 @@ mod tests {
     #[test]
     fn expired_forward_attempts_record_failures_in_estimator() {
         let estimator = Arc::new(RwLock::new(ConnectForwardEstimator::new()));
-        let mut op = ConnectOp::new_joiner(
-            Transaction::new::<ConnectMsg>(),
-            Location::new(0.1),
-            1,
-            None,
-            None,
-            estimator.clone(),
-        );
+        let mut op =
+            ConnectOp::new_joiner(Transaction::new::<ConnectMsg>(), 1, None, estimator.clone());
         let peer = make_peer(2000);
         op.forward_attempts.insert(
             peer.clone(),

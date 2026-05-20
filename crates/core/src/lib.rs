@@ -63,7 +63,15 @@ pub mod local_node {
 /// Exports for the dev tool.
 pub mod dev_tool {
     use super::*;
-    pub use crate::config::{Config, GlobalTestMetrics};
+    pub use crate::config::{
+        Config, GlobalTestMetrics, KEK_SIZE, KekBackend, KekBackendKind, KekError,
+        ensure_kek_loaded, load_from_backend, read_backend_marker, replace_backend_marker,
+        write_backend_marker,
+    };
+    // Backend constructors live in the `kek` submodule rather than the
+    // top-level `config` re-export to keep `Config`'s public surface
+    // free of platform-specific concrete types.
+    pub use crate::config::kek::{FileKek, KeyringKek, SystemdCredentialKek, build_backend_for};
     pub use client_events::{
         AuthToken, ClientEventsProxy, ClientId, OpenRequest, test::MemoryEventsGen,
         test::NetworkEventGenerator,
@@ -88,47 +96,17 @@ pub mod dev_tool {
     pub use ring::Location;
     pub use transport::{TransportKeypair, TransportPublicKey};
 
-    // #1454 Phase 3b — test hook to verify client-initiated GETs
-    // actually route through the task-per-tx driver rather than being
-    // satisfied by the `client_events.rs` local-cache shortcut.
+    // Test hooks: per-op driver call counters. Tests assert these
+    // increment to confirm wire variants dispatch through their
+    // driver (not a local-cache shortcut or legacy path).
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::get::op_ctx_task::DRIVER_CALL_COUNT as GET_DRIVER_CALL_COUNT;
-
-    // #1454 Phase 5 / #3883 — test hook to verify the dispatch site in
-    // `handle_pure_network_message_v1` routes fresh inbound relay
-    // GETs through the task-per-tx driver. Phase 5 final (GET slice)
-    // retired the legacy `handle_op_request<GetOp>` fallthrough; every
-    // GET wire variant now dispatches unconditionally to a task-per-tx
-    // driver. The originator-loopback case (`source_addr=None`) is
-    // mapped to `upstream_addr=own_addr` at the dispatch site, so the
-    // same `start_relay_get` driver handles both true relay hops and
-    // originator-loopback. UPDATE auto-fetch was migrated to
-    // `start_targeted_sub_op_get` in the same slice.
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::get::op_ctx_task::RELAY_DRIVER_CALL_COUNT as GET_RELAY_DRIVER_CALL_COUNT;
-
-    // #1454 Phase 5 follow-up slice A (#3917) — test hook to verify
-    // the dispatch gate in `handle_pure_network_message_v1` actually
-    // routes fresh inbound relay PUTs through the task-per-tx driver
-    // (vs. the legacy `handle_op_request` fallthrough used for
-    // client-initiated loopback and GC-spawned retries).
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::put::op_ctx_task::RELAY_PUT_DRIVER_CALL_COUNT;
-
-    // #1454 Phase 5 follow-up slice B — test hook for streaming PUT
-    // relay dispatch. Fires when the streaming driver is spawned for
-    // a fresh inbound `PutMsg::RequestStreaming` (vs. legacy
-    // `handle_op_request` fallthrough for GC retries / loopback /
-    // variants that stay on the legacy path).
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::put::op_ctx_task::RELAY_PUT_STREAMING_DRIVER_CALL_COUNT;
-
-    // #1454 Phase 5 follow-up slice A (#3932) — test hook to verify
-    // the dispatch gate in `handle_pure_network_message_v1` actually
-    // routes fresh inbound relay SUBSCRIBEs through the task-per-tx
-    // driver (vs. the legacy `handle_op_request` fallthrough used
-    // for renewals, PUT sub-op subscribes, executor auto-subscribe,
-    // and GC-spawned retries).
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_DRIVER_CALL_COUNT;
 
@@ -155,8 +133,10 @@ pub mod dev_tool {
         register_topology_snapshot, set_current_network_name, validate_topology,
         validate_topology_from_snapshots,
     };
+    pub use wasm_runtime::secret_snapshots::SnapshotMetadata;
     pub use wasm_runtime::{
-        ContractStore, DelegateStore, MockStateStorage, Runtime, SecretsStore, StateStore,
+        ContractStore, DelegateStore, MockStateStorage, Runtime, SecretStoreError, SecretsStore,
+        StateStore,
     };
 
     // Re-export simulation types for test infrastructure

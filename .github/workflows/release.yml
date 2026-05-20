@@ -4,9 +4,10 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to release (e.g., 0.1.31)'
-        required: true
+        description: 'Version to release (e.g., 0.1.31). Leave blank for auto-patch-bump from latest crates.io release.'
+        required: false
         type: string
+        default: ''
       skip_tests:
         description: 'Skip running tests before release'
         required: false
@@ -35,18 +36,46 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
-      - name: Validate version format
+      - name: Warn if RELEASE_PAT is not configured
+        env:
+          # Workflow secrets are not directly visible in `if:` expressions,
+          # so we expose RELEASE_PAT via env and check for emptiness inside
+          # the step. The value is never echoed.
+          RELEASE_PAT_PRESENT: ${{ secrets.RELEASE_PAT != '' }}
+        run: |
+          if [ "$RELEASE_PAT_PRESENT" != "true" ]; then
+            echo "::warning title=RELEASE_PAT not set::The release workflow can complete without RELEASE_PAT, but downstream workflows (CI on the bump PR, gateway-update.yml, release-announce.yml) will NOT fire automatically. GITHUB_TOKEN suppresses workflow-triggering events as an anti-recursion safeguard. Configure a RELEASE_PAT repo secret with 'repo' + 'workflow' scopes to make releases zero-touch. See issue #4118 and AGENTS.md → 'Release Workflow & RELEASE_PAT'."
+          else
+            echo "✅ RELEASE_PAT is configured. Downstream workflows will be triggered automatically."
+          fi
+
+      - name: Resolve + validate version
         id: validate
         run: |
           VERSION="${{ inputs.version }}"
-
-          # Remove 'v' prefix if present
           VERSION="${VERSION#v}"
 
-          # Validate format X.Y.Z
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Error: Version must be in format X.Y.Z (e.g., 0.1.31)"
-            exit 1
+          if [[ -z "$VERSION" ]]; then
+            # Auto-bump: take the highest released version on crates.io for
+            # the `freenet` crate and increment the patch. Minor/major bumps
+            # still require explicit input.
+            LATEST=$(curl -sS -A 'github-actions' https://crates.io/api/v1/crates/freenet \
+              | jq -r '.crate.max_version')
+            if [[ ! "$LATEST" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Could not resolve latest version from crates.io (got: '$LATEST')"
+              exit 1
+            fi
+            MAJOR=$(echo "$LATEST" | cut -d. -f1)
+            MINOR=$(echo "$LATEST" | cut -d. -f2)
+            PATCH=$(echo "$LATEST" | cut -d. -f3)
+            NEW_PATCH=$((PATCH + 1))
+            VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
+            echo "::notice::No version input; auto-bumping patch from crates.io latest $LATEST → $VERSION"
+          else
+            if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Version must be in format X.Y.Z (e.g., 0.1.31). Got: $VERSION"
+              exit 1
+            fi
           fi
 
           echo "version=$VERSION" >> $GITHUB_OUTPUT
@@ -98,7 +127,14 @@ jobs:
           sed "s/^version = \".*\"/version = \"$FDEV_VERSION\"/" crates/fdev/Cargo.toml > crates/fdev/Cargo.toml.tmp
           mv crates/fdev/Cargo.toml.tmp crates/fdev/Cargo.toml
 
-          sed "s/freenet = { path = \"..\/core\", version = \".*\" }/freenet = { path = \"..\/core\", version = \"$VERSION\" }/" crates/fdev/Cargo.toml > crates/fdev/Cargo.toml.tmp2
+          # Anchor on the version field, NOT a trailing ` }`. The line in
+          # crates/fdev/Cargo.toml carries a `, features = [...]` suffix so a
+          # pattern that requires the closing brace silently no-ops, leaving
+          # fdev's freenet-dep version pinned to the previous release (#4119).
+          # Mirror in `scripts/release.sh`; tests in
+          # `crates/fdev/tests/binstall_metadata.rs::release_sed_rewrite`
+          # (the `freenet_dep_*` cases) keep both copies in lockstep.
+          sed -E "s/(freenet = \\{ path = \"\\.\\.\\/core\", version = )\"[^\"]*\"/\\1\"$VERSION\"/" crates/fdev/Cargo.toml > crates/fdev/Cargo.toml.tmp2
           mv crates/fdev/Cargo.toml.tmp2 crates/fdev/Cargo.toml
 
           # The fdev crate version diverged from the freenet release tag, so
@@ -185,7 +221,10 @@ jobs:
 
       - name: Wait for PR to be merged
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Read-only polling; coalescing for consistency across release.yml
+          # so a future refactor that adds a write-action here can't silently
+          # fall back to GITHUB_TOKEN and break the cascade.
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
         run: |
           PR_NUMBER="${{ needs.update_versions.outputs.pr_number }}"
           # 60 min budget. Was 30 min when the release merge_group skipped
@@ -284,6 +323,12 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
+          # `token:` is what `git push` uses later in this job to push the
+          # `v$VERSION` tag. The tag push MUST use RELEASE_PAT (when set)
+          # so it fires the `tag` event that triggers `cross-compile.yml`.
+          # Tags pushed with `GITHUB_TOKEN` are suppressed by GitHub's
+          # anti-recursion safeguard (same root cause as #4118).
+          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Pull latest changes
         run: git pull origin main
@@ -291,7 +336,10 @@ jobs:
       - name: Generate release notes
         id: release_notes
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Read-only `gh release list` + `gh api`; coalescing for consistency
+          # so future event-emitting additions to this step don't silently
+          # regress to GITHUB_TOKEN.
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${{ needs.validate.outputs.version }}"
 
@@ -316,6 +364,12 @@ jobs:
       - name: Create and push tag
         if: ${{ !inputs.dry_run }}
         run: |
+          # `git tag -a` needs user.name/email. The `update_versions` job
+          # set these in its runner, but this job runs on a fresh runner
+          # where git config is empty — without these two lines the tag
+          # step fails with `fatal: empty ident name not allowed`.
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           VERSION="${{ needs.validate.outputs.version }}"
           git tag -a "v$VERSION" -m "Release v$VERSION"
           git push origin "v$VERSION"
@@ -324,7 +378,11 @@ jobs:
       - name: Create GitHub release
         if: ${{ !inputs.dry_run }}
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The release is created with `--draft`, so no `release.published`
+          # event fires here. Coalescing for defense-in-depth: if `--draft`
+          # is ever dropped, this site must already be on RELEASE_PAT or the
+          # cascade silently breaks.
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${{ needs.validate.outputs.version }}"
           gh release create "v$VERSION" \

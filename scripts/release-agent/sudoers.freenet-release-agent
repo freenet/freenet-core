@@ -1,0 +1,37 @@
+# Allow the release-agent to invoke the update script as root.
+#
+# IMPORTANT: per sudoers(5), the trailing `*` matches ANY characters
+# including whitespace — it is NOT restricted to a single non-whitespace
+# argument. The agent and script BOTH enforce that the version is a
+# strict `vX.Y.Z` semver string:
+#
+#   1. The agent parses the target with `semver::Version::parse` before
+#      forwarding (rejects whitespace, shell metacharacters, etc.) and
+#      passes it via `Command::arg` (separate execve slot, no shell).
+#   2. `gateway-auto-update.sh` re-validates the `--target-version`
+#      argument against a strict regex before using it (defense in depth
+#      for the case where the value is somehow attacker-controlled).
+#
+# Do NOT loosen either validation site without coordinating with this
+# sudoers entry. The `*` is here because sudoers globs don't support
+# regex; if a future sudo (>=1.9.10) lets us pin to a regex on the
+# argument, tighten it here.
+#
+# Relies on the default `secure_path` to prevent PATH-based shenanigans.
+# The `gateway-auto-update.sh` script MUST be owned by root and NOT
+# writable by `freenet-update`; the install script verifies this.
+#
+# Install path: /etc/sudoers.d/freenet-release-agent (mode 0440, owner root:root).
+# Validate with: visudo -c -f /etc/sudoers.d/freenet-release-agent
+freenet-update ALL=(root) NOPASSWD: /usr/local/bin/gateway-auto-update.sh --force --target-version *
+
+# Allow the release-agent to invoke the River announcement script as the
+# user who owns the room signing key + Freenet node (typically `ian` on
+# nova; absent on vega — that install simply omits this entry).
+#
+# The `*` after the script path is a sudoers wildcard matching the
+# entire message argv. As with --target-version above, the safety comes
+# from the agent's validation (length cap + NUL rejection in
+# server.rs::announce_river_handler) plus the script's own length check;
+# not from sudoers.
+freenet-update ALL=(ian) NOPASSWD: /usr/local/bin/announce-to-river.sh *

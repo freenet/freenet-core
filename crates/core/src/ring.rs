@@ -37,9 +37,8 @@ use crate::transport::TransportPublicKey;
 use crate::util::{Contains, time_source::InstantTimeSrc};
 use crate::{
     config::{GlobalExecutor, GlobalRng},
-    message::{NetMessage, NetMessageV1, Transaction},
+    message::Transaction,
     node::{self, EventLoopNotificationsSender, NodeConfig, OpManager, PeerId},
-    operations::{OpEnum, connect::ConnectOp},
     router::Router,
 };
 
@@ -749,10 +748,13 @@ impl Ring {
 
             let mut snapshot = ring.router.read().snapshot();
 
-            // Try to include connect forward estimator data
+            // Try to include connect forward estimator data.
+            // Drop the read guard immediately after `snapshot()` so unrelated
+            // consumers don't queue behind us for the four field assignments
+            // (clippy: `significant_drop_tightening`).
             if let Some(op_manager) = ring.upgrade_op_manager() {
-                let cfe = op_manager.connect_forward_estimator.read();
-                let (curve, data_range, events, adjustments) = cfe.snapshot();
+                let (curve, data_range, events, adjustments) =
+                    op_manager.connect_forward_estimator.read().snapshot();
                 snapshot.connect_forward_curve = Some(curve);
                 snapshot.connect_forward_data_range = Some(data_range);
                 snapshot.connect_forward_events = Some(events);
@@ -1053,10 +1055,11 @@ impl Ring {
                             SubscriptionRecoveryGuard::new(op_manager_clone.clone(), contract_key);
 
                         let instance_id = *contract_key.id();
-                        // Renewal driver (#1454): same task-per-tx machinery as
-                        // client-initiated SUBSCRIBE, with delivery returned to
-                        // this task instead of routed via `result_router_tx`.
-                        // `is_renewal=true` so the responder skips sending state.
+                        // Renewal driver: same machinery as
+                        // client-initiated SUBSCRIBE, with delivery
+                        // returned to this task instead of via
+                        // `result_router_tx`. `is_renewal=true` so
+                        // the responder skips sending state.
                         //
                         // Outer renewal-cycle timeout: cap each renewal task at
                         // a fraction of the renewal interval so a stuck driver
@@ -1458,7 +1461,9 @@ impl Ring {
     where
         for<'a> Location: From<&'a K>,
     {
-        let router = self.router.read();
+        // Router read-lock is only needed for the final `select_*` call;
+        // building the candidate list does not need it. Acquire it late to
+        // keep the critical section short (clippy: `significant_drop_tightening`).
         let target_location = Location::from(contract_id);
 
         let mut seen = HashSet::new();
@@ -1522,8 +1527,13 @@ impl Ring {
         // which may fail (especially in NAT scenarios without coordination).
         // It's better to return fewer candidates than unreachable ones.
 
-        let (selected, decision) =
-            router.select_k_best_peers_with_telemetry(candidates.iter(), target_location, k);
+        let (selected, decision) = self.router.read().select_k_best_peers_with_telemetry(
+            candidates.iter(),
+            target_location,
+            k,
+        );
+        // `selected` borrows from `candidates`, not from the router guard, so
+        // the read lock is released here before the tracing/collect below.
 
         tracing::debug!(
             target_location = %target_location.as_f64(),
@@ -2010,8 +2020,8 @@ impl Ring {
             // backoff state, and clears stale pending reservations for gateways.
             // Used during isolation recovery to ensure all gateways are retryable
             // when the node has zero ring connections (#3319).
-            // Wakes all tasks sleeping on gateway backoff (initial_join_procedure
-            // and any handle_aborted_op retries) so they can retry immediately.
+            // Wakes any task sleeping on gateway backoff
+            // (`initial_join_procedure`) so it can retry immediately.
             let reset_all_backoff = || {
                 self.reset_all_connection_backoff();
                 op_manager.gateway_backoff.lock().clear();
@@ -2436,8 +2446,8 @@ impl Ring {
                         pending_conn_adds.extend(target_locs.into_iter().take(allowed));
                     }
                 }
-                TopologyAdjustment::RemoveConnections(mut should_disconnect_peers) => {
-                    for peer in should_disconnect_peers.drain(..) {
+                TopologyAdjustment::RemoveConnections(should_disconnect_peers) => {
+                    for peer in should_disconnect_peers {
                         if let Some(addr) = peer.socket_addr() {
                             notifier
                                 .notifications_sender
@@ -2614,7 +2624,10 @@ impl Ring {
         );
 
         let query_target = {
-            let router = self.router.read();
+            // The router read-lock is only needed for the single
+            // `select_k_best_peers_with_telemetry` call; routing_candidates
+            // takes its own connection-manager locks. Acquire late to keep
+            // the critical section short (clippy: `significant_drop_tightening`).
             let num_connections = self.connection_manager.num_connections();
             tracing::debug!(
                 target_location = %ideal_location,
@@ -2636,8 +2649,11 @@ impl Ring {
                 false, // bypass readiness — this is a CONNECT for connection acquisition
             );
             let selected = if !candidates.is_empty() {
-                let (selected, _) =
-                    router.select_k_best_peers_with_telemetry(candidates.iter(), ideal_location, 1);
+                let (selected, _) = self.router.read().select_k_best_peers_with_telemetry(
+                    candidates.iter(),
+                    ideal_location,
+                    1,
+                );
                 selected.into_iter().next().cloned()
             } else {
                 None
@@ -2667,52 +2683,55 @@ impl Ring {
             target_location = %ideal_location,
             "Sending connect request via connection_maintenance"
         );
-        let ttl = self.max_hops_to_live.max(1).min(u8::MAX as usize) as u8;
-        let target_connections = self.connection_manager.min_connections;
 
-        let failed_addrs = self.connection_manager.recently_failed_addrs();
-        let connected_addrs = self.connection_manager.connected_peer_addrs();
-        tracing::debug!(
-            failed = failed_addrs.len(),
-            connected = connected_addrs.len(),
-            "acquire_new: pre-populating bloom filter with excluded peer addresses"
-        );
-        let mut exclude_addrs = failed_addrs;
-        exclude_addrs.extend(connected_addrs);
-        let (tx, op, msg) = ConnectOp::initiate_join_request(
-            joiner.clone(),
-            query_target.clone(),
-            ideal_location,
-            ttl,
-            target_connections,
-            op_manager.connect_forward_estimator.clone(),
-            &exclude_addrs,
-        );
+        // Driver computes ttl / target_connections / exclude_addrs internally
+        // (see start_client_connect at op_ctx_task.rs). acquire_new only
+        // needs to allocate the joiner tx, register it with
+        // live_tx_tracker, and spawn the driver task.
+        let _ = notifier;
+        let tx = Transaction::new::<crate::operations::connect::ConnectMsg>();
 
-        // Emit telemetry for initial connect request sent
-        if let Some(event) = NetEventLog::connect_request_sent(
-            &tx,
-            self,
-            ideal_location,
-            joiner,
-            query_target.clone(),
-            ttl,
-            true, // is_initial
-        ) {
-            self.register_events(Either::Left(event)).await;
-        }
+        let gateway_addr = match query_target.socket_addr() {
+            Some(addr) => addr,
+            None => {
+                tracing::warn!(
+                    target_location = %ideal_location,
+                    "acquire_new: selected query target has no socket address, skipping spawn"
+                );
+                return Ok(None);
+            }
+        };
 
-        if let Some(addr) = query_target.socket_addr() {
-            live_tx_tracker.add_transaction(addr, tx);
-        }
-        op_manager
-            .push(tx, OpEnum::Connect(Box::new(op)))
+        // Register tx with the live transaction tracker BEFORE spawning the
+        // driver. Otherwise the driver's first Response could land on the
+        // bypass before the registration completes, breaking the
+        // active_connect_transaction_count gauge that connection_maintenance
+        // uses to throttle concurrent acquisitions.
+        live_tx_tracker.add_transaction(gateway_addr, tx);
+
+        let op_manager_spawn = op_manager.clone();
+        let gateway = query_target;
+        let joiner_for_driver = joiner;
+        GlobalExecutor::spawn(async move {
+            if let Err(err) = crate::operations::connect::op_ctx_task::start_client_connect(
+                tx,
+                gateway,
+                gateway_addr,
+                &op_manager_spawn,
+                joiner_for_driver,
+                ideal_location,
+                None,
+            )
             .await
-            .map_err(|err| anyhow::anyhow!(err))?;
-        notifier
-            .notifications_sender
-            .send(Either::Left(NetMessage::V1(NetMessageV1::Connect(msg))))
-            .await?;
+            {
+                tracing::debug!(
+                    %tx,
+                    %err,
+                    "acquire_new: CONNECT driver completed with error"
+                );
+            }
+        });
+
         tracing::debug!(tx = %tx, "Connect request sent");
         Ok(Some(tx))
     }
@@ -3314,9 +3333,7 @@ pub(crate) enum RingError {
     #[error(transparent)]
     ConnError(#[from] Box<node::ConnectionError>),
     /// Retained for completeness; client_events maps it to a stable
-    /// `ClientError::EmptyRing`. Currently unconstructed since the
-    /// `request_get` legacy path that produced it was retired in the
-    /// #1454 sub-op GET migration.
+    /// `ClientError::EmptyRing`. Currently unconstructed.
     #[error("No ring connections found")]
     #[allow(dead_code)]
     EmptyRing,

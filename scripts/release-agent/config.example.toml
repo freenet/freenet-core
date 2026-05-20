@@ -1,0 +1,33 @@
+# Freenet release-agent configuration.
+#
+# Install path: /etc/freenet-release-agent/config.toml (mode 0640, owner
+# root:freenet-update).
+
+listen_addr = "127.0.0.1:9876"
+binary_path = "/usr/local/bin/freenet"
+update_command = "/usr/local/bin/gateway-auto-update.sh"
+hmac_secret_path = "/etc/freenet-release-agent/hmac.key"
+github_repo = "freenet/freenet-core"
+
+# Phase 1: dry-run is the safe default. The agent verifies HMAC, version-pin,
+# and rate limit, then logs "would have invoked the update script" without
+# spawning anything. Flip to `false` in Phase 2 once the workflow + auth path
+# have been validated against this gateway via shadow runs.
+dry_run = true
+
+# Reject a second update attempt within this window (default 10 minutes).
+rate_limit_seconds = 600
+
+# Reject requests whose `issued_at` timestamp is more than this many seconds
+# from the agent's clock. Defends against replay attacks.
+clock_skew_tolerance_seconds = 300
+
+# River announcement endpoint. Set both to enable `POST /announce/river`.
+# Leave blank (default) on gateways that don't have a Freenet node + room
+# signing key (e.g. vega) — the endpoint will return 503 there.
+#
+# `river_announce_user` is the local user under which `riverctl` runs;
+# they own the signing key and rooms.json. The sudoers entry must
+# authorize `freenet-update` to `sudo -u <user>` to this script.
+river_announce_command = ""
+river_announce_user = ""

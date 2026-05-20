@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use tokio::select;
 
 use common::{
-    allocate_test_node_block, base_node_test_config_with_rng, connect_ws_with_retry,
-    test_ip_for_node, test_node_config,
+    TEST_DELEGATE_CIPHER, TEST_DELEGATE_NONCE, allocate_test_node_block,
+    base_node_test_config_with_rng, connect_ws_with_retry, test_ip_for_node, test_node_config,
 };
 
 /// Message types matching test-delegate-creation's InboundAppMessage
@@ -141,8 +141,8 @@ async fn test_delegate_creation_e2e() -> anyhow::Result<()> {
             .send(ClientRequest::DelegateOp(
                 freenet_stdlib::client_api::DelegateRequest::RegisterDelegate {
                     delegate: parent_delegate.clone(),
-                    cipher: freenet_stdlib::client_api::DelegateRequest::DEFAULT_CIPHER,
-                    nonce: freenet_stdlib::client_api::DelegateRequest::DEFAULT_NONCE,
+                    cipher: TEST_DELEGATE_CIPHER,
+                    nonce: TEST_DELEGATE_NONCE,
                 },
             ))
             .await?;

@@ -317,7 +317,7 @@ pub struct InterestManager<T: TimeSource> {
     pending_removals: DashMap<PeerKey, Instant>,
 }
 
-impl<T: TimeSource> InterestManager<T> {
+impl<T: TimeSource + Sync> InterestManager<T> {
     /// Create a new interest manager with the given time source.
     pub fn new(time_source: T) -> Self {
         Self {
@@ -385,9 +385,15 @@ impl<T: TimeSource> InterestManager<T> {
         is_upstream: bool,
     ) -> bool {
         let now = self.time_source.now();
+        // Hold the `interested_peers` shard guard across `peer_contracts`
+        // insertion and `index_contract_hash` to keep the three writes
+        // atomic against a concurrent `remove_peer_interest` (which would
+        // otherwise observe a fully-removed peer and unindex a contract
+        // we're about to re-index, leaving a zombie entry).
+        // This intentionally undoes the PR #4129 `significant_drop_tightening`
+        // change for these four sites — see PR notes.
         let mut entry = self.interested_peers.entry(*contract).or_default();
         let is_new = !entry.contains_key(&peer);
-
         entry.insert(peer.clone(), PeerInterest::new(summary, is_upstream, now));
 
         // Maintain reverse index for O(1) peer disconnect cleanup
@@ -399,6 +405,7 @@ impl<T: TimeSource> InterestManager<T> {
         // Also index by hash for fast lookup
         self.index_contract_hash(contract);
 
+        drop(entry);
         is_new
     }
 
@@ -532,31 +539,50 @@ impl<T: TimeSource> InterestManager<T> {
     /// Remove all interests for a peer (called on peer disconnect).
     ///
     /// Uses the reverse index for O(1) lookup instead of O(contracts) scan.
-    /// Returns the number of contracts from which the peer was removed.
+    /// Returns the number of contracts from which the peer was actually removed.
+    ///
+    /// # Concurrency
+    ///
+    /// This is a *secondary-origin* remover: it starts from the
+    /// `peer_contracts` reverse index. It does NOT remove the
+    /// `peer_contracts` entry up front and then mutate `interested_peers`
+    /// directly — that older shape had a bidirectional-consistency race
+    /// (issue #4174): a concurrent `register_peer_interest(C, peer, ..)`
+    /// running between the up-front `peer_contracts.remove` and the
+    /// per-contract `interested_peers` mutation could re-insert `peer`
+    /// into both maps, after which this method would strip `peer` from
+    /// `interested_peers[C]` while leaving the reverse entry in
+    /// `peer_contracts[peer]` behind.
+    ///
+    /// Instead it merely *snapshots* the contract set and delegates each
+    /// per-contract cleanup to `remove_peer_interest`, which holds the
+    /// `interested_peers[contract]` shard guard across the matching
+    /// `peer_contracts` update — so every per-contract removal is
+    /// atomic and the invariant
+    /// `peer ∈ peer_contracts[peer] ⇔ peer ∈ interested_peers[contract]`
+    /// is preserved even under a concurrent re-registration.
     pub fn remove_all_peer_interests(&self, peer: &PeerKey) -> usize {
-        // Use the reverse index to find all contracts this peer is interested in
+        // Snapshot the contracts this peer is interested in WITHOUT
+        // removing the reverse-index entry — `remove_peer_interest`
+        // owns the `peer_contracts` update for each contract so the
+        // two maps stay consistent (issue #4174).
         let contracts: Vec<ContractKey> = self
             .peer_contracts
-            .remove(peer)
-            .map(|(_, set)| set.into_iter().collect())
+            .get(peer)
+            .map(|entry| entry.value().iter().cloned().collect())
             .unwrap_or_default();
 
-        let removed_count = contracts.len();
-
-        // Remove the peer from each contract's interest list
-        for contract in &contracts {
-            if let Some(mut entry) = self.interested_peers.get_mut(contract) {
-                entry.remove(peer);
-
-                // Clean up empty entries
-                if entry.is_empty() {
-                    drop(entry);
-                    self.interested_peers
-                        .remove_if(contract, |_, v| v.is_empty());
-                    self.cleanup_contract_if_no_interest(contract);
-                }
-            }
-        }
+        // Delegate each per-contract cleanup to `remove_peer_interest`,
+        // which atomically updates both `interested_peers` and
+        // `peer_contracts` under the contract's shard guard and also
+        // runs `cleanup_contract_if_no_interest`. Count only the
+        // contracts from which the peer was actually removed (a
+        // concurrent `remove_peer_interest` for the same pair may have
+        // already cleared an entry between the snapshot and here).
+        let removed_count = contracts
+            .iter()
+            .filter(|contract| self.remove_peer_interest(contract, peer))
+            .count();
 
         if removed_count > 0 {
             tracing::debug!(removed_count, "Removed peer interests on disconnect");
@@ -627,19 +653,30 @@ impl<T: TimeSource> InterestManager<T> {
     }
 
     /// Register local interest in a contract (for tracking our reasons).
+    ///
+    /// Currently unused inside the workspace but kept `pub` for external
+    /// consumers; same lock-across-index discipline as
+    /// [`Self::register_local_hosting`] applies so the method is not a
+    /// PR #4129–shaped race footgun.
     pub fn register_local_interest(&self, contract: &ContractKey) -> &Self {
-        self.local_interests.entry(*contract).or_default();
+        let entry = self.local_interests.entry(*contract).or_default();
         self.index_contract_hash(contract);
+        drop(entry);
         self
     }
 
     /// Register that we're hosting a contract locally.
     /// Returns true if this caused us to become interested (wasn't interested before).
     pub fn register_local_hosting(&self, contract: &ContractKey) -> bool {
+        // Hold the `local_interests` shard guard across `index_contract_hash`
+        // so a concurrent `remove_local_client` / `unregister_local_hosting`
+        // for the last reason cannot run its cleanup (unindex no-op) before
+        // we index, leaving a zombie entry in `contract_hash_index`.
         let mut entry = self.local_interests.entry(*contract).or_default();
         let was_interested = entry.is_interested();
         entry.hosting = true;
         self.index_contract_hash(contract);
+        drop(entry);
         !was_interested
     }
 
@@ -664,9 +701,14 @@ impl<T: TimeSource> InterestManager<T> {
     /// Add a local client subscription.
     /// Returns true if this caused us to become interested.
     pub fn add_local_client(&self, contract: &ContractKey) -> bool {
+        // Same lock-across-index discipline as `register_local_hosting`:
+        // hold the `local_interests` shard guard across
+        // `index_contract_hash` to prevent a concurrent
+        // `remove_local_client` from unindexing-before-we-index.
         let mut entry = self.local_interests.entry(*contract).or_default();
         let became_interested = entry.add_client();
         self.index_contract_hash(contract);
+        drop(entry);
         became_interested
     }
 
@@ -690,9 +732,11 @@ impl<T: TimeSource> InterestManager<T> {
     /// Add a downstream subscriber.
     /// Returns true if this caused us to become interested.
     pub fn add_downstream_subscriber(&self, contract: &ContractKey) -> bool {
+        // Same lock-across-index discipline as `register_local_hosting`.
         let mut entry = self.local_interests.entry(*contract).or_default();
         let became_interested = entry.add_downstream();
         self.index_contract_hash(contract);
+        drop(entry);
         became_interested
     }
 
@@ -1138,6 +1182,18 @@ mod tests {
             ContractInstanceId::new([seed; 32]),
             CodeHash::new([seed.wrapping_add(1); 32]),
         )
+    }
+
+    /// Like `make_contract_key` but with a `u32` seed for tests that need
+    /// many distinct contracts.
+    fn make_unique_contract_key(seed: u32) -> ContractKey {
+        let s = seed.to_le_bytes();
+        let mut id = [0u8; 32];
+        id[0..4].copy_from_slice(&s);
+        let mut code = [0u8; 32];
+        code[0..4].copy_from_slice(&s);
+        code[4] = 0xAB;
+        ContractKey::from_id_and_code(ContractInstanceId::new(id), CodeHash::new(code))
     }
 
     fn make_peer_key(_seed: u8) -> PeerKey {
@@ -2278,6 +2334,353 @@ mod tests {
             1,
             "Only 1 peer (B) should need syncing, not all {}",
             interested_peers.len()
+        );
+    }
+
+    /// Regression test for the PR #4129 add-then-index race in
+    /// `InterestManager`.
+    ///
+    /// Before the fix, `add_local_client` / `register_local_hosting` /
+    /// `add_downstream_subscriber` / `register_peer_interest` /
+    /// `register_local_interest` released the `local_interests` (or
+    /// `interested_peers`) shard guard before calling
+    /// `index_contract_hash`. A concurrent `remove_*` for the same
+    /// contract could then acquire the guard, decrement the last reason,
+    /// run `cleanup_contract_if_no_interest` → `unindex_contract_hash`
+    /// (a no-op because we haven't indexed yet), and the deferred index
+    /// would leak a zombie entry into `contract_hash_index`.
+    ///
+    /// Two properties make this race awkward to test:
+    ///
+    /// 1. The zombie only PERSISTS if the contract sees no further
+    ///    activity — a later add re-establishes backing interest, a
+    ///    later remove's cleanup unindexes it. A stress test that
+    ///    hammers one shared contract therefore continuously heals it.
+    /// 2. The racy window (`local_interests` guard drop → deferred
+    ///    `index_contract_hash`) is a handful of instructions wide.
+    ///
+    /// This test addresses both: each ROUND uses a fresh contract and
+    /// runs exactly ONE add racing exactly ONE remove. A barrier
+    /// releases the adder and remover simultaneously to maximize
+    /// overlap. Because there is only one add and one remove, nothing
+    /// can heal a zombie once created — it persists to the post-round
+    /// check, which reads the three maps directly and calls no
+    /// `remove_*` (which would trigger cleanup and heal it).
+    ///
+    /// Each of the four real add/remove PAIRS is exercised round-robin:
+    /// `register_peer_interest`/`remove_peer_interest`,
+    /// `register_local_hosting`/`unregister_local_hosting`,
+    /// `add_local_client`/`remove_local_client`,
+    /// `add_downstream_subscriber`/`remove_downstream_subscriber`. The
+    /// fifth fixed site, `register_local_interest`, gets the same
+    /// lock-across-index discipline but is NOT raced here: it is dead
+    /// code (no workspace caller) with no symmetric remove operation, so
+    /// there is no natural pair to race it against. It is structurally
+    /// identical to the tested `register_local_hosting` and is guarded
+    /// by code review plus the `.claude/rules/ring.md` rule entry.
+    ///
+    /// The fix holds the shard guard across `index_contract_hash`, so
+    /// the racy interleaving cannot occur and no round produces a
+    /// zombie.
+    #[test]
+    fn test_concurrent_add_remove_preserves_hash_index_invariant() {
+        use std::sync::{Arc, Barrier, Mutex};
+        use std::thread;
+
+        let (manager, _time) = make_manager();
+        let manager = Arc::new(manager);
+
+        let rounds: u32 = 120_000;
+
+        // Per-round spec shared with the two worker threads:
+        // (contract, which-pair, stop-sentinel).
+        let spec: Arc<Mutex<(ContractKey, u32, bool)>> =
+            Arc::new(Mutex::new((make_unique_contract_key(0), 0, false)));
+        // 3 parties: adder, remover, main.
+        let round_start = Arc::new(Barrier::new(3));
+        let round_end = Arc::new(Barrier::new(3));
+
+        // Single shared peer key for the peer-interest pair. The remover
+        // drains by enumerating `interested_peers` so it needs no key.
+        let peer = make_peer_key(0);
+
+        let adder = {
+            let manager = Arc::clone(&manager);
+            let spec = Arc::clone(&spec);
+            let round_start = Arc::clone(&round_start);
+            let round_end = Arc::clone(&round_end);
+            let peer = peer.clone();
+            thread::spawn(move || {
+                loop {
+                    round_start.wait();
+                    let (contract, which, stop) = *spec.lock().unwrap();
+                    if stop {
+                        break;
+                    }
+                    match which {
+                        0 => {
+                            manager.register_peer_interest(&contract, peer.clone(), None, false);
+                        }
+                        1 => {
+                            manager.register_local_hosting(&contract);
+                        }
+                        2 => {
+                            manager.add_local_client(&contract);
+                        }
+                        _ => {
+                            manager.add_downstream_subscriber(&contract);
+                        }
+                    }
+                    round_end.wait();
+                }
+            })
+        };
+
+        let remover = {
+            let manager = Arc::clone(&manager);
+            let spec = Arc::clone(&spec);
+            let round_start = Arc::clone(&round_start);
+            let round_end = Arc::clone(&round_end);
+            thread::spawn(move || {
+                loop {
+                    round_start.wait();
+                    let (contract, which, stop) = *spec.lock().unwrap();
+                    if stop {
+                        break;
+                    }
+                    match which {
+                        0 => {
+                            let peers: Vec<PeerKey> = manager
+                                .interested_peers
+                                .get(&contract)
+                                .map(|e| e.keys().cloned().collect())
+                                .unwrap_or_default();
+                            for p in peers {
+                                manager.remove_peer_interest(&contract, &p);
+                            }
+                        }
+                        1 => {
+                            manager.unregister_local_hosting(&contract);
+                        }
+                        2 => {
+                            manager.remove_local_client(&contract);
+                        }
+                        _ => {
+                            manager.remove_downstream_subscriber(&contract);
+                        }
+                    }
+                    round_end.wait();
+                }
+            })
+        };
+
+        let mut zombies: Vec<(u32, u32)> = Vec::new();
+        for round in 0..rounds {
+            let contract = make_unique_contract_key(round);
+            let which = round % 4;
+            *spec.lock().unwrap() = (contract, which, false);
+
+            round_start.wait(); // release adder + remover simultaneously
+            round_end.wait(); // both have completed their single op
+
+            // Activity on `contract` has fully stopped — exactly one add
+            // and one remove ran, nothing can heal a zombie now. Check
+            // the shard-consistency invariant directly, calling no
+            // `remove_*` (which would trigger cleanup). A zombie =
+            // indexed in `contract_hash_index`, absent from BOTH
+            // `local_interests` and `interested_peers`.
+            // `lookup_by_hash` returns every contract sharing the 32-bit
+            // hash, so check membership of THIS contract specifically —
+            // `!is_empty()` would false-positive on a hash collision.
+            let in_chi = manager
+                .lookup_by_hash(contract_hash(&contract))
+                .contains(&contract);
+            let in_li = manager.local_interests.contains_key(&contract);
+            let in_ip = manager.interested_peers.contains_key(&contract);
+            if in_chi && !in_li && !in_ip {
+                zombies.push((round, which));
+            }
+        }
+
+        // Signal both workers to exit, then release them off round_start.
+        *spec.lock().unwrap() = (make_unique_contract_key(0), 0, true);
+        round_start.wait();
+        adder.join().unwrap();
+        remover.join().unwrap();
+
+        assert!(
+            zombies.is_empty(),
+            "{} of {rounds} single-add/single-remove rounds leaked a \
+             zombie entry into contract_hash_index (no backing \
+             local_interests or interested_peers). This is the PR #4129 \
+             race that PR #4171 fixes. First offenders (round, pair): \
+             {:?}",
+            zombies.len(),
+            &zombies[..zombies.len().min(10)]
+        );
+    }
+
+    /// Regression test for issue #4174: `remove_all_peer_interests` must
+    /// preserve the bidirectional invariant
+    /// `peer ∈ peer_contracts[peer] ⇔ peer ∈ interested_peers[contract]`
+    /// when racing against a concurrent `register_peer_interest`.
+    ///
+    /// The bug: the old `remove_all_peer_interests` removed the
+    /// `peer_contracts[peer]` entry up front, captured a snapshot of the
+    /// contract set, then iterated that snapshot and mutated
+    /// `interested_peers` directly. A concurrent
+    /// `register_peer_interest(C, peer, ..)` for a contract `C` that is
+    /// already in the snapshot — running in the window AFTER the up-front
+    /// `peer_contracts.remove` but BEFORE the per-contract
+    /// `interested_peers[C]` mutation — re-inserts `peer` into BOTH maps.
+    /// `remove_all_peer_interests` then strips `peer` from
+    /// `interested_peers[C]` (it still has `C` in its stale snapshot) but
+    /// the freshly-re-created reverse entry in `peer_contracts[peer]`
+    /// survives — leaving a one-sided "ghost": `peer ∈ peer_contracts`
+    /// while `peer ∉ interested_peers[C]`.
+    ///
+    /// The fix delegates per-contract cleanup to `remove_peer_interest`,
+    /// which holds the `interested_peers[contract]` shard guard across
+    /// the `peer_contracts` update so each removal is atomic against a
+    /// concurrent `register_peer_interest`.
+    ///
+    /// Test design (mirrors
+    /// `test_concurrent_add_remove_preserves_hash_index_invariant`):
+    /// barrier-synced rounds with a fresh contract per round. CRITICAL —
+    /// to reproduce the race the contract must already be in the peer's
+    /// `peer_contracts` set when `remove_all_peer_interests` snapshots
+    /// it, so each round PRE-REGISTERS the contract on the main thread
+    /// before opening the barrier. The two workers then race a
+    /// re-`register_peer_interest` (refresh) of that already-registered
+    /// contract against `remove_all_peer_interests`. After each round
+    /// all activity on the contract has stopped, so the bidirectional
+    /// invariant must hold regardless of interleaving — any violation is
+    /// a real ghost left behind by the race.
+    ///
+    /// Sensitivity: with the fix reverted to the racy body, this test
+    /// caught the race in 10/10 runs of 200_000 rounds each (the
+    /// pre-registration is what makes it reliable — without it the
+    /// snapshot never contains the raced contract and the test cannot
+    /// see the bug). With the fix applied it passes 10/10.
+    #[test]
+    fn test_concurrent_remove_all_preserves_bidirectional_invariant() {
+        use std::sync::{Arc, Barrier, Mutex};
+        use std::thread;
+
+        let (manager, _time) = make_manager();
+        let manager = Arc::new(manager);
+
+        let rounds: u32 = 200_000;
+
+        // Per-round spec shared with the two worker threads:
+        // (contract, stop-sentinel).
+        let spec: Arc<Mutex<(ContractKey, bool)>> =
+            Arc::new(Mutex::new((make_unique_contract_key(0), false)));
+        // 3 parties: registrar, remover, main.
+        let round_start = Arc::new(Barrier::new(3));
+        let round_end = Arc::new(Barrier::new(3));
+
+        // Single shared peer key raced across every round.
+        let peer = make_peer_key(0);
+
+        // Registrar: re-registers (refreshes) the peer's interest in the
+        // round's contract — which the main thread has already
+        // registered before the barrier opened.
+        let registrar = {
+            let manager = Arc::clone(&manager);
+            let spec = Arc::clone(&spec);
+            let round_start = Arc::clone(&round_start);
+            let round_end = Arc::clone(&round_end);
+            let peer = peer.clone();
+            thread::spawn(move || {
+                loop {
+                    round_start.wait();
+                    let (contract, stop) = *spec.lock().unwrap();
+                    if stop {
+                        break;
+                    }
+                    manager.register_peer_interest(&contract, peer.clone(), None, false);
+                    round_end.wait();
+                }
+            })
+        };
+
+        // Remover: wipes ALL of the peer's interests, racing the
+        // registrar above.
+        let remover = {
+            let manager = Arc::clone(&manager);
+            let spec = Arc::clone(&spec);
+            let round_start = Arc::clone(&round_start);
+            let round_end = Arc::clone(&round_end);
+            let peer = peer.clone();
+            thread::spawn(move || {
+                loop {
+                    round_start.wait();
+                    let (_contract, stop) = *spec.lock().unwrap();
+                    if stop {
+                        break;
+                    }
+                    manager.remove_all_peer_interests(&peer);
+                    round_end.wait();
+                }
+            })
+        };
+
+        let mut ghosts: Vec<u32> = Vec::new();
+        for round in 0..rounds {
+            let contract = make_unique_contract_key(round);
+
+            // Pre-register the contract BEFORE opening the barrier so it
+            // is guaranteed to be in `remove_all_peer_interests`'s
+            // snapshot — this is what makes the #4174 race observable.
+            manager.register_peer_interest(&contract, peer.clone(), None, false);
+
+            *spec.lock().unwrap() = (contract, false);
+
+            round_start.wait(); // release registrar + remover simultaneously
+            round_end.wait(); // both have completed their single op
+
+            // Activity on `contract` has fully stopped. Check the
+            // bidirectional invariant directly, without calling any
+            // `remove_*` (which would trigger cleanup and mask a
+            // ghost). A ghost = `peer` present on exactly one side:
+            //   peer ∈ peer_contracts[peer]  XOR  peer ∈ interested_peers[contract]
+            let in_peer_contracts = manager
+                .peer_contracts
+                .get(&peer)
+                .map(|e| e.value().contains(&contract))
+                .unwrap_or(false);
+            let in_interested_peers = manager
+                .interested_peers
+                .get(&contract)
+                .map(|e| e.contains_key(&peer))
+                .unwrap_or(false);
+            if in_peer_contracts != in_interested_peers {
+                ghosts.push(round);
+            }
+
+            // Clean slate for the next round: if the registrar won the
+            // race the contract may still be registered. Drop it so the
+            // peer's contract set does not grow unboundedly (which would
+            // slow every later `remove_all_peer_interests` snapshot).
+            manager.remove_peer_interest(&contract, &peer);
+        }
+
+        // Signal both workers to exit, then release them off round_start.
+        *spec.lock().unwrap() = (make_unique_contract_key(0), true);
+        round_start.wait();
+        registrar.join().unwrap();
+        remover.join().unwrap();
+
+        assert!(
+            ghosts.is_empty(),
+            "{} of {rounds} register/remove-all rounds left a one-sided \
+             ghost: `peer` present in exactly one of peer_contracts / \
+             interested_peers for the round's contract. This is the \
+             issue #4174 bidirectional-consistency race. First offending \
+             rounds: {:?}",
+            ghosts.len(),
+            &ghosts[..ghosts.len().min(10)]
         );
     }
 }

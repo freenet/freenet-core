@@ -674,8 +674,8 @@ pub(crate) enum NodeEvent {
     /// Send an arbitrary `NetMessage` to a specific peer without registering
     /// a `pending_op_results` callback.
     ///
-    /// Use case (#1454 phase 2c): the CONNECT task-per-tx originator driver
-    /// holds an active multi-reply receiver for its transaction. When the
+    /// Use case: the CONNECT originator driver holds an active
+    /// multi-reply receiver for its transaction. When the
     /// joiner's hole-punch to an acceptor fails, it must emit
     /// `ConnectMsg::ConnectFailed` upstream so the relay chain can re-route.
     /// Routing that emission through `op_execution_sender`

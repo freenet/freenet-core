@@ -340,11 +340,10 @@ impl TestNodeBuilder {
         let ring = MockRing::new(own_location.clone(), self.candidates);
         let storage = MockStateStorage::new();
 
-        let mut executor = Executor::<MockRuntime, MockStateStorage>::new_mock_in_memory(
-            "test", storage, None, None,
-        )
-        .await
-        .expect("create test executor");
+        let mut executor =
+            Executor::<MockRuntime, MockStateStorage>::new_mock_in_memory("test", storage, None)
+                .await
+                .expect("create test executor");
 
         // Pre-load contracts
         for (contract, state) in self.contracts {

@@ -1,15 +1,24 @@
+//! UPDATE operation: applies a state change to a contract and
+//! broadcasts to subscribers.
+//!
+//! Every UPDATE wire variant dispatches to a driver —
+//! `op_ctx_task::start_client_update`, `start_relay_request_update`,
+//! `start_relay_broadcast_to`, `start_relay_request_update_streaming`,
+//! and `start_relay_broadcast_to_streaming`. The wire-format types,
+//! `BroadcastDedupCache`, `update_contract`, the log helpers, and
+//! the post-merge propagation helpers survive here because the
+//! drivers consume them.
+
 pub(crate) mod op_ctx_task;
 
-use freenet_stdlib::client_api::{ErrorKind, HostResponse};
 use freenet_stdlib::prelude::*;
 
 pub(crate) use self::messages::{BroadcastStreamingPayload, UpdateMsg, UpdateStreamingPayload};
-use super::{OpError, OpOutcome};
+use super::OpError;
 use crate::contract::{ContractHandlerEvent, ExecutorError, StoreResponse};
 use crate::message::{NodeEvent, Transaction};
-use crate::node::IsOperationCompleted;
-use crate::ring::{Location, PeerKeyLocation};
-use crate::{client_events::HostResult, node::OpManager};
+use crate::node::OpManager;
+use crate::ring::PeerKeyLocation;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 
@@ -114,168 +123,11 @@ pub(crate) struct BroadcastTargetResult {
     pub skipped_sender: usize,
 }
 
-// `UpdateOp` and its inherent impl + `IsOperationCompleted` impl
-// became orphan after #1454 phase 5 final retired the
-// `OpEnum::Update` carrier and the `ops.update` DashMap. The struct
-// (and its helper methods / `UpdateStats` / `UpdateState` /
-// `FinishedData`) are kept under `#[allow(dead_code)]` so the inline
-// tests in this module stay green; phase 6 will delete the carrier
-// and migrate the surviving outcome / failure-routing tests to the
-// task-per-tx driver tests in `op_ctx_task.rs`.
-#[allow(dead_code)]
-pub(crate) struct UpdateOp {
-    pub id: Transaction,
-    pub(crate) state: Option<UpdateState>,
-    pub(crate) stats: Option<UpdateStats>,
-    /// The address we received this operation's message from.
-    /// Used for connection-based routing: responses are sent back to this address.
-    pub(crate) upstream_addr: Option<std::net::SocketAddr>,
-}
-
-#[allow(dead_code)]
-impl UpdateOp {
-    pub fn id(&self) -> &Transaction {
-        &self.id
-    }
-
-    pub fn outcome(&self) -> OpOutcome<'_> {
-        if self.finalized() {
-            if let Some(UpdateStats {
-                target: Some(ref target),
-                contract_location: Some(loc),
-            }) = self.stats
-            {
-                return OpOutcome::ContractOpSuccessUntimed {
-                    target_peer: target,
-                    contract_location: loc,
-                };
-            }
-            return OpOutcome::Irrelevant;
-        }
-        // Not completed — if we have stats with target+location, report as failure
-        if let Some(UpdateStats {
-            target: Some(ref target),
-            contract_location: Some(loc),
-        }) = self.stats
-        {
-            OpOutcome::ContractOpFailure {
-                target_peer: target,
-                contract_location: loc,
-            }
-        } else {
-            OpOutcome::Incomplete
-        }
-    }
-
-    /// Returns true if this UPDATE was initiated by a local client (not forwarded from a peer).
-    pub(crate) fn is_client_initiated(&self) -> bool {
-        self.upstream_addr.is_none()
-    }
-
-    /// Extract routing failure info for timeout reporting.
-    pub(crate) fn failure_routing_info(&self) -> Option<(PeerKeyLocation, Location)> {
-        match &self.stats {
-            Some(UpdateStats {
-                target: Some(target),
-                contract_location: Some(loc),
-            }) => Some((target.clone(), *loc)),
-            _ => None,
-        }
-    }
-
-    pub fn finalized(&self) -> bool {
-        matches!(self.state, None | Some(UpdateState::Finished(_)))
-    }
-
-    /// Get the next hop address for hop-by-hop routing.
-    /// For UPDATE, this extracts the socket address from the stats.target field.
-    pub fn get_next_hop_addr(&self) -> Option<std::net::SocketAddr> {
-        self.stats
-            .as_ref()
-            .and_then(|s| s.target.as_ref())
-            .and_then(|t| t.socket_addr())
-    }
-
-    pub(super) fn to_host_result(&self) -> HostResult {
-        if let Some(UpdateState::Finished(data)) = &self.state {
-            let (key, summary) = (&data.key, &data.summary);
-            tracing::debug!(
-                "Creating UpdateResponse for transaction {} with key {} and summary length {}",
-                self.id,
-                key,
-                summary.size()
-            );
-            Ok(HostResponse::ContractResponse(
-                freenet_stdlib::client_api::ContractResponse::UpdateResponse {
-                    key: *key,
-                    summary: summary.clone(),
-                },
-            ))
-        } else {
-            tracing::error!(
-                tx = %self.id,
-                state = ?self.state,
-                phase = "error",
-                "UPDATE operation failed to finish successfully"
-            );
-            Err(ErrorKind::OperationError {
-                cause: "update didn't finish successfully".into(),
-            }
-            .into())
-        }
-    }
-
-    /// Handle aborted connections by failing the operation immediately.
-    ///
-    /// UPDATE operations don't have alternative routes to try. When the connection
-    /// drops, we notify the client of the failure so they can retry.
-    pub(crate) async fn handle_abort(self, op_manager: &OpManager) -> Result<(), OpError> {
-        tracing::warn!(
-            tx = %self.id,
-            "Update operation aborted due to connection failure"
-        );
-
-        // Create an error result to notify the client
-        let error_result: crate::client_events::HostResult =
-            Err(freenet_stdlib::client_api::ErrorKind::OperationError {
-                cause: "Update operation failed: peer connection dropped".into(),
-            }
-            .into());
-
-        // Send the error to the client via the result router.
-        // Use try_send to avoid blocking the event loop (see channel-safety.md).
-        if let Err(err) = op_manager
-            .result_router_tx
-            .try_send((self.id, error_result))
-        {
-            tracing::error!(
-                tx = %self.id,
-                error = %err,
-                "Failed to send abort notification to client \
-                 (result router channel full or closed)"
-            );
-        }
-
-        // Mark the operation as completed so it's removed from tracking
-        op_manager.completed(self.id);
-        Ok(())
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) struct UpdateStats {
-    pub(crate) target: Option<PeerKeyLocation>,
-    pub(crate) contract_location: Option<Location>,
-}
-
 pub(crate) struct UpdateExecution {
     pub(crate) value: WrappedState,
     pub(crate) summary: StateSummary<'static>,
     pub(crate) changed: bool,
 }
-
-// `UpdateResult` was the `Operation::Result` associated type for the
-// retired `impl Operation for UpdateOp`. Deleted in #1454 phase 5 final.
 
 /// Cooldown before retrying a self-healing contract fetch, in milliseconds.
 /// 5 minutes: long enough to avoid hammering peers if the contract genuinely
@@ -335,7 +187,7 @@ impl OpManager {
             "Auto-fetching contract from UPDATE sender (missing parameters)"
         );
 
-        // Spawn a targeted task-per-tx GET. The driver targets `sender_pkl`
+        // Spawn a targeted driver GET. The driver targets `sender_pkl`
         // for its first hop and falls back to `k_closest_potentially_hosting`
         // for any retries. Fire-and-forget — the side effect (contract cached
         // locally via `cache_contract_locally`) is what callers depend on.
@@ -343,27 +195,14 @@ impl OpManager {
         let _tx = super::get::op_ctx_task::start_targeted_sub_op_get(self, instance_id, sender_pkl);
     }
 
-    /// Get the list of network subscribers to broadcast an UPDATE to.
+    /// Resolve the set of peers to broadcast a state update to.
     ///
-    /// **Architecture Note (Issue #2075):**
-    /// This function returns only **network peer** subscribers, not local client subscriptions.
-    /// Local clients receive updates through a separate path via the contract executor's
-    /// `update_notifications` channels (see `send_update_notification` in runtime.rs).
-    ///
-    /// **Parameter `sender`:**
-    /// The address of the peer that initiated or forwarded this UPDATE to us.
-    /// - Used to filter out the sender from broadcast targets (avoid echo)
-    /// - When sender equals our own address (local UPDATE initiation), we include ourselves
-    ///   in neighbor hosting targets if we're hosting the contract
-    ///
-    /// # Hybrid Architecture (2026-01 Refactor)
-    ///
-    /// Updates are propagated via TWO sources:
-    /// 1. Neighbor hosting: peers who have announced they host this contract (fast, local knowledge)
-    /// 2. Interest manager: peers who have expressed interest via the Interest/Summary protocol
-    ///
-    /// This hybrid approach ensures updates reach all interested peers even if HostingAnnounce
-    /// messages haven't fully propagated yet.
+    /// Combines the proximity neighbor cache (peers who announced they seed
+    /// the contract) with the interest manager (peers who expressed interest
+    /// via the protocol). Skips the sender (to avoid echo) and this node
+    /// (unless we are the local originator). Returns skip-reason counters
+    /// alongside the resolved targets for broadcast delivery diagnostics
+    /// (issue #3046).
     pub(crate) fn get_broadcast_targets_update(
         &self,
         key: &ContractKey,
@@ -381,20 +220,16 @@ impl OpManager {
         let mut skipped_sender: usize = 0;
 
         // Source 1: Proximity cache (peers who announced they seed this contract)
-        // Returns TransportPublicKey (stable identity), resolve to PeerKeyLocation via pub_key lookup
         let proximity_pub_keys = self.neighbor_hosting.neighbors_with_contract(key);
         let proximity_found = proximity_pub_keys.len();
 
         for pub_key in proximity_pub_keys {
-            // Resolve pub_key to PeerKeyLocation (which includes current address)
             if let Some(pkl) = self.ring.connection_manager.get_peer_by_pub_key(&pub_key) {
-                // Skip sender to avoid echo (unless we're the originator)
                 if let Some(pkl_addr) = pkl.socket_addr() {
                     if &pkl_addr == sender && !is_local_update_initiator {
                         skipped_sender += 1;
                         continue;
                     }
-                    // Skip ourselves if not local originator
                     if !is_local_update_initiator && self_addr.as_ref() == Some(&pkl_addr) {
                         skipped_self += 1;
                         continue;
@@ -418,19 +253,16 @@ impl OpManager {
         let interest_found = interested_peers.len();
 
         for (peer_key, _interest) in interested_peers {
-            // Look up peer by public key
             if let Some(pkl) = self
                 .ring
                 .connection_manager
                 .get_peer_by_pub_key(&peer_key.0)
             {
-                // Skip sender to avoid echo
                 if let Some(pkl_addr) = pkl.socket_addr() {
                     if &pkl_addr == sender && !is_local_update_initiator {
                         skipped_sender += 1;
                         continue;
                     }
-                    // Skip ourselves
                     if !is_local_update_initiator && self_addr.as_ref() == Some(&pkl_addr) {
                         skipped_self += 1;
                         continue;
@@ -449,11 +281,9 @@ impl OpManager {
             }
         }
 
-        // Sort targets for deterministic iteration order
         let mut result: Vec<PeerKeyLocation> = targets.into_iter().collect();
         result.sort();
 
-        // Trace update propagation for debugging
         if !result.is_empty() {
             tracing::info!(
                 contract = %format!("{:.8}", key),
@@ -494,22 +324,13 @@ impl OpManager {
     }
 }
 
-/// Logs the failure outcome of `update_contract`.
+/// Logs the outcome of an `update_contract` failure with severity dependent on
+/// whether the rejection is a benign stale-state rejection (INFO) or a real
+/// failure (ERROR). See PR #3914.
 ///
-/// Splits into two cases (issue #3914):
-///
-/// 1. The contract WASM merge function rejected the incoming state with a
-///    typed `InvalidUpdate{,WithInfo}` error (e.g. "New state version 100
-///    must be higher than current version 100"). On production gateways
-///    this fires on every re-broadcast that misses the 60s dedup cache,
-///    generating 80-130 ERROR/hr per gateway with no actionable signal.
-///    Logged at INFO with `event="merge_rejected_invalid_update"`.
-///
-/// 2. Anything else (missing contract code, storage error, OOG, WASM trap,
-///    timeout, internal bug) keeps the original ERROR level. The
-///    discriminator is `is_invalid_update_rejection`, which matches the
-///    contract-side `InvalidUpdate{,WithInfo}` cause string EXCLUSIVELY,
-///    so runtime failures like OOG remain visible to operators.
+/// The narrow predicate `is_invalid_update_rejection` matches the contract
+/// WASM's typed "InvalidUpdate{,WithInfo}" rejection EXCLUSIVELY — OOG /
+/// traps / timeouts stay at ERROR.
 fn log_update_contract_failure(key: &ContractKey, err: &ExecutorError) {
     if err.is_invalid_update_rejection() {
         tracing::info!(
@@ -629,7 +450,7 @@ pub(crate) async fn update_contract(
             new_value: Ok(new_val),
             state_changed,
         }) => {
-            // Invariant: after a successful UPDATE, the resulting state must be non-empty.
+            // Invariant: after a successful UPDATE the resulting state must be non-empty.
             // A successful UpdateResponse with an empty value indicates a contract handler bug.
             debug_assert!(
                 new_val.size() > 0,
@@ -743,13 +564,6 @@ pub(crate) async fn update_contract(
             tracing::error!(event = ?other, contract = %key, phase = "error", "Unexpected event from contract handler during update");
             Err(OpError::UnexpectedOpState)
         }
-    }
-}
-
-#[allow(dead_code)]
-impl IsOperationCompleted for UpdateOp {
-    fn is_completed(&self) -> bool {
-        matches!(self.state, Some(UpdateState::Finished(_)))
     }
 }
 
@@ -1078,378 +892,11 @@ mod messages {
     }
 }
 
-// State machine for UPDATE operations.
-//
-// # Important: Updates are Fire-and-Forget
-//
-// Updates spread through the subscription tree like a virus - there is no acknowledgment
-// or completion signal that propagates back. When a node receives an UPDATE:
-// 1. It applies the update locally
-// 2. It broadcasts to its downstream subscribers (if any)
-// 3. It does NOT wait for or expect any response from downstream
-//
-// ── Type-state data structs ──────────────────────────────────────────────
-//
-// Each state in the UPDATE state machine is a named struct with typed
-// transition methods.  This gives compile-time guarantees:
-//
-//   ReceivedRequest ── (next state depends on whether contract is found locally)
-//   PrepareRequest ── into_finished()  ──► Finished
-//
-// Invalid transitions (e.g. Finished → ReceivedRequest) are unrepresentable
-// because the target type simply has no such method.
-
-/// Data for the Finished state: update was applied locally.
-///
-/// The `Finished` state only indicates that the LOCAL update was applied successfully.
-/// It does NOT mean all subscribers have received the update - that's unknowable.
-#[allow(dead_code)]
-#[derive(Debug)]
-pub struct FinishedData {
-    pub key: ContractKey,
-    pub summary: StateSummary<'static>,
-}
-
-// `PrepareRequestData` and `UpdateState::PrepareRequest` were retired in
-// #1454 phase 5 final together with `start_op` / `request_update`.
-//
-// `UpdateState::ReceivedRequest` and `UpdateState::Finished` survive
-// because the legacy `UpdateOp` carrier (kept until commit 4 deletes
-// `OpEnum::Update`) references them via `is_completed()` / `outcome()`
-// / `to_host_result()` and the inline test helpers.
-
-// ── State enum (wraps the typed structs) ─────────────────────────────────
-
-#[allow(dead_code)]
-#[derive(Debug)]
-pub enum UpdateState {
-    /// Initial state when receiving an update request from another peer.
-    ReceivedRequest,
-    /// The update was applied locally.
-    Finished(FinishedData),
-}
-
 #[cfg(test)]
 #[allow(clippy::wildcard_enum_match_arm)]
 mod tests {
     use super::*;
-    use crate::operations::OpOutcome;
     use crate::operations::test_utils::make_contract_key;
-
-    fn make_update_op(state: Option<UpdateState>, stats: Option<UpdateStats>) -> UpdateOp {
-        UpdateOp {
-            id: Transaction::new::<UpdateMsg>(),
-            state,
-            stats,
-            upstream_addr: None,
-        }
-    }
-
-    #[test]
-    fn is_client_initiated_true_when_no_upstream() {
-        let op = make_update_op(None, None);
-        assert!(op.is_client_initiated());
-    }
-
-    #[test]
-    fn is_client_initiated_false_when_forwarded() {
-        let op = UpdateOp {
-            id: Transaction::new::<UpdateMsg>(),
-            state: None,
-            stats: None,
-            upstream_addr: Some("127.0.0.1:12345".parse().unwrap()),
-        };
-        assert!(!op.is_client_initiated());
-    }
-
-    #[test]
-    fn update_op_outcome_success_untimed_when_finalized_with_full_stats() {
-        let target = PeerKeyLocation::random();
-        let loc = Location::random();
-        let op = make_update_op(
-            Some(UpdateState::Finished(FinishedData {
-                key: make_contract_key(1),
-                summary: StateSummary::from(vec![1u8]),
-            })),
-            Some(UpdateStats {
-                target: Some(target.clone()),
-                contract_location: Some(loc),
-            }),
-        );
-        match op.outcome() {
-            OpOutcome::ContractOpSuccessUntimed {
-                target_peer,
-                contract_location,
-            } => {
-                assert_eq!(*target_peer, target);
-                assert_eq!(contract_location, loc);
-            }
-            OpOutcome::ContractOpSuccess { .. }
-            | OpOutcome::ContractOpFailure { .. }
-            | OpOutcome::Incomplete
-            | OpOutcome::Irrelevant => {
-                panic!("Expected ContractOpSuccessUntimed for finalized update with full stats")
-            }
-        }
-    }
-
-    #[test]
-    fn update_op_outcome_irrelevant_when_finalized_without_stats() {
-        let op = make_update_op(
-            Some(UpdateState::Finished(FinishedData {
-                key: make_contract_key(1),
-                summary: StateSummary::from(vec![1u8]),
-            })),
-            None,
-        );
-        assert!(matches!(op.outcome(), OpOutcome::Irrelevant));
-    }
-
-    #[test]
-    fn update_op_outcome_irrelevant_when_finalized_with_partial_stats() {
-        // target is None — should fall through to Irrelevant
-        let op = make_update_op(
-            Some(UpdateState::Finished(FinishedData {
-                key: make_contract_key(1),
-                summary: StateSummary::from(vec![1u8]),
-            })),
-            Some(UpdateStats {
-                target: None,
-                contract_location: Some(Location::random()),
-            }),
-        );
-        assert!(matches!(op.outcome(), OpOutcome::Irrelevant));
-    }
-
-    #[test]
-    fn update_op_outcome_failure_when_not_finalized_with_full_stats() {
-        let target = PeerKeyLocation::random();
-        let loc = Location::random();
-        let op = make_update_op(
-            Some(UpdateState::ReceivedRequest),
-            Some(UpdateStats {
-                target: Some(target.clone()),
-                contract_location: Some(loc),
-            }),
-        );
-        match op.outcome() {
-            OpOutcome::ContractOpFailure {
-                target_peer,
-                contract_location,
-            } => {
-                assert_eq!(*target_peer, target);
-                assert_eq!(contract_location, loc);
-            }
-            OpOutcome::ContractOpSuccess { .. }
-            | OpOutcome::ContractOpSuccessUntimed { .. }
-            | OpOutcome::Incomplete
-            | OpOutcome::Irrelevant => {
-                panic!("Expected ContractOpFailure for non-finalized update with full stats")
-            }
-        }
-    }
-
-    #[test]
-    fn update_op_outcome_incomplete_when_not_finalized_without_stats() {
-        let op = make_update_op(Some(UpdateState::ReceivedRequest), None);
-        assert!(matches!(op.outcome(), OpOutcome::Incomplete));
-    }
-
-    #[test]
-    fn update_op_failure_routing_info_with_full_stats() {
-        let target = PeerKeyLocation::random();
-        let loc = Location::random();
-        let op = make_update_op(
-            None,
-            Some(UpdateStats {
-                target: Some(target.clone()),
-                contract_location: Some(loc),
-            }),
-        );
-        let info = op.failure_routing_info().expect("should have routing info");
-        assert_eq!(info.0, target);
-        assert_eq!(info.1, loc);
-    }
-
-    #[test]
-    fn update_op_failure_routing_info_without_stats() {
-        let op = make_update_op(None, None);
-        assert!(op.failure_routing_info().is_none());
-    }
-
-    #[test]
-    fn update_op_failure_routing_info_with_partial_stats() {
-        let op = make_update_op(
-            None,
-            Some(UpdateStats {
-                target: None,
-                contract_location: Some(Location::random()),
-            }),
-        );
-        assert!(op.failure_routing_info().is_none());
-    }
-
-    // `start_op_creates_update_with_partial_stats` tested the deleted
-    // `start_op` constructor (#1454 phase 5 final). Replacement
-    // coverage lives in `update_op_stats_lifecycle_*` below, which
-    // exercises the same partial-stats → finalized transition without
-    // depending on the legacy constructor.
-
-    /// Simulate the update operation lifecycle: partial stats → full stats → finished.
-    /// This mirrors what happens when an update operation finds a forwarding target.
-    #[test]
-    fn update_op_stats_lifecycle_from_partial_to_complete() {
-        let target = PeerKeyLocation::random();
-        let loc = Location::random();
-
-        // Step 1: Created with partial stats (no target yet)
-        let mut op = make_update_op(
-            Some(UpdateState::ReceivedRequest),
-            Some(UpdateStats {
-                target: None,
-                contract_location: Some(loc),
-            }),
-        );
-        assert!(matches!(op.outcome(), OpOutcome::Incomplete));
-        assert!(op.failure_routing_info().is_none());
-
-        // Step 2: Target found during forwarding
-        op.stats = Some(UpdateStats {
-            target: Some(target.clone()),
-            contract_location: Some(loc),
-        });
-        // Still not finalized → ContractOpFailure (has full stats but not done)
-        match op.outcome() {
-            OpOutcome::ContractOpFailure {
-                target_peer,
-                contract_location,
-            } => {
-                assert_eq!(*target_peer, target);
-                assert_eq!(contract_location, loc);
-            }
-            OpOutcome::ContractOpSuccess { .. }
-            | OpOutcome::ContractOpSuccessUntimed { .. }
-            | OpOutcome::Incomplete
-            | OpOutcome::Irrelevant => {
-                panic!("Expected ContractOpFailure for in-progress update with stats")
-            }
-        }
-        assert!(op.failure_routing_info().is_some());
-
-        // Step 3: Operation finishes
-        op.state = Some(UpdateState::Finished(FinishedData {
-            key: make_contract_key(1),
-            summary: StateSummary::from(vec![1u8]),
-        }));
-        match op.outcome() {
-            OpOutcome::ContractOpSuccessUntimed {
-                target_peer,
-                contract_location,
-            } => {
-                assert_eq!(*target_peer, target);
-                assert_eq!(contract_location, loc);
-            }
-            OpOutcome::ContractOpSuccess { .. }
-            | OpOutcome::ContractOpFailure { .. }
-            | OpOutcome::Incomplete
-            | OpOutcome::Irrelevant => {
-                panic!("Expected ContractOpSuccessUntimed for finished update with stats")
-            }
-        }
-    }
-
-    /// Verify that contract_location=None in UpdateStats causes Incomplete/Irrelevant
-    /// outcomes even when a target is set.
-    #[test]
-    fn update_op_outcome_with_target_but_no_contract_location() {
-        let target = PeerKeyLocation::random();
-
-        // Not finalized with target but no location → Incomplete
-        let op = make_update_op(
-            Some(UpdateState::ReceivedRequest),
-            Some(UpdateStats {
-                target: Some(target.clone()),
-                contract_location: None,
-            }),
-        );
-        assert!(matches!(op.outcome(), OpOutcome::Incomplete));
-        assert!(op.failure_routing_info().is_none());
-
-        // Finalized with target but no location → Irrelevant
-        let op = make_update_op(
-            Some(UpdateState::Finished(FinishedData {
-                key: make_contract_key(1),
-                summary: StateSummary::from(vec![1u8]),
-            })),
-            Some(UpdateStats {
-                target: Some(target),
-                contract_location: None,
-            }),
-        );
-        assert!(matches!(op.outcome(), OpOutcome::Irrelevant));
-    }
-
-    // ── Intermediate node stats tracking tests (#3527) ─────────────────────
-
-    use crate::operations::test_utils::make_peer;
-
-    /// Non-finalized UPDATE with stats reports ContractOpFailure on timeout.
-    #[test]
-    fn test_update_failure_outcome_with_stats() {
-        let target = make_peer(9001);
-        let contract_location = Location::from(&make_contract_key(42));
-
-        let op = make_update_op(
-            Some(UpdateState::ReceivedRequest),
-            Some(UpdateStats {
-                target: Some(target.clone()),
-                contract_location: Some(contract_location),
-            }),
-        );
-
-        assert!(!op.finalized());
-        match op.outcome() {
-            OpOutcome::ContractOpFailure {
-                target_peer,
-                contract_location: loc,
-            } => {
-                assert_eq!(target_peer, &target);
-                assert_eq!(loc, contract_location);
-            }
-            other => panic!("Expected ContractOpFailure, got {other:?}"),
-        }
-    }
-
-    /// Non-finalized UPDATE without stats reports Incomplete.
-    #[test]
-    fn test_update_failure_outcome_without_stats() {
-        let op = make_update_op(Some(UpdateState::ReceivedRequest), None);
-
-        assert!(!op.finalized());
-        assert!(
-            matches!(op.outcome(), OpOutcome::Incomplete),
-            "UPDATE without stats should return Incomplete"
-        );
-    }
-
-    /// failure_routing_info() returns correct peer and location from stats.
-    #[test]
-    fn test_update_failure_routing_info() {
-        let target = make_peer(9002);
-        let contract_location = Location::from(&make_contract_key(42));
-
-        let op = make_update_op(
-            Some(UpdateState::ReceivedRequest),
-            Some(UpdateStats {
-                target: Some(target.clone()),
-                contract_location: Some(contract_location),
-            }),
-        );
-
-        let (peer, loc) = op.failure_routing_info().expect("should have routing info");
-        assert_eq!(peer, target);
-        assert_eq!(loc, contract_location);
-    }
 
     /// Regression tests for issue #3914: misleading ERROR/WARN log noise from
     /// benign WASM rejections of stale broadcast UPDATEs. The contract correctly
@@ -1663,70 +1110,6 @@ mod tests {
                 "out-of-gas must NOT trigger self-heal auto-fetch (contract code is present locally; the broader is_contract_exec_rejection predicate catches this case independently of log severity)"
             );
         }
-    }
-
-    /// Pin: `UpdateMsg::BroadcastTo` handler in `process_message` must spawn
-    /// `send_summary_back_on_rejection` when the WASM merge rejects as an
-    /// invalid-update rejection (stale version). Skipping this causes the
-    /// sender to repeatedly full-state-broadcast identical content; see
-    /// PR description for production evidence.
-    #[test]
-    fn legacy_broadcast_to_sends_summary_back_on_rejection() {
-        let src = include_str!("update.rs");
-        let bcast_arm_pos = src
-            .find("UpdateMsg::BroadcastTo {")
-            .expect("UpdateMsg::BroadcastTo match arm not found");
-        // Scope to the Err(err) branch of this arm.
-        let err_branch_start = src[bcast_arm_pos..]
-            .find("Err(err) =>")
-            .map(|p| bcast_arm_pos + p)
-            .expect("BroadcastTo Err(err) branch not found");
-        let branch = &src[err_branch_start..err_branch_start + 3500];
-
-        assert!(
-            branch.contains("err.is_invalid_update_rejection()"),
-            "BroadcastTo rejection branch MUST gate summary-back on \
-             is_invalid_update_rejection (not is_contract_exec_rejection): \
-             the broader predicate matches OOG/traps which are \
-             attacker-inducible and must not amplify into summary-back"
-        );
-        assert!(
-            branch.contains("send_summary_back_on_rejection"),
-            "send_summary_back_on_rejection call missing — stale-version \
-             rejections in legacy BroadcastTo will keep amplifying"
-        );
-    }
-
-    /// Pin: `UpdateMsg::BroadcastToStreaming` handler must spawn
-    /// `send_summary_back_on_rejection` on the invalid-update rejection
-    /// branch (the non-`try_auto_fetch_contract` branch).
-    #[test]
-    fn legacy_broadcast_to_streaming_sends_summary_back_on_rejection() {
-        let src = include_str!("update.rs");
-        let stream_arm_pos = src
-            .find("UpdateMsg::BroadcastToStreaming")
-            .expect("BroadcastToStreaming arm not found");
-        let err_branch_start = src[stream_arm_pos..]
-            .find("Err(err) =>")
-            .map(|p| stream_arm_pos + p)
-            .expect("BroadcastToStreaming Err(err) branch not found");
-        let branch = &src[err_branch_start..err_branch_start + 3000];
-
-        assert!(
-            branch.contains("err.is_invalid_update_rejection()"),
-            "BroadcastToStreaming Err branch must gate summary-back on \
-             is_invalid_update_rejection"
-        );
-        assert!(
-            branch.contains("send_summary_back_on_rejection"),
-            "BroadcastToStreaming Err branch must spawn \
-             send_summary_back_on_rejection on invalid-update rejection"
-        );
-        assert!(
-            branch.contains("try_auto_fetch_contract"),
-            "BroadcastToStreaming Err branch must still call \
-             try_auto_fetch_contract on the non-rejection (missing-contract) path"
-        );
     }
 
     /// Pin: `send_summary_back_on_rejection` helper MUST gate on

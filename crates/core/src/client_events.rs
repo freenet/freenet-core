@@ -307,7 +307,7 @@ async fn register_subscription_listener(
 async fn report_op_init_error(
     op_manager: &OpManager,
     tx: crate::message::Transaction,
-    contract: &impl std::fmt::Display,
+    contract: &(impl std::fmt::Display + Sync),
     op_name: &str,
     err: &OpError,
     client_id: ClientId,
@@ -340,7 +340,6 @@ async fn report_op_init_error(
         | OpError::NotificationChannelError(_)
         | OpError::IncorrectTxType(..)
         | OpError::OpNotPresent(_)
-        | OpError::OpNotAvailable(_)
         | OpError::StreamCancelled
         | OpError::OrphanStreamClaimFailed => ErrorKind::OperationError {
             cause: format!("{op_name} operation failed: {err}").into(),
@@ -660,11 +659,10 @@ async fn process_open_request(
 
                         let contract_key = contract.key();
 
-                        // Phase 3a (#1454): task-per-tx driver handles both
-                        // local-only and network PUTs. The driver calls
-                        // put_contract locally first, then finds peers and
-                        // sends the request. No request-router dedup needed
-                        // — each task owns its own operation lifecycle.
+                        // Driver handles both local-only and network
+                        // PUTs: calls put_contract locally, finds
+                        // peers, sends the request. Each task owns
+                        // its own operation lifecycle.
                         let client_tx = crate::message::Transaction::new::<put::PutMsg>();
 
                         op_manager
@@ -1160,11 +1158,9 @@ async fn process_open_request(
                             })));
                         }
 
-                        // Phase 3b (#1454): task-per-tx driver handles network
-                        // GETs. The driver owns its routing state in task locals
-                        // and calls notify_contract_handler locally as needed.
-                        // No request-router dedup — each task owns its own
-                        // operation lifecycle (matching PUT 3a's decision).
+                        // Driver owns its routing state in task
+                        // locals and calls notify_contract_handler
+                        // locally as needed.
                         tracing::debug!(
                             client_id = %client_id,
                             request_id = %request_id,
@@ -1174,7 +1170,7 @@ async fn process_open_request(
                             is_subscribed,
                             connection_count,
                             phase = "network_routing",
-                            "Routing GET request through network (task-per-tx driver)"
+                            "Routing GET request through network"
                         );
 
                         let client_tx = crate::message::Transaction::new::<get::GetMsg>();
@@ -1424,9 +1420,10 @@ async fn process_open_request(
                                     );
                                 })?;
 
-                            // Start dedicated operation for this client AFTER registration.
-                            // `subscribe_with_id` is client-initiated-only since #1454 Phase 2b;
-                            // no `is_renewal` parameter.
+                            // Start dedicated operation for this
+                            // client AFTER registration.
+                            // `subscribe_with_id` is
+                            // client-initiated-only; no `is_renewal`.
                             let _result_tx = crate::node::subscribe_with_id(
                                 op_manager.clone(),
                                 key,
@@ -1475,8 +1472,7 @@ async fn process_open_request(
                                     );
                                 })?;
 
-                            // `subscribe_with_id` is client-initiated-only since #1454 Phase 2b;
-                            // no `is_renewal` parameter.
+                            // `subscribe_with_id` is client-initiated-only; no `is_renewal` parameter.
                             crate::node::subscribe_with_id(op_manager.clone(), key, None, Some(tx))
                                 .await
                                 .inspect_err(|err| {
@@ -1516,6 +1512,72 @@ async fn process_open_request(
                     "Received delegate operation from client"
                 );
                 let delegate_key = req.key().clone();
+                // Derive a short discriminant tag for the INFO logs, but only when INFO is
+                // enabled — the Vec<&str> collect + format! would otherwise allocate on every
+                // delegate dispatch even when the log line is suppressed.
+                let msg_type: Option<String> = if tracing::enabled!(tracing::Level::INFO) {
+                    Some(match &req {
+                        freenet_stdlib::client_api::DelegateRequest::ApplicationMessages {
+                            inbound,
+                            ..
+                        } => {
+                            // Include the count of inbound message variants for observability.
+                            // Each variant name is a short discriminant so operators can tell
+                            // ApplicationMessage (from app) apart from GetContractResponse etc.
+                            let tags: Vec<&str> = inbound
+                                .iter()
+                                .map(|m| match m {
+                                    InboundDelegateMsg::ApplicationMessage(_) => {
+                                        "ApplicationMessage"
+                                    }
+                                    InboundDelegateMsg::UserResponse(_) => "UserResponse",
+                                    InboundDelegateMsg::GetContractResponse(_) => {
+                                        "GetContractResponse"
+                                    }
+                                    InboundDelegateMsg::PutContractResponse(_) => {
+                                        "PutContractResponse"
+                                    }
+                                    InboundDelegateMsg::UpdateContractResponse(_) => {
+                                        "UpdateContractResponse"
+                                    }
+                                    InboundDelegateMsg::SubscribeContractResponse(_) => {
+                                        "SubscribeContractResponse"
+                                    }
+                                    InboundDelegateMsg::ContractNotification(_) => {
+                                        "ContractNotification"
+                                    }
+                                    InboundDelegateMsg::DelegateMessage(_) => "DelegateMessage",
+                                    _ => "Unknown",
+                                })
+                                .collect();
+                            // Format as "ApplicationMessages[ApplicationMessage,DelegateMessage]"
+                            // when there are inbound messages, or bare "ApplicationMessages" when empty.
+                            if tags.is_empty() {
+                                "ApplicationMessages".to_string()
+                            } else {
+                                format!("ApplicationMessages[{}]", tags.join(","))
+                            }
+                        }
+                        freenet_stdlib::client_api::DelegateRequest::RegisterDelegate {
+                            ..
+                        } => "RegisterDelegate".to_string(),
+                        freenet_stdlib::client_api::DelegateRequest::UnregisterDelegate(_) => {
+                            "UnregisterDelegate".to_string()
+                        }
+                        _ => "Unknown".to_string(),
+                    })
+                } else {
+                    None
+                };
+                if let Some(ref mt) = msg_type {
+                    tracing::info!(
+                        delegate = %delegate_key,
+                        msg_type = %mt,
+                        request_id = %request_id,
+                        outcome = "queued",
+                        "DelegateRequest dispatch"
+                    );
+                }
                 let origin_contract = request.origin_contract;
 
                 let res = match op_manager
@@ -1525,7 +1587,18 @@ async fn process_open_request(
                     })
                     .await
                 {
-                    Ok(ContractHandlerEvent::DelegateResponse(res)) => res,
+                    Ok(ContractHandlerEvent::DelegateResponse(res)) => {
+                        if let Some(ref mt) = msg_type {
+                            tracing::info!(
+                                delegate = %delegate_key,
+                                msg_type = %mt,
+                                request_id = %request_id,
+                                outcome = "executed",
+                                "DelegateRequest dispatch"
+                            );
+                        }
+                        res
+                    }
                     Err(err) => {
                         tracing::error!(
                             client_id = %client_id,

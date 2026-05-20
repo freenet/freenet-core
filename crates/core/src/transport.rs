@@ -202,6 +202,7 @@ pub(crate) mod fixed_rate;
 pub mod global_bandwidth;
 pub(crate) mod ledbat;
 pub mod metrics;
+pub(crate) mod rolling_rtt_stats;
 mod sent_packet_tracker;
 mod symmetric_message;
 pub(crate) mod token_bucket;

@@ -13,7 +13,10 @@ use freenet::{
 use std::sync::Arc;
 
 mod commands;
-use commands::{service::ServiceCommand, uninstall::UninstallCommand, update::UpdateCommand};
+use commands::{
+    secrets_cmd::SecretsCliConfig, service::ServiceCommand, uninstall::UninstallCommand,
+    update::UpdateCommand,
+};
 
 /// Freenet - A distributed, decentralized, and censorship-resistant platform
 #[derive(Parser, Debug)]
@@ -46,6 +49,12 @@ enum Command {
     Update(UpdateCommand),
     /// Completely uninstall Freenet (service, binaries, and optionally data)
     Uninstall(UninstallCommand),
+    /// Manage the node KEK (Key Encryption Key) backend.
+    ///
+    /// The KEK is the master key from which every per-delegate DEK is
+    /// derived via HKDF. Subcommands report status, rotate, or migrate
+    /// the KEK between backends (OS keyring / systemd credential / file).
+    Secrets(SecretsCliConfig),
 }
 
 /// Build metadata embedded at compile time
@@ -660,6 +669,15 @@ fn freenet_main() -> anyhow::Result<()> {
         }
         Some(Command::Update(cmd)) => cmd.run(build_info::VERSION),
         Some(Command::Uninstall(cmd)) => cmd.run(),
+        Some(Command::Secrets(cfg)) => {
+            // CLI utility; uses simple current-thread runtime (no
+            // multi-thread / blocking-pool tuning needed for IO-light
+            // KEK marker reads + status print).
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            rt.block_on(commands::secrets_cmd::run(cfg))
+        }
         Some(Command::Network { mut config }) => {
             config.mode = Some(OperationMode::Network);
             run_node(config)

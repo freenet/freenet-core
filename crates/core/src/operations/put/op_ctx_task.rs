@@ -1,43 +1,23 @@
-//! Task-per-transaction client-initiated PUT (#1454 Phase 3a).
+//! Task-per-transaction PUT drivers.
 //!
-//! Mirrors [`crate::operations::subscribe::op_ctx_task`] — the first
-//! production consumer of [`OpCtx::send_and_await`] for SUBSCRIBE.
-//! This module applies the same pattern to client-initiated PUT.
+//! Each entry point — client-initiated, relay non-streaming, relay
+//! streaming — owns routing state in task locals. There is no
+//! `ops.put` DashMap; per-node dedup is enforced via
+//! `OpManager.active_relay_put_txs`.
 //!
-//! # Scope (Phase 3a)
+//! # Client-initiated flow
 //!
-//! Only the **client-initiated originator** PUT runs through this module.
-//! Relay PUTs (with `upstream_addr: Some`), GC-spawned speculative retries,
-//! and streaming request setup stay on the legacy re-entry loop.
+//! 1. [`super::put_contract`] stores the contract locally.
+//! 2. Find k-closest peers to forward to.
+//! 3. No remote peers: deliver directly via `send_client_result`.
+//! 4. Loop: [`OpCtx::send_and_await`] with a fresh `Transaction`
+//!    per attempt (single-use-per-tx).
+//! 5. Terminal `Response`/`ResponseStreaming`:
+//!    [`super::finalize_put_at_originator`] + `send_client_result`.
+//! 6. Timeout/wire-error: advance to next peer or exhaust.
 //!
-//! # Architecture
-//!
-//! The task owns all routing state in its locals — there is no `PutOp` in
-//! `OpManager.ops.put` for any attempt this task makes. The task:
-//!
-//! 1. Calls [`super::put_contract`] to store the contract locally.
-//! 2. Finds the k-closest peers to forward the PUT to.
-//! 3. If no remote peers: delivers directly via `send_client_result`.
-//! 4. Otherwise: loops, calling [`OpCtx::send_and_await`] with a fresh
-//!    `Transaction` per attempt (single-use-per-tx constraint).
-//! 5. On terminal `Response`/`ResponseStreaming`: calls
-//!    [`super::finalize_put_at_originator`] for telemetry + subscription,
-//!    then delivers via `send_client_result`.
-//! 6. On timeout/wire-error: advances to next peer or exhausts.
-//!
-//! # Speculative retries (R2)
-//!
-//! The driver uses serial retries only. Speculative parallel paths
-//! (GC-spawned via `speculative_paths`) are not supported — the driver
-//! has no DashMap entry for the GC task to find. This is an accepted
-//! regression for Phase 3a; the driver's retry loop covers the same
-//! failure modes, just sequentially.
-//!
-//! # Connection-drop latency (R6)
-//!
-//! Legacy `handle_abort` detects disconnects in <1s. Task-per-tx relies
-//! on the `OPERATION_TTL` (60s) timeout. Accepted ceiling, matching
-//! Phase 2b's SUBSCRIBE driver.
+//! Retries are serial only. Connection-drop detection relies on
+//! `OPERATION_TTL` (60s).
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -50,8 +30,8 @@ use freenet_stdlib::prelude::*;
 use crate::client_events::HostResult;
 use crate::config::{GlobalExecutor, OPERATION_TTL};
 use crate::message::{NetMessage, NetMessageV1, Transaction};
+use crate::node::NetworkBridge;
 use crate::node::OpManager;
-use crate::operations::NetworkBridge;
 use crate::operations::OpError;
 use crate::operations::op_ctx::{
     AdvanceOutcome, AttemptOutcome, RetryDriver, RetryLoopOutcome, drive_retry_loop,
@@ -86,7 +66,7 @@ pub(crate) async fn start_client_put(
     tracing::debug!(
         tx = %client_tx,
         contract = %contract.key(),
-        "put (task-per-tx): spawning client-initiated task"
+        "put: spawning client-initiated task"
     );
 
     // Spawn the driver. Same fire-and-forget rationale as SUBSCRIBE's
@@ -536,7 +516,7 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
             tracing::warn!(
                 tx = %client_tx,
                 error = %err,
-                "put (task-per-tx): infrastructure error; publishing synthesized client error"
+                "put: infrastructure error; publishing synthesized client error"
             );
             let synthesized: HostResult = Err(ErrorKind::OperationError {
                 cause: format!("PUT failed: {err}").into(),
@@ -547,12 +527,12 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
     }
 }
 
-// ── Relay PUT driver (#1454 phase 5 follow-up slice A) ──────────────────────
+// ── Relay PUT driver ─────────────────────────────────────────────────────────
 
 /// Counter: number of times `start_relay_put` was invoked. Incremented
 /// under test/testing feature only — used by structural pin tests to
 /// prove the dispatch gate routes fresh inbound `PutMsg::Request`
-/// through the task-per-tx driver rather than legacy `handle_op_request`.
+/// through the driver rather than legacy `handle_op_request`.
 #[cfg(any(test, feature = "testing"))]
 pub static RELAY_PUT_DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -578,10 +558,9 @@ pub static RELAY_PUT_DEDUP_REJECTS: std::sync::atomic::AtomicUsize =
 /// Spawn a relay driver for a fresh inbound non-streaming `PutMsg::Request`.
 ///
 /// Gated by the dispatch site in `node.rs::handle_pure_network_message_v1`
-/// on `source_addr.is_some() && !has_put_op(id)`. The driver owns local
-/// store + optional downstream forward + upstream bubble-up in its task
-/// locals — no `PutOp` is stored in `OpManager.ops.put` for this
-/// transaction.
+/// on `source_addr.is_some()`. Per-node dedup against concurrent inbound
+/// retries is enforced by `OpManager.active_relay_put_txs` inside the
+/// driver. State lives in task locals.
 ///
 /// Returns immediately after spawning. Driver publishes its own side
 /// effects (local put_contract / host_contract / interest broadcast,
@@ -632,7 +611,7 @@ where
             contract = %contract.key(),
             %upstream_addr,
             phase = "relay_put_dedup_reject",
-            "PUT relay (task-per-tx): duplicate Request for in-flight tx, dropping"
+            "PUT relay: duplicate Request for in-flight tx, dropping"
         );
         return Ok(());
     }
@@ -643,7 +622,7 @@ where
         htl,
         %upstream_addr,
         phase = "relay_put_start",
-        "PUT relay (task-per-tx): spawning driver"
+        "PUT relay: spawning driver"
     );
 
     // Construct guard + bump counters BEFORE spawn so the dedup-set
@@ -727,18 +706,16 @@ async fn run_relay_put<CB>(
             tx = %incoming_tx,
             error = %err,
             phase = "relay_put_error",
-            "PUT relay (task-per-tx): driver returned error"
+            "PUT relay: driver returned error"
         );
     }
 
-    // Originator-loopback error path (#1454 phase 5 final PUT slice
-    // follow-up): when the relay driver runs on the originator's own
-    // node and fails (e.g., `put_contract` rejects an invalid state),
-    // the originator's `start_client_put` `send_and_await` waiter has
-    // no `PutMsg::Response` to consume — it would hang until the test
-    // / client times out. Mirror the legacy `report_result` Err arm
-    // (node.rs:636-651) by publishing a `HostResult::Err` to the
-    // originator's client transaction, then completing the tx.
+    // Originator-loopback error path: when the relay driver runs
+    // on the originator's own node and fails, the originator's
+    // `start_client_put` `send_and_await` waiter has no
+    // `PutMsg::Response` to consume — it would hang until timeout.
+    // Publish a `HostResult::Err` to the originator's client
+    // transaction and complete the tx.
     //
     // Safe in non-loopback mode because remote relays don't share
     // tx-space with a local client (the originator is on a different
@@ -762,8 +739,8 @@ async fn run_relay_put<CB>(
     // sender in the slot that only the 60s sweep would reclaim without
     // this explicit release.
     //
-    // Originator-loopback exception (#1454 phase 5 final PUT slice):
-    // when this driver runs on the originator's own node
+    // Originator-loopback exception: when this driver runs on the
+    // originator's own node
     // (`upstream_addr == own_addr`), the `pending_op_results` callback
     // for `incoming_tx` is the *originator's* `send_and_await` waiter,
     // NOT one this driver installed. Releasing it here would emit
@@ -801,7 +778,7 @@ where
         htl,
         %upstream_addr,
         phase = "relay_put_request",
-        "PUT relay (task-per-tx): processing Request"
+        "PUT relay: processing Request"
     );
 
     // ── Step 1: Store contract locally (all nodes cache) ────────────────────
@@ -840,7 +817,7 @@ where
                         tx = %incoming_tx,
                         contract = %key,
                         target_pub_key = %peer.pub_key(),
-                        "PUT relay (task-per-tx): next hop has no socket address"
+                        "PUT relay: next hop has no socket address"
                     );
                     // No next hop — act as final destination.
                     return relay_put_finalize_local(
@@ -861,7 +838,7 @@ where
                 tx = %incoming_tx,
                 contract = %key,
                 phase = "relay_put_complete",
-                "PUT relay (task-per-tx): no next hop, finalizing at this node"
+                "PUT relay: no next hop, finalizing at this node"
             );
             return relay_put_finalize_local(
                 op_manager,
@@ -894,12 +871,12 @@ where
         peer_addr = %next_addr,
         htl = new_htl,
         phase = "relay_put_forward",
-        "PUT relay (task-per-tx): forwarding to next hop"
+        "PUT relay: forwarding to next hop"
     );
 
-    // Originator-loopback mode (`upstream_addr == own_addr`, #1454
-    // phase 5 final PUT slice): the originator's `send_and_await`
-    // already installed a `pending_op_results` callback under
+    // Originator-loopback mode (`upstream_addr == own_addr`): the
+    // originator's `send_and_await` already installed a
+    // `pending_op_results` callback under
     // `incoming_tx`. Using `send_to_and_await` here would overwrite
     // that callback with the relay's own waiter, then the relay
     // consumes the reply and the originator's wait dangles forever.
@@ -914,11 +891,10 @@ where
     // Streaming upgrade on forward: serialize the payload, and if it
     // exceeds `streaming_threshold`, send a `RequestStreaming` metadata
     // message + raw stream fragments via `network_bridge.send_stream`.
-    // Mirrors legacy `put.rs:480-528` (pre-#1454 phase 5 final, PUT
-    // slice retirement). Different from `start_relay_put_streaming`'s
-    // `pipe_stream` path because there's no inbound stream handle to
-    // fork — the payload is materialized locally as `merged_value` and
-    // we send raw fragments.
+    // Different from `start_relay_put_streaming`'s `pipe_stream`
+    // path because there's no inbound stream handle to fork — the
+    // payload is materialized locally as `merged_value` and we send
+    // raw fragments.
     let payload = PutStreamingPayload {
         contract: contract.clone(),
         related_contracts: related_contracts.clone(),
@@ -959,7 +935,7 @@ where
                     contract = %key,
                     target = %next_addr,
                     error = %err,
-                    "PUT relay (task-per-tx, loopback): \
+                    "PUT relay (loopback, loopback): \
                      streaming-upgrade send_fire_and_forget failed"
                 );
                 return Err(err);
@@ -979,7 +955,7 @@ where
                     target = %next_addr,
                     %stream_id,
                     error = %err,
-                    "PUT relay (task-per-tx, loopback): send_stream failed"
+                    "PUT relay (loopback, loopback): send_stream failed"
                 );
                 return Err(OpError::NotificationChannelError(format!(
                     "send_stream failed: {err}"
@@ -1000,7 +976,7 @@ where
                     contract = %key,
                     target = %next_addr,
                     error = %err,
-                    "PUT relay (task-per-tx, loopback): send_fire_and_forget failed"
+                    "PUT relay (loopback, loopback): send_fire_and_forget failed"
                 );
                 return Err(err);
             }
@@ -1020,7 +996,7 @@ where
             payload_size,
             %stream_id,
             phase = "relay_put_forward_upgrade",
-            "PUT relay (task-per-tx): payload exceeds threshold, upgrading to streaming"
+            "PUT relay: payload exceeds threshold, upgrading to streaming"
         );
         let metadata_msg = NetMessage::from(PutMsg::RequestStreaming {
             id: incoming_tx,
@@ -1051,7 +1027,7 @@ where
                     contract = %key,
                     target = %next_addr,
                     error = %err,
-                    "PUT relay (task-per-tx): streaming-upgrade send_to_and_register_waiter failed"
+                    "PUT relay: streaming-upgrade send_to_and_register_waiter failed"
                 );
                 op_manager.release_pending_op_slot(incoming_tx).await;
                 return Err(err);
@@ -1073,7 +1049,7 @@ where
                 target = %next_addr,
                 %stream_id,
                 error = %err,
-                "PUT relay (task-per-tx): send_stream failed during streaming upgrade"
+                "PUT relay: send_stream failed during streaming upgrade"
             );
             op_manager.release_pending_op_slot(incoming_tx).await;
             return Err(OpError::NotificationChannelError(format!(
@@ -1116,7 +1092,7 @@ where
                 contract = %key,
                 target = %next_addr,
                 error = %err,
-                "PUT relay (task-per-tx): send_to_and_await failed"
+                "PUT relay: send_to_and_await failed"
             );
             crate::operations::record_relay_route_event(
                 op_manager,
@@ -1133,7 +1109,7 @@ where
                 contract = %key,
                 target = %next_addr,
                 timeout_secs = OPERATION_TTL.as_secs(),
-                "PUT relay (task-per-tx): downstream timed out"
+                "PUT relay: downstream timed out"
             );
             crate::operations::record_relay_route_event(
                 op_manager,
@@ -1156,7 +1132,7 @@ where
                 tx = %incoming_tx,
                 contract = %reply_key,
                 phase = "relay_put_bubble",
-                "PUT relay (task-per-tx): downstream returned Response; bubbling upstream"
+                "PUT relay: downstream returned Response; bubbling upstream"
             );
             crate::operations::record_relay_route_event(
                 op_manager,
@@ -1178,7 +1154,7 @@ where
                 tx = %incoming_tx,
                 contract = %reply_key,
                 phase = "relay_put_bubble_streaming_downgrade",
-                "PUT relay (task-per-tx): downstream returned ResponseStreaming — \
+                "PUT relay: downstream returned ResponseStreaming — \
                  synthesizing non-streaming Response upstream (slice A limitation)"
             );
             crate::operations::record_relay_route_event(
@@ -1198,7 +1174,7 @@ where
                 tx = %incoming_tx,
                 contract = %key,
                 reply_variant = ?std::mem::discriminant(&other),
-                "PUT relay (task-per-tx): unexpected reply variant; treating as failure"
+                "PUT relay: unexpected reply variant; treating as failure"
             );
             Err(OpError::UnexpectedOpState)
         }
@@ -1243,7 +1219,7 @@ async fn relay_put_store_locally(
                 contract = %key,
                 error = %err,
                 htl,
-                "PUT relay (task-per-tx): put_contract failed"
+                "PUT relay: put_contract failed"
             );
             if let Some(event) = NetEventLog::put_failure(
                 &incoming_tx,
@@ -1286,7 +1262,7 @@ async fn relay_put_store_locally(
 
     debug_assert!(
         op_manager.ring.is_hosting_contract(&key),
-        "PUT relay (task-per-tx): contract {key} must be in hosting list after put_contract + host_contract"
+        "PUT relay: contract {key} must be in hosting list after put_contract + host_contract"
     );
 
     Ok(merged_value)
@@ -1324,17 +1300,12 @@ async fn relay_put_finalize_local(
 /// Send `PutMsg::Response` upstream (fire-and-forget: upstream relay
 /// awaits via its own `send_to_and_await`, no reply expected).
 ///
-/// Originator-loopback case (`upstream_addr == own_addr`, added in
-/// #1454 phase 5 final PUT slice): when the relay driver is running
-/// on the originator's own node — because `start_client_put`'s
-/// `send_and_await(target=None)` looped the Request back into the
-/// local event loop and the dispatch site mapped `source_addr=None`
-/// to `upstream=own_addr` — the Response cannot ship over the wire
-/// (no self-connection). Route via `send_local_loopback` so the
-/// message lands as an `InboundMessage`, hits the PUT bypass in
-/// `handle_pure_network_message_v1`, and forwards to the originator's
-/// `pending_op_results` waiter. Mirrors the legacy `LocalCompletion`
-/// terminal-reply contract.
+/// Originator-loopback case (`upstream_addr == own_addr`): when
+/// the relay driver runs on the originator's own node, the
+/// Response cannot ship over the wire (no self-connection). Route
+/// via `send_local_loopback` so the message lands as an
+/// `InboundMessage`, hits the PUT bypass, and forwards to the
+/// originator's `pending_op_results` waiter.
 async fn relay_put_send_response(
     op_manager: &OpManager,
     incoming_tx: Transaction,
@@ -1358,12 +1329,12 @@ async fn relay_put_send_response(
     }
 }
 
-// ── Relay streaming PUT driver (#1454 phase 5 follow-up slice B) ────────────
+// ── Relay streaming PUT driver ───────────────────────────────────────────────
 
 /// Counter: number of times `start_relay_put_streaming` was invoked
 /// (BEFORE the dedup gate). Incremented under test/testing feature
 /// only — used by runtime pin tests to prove the dispatch gate routes
-/// fresh inbound streaming PUT relays through the task-per-tx driver.
+/// fresh inbound streaming PUT relays through the driver.
 /// Counts both admitted and dedup-rejected calls; pair with
 /// `RELAY_PUT_STREAMING_DEDUP_REJECTS` to reason about admitted ones.
 #[cfg(any(test, feature = "testing"))]
@@ -1442,7 +1413,7 @@ where
             contract = %contract_key,
             %upstream_addr,
             phase = "relay_put_streaming_dedup_reject",
-            "PUT streaming relay (task-per-tx): duplicate Request for in-flight tx, dropping"
+            "PUT streaming relay: duplicate Request for in-flight tx, dropping"
         );
         // Mirror slice A dedup-reject semantics: silently drop. The
         // still-in-flight driver owns the upstream reply for this tx;
@@ -1463,7 +1434,7 @@ where
         htl,
         %upstream_addr,
         phase = "relay_put_streaming_start",
-        "PUT streaming relay (task-per-tx): spawning driver"
+        "PUT streaming relay: spawning driver"
     );
 
     RELAY_PUT_STREAMING_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1542,7 +1513,7 @@ async fn run_relay_put_streaming<CB>(
             tx = %incoming_tx,
             error = %err,
             phase = "relay_put_streaming_error",
-            "PUT streaming relay (task-per-tx): driver returned error"
+            "PUT streaming relay: driver returned error"
         );
     }
 
@@ -1575,7 +1546,7 @@ where
         htl,
         %upstream_addr,
         phase = "relay_put_streaming_request",
-        "PUT streaming relay (task-per-tx): processing RequestStreaming"
+        "PUT streaming relay: processing RequestStreaming"
     );
 
     // ── Step 1: Claim the inbound stream (atomic dedup) ────────────────────
@@ -1589,7 +1560,7 @@ where
             tracing::debug!(
                 tx = %incoming_tx,
                 %stream_id,
-                "PUT streaming relay (task-per-tx): stream already claimed, skipping"
+                "PUT streaming relay: stream already claimed, skipping"
             );
             return Ok(());
         }
@@ -1598,7 +1569,7 @@ where
                 tx = %incoming_tx,
                 %stream_id,
                 error = %err,
-                "PUT streaming relay (task-per-tx): orphan stream claim failed"
+                "PUT streaming relay: orphan stream claim failed"
             );
             // Silently fail — upstream's waiter falls back to its own
             // OPERATION_TTL. Same rationale as dedup-reject above:
@@ -1715,7 +1686,7 @@ where
     // AFTER that do we enqueue `pipe_stream` onto the bridge channel.
     // If we inverted the order, a fast downstream reply could reach
     // `handle_pure_network_message_v1` before the waiter installs —
-    // `try_forward_task_per_tx_reply` would drop the reply as
+    // `try_forward_driver_reply` would drop the reply as
     // OpNotPresent and the driver would hang until `OPERATION_TTL`.
     let downstream_reply_rx: Option<(SocketAddr, tokio::sync::mpsc::Receiver<NetMessage>)> =
         if let Some((next_addr, metadata_net, outbound_sid, forked_handle, embedded_metadata)) =
@@ -1732,7 +1703,7 @@ where
                         tx = %incoming_tx,
                         target = %next_addr,
                         error = %err,
-                        "PUT streaming relay (task-per-tx): metadata register_waiter failed; will finalize locally"
+                        "PUT streaming relay: metadata register_waiter failed; will finalize locally"
                     );
                     None
                 }
@@ -1746,7 +1717,7 @@ where
                         tx = %incoming_tx,
                         target = %next_addr,
                         error = %err,
-                        "PUT streaming relay (task-per-tx): pipe_stream failed after waiter install; \
+                        "PUT streaming relay: pipe_stream failed after waiter install; \
                          will wait on downstream reply and bubble what we get"
                     );
                     // Waiter is already installed; the downstream may still
@@ -1767,7 +1738,7 @@ where
                 tx = %incoming_tx,
                 %stream_id,
                 error = %err,
-                "PUT streaming relay (task-per-tx): stream assembly failed"
+                "PUT streaming relay: stream assembly failed"
             );
             return Err(OpError::StreamCancelled);
         }
@@ -1780,7 +1751,7 @@ where
                 tx = %incoming_tx,
                 %stream_id,
                 error = %err,
-                "PUT streaming relay (task-per-tx): payload deserialize failed"
+                "PUT streaming relay: payload deserialize failed"
             );
             return Err(OpError::invalid_transition(incoming_tx));
         }
@@ -1797,7 +1768,7 @@ where
             tx = %incoming_tx,
             expected = %contract_key,
             actual = %key,
-            "PUT streaming relay (task-per-tx): contract key mismatch"
+            "PUT streaming relay: contract key mismatch"
         );
         return Err(OpError::invalid_transition(incoming_tx));
     }
@@ -1827,7 +1798,7 @@ where
                 tracing::warn!(
                     tx = %incoming_tx,
                     target = %next_addr,
-                    "PUT streaming relay (task-per-tx): downstream reply channel closed before reply"
+                    "PUT streaming relay: downstream reply channel closed before reply"
                 );
                 if let Some(ref peer) = next_hop {
                     crate::operations::record_relay_route_event(
@@ -1845,7 +1816,7 @@ where
                 tracing::warn!(
                     tx = %incoming_tx,
                     target = %next_addr,
-                    "PUT streaming relay (task-per-tx): downstream reply timed out"
+                    "PUT streaming relay: downstream reply timed out"
                 );
                 if let Some(ref peer) = next_hop {
                     crate::operations::record_relay_route_event(
@@ -1871,7 +1842,7 @@ where
                     tx = %incoming_tx,
                     contract = %reply_key,
                     phase = "relay_put_streaming_bubble",
-                    "PUT streaming relay (task-per-tx): downstream replied; bubbling Response upstream"
+                    "PUT streaming relay: downstream replied; bubbling Response upstream"
                 );
                 if let Some(ref peer) = next_hop {
                     crate::operations::record_relay_route_event(
@@ -1892,7 +1863,7 @@ where
                     tx = %incoming_tx,
                     contract = %key,
                     reply_variant = ?std::mem::discriminant(&other),
-                    "PUT streaming relay (task-per-tx): unexpected reply variant"
+                    "PUT streaming relay: unexpected reply variant"
                 );
                 relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await
             }
@@ -1948,7 +1919,7 @@ mod tests {
         }));
         assert!(
             matches!(classify_reply(&msg), ReplyClass::Unexpected),
-            "ForwardingAck must NOT be classified as terminal (Phase 2b bug 2)"
+            "ForwardingAck must NOT be classified as terminal"
         );
     }
 
@@ -1958,7 +1929,7 @@ mod tests {
     /// `maybe_subscribe_child` for subscriptions. If `finalize_put_at_originator`
     /// is called with `subscribe=true`, it starts a subscription via the legacy
     /// `start_subscription_after_put` path, AND `maybe_subscribe_child` starts
-    /// another via the task-per-tx `run_client_subscribe` path — doubling
+    /// another via the driver `run_client_subscribe` path — doubling
     /// network traffic and subscription registrations.
     ///
     /// This test scrapes the source to verify all `finalize_put_at_originator`
@@ -2164,10 +2135,9 @@ mod tests {
         ));
     }
 
-    // ── Relay PUT driver structural pin tests (#1454 phase 5 follow-up,
-    // slice A). Anchor the relay section on the entry-point fn so
-    // module-level doc comments (which reference variant names by
-    // design) don't enter scope.
+    // ── Relay PUT driver structural pin tests. Anchor the relay
+    // section on the entry-point fn so module-level doc comments
+    // (which reference variant names by design) don't enter scope.
 
     fn relay_section(src: &str) -> &str {
         let start = src
@@ -2293,8 +2263,8 @@ mod tests {
              Response bubbles back to the relay's waiter"
         );
         // The driver MAY use `send_fire_and_forget` in the
-        // originator-loopback branch (#1454 phase 5 final PUT slice):
-        // when `upstream_addr == own_addr`, installing a waiter would
+        // originator-loopback branch: when
+        // `upstream_addr == own_addr`, installing a waiter would
         // overwrite the originator's pending_op_results callback. The
         // fire-and-forget forward lets the downstream Response return
         // directly to the originator's still-installed callback. The
@@ -2313,7 +2283,7 @@ mod tests {
     /// non-existent self-connection and the originator-loopback PUT
     /// fails with "Cannot establish connection - peer not found".
     /// Repro: `test_minimal_state_put_get` and the rest of
-    /// `edge_case_state_sizes` (#1454 phase 5 final, PUT slice fixup).
+    /// `edge_case_state_sizes`.
     #[test]
     fn relay_put_send_response_uses_loopback_when_upstream_is_own_addr() {
         let src = include_str!("op_ctx_task.rs");
@@ -2422,9 +2392,10 @@ mod tests {
         );
     }
 
-    /// Pin: driver forward must reuse `incoming_tx` — legacy PUT relay
+    /// Pin: driver forward must reuse `incoming_tx` — the PUT relay
     /// uses the same tx end-to-end. Minting a fresh tx per hop breaks
-    /// the dispatch gate's has_put_op check at the downstream peer.
+    /// the downstream peer's `active_relay_put_txs` dedup gate and
+    /// detaches the response from the originator's waiter.
     #[test]
     fn drive_relay_put_reuses_incoming_tx_on_forward() {
         let src = include_str!("op_ctx_task.rs");
@@ -2445,7 +2416,7 @@ mod tests {
         assert!(
             forward_window.contains("id: incoming_tx"),
             "relay forward must reuse incoming_tx; minting a fresh tx per hop \
-             breaks the downstream dispatch gate's has_put_op check"
+             breaks the downstream `active_relay_put_txs` dedup gate"
         );
         assert!(
             !forward_window.contains("Transaction::new::<PutMsg>()"),
@@ -2599,10 +2570,10 @@ mod tests {
         );
     }
 
-    /// Bound the upgrade-on-forward analysis to the *relay-non-loopback*
-    /// branch of `drive_relay_put`. The originator-loopback branch
-    /// (added in #1454 phase 5 final PUT slice) intentionally does NOT
-    /// install a reply waiter — the originator's
+    /// Bound the upgrade-on-forward analysis to the
+    /// *relay-non-loopback* branch of `drive_relay_put`. The
+    /// originator-loopback branch intentionally does NOT install a
+    /// reply waiter — the originator's
     /// `pending_op_results` callback already exists and the loopback
     /// forward is fire-and-forget. The relay branch (`let round_trip =
     /// if upgrade_to_streaming`) is the one that must install a

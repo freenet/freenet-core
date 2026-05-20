@@ -1,0 +1,18 @@
+# Drop into your Caddy config (e.g. /etc/caddy/conf.d/freenet-release-agent.conf
+# if your Caddyfile imports conf.d/*, or appended to /etc/caddy/Caddyfile).
+#
+# Replace <HOSTNAME> with the gateway's short name (e.g. `nova`, `vega`).
+# Caddy will obtain a Let's Encrypt cert for the resulting site automatically.
+update.<HOSTNAME>.locut.us {
+    reverse_proxy 127.0.0.1:9876
+
+    # Optional: rate-limit at the edge as well. The agent enforces its own
+    # rate limit; this just shaves off the obvious noise before it reaches
+    # the agent.
+    @abusive {
+        not header X-Signature *
+    }
+    handle @abusive {
+        respond "missing signature" 401
+    }
+}

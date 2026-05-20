@@ -240,14 +240,10 @@ pub(crate) struct NetEventLog<'a> {
     kind: EventKind,
 }
 
-// `get_failure`, `get_success`, `get_forwarding_ack_*` constructors retired
-// alongside the legacy GET state machine in #1454 phase 5 final (GET
-// slice). The task-per-tx driver does not emit these `NetEventLog`
-// variants — telemetry has migrated to `record_get_access` /
-// `mark_local_client_access` and operator-facing tracing spans. The
-// constructors are kept for symmetry with the surviving PUT/UPDATE/
-// SUBSCRIBE/CONNECT counterparts and as reference for any future
-// re-introduction of GET-specific event-log variants.
+// GET telemetry migrated to `record_get_access` /
+// `mark_local_client_access` and operator-facing tracing spans;
+// these `NetEventLog` constructors are no longer emitted but kept
+// for symmetry with the surviving counterparts.
 #[allow(dead_code)]
 impl<'a> NetEventLog<'a> {
     /// Safely get the peer_id from the ring's connection manager.
@@ -1126,7 +1122,7 @@ impl<'a> NetEventLog<'a> {
                     .unwrap_or_else(|| own_loc.clone()); // Fallback to own location if target unknown
                 EventKind::Put(PutEvent::ResponseSent {
                     id: *id,
-                    from: own_loc.clone(),
+                    from: own_loc,
                     to,
                     key: *key,
                     timestamp: chrono::Utc::now().timestamp() as u64,
@@ -1147,7 +1143,7 @@ impl<'a> NetEventLog<'a> {
                     .unwrap_or_else(|| own_loc.clone()); // Fallback to own location if target unknown
                 EventKind::Get(GetEvent::ResponseSent {
                     id: *id,
-                    from: own_loc.clone(),
+                    from: own_loc,
                     to,
                     key,
                     timestamp: chrono::Utc::now().timestamp() as u64,
@@ -1167,7 +1163,7 @@ impl<'a> NetEventLog<'a> {
                     .unwrap_or_else(|| own_loc.clone()); // Fallback to own location if target unknown
                 EventKind::Subscribe(SubscribeEvent::ResponseSent {
                     id: *id,
-                    from: own_loc.clone(),
+                    from: own_loc,
                     to,
                     key,
                     timestamp: chrono::Utc::now().timestamp() as u64,
@@ -1183,7 +1179,7 @@ impl<'a> NetEventLog<'a> {
                 EventKind::Subscribe(SubscribeEvent::UnsubscribeSent {
                     id: *id,
                     instance_id: *instance_id,
-                    from: own_loc.clone(),
+                    from: own_loc,
                     to,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
@@ -1228,7 +1224,7 @@ impl<'a> NetEventLog<'a> {
                 let events = vec![
                     NetEventLog {
                         tx: msg.id(),
-                        peer_id: acceptor_peer_id.clone(),
+                        peer_id: acceptor_peer_id,
                         kind: EventKind::Connect(ConnectEvent::Connected {
                             this: acceptor.clone(),
                             connected: this_peer.clone(),
@@ -1571,7 +1567,7 @@ impl<'a> From<NetEventLog<'a>> for NetLogMessage {
             datetime: Utc::now(),
             tx: *log.tx,
             kind: log.kind,
-            peer_id: log.peer_id.clone(),
+            peer_id: log.peer_id,
         }
     }
 }
@@ -1679,7 +1675,7 @@ impl EventRegister {
         let (log_sender, log_recv) = mpsc::channel(1000);
         NEW_RECORDS_TS.get_or_init(SystemTime::now);
         let log_file = Arc::new(event_log_path.clone());
-        GlobalExecutor::spawn(Self::record_logs(log_recv, log_file.clone()));
+        GlobalExecutor::spawn(Self::record_logs(log_recv, log_file));
 
         let flush_handle = EventFlushHandle {
             sender: log_sender.clone(),
@@ -3579,8 +3575,12 @@ pub(crate) enum GetEvent {
     /// An upstream peer received a ForwardingAck from a downstream relay.
     ///
     /// When received, `ack_received` is set to `true`, which prevents the GC task
-    /// from launching speculative retries. If the downstream chain then stalls,
-    /// the originator waits the full OPERATION_TTL with no recovery (#3570).
+    /// from launching speculative retries. If the downstream chain then stalls
+    /// (downstream peer never formally disconnects), the originator waits the full
+    /// OPERATION_TTL with no recovery (#3570). Formal disconnect of the immediate
+    /// downstream peer now wakes the parked driver sub-ms via
+    /// `handle_orphaned_transactions` (#4154); the no-recovery window remains for
+    /// silent stalls / slow-loris where no disconnect signal arrives.
     ForwardingAckReceived {
         id: Transaction,
         /// The peer that received the ACK (originator or intermediate relay).
@@ -4416,7 +4416,7 @@ pub(super) mod test {
             let msg_log = NetLogMessage {
                 datetime: Utc::now(),
                 tx: *log.tx,
-                peer_id: peer_id.clone(),
+                peer_id,
                 kind,
             };
             (msg_log, log_id)

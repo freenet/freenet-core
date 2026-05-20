@@ -83,7 +83,7 @@ pub struct StateStore<S: StateStorage> {
 
 impl<S> StateStore<S>
 where
-    S: StateStorage + Send + 'static,
+    S: StateStorage + Send + Sync + 'static,
     <S as StateStorage>::Error: Into<anyhow::Error>,
 {
     /// Create a StateStore with moka caching enabled.

@@ -1,8 +1,7 @@
 use super::*;
 use super::{
     ContractExecutor, ContractRequest, ContractResponse, ExecutorError, InitCheckResult,
-    OpRequestSender, RequestError, Response, SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD,
-    StateStoreError, now_nanos,
+    RequestError, Response, SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD, StateStoreError, now_nanos,
 };
 
 /// Maximum number of related contracts a single validation can request.
@@ -106,8 +105,6 @@ pub struct RuntimePool {
     available: Semaphore,
     /// Configuration for creating new executors
     config: Arc<Config>,
-    /// Channel to send operation requests to the event loop (cloneable, shared by all executors)
-    op_sender: OpRequestSender,
     /// Reference to the operation manager (cloneable, shared by all executors)
     op_manager: Arc<OpManager>,
     /// Total pool size (for health checking)
@@ -130,6 +127,8 @@ pub struct RuntimePool {
     shared_contract_modules: SharedModuleCache<ContractKey>,
     /// Shared compiled delegate module cache.
     shared_delegate_modules: SharedModuleCache<DelegateKey>,
+    /// Shared per-delegate `ctx.write()` cache (see `DelegateContextCache`).
+    shared_delegate_contexts: crate::wasm_runtime::DelegateContextCache,
     /// Shared backend engine used by all executors.
     ///
     /// All executors MUST share the same backend engine because compiled modules
@@ -159,12 +158,10 @@ impl RuntimePool {
     ///
     /// # Arguments
     /// * `config` - Configuration for executors
-    /// * `op_sender` - Channel to send operation requests to the event loop (cloneable)
     /// * `op_manager` - Reference to the operation manager
     /// * `pool_size` - Number of executors to create (typically CPU count)
     pub async fn new(
         config: Arc<Config>,
-        op_sender: OpRequestSender,
         op_manager: Arc<OpManager>,
         pool_size: NonZeroUsize,
     ) -> anyhow::Result<Self> {
@@ -193,6 +190,9 @@ impl RuntimePool {
             Arc::new(Mutex::new(LruCache::new(cache_capacity)));
         let shared_delegate_modules: SharedModuleCache<DelegateKey> =
             Arc::new(Mutex::new(LruCache::new(cache_capacity)));
+        // Shared delegate-context cache so a prompt round-trip routed to a
+        // different pool executor still finds its `ctx.write()` blob.
+        let shared_delegate_contexts = crate::wasm_runtime::new_delegate_context_cache();
 
         // Create shared recovery guard for corrupted-state self-healing.
         // All pool executors share this so recovery tracking is consistent.
@@ -206,10 +206,10 @@ impl RuntimePool {
         let mut first_executor = Executor::from_config_with_shared_modules(
             config.clone(),
             shared_state_store.clone(),
-            Some(op_sender.clone()),
             Some(op_manager.clone()),
             shared_contract_modules.clone(),
             shared_delegate_modules.clone(),
+            shared_delegate_contexts.clone(),
             None, // No shared backend yet — this executor creates the engine
         )
         .await?;
@@ -227,10 +227,10 @@ impl RuntimePool {
             let mut executor = Executor::from_config_with_shared_modules(
                 config.clone(),
                 shared_state_store.clone(),
-                Some(op_sender.clone()),
                 Some(op_manager.clone()),
                 shared_contract_modules.clone(),
                 shared_delegate_modules.clone(),
+                shared_delegate_contexts.clone(),
                 Some(shared_backend_engine.clone()),
             )
             .await?;
@@ -258,7 +258,6 @@ impl RuntimePool {
             runtimes,
             available: Semaphore::new(pool_size_usize),
             config,
-            op_sender,
             op_manager,
             pool_size: pool_size_usize,
             checked_out: AtomicUsize::new(0),
@@ -269,6 +268,7 @@ impl RuntimePool {
             shared_client_counts,
             shared_contract_modules,
             shared_delegate_modules,
+            shared_delegate_contexts,
             shared_backend_engine,
             shared_recovery_guard,
             delegate_notification_tx,
@@ -415,10 +415,10 @@ impl RuntimePool {
         let mut executor = Executor::from_config_with_shared_modules(
             self.config.clone(),
             self.shared_state_store.clone(),
-            Some(self.op_sender.clone()),
             Some(self.op_manager.clone()),
             self.shared_contract_modules.clone(),
             self.shared_delegate_modules.clone(),
+            self.shared_delegate_contexts.clone(),
             Some(self.shared_backend_engine.clone()),
         )
         .await?;
@@ -738,11 +738,6 @@ impl ContractExecutor for RuntimePool {
 // Single Executor Implementation
 // ============================================================================
 
-// `ComputedStateUpdate` and `compute_state_update` were retired together
-// with the network branch of `perform_contract_update` in #1454 phase 5;
-// that branch was unreachable in production because no
-// `OperationMode::Network` constructor exists.
-
 // ============================================================================
 // Bridged methods - shared production logic for Runtime and MockWasmRuntime
 // ============================================================================
@@ -750,7 +745,7 @@ impl ContractExecutor for RuntimePool {
 #[allow(private_bounds)]
 impl<R, S> Executor<R, S>
 where
-    R: crate::wasm_runtime::ContractRuntimeBridge,
+    R: crate::wasm_runtime::ContractRuntimeBridge + Send + Sync,
     S: crate::wasm_runtime::StateStorage + Send + Sync + 'static,
     <S as crate::wasm_runtime::StateStorage>::Error: Into<anyhow::Error>,
 {
@@ -1281,6 +1276,24 @@ where
             });
         }
 
+        // Short-circuit: if the incoming state is byte-identical to the stored
+        // state, there is nothing to merge and no WASM call is needed.  This
+        // is the dominant case for idempotent re-broadcasts (a peer re-pushes
+        // the state it already received) and avoids the spurious
+        // `merge_rejected_valid_local` INFO log that was firing every time the
+        // dedup cache missed an already-current state.  See issue #4151.
+        if let Some(ref full_incoming) = incoming_full_state {
+            if full_incoming.as_ref() == current_state.as_ref() {
+                tracing::debug!(
+                    contract = %key,
+                    state_size = current_state.size(),
+                    event = "merge_skipped_identical",
+                    "Incoming state is byte-identical to stored state — skipping WASM update_state"
+                );
+                return Ok(UpsertResult::NoChange);
+            }
+        }
+
         let mut recovery_performed = false;
         let updated_state = match self
             .attempt_state_update(&params, &current_state, &key, &updates)
@@ -1459,15 +1472,34 @@ where
 
                 // Local state is valid — the merge failure is legitimate, not corruption.
                 if local_valid {
-                    tracing::info!(
-                        contract = %key,
-                        error = %merge_err,
-                        local_state_size = current_state.size(),
-                        incoming_state_size = valid_incoming.size(),
-                        event = "merge_rejected_valid_local",
-                        "Merge rejected incoming state but local state is valid - \
-                         not replacing (incoming state may be stale)"
-                    );
+                    // Downgrade to DEBUG for idempotent re-pushes where the contract's
+                    // merge function correctly rejected the incoming state because its
+                    // version is not newer (e.g. "New state version X must be higher
+                    // than current version X"). These fire on every re-broadcast that
+                    // misses the dedup cache and are not operator-actionable. Any other
+                    // merge failure (OOG, WASM trap, etc.) keeps the INFO level because
+                    // it may indicate a real problem. See issue #4151.
+                    if merge_err.is_invalid_update_rejection() {
+                        tracing::debug!(
+                            contract = %key,
+                            error = %merge_err,
+                            local_state_size = current_state.size(),
+                            incoming_state_size = valid_incoming.size(),
+                            event = "merge_rejected_valid_local",
+                            "Merge rejected incoming state (idempotent re-push, \
+                             incoming version not newer) - not replacing"
+                        );
+                    } else {
+                        tracing::info!(
+                            contract = %key,
+                            error = %merge_err,
+                            local_state_size = current_state.size(),
+                            incoming_state_size = valid_incoming.size(),
+                            event = "merge_rejected_valid_local",
+                            "Merge rejected incoming state but local state is valid - \
+                             not replacing (incoming state may be stale)"
+                        );
+                    }
                     return Err(merge_err);
                 }
 
@@ -2544,14 +2576,13 @@ impl Executor<Runtime> {
     /// Create an Executor for local-only mode (no network operations).
     /// Use this from the binary for local mode execution.
     pub async fn from_config_local(config: Arc<Config>) -> anyhow::Result<Self> {
-        Self::from_config(config, None, None).await
+        Self::from_config(config, None).await
     }
 
     /// Create an Executor with optional network operation support.
     /// This is `pub(crate)` because the parameters involve crate-internal types.
     pub(crate) async fn from_config(
         config: Arc<Config>,
-        op_sender: Option<OpRequestSender>,
         op_manager: Option<Arc<OpManager>>,
     ) -> anyhow::Result<Self> {
         let (contract_store, delegate_store, secret_store, state_store) =
@@ -2562,14 +2593,13 @@ impl Executor<Runtime> {
         Executor::new(
             state_store,
             move || {
-                if let Err(error) = crate::util::set_cleanup_on_exit(config.paths().clone()) {
+                if let Err(error) = crate::util::set_cleanup_on_exit(config.paths()) {
                     tracing::error!("Failed to set cleanup on exit: {error}");
                 }
                 Ok(())
             },
             OperationMode::Local,
             rt,
-            op_sender,
             op_manager,
         )
         .await
@@ -2581,13 +2611,17 @@ impl Executor<Runtime> {
     /// If `shared_backend` is `None`, a new backend engine is created (used for
     /// the first executor in a pool). If `Some`, the provided engine is shared
     /// (used for subsequent executors and replacements).
+    // Each parameter is a distinct shared resource the pool wires through
+    // explicitly; bundling them into a struct just to satisfy the lint
+    // would obscure which executor sees which cache.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn from_config_with_shared_modules(
         config: Arc<Config>,
         shared_state_store: StateStore<Storage>,
-        op_sender: Option<OpRequestSender>,
         op_manager: Option<Arc<OpManager>>,
         contract_modules: SharedModuleCache<ContractKey>,
         delegate_modules: SharedModuleCache<DelegateKey>,
+        delegate_contexts: crate::wasm_runtime::DelegateContextCache,
         shared_backend: Option<BackendEngine>,
     ) -> anyhow::Result<Self> {
         let db = shared_state_store.storage();
@@ -2600,6 +2634,7 @@ impl Executor<Runtime> {
             false,
             contract_modules,
             delegate_modules,
+            delegate_contexts,
             shared_backend.unwrap_or_else(|| {
                 // First executor — create a fresh backend engine; RuntimePool
                 // will extract and share it with subsequent executors.
@@ -2616,7 +2651,6 @@ impl Executor<Runtime> {
             || Ok(()),
             OperationMode::Local,
             rt,
-            op_sender,
             op_manager,
         )
         .await
@@ -3063,24 +3097,14 @@ impl Executor<Runtime> {
             .state_store
             .get(&key)
             .await
-            .map_err(ExecutorError::other)?
-            .clone();
+            .map_err(ExecutorError::other)?;
 
         let updates = vec![update];
 
         // `Executor::contract_requests` is only invoked from `run_local_node`
-        // (HTTP/WS local-only entry points); network-mode UPDATEs from clients
-        // arrive through `client_event_handling` → `start_client_update`
-        // (#1454 phase 4) and never reach this function. The
-        // `OperationMode::Local` short-circuit therefore covers every
-        // production caller.
-        //
-        // Phase 5 final (#1454) deleted the executor-initiated network
-        // UPDATE path (`UpdateContract`, `op_request(UpdateContract)`,
-        // `request_update`, `start_op`) because no `OperationMode::Network`
-        // constructor exists in the tree. The remaining branch returns
-        // an internal error if a future caller flips the mode without
-        // restoring a task-per-tx executor UPDATE driver.
+        // (HTTP/WS local-only entry points). Network-mode UPDATEs from
+        // clients arrive through `client_event_handling` →
+        // `start_client_update` and never reach this function.
         if self.mode == OperationMode::Local {
             let new_state = self
                 .get_updated_state(&parameters, current_state, key, updates)
@@ -3093,8 +3117,8 @@ impl Executor<Runtime> {
         }
 
         Err(ExecutorError::other(anyhow::anyhow!(
-            "executor-initiated network UPDATE path was retired in #1454 phase 5; \
-             clients must dispatch UPDATEs via `start_client_update` (client_events.rs)"
+            "network UPDATE must dispatch via `start_client_update` (client_events.rs); \
+             `perform_contract_update` is reachable only in local mode"
         )))
     }
 
@@ -3461,24 +3485,16 @@ impl Executor<Runtime> {
         if self.mode == OperationMode::Local {
             return Ok(());
         }
-        // Bypass the legacy `op_request` mediator path entirely (#1454
-        // SUBSCRIBE executor migration): driver delivers the resolved
-        // outcome directly through its return value. The executor was
-        // the last legacy writer into `ops.subscribe` for client-style
-        // SUBSCRIBE — once this migrates, the SUBSCRIBE GC retry block
-        // becomes provably dead (mirrors GET phase 5-final pattern).
         let op_manager = self
             .op_manager
             .as_ref()
             .ok_or_else(|| ExecutorError::other(anyhow::anyhow!("missing op_manager")))?;
         let executor_tx = crate::message::Transaction::new::<operations::subscribe::SubscribeMsg>();
-        // 120 s mirrors the legacy `op_request` `OP_REQUEST_TIMEOUT`
-        // (`crates/core/src/contract/executor.rs`, deleted in this
-        // migration). Caps total task lifetime — the inner driver's
-        // per-attempt `OPERATION_TTL = 60 s` would otherwise allow
-        // multi-attempt waits to compound. Any change here should be
-        // checked against the per-attempt budget so `MAX_RETRIES`
-        // attempts can complete within the deadline.
+        // Caps total task lifetime — the inner driver's per-attempt
+        // `OPERATION_TTL = 60 s` would otherwise allow multi-attempt
+        // waits to compound. Any change here should be checked against
+        // the per-attempt budget so `MAX_RETRIES` attempts can complete
+        // within the deadline.
         const SUBSCRIBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
         match tokio::time::timeout(
             SUBSCRIBE_TIMEOUT,
@@ -3511,26 +3527,23 @@ impl Executor<Runtime> {
                 return Ok(Either::Left(state));
             }
         }
-        // Fetch from network via the task-per-tx sub-op GET driver.
-        // Bypasses the legacy `op_request` mediator path entirely
-        // (issue #1454 phase 5 follow-up): driver delivers the
-        // resolved `GetResult` directly through a oneshot.
+        // Fetch from network via the sub-op GET driver. The driver
+        // delivers the resolved `GetResult` directly through a oneshot.
         let op_manager = self
             .op_manager
             .as_ref()
             .ok_or_else(|| ExecutorError::other(anyhow::anyhow!("missing op_manager")))?;
         let (_tx, rx) =
             operations::get::op_ctx_task::start_sub_op_get(op_manager, *id, return_contract_code);
-        // Matches the legacy `op_request` envelope. Outer callers may
-        // wrap this with a tighter budget (e.g.,
+        // Outer callers may wrap this with a tighter budget (e.g.,
         // `fetch_related_for_validation_network` uses
         // `RELATED_FETCH_TIMEOUT = 10s`); when that fires first the
         // receiver is dropped silently and the spawned sub-op task
         // continues until OPERATION_TTL exhausts the retry loop. No
         // leak (oneshot send-after-drop is graceful) — just a
         // longer-lived background task.
-        const OP_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-        let outcome = tokio::time::timeout(OP_REQUEST_TIMEOUT, rx)
+        const SUB_OP_FETCH_TIMEOUT: Duration = Duration::from_secs(120);
+        let outcome = tokio::time::timeout(SUB_OP_FETCH_TIMEOUT, rx)
             .await
             .map_err(|_| {
                 tracing::warn!(
@@ -3741,13 +3754,9 @@ mod resolve_message_origin_tests {
 }
 
 #[cfg(test)]
-mod sub_op_get_migration_pin_tests {
-    /// Pin: `local_state_or_from_network` MUST use the task-per-tx
-    /// sub-op GET driver, not the legacy `op_request(GetContract)`
-    /// path. Regression: legacy path went through the executor
-    /// mediator + `request_get`, pushing GetOp into ops.get and
-    /// keeping the GC speculative-retry block alive for sub-op GETs.
-    /// Migrated in #1454 phase 5 follow-up.
+mod executor_pin_tests {
+    /// Pin: `local_state_or_from_network` MUST use the sub-op GET
+    /// driver.
     #[test]
     fn local_state_or_from_network_uses_sub_op_driver() {
         let src = include_str!("runtime.rs");
@@ -3763,36 +3772,23 @@ mod sub_op_get_migration_pin_tests {
             .expect("closing brace");
         assert!(
             body.contains("start_sub_op_get"),
-            "local_state_or_from_network must call start_sub_op_get — \
-             sub-op GET migration in #1454 phase 5 follow-up"
+            "local_state_or_from_network must call start_sub_op_get"
         );
         // Compose the needles at runtime so the assertion source itself
-        // doesn't trip the pin (matches the pattern used in put.rs).
+        // doesn't trip the pin.
         let get_contract_needle = ["Get", "Contract", " {"].concat();
         assert!(
             !body.contains(&get_contract_needle),
-            "local_state_or_from_network must NOT construct legacy \
-             GetContract — retired in #1454 sub-op GET migration"
+            "local_state_or_from_network must NOT construct GetContract"
         );
         let op_request_needle = ["self.", "op_request"].concat();
         assert!(
             !body.contains(&op_request_needle),
-            "local_state_or_from_network must NOT call self.op_request — \
-             sub-op GET migration bypasses the legacy mediator path"
+            "local_state_or_from_network must NOT call self.op_request"
         );
     }
 
-    /// Pin: `executor::subscribe` MUST use the task-per-tx executor
-    /// SUBSCRIBE driver, not the legacy `op_request(SubscribeContract)`
-    /// path. Regression: legacy path went through the executor mediator
-    /// and called `request_subscribe`, pushing `SubscribeOp` into
-    /// `ops.subscribe` and keeping the SUBSCRIBE GC retry block alive
-    /// for the executor auto-subscribe writer.
-    ///
-    /// Migrated in #1454 SUBSCRIBE executor migration (mirrors the
-    /// GET phase 5-final pattern). The next slice retires the
-    /// SUBSCRIBE GC retry block once relay-side intermediate-peer
-    /// writers are also migrated.
+    /// Pin: `executor::subscribe` MUST use `run_executor_subscribe`.
     #[test]
     fn executor_subscribe_uses_run_executor_subscribe() {
         let src = include_str!("runtime.rs");
@@ -3808,37 +3804,27 @@ mod sub_op_get_migration_pin_tests {
             .expect("closing brace");
         assert!(
             body.contains("run_executor_subscribe"),
-            "executor::subscribe must call run_executor_subscribe — \
-             SUBSCRIBE executor migration (#1454)"
+            "executor::subscribe must call run_executor_subscribe"
         );
         // Compose the needle at runtime so the assertion source itself
         // doesn't trip the pin.
         let sub_contract_needle = ["Subscribe", "Contract", " {"].concat();
         assert!(
             !body.contains(&sub_contract_needle),
-            "executor::subscribe must NOT construct legacy \
-             SubscribeContract — retired in #1454 SUBSCRIBE executor \
-             migration"
+            "executor::subscribe must NOT construct SubscribeContract"
         );
         let op_request_needle = ["self.", "op_request"].concat();
         assert!(
             !body.contains(&op_request_needle),
-            "executor::subscribe must NOT call self.op_request — \
-             SUBSCRIBE executor migration bypasses the legacy mediator \
-             path"
+            "executor::subscribe must NOT call self.op_request"
         );
     }
 
-    /// Pin: `perform_contract_update` MUST NOT construct an
-    /// `UpdateContract` or call `self.op_request` for the network
-    /// branch. Regression: the legacy path went through the executor
-    /// mediator + `request_update`, pushing `UpdateOp` into
-    /// `ops.update` and keeping the legacy state-machine alive even
-    /// though the network branch was unreachable in production
-    /// (no `OperationMode::Network` constructor exists in the tree).
-    /// Retired in #1454 phase 5 final (UPDATE slice).
+    /// Pin: `perform_contract_update` MUST NOT route the network branch
+    /// through `UpdateContract` / `self.op_request` / `request_update`.
+    /// Network-mode UPDATEs flow through `start_client_update`.
     #[test]
-    fn perform_contract_update_does_not_use_legacy_network_path() {
+    fn perform_contract_update_does_not_use_network_op_request() {
         let src = include_str!("runtime.rs");
         let body = src
             .split("async fn perform_contract_update(")
@@ -3853,21 +3839,18 @@ mod sub_op_get_migration_pin_tests {
         let update_contract_needle = ["Update", "Contract", " {"].concat();
         assert!(
             !body.contains(&update_contract_needle),
-            "perform_contract_update must NOT construct legacy \
-             UpdateContract — retired in #1454 phase 5 final"
+            "perform_contract_update must NOT construct UpdateContract"
         );
         let op_request_needle = ["self.", "op_request"].concat();
         assert!(
             !body.contains(&op_request_needle),
-            "perform_contract_update must NOT call self.op_request — \
-             phase 5 final bypassed the legacy mediator path; \
+            "perform_contract_update must NOT call self.op_request; \
              network-mode UPDATEs flow through start_client_update"
         );
         let request_update_needle = ["request_", "update("].concat();
         assert!(
             !body.contains(&request_update_needle),
-            "perform_contract_update must NOT call legacy request_update — \
-             retired in #1454 phase 5 final"
+            "perform_contract_update must NOT call request_update"
         );
     }
 

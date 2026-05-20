@@ -1,73 +1,33 @@
-//! Task-per-transaction client-initiated SUBSCRIBE (#1454 Phase 2b).
+//! Task-per-transaction SUBSCRIBE drivers.
 //!
-//! This module hosts the first production consumer of [`OpCtx::send_and_await`][ocx],
-//! driving a client-initiated SUBSCRIBE end-to-end inside a single spawned
-//! task instead of the legacy re-entry loop through `handle_op_result` +
-//! `OpManager.ops.subscribe` DashMap.
-//!
-//! # Scope (Phase 2b)
-//!
-//! Only the **client-initiated** SUBSCRIBE entry point (via
-//! [`crate::node::subscribe_with_id`]) runs through this module. The other
-//! three entry points stay on the legacy path for reasons documented on
-//! issue #1454 Phase 2b:
-//!
-//! - **Renewals** (`ring.rs::connection_maintenance` loop) — their jitter
-//!   and spam-prevention in `can_request_subscription()` are load-bearing.
-//! - **PUT/GET sub-ops** (`start_subscription_request` and
-//!   `maybe_subscribe_child` in `put/op_ctx_task.rs` /
-//!   `get/op_ctx_task.rs`) — historically used `SubOperationTracker`
-//!   for blocking semantics; migrated to `run_client_subscribe` (PUT
-//!   in Phase 3a, GET in Phase 3b, the legacy
-//!   `auto_subscribe_on_get_response` fallback in the sub-op
-//!   SUBSCRIBE migration follow-up).
-//! - **Intermediate-peer forwarding** (`SubscribeOp::load_or_init` on
-//!   incoming `Request`) — server-side response role; migrated in Phase 5.
-//!
-//! Only the **client-initiated** path goes through `subscribe_with_id`;
-//! the three legacy paths never call it, so migrating the body of
-//! `subscribe_with_id` wholesale is sufficient to gate the new path.
+//! Each entry point — client-initiated, executor auto-subscribe,
+//! renewal, relay — owns its routing state in task locals. There is
+//! no `ops.subscribe` DashMap; per-node dedup is enforced via
+//! `OpManager.active_relay_subscribe_txs`.
 //!
 //! # Architecture
 //!
-//! The task owns all routing state in its locals — there is no
-//! `SubscribeOp` in the `OpManager.ops.subscribe` DashMap for any attempt
-//! this task makes. The task:
-//!
-//! 1. Calls [`super::prepare_initial_request`] to decide target peer vs
+//! 1. [`super::prepare_initial_request`] decides target peer vs
 //!    local-completion vs give-up.
-//! 2. If network target: loops, calling [`OpCtx::send_and_await`][ocx]
-//!    with a **fresh `Transaction` per attempt** (required by
-//!    `send_and_await`'s single-use-per-tx contract). Each attempt
-//!    inserts a capacity-1 reply channel into `p2p_protoc::pending_op_results`
-//!    keyed by the attempt tx; the pure-network-message handler routes
-//!    replies via the SUBSCRIBE bypass added in Phase 2b (see
-//!    `node::try_forward_task_per_tx_reply`).
-//! 3. On `Subscribed`: delivers via `result_router_tx` keyed by the
-//!    **client-visible** `Transaction` (the one returned to the caller
-//!    and registered with `ch_outbound.waiting_for_transaction_result`).
-//! 4. On `NotFound`: applies breadth retry → fresh k_closest round →
-//!    exhaustion, mirroring the legacy retry logic in
-//!    `subscribe::handle_op_response`.
-//! 5. On `send_and_await` timeout: treats the attempt as a peer timeout
-//!    and applies the same retry logic.
+//! 2. Network target: loop calls [`OpCtx::send_and_await`][ocx] with
+//!    a **fresh `Transaction` per attempt** (required by
+//!    `send_and_await`'s single-use-per-tx contract). Replies route
+//!    via the SUBSCRIBE bypass in `handle_pure_network_message_v1`.
+//! 3. `Subscribed` → delivers via `result_router_tx` keyed by
+//!    `client_tx`.
+//! 4. `NotFound` → breadth retry → fresh k_closest → exhaustion.
+//! 5. `send_and_await` timeout → treated as peer timeout.
 //!
 //! # Client-visible tx vs per-attempt tx
 //!
-//! Legacy SUBSCRIBE reuses one `Transaction` end-to-end. Phase 2b splits
-//! this into two tx lifetimes:
+//! - **`client_tx`**: allocated once by the WS handler, registered
+//!   with `ch_outbound.waiting_for_transaction_result`, delivered to
+//!   via `result_router_tx`. Never passed to `send_and_await`.
+//! - **`attempt_tx`**: fresh per retry. Used for the wire Request,
+//!   the `OpCtx`, and the `pending_op_results` callback slot.
 //!
-//! - **`client_tx`**: allocated once by the WS handler, registered with
-//!   `ch_outbound.waiting_for_transaction_result`, delivered to via
-//!   `result_router_tx`. Never passed to `send_and_await`.
-//! - **`attempt_tx`**: fresh per retry. Used for the wire Request, the
-//!   `OpCtx`, and the `pending_op_results` callback slot. Never surfaced
-//!   to the client.
-//!
-//! The split is mandatory: `OpCtx::send_and_await` can only fire once per
-//! Transaction (the `completed` / `under_progress` dedup sets in
-//! `OpManager` suppress second callbacks). Attempt isolation is the
-//! simplest reconciliation with that constraint.
+//! The split is mandatory: `OpCtx::send_and_await` fires once per
+//! Transaction.
 //!
 //! [ocx]: crate::operations::OpCtx::send_and_await
 
@@ -108,7 +68,7 @@ pub(crate) async fn start_client_subscribe(
     tracing::debug!(
         tx = %client_tx,
         contract = %instance_id,
-        "subscribe (task-per-tx): spawning client-initiated task"
+        "subscribe: spawning client-initiated task"
     );
 
     // Spawn the driver. The task is fire-and-forget from this function's
@@ -161,8 +121,8 @@ pub(crate) async fn start_client_subscribe(
 /// Runs inside a spawned task. Never panics — any error is converted into
 /// a `HostResult::Err` and delivered through `result_router_tx`.
 ///
-/// `pub(crate)` so PUT's task-per-tx driver (Phase 3a) can `.await` this
-/// inline for blocking-subscribe children without spawning a separate task.
+/// `pub(crate)` so PUT's driver can `.await` this inline for
+/// blocking-subscribe children without spawning a separate task.
 pub(crate) async fn run_client_subscribe(
     op_manager: Arc<OpManager>,
     instance_id: ContractInstanceId,
@@ -206,7 +166,7 @@ pub(crate) async fn run_client_subscribe(
 ///
 /// Note on the channel-congestion bucket: the legacy `ring.rs` renewal
 /// site only matched [`OpError::NotificationChannelError`] for the
-/// no-penalty arm. The task-per-tx renewal driver also routes
+/// no-penalty arm. The driver renewal driver also routes
 /// [`OpError::NotificationError`] (returned from
 /// [`mpsc::Sender::send`]'s `Err(SendError(_))` via [`OpError::from`])
 /// into [`Self::ChannelCongestion`] because both indicate the same
@@ -233,7 +193,7 @@ pub(crate) enum RenewalOutcome {
 ///
 /// The legacy renewal site at `ring.rs::connection_maintenance` used
 /// `notify_op_change_nonblocking` to fail-fast under congestion of the
-/// 2048-cap event-loop notification channel. The task-per-tx renewal
+/// 2048-cap event-loop notification channel. The driver renewal
 /// driver dispatches each attempt through `OpCtx::send_to_and_await`,
 /// which uses the separate `op_execution_sender` channel; that channel
 /// has its own bound and behaviour, so the legacy fail-fast contract no
@@ -367,7 +327,7 @@ pub(crate) async fn run_executor_subscribe(
             tracing::debug!(
                 %key,
                 tx = %executor_tx,
-                "executor subscribe (task-per-tx): local hit, completing inline"
+                "executor subscribe: local hit, completing inline"
             );
             // Mirror the interest-registration side-effect of
             // `complete_local_subscription` for non-renewal locals.
@@ -541,7 +501,7 @@ async fn drive_client_subscribe_inner(
         tx = %client_tx,
         contract = %instance_id,
         target = %target_addr,
-        "subscribe (task-per-tx): initial target selected, entering retry loop"
+        "subscribe: initial target selected, entering retry loop"
     );
 
     // Initial state for the retry loop. The first iteration uses
@@ -571,7 +531,7 @@ async fn drive_client_subscribe_inner(
             target = %current_target_addr,
             retries,
             attempts_at_hop,
-            "subscribe (task-per-tx): sending attempt"
+            "subscribe: sending attempt"
         );
 
         // Per-attempt telemetry (review finding L4). `prepare_initial_request`
@@ -663,7 +623,7 @@ async fn drive_client_subscribe_inner(
                     attempts_at_hop,
                     outcome = "wire_error",
                     error = %err,
-                    "subscribe (task-per-tx): send_and_await failed; advancing to next peer"
+                    "subscribe: send_and_await failed; advancing to next peer"
                 );
                 match advance_to_next_peer(
                     op_manager,
@@ -707,7 +667,7 @@ async fn drive_client_subscribe_inner(
                     attempts_at_hop,
                     outcome = "timeout",
                     timeout_secs = OPERATION_TTL.as_secs(),
-                    "subscribe (task-per-tx): attempt timed out; advancing to next peer"
+                    "subscribe: attempt timed out; advancing to next peer"
                 );
                 match advance_to_next_peer(
                     op_manager,
@@ -751,7 +711,7 @@ async fn drive_client_subscribe_inner(
                     retries,
                     attempts_at_hop,
                     outcome = "subscribed",
-                    "subscribe (task-per-tx): subscribed"
+                    "subscribe: subscribed"
                 );
 
                 // Feed the routing-prediction model on the client-initiated
@@ -760,7 +720,7 @@ async fn drive_client_subscribe_inner(
                 // payload_transfer_time: ZERO }` so the router's
                 // `response_start_time_estimator` learned from every successful
                 // subscribe (payload_size==0 deliberately skips
-                // `transfer_rate_estimator`). The task-per-tx migration of this
+                // `transfer_rate_estimator`). The migration of this
                 // path stopped emitting any RouteEvent at all, leaving the
                 // response-time estimator with zero observations from
                 // client-initiated subscribes. Restore that feedback so the
@@ -789,7 +749,7 @@ async fn drive_client_subscribe_inner(
                 op_manager.ring.routing_finished(route_event);
                 // Mirror the legacy Response-handler side effects from
                 // `subscribe.rs`'s `SubscribeMsg::Response` arm. The
-                // task-per-tx reply forwarding bypass in `node.rs` skips
+                // driver reply forwarding bypass in `node.rs` skips
                 // `handle_op_request` for terminal Responses, so without
                 // these calls the local interest manager and ring would
                 // never learn about the subscription, breaking
@@ -804,7 +764,7 @@ async fn drive_client_subscribe_inner(
                     .connection_manager
                     .get_peer_by_addr(current_target_addr)
                 {
-                    let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key.clone());
+                    let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key);
                     op_manager
                         .interest_manager
                         .register_peer_interest(&key, peer_key, None, true);
@@ -837,7 +797,7 @@ async fn drive_client_subscribe_inner(
                     retries,
                     attempts_at_hop,
                     outcome = "not_found",
-                    "subscribe (task-per-tx): NotFound from peer; advancing to next peer"
+                    "subscribe: NotFound from peer; advancing to next peer"
                 );
                 match advance_to_next_peer(
                     op_manager,
@@ -870,7 +830,7 @@ async fn drive_client_subscribe_inner(
                 tracing::warn!(
                     tx = %client_tx,
                     attempt_tx = %attempt_tx,
-                    "subscribe (task-per-tx): unexpected terminal reply"
+                    "subscribe: unexpected terminal reply"
                 );
                 return Err(OpError::UnexpectedOpState);
             }
@@ -903,9 +863,8 @@ fn classify_reply(msg: &NetMessage) -> ReplyClass {
     }
 }
 
-/// Advance the task-local routing state to the next peer to try, mirroring
-/// the legacy `subscribe::handle_op_response` NotFound + alternatives-exhausted
-/// logic (`subscribe.rs` ~1675–1842 before Phase 2b).
+/// Advance the task-local routing state to the next peer to try
+/// (NotFound + alternatives-exhausted logic).
 ///
 /// Thin wrapper around [`advance_to_next_peer_impl`] that binds the
 /// `fresh_candidates` hook to `op_manager.ring.k_closest_potentially_hosting`.
@@ -985,7 +944,7 @@ where
                     %instance_id,
                     target = %addr,
                     attempts_at_hop = *attempts_at_hop,
-                    "subscribe (task-per-tx): breadth retry with next alternative"
+                    "subscribe: breadth retry with next alternative"
                 );
                 return Some((candidate, addr));
             }
@@ -1012,7 +971,7 @@ where
                     %instance_id,
                     target = %addr,
                     retries = *retries,
-                    "subscribe (task-per-tx): fresh k_closest round found new target"
+                    "subscribe: fresh k_closest round found new target"
                 );
                 return Some((candidate, addr));
             }
@@ -1021,7 +980,7 @@ where
         tracing::debug!(
             %instance_id,
             retries = *retries,
-            "subscribe (task-per-tx): fresh k_closest round returned no usable candidates"
+            "subscribe: fresh k_closest round returned no usable candidates"
         );
     }
 
@@ -1067,7 +1026,7 @@ fn deliver_outcome(
     outcome: DriverOutcome,
 ) {
     // Dashboard op_stats SUBSCRIBE counter (issue #4010). The legacy
-    // `report_result` recording path is bypassed for task-per-tx
+    // `report_result` recording path is bypassed for driver
     // terminal replies (see `node::record_op_result` rustdoc), so
     // every terminal outcome must be recorded here.
     //
@@ -1092,7 +1051,7 @@ fn deliver_outcome(
         DriverOutcome::SkipAlreadyDelivered => {
             tracing::debug!(
                 tx = %client_tx,
-                "subscribe (task-per-tx): local completion already published; \
+                "subscribe: local completion already published; \
                  skipping result_router_tx"
             );
         }
@@ -1101,7 +1060,7 @@ fn deliver_outcome(
                 tx = %client_tx,
                 contract = %instance_id,
                 error = %err,
-                "subscribe (task-per-tx): infrastructure error; \
+                "subscribe: infrastructure error; \
                  publishing synthesized client error"
             );
             let synthesized: HostResult = Err(ErrorKind::OperationError {
@@ -1113,7 +1072,7 @@ fn deliver_outcome(
     }
 }
 
-// ── Relay SUBSCRIBE driver (#1454 phase 5 follow-up slice A) ─────────────────
+// ── Relay SUBSCRIBE driver ───────────────────────────────────────────────────
 
 /// Counter: relay SUBSCRIBE drivers currently in flight. Decremented in
 /// the RAII guard on driver exit. Diagnostic for `FREENET_MEMORY_STATS`.
@@ -1135,45 +1094,26 @@ pub static RELAY_SUBSCRIBE_DEDUP_REJECTS: std::sync::atomic::AtomicUsize =
 
 /// Counter: number of times `start_relay_subscribe` was invoked. Used by
 /// structural pin tests to prove the dispatch gate routes fresh inbound
-/// `SubscribeMsg::Request` through the task-per-tx driver rather than
+/// `SubscribeMsg::Request` through the driver rather than
 /// legacy `handle_op_request`.
 #[cfg(any(test, feature = "testing"))]
 pub static RELAY_SUBSCRIBE_DRIVER_CALL_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
-/// Spawn a relay driver for a fresh inbound `SubscribeMsg::Request`.
+/// Spawn a relay driver for a fresh inbound
+/// `SubscribeMsg::Request`.
 ///
-/// Gated by the dispatch site in `node.rs::handle_pure_network_message_v1`
-/// on `source_addr.is_some() && !has_subscribe_op(id)`. The driver owns
-/// local-hit response + single downstream forward + upstream bubble-up
-/// in its task locals — no `SubscribeOp` is stored in
-/// `OpManager.ops.subscribe` for this transaction.
+/// The driver owns local-hit response + single downstream forward +
+/// upstream bubble-up in its task locals.
 ///
-/// # Slice A
+/// Notable omissions:
 ///
-/// Migrated:
-/// - `SubscribeMsg::Request` relay arm: has-contract check (including the
-///   brief wait-for-in-flight-PUT helper), `register_downstream_subscriber`
-///   on local hit, forward-and-await-Response on next hop, bubble
-///   `SubscribeMsg::Response` back upstream after registering the
-///   requester as a downstream subscriber.
-/// - `ForwardingAck` OMITTED deliberately — same reasoning as GET/PUT/
-///   UPDATE slice A: the ack shares `incoming_tx` with the reply and
-///   would satisfy upstream's capacity-1 `pending_op_results` waiter
-///   before the real `Response`.
-/// - Cross-peer retries OMITTED at the relay — legacy breadth/retry loop
-///   at relay hops is the phase-5 memory-explosion amplifier (see
-///   `project_1454_phase5_memory.md`). Originator-side driver (Phase 2b)
-///   owns cross-peer retry; relay forwards once.
-///
-/// NOT migrated (stays on legacy path):
-/// - `SubscribeMsg::Response` originator arm (Phase 2b driver handles it
-///   via `pending_op_results` bypass).
-/// - `SubscribeMsg::Unsubscribe` and `SubscribeMsg::ForwardingAck` — fire
-///   and forget fast-path, no op state needed.
-/// - Renewals, PUT sub-op subscribes, and intermediate-peer forwarding
-///   through renewal/executor entry points — no `source_addr` or
-///   pre-existing `SubscribeOp` makes them fall through.
+/// - `ForwardingAck` is NOT emitted — the ack shares `incoming_tx`
+///   with the reply and would satisfy upstream's capacity-1
+///   `pending_op_results` waiter before the real `Response`.
+/// - Cross-peer retries are NOT attempted at the relay — the relay
+///   breadth/retry loop was the memory-explosion amplifier (see
+///   `project_1454_phase5_memory.md`). Originator owns retry.
 pub(crate) async fn start_relay_subscribe(
     op_manager: Arc<OpManager>,
     incoming_tx: Transaction,
@@ -1193,7 +1133,7 @@ pub(crate) async fn start_relay_subscribe(
             %instance_id,
             %upstream_addr,
             phase = "relay_subscribe_dedup_reject",
-            "SUBSCRIBE relay (task-per-tx): duplicate Request for in-flight tx, replying NotFound"
+            "SUBSCRIBE relay: duplicate Request for in-flight tx, replying NotFound"
         );
         // Emit an immediate `NotFound` back to the rejected upstream so
         // its `send_to_and_await` returns fast instead of stalling the
@@ -1216,7 +1156,7 @@ pub(crate) async fn start_relay_subscribe(
                 tx = %incoming_tx,
                 %upstream_addr,
                 error = %err,
-                "SUBSCRIBE relay (task-per-tx): dedup-reject NotFound send failed"
+                "SUBSCRIBE relay: dedup-reject NotFound send failed"
             );
         }
         return Ok(());
@@ -1241,7 +1181,7 @@ pub(crate) async fn start_relay_subscribe(
         %upstream_addr,
         is_renewal,
         phase = "relay_subscribe_start",
-        "SUBSCRIBE relay (task-per-tx): spawning driver"
+        "SUBSCRIBE relay: spawning driver"
     );
 
     GlobalExecutor::spawn(run_relay_subscribe(
@@ -1304,7 +1244,7 @@ async fn run_relay_subscribe(
             %instance_id,
             error = %err,
             phase = "relay_subscribe_error",
-            "SUBSCRIBE relay (task-per-tx): driver returned error"
+            "SUBSCRIBE relay: driver returned error"
         );
     }
 
@@ -1326,13 +1266,13 @@ async fn run_relay_subscribe(
 /// target_peer, contract_location, request_sent_at }` to the
 /// `AwaitingResponse` state so that downstream timeouts (reported via
 /// `handle_abort`) fed `PeerHealthTracker` and the failure estimator.
-/// The task-per-tx driver DROPS this signal on the relay node: on
+/// The driver DROPS this signal on the relay node: on
 /// `send_to_and_await` timeout we bubble `NotFound` upstream and exit
 /// without touching `PeerHealthTracker`.
 ///
 /// This is deliberate for slice A. Cross-peer retry at the relay was
 /// the phase-5 memory-explosion amplifier (see `project_1454_phase5_memory.md`
-/// and PR #3896's fix stack) — the task-per-tx design moves ALL
+/// and PR #3896's fix stack) — the driver design moves ALL
 /// cross-peer retry to the originator's client-init driver. The
 /// originator's `send_to_and_await` timeout path there is the correct
 /// site for peer-health updates; reporting them at a relay that does
@@ -1360,7 +1300,7 @@ async fn drive_relay_subscribe(
         %upstream_addr,
         is_renewal,
         phase = "relay_subscribe_request",
-        "SUBSCRIBE relay (task-per-tx): processing Request"
+        "SUBSCRIBE relay: processing Request"
     );
 
     // ── Step 1: Local-hit fast path (with brief wait-for-in-flight-PUT) ──
@@ -1372,7 +1312,7 @@ async fn drive_relay_subscribe(
     .await?
     {
         // Register the subscribing peer as a downstream subscriber.
-        // The relay task-per-tx path does not know the requester's
+        // The relay driver path does not know the requester's
         // `TransportPublicKey` (the legacy path had it because the op
         // state carried `requester_pub_key`); `register_downstream_subscriber`
         // falls back to addr-based lookup in that case, which is adequate
@@ -1384,7 +1324,7 @@ async fn drive_relay_subscribe(
             None,
             Some(upstream_addr),
             &incoming_tx,
-            " (task-per-tx relay local hit)",
+            " (driver relay local hit)",
         )
         .await;
 
@@ -1393,7 +1333,7 @@ async fn drive_relay_subscribe(
             contract = %key,
             is_renewal,
             phase = "relay_subscribe_local_hit",
-            "SUBSCRIBE relay (task-per-tx): fulfilled locally, sending Response"
+            "SUBSCRIBE relay: fulfilled locally, sending Response"
         );
         return relay_subscribe_send_response(
             op_manager,
@@ -1412,7 +1352,7 @@ async fn drive_relay_subscribe(
             contract = %instance_id,
             htl = 0,
             phase = "relay_subscribe_not_found",
-            "SUBSCRIBE relay (task-per-tx): HTL exhausted"
+            "SUBSCRIBE relay: HTL exhausted"
         );
         if let Some(event) = crate::tracing::NetEventLog::subscribe_not_found(
             &incoming_tx,
@@ -1452,7 +1392,7 @@ async fn drive_relay_subscribe(
             tx = %incoming_tx,
             contract = %instance_id,
             phase = "relay_subscribe_not_found",
-            "SUBSCRIBE relay (task-per-tx): no closer peers to forward"
+            "SUBSCRIBE relay: no closer peers to forward"
         );
         if let Some(event) = crate::tracing::NetEventLog::subscribe_not_found(
             &incoming_tx,
@@ -1483,7 +1423,7 @@ async fn drive_relay_subscribe(
                 tx = %incoming_tx,
                 %instance_id,
                 target_pub_key = %next_hop.pub_key(),
-                "SUBSCRIBE relay (task-per-tx): next hop has no socket address"
+                "SUBSCRIBE relay: next hop has no socket address"
             );
             return relay_subscribe_send_response(
                 op_manager,
@@ -1519,7 +1459,7 @@ async fn drive_relay_subscribe(
         peer_addr = %next_addr,
         htl = new_htl,
         phase = "relay_subscribe_forward",
-        "SUBSCRIBE relay (task-per-tx): forwarding to next hop"
+        "SUBSCRIBE relay: forwarding to next hop"
     );
 
     let forward = NetMessage::from(SubscribeMsg::Request {
@@ -1547,7 +1487,7 @@ async fn drive_relay_subscribe(
                 %instance_id,
                 target = %next_addr,
                 error = %err,
-                "SUBSCRIBE relay (task-per-tx): send_to_and_await failed"
+                "SUBSCRIBE relay: send_to_and_await failed"
             );
             crate::operations::record_relay_route_event(
                 op_manager,
@@ -1571,7 +1511,7 @@ async fn drive_relay_subscribe(
                 %instance_id,
                 target = %next_addr,
                 timeout_secs = OPERATION_TTL.as_secs(),
-                "SUBSCRIBE relay (task-per-tx): downstream timed out"
+                "SUBSCRIBE relay: downstream timed out"
             );
             crate::operations::record_relay_route_event(
                 op_manager,
@@ -1614,7 +1554,7 @@ async fn drive_relay_subscribe(
                 None,
                 Some(upstream_addr),
                 &incoming_tx,
-                " (task-per-tx relay registration on Response)",
+                " (driver relay registration on Response)",
             )
             .await;
 
@@ -1622,7 +1562,7 @@ async fn drive_relay_subscribe(
                 tx = %incoming_tx,
                 contract = %key,
                 phase = "relay_subscribe_bubble",
-                "SUBSCRIBE relay (task-per-tx): downstream Subscribed; bubbling upstream"
+                "SUBSCRIBE relay: downstream Subscribed; bubbling upstream"
             );
             crate::operations::record_relay_route_event(
                 op_manager,
@@ -1645,7 +1585,7 @@ async fn drive_relay_subscribe(
                 tx = %incoming_tx,
                 %instance_id,
                 phase = "relay_subscribe_bubble_not_found",
-                "SUBSCRIBE relay (task-per-tx): downstream NotFound; bubbling upstream"
+                "SUBSCRIBE relay: downstream NotFound; bubbling upstream"
             );
             crate::operations::record_relay_route_event(
                 op_manager,
@@ -1664,7 +1604,7 @@ async fn drive_relay_subscribe(
                 tx = %incoming_tx,
                 %instance_id,
                 reply_variant = ?std::mem::discriminant(&other),
-                "SUBSCRIBE relay (task-per-tx): unexpected reply variant; treating as NotFound"
+                "SUBSCRIBE relay: unexpected reply variant; treating as NotFound"
             );
             SubscribeMsgResult::NotFound
         }
@@ -2042,10 +1982,9 @@ mod tests {
         assert!(alt_addrs.contains(&p3_addr));
     }
 
-    // ── Relay SUBSCRIBE driver structural pin tests (#1454 phase 5
-    // follow-up slice A). Anchor on the `start_relay_subscribe`
-    // entry-point fn so module-level docs referencing variant names
-    // don't contaminate the scan.
+    // ── Relay SUBSCRIBE driver structural pin tests. Anchor on
+    // the `start_relay_subscribe` entry-point fn so module-level
+    // docs referencing variant names don't contaminate the scan.
 
     fn relay_section(src: &str) -> &str {
         let start = src
@@ -2294,7 +2233,7 @@ mod tests {
         );
     }
 
-    // ── classify_renewal_result tests (#1454 SUBSCRIBE renewal slice) ────
+    // ── classify_renewal_result tests ────────────────────────────────────
     //
     // The renewal classifier is the load-bearing decision point for
     // backoff bookkeeping. Misclassification of a transient channel error
@@ -2413,8 +2352,7 @@ mod tests {
         ));
     }
 
-    // ── classify_executor_subscribe_result tests (#1454 SUBSCRIBE
-    //    executor migration) ───────────────────────────────────────────
+    // ── classify_executor_subscribe_result tests ─────────────────────
     //
     // Executor auto-subscribe delivers Result<(), OpError> directly.
     // These pin the mapping so a future `OpError` / `DriverOutcome`
@@ -2485,7 +2423,7 @@ mod tests {
         }
     }
 
-    // ── run_executor_subscribe body pin tests (#1454) ────────────────
+    // ── run_executor_subscribe body pin tests ─────────────────────────
     //
     // Behavioral end-to-end tests of `run_executor_subscribe` would
     // require spinning a full `OpManager` (no shared test fixture
@@ -2584,7 +2522,7 @@ mod tests {
     }
 
     /// Issue #4010: `deliver_outcome` must record the SUBSCRIBE outcome
-    /// to the dashboard `op_stats.subscribes` counter (the task-per-tx
+    /// to the dashboard `op_stats.subscribes` counter (the driver
     /// bypass at `handle_pure_network_message_v1` skips the legacy
     /// `report_result` recording path), and it must NOT record sub-op
     /// SUBSCRIBE attempts (those are background plumbing spawned by
@@ -2604,7 +2542,7 @@ mod tests {
         assert!(
             body.contains("record_op_result"),
             "deliver_outcome must call record_op_result so the dashboard \
-             SUBSCRIBE counter advances on task-per-tx terminal replies. \
+             SUBSCRIBE counter advances on driver terminal replies. \
              Issue #4010."
         );
         assert!(

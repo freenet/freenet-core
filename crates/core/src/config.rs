@@ -22,7 +22,12 @@ use crate::{
     transport::{CongestionControlAlgorithm, CongestionControlConfig, TransportKeypair},
 };
 
+pub(crate) mod kek;
 mod secret;
+pub use kek::{
+    KEK_SIZE, KekBackend, KekBackendKind, KekError, ensure_kek_loaded, load_from_backend,
+    read_backend_marker, replace_backend_marker, resolve_first_start, write_backend_marker,
+};
 pub use secret::*;
 
 /// Default maximum number of connections for the peer.
@@ -56,6 +61,7 @@ static ASYNC_RT: LazyLock<Option<Runtime>> = LazyLock::new(GlobalExecutor::initi
 
 const DEFAULT_TRANSIENT_BUDGET: usize = 2048;
 const DEFAULT_TRANSIENT_TTL_SECS: u64 = 30;
+const DEFAULT_EVENT_LOOP_CHANNEL_CAPACITY: usize = 2048;
 
 const QUALIFIER: &str = "";
 const ORGANIZATION: &str = "The Freenet Project Inc";
@@ -120,6 +126,7 @@ impl Default for ConfigArgs {
                 total_bandwidth_limit: None,
                 min_bandwidth_per_connection: None,
                 blocked_addresses: None,
+                event_loop_channel_capacity: None,
                 transient_budget: Some(DEFAULT_TRANSIENT_BUDGET),
                 transient_ttl_secs: Some(DEFAULT_TRANSIENT_TTL_SECS),
                 min_connections: None,
@@ -197,9 +204,9 @@ impl ConfigArgs {
                             std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
                         })?;
                         let secrets = Self::read_secrets(
-                            config.secrets.transport_keypair_path,
-                            config.secrets.nonce_path,
-                            config.secrets.cipher_path,
+                            config.secrets.transport_keypair_path.clone(),
+                            config.secrets.nonce_path.clone(),
+                            config.secrets.cipher_path.clone(),
                         )?;
                         config.secrets = secrets;
                         Ok(Some(config))
@@ -208,9 +215,9 @@ impl ConfigArgs {
                         let mut file = File::open(&path)?;
                         let mut config = serde_json::from_reader::<_, Config>(&mut file)?;
                         let secrets = Self::read_secrets(
-                            config.secrets.transport_keypair_path,
-                            config.secrets.nonce_path,
-                            config.secrets.cipher_path,
+                            config.secrets.transport_keypair_path.clone(),
+                            config.secrets.nonce_path.clone(),
+                            config.secrets.cipher_path.clone(),
                         )?;
                         config.secrets = secrets;
                         Ok(Some(config))
@@ -603,6 +610,10 @@ impl ConfigArgs {
                     .network_api
                     .blocked_addresses
                     .map(|addrs| addrs.into_iter().collect()),
+                event_loop_channel_capacity: self
+                    .network_api
+                    .event_loop_channel_capacity
+                    .unwrap_or_else(default_event_loop_channel_capacity),
                 transient_budget: self
                     .network_api
                     .transient_budget
@@ -903,6 +914,16 @@ pub struct NetworkArgs {
     #[arg(long, num_args = 0..)]
     pub blocked_addresses: Option<Vec<SocketAddr>>,
 
+    /// Capacity for the event loop notification and op execution channels.
+    /// Default: 2048. Increase under sustained multi-client load to reduce
+    /// channel saturation and associated context-switch spikes.
+    #[arg(long, env = "EVENT_LOOP_CHANNEL_CAPACITY")]
+    #[serde(
+        rename = "event-loop-channel-capacity",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub event_loop_channel_capacity: Option<usize>,
+
     /// Maximum number of concurrent transient connections accepted by a gateway.
     #[arg(long, env = "TRANSIENT_BUDGET")]
     #[serde(rename = "transient-budget", skip_serializing_if = "Option::is_none")]
@@ -1126,6 +1147,12 @@ pub struct NetworkApiConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blocked_addresses: Option<HashSet<SocketAddr>>,
 
+    /// Capacity for the event loop notification and op execution channels.
+    /// Default: 2048. Increase under sustained multi-client load to reduce
+    /// channel saturation and associated context-switch spikes.
+    #[serde(default = "default_event_loop_channel_capacity")]
+    pub event_loop_channel_capacity: usize,
+
     /// Maximum number of concurrent transient connections accepted by a gateway.
     #[serde(default = "default_transient_budget", rename = "transient-budget")]
     pub transient_budget: usize,
@@ -1228,6 +1255,10 @@ use port_allocation::find_available_port;
 
 pub fn default_network_api_port() -> u16 {
     find_available_port().unwrap_or(31337) // Fallback to 31337 if we can't find a random port
+}
+
+pub(crate) fn default_event_loop_channel_capacity() -> usize {
+    DEFAULT_EVENT_LOOP_CHANNEL_CAPACITY
 }
 
 fn default_transient_budget() -> usize {

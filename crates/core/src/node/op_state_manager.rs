@@ -25,18 +25,13 @@ use crate::{
     client_events::HostResult,
     config::GlobalExecutor,
     contract::{ContractError, ContractHandlerChannel, ContractHandlerEvent, SenderHalve},
-    message::{
-        InterestMessage, MessageStats, NetMessage, NetMessageV1, NodeEvent, Transaction,
-        TransactionType,
-    },
+    message::{InterestMessage, MessageStats, NetMessage, NetMessageV1, NodeEvent, Transaction},
     operations::{
-        OpCtx, OpEnum, OpError,
-        connect::{ConnectForwardEstimator, ConnectOp, ConnectState},
-        orphan_streams::OrphanStreamRegistry,
+        OpCtx, OpError, connect::ConnectForwardEstimator, orphan_streams::OrphanStreamRegistry,
     },
     ring::{
-        ConnectionFailureReason, ConnectionManager, LiveTransactionTracker, PeerConnectionBackoff,
-        PeerKey, PeerKeyLocation, Ring,
+        ConnectionManager, LiveTransactionTracker, PeerConnectionBackoff, PeerKey, PeerKeyLocation,
+        Ring,
     },
     transport::TransportPublicKey,
     util::time_source::InstantTimeSrc,
@@ -47,34 +42,12 @@ use super::{
     network_bridge::EventLoopNotificationsSender,
 };
 
-#[cfg(debug_assertions)]
-macro_rules! check_id_op {
-    ($get_ty:expr, $var:path) => {
-        if !matches!($get_ty, $var) {
-            return Err(OpError::IncorrectTxType($var, $get_ty));
-        }
-    };
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum OpNotAvailable {
-    #[error("operation running")]
-    Running,
-    #[error("operation completed")]
-    Completed,
-}
-
 #[derive(Default)]
 struct Ops {
-    connect: DashMap<Transaction, crate::operations::connect::ConnectOp>,
-    // `get`, `put`, `update` and `subscribe` DashMaps retired in #1454
-    // phase 5 final (UPDATE slice, PUT slice, GET slice, SUBSCRIBE
-    // slice): every wire path (client + non-streaming relay + streaming
-    // relay) now runs on `op_ctx_task::*` task-per-tx drivers that own
-    // their state in task locals. The legacy `Operation` impls, the
-    // `request_*` / `start_op*` originator helpers, and the
-    // `OpEnum::{Get,Put,Update,Subscribe}` carriers were deleted in
-    // earlier commits.
+    // No per-op DashMaps remain. CONNECT, GET, PUT, UPDATE, and
+    // SUBSCRIBE all run on drivers that own state in task
+    // locals; the only state retained here is the global completed /
+    // under_progress sets used by the GC sweep.
     completed: DashSet<Transaction>,
     under_progress: DashSet<Transaction>,
 }
@@ -85,7 +58,6 @@ struct Ops {
 /// run.
 #[derive(Debug, Default)]
 struct OpsSizes {
-    connect: usize,
     completed: usize,
     under_progress: usize,
 }
@@ -93,7 +65,6 @@ struct OpsSizes {
 impl Ops {
     fn sizes(&self) -> OpsSizes {
         OpsSizes {
-            connect: self.connect.len(),
             completed: self.completed.len(),
             under_progress: self.under_progress.len(),
         }
@@ -148,8 +119,8 @@ pub(crate) struct OpManager {
     /// Backoff tracker for failed gateway connection attempts.
     /// Used to implement exponential backoff when retrying connections.
     pub gateway_backoff: Arc<Mutex<PeerConnectionBackoff>>,
-    /// Notifies `initial_join_procedure` and `handle_aborted_op` when gateway
-    /// backoff is cleared, so they can wake from backoff sleeps and retry immediately.
+    /// Notifies `initial_join_procedure` when gateway backoff is cleared,
+    /// so it can wake from backoff sleep and retry immediately.
     pub gateway_backoff_cleared: Arc<tokio::sync::Notify>,
     /// Addresses blocked by local policy. Used by the connect protocol to reject
     /// join requests from blocked peers at the routing level, allowing the uphill
@@ -164,7 +135,7 @@ pub(crate) struct OpManager {
     /// Maps contract instance ID to the timestamp (ms since epoch via GlobalSimulationTime)
     /// when the fetch was initiated, with a cooldown to avoid repeated fetch attempts.
     pub(crate) pending_contract_fetches: Arc<DashMap<ContractInstanceId, u64>>,
-    /// Transactions with an active task-per-tx relay-GET driver at this
+    /// Transactions with an active driver relay-GET driver at this
     /// node. Populated by `start_relay_get` before spawn and removed by
     /// an RAII guard on the driver task. Consulted by the dispatch gate
     /// in `node.rs` to reject duplicate inbound Requests for a tx that
@@ -172,46 +143,31 @@ pub(crate) struct OpManager {
     /// amplification observed in workflow run 24600634908 (6.8M spawns
     /// in 100s, 63GB RSS).
     pub(crate) active_relay_get_txs: Arc<DashSet<Transaction>>,
-    /// Set of transactions currently being driven by a relay UPDATE
-    /// task-per-tx driver on this node. Same role as
-    /// `active_relay_get_txs` but for UPDATE relay (#1454 phase 5
-    /// follow-up). UPDATE relay has no retry loop and no upstream
-    /// reply, so the amplification risk is structurally lower than GET
-    /// — the dedup gate exists primarily for robustness against
-    /// GC-spawned re-entries and routing-bloom false-positive
-    /// retransmissions.
+    /// Same role as `active_relay_get_txs` but for UPDATE relay.
+    /// UPDATE relay has no retry loop and no upstream reply, so the
+    /// amplification risk is structurally lower than GET — the gate
+    /// exists primarily for robustness against GC-spawned re-entries
+    /// and routing-bloom false-positive retransmissions.
     pub(crate) active_relay_update_txs: Arc<DashSet<Transaction>>,
-    /// Set of transactions currently being driven by a relay PUT
-    /// task-per-tx driver on this node. Same role as
-    /// `active_relay_get_txs` but for PUT relay (#1454 phase 5
-    /// follow-up slice A). PUT relay has req/response semantics like
-    /// GET (but forwards once — no per-hop retry), so the amplification
-    /// risk is comparable to GET. The dedup gate rejects duplicate
-    /// inbound `PutMsg::Request` for a tx that already has a live
-    /// relay driver — prevents GC-spawned re-entries and routing-bloom
-    /// false-positive retransmissions from spawning redundant drivers.
+    /// Same role as `active_relay_get_txs` but for PUT relay. PUT
+    /// relay has req/response semantics like GET (but forwards once
+    /// — no per-hop retry), so amplification risk is comparable.
+    /// Rejects duplicate inbound `PutMsg::Request` for a tx that
+    /// already has a live driver.
     pub(crate) active_relay_put_txs: Arc<DashSet<Transaction>>,
-    /// Set of transactions currently being driven by a relay SUBSCRIBE
-    /// task-per-tx driver on this node. Same role as
-    /// `active_relay_get_txs` but for SUBSCRIBE relay (#1454 phase 5
-    /// follow-up slice A). SUBSCRIBE relay has req/response semantics
-    /// like GET/PUT but forwards once — no per-hop retry — because the
-    /// client-init driver (Phase 2b) owns cross-peer retry. The dedup
-    /// gate rejects duplicate inbound `SubscribeMsg::Request` for a tx
-    /// that already has a live relay driver.
+    /// Same role as `active_relay_get_txs` but for SUBSCRIBE relay.
+    /// SUBSCRIBE relay forwards once — no per-hop retry — because
+    /// the client driver owns cross-peer retry. Rejects duplicate
+    /// inbound `SubscribeMsg::Request`.
     pub(crate) active_relay_subscribe_txs: Arc<DashSet<Transaction>>,
-    /// Set of transactions currently being driven by a relay CONNECT
-    /// task-per-tx driver on this node. Same role as
-    /// `active_relay_get_txs` but for CONNECT relay (#1454 phase 2c
-    /// slice 1). The dedup gate rejects duplicate inbound
-    /// `ConnectMsg::Request` for a tx that already has a live relay
-    /// driver — prevents bloom-filter rekey re-entries and
-    /// uphill-retry false-positive retransmissions from spawning
-    /// redundant drivers. Phase 2c slice 1 covers the
-    /// Request→Response forward path; Rejected within-relay retries
-    /// and ConnectFailed downstream propagation stay on legacy
-    /// `process_message`, gated by the dedup set's absence on those
-    /// branches.
+    /// Same role as `active_relay_get_txs` but for CONNECT relay.
+    /// Rejects duplicate inbound `ConnectMsg::Request` — prevents
+    /// bloom-filter rekey re-entries and uphill-retry false-positive
+    /// retransmissions from spawning
+    /// redundant drivers. The driver covers the Request→Response
+    /// forward path; Rejected within-relay retries and ConnectFailed
+    /// downstream propagation stay on legacy `process_message`, gated
+    /// by the dedup set's absence on those branches.
     pub(crate) active_relay_connect_txs: Arc<DashSet<Transaction>>,
 }
 
@@ -300,7 +256,6 @@ impl OpManager {
                     event_register,
                     result_router_tx.clone(),
                     request_router.clone(),
-                    ring.clone(),
                     contract_waiters.clone(),
                     pending_contract_fetches.clone(),
                     active_relay_get_txs.clone(),
@@ -423,16 +378,24 @@ impl OpManager {
         }
     }
 
+    /// Non-blocking variant of [`Self::release_pending_op_slot`] for callers
+    /// that run on the network event loop (where `send().await` could
+    /// deadlock). Used by `P2pBridge::handle_orphaned_transactions` to wake
+    /// drivers whose downstream peer has just disconnected (#4154). The
+    /// notification is best-effort: on a transiently-full channel the
+    /// driver falls back to its `OPERATION_TTL` timeout. See
+    /// [`try_release_pending_op_slot_on`] for the underlying send logic.
+    pub(crate) fn try_release_pending_op_slot(&self, tx: Transaction) {
+        try_release_pending_op_slot_on(&self.to_event_listener.notifications_sender, tx);
+    }
+
     /// Timeout for sending notifications to the event loop.
     /// If the channel is full for this long, the event loop is stuck and sending will never succeed.
     const NOTIFICATION_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
-    // `notify_op_change` was the legacy state-machine re-entry primitive
-    // (push to ops DashMap + send NetMessage on notifications channel).
-    // Retired in #1454 phase 5 final after all five ops (GET/PUT/UPDATE/
-    // SUBSCRIBE + CONNECT relay) migrated to task-per-tx drivers that
-    // route outbound messages through `op_execution_sender` and own
-    // their own state in task locals.
+    // `notify_op_change` (legacy state-machine re-entry primitive)
+    // is gone: every op routes outbound messages through
+    // `op_execution_sender` and owns its state in task locals.
 
     // An early, fast path, return for communicating events in the node to the main message handler,
     // without any transmission in the network whatsoever and avoiding any state transition.
@@ -534,12 +497,8 @@ impl OpManager {
             instance_id,
         });
 
-        // #1454 phase 5 final (SUBSCRIBE slice): fire-and-forget the
-        // Unsubscribe wire message through OpCtx. The legacy path pushed
-        // a synthetic SubscribeOp into `ops.subscribe` so the event
-        // loop's `peek_next_hop_addr` SUBSCRIBE arm could recover the
-        // target address; both that arm and the DashMap were retired in
-        // this slice. The op-execution channel routes directly to
+        // Fire-and-forget the Unsubscribe wire message through
+        // `OpCtx`. The op-execution channel routes directly to
         // `OutboundMessageWithTarget` given `Some(target_addr)`, so no
         // operation state is required (Unsubscribe has no reply).
         let mut ctx = self.op_ctx(tx);
@@ -568,12 +527,10 @@ impl OpManager {
 
     /// Build a per-transaction [`OpCtx`] bound to `tx`.
     ///
-    /// Phase 2a factory for the async sub-transaction refactor (#1454). The
-    /// returned context clones the event-loop `op_execution_sender` and is
-    /// the only supported way to obtain an `OpCtx` outside this crate's
-    /// unit tests. See [`OpCtx`] for scope, single-use semantics, and the
-    /// "where to call this" guidance.
-    #[allow(dead_code)] // Phase 2a scaffolding: first production caller lands in Phase 2b (#1454).
+    /// Construct an [`OpCtx`] for `tx`. Clones the event-loop
+    /// `op_execution_sender`; the only supported way to obtain an
+    /// `OpCtx` outside this crate's unit tests.
+    #[allow(dead_code)]
     pub fn op_ctx(&self, tx: Transaction) -> OpCtx {
         OpCtx::new(tx, self.to_event_listener.op_execution_sender.clone())
     }
@@ -600,131 +557,50 @@ impl OpManager {
             .await
     }
 
-    pub async fn push(&self, id: Transaction, op: OpEnum) -> Result<(), OpError> {
-        // Check if operation is already completed - don't push back to HashMap
-        if self.ops.completed.contains(&id) {
-            tracing::debug!(
-                tx = %id,
-                "OpManager: Ignoring push for already completed operation"
-            );
-            return Ok(());
-        }
-
-        if let Some(tx) = self.ops.under_progress.remove(&id) {
-            if tx.timed_out() {
-                self.ops.completed.insert(tx);
-                return Ok(());
-            }
-        }
-        self.new_transactions.send(id).await?;
-        match op {
-            OpEnum::Connect(op) => {
-                #[cfg(debug_assertions)]
-                check_id_op!(id.transaction_type(), TransactionType::Connect);
-                self.ops.connect.insert(id, *op);
-            }
-        }
-        Ok(())
-    }
-
-    /// Peek at the next hop address for an operation without removing it.
-    /// Used by hop-by-hop routing to determine where to send initial outbound messages.
-    /// Returns None if the operation doesn't exist or doesn't have a next hop address.
-    pub fn peek_next_hop_addr(&self, id: &Transaction) -> Option<std::net::SocketAddr> {
-        if self.ops.completed.contains(id) || self.ops.under_progress.contains(id) {
-            return None;
-        }
-        match id.transaction_type() {
-            TransactionType::Connect => self
-                .ops
-                .connect
-                .get(id)
-                .and_then(|op| op.get_next_hop_addr()),
-            // GET, PUT, UPDATE and SUBSCRIBE have no DashMap entry
-            // post-#1454 phase 5 final; task-per-tx drivers manage
-            // their own routing.
-            TransactionType::Get
-            | TransactionType::Put
-            | TransactionType::Update
-            | TransactionType::Subscribe => None,
-        }
-    }
-
-    /// Peek at the full target peer (including public key) without removing the operation.
-    /// Used when establishing new connections where we need the public key for handshake.
-    pub fn peek_target_peer(&self, id: &Transaction) -> Option<PeerKeyLocation> {
-        if self.ops.completed.contains(id) || self.ops.under_progress.contains(id) {
-            return None;
-        }
-        match id.transaction_type() {
-            TransactionType::Connect => {
-                self.ops.connect.get(id).and_then(|op| op.get_target_peer())
-            }
-            // Other operations only store addresses, not full peer info
-            TransactionType::Put
-            | TransactionType::Get
-            | TransactionType::Subscribe
-            | TransactionType::Update => None,
-        }
-    }
-
-    /// Get the current hop count (remaining HTL) for an operation.
-    /// Used for calculating hop_count in success/failure events.
-    pub fn get_current_hop(&self, _id: &Transaction) -> Option<usize> {
-        // GET, PUT and UPDATE have no DashMap entry post-#1454 phase 5
-        // final; SUBSCRIBE doesn't track HTL; CONNECT has no current
-        // hop concept exposed. The `get_current_hop` getter is kept for
-        // API compatibility with the tracing/telemetry consumer at
-        // `crates/core/src/tracing.rs:1266` (which uses it to decorate
-        // event logs with the operation's remaining HTL when known).
-        // Post-GET-slice retirement, no live operation reports a hop
-        // here — telemetry sites get `None` and skip the decoration.
+    /// Peek at the next hop address for an outbound initial request.
+    ///
+    /// Always returns `None` — every op now runs on a driver
+    /// driver that owns routing decisions in task locals, so there is
+    /// no DashMap entry to consult here. Retained as a stable API
+    /// surface for `p2p_protoc::handle_notification_msg`, which falls
+    /// back to the connection-manager lookup chain when this returns
+    /// `None`.
+    pub fn peek_next_hop_addr(&self, _id: &Transaction) -> Option<std::net::SocketAddr> {
         None
     }
 
-    pub fn pop(&self, id: &Transaction) -> Result<Option<OpEnum>, OpNotAvailable> {
-        if self.ops.completed.contains(id) {
-            return Err(OpNotAvailable::Completed);
-        }
-        if self.ops.under_progress.contains(id) {
-            if id.timed_out() {
-                self.ops.completed.insert(*id);
-                return Err(OpNotAvailable::Completed);
-            }
-            return Err(OpNotAvailable::Running);
-        }
-        let op = match id.transaction_type() {
-            TransactionType::Connect => self
-                .ops
-                .connect
-                .remove(id)
-                .map(|(_k, v)| v)
-                .map(|op| OpEnum::Connect(Box::new(op))),
-            // GET, PUT, UPDATE and SUBSCRIBE have no DashMap entry
-            // post-#1454 phase 5 final.
-            TransactionType::Get
-            | TransactionType::Put
-            | TransactionType::Update
-            | TransactionType::Subscribe => None,
-        };
-        self.ops.under_progress.insert(*id);
-        Ok(op)
+    /// Peek at the full target peer (including public key) for an
+    /// outbound initial request.
+    ///
+    /// Always returns `None` — same rationale as
+    /// [`Self::peek_next_hop_addr`]. The caller in `p2p_protoc` falls
+    /// back to `connection_manager.get_peer_location_by_addr` and the
+    /// configured-gateway list to recover the public key needed for
+    /// the handshake.
+    pub fn peek_target_peer(&self, _id: &Transaction) -> Option<PeerKeyLocation> {
+        None
+    }
+
+    /// Get the current hop count (remaining HTL) for an operation.
+    /// Always returns `None` — no live op reports a hop here.
+    /// Kept for API compatibility with the tracing consumer at
+    /// `crates/core/src/tracing.rs:1266`.
+    pub fn get_current_hop(&self, _id: &Transaction) -> Option<usize> {
+        None
     }
 
     /// Emit a `NodeEvent::TransactionCompleted(tx)` to the event loop,
     /// triggering cleanup of any `pending_op_results` entry keyed by `tx`.
     ///
-    /// Used by Phase 2b's task-per-tx subscribe path (#1454) to release
-    /// the per-attempt callback slot in `p2p_protoc::pending_op_results`
-    /// after each `OpCtx::send_and_await` round-trip finishes. Without
-    /// this emission the attempt-tx entries accumulate until either the
-    /// periodic 60 s cleanup sweeps closed senders or the node shuts
-    /// down — see `test_pending_op_results_bounded` for the regression
-    /// guard.
+    /// Releases the per-attempt callback slot in
+    /// `p2p_protoc::pending_op_results` after each
+    /// `OpCtx::send_and_await` round-trip finishes. Without this,
+    /// attempt-tx entries accumulate until the 60 s sweep —
+    /// `test_pending_op_results_bounded` is the regression guard.
     ///
-    /// Distinct from [`Self::send_client_result`] which also emits this
-    /// event but additionally pushes a `HostResult` through
-    /// `result_router_tx`. The task-per-tx path has many attempt txs
+    /// Distinct from [`Self::send_client_result`], which also emits
+    /// this event but additionally pushes a `HostResult` through
+    /// `result_router_tx`. The driver has many attempt txs
     /// per client tx, so per-attempt cleanup can't go through
     /// `send_client_result` (that would publish N duplicate results to
     /// the client).
@@ -746,12 +622,12 @@ impl OpManager {
     ///
     /// The `p2p_protoc::handle_notification_message` branch for
     /// `TransactionCompleted` (lines 2030–2036) also calls
-    /// `state.tx_to_client.remove(&tx)`. For task-per-tx attempt txs this
+    /// `state.tx_to_client.remove(&tx)`. For per-attempt txs this
     /// is a tolerated no-op: `tx_to_client` is only populated on
     /// client-visible txs via `ch_outbound.waiting_for_subscription_result`
-    /// / `waiting_for_transaction_result`, never on per-attempt txs. If a
-    /// future change starts keying `tx_to_client` by attempt tx, this
-    /// eager cleanup will silently drop mappings and must be revisited.
+    /// / `waiting_for_transaction_result`. If a future change starts
+    /// keying `tx_to_client` by attempt tx, this eager cleanup will
+    /// silently drop mappings and must be revisited.
     pub(crate) async fn release_pending_op_slot(&self, tx: Transaction) {
         release_pending_op_slot_on(
             self.to_event_listener.notifications_sender(),
@@ -761,85 +637,15 @@ impl OpManager {
         .await
     }
 
-    // `has_get_op` was the relay GET dispatch gate; retired in
-    // #1454 phase 5 final (GET slice) together with the `ops.get`
-    // DashMap. Every GET wire variant now spawns its task-per-tx
-    // driver unconditionally (the legacy `handle_op_request<GetOp>`
-    // fallthrough is gone), so the gate has no remaining decision
-    // value. The dispatch site in `node.rs::NetMessageV1::Get` was
-    // simplified in this slice.
-
-    // `has_update_op` was the relay UPDATE dispatch gate; retired in
-    // #1454 phase 5 final together with the `ops.update` DashMap.
-    // Every UPDATE wire variant now spawns its task-per-tx driver
-    // unconditionally (the legacy `handle_op_request<UpdateOp>`
-    // fallthrough is gone), so the gate has no remaining decision
-    // value. The dispatch sites in `node.rs` were simplified in
-    // commit 3.
-
-    // `has_put_op` was the relay PUT dispatch gate; retired in
-    // #1454 phase 5 final (PUT slice) together with the `ops.put`
-    // DashMap. Every PUT wire variant now spawns its task-per-tx
-    // driver unconditionally (the legacy `handle_op_request<PutOp>`
-    // fallthrough is gone), so the gate has no remaining decision
-    // value. The dispatch sites in `node.rs` were simplified in
-    // commit 3.
-
-    // `has_subscribe_op` was the relay SUBSCRIBE dispatch gate; retired
-    // in #1454 phase 5 final (SUBSCRIBE slice) together with the
-    // `ops.subscribe` DashMap. Every SUBSCRIBE wire variant now spawns
-    // its task-per-tx driver or runs through a dedicated inbound
-    // handler unconditionally (the legacy `handle_op_request<SubscribeOp>`
-    // fallthrough is gone), so the gate has no remaining decision value.
-    // The dispatch site in `node.rs::NetMessageV1::Subscribe` was
-    // simplified in this slice.
-
-    /// Returns `true` if a `ConnectOp` is currently registered for this
-    /// transaction in `OpManager.ops.connect`.
-    ///
-    /// Same role as `has_get_op` but for the relay CONNECT dispatch
-    /// gate (#1454 phase 2c slice 1). Used by `node.rs` to distinguish
-    /// a fresh inbound relay CONNECT Request (no existing op → spawn
-    /// the task-per-tx driver) from a within-relay Rejected retry, a
-    /// ConnectFailed downstream re-route, or any other re-entry that
-    /// already has a `ConnectOp` from a prior `process_message` call
-    /// (existing op → fall through to the legacy `handle_op_request`
-    /// path).
-    pub fn has_connect_op(&self, id: &Transaction) -> bool {
-        self.ops.connect.contains_key(id)
-    }
+    // `has_{connect,get,update,put,subscribe}_op` were the legacy
+    // relay dispatch gates; all gone with their DashMaps. Every wire
+    // variant now spawns its driver unconditionally and the dedup
+    // gate lives in `active_relay_{op}_txs`.
 
     pub fn completed(&self, id: Transaction) {
         self.ring.live_tx_tracker.remove_finished_transaction(id);
         self.ops.under_progress.remove(&id);
         self.ops.completed.insert(id);
-
-        // Remove the per-type DashMap entry for this transaction.
-        //
-        // Legacy state-machine paths reach `completed` after `pop` already
-        // removed the entry, so the remove below is a no-op for them.
-        //
-        // Task-per-tx drivers use `OpCtx::send_and_await`, which loops the
-        // outbound message back through the event loop as an InboundMessage
-        // with `source_addr=None`. The originator's multi-hop branch in
-        // `process_message` (e.g. put.rs SendAndContinue when forwarding)
-        // returns a non-finalized state that `handle_op_result` pushes into
-        // `ops.<type>`. The bypass in `handle_pure_network_message_v1` then
-        // routes the terminal Response directly to the driver task, so the
-        // entry never re-enters `handle_op_request` and never gets popped.
-        // Without this remove, the entry leaks for OPERATION_TTL (60s) and
-        // pollutes `has_<type>_op` checks until the GC sweep clears it.
-        match id.transaction_type() {
-            TransactionType::Connect => {
-                self.ops.connect.remove(&id);
-            }
-            // GET, PUT, UPDATE and SUBSCRIBE have no DashMap entry
-            // post-#1454 phase 5 final.
-            TransactionType::Get
-            | TransactionType::Put
-            | TransactionType::Update
-            | TransactionType::Subscribe => {}
-        }
 
         // Clean up request router to prevent stale entries from blocking subsequent requests
         if let Some(router) = self.request_router.get() {
@@ -899,13 +705,12 @@ impl OpManager {
         }
     }
 
-    /// Returns pending operation counts: [connect, put, get, subscribe, update].
-    /// GET, PUT, UPDATE and SUBSCRIBE slots are always 0 after #1454
-    /// phase 5 final retired the corresponding DashMaps; kept in the
-    /// array for API stability with the home-page renderer / telemetry
-    /// consumers.
+    /// Returns pending operation counts: [connect, put, get, subscribe,
+    /// update]. All slots are always 0 (operations run as standalone
+    /// driver tasks); retained for API stability with the home-page
+    /// renderer and telemetry consumers.
     pub fn pending_op_counts(&self) -> [u32; 5] {
-        [self.ops.connect.len() as u32, 0, 0, 0, 0]
+        [0; 5]
     }
 
     /// Returns the number of entries in the contract_waiters map.
@@ -1005,12 +810,11 @@ impl OpManager {
 /// `OpManager` (review finding T-3). The `OpManager` method is a thin
 /// wrapper around this free function.
 ///
-/// Uses `send().await` (wrapped in `timeout`) rather than `try_send`
-/// because the caller is Phase 2b's task-per-tx subscribe driver
-/// spawned via `GlobalExecutor::spawn` — a short blocking wait is
-/// within the channel-safety rules for that context, and dropping the
-/// event on transient backpressure would re-introduce the
-/// `test_pending_op_results_bounded` leak.
+/// Uses `send().await` (wrapped in `timeout`) rather than
+/// `try_send`. The caller runs in a `GlobalExecutor::spawn`'d task,
+/// so a short blocking wait is within the channel-safety rules;
+/// dropping the event on transient backpressure would re-introduce
+/// the `test_pending_op_results_bounded` leak.
 async fn release_pending_op_slot_on(
     notifications_sender: &mpsc::Sender<Either<NetMessage, NodeEvent>>,
     tx: Transaction,
@@ -1038,6 +842,38 @@ async fn release_pending_op_slot_on(
                  event loop may be stuck; pending_op_results entry will be \
                  reclaimed by 60s sweep"
             );
+        }
+    }
+}
+
+/// Non-blocking emit of `NodeEvent::TransactionCompleted(tx)` on the
+/// event-loop notification channel; returns `true` when enqueued.
+///
+/// Extracted from [`OpManager::try_release_pending_op_slot`] so it can be
+/// exercised in unit tests without building a full `OpManager`. Best-effort:
+/// a momentarily-full or closed channel produces a warning and the parked
+/// driver falls back to its `OPERATION_TTL` timeout (#4154).
+fn try_release_pending_op_slot_on(
+    notifications_sender: &mpsc::Sender<Either<NetMessage, NodeEvent>>,
+    tx: Transaction,
+) -> bool {
+    match notifications_sender.try_send(Either::Right(NodeEvent::TransactionCompleted(tx))) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::warn!(
+                %tx,
+                "try_release_pending_op_slot: notification channel full; \
+                 driver will wait for OPERATION_TTL timeout"
+            );
+            false
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::warn!(
+                %tx,
+                "try_release_pending_op_slot: notification channel closed; \
+                 receiver likely dropped"
+            );
+            false
         }
     }
 }
@@ -1075,79 +911,17 @@ fn notify_transaction_timeout(
     }
 }
 
-// `notify_subscription_timeout` and `report_timeout_failure` retired in
-// #1454 phase 5 final (SUBSCRIBE slice). They were called only from
-// `remove_subscribe_and_notify_timeout`, which was deleted in the same
-// commit. The task-per-tx subscribe driver owns its own timeout
-// reporting via `result_router_tx` publication, and relays route any
-// per-hop failure through their own per-tx drivers — neither needs a
-// GC-sweep notifier.
+// Per-op GC sweep helpers (`remove_*_and_report_failure` /
+// `notify_subscription_timeout`) are gone — each non-CONNECT op
+// owns its own timeout reporting in its driver via
+// `RetryLoopOutcome::Exhausted` → `result_router_tx`, and relay
+// drivers expire their inflight guards naturally.
 
-// `remove_put_and_report_failure` and `remove_update_and_report_failure`
-// were retired in #1454 phase 5 final (PUT slice / UPDATE slice 1)
-// together with the `ops.put` / `ops.update` DashMaps. Client-initiated
-// PUTs and UPDATEs now own their timeout reporting in the task-per-tx
-// driver (`{put,update}::op_ctx_task::start_client_*`); relay PUTs and
-// UPDATEs are owned by their per-tx drivers and have no client to
-// report to.
-
-// `remove_subscribe_and_notify_timeout` retired in #1454 phase 5 final
-// (SUBSCRIBE slice) together with the `ops.subscribe` DashMap. Client-,
-// renewal-, executor-, and sub-op-initiated SUBSCRIBEs now own their
-// timeout reporting in the task-per-tx driver
-// (`subscribe::op_ctx_task::*`); relay SUBSCRIBEs are owned by their
-// per-tx drivers (`start_relay_subscribe`) which expire their inflight
-// guards naturally. The Unsubscribe wire variant is fire-and-forget and
-// has no timeout reporter.
-
-// `remove_get_and_report_failure` retired in #1454 phase 5 final
-// (GET slice) together with the `ops.get` DashMap. Originator-side
-// timeout reporting is now owned by the task-per-tx driver via the
-// `RetryLoopOutcome::Exhausted` → `result_router_tx` publication
-// path. Relay drivers expire their inflight guards naturally; no GC
-// sweep is needed.
-
-/// Log when a connect operation in Relaying state with an outstanding uphill forward times out,
-/// and record the unresponsive peer as an acceptor failure for reliability scoring.
-fn record_connect_uphill_timeout(
-    tx: &Transaction,
-    op: &ConnectOp,
-    conn_manager: &ConnectionManager,
-) {
-    let Some(ConnectState::Relaying(state)) = &op.state else {
-        return;
-    };
-    // Don't record timeout for relays that already forwarded a ConnectResponse —
-    // forwarded_to is preserved for ConnectFailed propagation, not because
-    // we're still waiting for a response.
-    if state.response_forwarded {
-        return;
-    }
-    let Some(ref peer) = state.forwarded_to else {
-        return;
-    };
-    let pending_secs = if let Some(ref fwd_at) = state.forwarded_at {
-        fwd_at.elapsed().as_secs()
-    } else {
-        tx.elapsed().as_secs()
-    };
-    tracing::warn!(
-        tx = %tx,
-        forwarded_to = %peer.pub_key(),
-        forwarded_to_addr = ?peer.socket_addr(),
-        pending_secs,
-        "connect: uphill route timed out with no response"
-    );
-    if let Some(addr) = peer.socket_addr() {
-        let now = tokio::time::Instant::now();
-        conn_manager.record_acceptor_outcome(addr, false, now);
-        tracing::info!(
-            tx = %tx,
-            addr = %addr,
-            "recorded GC timeout as acceptor failure"
-        );
-    }
-}
+// `record_connect_uphill_timeout` and the per-op GC-sweep CONNECT
+// branch are gone with `ops.connect`. The CONNECT driver
+// (`start_relay_connect`) now owns its own uphill-timeout reporting
+// via the `Relay*InflightGuard` failure path; the GC sweep no longer
+// has a `ConnectOp` to inspect.
 
 #[allow(clippy::too_many_arguments)]
 async fn garbage_cleanup_task<ER: NetEventRegister>(
@@ -1158,7 +932,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
     mut event_register: ER,
     _result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
     request_router: Arc<OnceLock<Arc<RequestRouter>>>,
-    ring: Arc<Ring>,
     contract_waiters: Arc<
         Mutex<std::collections::HashMap<ContractInstanceId, Vec<oneshot::Sender<()>>>>,
     >,
@@ -1254,9 +1027,10 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     tracing::info!(
                         target: "memory_stats",
                         tick = tick_count,
-                        ops_connect = ops_sizes.connect,
-                        // ops_get / ops_put / ops_update / ops_subscribe
-                        // retired in #1454 phase 5 final.
+                        // No DashMaps for ops_connect / ops_get /
+                        // ops_put / ops_update / ops_subscribe —
+                        // always 0.
+                        ops_connect = 0,
                         ops_put = 0,
                         ops_get = 0,
                         ops_subscribe = 0,
@@ -1312,13 +1086,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     }
                 }
 
-                // Shared retry constants for SUBSCRIBE speculative retry below.
-                // (GET speculative retry was retired in #1454 Phase 5-final
-                // slice 1; SUBSCRIBE speculative retry was retired in
-                // Phase 5-final slice 1 follow-up — see comment below.
-                // The shared `ACK_TIMEOUT` / `MAX_SPECULATIVE_PATHS` /
-                // `PROGRESS_TIMEOUT` constants that both blocks consumed
-                // are no longer referenced and have been removed.)
 
                 // Periodically clean up stale pending_contract_fetches entries.
                 // Entries older than 2x cooldown are removed to prevent unbounded growth.
@@ -1330,19 +1097,8 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     });
                 }
 
-                // SUBSCRIBE speculative-retry GC block was retired in #1454
-                // Phase 5-final. The `ops.subscribe` DashMap itself was
-                // then retired in the SUBSCRIBE slice (this PR): every
-                // SUBSCRIBE wire variant now runs on the task-per-tx
-                // driver in `operations/subscribe/op_ctx_task.rs`
-                // (Request) or a dedicated free function
-                // (`handle_unsubscribe_inbound` for Unsubscribe), and
-                // the surviving `send_unsubscribe_upstream` writer uses
-                // `OpCtx::send_fire_and_forget` directly. There is no
-                // longer a DashMap to GC-sweep.
-
-                let mut old_missing = std::mem::replace(&mut delayed, Vec::with_capacity(200));
-                for tx in old_missing.drain(..) {
+                let old_missing = std::mem::take(&mut delayed);
+                for tx in old_missing {
                     if let Some(tx) = ops.completed.remove(&tx) {
                         if cfg!(feature = "trace-ot") {
                             let op_type = tx.transaction_type().description();
@@ -1352,27 +1108,12 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         }
                         continue;
                     }
-                    let still_waiting = match tx.transaction_type() {
-                        TransactionType::Connect => {
-                            if let Some((_, mut op)) = ops.connect.remove(&tx) {
-                                op.expire_forward_attempts(tokio::time::Instant::now());
-                                record_connect_uphill_timeout(&tx, &op, &ring.connection_manager);
-                                if let Some(target_loc) = op.desired_location {
-                                    ring.record_connection_failure(target_loc, ConnectionFailureReason::Timeout);
-                                }
-                                false
-                            } else {
-                                true
-                            }
-                        }
-                        // GET, PUT, UPDATE and SUBSCRIBE have no DashMap
-                        // entry post-#1454 phase 5 final; task-per-tx
-                        // drivers own their own timeout reporting.
-                        TransactionType::Get
-                        | TransactionType::Put
-                        | TransactionType::Update
-                        | TransactionType::Subscribe => false,
-                    };
+                    // Every op runs on a driver and owns
+                    // its own timeout reporting (via
+                    // `Relay*InflightGuard` failure paths or
+                    // `RetryLoopOutcome::Exhausted`). Nothing for the
+                    // GC sweep to remove per-op anymore.
+                    let still_waiting = false;
                     if still_waiting {
                         delayed.push(tx);
                     } else {
@@ -1425,27 +1166,10 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                             _ = tx;
                         }
                     }
-                    let removed = match tx.transaction_type() {
-                        TransactionType::Connect => {
-                            if let Some((_, mut op)) = ops.connect.remove(&tx) {
-                                op.expire_forward_attempts(tokio::time::Instant::now());
-                                record_connect_uphill_timeout(&tx, &op, &ring.connection_manager);
-                                if let Some(target_loc) = op.desired_location {
-                                    ring.record_connection_failure(target_loc, ConnectionFailureReason::Timeout);
-                                }
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                        // GET, PUT, UPDATE and SUBSCRIBE have no DashMap
-                        // entry post-#1454 phase 5 final; task-per-tx
-                        // drivers own their own timeout reporting.
-                        TransactionType::Get
-                        | TransactionType::Put
-                        | TransactionType::Update
-                        | TransactionType::Subscribe => false,
-                    };
+                    // Same as above: every op owns its own timeout
+                    // reporting; the GC sweep has nothing per-op to
+                    // remove.
+                    let removed = false;
                     if removed {
                         tracing::info!(
                             tx = %tx,
@@ -1524,9 +1248,8 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────
-    // `release_pending_op_slot_on` tests (#1454 Phase 2b,
-    // review finding T-3). Tests the extracted helper directly
-    // so we don't need to build a full OpManager.
+    // `release_pending_op_slot_on` tests. Tests the extracted
+    // helper directly without building a full OpManager.
     // ──────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1553,12 +1276,13 @@ mod tests {
             .expect("timed out waiting for TransactionCompleted emission")
             .expect("notification channel closed");
 
-        #[allow(clippy::wildcard_enum_match_arm)]
         match received {
             Either::Right(NodeEvent::TransactionCompleted(observed)) => {
                 assert_eq!(observed, tx, "emitted tx must match the argument");
             }
-            other => panic!("expected TransactionCompleted, got {other:?}"),
+            other @ Either::Left(_) | other @ Either::Right(_) => {
+                panic!("expected TransactionCompleted, got {other:?}")
+            }
         }
     }
 
@@ -1678,6 +1402,121 @@ mod tests {
         );
     }
 
+    // ──────────────────────────────────────────────────────────
+    // Regression tests for #4154: parked drivers must be woken when
+    // their downstream peer disconnects, not wait `OPERATION_TTL`.
+    // Pre-fix, `handle_orphaned_transactions` only logged orphans and
+    // a forwarded GET blocked the full 60 s before retrying. The fix
+    // emits `TransactionCompleted(tx)` per orphan via
+    // `try_release_pending_op_slot_on`, the event loop drops the
+    // matching `pending_op_results` sender, and the driver's `recv()`
+    // returns `None` — `send_and_await` maps that to
+    // `OpError::NotificationError` and the retry loop advances.
+    // ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn try_release_pending_op_slot_emits_transaction_completed() {
+        // Happy path: the standalone helper enqueues exactly one
+        // `TransactionCompleted(tx)` on the notification channel.
+        let (receiver, notifier) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut notifications_receiver,
+            ..
+        } = receiver;
+
+        let tx = Transaction::ttl_transaction();
+
+        let delivered = super::try_release_pending_op_slot_on(notifier.notifications_sender(), tx);
+        assert!(delivered, "helper must enqueue on a live channel");
+
+        let received = timeout(Duration::from_millis(100), notifications_receiver.recv())
+            .await
+            .expect("timed out waiting for TransactionCompleted emission")
+            .expect("notification channel closed");
+
+        match received {
+            Either::Right(NodeEvent::TransactionCompleted(observed)) => {
+                assert_eq!(observed, tx, "emitted tx must match the argument");
+            }
+            other @ Either::Left(_) | other @ Either::Right(_) => {
+                panic!("expected TransactionCompleted, got {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn try_release_pending_op_slot_handles_dropped_receiver() {
+        // Closed channel: helper must return `false` rather than panic
+        // — disconnect cleanup must remain robust when the event loop
+        // has already torn down (e.g. shutdown races).
+        let (receiver, notifier) = event_loop_notification_channel();
+        drop(receiver);
+
+        let tx = Transaction::ttl_transaction();
+        let delivered = super::try_release_pending_op_slot_on(notifier.notifications_sender(), tx);
+        assert!(
+            !delivered,
+            "helper must return false once receiver is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphaned_transaction_wakes_parked_pending_op_results_waiter() {
+        // End-to-end pipeline test for #4154 without standing up a full
+        // node. Reproduces the driver → notification-channel → event-
+        // loop → sender-drop → driver-wakeup sequence and asserts it
+        // completes in under 100 ms (pre-fix it would hang `OPERATION_TTL`).
+        let (mut event_loop_receiver, notifier) = event_loop_notification_channel();
+
+        // Stand in for `pending_op_results[tx] = sender` and the driver's
+        // pending `recv()` on the matching receiver.
+        let (response_sender, mut driver_response_rx) =
+            tokio::sync::mpsc::channel::<crate::message::NetMessage>(1);
+        let mut pending_op_results: std::collections::HashMap<
+            Transaction,
+            tokio::sync::mpsc::Sender<crate::message::NetMessage>,
+        > = std::collections::HashMap::new();
+        let tx = Transaction::ttl_transaction();
+        pending_op_results.insert(tx, response_sender);
+
+        // Trigger the wake — this is the orphan-handler path under test.
+        let delivered = super::try_release_pending_op_slot_on(notifier.notifications_sender(), tx);
+        assert!(delivered, "orphan-handler helper must enqueue notification");
+
+        // Mimic the event loop's `TransactionCompleted` arm by dropping the
+        // sender out of `pending_op_results`.
+        let event = timeout(
+            Duration::from_millis(100),
+            event_loop_receiver.notifications_receiver.recv(),
+        )
+        .await
+        .expect("event loop never received TransactionCompleted")
+        .expect("notification channel closed before TransactionCompleted arrived");
+        match event {
+            Either::Right(NodeEvent::TransactionCompleted(observed)) => {
+                assert_eq!(observed, tx);
+                pending_op_results.remove(&observed);
+            }
+            other @ Either::Left(_) | other @ Either::Right(_) => {
+                panic!("expected TransactionCompleted, got {other:?}")
+            }
+        }
+
+        // The driver's `recv()` must now resolve to `None` immediately —
+        // pre-fix this hung the full `OPERATION_TTL`. Cap at 100 ms.
+        let driver_wakeup = timeout(Duration::from_millis(100), driver_response_rx.recv()).await;
+        match driver_wakeup {
+            Ok(None) => {
+                // Channel closed, driver wakes with `Err(NotificationError)` — correct.
+            }
+            Ok(Some(msg)) => panic!("driver received unexpected message: {msg:?}"),
+            Err(_) => panic!(
+                "driver did not wake after orphan handling — \
+                 pre-#4154 behavior reproduced"
+            ),
+        }
+    }
+
     #[test]
     fn contract_waiters_cleanup_removes_closed_senders() {
         use std::collections::HashMap;
@@ -1713,123 +1552,4 @@ mod tests {
         assert!(!waiters.contains_key(&id2));
         assert_eq!(waiters[&id1].len(), 1);
     }
-
-    mod record_connect_uphill_timeout_tests {
-        use super::super::record_connect_uphill_timeout;
-        use crate::message::Transaction;
-        use crate::operations::VisitedPeers;
-        use crate::operations::connect::{
-            ConnectMsg, ConnectOp, ConnectRequest, ConnectState, DEFAULT_UPHILL_BUDGET, RelayState,
-        };
-        use crate::ring::{ConnectionManager, Location, PeerKeyLocation};
-        use crate::transport::TransportKeypair;
-        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
-        fn make_peer(port: u16) -> PeerKeyLocation {
-            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
-            let keypair = TransportKeypair::new();
-            PeerKeyLocation::new(keypair.public().clone(), addr)
-        }
-
-        fn make_relay_state(
-            forwarded_to: Option<PeerKeyLocation>,
-            response_forwarded: bool,
-        ) -> ConnectState {
-            ConnectState::Relaying(Box::new(RelayState {
-                upstream_addr: "10.0.0.1:5000".parse().unwrap(),
-                request: ConnectRequest {
-                    desired_location: Location::new(0.3),
-                    joiner: make_peer(5002),
-                    ttl: 5,
-                    visited: VisitedPeers::new(&Transaction::new::<ConnectMsg>()),
-                    uphill_budget: DEFAULT_UPHILL_BUDGET,
-                },
-                forwarded_to,
-                forwarded_at: Some(tokio::time::Instant::now()),
-                observed_sent: false,
-                accepted_locally: false,
-                response_forwarded,
-            }))
-        }
-
-        /// Regression test for #3392: GC-expired CONNECT forwards to unresponsive
-        /// peers must be recorded as acceptor failures so the peer gets a low
-        /// reliability score for future routing decisions.
-        #[test]
-        fn records_failure_for_unresponsive_relay() {
-            let peer = make_peer(5001);
-            let peer_addr = peer.socket_addr().unwrap();
-            let op = ConnectOp::with_state(make_relay_state(Some(peer), false));
-            let tx = Transaction::new::<ConnectMsg>();
-            let cm = ConnectionManager::test_default();
-
-            let now = tokio::time::Instant::now();
-            // Initially unknown → 0.5 prior
-            let initial = cm.peer_acceptor_reliability(peer_addr, now);
-            assert!(
-                (initial - 0.5).abs() < f64::EPSILON,
-                "unknown peer should start at 0.5"
-            );
-
-            // Three GC timeouts should lower reliability
-            for _ in 0..3 {
-                record_connect_uphill_timeout(&tx, &op, &cm);
-            }
-
-            let after = cm.peer_acceptor_reliability(peer_addr, now);
-            assert!(
-                after < initial,
-                "peer reliability should decrease after 3 GC timeouts: {} vs {}",
-                after,
-                initial
-            );
-            // (0+1)/(3+2) = 0.2
-            assert!(
-                (after - 0.2).abs() < 0.01,
-                "expected ~0.2 after 3 failures, got {}",
-                after
-            );
-        }
-
-        /// response_forwarded=true must NOT record a failure — the forwarded_to
-        /// field is kept for ConnectFailed propagation, not because the peer is
-        /// unresponsive.
-        #[test]
-        fn skips_when_response_already_forwarded() {
-            let peer = make_peer(5001);
-            let peer_addr = peer.socket_addr().unwrap();
-            let op = ConnectOp::with_state(make_relay_state(Some(peer), true));
-            let tx = Transaction::new::<ConnectMsg>();
-            let cm = ConnectionManager::test_default();
-
-            for _ in 0..5 {
-                record_connect_uphill_timeout(&tx, &op, &cm);
-            }
-
-            let now = tokio::time::Instant::now();
-            let score = cm.peer_acceptor_reliability(peer_addr, now);
-            assert!(
-                (score - 0.5).abs() < f64::EPSILON,
-                "peer should still have 0.5 reliability when response was already forwarded, got {}",
-                score
-            );
-        }
-
-        /// Non-Relaying state (e.g., Completed) must not record any failure.
-        #[test]
-        fn skips_for_non_relay_state() {
-            let op = ConnectOp::with_state(ConnectState::Completed);
-            let tx = Transaction::new::<ConnectMsg>();
-            let cm = ConnectionManager::test_default();
-
-            // Should not panic or record anything
-            record_connect_uphill_timeout(&tx, &op, &cm);
-        }
-    }
-
-    // `has_get_op_*`, `has_update_op_returns_*` and
-    // `has_put_op_returns_*` tests were retired in #1454 phase 5 final
-    // together with the corresponding APIs and DashMaps. Equivalent
-    // coverage for the surviving ops (CONNECT, SUBSCRIBE) lives in the
-    // relay-driver dedup tests under `op_ctx_task` modules.
 }

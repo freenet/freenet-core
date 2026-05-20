@@ -38,15 +38,9 @@ use crate::transport::{
 use crate::{
     client_events::ClientId,
     config::GlobalExecutor,
-    contract::{
-        ContractHandlerChannel, ExecutorToEventLoopChannel, NetworkEventListenerHalve,
-        WaitingResolution,
-    },
+    contract::{ContractHandlerChannel, ExecutorTransactionStream, WaitingResolution},
     message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
-    node::{
-        NetEventRegister, NodeConfig, OpManager, PeerId, handle_aborted_op,
-        process_message_decoupled,
-    },
+    node::{NetEventRegister, NodeConfig, OpManager, PeerId, process_message_decoupled},
     ring::{KnownPeerKeyLocation, PeerConnectionBackoff, PeerKeyLocation},
     tracing::NetEventLog,
 };
@@ -181,47 +175,30 @@ impl P2pBridge {
         }
     }
 
-    /// Handle orphaned transactions after a peer connection is pruned.
+    /// Wake any drivers whose downstream peer just disconnected.
     ///
-    /// This triggers retry logic for operations that were pending on the disconnected peer,
-    /// allowing them to be routed through alternate peers instead of waiting for timeout.
-    pub(crate) async fn handle_orphaned_transactions(
-        &self,
-        transactions: Vec<Transaction>,
-        gateways: &[PeerKeyLocation],
-    ) {
+    /// For each orphaned `tx` we emit
+    /// `NodeEvent::TransactionCompleted(tx)` via `try_send`. The event-
+    /// loop handler at `NodeEvent::TransactionCompleted` drops the
+    /// matching `pending_op_results` sender, which closes the channel
+    /// the driver is awaiting in `OpCtx::send_and_await`. The driver
+    /// then sees `Err(OpError::NotificationError)`; the shared retry
+    /// loop (`drive_retry_loop`) routes that to `advance()` and tries
+    /// the next peer.
+    ///
+    /// Without this hop, a GET (or other relayed op) issued just before
+    /// its downstream peer disconnected would block for the full
+    /// `OPERATION_TTL` (60 s) before retrying — see #4154.
+    pub(crate) async fn handle_orphaned_transactions(&self, transactions: Vec<Transaction>) {
         if transactions.is_empty() {
             return;
         }
-
         tracing::debug!(
             count = transactions.len(),
-            "Handling orphaned transactions from pruned connection"
+            "Orphaned transactions from pruned connection — waking parked drivers"
         );
-
-        // Process all orphaned transactions concurrently for better performance
-        let results = futures::future::join_all(transactions.into_iter().map(|tx| {
-            let op_manager = &self.op_manager;
-            async move {
-                tracing::debug!(
-                    %tx,
-                    tx_type = ?tx.transaction_type(),
-                    "Attempting retry for orphaned transaction"
-                );
-                (tx, handle_aborted_op(tx, op_manager, gateways).await)
-            }
-        }))
-        .await;
-
-        // Log any failures
-        for (tx, result) in results {
-            if let Err(err) = result {
-                tracing::warn!(
-                    %tx,
-                    error = %err,
-                    "Failed to handle orphaned transaction"
-                );
-            }
+        for tx in transactions {
+            self.op_manager.try_release_pending_op_slot(tx);
         }
     }
 
@@ -632,14 +609,12 @@ impl P2pConnManager {
         op_manager: Arc<OpManager>,
         client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
         notification_channel: EventLoopNotificationsReceiver,
-        executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         node_controller: Receiver<NodeEvent>,
     ) -> anyhow::Result<Infallible> {
         self.run_event_listener_with_socket::<UdpSocket>(
             op_manager,
             client_wait_for_transaction,
             notification_channel,
-            executor_listener,
             node_controller,
         )
         .await
@@ -660,7 +635,6 @@ impl P2pConnManager {
         op_manager: Arc<OpManager>,
         client_wait_for_transaction: ContractHandlerChannel<WaitingResolution>,
         notification_channel: EventLoopNotificationsReceiver,
-        executor_listener: ExecutorToEventLoopChannel<NetworkEventListenerHalve>,
         node_controller: Receiver<NodeEvent>,
     ) -> anyhow::Result<Infallible> {
         // Destructure self to avoid partial move issues
@@ -741,7 +715,7 @@ impl P2pConnManager {
             handshake_handler,
             node_controller,
             client_wait_for_transaction,
-            executor_listener,
+            ExecutorTransactionStream,
             conn_event_rx,
         );
 
@@ -1184,7 +1158,6 @@ impl P2pConnManager {
                                     let (callback, mut result) = mpsc::channel(10);
                                     let msg_clone = msg.clone();
                                     let bridge_sender = ctx.bridge.ev_listener_tx.clone();
-                                    let op_manager = ctx.bridge.op_manager.clone();
                                     let gateways = ctx.gateways.clone();
 
                                     // Mark gateway connections as transient to prevent
@@ -1253,17 +1226,6 @@ impl P2pConnManager {
                                                     phase = "error",
                                                     "Connection attempt failed"
                                                 );
-                                                if let Err(err) =
-                                                    handle_aborted_op(tx, &op_manager, &gateways)
-                                                        .await
-                                                {
-                                                    tracing::warn!(
-                                                        tx = %tx,
-                                                        error = ?err,
-                                                        phase = "error",
-                                                        "Failed to propagate aborted operation"
-                                                    );
-                                                }
                                             }
                                             Ok(None) => {
                                                 tracing::error!(
@@ -1272,17 +1234,6 @@ impl P2pConnManager {
                                                     phase = "error",
                                                     "Response channel closed before connection result received"
                                                 );
-                                                if let Err(err) =
-                                                    handle_aborted_op(tx, &op_manager, &gateways)
-                                                        .await
-                                                {
-                                                    tracing::warn!(
-                                                        tx = %tx,
-                                                        error = ?err,
-                                                        phase = "error",
-                                                        "Failed to propagate aborted operation"
-                                                    );
-                                                }
                                             }
                                             Err(_) => {
                                                 tracing::error!(
@@ -1291,17 +1242,6 @@ impl P2pConnManager {
                                                     phase = "timeout",
                                                     "Timeout waiting for connection establishment"
                                                 );
-                                                if let Err(err) =
-                                                    handle_aborted_op(tx, &op_manager, &gateways)
-                                                        .await
-                                                {
-                                                    tracing::warn!(
-                                                        tx = %tx,
-                                                        error = ?err,
-                                                        phase = "error",
-                                                        "Failed to propagate aborted operation"
-                                                    );
-                                                }
                                             }
                                         }
                                     });
@@ -1479,7 +1419,6 @@ impl P2pConnManager {
                                         ctx.bridge
                                             .handle_orphaned_transactions(
                                                 prune_result.orphaned_transactions,
-                                                &ctx.gateways,
                                             )
                                             .await;
 
@@ -1528,7 +1467,7 @@ impl P2pConnManager {
                                         "Cleaning up in-progress connection reservations"
                                     );
 
-                                    for (addr, mut callbacks) in state.awaiting_connection.drain() {
+                                    for (addr, callbacks) in state.awaiting_connection.drain() {
                                         tracing::debug!(
                                             peer_addr = %addr,
                                             callbacks = callbacks.len(),
@@ -1536,7 +1475,7 @@ impl P2pConnManager {
                                             "Notifying awaiting connection of shutdown"
                                         );
                                         // Best effort notification during shutdown - receiver may already be dropped
-                                        for mut callback in callbacks.drain(..) {
+                                        for mut callback in callbacks {
                                             #[allow(clippy::let_underscore_must_use)]
                                             let _ = callback.send_result(Err(())).await;
                                         }
@@ -1554,7 +1493,7 @@ impl P2pConnManager {
                                         for _ in 0..pending_count {
                                             crate::config::GlobalTestMetrics::record_pending_op_remove();
                                         }
-                                        state.pending_op_results.drain();
+                                        state.pending_op_results.clear();
                                     }
 
                                     tracing::info!(
@@ -1897,8 +1836,10 @@ impl P2pConnManager {
                                         let is_subscribed =
                                             op_manager.ring.is_subscribed(&contract_key);
                                         let subscriber_count = if is_subscribed { 1 } else { 0 };
+                                        // stdlib 0.8.0 keyed contract_states by String
+                                        // (`fix!: stringify NodeDiagnosticsResponse.contract_states keys`).
                                         response.contract_states.insert(
-                                            contract_key,
+                                            contract_key.to_string(),
                                             ContractState {
                                                 subscribers: subscriber_count as u32,
                                                 subscriber_peer_ids: Vec::new(),
@@ -1914,7 +1855,7 @@ impl P2pConnManager {
                                             op_manager.ring.is_subscribed(contract_key);
                                         let subscriber_count = if is_subscribed { 1 } else { 0 };
                                         response.contract_states.insert(
-                                            *contract_key,
+                                            contract_key.to_string(),
                                             ContractState {
                                                 subscribers: subscriber_count as u32,
                                                 subscriber_peer_ids: Vec::new(),
@@ -2034,6 +1975,17 @@ impl P2pConnManager {
                                 if state.pending_op_results.remove(&tx).is_some() {
                                     crate::config::GlobalTestMetrics::record_pending_op_remove();
                                 }
+                                // Clean up the `live_tx_tracker` entry registered
+                                // by `handle_op_execution` for messages with an
+                                // explicit target (#4154); otherwise per-attempt
+                                // entries leak past op completion. Idempotent with
+                                // the `op_manager.completed(client_tx)` that
+                                // drivers call on terminal exit.
+                                ctx.bridge
+                                    .op_manager
+                                    .ring
+                                    .live_tx_tracker
+                                    .remove_finished_transaction(tx);
                             }
                             NodeEvent::LocalSubscribeComplete {
                                 tx,
@@ -2238,7 +2190,7 @@ impl P2pConnManager {
 
         // Handle orphaned transactions immediately (retry via alternate routes)
         self.bridge
-            .handle_orphaned_transactions(prune_result.orphaned_transactions, &self.gateways)
+            .handle_orphaned_transactions(prune_result.orphaned_transactions)
             .await;
 
         // Broadcast unready if we dropped below the readiness threshold
@@ -2336,7 +2288,7 @@ impl P2pConnManager {
 
         // Handle orphaned transactions
         self.bridge
-            .handle_orphaned_transactions(prune_result.orphaned_transactions, &self.gateways)
+            .handle_orphaned_transactions(prune_result.orphaned_transactions)
             .await;
 
         if prune_result.became_unready {
@@ -2472,10 +2424,14 @@ impl P2pConnManager {
         );
         match msg {
             NetMessage::V1(NetMessageV1::Aborted(tx)) => {
-                handle_aborted_op(tx, op_manager, &self.gateways).await?;
+                tracing::debug!(
+                    %tx,
+                    tx_type = ?tx.transaction_type(),
+                    "Received Aborted wire message — driver owns cancellation, ignoring"
+                );
             }
             msg => {
-                self.process_message(msg, source_addr, op_manager, None, state)
+                self.process_message(msg, source_addr, op_manager, state)
                     .await;
             }
         }
@@ -2487,7 +2443,6 @@ impl P2pConnManager {
         msg: NetMessage,
         source_addr: Option<SocketAddr>,
         op_manager: &Arc<OpManager>,
-        executor_callback_opt: Option<ExecutorToEventLoopChannel<crate::contract::Callback>>,
         state: &mut EventListenerState,
     ) {
         tracing::debug!(
@@ -2498,13 +2453,6 @@ impl P2pConnManager {
             peer = ?op_manager.ring.connection_manager.get_own_addr(),
             "process_message called - processing network message"
         );
-
-        // Only use the callback if this message was initiated by the executor
-        let executor_callback_opt = if state.pending_from_executor.remove(msg.id()) {
-            executor_callback_opt
-        } else {
-            None
-        };
 
         let span = tracing::info_span!(
             "process_network_message",
@@ -2521,7 +2469,6 @@ impl P2pConnManager {
                 op_manager.clone(),
                 self.bridge.clone(),
                 self.event_listener.trait_clone(),
-                executor_callback_opt,
                 pending_op_result,
             )
             .instrument(span),
@@ -3311,10 +3258,7 @@ impl P2pConnManager {
                     .prune_connection(PeerId::new(old_peer.pub_key().clone(), peer_addr))
                     .await;
                 self.bridge
-                    .handle_orphaned_transactions(
-                        prune_result.orphaned_transactions,
-                        &self.gateways,
-                    )
+                    .handle_orphaned_transactions(prune_result.orphaned_transactions)
                     .await;
                 if prune_result.became_unready {
                     // Deferred: broadcast after connection_manager borrow ends
@@ -3759,10 +3703,7 @@ impl P2pConnManager {
 
                     // Handle orphaned transactions immediately (retry via alternate routes)
                     self.bridge
-                        .handle_orphaned_transactions(
-                            prune_result.orphaned_transactions,
-                            &self.gateways,
-                        )
+                        .handle_orphaned_transactions(prune_result.orphaned_transactions)
                         .await;
 
                     if prune_result.became_unready {
@@ -3904,9 +3845,39 @@ impl P2pConnManager {
                 // would otherwise short-circuit in `process_message` and never
                 // register as a downstream subscriber on the home node.
                 match target_addr {
-                    Some(target_addr) => EventResult::Event(
-                        ConnEvent::OutboundMessageWithTarget { target_addr, msg }.into(),
-                    ),
+                    Some(target_addr) => {
+                        // Track `tx → target_addr` so disconnect-cancellation in
+                        // `prune_connection` / `handle_orphaned_transactions` can
+                        // wake the parked driver (#4154). Two cases register here:
+                        //   - `send_to_and_await`: this branch just installed a
+                        //     waiter into `pending_op_results` above.
+                        //   - `send_fire_and_forget` from a relay driver running
+                        //     on the originator: the callback is closed (no insert
+                        //     above) but the originator's client driver has an
+                        //     earlier `pending_op_results[tx]` waiter that needs
+                        //     waking.
+                        // Skip when no waiter is present (e.g. cancelled-driver
+                        // teardown races) — registering with nothing to wake would
+                        // leak a live_tx_tracker entry until the peer disconnects.
+                        // Same-peer duplicates (e.g. CONNECT's parallel
+                        // `Ring::initiate_connect` registration) are tolerated by
+                        // `remove_finished_transaction`'s per-peer `retain`. Cross-
+                        // peer rebinds (same tx forwarded to two peers in turn) leave
+                        // a stale entry on the earlier peer until that peer
+                        // disconnects — a known limitation documented in
+                        // `LiveTransactionTracker::add_transaction`'s rustdoc.
+                        let tx = *msg.id();
+                        if state.pending_op_results.contains_key(&tx) {
+                            self.bridge
+                                .op_manager
+                                .ring
+                                .live_tx_tracker
+                                .add_transaction(target_addr, tx);
+                        }
+                        EventResult::Event(
+                            ConnEvent::OutboundMessageWithTarget { target_addr, msg }.into(),
+                        )
+                    }
                     None => EventResult::Event(ConnEvent::InboundMessage(msg.into()).into()),
                 }
             }
@@ -4143,10 +4114,10 @@ impl P2pConnManager {
     /// Send an arbitrary `NetMessage` to a target peer without registering
     /// a `pending_op_results` callback for the message's transaction.
     ///
-    /// Mirrors `handle_send_interest_message` but accepts a fully-formed
-    /// `NetMessage`. Introduced for #1454 phase 2c (CONNECT originator
-    /// task-per-tx driver) so the joiner can emit `ConnectFailed` upstream
-    /// without disturbing its own multi-reply receiver slot.
+    /// Mirrors `handle_send_interest_message` but accepts a
+    /// fully-formed `NetMessage`. Used by the CONNECT joiner to
+    /// emit `ConnectFailed` upstream without disturbing its own
+    /// multi-reply receiver slot.
     async fn handle_send_net_message(
         &mut self,
         target: SocketAddr,
@@ -5480,6 +5451,30 @@ mod tests {
             GlobalTestMetrics::pending_op_removes() - removes_before,
             3,
             "Drop must record one pending_op_remove per resident entry"
+        );
+    }
+
+    /// Regression guard for #4154: `handle_orphaned_transactions` must not
+    /// revert to a logging-only stub. If a future refactor renames the
+    /// helper, update both the call site and this guard together.
+    #[test]
+    fn handle_orphaned_transactions_wakes_parked_drivers() {
+        let src = include_str!("p2p_protoc.rs");
+        let handler_start = src
+            .find("pub(crate) async fn handle_orphaned_transactions(")
+            .expect("handle_orphaned_transactions must exist");
+        // Bound the body at the next `\n    }\n` — `async fn` impl methods
+        // close at indent level 4.
+        let body_after = &src[handler_start..];
+        let end = body_after
+            .find("\n    }\n")
+            .expect("handle_orphaned_transactions must close cleanly");
+        let body = &body_after[..end];
+        assert!(
+            body.contains("try_release_pending_op_slot"),
+            "handle_orphaned_transactions must call \
+             try_release_pending_op_slot to wake parked drivers (#4154). \
+             Found body:\n{body}"
         );
     }
 

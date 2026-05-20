@@ -8,6 +8,7 @@ mod error;
 pub(crate) mod mock_state_storage;
 mod native_api;
 mod runtime;
+pub mod secret_snapshots;
 mod secrets_store;
 pub(crate) mod simulation_runtime;
 mod state_store;
@@ -23,11 +24,11 @@ pub(crate) use error::{ContractError, RuntimeInnerError, RuntimeResult};
 pub use mock_state_storage::MockStateStorage;
 pub(crate) use native_api::{
     CREATED_DELEGATES_COUNT, DELEGATE_INHERITED_ORIGINS, DELEGATE_SUBSCRIPTIONS,
+    DelegateContextCache, new_delegate_context_cache,
 };
 pub use runtime::{ContractExecError, DEFAULT_MODULE_CACHE_CAPACITY, Runtime};
 pub(crate) use runtime::{RuntimeConfig, SharedModuleCache};
-pub(crate) use secrets_store::SecretStoreError;
-pub use secrets_store::SecretsStore;
+pub use secrets_store::{SecretStoreError, SecretsStore};
 // NOTE: InMemoryContractStore and SimulationStores are available but currently unused
 // They provide infrastructure for more sophisticated simulation scenarios
 #[allow(unused_imports)]
