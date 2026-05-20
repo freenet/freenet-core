@@ -1,0 +1,9 @@
+# cargo-deny configuration for freenet-core.
+# See: https://embarkstudios.github.io/cargo-deny/
+
+[bans]
+# Allow multiple versions — most duplicates are semver-incompatible
+# versions pulled in by different dependency ecosystems (e.g., wasmtime
+# vs reqwest, rustls 0.21 vs 0.23). These cannot be unified without
+# upstream changes. Tracked in #4177.
+multiple-versions = "allow"
