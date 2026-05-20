@@ -993,16 +993,33 @@ impl ConnectionManager {
     /// Sets the own address unconditionally.
     /// Used when a peer behind NAT learns their external address from ObservedAddress.
     pub fn set_own_addr(&self, addr: SocketAddr) {
-        // Release the own_addr lock before notifying network_status and emitting
-        // tracing — neither needs the guard, and holding it across them serializes
-        // unrelated callers under load (clippy: `significant_drop_tightening`).
+        // Hold the `own_addr` mutex across the `network_status::set_external_address`
+        // call so the two state writes are atomic with respect to each other.
+        // `own_addr` and `network_status::external_address` mirror the same value;
+        // if the lock is released between the writes, two concurrent
+        // `set_own_addr(X)` / `set_own_addr(Y)` calls can interleave such that
+        // `own_addr` ends up `Y` while `external_address` ends up `X` permanently
+        // (writer B's mutex section completes before writer A reaches
+        // `set_external_address`). See issue #4172 / PR #4129.
+        //
+        // This is the same cross-structure atomicity discipline described in
+        // `.claude/rules/ring.md` ("Cross-DashMap Lock Discipline") — a Mutex
+        // here rather than a DashMap shard guard, but the same spirit applies.
+        //
+        // The `significant_drop_tightening` clippy lint will want to narrow this
+        // lock back down (as PR #4129 did, introducing the race). It MUST NOT:
+        // the guard is load-bearing for cross-structure atomicity, not just for
+        // serializing the mutex write itself. A blind `cargo clippy --fix` would
+        // silently re-introduce the #4172 TOCTOU.
         let old_addr = {
             let mut own_addr = self.own_addr.lock();
             let old = *own_addr;
             *own_addr = Some(addr);
+            crate::node::network_status::set_external_address(addr);
             old
         };
-        crate::node::network_status::set_external_address(addr);
+        // Tracing is deliberately outside the lock: only the two state writes
+        // above need to be atomic w.r.t. each other; logging does not.
         tracing::debug!(
             old_addr = ?old_addr,
             new_addr = %addr,
@@ -2347,6 +2364,101 @@ mod tests {
         let result = cm.try_set_own_addr(new_addr);
         assert_eq!(result, Some(original_addr)); // Returns existing when already set
         assert_eq!(cm.get_own_addr(), Some(original_addr)); // Unchanged
+    }
+
+    // ============ set_own_addr TOCTOU regression test (#4172) ============
+
+    /// Regression test for issue #4172.
+    ///
+    /// `set_own_addr` writes two mirrored pieces of state: the `own_addr`
+    /// mutex and `network_status::external_address`. PR #4129 narrowed the
+    /// lock so it was released before `set_external_address` was called,
+    /// making the two writes non-atomic. Two concurrent `set_own_addr(X)` /
+    /// `set_own_addr(Y)` calls could then interleave so that `own_addr` ended
+    /// up `Y` while `external_address` ended up `X` permanently.
+    ///
+    /// ## How the test detects the bug
+    ///
+    /// Each round spawns several threads, each calling `set_own_addr` with a
+    /// distinct address. After all threads join, `set_own_addr` activity has
+    /// completely ceased, so the two mirrored values MUST agree — there is
+    /// no in-flight writer that could explain a difference. With the fix the
+    /// last mutex holder writes both values atomically, so they always
+    /// agree. With the bug (lock released before `set_external_address`) the
+    /// thread that performs the globally-last `own_addr` write can differ
+    /// from the thread that performs the globally-last `set_external_address`
+    /// write, leaving a durable mismatch.
+    ///
+    /// A single round only catches the race when the final writes happen to
+    /// interleave, so the test runs many rounds with a `Barrier` aligning
+    /// thread starts to maximize contention. With the bug present this
+    /// diverges reliably (empirically within ~100 rounds); the assertion
+    /// below is exact (`==`), never probabilistic — the fixed code passes
+    /// every round.
+    #[test]
+    fn test_set_own_addr_atomic_with_network_status() {
+        use std::sync::{Arc as StdArc, Barrier};
+
+        // GLOBAL-STATE CONTRACT: this test asserts on the process-global
+        // `network_status::external_address`, so it must remain the ONLY
+        // test that concurrently writes that global. That holds today:
+        // `set_external_address` has exactly one production caller
+        // (`set_own_addr`), and integration tests that spin up nodes run in
+        // separate test binaries (separate processes — each gets its own
+        // `NETWORK_STATUS`). Within this lib-test binary no other test calls
+        // `set_own_addr` / `set_external_address`. If a future lib-test does,
+        // it must serialize against this one (e.g. share a test mutex) or
+        // this `assert_eq!` can flake. (Reviewers: Claude testing/skeptical +
+        // Gemini all flagged this latent coupling — documented, not a current
+        // bug.)
+        //
+        // `network_status::set_external_address` is a no-op until `init()` has
+        // run. `init()` is idempotent (OnceLock — first caller wins), so this
+        // is safe even if another test already initialized the global.
+        crate::node::network_status::init(0, HashSet::new(), "test".to_string());
+
+        // Use a single ConnectionManager across all rounds: the bug is a
+        // durable inconsistency, so any round that diverges fails the test.
+        let cm = StdArc::new(make_connection_manager(None, 1, 10, false));
+
+        const ROUNDS: u32 = 4_000;
+        const THREADS: u16 = 8;
+
+        for round in 0..ROUNDS {
+            let barrier = StdArc::new(Barrier::new(THREADS as usize));
+            let mut handles = Vec::with_capacity(THREADS as usize);
+            for i in 0..THREADS {
+                let cm = StdArc::clone(&cm);
+                let barrier = StdArc::clone(&barrier);
+                // Distinct port per (round, thread) so each call writes a
+                // unique value and a mismatch is unambiguous.
+                let port = 20_000u16.wrapping_add((round as u16) << 3).wrapping_add(i);
+                let addr = make_addr(port);
+                handles.push(std::thread::spawn(move || {
+                    // Align starts so the threads' critical sections overlap.
+                    barrier.wait();
+                    cm.set_own_addr(addr);
+                }));
+            }
+            for h in handles {
+                h.join().expect("set_own_addr thread panicked");
+            }
+
+            // All writers have finished: the two mirrors MUST agree on
+            // whichever writer won the race.
+            let own = cm.get_own_addr();
+            let external = crate::node::network_status::external_address();
+            assert!(
+                own.is_some(),
+                "round {round}: own_addr should be set after concurrent writes"
+            );
+            assert_eq!(
+                own, external,
+                "round {round}: own_addr ({own:?}) and \
+                 network_status::external_address ({external:?}) diverged — \
+                 set_own_addr is not atomic (#4172)"
+            );
+        }
     }
 
     // ============ update_peer_identity tests ============
