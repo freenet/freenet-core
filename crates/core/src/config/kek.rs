@@ -487,7 +487,10 @@ pub fn read_backend_marker(secrets_dir: &Path) -> Result<Option<KekBackendKind>,
 /// `OpenOptions::create_new` so a pre-existing marker is preserved —
 /// callers performing migration are expected to go through
 /// `replace_backend_marker`, which handles atomic overwrite.
-fn write_backend_marker(secrets_dir: &Path, kind: KekBackendKind) -> Result<(), KekError> {
+///
+/// Exposed `pub` so the `freenet secrets kek-init` CLI can stamp the
+/// marker after explicitly provisioning a chosen backend out-of-band.
+pub fn write_backend_marker(secrets_dir: &Path, kind: KekBackendKind) -> Result<(), KekError> {
     std::fs::create_dir_all(secrets_dir)?;
     let path = secrets_dir.join(KEK_BACKEND_MARKER_FILENAME);
     use std::io::Write;
@@ -575,18 +578,23 @@ pub fn ensure_kek_loaded(
 
 fn build_chain(secrets_dir: &Path) -> Vec<Box<dyn KekBackend>> {
     let mut chain: Vec<Box<dyn KekBackend>> = Vec::new();
-    // KeyringKek is only added on platforms whose `keyring` features are
-    // enabled in the workspace (apple-native, windows-native). On Linux
-    // the crate falls back to the in-memory `mock-keyring` shim that
-    // accepts `store` calls but loses the entry on process exit — adding
-    // it to the chain there would silently win over FileKek and break
-    // restart-roundtrip recovery. Linux operators who want real
-    // persistence can re-enable `sync-secret-service` in a downstream
-    // fork (requires libdbus-1-dev at build time).
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    if let Ok(b) = KeyringKek::new() {
-        chain.push(Box::new(b));
-    }
+    // Auto-resolution intentionally OMITS `KeyringKek`. Touching the OS
+    // keyring on first node start would trigger a Keychain / Credential
+    // Manager prompt that the user did not initiate (they started a
+    // node, not a credential request), which is exactly the surprise
+    // the lazy-consent design (tracked as a follow-up under #4137) is
+    // meant to prevent. Operators who want the keyring backend must
+    // opt in explicitly via `freenet secrets kek-init --backend keyring`
+    // (or `kek-migrate --to keyring` after first start) — the act of
+    // running the CLI command is the consent capture.
+    //
+    // SystemdCredentialKek is kept in the auto-chain because it only
+    // activates when systemd has already provisioned the credential
+    // (CREDENTIALS_DIRECTORY env var is set); the operator opted in
+    // by configuring the systemd unit, no out-of-band prompt fires.
+    //
+    // FileKek is the always-available default; logs a warning so the
+    // operator knows the KEK lives on disk and how to upgrade.
     if let Some(b) = SystemdCredentialKek::new() {
         chain.push(Box::new(b));
     }

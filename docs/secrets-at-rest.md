@@ -14,11 +14,44 @@ node KEK (32 bytes, in OS keyring / systemd cred / file)
 ```
 
 The KEK is provisioned on first start by the resolver in
-`crates/core/src/config/kek.rs`, which tries OS keyring → systemd
-credential → file backend in order and persists the choice in
+`crates/core/src/config/kek.rs`. The **auto-resolver intentionally
+omits the OS keyring backend** to avoid an unexpected Keychain /
+Credential Manager prompt the moment an operator first runs `freenet`.
+The auto-chain is therefore:
+
+1. `systemd` credential — only active when the node was started by
+   systemd with `LoadCredentialEncrypted=freenet-kek:...` on the unit
+   (so the operator already opted in by configuring the unit).
+2. `file` — `secrets_dir/node_kek`, 0o600. Always-available fallback;
+   logs a WARN so the operator knows the KEK lives on disk.
+
+The OS keyring backend is **opt-in**: operators who want it run
+`freenet secrets kek-init --backend keyring --secrets-dir <path> --yes`
+**before** the first node start. The act of running that CLI command
+is the consent capture — the keyring write (and any platform
+permission dialog it triggers) happens during a command the operator
+explicitly invoked, not during plain `freenet` startup.
+
+After the resolver runs, the choice is persisted in
 `secrets_dir/kek_backend`. Subsequent starts load STRICTLY from the
-recorded backend — transient keyring outage is a hard error, never a
+recorded backend — transient backend outage is a hard error, never a
 silent demotion.
+
+### Platform notes (keyring backend)
+
+| Platform | First write | Subsequent reads | After binary upgrade |
+|---|---|---|---|
+| macOS (signed) | silent | silent | Keychain prompt (signature changed) |
+| macOS (unsigned / dev) | silent | prompts each start | prompts each start |
+| Windows | silent | silent | silent |
+| Linux | requires Secret Service daemon | depends on daemon | depends on daemon |
+
+The macOS / dev-build prompt-per-start behavior is the main reason
+keyring is opt-in: every auto-update changes the binary signature, and
+without opt-in every release would surface a surprise prompt. A future
+PR will let an application (delegate) trigger a consent flow lazily on
+first-use via the WS API, so end users can grant per-app and the keyring
+becomes the obvious default again.
 
 ## Operator migration matrix
 
@@ -55,9 +88,14 @@ first write.
 
 ```
 freenet secrets kek-status   --secrets-dir <path>
-freenet secrets kek-migrate  --secrets-dir <path> --to {keyring|systemd|file} --yes
+freenet secrets kek-init     --secrets-dir <path> --backend {keyring|systemd|file} --yes
+freenet secrets kek-migrate  --secrets-dir <path> --to     {keyring|systemd|file} --yes
 freenet secrets kek-rotate   --secrets-dir <path> --yes   # NOT YET IMPLEMENTED (#4137)
 ```
+
+`kek-init` opts in to a specific backend BEFORE first start. It refuses
+to run if the backend marker already exists — use `kek-migrate` after
+first start.
 
 Node MUST be stopped before running migrate. `kek-rotate` currently
 bails with a clear error pointing operators at the temporary

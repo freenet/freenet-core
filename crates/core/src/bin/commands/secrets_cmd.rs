@@ -15,10 +15,13 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
+use chacha20poly1305::aead::{OsRng, rand_core::RngCore};
 use freenet::dev_tool::{
-    KekBackendKind, load_from_backend, read_backend_marker, replace_backend_marker,
+    KEK_SIZE, KekBackendKind, build_backend_for, load_from_backend, read_backend_marker,
+    replace_backend_marker, write_backend_marker,
 };
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 #[derive(clap::Parser, Clone, Debug)]
 pub struct SecretsCliConfig {
@@ -37,6 +40,12 @@ pub enum SecretsCommand {
     /// Print the active KEK backend and the KEK fingerprint
     /// (`SHA-256(KEK)[..8]` in hex). Does NOT print the KEK itself.
     KekStatus(KekStatusArgs),
+    /// Explicitly provision the node KEK into a specific backend
+    /// BEFORE the first node start. Use this to opt in to the OS
+    /// keyring backend (which the auto-resolver intentionally skips
+    /// to avoid an unexpected Keychain / Credential Manager prompt
+    /// at startup).
+    KekInit(KekInitArgs),
     /// Generate a new KEK, re-encrypt every active secret + snapshot
     /// under the new derived DEKs, atomically swap the KEK in the
     /// backend, delete the previous value. The node MUST be stopped.
@@ -53,6 +62,25 @@ pub struct KekStatusArgs {
     /// `kek_backend` / `delegate_cipher` live).
     #[clap(long, value_parser)]
     pub secrets_dir: PathBuf,
+}
+
+#[derive(clap::Parser, Clone, Debug)]
+pub struct KekInitArgs {
+    /// Path to the node's secrets directory. Will be created if it
+    /// doesn't yet exist.
+    #[clap(long, value_parser)]
+    pub secrets_dir: PathBuf,
+    /// Backend to provision the KEK into: `keyring`, `systemd`, or `file`.
+    ///
+    /// Choosing `keyring` triggers the OS keyring write here (which is
+    /// what produces the platform's consent dialog on macOS/Linux for
+    /// dev/unsigned builds) — the act of running this command is the
+    /// operator's explicit consent.
+    #[clap(long)]
+    pub backend: String,
+    /// Acknowledge that this is an interactive provisioning step.
+    #[clap(long)]
+    pub yes: bool,
 }
 
 #[derive(clap::Parser, Clone, Debug)]
@@ -78,9 +106,90 @@ pub struct KekMigrateArgs {
 pub async fn run(config: SecretsCliConfig) -> Result<()> {
     match config.command {
         SecretsCommand::KekStatus(args) => kek_status(args).await,
+        SecretsCommand::KekInit(args) => kek_init(args).await,
         SecretsCommand::KekRotate(args) => kek_rotate(args).await,
         SecretsCommand::KekMigrate(args) => kek_migrate(args).await,
     }
+}
+
+fn parse_backend_kind(s: &str) -> Result<KekBackendKind> {
+    match s {
+        "keyring" => Ok(KekBackendKind::Keyring),
+        "systemd" => Ok(KekBackendKind::Systemd),
+        "file" => Ok(KekBackendKind::File),
+        other => Err(anyhow!(
+            "unrecognized backend `{other}`; expected keyring|systemd|file"
+        )),
+    }
+}
+
+async fn kek_init(args: KekInitArgs) -> Result<()> {
+    let target = parse_backend_kind(&args.backend)?;
+
+    // Prior provisioning short-circuits — refuse rather than racing
+    // with an existing KEK. Operators migrating between backends after
+    // first start use `kek-migrate`, not `kek-init`.
+    if let Some(existing) =
+        read_backend_marker(&args.secrets_dir).context("failed to read kek_backend marker")?
+    {
+        bail!(
+            "KEK already provisioned on `{existing}` backend in {}. Use \
+             `freenet secrets kek-migrate --to {target}` to switch backends.",
+            args.secrets_dir.display()
+        );
+    }
+
+    if !args.yes {
+        eprintln!(
+            "About to provision a new node KEK into the `{target}` backend at {}.\n\
+             - `keyring`: writes to the OS secret store. On macOS this binds the entry to\n\
+               the current binary signature; ad-hoc / dev builds will re-prompt on every\n\
+               start. On Linux it requires a Secret Service daemon. On Windows it writes\n\
+               silently to Credential Manager.\n\
+             - `systemd`: ONLY valid when the freenet unit was started with\n\
+               `LoadCredentialEncrypted=freenet-kek:/path` — this command will fail otherwise.\n\
+             - `file`:    writes `node_kek` (0o600) to the secrets dir. Weakest option;\n\
+               operator is responsible for protecting the directory.\n\
+             Re-run with --yes to proceed.",
+            args.secrets_dir.display()
+        );
+        bail!("aborted (no --yes)");
+    }
+
+    std::fs::create_dir_all(&args.secrets_dir).with_context(|| {
+        format!(
+            "failed to create secrets dir {}",
+            args.secrets_dir.display()
+        )
+    })?;
+
+    let backend = build_backend_for(target, &args.secrets_dir).with_context(|| {
+        format!("failed to construct `{target}` backend handle (is it available on this platform?)")
+    })?;
+
+    // Cryptographic key material — `OsRng` (not `GlobalRng`) is the
+    // right choice here: KEK is the node's root secret, must come from
+    // the OS entropy pool, never from a seedable simulation RNG.
+    let mut kek_bytes = Zeroizing::new([0u8; KEK_SIZE]);
+    OsRng.fill_bytes(kek_bytes.as_mut_slice());
+
+    backend.store(&kek_bytes).with_context(|| {
+        format!(
+            "failed to store KEK in `{target}` backend (existing entry? delete first via OS tools)"
+        )
+    })?;
+
+    write_backend_marker(&args.secrets_dir, target)
+        .context("failed to write kek_backend marker after provisioning")?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(kek_bytes.as_slice());
+    let fp = hasher.finalize();
+    let fp_hex: String = fp[..8].iter().map(|b| format!("{b:02x}")).collect();
+
+    println!("Provisioned KEK into `{target}` backend.");
+    println!("KEK fingerprint (SHA-256[..8]): {fp_hex}");
+    Ok(())
 }
 
 async fn kek_status(args: KekStatusArgs) -> Result<()> {
@@ -149,18 +258,7 @@ async fn kek_rotate(args: KekRotateArgs) -> Result<()> {
 }
 
 async fn kek_migrate(args: KekMigrateArgs) -> Result<()> {
-    use freenet::dev_tool::build_backend_for;
-
-    let target: KekBackendKind = match args.to.as_str() {
-        "keyring" => KekBackendKind::Keyring,
-        "systemd" => KekBackendKind::Systemd,
-        "file" => KekBackendKind::File,
-        other => {
-            return Err(anyhow!(
-                "unrecognized --to backend `{other}`; expected keyring|systemd|file"
-            ));
-        }
-    };
+    let target = parse_backend_kind(&args.to)?;
 
     let current = read_backend_marker(&args.secrets_dir)
         .context("failed to read kek_backend marker")?
