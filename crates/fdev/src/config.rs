@@ -151,9 +151,6 @@ pub struct UpdateConfig {
     /// contract's `update_state` only accepts full-state replacements.
     #[arg(long)]
     pub(crate) as_state: bool,
-    /// Whether this contract will be updated in the network or is just a dry run
-    /// to be executed in local mode only. By default puts are performed in local.
-    pub(crate) release: bool,
 }
 
 /// Publishes a new contract or delegate to the network.
@@ -169,10 +166,6 @@ pub struct PutConfig {
     /// with empty parameters.
     #[arg(long)]
     pub(crate) parameters: Option<PathBuf>,
-    /// Whether this contract will be released into the network or is just a dry run
-    /// to be executed in local mode only. By default puts are performed in local.
-    #[arg(long)]
-    pub(crate) release: bool,
     /// Type of put to perform.
     #[clap(subcommand)]
     pub(crate) package_type: PutType,
@@ -279,4 +272,61 @@ pub(crate) enum ContractKind {
     WebApp,
     /// An standard contract.
     Contract,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    use super::Config;
+
+    /// Regression test for #4088: `fdev publish --release` used to bail
+    /// unconditionally with "Cannot publish contracts in the network yet".
+    /// After the fix the `--release` flag no longer exists on `publish`;
+    /// passing it should be a CLI parse error, not a silent rejection at
+    /// runtime.
+    #[test]
+    fn publish_does_not_accept_release_flag() {
+        let result = Config::try_parse_from([
+            "fdev",
+            "publish",
+            "--code",
+            "contract.wasm",
+            "--release", // must not exist
+            "contract",
+        ]);
+        let err_msg = result
+            .as_ref()
+            .map(|_| String::new())
+            .unwrap_or_else(|e| e.to_string());
+        assert!(
+            result.is_err(),
+            "fdev publish --release should be a parse error after #4088 removal, but parsed OK"
+        );
+        assert!(
+            err_msg.contains("--release") || err_msg.contains("release"),
+            "error message should mention the unknown flag, got: {err_msg}"
+        );
+    }
+
+    /// Regression test for #4088: `fdev execute update <KEY> <DELTA> <RELEASE>`
+    /// used to accept a positional `release: bool` argument that bailed
+    /// unconditionally when true. After the fix the positional arg is gone.
+    #[test]
+    fn execute_update_does_not_accept_positional_release_bool() {
+        // Passing "true" as a third positional arg should now be rejected
+        // because UpdateConfig only accepts key + delta.
+        let result = Config::try_parse_from([
+            "fdev",
+            "execute",
+            "update",
+            "SomeBase58ContractKey",
+            "/tmp/delta.bin",
+            "true", // was the `release: bool` positional; must not exist
+        ]);
+        assert!(
+            result.is_err(),
+            "fdev execute update with a third positional arg should fail after #4088 removal"
+        );
+    }
 }
