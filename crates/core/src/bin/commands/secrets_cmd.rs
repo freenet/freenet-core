@@ -543,6 +543,75 @@ mod tests {
         );
     }
 
+    fn status_args(dir: &std::path::Path) -> KekStatusArgs {
+        KekStatusArgs {
+            secrets_dir: dir.to_path_buf(),
+        }
+    }
+
+    fn rotate_args(dir: &std::path::Path, yes: bool) -> KekRotateArgs {
+        KekRotateArgs {
+            secrets_dir: dir.to_path_buf(),
+            yes,
+        }
+    }
+
+    #[tokio::test]
+    async fn kek_status_succeeds_when_marker_absent() {
+        // First-start flow: no marker, no KEK. `kek-status` must Ok
+        // with the not-provisioned message, NOT bail.
+        let dir = tempfile::tempdir().expect("tempdir");
+        kek_status(status_args(dir.path()))
+            .await
+            .expect("kek-status with no marker must succeed");
+    }
+
+    #[tokio::test]
+    async fn kek_status_succeeds_after_kek_init() {
+        // Happy path: marker present + KEK loadable → fingerprint
+        // computed without error.
+        let dir = tempfile::tempdir().expect("tempdir");
+        kek_init(args(dir.path(), "file", true))
+            .await
+            .expect("seed kek-init");
+        kek_status(status_args(dir.path()))
+            .await
+            .expect("kek-status after init must succeed");
+    }
+
+    #[tokio::test]
+    async fn kek_status_fails_when_marker_points_at_missing_kek() {
+        // Path 3: marker says file, but node_kek is absent.
+        // `load_from_backend` returns `KekError::NoBackend`, which
+        // kek_status must propagate as an error (not panic, not silently
+        // succeed). Regression guard for the TOCTOU-panic fix (B4).
+        let dir = tempfile::tempdir().expect("tempdir");
+        write_backend_marker(dir.path(), KekBackendKind::File).expect("seed marker");
+        let err = kek_status(status_args(dir.path()))
+            .await
+            .expect_err("must error when marker points at empty backend");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("failed to load KEK"),
+            "expected load-failure error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kek_rotate_always_bails_with_not_implemented() {
+        // kek_rotate is unconditionally not-implemented in this build.
+        // Pin that with --yes set — catches accidental gating on --yes
+        // (the bail must surface BEFORE the --yes check).
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = kek_rotate(rotate_args(dir.path(), true))
+            .await
+            .expect_err("kek-rotate must always error");
+        assert!(
+            err.to_string().contains("not yet implemented"),
+            "expected not-implemented bail, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn kek_migrate_fails_when_source_backend_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
