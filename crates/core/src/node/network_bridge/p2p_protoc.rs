@@ -189,11 +189,7 @@ impl P2pBridge {
     /// Without this hop, a GET (or other relayed op) issued just before
     /// its downstream peer disconnected would block for the full
     /// `OPERATION_TTL` (60 s) before retrying — see #4154.
-    pub(crate) async fn handle_orphaned_transactions(
-        &self,
-        transactions: Vec<Transaction>,
-        _gateways: &[PeerKeyLocation],
-    ) {
+    pub(crate) async fn handle_orphaned_transactions(&self, transactions: Vec<Transaction>) {
         if transactions.is_empty() {
             return;
         }
@@ -1423,7 +1419,6 @@ impl P2pConnManager {
                                         ctx.bridge
                                             .handle_orphaned_transactions(
                                                 prune_result.orphaned_transactions,
-                                                &ctx.gateways,
                                             )
                                             .await;
 
@@ -2195,7 +2190,7 @@ impl P2pConnManager {
 
         // Handle orphaned transactions immediately (retry via alternate routes)
         self.bridge
-            .handle_orphaned_transactions(prune_result.orphaned_transactions, &self.gateways)
+            .handle_orphaned_transactions(prune_result.orphaned_transactions)
             .await;
 
         // Broadcast unready if we dropped below the readiness threshold
@@ -2293,7 +2288,7 @@ impl P2pConnManager {
 
         // Handle orphaned transactions
         self.bridge
-            .handle_orphaned_transactions(prune_result.orphaned_transactions, &self.gateways)
+            .handle_orphaned_transactions(prune_result.orphaned_transactions)
             .await;
 
         if prune_result.became_unready {
@@ -3263,10 +3258,7 @@ impl P2pConnManager {
                     .prune_connection(PeerId::new(old_peer.pub_key().clone(), peer_addr))
                     .await;
                 self.bridge
-                    .handle_orphaned_transactions(
-                        prune_result.orphaned_transactions,
-                        &self.gateways,
-                    )
+                    .handle_orphaned_transactions(prune_result.orphaned_transactions)
                     .await;
                 if prune_result.became_unready {
                     // Deferred: broadcast after connection_manager borrow ends
@@ -3711,10 +3703,7 @@ impl P2pConnManager {
 
                     // Handle orphaned transactions immediately (retry via alternate routes)
                     self.bridge
-                        .handle_orphaned_transactions(
-                            prune_result.orphaned_transactions,
-                            &self.gateways,
-                        )
+                        .handle_orphaned_transactions(prune_result.orphaned_transactions)
                         .await;
 
                     if prune_result.became_unready {
