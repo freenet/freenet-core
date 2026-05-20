@@ -45,11 +45,13 @@ name: Claude PR Rule Review
 #       `/proc/<pid>/environ`, since the Claude process env carries
 #       CLAUDE_CODE_OAUTH_TOKEN + GITHUB_TOKEN, or `~/.claude` on disk)
 #       and echo it into the review text. The `settings.permissions.deny`
-#       block scopes `Read`/`Glob`/`Grep` away from `/proc`, `/sys`,
-#       `/dev`, `/etc`, `/root`, the runner's home dotfiles and
-#       `$RUNNER_TEMP` — confining file access to the checked-out repo
-#       and the precomputed diff. This is defense-in-depth, not a perfect
-#       sandbox; the no-Bash lockdown in (a) is the load-bearing control.
+#       block adds `Read(...)` path rules — which Claude Code also
+#       applies to the Grep and Glob file-reading tools — denying
+#       `/proc`, `/sys`, `/dev`, `/etc`, `/root`, the runner's home
+#       dotfiles and `$RUNNER_TEMP`, confining file access to the
+#       checked-out repo and the precomputed diff. This is
+#       defense-in-depth, not a perfect sandbox; the no-Bash lockdown in
+#       (a) is the load-bearing control.
 #
 #   (d) The job token has only `pull-requests: write` + `issues: write` +
 #       `statuses: write` — no `contents: write`. Worst case is a
@@ -348,10 +350,20 @@ jobs:
           #     The precomputed diff lives INSIDE the workspace
           #     (`.pr-review-tmp/`), and the repo's own `.claude/` rules and
           #     `.github/` are part of the review, so the deny list targets
-          #     only paths OUTSIDE the repo tree. deny takes precedence over
-          #     allow. NOTE: this is defense-in-depth, not a perfect sandbox —
-          #     the no-Bash lockdown is the primary control; see the "Fork PR
-          #     security model" header.
+          #     only paths OUTSIDE the repo tree.
+          #
+          # PATH SYNTAX (Claude Code permission rules, gitignore-based):
+          #   `//abs/**` = absolute path from filesystem root;
+          #   `~/p/**`   = path under the runner's home dir;
+          #   a SINGLE leading slash (`/proc/**`) would mean
+          #   "<project root>/proc" — NOT the real /proc — so the
+          #   double-slash form below is REQUIRED. Do not "simplify" it.
+          # Claude Code applies `Read(...)` rules to the Grep and Glob
+          # file-reading tools too, so only `Read(...)` path rules are
+          # needed (there is no `Grep(path)` / `Glob(path)` rule form).
+          # deny takes precedence over allow. NOTE: this is
+          # defense-in-depth, not a perfect sandbox — the no-Bash lockdown
+          # is the primary control; see the "Fork PR security model" header.
           settings: |
             {
               "permissions": {
@@ -379,23 +391,7 @@ jobs:
                   "Read(~/.netrc)",
                   "Read(~/.ssh/**)",
                   "Read(~/.git-credentials)",
-                  "Read(~/work/_temp/**)",
-                  "Grep(//proc/**)",
-                  "Grep(//sys/**)",
-                  "Grep(//etc/**)",
-                  "Grep(//root/**)",
-                  "Grep(~/.claude/**)",
-                  "Grep(~/.config/**)",
-                  "Grep(~/.ssh/**)",
-                  "Grep(~/work/_temp/**)",
-                  "Glob(//proc/**)",
-                  "Glob(//sys/**)",
-                  "Glob(//etc/**)",
-                  "Glob(//root/**)",
-                  "Glob(~/.claude/**)",
-                  "Glob(~/.config/**)",
-                  "Glob(~/.ssh/**)",
-                  "Glob(~/work/_temp/**)"
+                  "Read(~/work/_temp/**)"
                 ]
               }
             }
