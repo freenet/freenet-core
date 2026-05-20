@@ -127,7 +127,7 @@ if [[ -s "$OUT/outdated.raw" ]]; then
     map(
       {crate: .crate_name, deps: [.dependencies[] | select(
         (.compat != null and .compat != "" and .compat != "Removed" and .compat != "---")
-        or (.latest != null and .latest != "" and .latest != "Removed")
+        or (.latest != null and .latest != "" and .latest != "Removed" and .latest != "---")
       )]}
     ) |
     map(. + {update_count: (.deps | length)})
@@ -139,7 +139,10 @@ if [[ -s "$OUT/outdated.raw" ]]; then
     [.[].dependencies[]] |
     {
       compat_updates: [.[] | select(.compat != null and .compat != "" and .compat != "Removed" and .compat != "---")],
-      major_updates:  [.[] | select(.compat == null or .compat == "" or .compat == "---" or .compat == "Removed")]
+      major_updates:  [.[] | select(
+        (.compat == null or .compat == "" or .compat == "---" or .compat == "Removed")
+        and (.latest != null and .latest != "" and .latest != "Removed" and .latest != "---")
+      )]
     } |
     {compat_count: (.compat_updates | length), major_count: (.major_updates | length)}
   ' "$OUT/outdated.raw" > "$OUT/outdated.classification.json" 2>/dev/null \
