@@ -101,6 +101,9 @@ tracing-appender = { workspace = true, optional = true }
 opentelemetry-otlp = { workspace = true, optional = true }
 opentelemetry_sdk = { workspace = true, optional = true }
 
+hkdf = { workspace = true }
+keyring = { workspace = true }
+
 # internal deps
 freenet-stdlib = { features = ["net"], workspace = true }
 console-subscriber = { workspace = true, optional = true }

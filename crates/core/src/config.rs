@@ -22,7 +22,12 @@ use crate::{
     transport::{CongestionControlAlgorithm, CongestionControlConfig, TransportKeypair},
 };
 
+pub(crate) mod kek;
 mod secret;
+pub use kek::{
+    KEK_SIZE, KekBackend, KekBackendKind, KekError, ensure_kek_loaded, load_from_backend,
+    read_backend_marker, replace_backend_marker, resolve_first_start, write_backend_marker,
+};
 pub use secret::*;
 
 /// Default maximum number of connections for the peer.
