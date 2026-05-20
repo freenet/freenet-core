@@ -30,7 +30,10 @@ name: Claude PR Rule Review
 #   `statuses: write` — worst case is a misleading comment, which a human
 #   reviewer will catch; (d) the action automatically scrubs Anthropic /
 #   cloud / GitHub Actions secrets from subprocess env when this input
-#   is set.
+#   is set; (e) the checkout step sets `persist-credentials: false` so the
+#   job's GITHUB_TOKEN is NOT written to .git/config — read-only tools
+#   alone are not enough, since `Read`/`cat` could otherwise exfiltrate a
+#   persisted token from .git/config under prompt injection.
 # - Do NOT copy this `allowed_non_write_users: '*'` pattern to any workflow
 #   that grants Claude write/edit tools, commit signing, or contents:write.
 #
@@ -89,6 +92,13 @@ jobs:
           # execute the fork's code (no cargo build/test).
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
+          # SECURITY: do not persist the job's GITHUB_TOKEN into .git/config.
+          # With `allowed_non_write_users: '*'` below, a malicious fork PR can
+          # prompt-inject Claude via the diff. Claude's tools are read-only,
+          # but `Read`/`cat` would still let an injected prompt exfiltrate a
+          # persisted token from .git/config. We only run local git diff/log/
+          # show here, which need no credentials.
+          persist-credentials: false
 
       - name: Check review-override label
         id: override
