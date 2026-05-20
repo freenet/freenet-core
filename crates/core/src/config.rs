@@ -204,9 +204,9 @@ impl ConfigArgs {
                             std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
                         })?;
                         let secrets = Self::read_secrets(
-                            config.secrets.transport_keypair_path,
-                            config.secrets.nonce_path,
-                            config.secrets.cipher_path,
+                            config.secrets.transport_keypair_path.clone(),
+                            config.secrets.nonce_path.clone(),
+                            config.secrets.cipher_path.clone(),
                         )?;
                         config.secrets = secrets;
                         Ok(Some(config))
@@ -215,9 +215,9 @@ impl ConfigArgs {
                         let mut file = File::open(&path)?;
                         let mut config = serde_json::from_reader::<_, Config>(&mut file)?;
                         let secrets = Self::read_secrets(
-                            config.secrets.transport_keypair_path,
-                            config.secrets.nonce_path,
-                            config.secrets.cipher_path,
+                            config.secrets.transport_keypair_path.clone(),
+                            config.secrets.nonce_path.clone(),
+                            config.secrets.cipher_path.clone(),
                         )?;
                         config.secrets = secrets;
                         Ok(Some(config))

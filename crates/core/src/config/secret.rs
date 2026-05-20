@@ -2,6 +2,7 @@ use std::path::Path;
 
 use aes_gcm::KeyInit;
 use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::OsRng};
+use zeroize::Zeroize;
 
 use super::*;
 
@@ -263,22 +264,35 @@ impl SecretArgs {
         })
     }
 
-    pub(super) fn merge(&mut self, other: Secrets) {
+    pub(super) fn merge(&mut self, mut other: Secrets) {
+        // `Secrets` is `Drop` (zeroizes cipher/nonce); we can't move
+        // path fields out of `other` directly, so swap them out with
+        // `mem::take` and let `other` drop with `None` placeholders.
         if self.transport_keypair.is_none() {
-            self.transport_keypair = other.transport_keypair_path;
+            self.transport_keypair = std::mem::take(&mut other.transport_keypair_path);
         }
 
         if self.nonce.is_none() {
-            self.nonce = other.nonce_path;
+            self.nonce = std::mem::take(&mut other.nonce_path);
         }
 
         if self.cipher.is_none() {
-            self.cipher = other.cipher_path;
+            self.cipher = std::mem::take(&mut other.cipher_path);
         }
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+/// Persisted secrets bundle (transport keypair + the legacy
+/// cipher/nonce fields kept for read-side decrypt of pre-#4140 blobs).
+///
+/// `Debug` is impl'd by hand so the 32-byte cipher and 24-byte nonce
+/// never leak into logs; the impl renders them as `<redacted N bytes>`.
+/// On drop, the cipher and nonce byte arrays are wiped via
+/// `Zeroize::zeroize` so the freelist slot cannot be read back later by
+/// an unrelated allocation. `TransportKeypair` carries its own
+/// `ZeroizeOnDrop` on the secret-key half (`x25519_dalek::StaticSecret`),
+/// so this struct does not need to wipe it explicitly.
+#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Secrets {
     #[serde(skip)]
     pub transport_keypair: TransportKeypair,
@@ -292,6 +306,26 @@ pub struct Secrets {
     pub cipher: [u8; 32],
     #[serde(rename = "cipher", skip_serializing_if = "Option::is_none")]
     pub cipher_path: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for Secrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Secrets")
+            .field("transport_keypair", &"<redacted>")
+            .field("transport_keypair_path", &self.transport_keypair_path)
+            .field("nonce", &"<redacted 24 bytes>")
+            .field("nonce_path", &self.nonce_path)
+            .field("cipher", &"<redacted 32 bytes>")
+            .field("cipher_path", &self.cipher_path)
+            .finish()
+    }
+}
+
+impl Drop for Secrets {
+    fn drop(&mut self) {
+        self.cipher.zeroize();
+        self.nonce.zeroize();
+    }
 }
 
 // Only used in tests
@@ -601,6 +635,55 @@ mod tests {
             secrets2.transport_keypair_path.as_deref(),
             Some(keypair_path.as_path()),
             "reloaded keypair should preserve the path"
+        );
+    }
+
+    /// `TransportKeypair::save` (private half) MUST land at 0o600 on
+    /// Unix. Before the file-permission tightening, the tmp file was
+    /// created via `File::create` which inherited the process umask
+    /// (typically 0o022 → 0o644, world-readable). Pin the tight mode
+    /// here so a future regression that drops the `OpenOptions::mode`
+    /// call would fail this test instead of silently leaking the X25519
+    /// private key to other local users.
+    #[cfg(unix)]
+    #[test]
+    fn test_transport_keypair_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let secrets_dir = tmp_dir.path();
+
+        // Auto-persist path: SecretArgs::build writes via TransportKeypair::save.
+        let args = SecretArgs::default();
+        let secrets = args.build(Some(secrets_dir)).unwrap();
+        let keypair_path = secrets
+            .transport_keypair_path
+            .as_deref()
+            .expect("auto-persisted keypair has a path");
+
+        let mode = std::fs::metadata(keypair_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "auto-persisted transport_keypair must be 0o600, got {mode:o}"
+        );
+
+        // Direct save path: also pin the mode for callers that hit
+        // TransportKeypair::save outside SecretArgs::build (e.g. the
+        // RSA-PEM legacy upgrade path in read_transport_keypair).
+        let direct_path = secrets_dir.join("direct_keypair");
+        TransportKeypair::new().save(&direct_path).unwrap();
+        let direct_mode = std::fs::metadata(&direct_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            direct_mode, 0o600,
+            "direct TransportKeypair::save must produce 0o600, got {direct_mode:o}"
         );
     }
 

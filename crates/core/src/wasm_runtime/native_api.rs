@@ -1061,6 +1061,16 @@ pub(super) mod delegate_secrets {
                 // SAFETY: `dst` was validated by `validate_and_compute_ptr` to point to
                 // `secret_len` bytes within WASM linear memory, and `plaintext` is a
                 // valid byte slice of that length.
+                //
+                // Memory hygiene boundary: the host-side `plaintext` is
+                // `Zeroizing<Vec<u8>>` so its allocation is wiped when
+                // this function returns. The copy destination — WASM
+                // linear memory inside the delegate instance — is NOT
+                // wiped by us; the delegate is responsible for zeroing
+                // its own buffer when done. The corresponding stdlib-
+                // side `Zeroize` derive is tracked under #4137 and will
+                // ship in a follow-up once a freenet-stdlib release is
+                // cut for it (stdlib-first release policy).
                 unsafe {
                     std::ptr::copy_nonoverlapping(plaintext.as_ptr(), dst, secret_len);
                 }
@@ -1133,7 +1143,9 @@ pub(super) mod delegate_secrets {
         };
         // SAFETY: `val_src` was validated by `validate_and_compute_ptr` to point to
         // `val_len` bytes within the WASM linear memory.
-        let value = unsafe { std::slice::from_raw_parts(val_src, val_len as usize) }.to_vec();
+        let value = zeroize::Zeroizing::new(
+            unsafe { std::slice::from_raw_parts(val_src, val_len as usize) }.to_vec(),
+        );
 
         match env
             .secret_store_mut()
