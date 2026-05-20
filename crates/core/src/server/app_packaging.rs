@@ -238,4 +238,14 @@ mod tests {
         // The malicious entry must not have escaped into the parent directory.
         assert!(!dir.path().join("escape.txt").exists());
     }
+
+    #[test]
+    fn unpack_rejects_absolute_path_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = web_app(&[("/etc/passwd", b"pwned")]);
+        let err = app
+            .unpack(dir.path())
+            .expect_err("an archive entry with an absolute path must be rejected");
+        assert!(matches!(err, WebContractError::UnpackingError(_)));
+    }
 }
