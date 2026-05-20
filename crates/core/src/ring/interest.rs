@@ -2346,8 +2346,19 @@ mod tests {
     /// overlap. Because there is only one add and one remove, nothing
     /// can heal a zombie once created — it persists to the post-round
     /// check, which reads the three maps directly and calls no
-    /// `remove_*` (which would trigger cleanup and heal it). Each of the
-    /// four fixed add/remove pairs is exercised round-robin.
+    /// `remove_*` (which would trigger cleanup and heal it).
+    ///
+    /// Each of the four real add/remove PAIRS is exercised round-robin:
+    /// `register_peer_interest`/`remove_peer_interest`,
+    /// `register_local_hosting`/`unregister_local_hosting`,
+    /// `add_local_client`/`remove_local_client`,
+    /// `add_downstream_subscriber`/`remove_downstream_subscriber`. The
+    /// fifth fixed site, `register_local_interest`, gets the same
+    /// lock-across-index discipline but is NOT raced here: it is dead
+    /// code (no workspace caller) with no symmetric remove operation, so
+    /// there is no natural pair to race it against. It is structurally
+    /// identical to the tested `register_local_hosting` and is guarded
+    /// by code review plus the `.claude/rules/ring.md` rule entry.
     ///
     /// The fix holds the shard guard across `index_contract_hash`, so
     /// the racy interleaving cannot occur and no round produces a
@@ -2459,7 +2470,12 @@ mod tests {
             // `remove_*` (which would trigger cleanup). A zombie =
             // indexed in `contract_hash_index`, absent from BOTH
             // `local_interests` and `interested_peers`.
-            let in_chi = !manager.lookup_by_hash(contract_hash(&contract)).is_empty();
+            // `lookup_by_hash` returns every contract sharing the 32-bit
+            // hash, so check membership of THIS contract specifically —
+            // `!is_empty()` would false-positive on a hash collision.
+            let in_chi = manager
+                .lookup_by_hash(contract_hash(&contract))
+                .contains(&contract);
             let in_li = manager.local_interests.contains_key(&contract);
             let in_ip = manager.interested_peers.contains_key(&contract);
             if in_chi && !in_li && !in_ip {
