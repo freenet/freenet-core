@@ -127,6 +127,8 @@ pub struct RuntimePool {
     shared_contract_modules: SharedModuleCache<ContractKey>,
     /// Shared compiled delegate module cache.
     shared_delegate_modules: SharedModuleCache<DelegateKey>,
+    /// Shared per-delegate `ctx.write()` cache (see `DelegateContextCache`).
+    shared_delegate_contexts: crate::wasm_runtime::DelegateContextCache,
     /// Shared backend engine used by all executors.
     ///
     /// All executors MUST share the same backend engine because compiled modules
@@ -188,6 +190,9 @@ impl RuntimePool {
             Arc::new(Mutex::new(LruCache::new(cache_capacity)));
         let shared_delegate_modules: SharedModuleCache<DelegateKey> =
             Arc::new(Mutex::new(LruCache::new(cache_capacity)));
+        // Shared delegate-context cache so a prompt round-trip routed to a
+        // different pool executor still finds its `ctx.write()` blob.
+        let shared_delegate_contexts = crate::wasm_runtime::new_delegate_context_cache();
 
         // Create shared recovery guard for corrupted-state self-healing.
         // All pool executors share this so recovery tracking is consistent.
@@ -204,6 +209,7 @@ impl RuntimePool {
             Some(op_manager.clone()),
             shared_contract_modules.clone(),
             shared_delegate_modules.clone(),
+            shared_delegate_contexts.clone(),
             None, // No shared backend yet — this executor creates the engine
         )
         .await?;
@@ -224,6 +230,7 @@ impl RuntimePool {
                 Some(op_manager.clone()),
                 shared_contract_modules.clone(),
                 shared_delegate_modules.clone(),
+                shared_delegate_contexts.clone(),
                 Some(shared_backend_engine.clone()),
             )
             .await?;
@@ -261,6 +268,7 @@ impl RuntimePool {
             shared_client_counts,
             shared_contract_modules,
             shared_delegate_modules,
+            shared_delegate_contexts,
             shared_backend_engine,
             shared_recovery_guard,
             delegate_notification_tx,
@@ -410,6 +418,7 @@ impl RuntimePool {
             Some(self.op_manager.clone()),
             self.shared_contract_modules.clone(),
             self.shared_delegate_modules.clone(),
+            self.shared_delegate_contexts.clone(),
             Some(self.shared_backend_engine.clone()),
         )
         .await?;
@@ -2565,12 +2574,17 @@ impl Executor<Runtime> {
     /// If `shared_backend` is `None`, a new backend engine is created (used for
     /// the first executor in a pool). If `Some`, the provided engine is shared
     /// (used for subsequent executors and replacements).
+    // Each parameter is a distinct shared resource the pool wires through
+    // explicitly; bundling them into a struct just to satisfy the lint
+    // would obscure which executor sees which cache.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn from_config_with_shared_modules(
         config: Arc<Config>,
         shared_state_store: StateStore<Storage>,
         op_manager: Option<Arc<OpManager>>,
         contract_modules: SharedModuleCache<ContractKey>,
         delegate_modules: SharedModuleCache<DelegateKey>,
+        delegate_contexts: crate::wasm_runtime::DelegateContextCache,
         shared_backend: Option<BackendEngine>,
     ) -> anyhow::Result<Self> {
         let db = shared_state_store.storage();
@@ -2583,6 +2597,7 @@ impl Executor<Runtime> {
             false,
             contract_modules,
             delegate_modules,
+            delegate_contexts,
             shared_backend.unwrap_or_else(|| {
                 // First executor — create a fresh backend engine; RuntimePool
                 // will extract and share it with subsequent executors.
