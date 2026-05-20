@@ -2400,6 +2400,19 @@ mod tests {
     fn test_set_own_addr_atomic_with_network_status() {
         use std::sync::{Arc as StdArc, Barrier};
 
+        // GLOBAL-STATE CONTRACT: this test asserts on the process-global
+        // `network_status::external_address`, so it must remain the ONLY
+        // test that concurrently writes that global. That holds today:
+        // `set_external_address` has exactly one production caller
+        // (`set_own_addr`), and integration tests that spin up nodes run in
+        // separate test binaries (separate processes — each gets its own
+        // `NETWORK_STATUS`). Within this lib-test binary no other test calls
+        // `set_own_addr` / `set_external_address`. If a future lib-test does,
+        // it must serialize against this one (e.g. share a test mutex) or
+        // this `assert_eq!` can flake. (Reviewers: Claude testing/skeptical +
+        // Gemini all flagged this latent coupling — documented, not a current
+        // bug.)
+        //
         // `network_status::set_external_address` is a no-op until `init()` has
         // run. `init()` is idempotent (OnceLock — first caller wins), so this
         // is safe even if another test already initialized the global.
