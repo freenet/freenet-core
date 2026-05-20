@@ -2,6 +2,7 @@ use std::path::Path;
 
 use aes_gcm::KeyInit;
 use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::OsRng};
+use zeroize::Zeroize;
 
 use super::*;
 
@@ -263,22 +264,35 @@ impl SecretArgs {
         })
     }
 
-    pub(super) fn merge(&mut self, other: Secrets) {
+    pub(super) fn merge(&mut self, mut other: Secrets) {
+        // `Secrets` is `Drop` (zeroizes cipher/nonce); we can't move
+        // path fields out of `other` directly, so swap them out with
+        // `mem::take` and let `other` drop with `None` placeholders.
         if self.transport_keypair.is_none() {
-            self.transport_keypair = other.transport_keypair_path;
+            self.transport_keypair = std::mem::take(&mut other.transport_keypair_path);
         }
 
         if self.nonce.is_none() {
-            self.nonce = other.nonce_path;
+            self.nonce = std::mem::take(&mut other.nonce_path);
         }
 
         if self.cipher.is_none() {
-            self.cipher = other.cipher_path;
+            self.cipher = std::mem::take(&mut other.cipher_path);
         }
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+/// Persisted secrets bundle (transport keypair + the legacy
+/// cipher/nonce fields kept for read-side decrypt of pre-#4140 blobs).
+///
+/// `Debug` is impl'd by hand so the 32-byte cipher and 24-byte nonce
+/// never leak into logs; the impl renders them as `<redacted N bytes>`.
+/// On drop, the cipher and nonce byte arrays are wiped via
+/// `Zeroize::zeroize` so the freelist slot cannot be read back later by
+/// an unrelated allocation. `TransportKeypair` carries its own
+/// `ZeroizeOnDrop` on the secret-key half (`x25519_dalek::StaticSecret`),
+/// so this struct does not need to wipe it explicitly.
+#[derive(Clone, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Secrets {
     #[serde(skip)]
     pub transport_keypair: TransportKeypair,
@@ -292,6 +306,26 @@ pub struct Secrets {
     pub cipher: [u8; 32],
     #[serde(rename = "cipher", skip_serializing_if = "Option::is_none")]
     pub cipher_path: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for Secrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Secrets")
+            .field("transport_keypair", &"<redacted>")
+            .field("transport_keypair_path", &self.transport_keypair_path)
+            .field("nonce", &"<redacted 24 bytes>")
+            .field("nonce_path", &self.nonce_path)
+            .field("cipher", &"<redacted 32 bytes>")
+            .field("cipher_path", &self.cipher_path)
+            .finish()
+    }
+}
+
+impl Drop for Secrets {
+    fn drop(&mut self) {
+        self.cipher.zeroize();
+        self.nonce.zeroize();
+    }
 }
 
 // Only used in tests

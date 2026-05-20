@@ -1133,7 +1133,9 @@ pub(super) mod delegate_secrets {
         };
         // SAFETY: `val_src` was validated by `validate_and_compute_ptr` to point to
         // `val_len` bytes within the WASM linear memory.
-        let value = unsafe { std::slice::from_raw_parts(val_src, val_len as usize) }.to_vec();
+        let value = zeroize::Zeroizing::new(
+            unsafe { std::slice::from_raw_parts(val_src, val_len as usize) }.to_vec(),
+        );
 
         match env
             .secret_store_mut()

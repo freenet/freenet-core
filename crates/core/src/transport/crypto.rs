@@ -37,13 +37,20 @@ pub struct TransportKeypair {
 
 impl TransportKeypair {
     pub fn save(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        use std::fs::File;
         use std::io::Write;
 
         let path = path.as_ref();
-        // Use atomic write: write to temp file, then rename
+        // Atomic write: tmp file at 0o600 (owner-only) on Unix, then rename.
+        // Process-wide umask used to leave this world-readable.
         let temp_path = path.with_extension("tmp");
-        let mut file = File::create(&temp_path)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&temp_path)?;
         // Save as hex-encoded private key bytes
         let hex = hex::encode(self.secret.0.as_bytes());
         file.write_all(hex.as_bytes())?;
