@@ -1097,6 +1097,8 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                     });
                 }
 
+                // Capacity discard is intentional — `old_missing` is a local that
+                // goes out of scope after this loop; the new Vec is allocated above.
                 let old_missing = std::mem::replace(&mut delayed, Vec::with_capacity(200));
                 for tx in old_missing {
                     if let Some(tx) = ops.completed.remove(&tx) {
