@@ -24,18 +24,28 @@ name: Claude PR Rule Review
 #   action exits with "Actor does not have write permissions" on every
 #   first-party fork PR run (see freenet/freenet-core#4129).
 # - This is safe HERE because: (a) the prompt is hardcoded in this YAML —
-#   fork PRs can't change it; (b) Claude's tools are locked down to
-#   read-only via `settings` below — no Write/Edit/Bash-shell; (c) the
-#   job token has only `pull-requests: write` + `issues: write` +
-#   `statuses: write` — worst case is a misleading comment, which a human
-#   reviewer will catch; (d) the action automatically scrubs Anthropic /
-#   cloud / GitHub Actions secrets from subprocess env when this input
-#   is set; (e) the checkout step sets `persist-credentials: false` so the
-#   job's GITHUB_TOKEN is NOT written to .git/config — read-only tools
-#   alone are not enough, since `Read`/`cat` could otherwise exfiltrate a
-#   persisted token from .git/config under prompt injection.
+#   fork PRs can't change it; (b) Claude is granted ONLY the `Read`,
+#   `Glob` and `Grep` tools via `settings` below — NO Bash, so a
+#   prompt-injected fork PR diff cannot execute ANY command. `Read`/`Glob`/
+#   `Grep` only inspect files; they cannot run a shell, spawn a process,
+#   or make a network request. There is therefore no execution surface to
+#   exfiltrate secrets through. (NOTE: `Bash(prefix:*)` allow-patterns are
+#   NOT a sandbox — a command starting with an allowed prefix can still
+#   chain arbitrary shell via `;`, `&&`, `|` or `$(...)`. We do not rely
+#   on them; Bash is denied entirely.); (c) the diff under review is
+#   precomputed by a TRUSTED plain-YAML step ("Compute PR diff" below) and
+#   written to a file — Claude reads that file with `Read`, it never runs
+#   `git diff` itself; (d) the job token has only `pull-requests: write` +
+#   `issues: write` + `statuses: write` — worst case is a misleading
+#   comment, which a human reviewer will catch; (e) the action
+#   automatically scrubs Anthropic / cloud / GitHub Actions secrets from
+#   subprocess env when this input is set; (f) the checkout step sets
+#   `persist-credentials: false` so the job's GITHUB_TOKEN is NOT written
+#   to .git/config — defense-in-depth so that even a `Read` of
+#   .git/config cannot surface a persisted token.
 # - Do NOT copy this `allowed_non_write_users: '*'` pattern to any workflow
-#   that grants Claude write/edit tools, commit signing, or contents:write.
+#   that grants Claude write/edit tools, Bash, commit signing, or
+#   contents:write.
 #
 # Complements (does not replace):
 # - ci.yml: cargo fmt, clippy, tests, conventional commits, rule lint
@@ -87,17 +97,18 @@ jobs:
         if: github.event_name != 'merge_group'
         uses: actions/checkout@v6
         with:
-          # Explicitly checkout the PR head so git diff sees the fork's changes.
-          # Safe: we only run git diff and call the Claude API — we never
-          # execute the fork's code (no cargo build/test).
+          # Explicitly checkout the PR head so the trusted "Compute PR diff"
+          # step sees the fork's changes. Safe: we only run git locally and
+          # call the Claude API — we never execute the fork's code (no cargo
+          # build/test).
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           # SECURITY: do not persist the job's GITHUB_TOKEN into .git/config.
           # With `allowed_non_write_users: '*'` below, a malicious fork PR can
-          # prompt-inject Claude via the diff. Claude's tools are read-only,
-          # but `Read`/`cat` would still let an injected prompt exfiltrate a
-          # persisted token from .git/config. We only run local git diff/log/
-          # show here, which need no credentials.
+          # prompt-inject Claude via the diff. Claude has no Bash, but the
+          # `Read` tool could still surface a persisted token from
+          # .git/config under prompt injection. The trusted git steps here
+          # need no credentials, so persisting them buys nothing.
           persist-credentials: false
 
       - name: Check review-override label
@@ -225,6 +236,52 @@ jobs:
           echo "Has Core: $HAS_CORE"
           wc -l /tmp/relevant_rules.txt
 
+      - name: Compute PR diff
+        # TRUSTED step: runs in plain YAML, NOT controlled by Claude. Precomputes
+        # the PR diff so the Claude review step needs no Bash at all. The diff is
+        # written to files under $RUNNER_TEMP/pr-review/ which the Claude step then
+        # reads with the `Read` tool. This is what makes the fork-review path
+        # genuinely read-only: Claude is granted only Read/Glob/Grep below.
+        id: diff
+        if: github.event_name != 'merge_group' && steps.override.outputs.overridden != 'true' && steps.rules.outputs.skip != 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          OUT_DIR="${RUNNER_TEMP}/pr-review"
+          mkdir -p "$OUT_DIR"
+
+          # Three-dot diff: changes on the PR head relative to the merge base
+          # with the target branch. base.sha/head.sha come from the trusted
+          # pull_request event payload, not from anything a fork can control.
+          DIFF_FILE="$OUT_DIR/diff.patch"
+          NAMES_FILE="$OUT_DIR/files.txt"
+          LOG_FILE="$OUT_DIR/commits.txt"
+
+          git diff "${BASE_SHA}...${HEAD_SHA}" > "$DIFF_FILE" || {
+            echo "git diff failed" >&2
+            exit 1
+          }
+          git diff --name-only "${BASE_SHA}...${HEAD_SHA}" > "$NAMES_FILE" || true
+          git log --no-merges --pretty='- %h %s' "${BASE_SHA}..${HEAD_SHA}" > "$LOG_FILE" || true
+
+          # Cap very large diffs so the prompt stays within model limits.
+          MAX_BYTES=1500000
+          DIFF_BYTES=$(wc -c < "$DIFF_FILE")
+          if [ "$DIFF_BYTES" -gt "$MAX_BYTES" ]; then
+            head -c "$MAX_BYTES" "$DIFF_FILE" > "$DIFF_FILE.tmp"
+            printf '\n\n[... diff truncated at %s bytes of %s total — review the largest changes; use Read/Glob/Grep on the checked-out tree for full context ...]\n' \
+              "$MAX_BYTES" "$DIFF_BYTES" >> "$DIFF_FILE.tmp"
+            mv "$DIFF_FILE.tmp" "$DIFF_FILE"
+            echo "truncated=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "truncated=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "dir=$OUT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Diff: $DIFF_BYTES bytes; files: $(wc -l < "$NAMES_FILE"); commits: $(wc -l < "$LOG_FILE")"
+
       - name: Claude rule review
         id: review
         if: github.event_name != 'merge_group' && steps.override.outputs.overridden != 'true' && steps.rules.outputs.skip != 'true'
@@ -237,22 +294,25 @@ jobs:
           # the top of this file. Only safe in combination with the read-only
           # `settings.permissions` lockdown below.
           allowed_non_write_users: '*'
-          # Lock Claude to read-only tools — the rule review only needs to read
-          # rule files and inspect the diff. Defense-in-depth against prompt
-          # injection from fork PR diffs.
+          # Lock Claude to read-only file inspection. The `allow` list grants
+          # ONLY Read/Glob/Grep — no Bash. With no Bash granted and no
+          # permissive defaultMode, Bash is denied entirely, so a
+          # prompt-injected fork PR diff has NO command-execution surface.
+          # The diff itself is precomputed by the trusted "Compute PR diff"
+          # step above; Claude reads it from a file via `Read`.
+          # `Bash(prefix:*)` allow-patterns are deliberately NOT used: they
+          # are not a sandbox (a command can chain arbitrary shell after an
+          # allowed prefix via `;`, `&&`, `|`, `$(...)`).
+          # The `deny` list is belt-and-suspenders — these tools are already
+          # denied by virtue of not being in `allow`, but listing them keeps
+          # the intent explicit if a future edit adds a permissive default.
           settings: |
             {
               "permissions": {
                 "allow": [
                   "Read",
                   "Glob",
-                  "Grep",
-                  "Bash(git diff:*)",
-                  "Bash(git log:*)",
-                  "Bash(git show:*)",
-                  "Bash(cat:*)",
-                  "Bash(wc:*)",
-                  "Bash(ls:*)"
+                  "Grep"
                 ],
                 "deny": [
                   "Write",
@@ -262,12 +322,7 @@ jobs:
                   "WebFetch",
                   "WebSearch",
                   "Task",
-                  "Bash(curl:*)",
-                  "Bash(wget:*)",
-                  "Bash(rm:*)",
-                  "Bash(git push:*)",
-                  "Bash(git commit:*)",
-                  "Bash(gh:*)"
+                  "Bash"
                 ]
               }
             }
@@ -288,6 +343,26 @@ jobs:
             CI job via grep. Do NOT report those here — focus on nuanced issues that
             require judgment.
 
+            ## Available Tools
+
+            You have ONLY the `Read`, `Glob`, and `Grep` tools — no Bash, no shell.
+            The PR diff has already been computed for you by a trusted CI step. Use
+            `Read` to open the diff and rule files, and `Glob`/`Grep` to search the
+            checked-out source tree for additional context.
+
+            ## Precomputed PR Diff
+
+            The PR diff has been written to files under `${{ steps.diff.outputs.dir }}`:
+
+            - `${{ steps.diff.outputs.dir }}/diff.patch` — the full unified diff
+              (changes on the PR head vs. the merge base with the target branch).
+            - `${{ steps.diff.outputs.dir }}/files.txt` — the list of changed file paths.
+            - `${{ steps.diff.outputs.dir }}/commits.txt` — the PR's commit summaries.
+
+            Read `diff.patch` first. It is the authoritative source of what changed.
+            (If it ends with a "diff truncated" marker, the diff was very large — use
+            `Read`/`Glob`/`Grep` on the checked-out tree for the parts not shown.)
+
             ## Applicable Rules
 
             The following rules apply to this PR based on the changed file paths:
@@ -298,8 +373,10 @@ jobs:
             ## Review Instructions
 
             1. Read the relevant rule files from `.claude/rules/`
-            2. Run `git diff origin/${{ github.event.pull_request.base.ref }}...HEAD` to see the full diff
-            3. Check each changed file against the applicable rules
+            2. Read `${{ steps.diff.outputs.dir }}/diff.patch` to see the full diff
+               (and `files.txt` / `commits.txt` for the file list and commit summaries)
+            3. Check each changed file against the applicable rules; use `Read`/`Glob`/
+               `Grep` on the checked-out tree when you need surrounding context
             4. Report findings grouped by severity
 
             ## Severity Levels
