@@ -2347,6 +2347,15 @@ mod tests {
 
     #[test]
     fn test_try_set_own_addr_when_unset() {
+        // `try_set_own_addr` on an unset `own_addr` calls
+        // `network_status::set_external_address`, writing the process-global
+        // `NETWORK_STATUS`. Hold the crate-wide lock so this does not race
+        // `test_set_own_addr_atomic_with_network_status` or the
+        // `node::network_status` tests under `cargo test` (one process, all
+        // tests concurrent). See `TEST_GLOBAL_STATE_LOCK` rustdoc.
+        let _global = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
+            .lock()
+            .expect("TEST_GLOBAL_STATE_LOCK poisoned by an earlier test panic");
         let cm = make_connection_manager(None, 1, 10, false);
 
         let addr = make_addr(8000);
@@ -2357,6 +2366,10 @@ mod tests {
 
     #[test]
     fn test_try_set_own_addr_when_already_set() {
+        // No `TEST_GLOBAL_STATE_LOCK` needed: `own_addr` starts `Some`, so
+        // `try_set_own_addr` takes the early-return branch and never calls
+        // `network_status::set_external_address` — this test does not touch
+        // the process-global `NETWORK_STATUS`.
         let original_addr = make_addr(8000);
         let cm = make_connection_manager(Some(original_addr), 1, 10, false);
 
@@ -2399,22 +2412,25 @@ mod tests {
     fn test_set_own_addr_atomic_with_network_status() {
         use std::sync::{Arc as StdArc, Barrier};
 
-        // GLOBAL-STATE CONTRACT: this test asserts on the process-global
-        // `network_status::external_address`, so it must remain the ONLY
-        // test that concurrently writes that global. That holds today:
-        // `set_external_address` has exactly one production caller
-        // (`set_own_addr`), and integration tests that spin up nodes run in
-        // separate test binaries (separate processes — each gets its own
-        // `NETWORK_STATUS`). Within this lib-test binary no other test calls
-        // `set_own_addr` / `set_external_address`. If a future lib-test does,
-        // it must serialize against this one (e.g. share a test mutex) or
-        // this `assert_eq!` can flake. (Reviewers: Claude testing/skeptical +
-        // Gemini all flagged this latent coupling — documented, not a current
-        // bug.)
+        // GLOBAL-STATE CONTRACT: this test reads and writes the process-global
+        // `network_status::external_address` (via `set_own_addr`). Under
+        // `cargo test` — the project's documented pre-commit command (see
+        // AGENTS.md) — the whole lib-test binary runs in ONE process with
+        // tests executing concurrently, so any other test touching that
+        // global races this one's `assert_eq!`. (CI's `cargo nextest` masks
+        // the race with per-process isolation; `cargo test` does not.)
+        //
+        // `connection_manager`'s `test_try_set_own_addr_*` tests and every
+        // test in `node::network_status` also touch this global. They are all
+        // serialized by the crate-wide `TEST_GLOBAL_STATE_LOCK`, which this
+        // test acquires below for its entire body.
         //
         // `network_status::set_external_address` is a no-op until `init()` has
         // run. `init()` is idempotent (OnceLock — first caller wins), so this
         // is safe even if another test already initialized the global.
+        let _global = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
+            .lock()
+            .expect("TEST_GLOBAL_STATE_LOCK poisoned by an earlier test panic");
         crate::node::network_status::init(0, HashSet::new(), "test".to_string());
 
         // Use a single ConnectionManager across all rounds: the bug is a
@@ -2424,6 +2440,13 @@ mod tests {
         const ROUNDS: u32 = 4_000;
         const THREADS: u16 = 8;
 
+        // Collect the first divergence (if any) instead of asserting inside
+        // the loop. Panicking while `_global` is held would poison
+        // `TEST_GLOBAL_STATE_LOCK` and cascade `PoisonError`s into every
+        // other test that shares it; instead we record the failure, drop the
+        // guard, then assert. The check itself is unchanged — exact equality
+        // of the two mirrors after all writers for the round have joined.
+        let mut divergence: Option<String> = None;
         for round in 0..ROUNDS {
             let barrier = StdArc::new(Barrier::new(THREADS as usize));
             let mut handles = Vec::with_capacity(THREADS as usize);
@@ -2448,16 +2471,27 @@ mod tests {
             // whichever writer won the race.
             let own = cm.get_own_addr();
             let external = crate::node::network_status::external_address();
-            assert!(
-                own.is_some(),
-                "round {round}: own_addr should be set after concurrent writes"
-            );
-            assert_eq!(
-                own, external,
-                "round {round}: own_addr ({own:?}) and \
-                 network_status::external_address ({external:?}) diverged — \
-                 set_own_addr is not atomic (#4172)"
-            );
+            if own.is_none() {
+                divergence = Some(format!(
+                    "round {round}: own_addr unset after concurrent writes"
+                ));
+                break;
+            }
+            if own != external {
+                divergence = Some(format!(
+                    "round {round}: own_addr ({own:?}) and \
+                     network_status::external_address ({external:?}) diverged — \
+                     set_own_addr is not atomic (#4172)"
+                ));
+                break;
+            }
+        }
+
+        // Release the shared global-state lock before asserting so a failure
+        // does not poison it for other tests.
+        drop(_global);
+        if let Some(msg) = divergence {
+            panic!("{msg}");
         }
     }
 

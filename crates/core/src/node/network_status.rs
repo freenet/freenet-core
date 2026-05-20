@@ -373,6 +373,25 @@ pub(crate) fn external_address() -> Option<SocketAddr> {
         .and_then(|status| status.read().ok().and_then(|s| s.external_address))
 }
 
+/// Process-wide serialization lock for tests that read or write the shared
+/// `NETWORK_STATUS` global (directly, or indirectly via `set_external_address`
+/// / `set_own_addr` / `try_set_own_addr`).
+///
+/// `NETWORK_STATUS` is process-global. Under `cargo test` (the project's
+/// documented pre-commit command — see AGENTS.md) the whole lib-test binary
+/// runs in ONE process with tests executing concurrently, so any two tests
+/// touching this global race each other. CI's `cargo nextest` happens to mask
+/// the race by giving every test its own process, but `cargo test` does not.
+///
+/// Every test in this crate that touches `NETWORK_STATUS` MUST acquire this
+/// lock for its whole body, so the writes/reads are serialized under both
+/// `cargo test` and `cargo nextest`. This lives at crate scope (not inside a
+/// `mod tests`) precisely so tests in *other* modules — notably the
+/// `set_own_addr` TOCTOU regression test in `connection_manager.rs` — can
+/// share the exact same lock.
+#[cfg(test)]
+pub(crate) static TEST_GLOBAL_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // --- Snapshot types for rendering ---
 
 /// Snapshot of the current network status for rendering.
@@ -699,11 +718,16 @@ pub(crate) fn format_ago(secs: u64) -> String {
 mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
-    use std::sync::Mutex;
 
     /// Tests that touch the shared NETWORK_STATUS global must hold this lock
     /// to prevent interleaving with other tests running in parallel.
-    static TEST_MUTEX: Mutex<()> = Mutex::new(());
+    ///
+    /// This is the crate-wide [`TEST_GLOBAL_STATE_LOCK`] — shared with the
+    /// `set_own_addr` TOCTOU regression test in `connection_manager.rs`, which
+    /// also mutates this global. A poisoned lock here would mean some test
+    /// panicked while holding it; `.lock()` would then return `Err`, which is
+    /// itself a useful signal, so the `.unwrap()` is intentional.
+    use super::TEST_GLOBAL_STATE_LOCK as TEST_MUTEX;
 
     #[test]
     fn test_classify_version_mismatch() {
