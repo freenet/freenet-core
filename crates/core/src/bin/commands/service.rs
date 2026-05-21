@@ -1101,8 +1101,9 @@ fn run_wrapper(version: &str) -> Result<()> {
     //   - `spawn_new_wrapper`                      (this file)
     //   - `open_log_file` notepad/open/xdg-open    (tray.rs)
     //   - `taskkill_pid` (nulls all three) and `list_freenet_processes`
-    //     (`.output()` — pipes, no stdin inherit), reached via the
-    //     post-update restart in `update.rs` -> `kill_freenet_service_processes`
+    //     (`.output()` — fresh pipes, no stdin inherit), reached directly via
+    //     `kill_stale_freenet_processes` (called below) and via
+    //     `kill_freenet_service_processes` (the `update.rs` restart path)
     // Add any new child spawn in this module with null stdio by default.
     // See #3933 / #3934 and `.claude/rules/bug-prevention-patterns.md`
     // at the repo root for the rule + audit grep.
@@ -3354,6 +3355,11 @@ fn parse_freenet_process_listing(stdout: &str) -> Vec<(u32, String)> {
 /// longer installed by default on recent Windows releases. Returns `None` if
 /// the process listing could not be obtained.
 ///
+/// A process whose `CommandLine` cannot be read (owned by another user) is
+/// listed with an empty command line and so is never classified as a service
+/// process. The wrapper, node, and installer all run as the same user, so
+/// this never hides one of our own processes.
+///
 /// `.output()` captures stdout/stderr through fresh pipes and does not inherit
 /// stdin, so this spawn is safe even after `FreeConsole()` (see the spawn-site
 /// audit note on `run_wrapper`).
@@ -3422,19 +3428,31 @@ fn kill_freenet_processes_matching(kind: FreenetServiceProcess) -> usize {
 /// installer (issue #4205), a concurrent `freenet` CLI command, or the caller
 /// itself.
 ///
-/// Wrappers are killed before nodes, and the node set is re-enumerated once
-/// the wrappers are gone: a live wrapper's run loop respawns the `network`
-/// child the instant it exits, so a node killed while a wrapper is still alive
-/// could be replaced by one missing from the original listing.
+/// Wrappers are killed first, then nodes are killed in a short re-enumerating
+/// loop. A live wrapper's run loop respawns the `network` child the instant it
+/// exits, and `taskkill /f` only *requests* termination (`TerminateProcess` is
+/// asynchronous), so a wrapper can briefly outlive the wrapper pass and spawn
+/// a node the first node pass never saw. The loop re-enumerates until a pass
+/// finds no nodes — by then every wrapper has fully exited — bounded so an
+/// unkillable process cannot hang the caller.
 ///
 /// Returns `0` when nothing was running — but also when the process listing
 /// could not be obtained or every `taskkill` failed; callers treat `0`
 /// uniformly as "nothing was stopped".
 #[cfg(target_os = "windows")]
 pub(crate) fn kill_freenet_service_processes() -> usize {
-    let wrappers = kill_freenet_processes_matching(FreenetServiceProcess::Wrapper);
-    // Re-enumerate: with every wrapper gone, no new node child can be spawned.
-    wrappers + kill_freenet_processes_matching(FreenetServiceProcess::Node)
+    let mut killed = kill_freenet_processes_matching(FreenetServiceProcess::Wrapper);
+    for _ in 0..3 {
+        let nodes = kill_freenet_processes_matching(FreenetServiceProcess::Node);
+        killed += nodes;
+        if nodes == 0 {
+            break;
+        }
+        // Give a still-dying wrapper time to finish so a node it respawns is
+        // visible to the next enumeration.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    killed
 }
 
 #[cfg(target_os = "windows")]
@@ -3619,6 +3637,15 @@ mod tests {
     fn command_line_args_strips_unquoted_executable_path() {
         assert_eq!(command_line_args("C:\\bin\\freenet.exe network"), "network");
         assert_eq!(command_line_args("freenet.exe"), "");
+    }
+
+    #[test]
+    fn command_line_args_handles_degenerate_input() {
+        // Empty and whitespace-only input.
+        assert_eq!(command_line_args(""), "");
+        assert_eq!(command_line_args("   "), "");
+        // A leading quote with no closing quote — must not panic, yields "".
+        assert_eq!(command_line_args("\"C:\\bin\\freenet.exe network"), "");
     }
 
     #[test]
@@ -4904,6 +4931,42 @@ mod tests {
                  autostart fires a silent spawn failure with os error 6 \
                  (#3933 / #3934). The fix pattern matches the network-child \
                  spawn in run_wrapper_loop.",
+                pattern
+            );
+        }
+    }
+
+    /// Source-level regression pin for the `FreeConsole()` rule, mirroring
+    /// `spawn_update_command_must_null_all_three_standard_handles`.
+    ///
+    /// `taskkill_pid` spawns a child via `Command::status()`, which inherits
+    /// the parent's standard handles unless they are explicitly nulled. It is
+    /// reachable from `kill_stale_freenet_processes` (run by the wrapper right
+    /// after `FreeConsole()`) and from the auto-update restart path. If a
+    /// future refactor drops the `.stdin/.stdout/.stderr(Stdio::null())`
+    /// lines, this fails loudly instead of shipping a silent os-error-6 spawn
+    /// failure to Windows.
+    #[test]
+    fn taskkill_pid_must_null_all_three_standard_handles() {
+        let src = include_str!("service.rs");
+        let (_, after_fn_start) = src
+            .split_once("fn taskkill_pid(")
+            .expect("taskkill_pid definition not found");
+        let (body, _) = after_fn_start
+            .split_once("\nfn ")
+            .expect("could not locate end of taskkill_pid");
+        let code_only: String = body
+            .lines()
+            .map(|line| line.split_once("//").map(|(c, _)| c).unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for handle in ["stdin", "stdout", "stderr"] {
+            let pattern = format!(".{handle}(std::process::Stdio::null())");
+            assert!(
+                code_only.contains(&pattern),
+                "taskkill_pid must call `{}` — without it, the `taskkill` \
+                 spawn fails with os error 6 after the wrapper's \
+                 FreeConsole() (#3933 / #3934).",
                 pattern
             );
         }
