@@ -3196,21 +3196,11 @@ pub fn stop_and_remove_service(_system: bool) -> Result<bool> {
 
     let had_registry = run_key.delete_value("Freenet").is_ok();
 
-    // Kill any running freenet processes (wrapper + child), excluding ourselves
-    let our_pid = std::process::id().to_string();
-    drop(
-        std::process::Command::new("taskkill")
-            .args([
-                "/f",
-                "/im",
-                "freenet.exe",
-                "/fi",
-                &format!("PID ne {}", our_pid),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status(),
-    );
+    // Kill the running Freenet service processes (wrapper + node child).
+    // Targets only the service's own processes by command line so an
+    // unrelated freenet.exe — e.g. the GUI installer — is never killed
+    // (issue #4205).
+    kill_freenet_service_processes();
 
     // Also clean up any legacy scheduled task from older installs
     let had_task = std::process::Command::new("schtasks")
@@ -3311,32 +3301,127 @@ fn start_service(system: bool) -> Result<()> {
     Ok(())
 }
 
+/// Strip the leading executable path from a Windows process command line,
+/// returning just the argument portion (everything after the program name).
+///
+/// The program path is normally quoted — both Rust's `Command` and the
+/// registry `Run` key quote it — in which case it can be stripped exactly.
+/// For an unquoted path we fall back to splitting on the first whitespace;
+/// that is only ambiguous for unquoted paths containing spaces, which
+/// Windows avoids for the processes Freenet itself spawns.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn command_line_args(cmdline: &str) -> &str {
+    let trimmed = cmdline.trim_start();
+    if let Some(after_open_quote) = trimmed.strip_prefix('"') {
+        after_open_quote
+            .find('"')
+            .map_or("", |close| after_open_quote[close + 1..].trim_start())
+    } else {
+        trimmed
+            .find(char::is_whitespace)
+            .map_or("", |space| trimmed[space..].trim_start())
+    }
+}
+
+/// Decide whether a `freenet.exe` process — identified by its full command
+/// line — belongs to the running Freenet service: the `service run-wrapper`
+/// wrapper or its `network` node child.
+///
+/// This must return `false` for every other `freenet.exe` invocation. In
+/// particular the Windows GUI installer is launched with no subcommand, so a
+/// blanket `taskkill /im freenet.exe` during its install-time stop step used
+/// to terminate the installer itself (issue #4205). Targeting only the
+/// wrapper/node by command line avoids that.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn is_freenet_service_process(cmdline: &str) -> bool {
+    command_line_args(cmdline)
+        .split_whitespace()
+        .any(|token| token == "run-wrapper" || token == "network")
+}
+
+/// Parse the `<pid>\t<command line>` lines produced by the PowerShell process
+/// listing in [`list_freenet_processes`] into `(pid, command_line)` pairs.
+/// Lines that do not begin with a numeric PID are ignored.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn parse_freenet_process_listing(stdout: &str) -> Vec<(u32, String)> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_end_matches('\r');
+            let (pid, cmdline) = line.split_once('\t').unwrap_or((line, ""));
+            Some((pid.trim().parse::<u32>().ok()?, cmdline.to_string()))
+        })
+        .collect()
+}
+
+/// Enumerate `freenet.exe` processes and their command lines via PowerShell.
+///
+/// Uses `Get-CimInstance` rather than `wmic`, which is deprecated and no
+/// longer installed by default on recent Windows releases. Returns `None` if
+/// the process listing could not be obtained.
+#[cfg(target_os = "windows")]
+fn list_freenet_processes() -> Option<Vec<(u32, String)>> {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='freenet.exe'\" | \
+             ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_freenet_process_listing(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// Stop the running Freenet service — the `service run-wrapper` wrapper and
+/// the `network` node child — and return the number of processes terminated.
+///
+/// Unlike a blanket `taskkill /im freenet.exe`, this targets only the
+/// service's own processes (identified by command line), so it never kills an
+/// unrelated `freenet.exe` that merely shares the image name: the GUI
+/// installer (issue #4205), a concurrent `freenet` CLI command, or the caller
+/// itself. The current process is always excluded.
+#[cfg(target_os = "windows")]
+pub(crate) fn kill_freenet_service_processes() -> usize {
+    let our_pid = std::process::id();
+    let Some(processes) = list_freenet_processes() else {
+        return 0;
+    };
+    let mut killed = 0;
+    for (pid, cmdline) in processes {
+        if pid == our_pid || !is_freenet_service_process(&cmdline) {
+            continue;
+        }
+        let terminated = std::process::Command::new("taskkill")
+            .args(["/f", "/pid", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if terminated {
+            killed += 1;
+        }
+    }
+    killed
+}
+
 #[cfg(target_os = "windows")]
 fn stop_service(system: bool) -> Result<()> {
     check_no_system_flag_windows(system)?;
 
-    // Kill freenet processes, excluding the current one (which IS freenet.exe)
-    let our_pid = std::process::id().to_string();
-    let status = std::process::Command::new("taskkill")
-        .args([
-            "/f",
-            "/im",
-            "freenet.exe",
-            "/fi",
-            &format!("PID ne {}", our_pid),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .context("Failed to stop Freenet")?;
-
-    if status.success() {
+    if kill_freenet_service_processes() > 0 {
         println!("Freenet stopped.");
+        Ok(())
     } else {
-        anyhow::bail!("Failed to stop Freenet. It may not be running.");
+        anyhow::bail!("Failed to stop Freenet. It may not be running.")
     }
-
-    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -3491,6 +3576,91 @@ fn service_logs(_error_only: bool) -> Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn command_line_args_strips_quoted_executable_path() {
+        assert_eq!(
+            command_line_args("\"C:\\Program Files\\Freenet\\freenet.exe\" service run-wrapper"),
+            "service run-wrapper"
+        );
+        // Quoted path, no arguments — the GUI installer launched by Explorer.
+        assert_eq!(
+            command_line_args("\"C:\\Users\\me\\Downloads\\freenet.exe\""),
+            ""
+        );
+    }
+
+    #[test]
+    fn command_line_args_strips_unquoted_executable_path() {
+        assert_eq!(command_line_args("C:\\bin\\freenet.exe network"), "network");
+        assert_eq!(command_line_args("freenet.exe"), "");
+    }
+
+    #[test]
+    fn is_freenet_service_process_matches_wrapper_and_node() {
+        assert!(is_freenet_service_process(
+            "\"C:\\Users\\me\\AppData\\Local\\Freenet\\bin\\freenet.exe\" service run-wrapper"
+        ));
+        assert!(is_freenet_service_process(
+            "\"C:\\Users\\me\\AppData\\Local\\Freenet\\bin\\freenet.exe\" network"
+        ));
+    }
+
+    /// Regression test for issue #4205: the Windows GUI installer is launched
+    /// with no subcommand, so it must never be classified as a service
+    /// process — otherwise the install-time `service stop` step kills the
+    /// installer itself before anything is installed.
+    #[test]
+    fn is_freenet_service_process_spares_installer_and_other_commands() {
+        // GUI installer: double-clicked freenet.exe, no arguments.
+        assert!(!is_freenet_service_process(
+            "\"C:\\Users\\me\\Downloads\\freenet.exe\""
+        ));
+        // The `service stop` child process that triggers the kill.
+        assert!(!is_freenet_service_process(
+            "\"C:\\Users\\me\\Downloads\\freenet.exe\" service stop"
+        ));
+        // A concurrent self-update must not be killed.
+        assert!(!is_freenet_service_process(
+            "\"C:\\Program Files\\Freenet\\freenet.exe\" update"
+        ));
+        // An install path that merely contains the word "network" — the
+        // quoted exe path is stripped, so this must not match.
+        assert!(!is_freenet_service_process(
+            "\"C:\\Users\\me\\My Network Tools\\freenet.exe\""
+        ));
+    }
+
+    #[test]
+    fn parse_freenet_process_listing_extracts_pid_and_command_line() {
+        let stdout = "1234\t\"C:\\bin\\freenet.exe\" service run-wrapper\r\n\
+                      5678\t\"C:\\bin\\freenet.exe\" network\r\n\
+                      9012\t\"C:\\Users\\me\\Downloads\\freenet.exe\"\r\n";
+        assert_eq!(
+            parse_freenet_process_listing(stdout),
+            vec![
+                (
+                    1234u32,
+                    "\"C:\\bin\\freenet.exe\" service run-wrapper".to_string()
+                ),
+                (5678u32, "\"C:\\bin\\freenet.exe\" network".to_string()),
+                (
+                    9012u32,
+                    "\"C:\\Users\\me\\Downloads\\freenet.exe\"".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_freenet_process_listing_skips_blank_and_malformed_lines() {
+        // A process whose CommandLine could not be read prints just its PID;
+        // blank lines and non-numeric lines must be ignored.
+        assert_eq!(
+            parse_freenet_process_listing("4242\t\r\n\r\nnot-a-pid\tsomething\r\n"),
+            vec![(4242u32, String::new())]
+        );
+    }
 
     /// Flock-level regression test for the dup-tray bug observed in
     /// phase-1 smoke test 2026-04-22. Uses a dedicated path inside a

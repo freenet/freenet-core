@@ -44,17 +44,18 @@ pub fn run_install(progress: impl Fn(InstallProgress) + Send) -> Result<()> {
 
     let installed_exe = install_dir.join("freenet.exe");
 
-    // Step 1: Stop existing service if running
+    // Step 1: Stop existing service if running.
+    //
+    // Stop it in-process rather than shelling out to the already-installed
+    // `freenet.exe service stop`. Older installed versions implement that
+    // subcommand as a blanket `taskkill /im freenet.exe`, which also matches
+    // this GUI installer (it is likewise named `freenet.exe`) and kills it
+    // mid-install — issue #4205. Running the stop here uses this binary's
+    // command-line-targeted logic and excludes the current process, so it is
+    // unaffected by whatever version is already installed.
     progress(InstallProgress::StoppingExisting);
     if installed_exe.exists() {
-        // Try to stop gracefully — ignore errors (may not be running)
-        drop(
-            std::process::Command::new(&installed_exe)
-                .args(["service", "stop"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status(),
-        );
+        crate::commands::service::kill_freenet_service_processes();
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
 
