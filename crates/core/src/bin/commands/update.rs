@@ -473,21 +473,11 @@ impl UpdateCommand {
             {
                 if is_windows_wrapper_running() {
                     println!("Restarting Freenet service...");
-                    // Kill old wrapper + child processes (excluding ourselves),
-                    // then start a new wrapper with the updated binary.
-                    let our_pid = std::process::id().to_string();
-                    Command::new("taskkill")
-                        .args([
-                            "/f",
-                            "/im",
-                            "freenet.exe",
-                            "/fi",
-                            &format!("PID ne {}", our_pid),
-                        ])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .ok();
+                    // Kill the old wrapper + node child, then start a new
+                    // wrapper with the updated binary. Targets only the
+                    // service's own processes by command line so an unrelated
+                    // freenet.exe is never killed (issue #4205).
+                    super::service::kill_freenet_service_processes();
                     // Brief pause to ensure the old process is fully stopped
                     std::thread::sleep(std::time::Duration::from_secs(2));
                     let status = Command::new(&current_exe)
