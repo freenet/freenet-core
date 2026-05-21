@@ -3403,8 +3403,7 @@ pub(crate) fn kill_freenet_service_processes() -> usize {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
+            .is_ok_and(|status| status.success());
         if terminated {
             killed += 1;
         }
