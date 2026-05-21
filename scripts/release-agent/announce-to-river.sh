@@ -26,14 +26,20 @@ ROOM_OWNER_VK="${ROOM_OWNER_VK:-4uNUKFzZQCnzo4K2ecZ16cMsYEEfoaRS35z6exEsbvm4}"
 SIGNING_KEY_FILE="${SIGNING_KEY_FILE:-$HOME/.config/freenet-river-official/room_owner_signing_key.bin}"
 ROOMS_JSON="${ROOMS_JSON:-$HOME/.local/share/river/rooms.json}"
 FREENET_NODE_URL="${FREENET_NODE_URL:-http://127.0.0.1:7509/}"
-LOG_FILE="${LOG_FILE:-/var/log/freenet-release-agent-river.log}"
+# Optional persistent log file. Empty by default — the release-agent already
+# captures this script's stderr to journald, and the old /var/log default
+# was not writable by the announce user, so every log() call emitted a
+# spurious "Permission denied" line (issue #4208).
+LOG_FILE="${LOG_FILE:-}"
 
 log() {
     local timestamp
     timestamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
     echo "[$timestamp] $*" >&2
-    # Best-effort persistent log; non-fatal if not writable.
-    echo "[$timestamp] $*" >> "$LOG_FILE" 2>/dev/null || true
+    # Optional best-effort persistent log; non-fatal if not writable.
+    if [[ -n "$LOG_FILE" ]]; then
+        echo "[$timestamp] $*" >> "$LOG_FILE" 2>/dev/null || true
+    fi
 }
 
 usage() {
@@ -76,9 +82,31 @@ if [[ ! -f "$ROOMS_JSON" ]]; then
     exit 1
 fi
 
-# Check that the Freenet node is reachable. riverctl will hang otherwise.
-if ! curl -s --max-time 3 "$FREENET_NODE_URL" >/dev/null 2>&1; then
-    log "ERROR: Freenet node not reachable at $FREENET_NODE_URL"
+# Wait for the Freenet node to be reachable (riverctl hangs otherwise).
+#
+# A release announcement runs concurrently with the gateway update that
+# restarts the local node, so a single probe routinely races that restart
+# window and the announce fails (issue #4208). Retry for several minutes —
+# the node is only briefly down.
+#
+# The sleep also keeps this script alive past the release-agent's 1-second
+# early-exit probe: the agent treats a sub-1s exit as a failure (HTTP 500)
+# but returns 202 for a script still running, then reaps it in the
+# background. Retrying here therefore lets the announce complete once the
+# node is back instead of dying inside that probe window.
+node_ready=false
+for attempt in $(seq 1 60); do
+    if curl -s --max-time 3 "$FREENET_NODE_URL" >/dev/null 2>&1; then
+        node_ready=true
+        break
+    fi
+    if [[ "$attempt" -eq 1 ]]; then
+        log "Freenet node not reachable at $FREENET_NODE_URL yet — waiting (it is restarted by the concurrent gateway update)"
+    fi
+    sleep 5
+done
+if [[ "$node_ready" != true ]]; then
+    log "ERROR: Freenet node still not reachable at $FREENET_NODE_URL after retries"
     exit 1
 fi
 
