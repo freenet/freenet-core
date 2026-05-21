@@ -2018,9 +2018,13 @@ fn kill_stale_freenet_processes(log_dir: &Path) {
     {
         // Reap orphaned `network` node children left by a previous wrapper
         // instance. Only nodes are targeted — never a wrapper or another
-        // `freenet` subcommand. Shares the PowerShell-based enumeration used
-        // by `kill_freenet_service_processes`; `wmic` (used here previously)
-        // is deprecated and absent by default on recent Windows releases.
+        // `freenet` subcommand. A single pass suffices here (unlike the loop
+        // in `kill_freenet_service_processes`): this runs at wrapper startup
+        // and on the port-conflict retry, when the only live wrapper is this
+        // process, so no other wrapper exists to respawn a reaped node.
+        // Shares the PowerShell-based enumeration used by
+        // `kill_freenet_service_processes`; `wmic` (used here previously) is
+        // deprecated and absent by default on recent Windows releases.
         if kill_freenet_processes_matching(FreenetServiceProcess::Node) > 0 {
             log_wrapper_event(
                 log_dir,
@@ -3419,8 +3423,7 @@ fn kill_freenet_processes_matching(kind: FreenetServiceProcess) -> usize {
 }
 
 /// Stop the running Freenet service — the `service run-wrapper` supervisor and
-/// the `network` node child it manages — and return the number of processes
-/// terminated.
+/// the `network` node child it manages.
 ///
 /// Unlike a blanket `taskkill /im freenet.exe`, this targets only the
 /// service's own processes (classified by command line), so it never kills an
@@ -3428,17 +3431,26 @@ fn kill_freenet_processes_matching(kind: FreenetServiceProcess) -> usize {
 /// installer (issue #4205), a concurrent `freenet` CLI command, or the caller
 /// itself.
 ///
-/// Wrappers are killed first, then nodes are killed in a short re-enumerating
-/// loop. A live wrapper's run loop respawns the `network` child the instant it
-/// exits, and `taskkill /f` only *requests* termination (`TerminateProcess` is
-/// asynchronous), so a wrapper can briefly outlive the wrapper pass and spawn
-/// a node the first node pass never saw. The loop re-enumerates until a pass
-/// finds no nodes — by then every wrapper has fully exited — bounded so an
-/// unkillable process cannot hang the caller.
+/// Wrappers are killed first, then nodes in a short re-enumerating loop. Only
+/// a live wrapper spawns `network` children, and `taskkill /f` merely
+/// *requests* termination (`TerminateProcess` is asynchronous), so a wrapper
+/// can briefly outlive the wrapper pass — long enough to spawn a node the
+/// first node enumeration missed. Each loop pass re-enumerates; once no
+/// wrapper this sweep terminated is still alive, the node set is stable. The
+/// loop stops as soon as a pass kills nothing — everything is gone, or the
+/// remainder is unkillable and retrying will not help — and is bounded to 3
+/// passes (200ms apart, comfortably over normal `TerminateProcess` latency)
+/// so an unkillable process cannot hang the caller.
 ///
-/// Returns `0` when nothing was running — but also when the process listing
-/// could not be obtained or every `taskkill` failed; callers treat `0`
-/// uniformly as "nothing was stopped".
+/// Known limitation: a wrapper mid-self-update can `spawn_new_wrapper` inside
+/// its own async-termination window; that successor is not re-enumerated and
+/// may survive. This matches the previous blanket `taskkill`'s exposure and
+/// requires a self-update to coincide with a stop to the millisecond.
+///
+/// Returns the count of successful `taskkill` requests — which counts a node
+/// re-killed across passes more than once, so callers only test `> 0`. A `0`
+/// result means nothing was running, the process listing was unavailable, or
+/// every `taskkill` failed; callers treat all three as "nothing was stopped".
 #[cfg(target_os = "windows")]
 pub(crate) fn kill_freenet_service_processes() -> usize {
     let mut killed = kill_freenet_processes_matching(FreenetServiceProcess::Wrapper);

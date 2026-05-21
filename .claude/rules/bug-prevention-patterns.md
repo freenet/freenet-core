@@ -53,6 +53,7 @@ Source-level regression pins live in:
 
 - `commands::tray::tests::open_log_file_spawn_must_null_all_three_standard_handles`
 - `commands::service::tests::spawn_update_command_must_null_all_three_standard_handles`
+- `commands::service::tests::taskkill_pid_must_null_all_three_standard_handles`
 
 A future revert of any of these null-stdio calls fails CI with a
 specific, issue-numbered error message rather than shipping the
