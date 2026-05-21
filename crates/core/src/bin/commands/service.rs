@@ -1100,6 +1100,9 @@ fn run_wrapper(version: &str) -> Result<()> {
     //   - network child in `run_wrapper_loop`      (this file, ~line 1452)
     //   - `spawn_new_wrapper`                      (this file)
     //   - `open_log_file` notepad/open/xdg-open    (tray.rs)
+    //   - `taskkill_pid` (nulls all three) and `list_freenet_processes`
+    //     (`.output()` — pipes, no stdin inherit), reached via the
+    //     post-update restart in `update.rs` -> `kill_freenet_service_processes`
     // Add any new child spawn in this module with null stdio by default.
     // See #3933 / #3934 and `.claude/rules/bug-prevention-patterns.md`
     // at the repo root for the rule + audit grep.
@@ -2012,44 +2015,17 @@ fn kill_stale_freenet_processes(log_dir: &Path) {
 
     #[cfg(target_os = "windows")]
     {
-        // Use WMIC to find freenet.exe processes with "network" in the command line,
-        // then kill them by PID. This avoids killing the wrapper itself or other
-        // freenet subcommands (update, service, etc.).
-        let output = std::process::Command::new("wmic")
-            .args([
-                "process",
-                "where",
-                "name='freenet.exe' and commandline like '%network%'",
-                "get",
-                "processid",
-                "/format:list",
-            ])
-            .output();
-        if let Ok(output) = output {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut killed = false;
-            for line in stdout.lines() {
-                if let Some(pid_str) = line.strip_prefix("ProcessId=") {
-                    let pid = pid_str.trim();
-                    if !pid.is_empty() {
-                        drop(
-                            std::process::Command::new("taskkill")
-                                .args(["/F", "/PID", pid])
-                                .stdout(std::process::Stdio::null())
-                                .stderr(std::process::Stdio::null())
-                                .status(),
-                        );
-                        killed = true;
-                    }
-                }
-            }
-            if killed {
-                log_wrapper_event(
-                    log_dir,
-                    "Killed stale freenet network process(es) on startup",
-                );
-                std::thread::sleep(std::time::Duration::from_secs(2));
-            }
+        // Reap orphaned `network` node children left by a previous wrapper
+        // instance. Only nodes are targeted — never a wrapper or another
+        // `freenet` subcommand. Shares the PowerShell-based enumeration used
+        // by `kill_freenet_service_processes`; `wmic` (used here previously)
+        // is deprecated and absent by default on recent Windows releases.
+        if kill_freenet_processes_matching(FreenetServiceProcess::Node) > 0 {
+            log_wrapper_event(
+                log_dir,
+                "Killed stale freenet network process(es) on startup",
+            );
+            std::thread::sleep(std::time::Duration::from_secs(2));
         }
     }
 }
@@ -3323,24 +3299,42 @@ fn command_line_args(cmdline: &str) -> &str {
     }
 }
 
-/// Decide whether a `freenet.exe` process — identified by its full command
-/// line — belongs to the running Freenet service: the `service run-wrapper`
-/// wrapper or its `network` node child.
-///
-/// This must return `false` for every other `freenet.exe` invocation. In
-/// particular the Windows GUI installer is launched with no subcommand, so a
-/// blanket `taskkill /im freenet.exe` during its install-time stop step used
-/// to terminate the installer itself (issue #4205). Targeting only the
-/// wrapper/node by command line avoids that.
+/// Which Freenet service process a `freenet.exe` command line represents.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn is_freenet_service_process(cmdline: &str) -> bool {
-    command_line_args(cmdline)
-        .split_whitespace()
-        .any(|token| token == "run-wrapper" || token == "network")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreenetServiceProcess {
+    /// The `service run-wrapper` supervisor (also the Windows tray process).
+    Wrapper,
+    /// The `network` node child the wrapper supervises.
+    Node,
+}
+
+/// Classify a `freenet.exe` process from its full command line.
+///
+/// Matching is by the **subcommand prefix** — the first argument token after
+/// the executable path — not by scanning every token. A blanket token scan
+/// would misfire on a command line where `network` or `run-wrapper` appears
+/// as an option value or path component rather than the subcommand, e.g.
+/// `freenet local --config-dir network`.
+///
+/// Returns `None` for every other `freenet.exe` invocation, which must never
+/// be killed: the GUI installer (launched with no subcommand — issue #4205),
+/// `service stop`, `update`, or any directly-run `freenet` CLI command. Note
+/// that a node started manually via the top-level `freenet network`
+/// subcommand IS classified as `Node` — `service stop` is meant to stop a
+/// running node regardless of how it was launched.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn classify_freenet_process(cmdline: &str) -> Option<FreenetServiceProcess> {
+    let mut args = command_line_args(cmdline).split_whitespace();
+    match args.next()? {
+        "network" => Some(FreenetServiceProcess::Node),
+        "service" if args.next() == Some("run-wrapper") => Some(FreenetServiceProcess::Wrapper),
+        _ => None,
+    }
 }
 
 /// Parse the `<pid>\t<command line>` lines produced by the PowerShell process
-/// listing in [`list_freenet_processes`] into `(pid, command_line)` pairs.
+/// listing in `list_freenet_processes` into `(pid, command_line)` pairs.
 /// Lines that do not begin with a numeric PID are ignored.
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn parse_freenet_process_listing(stdout: &str) -> Vec<(u32, String)> {
@@ -3359,6 +3353,10 @@ fn parse_freenet_process_listing(stdout: &str) -> Vec<(u32, String)> {
 /// Uses `Get-CimInstance` rather than `wmic`, which is deprecated and no
 /// longer installed by default on recent Windows releases. Returns `None` if
 /// the process listing could not be obtained.
+///
+/// `.output()` captures stdout/stderr through fresh pipes and does not inherit
+/// stdin, so this spawn is safe even after `FreeConsole()` (see the spawn-site
+/// audit note on `run_wrapper`).
 #[cfg(target_os = "windows")]
 fn list_freenet_processes() -> Option<Vec<(u32, String)>> {
     let output = std::process::Command::new("powershell")
@@ -3379,36 +3377,64 @@ fn list_freenet_processes() -> Option<Vec<(u32, String)>> {
     )))
 }
 
-/// Stop the running Freenet service — the `service run-wrapper` wrapper and
-/// the `network` node child — and return the number of processes terminated.
+/// Force-terminate a process by PID via `taskkill`. Returns whether `taskkill`
+/// reported success.
 ///
-/// Unlike a blanket `taskkill /im freenet.exe`, this targets only the
-/// service's own processes (identified by command line), so it never kills an
-/// unrelated `freenet.exe` that merely shares the image name: the GUI
-/// installer (issue #4205), a concurrent `freenet` CLI command, or the caller
-/// itself. The current process is always excluded.
+/// All three standard handles are nulled so the spawn succeeds even when the
+/// caller has detached from its console via `FreeConsole()` — the auto-update
+/// restart path reaches here from the wrapper. See
+/// `.claude/rules/bug-prevention-patterns.md`.
 #[cfg(target_os = "windows")]
-pub(crate) fn kill_freenet_service_processes() -> usize {
+fn taskkill_pid(pid: u32) -> bool {
+    std::process::Command::new("taskkill")
+        .args(["/f", "/pid", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Enumerate `freenet.exe` processes and `taskkill` every one classified as
+/// `kind`, excluding the current process. Returns the number terminated.
+#[cfg(target_os = "windows")]
+fn kill_freenet_processes_matching(kind: FreenetServiceProcess) -> usize {
     let our_pid = std::process::id();
     let Some(processes) = list_freenet_processes() else {
         return 0;
     };
     let mut killed = 0;
     for (pid, cmdline) in processes {
-        if pid == our_pid || !is_freenet_service_process(&cmdline) {
-            continue;
-        }
-        let terminated = std::process::Command::new("taskkill")
-            .args(["/f", "/pid", &pid.to_string()])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-        if terminated {
+        if pid != our_pid && classify_freenet_process(&cmdline) == Some(kind) && taskkill_pid(pid) {
             killed += 1;
         }
     }
     killed
+}
+
+/// Stop the running Freenet service — the `service run-wrapper` supervisor and
+/// the `network` node child it manages — and return the number of processes
+/// terminated.
+///
+/// Unlike a blanket `taskkill /im freenet.exe`, this targets only the
+/// service's own processes (classified by command line), so it never kills an
+/// unrelated `freenet.exe` that merely shares the image name: the GUI
+/// installer (issue #4205), a concurrent `freenet` CLI command, or the caller
+/// itself.
+///
+/// Wrappers are killed before nodes, and the node set is re-enumerated once
+/// the wrappers are gone: a live wrapper's run loop respawns the `network`
+/// child the instant it exits, so a node killed while a wrapper is still alive
+/// could be replaced by one missing from the original listing.
+///
+/// Returns `0` when nothing was running — but also when the process listing
+/// could not be obtained or every `taskkill` failed; callers treat `0`
+/// uniformly as "nothing was stopped".
+#[cfg(target_os = "windows")]
+pub(crate) fn kill_freenet_service_processes() -> usize {
+    let wrappers = kill_freenet_processes_matching(FreenetServiceProcess::Wrapper);
+    // Re-enumerate: with every wrapper gone, no new node child can be spawned.
+    wrappers + kill_freenet_processes_matching(FreenetServiceProcess::Node)
 }
 
 #[cfg(target_os = "windows")]
@@ -3596,13 +3622,19 @@ mod tests {
     }
 
     #[test]
-    fn is_freenet_service_process_matches_wrapper_and_node() {
-        assert!(is_freenet_service_process(
-            "\"C:\\Users\\me\\AppData\\Local\\Freenet\\bin\\freenet.exe\" service run-wrapper"
-        ));
-        assert!(is_freenet_service_process(
-            "\"C:\\Users\\me\\AppData\\Local\\Freenet\\bin\\freenet.exe\" network"
-        ));
+    fn classify_freenet_process_identifies_wrapper_and_node() {
+        assert_eq!(
+            classify_freenet_process(
+                "\"C:\\Users\\me\\AppData\\Local\\Freenet\\bin\\freenet.exe\" service run-wrapper"
+            ),
+            Some(FreenetServiceProcess::Wrapper)
+        );
+        assert_eq!(
+            classify_freenet_process(
+                "\"C:\\Users\\me\\AppData\\Local\\Freenet\\bin\\freenet.exe\" network"
+            ),
+            Some(FreenetServiceProcess::Node)
+        );
     }
 
     /// Regression test for issue #4205: the Windows GUI installer is launched
@@ -3610,24 +3642,50 @@ mod tests {
     /// process — otherwise the install-time `service stop` step kills the
     /// installer itself before anything is installed.
     #[test]
-    fn is_freenet_service_process_spares_installer_and_other_commands() {
+    fn classify_freenet_process_spares_installer_and_other_commands() {
         // GUI installer: double-clicked freenet.exe, no arguments.
-        assert!(!is_freenet_service_process(
-            "\"C:\\Users\\me\\Downloads\\freenet.exe\""
-        ));
+        assert_eq!(
+            classify_freenet_process("\"C:\\Users\\me\\Downloads\\freenet.exe\""),
+            None
+        );
         // The `service stop` child process that triggers the kill.
-        assert!(!is_freenet_service_process(
-            "\"C:\\Users\\me\\Downloads\\freenet.exe\" service stop"
-        ));
+        assert_eq!(
+            classify_freenet_process("\"C:\\Users\\me\\Downloads\\freenet.exe\" service stop"),
+            None
+        );
         // A concurrent self-update must not be killed.
-        assert!(!is_freenet_service_process(
-            "\"C:\\Program Files\\Freenet\\freenet.exe\" update"
-        ));
+        assert_eq!(
+            classify_freenet_process("\"C:\\Program Files\\Freenet\\freenet.exe\" update"),
+            None
+        );
         // An install path that merely contains the word "network" — the
         // quoted exe path is stripped, so this must not match.
-        assert!(!is_freenet_service_process(
-            "\"C:\\Users\\me\\My Network Tools\\freenet.exe\""
-        ));
+        assert_eq!(
+            classify_freenet_process("\"C:\\Users\\me\\My Network Tools\\freenet.exe\""),
+            None
+        );
+    }
+
+    /// `network` / `run-wrapper` must only match as the subcommand (the first
+    /// argument token), never as an option value or later argument —
+    /// otherwise an unrelated `freenet` CLI invocation would be killed.
+    #[test]
+    fn classify_freenet_process_matches_subcommand_prefix_only() {
+        // `network` appearing as an option value, not the subcommand.
+        assert_eq!(
+            classify_freenet_process("\"C:\\bin\\freenet.exe\" local --config-dir network"),
+            None
+        );
+        // `run-wrapper` only counts immediately after the `service` subcommand.
+        assert_eq!(
+            classify_freenet_process("\"C:\\bin\\freenet.exe\" service stop run-wrapper"),
+            None
+        );
+        // The real node spawn has `network` as the first token.
+        assert_eq!(
+            classify_freenet_process("\"C:\\bin\\freenet.exe\" network"),
+            Some(FreenetServiceProcess::Node)
+        );
     }
 
     #[test]
