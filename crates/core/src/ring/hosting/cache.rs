@@ -118,6 +118,52 @@ impl<T: TimeSource> HostingCache<T> {
         }
     }
 
+    /// Evict past-TTL, non-retained contracts while the cache is over budget.
+    ///
+    /// Walks `lru_order` front-first (oldest first). An entry is evicted when
+    /// it is past `min_ttl` since its last access AND `should_retain(key)` is
+    /// `false`. Eviction stops as soon as `current_bytes <= budget_bytes`.
+    /// Entries that are retained (in use) or still within `min_ttl` are kept
+    /// even if that leaves the cache over budget.
+    ///
+    /// Uses a `retain()`-style walk so the LRU ordering of surviving entries
+    /// is preserved. Returns the evicted keys.
+    fn evict_over_budget<F>(&mut self, should_retain: &F) -> Vec<ContractKey>
+    where
+        F: Fn(&ContractKey) -> bool,
+    {
+        if self.current_bytes <= self.budget_bytes {
+            return Vec::new();
+        }
+
+        let now = self.time_source.now();
+        let mut evicted = Vec::new();
+
+        self.lru_order.retain(|key| {
+            if self.current_bytes <= self.budget_bytes {
+                return true; // back under budget, stop evicting
+            }
+            if let Some(entry) = self.contracts.get(key) {
+                let age = now.saturating_duration_since(entry.last_accessed);
+                if age >= self.min_ttl && !should_retain(key) {
+                    let size = entry.size_bytes;
+                    self.contracts.remove(key);
+                    self.current_bytes = self.current_bytes.saturating_sub(size);
+                    evicted.push(*key);
+                    false
+                } else {
+                    // Retained (in use) or still within TTL — keep it even
+                    // if that leaves the cache over budget.
+                    true
+                }
+            } else {
+                false // orphaned LRU entry
+            }
+        });
+
+        evicted
+    }
+
     /// Record an access to a contract, adding or refreshing it in the cache.
     ///
     /// If the contract is already cached, this refreshes its LRU position and timestamp.
@@ -127,15 +173,27 @@ impl<T: TimeSource> HostingCache<T> {
     /// - `is_new`: Whether this contract was newly added (vs. refreshed existing)
     /// - `evicted`: Contracts that were evicted to make room (if any)
     ///
-    /// Eviction respects TTL: contracts won't be evicted until min_ttl has passed.
-    pub fn record_access(
+    /// Eviction respects TTL: contracts won't be evicted until min_ttl has
+    /// passed. It also honors `should_retain`: a contract for which
+    /// `should_retain(key)` returns `true` (e.g. one with an active client
+    /// subscription, downstream subscriber, or network subscription) is
+    /// never evicted, even past TTL. Evicting an in-use contract would
+    /// orphan its on-disk state — the caller skips disk reclamation for it,
+    /// but the contract is then gone from the cache and never revisited.
+    ///
+    /// The newly-inserted contract is age-0, so it can never be evicted by
+    /// the same `record_access` call.
+    pub fn record_access<F>(
         &mut self,
         key: ContractKey,
         size_bytes: u64,
         access_type: AccessType,
-    ) -> RecordAccessResult {
+        should_retain: F,
+    ) -> RecordAccessResult
+    where
+        F: Fn(&ContractKey) -> bool,
+    {
         let now = self.time_source.now();
-        let mut evicted = Vec::new();
 
         if let Some(existing) = self.contracts.get_mut(&key) {
             // Already cached - update size if changed and refresh position
@@ -156,38 +214,12 @@ impl<T: TimeSource> HostingCache<T> {
 
             RecordAccessResult {
                 is_new: false,
-                evicted,
+                evicted: Vec::new(),
             }
         } else {
-            // Not cached - need to add it
-            // First, evict until we have room (respecting TTL)
-            while self.current_bytes + size_bytes > self.budget_bytes && !self.lru_order.is_empty()
-            {
-                if let Some(oldest_key) = self.lru_order.front().cloned() {
-                    if let Some(oldest) = self.contracts.get(&oldest_key) {
-                        let age = now.saturating_duration_since(oldest.last_accessed);
-                        if age >= self.min_ttl {
-                            // Entry is past TTL, safe to evict
-                            if let Some(removed) = self.contracts.remove(&oldest_key) {
-                                self.current_bytes =
-                                    self.current_bytes.saturating_sub(removed.size_bytes);
-                                self.lru_order.pop_front();
-                                evicted.push(oldest_key);
-                            }
-                        } else {
-                            // Oldest entry still within TTL - allow exceeding budget
-                            break;
-                        }
-                    } else {
-                        // Entry in LRU but not in map - clean up
-                        self.lru_order.pop_front();
-                    }
-                } else {
-                    break;
-                }
-            }
-
-            // Add the new contract
+            // Not cached - insert the new entry first, then evict over-budget
+            // entries. The new entry is age-0 so the eviction walk's
+            // past-TTL check guarantees it is never evicted by this call.
             let contract = HostedContract {
                 size_bytes,
                 last_accessed: now,
@@ -198,6 +230,8 @@ impl<T: TimeSource> HostingCache<T> {
             self.contracts.insert(key, contract);
             self.lru_order.push_back(key);
             self.current_bytes = self.current_bytes.saturating_add(size_bytes);
+
+            let evicted = self.evict_over_budget(&should_retain);
 
             RecordAccessResult {
                 is_new: true,
@@ -311,39 +345,10 @@ impl<T: TimeSource> HostingCache<T> {
     where
         F: Fn(&ContractKey) -> bool,
     {
-        if self.current_bytes <= self.budget_bytes {
-            // Under budget — nothing to evict. Contracts live indefinitely
-            // while we have space. TTL only determines eviction eligibility
-            // when we need to free space.
-            return Vec::new();
-        }
-
-        let now = self.time_source.now();
-        let mut evicted = Vec::new();
-
-        // Over budget: evict past-TTL contracts (oldest first via LRU order)
-        // until we're back under budget.
-        self.lru_order.retain(|key| {
-            if self.current_bytes <= self.budget_bytes {
-                return true; // back under budget, stop evicting
-            }
-            if let Some(entry) = self.contracts.get(key) {
-                let age = now.saturating_duration_since(entry.last_accessed);
-                if age >= self.min_ttl && !should_retain(key) {
-                    let size = entry.size_bytes;
-                    self.contracts.remove(key);
-                    self.current_bytes = self.current_bytes.saturating_sub(size);
-                    evicted.push(*key);
-                    false
-                } else {
-                    true
-                }
-            } else {
-                false // orphaned LRU entry
-            }
-        });
-
-        evicted
+        // Over-budget eviction logic is shared with `record_access` via
+        // `evict_over_budget`: it returns early when under budget, then
+        // evicts past-TTL, non-retained entries oldest-first.
+        self.evict_over_budget(&should_retain)
     }
 
     /// Load a contract entry from persisted data during startup.
@@ -446,7 +451,7 @@ mod tests {
         let (mut cache, _) = make_cache(1000, Duration::from_secs(60));
         let key = make_key(1);
 
-        let result = cache.record_access(key, 100, AccessType::Get);
+        let result = cache.record_access(key, 100, AccessType::Get, |_| false);
 
         assert!(result.is_new);
         assert!(result.evicted.is_empty());
@@ -465,12 +470,12 @@ mod tests {
         let key = make_key(1);
 
         // First access
-        cache.record_access(key, 100, AccessType::Get);
+        cache.record_access(key, 100, AccessType::Get, |_| false);
         let first_access = cache.get(&key).unwrap().last_accessed;
 
         // Advance time and access again
         time.advance_time(Duration::from_secs(10));
-        cache.record_access(key, 100, AccessType::Put);
+        cache.record_access(key, 100, AccessType::Put, |_| false);
 
         // Should still be one contract, but updated
         assert_eq!(cache.len(), 1);
@@ -490,15 +495,15 @@ mod tests {
         let key3 = make_key(3);
 
         // Add two entries
-        cache.record_access(key1, 100, AccessType::Get);
-        cache.record_access(key2, 100, AccessType::Get);
+        cache.record_access(key1, 100, AccessType::Get, |_| false);
+        cache.record_access(key2, 100, AccessType::Get, |_| false);
         assert_eq!(cache.current_bytes(), 200);
 
         // Advance time by 30 seconds (under TTL)
         time.advance_time(Duration::from_secs(30));
 
         // Add third entry - should NOT evict because all entries under TTL
-        let result = cache.record_access(key3, 100, AccessType::Get);
+        let result = cache.record_access(key3, 100, AccessType::Get, |_| false);
         assert!(
             result.evicted.is_empty(),
             "Should not evict entries under TTL"
@@ -522,14 +527,14 @@ mod tests {
         let key3 = make_key(3);
 
         // Add two entries
-        cache.record_access(key1, 100, AccessType::Get);
-        cache.record_access(key2, 100, AccessType::Get);
+        cache.record_access(key1, 100, AccessType::Get, |_| false);
+        cache.record_access(key2, 100, AccessType::Get, |_| false);
 
         // Advance time past TTL
         time.advance_time(Duration::from_secs(61));
 
         // Add third entry - should evict key1 (oldest)
-        let result = cache.record_access(key3, 100, AccessType::Get);
+        let result = cache.record_access(key3, 100, AccessType::Get, |_| false);
         assert!(result.is_new);
         assert_eq!(result.evicted, vec![key1]);
         assert_eq!(cache.len(), 2);
@@ -546,11 +551,11 @@ mod tests {
         let key3 = make_key(3);
 
         // Add two contracts
-        cache.record_access(key1, 100, AccessType::Get);
-        cache.record_access(key2, 100, AccessType::Get);
+        cache.record_access(key1, 100, AccessType::Get, |_| false);
+        cache.record_access(key2, 100, AccessType::Get, |_| false);
 
         // Access key1 again - should move it to back of LRU
-        cache.record_access(key1, 100, AccessType::Subscribe);
+        cache.record_access(key1, 100, AccessType::Subscribe, |_| false);
 
         // LRU order should now be [key2, key1]
         let order = cache.keys_lru_order();
@@ -558,7 +563,7 @@ mod tests {
 
         // Advance past TTL and add key3 - should evict key2 (now oldest)
         time.advance_time(Duration::from_secs(61));
-        let result = cache.record_access(key3, 100, AccessType::Get);
+        let result = cache.record_access(key3, 100, AccessType::Get, |_| false);
 
         assert_eq!(result.evicted, vec![key2]);
         assert!(cache.contains(&key1));
@@ -574,8 +579,8 @@ mod tests {
         let key3 = make_key(3);
 
         // Add two entries
-        cache.record_access(key1, 100, AccessType::Get);
-        cache.record_access(key2, 100, AccessType::Get);
+        cache.record_access(key1, 100, AccessType::Get, |_| false);
+        cache.record_access(key2, 100, AccessType::Get, |_| false);
 
         // Advance time by 50 seconds
         time.advance_time(Duration::from_secs(50));
@@ -587,7 +592,7 @@ mod tests {
         time.advance_time(Duration::from_secs(15));
 
         // Add key3 - should evict key2 (past TTL), NOT key1 (recently touched)
-        let result = cache.record_access(key3, 100, AccessType::Get);
+        let result = cache.record_access(key3, 100, AccessType::Get, |_| false);
 
         assert_eq!(
             result.evicted,
@@ -611,16 +616,16 @@ mod tests {
         let large = make_key(4);
 
         // Add three small contracts
-        cache.record_access(small1, 100, AccessType::Get);
-        cache.record_access(small2, 100, AccessType::Get);
-        cache.record_access(small3, 100, AccessType::Get);
+        cache.record_access(small1, 100, AccessType::Get, |_| false);
+        cache.record_access(small2, 100, AccessType::Get, |_| false);
+        cache.record_access(small3, 100, AccessType::Get, |_| false);
         assert_eq!(cache.current_bytes(), 300);
 
         // Advance past TTL
         time.advance_time(Duration::from_secs(61));
 
         // Add one large contract - should evict two small ones
-        let result = cache.record_access(large, 200, AccessType::Put);
+        let result = cache.record_access(large, 200, AccessType::Put, |_| false);
 
         assert_eq!(result.evicted.len(), 2);
         assert_eq!(result.evicted[0], small1); // Oldest first
@@ -639,9 +644,9 @@ mod tests {
         let key3 = make_key(3);
 
         // Add three entries (exceeds budget)
-        cache.record_access(key1, 100, AccessType::Get);
-        cache.record_access(key2, 100, AccessType::Get);
-        cache.record_access(key3, 100, AccessType::Get);
+        cache.record_access(key1, 100, AccessType::Get, |_| false);
+        cache.record_access(key2, 100, AccessType::Get, |_| false);
+        cache.record_access(key3, 100, AccessType::Get, |_| false);
         assert_eq!(cache.len(), 3);
         assert_eq!(cache.current_bytes(), 300);
 
@@ -667,9 +672,9 @@ mod tests {
         let key3 = make_key(3);
 
         // Add three entries (exceeds budget)
-        cache.record_access(key1, 100, AccessType::Get);
-        cache.record_access(key2, 100, AccessType::Get);
-        cache.record_access(key3, 100, AccessType::Get);
+        cache.record_access(key1, 100, AccessType::Get, |_| false);
+        cache.record_access(key2, 100, AccessType::Get, |_| false);
+        cache.record_access(key3, 100, AccessType::Get, |_| false);
 
         // Advance past TTL
         time.advance_time(Duration::from_secs(61));
@@ -683,6 +688,63 @@ mod tests {
         assert!(!cache.contains(&key2));
         assert!(cache.contains(&key3));
         assert_eq!(cache.current_bytes(), 200);
+    }
+
+    /// `record_access` must honor `should_retain`: an over-budget, past-TTL
+    /// entry whose `should_retain` returns true is NOT evicted; an
+    /// unretained past-TTL entry IS evicted.
+    #[test]
+    fn test_record_access_respects_should_retain() {
+        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+        let retained = make_key(1);
+        let evictable = make_key(2);
+        let trigger = make_key(3);
+
+        // Fill the cache: `retained` (oldest) then `evictable`.
+        cache.record_access(retained, 100, AccessType::Get, |_| false);
+        cache.record_access(evictable, 100, AccessType::Get, |_| false);
+        assert_eq!(cache.current_bytes(), 200);
+
+        // Advance past TTL so both existing entries are eviction-eligible.
+        time.advance_time(Duration::from_secs(61));
+
+        // Insert a third entry, over budget. `retained` is the oldest, so a
+        // naive LRU eviction would drop it first — but `should_retain`
+        // protects it, so `evictable` (next oldest) must be evicted instead.
+        let result = cache.record_access(trigger, 100, AccessType::Get, |k| *k == retained);
+
+        assert_eq!(
+            result.evicted,
+            vec![evictable],
+            "in-use (retained) contract must be skipped; the unretained \
+             past-TTL contract must be evicted instead"
+        );
+        assert!(
+            cache.contains(&retained),
+            "retained contract must survive even past TTL and over budget"
+        );
+        assert!(!cache.contains(&evictable));
+        assert!(cache.contains(&trigger));
+    }
+
+    /// The contract inserted by `record_access` is age-0, so it is never
+    /// evicted by the same call even when the insert pushes over budget.
+    #[test]
+    fn test_record_access_never_evicts_the_new_entry() {
+        let (mut cache, time) = make_cache(100, Duration::from_secs(60));
+        let first = make_key(1);
+        let second = make_key(2);
+
+        cache.record_access(first, 100, AccessType::Get, |_| false);
+        time.advance_time(Duration::from_secs(61));
+
+        // Inserting `second` puts the cache over budget; `first` is past TTL
+        // and unretained so it is evicted, but the just-inserted `second`
+        // (age 0) must survive.
+        let result = cache.record_access(second, 100, AccessType::Get, |_| false);
+        assert_eq!(result.evicted, vec![first]);
+        assert!(cache.contains(&second));
+        assert!(!cache.contains(&first));
     }
 
     #[test]
@@ -704,13 +766,13 @@ mod tests {
         let key = make_key(1);
 
         // Test each access type is recorded correctly
-        cache.record_access(key, 100, AccessType::Get);
+        cache.record_access(key, 100, AccessType::Get, |_| false);
         assert_eq!(cache.get(&key).unwrap().access_type, AccessType::Get);
 
-        cache.record_access(key, 100, AccessType::Put);
+        cache.record_access(key, 100, AccessType::Put, |_| false);
         assert_eq!(cache.get(&key).unwrap().access_type, AccessType::Put);
 
-        cache.record_access(key, 100, AccessType::Subscribe);
+        cache.record_access(key, 100, AccessType::Subscribe, |_| false);
         assert_eq!(cache.get(&key).unwrap().access_type, AccessType::Subscribe);
     }
 
@@ -720,17 +782,17 @@ mod tests {
         let key = make_key(1);
 
         // Add contract with initial size
-        cache.record_access(key, 100, AccessType::Get);
+        cache.record_access(key, 100, AccessType::Get, |_| false);
         assert_eq!(cache.current_bytes(), 100);
         assert_eq!(cache.get(&key).unwrap().size_bytes, 100);
 
         // Contract state grows
-        cache.record_access(key, 200, AccessType::Put);
+        cache.record_access(key, 200, AccessType::Put, |_| false);
         assert_eq!(cache.current_bytes(), 200);
         assert_eq!(cache.get(&key).unwrap().size_bytes, 200);
 
         // Contract state shrinks
-        cache.record_access(key, 150, AccessType::Put);
+        cache.record_access(key, 150, AccessType::Put, |_| false);
         assert_eq!(cache.current_bytes(), 150);
         assert_eq!(cache.get(&key).unwrap().size_bytes, 150);
     }
@@ -746,9 +808,9 @@ mod tests {
         let key2 = make_key(2);
         let key3 = make_key(3);
 
-        cache.record_access(key1, 100, AccessType::Get);
-        cache.record_access(key2, 100, AccessType::Put);
-        cache.record_access(key3, 100, AccessType::Subscribe);
+        cache.record_access(key1, 100, AccessType::Get, |_| false);
+        cache.record_access(key2, 100, AccessType::Put, |_| false);
+        cache.record_access(key3, 100, AccessType::Subscribe, |_| false);
 
         let keys: Vec<ContractKey> = cache.iter().collect();
         assert_eq!(keys.len(), 3);
@@ -766,7 +828,7 @@ mod tests {
         let (mut cache, time) = make_cache(10000, Duration::from_secs(60));
         let key = make_key(1);
 
-        cache.record_access(key, 100, AccessType::Get);
+        cache.record_access(key, 100, AccessType::Get, |_| false);
         cache.mark_local_client_access(&key);
 
         // Immediately after marking: recent access is true

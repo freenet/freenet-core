@@ -575,11 +575,19 @@ impl HostingManager {
     }
 
     /// Whether something still depends on this node hosting `contract` — i.e.
-    /// it has a live local client subscription or a downstream peer
-    /// subscriber. Used to gate hosting-cache eviction reclamation: a
-    /// contract that is in use must NOT have its on-disk state/code deleted.
+    /// it has a live local client subscription, a downstream peer subscriber,
+    /// or an active upstream network subscription. Used to gate hosting-cache
+    /// eviction reclamation: a contract that is in use must NOT have its
+    /// on-disk state/code deleted.
+    ///
+    /// The network-subscription term (`is_subscribed`) matters because a node
+    /// can hold an active upstream subscription for a contract with no local
+    /// client and no downstream subscriber — it still expects UPDATEs, so its
+    /// disk state must be retained.
     pub fn contract_in_use(&self, contract: &ContractKey) -> bool {
-        self.has_client_subscriptions(contract.id()) || self.has_downstream_subscribers(contract)
+        self.has_client_subscriptions(contract.id())
+            || self.has_downstream_subscribers(contract)
+            || self.is_subscribed(contract)
     }
 
     /// Remove downstream subscribers whose leases have expired.
@@ -647,10 +655,17 @@ impl HostingManager {
         size_bytes: u64,
         access_type: AccessType,
     ) -> RecordAccessResult {
-        let result = self
-            .hosting_cache
-            .write()
-            .record_access(key, size_bytes, access_type);
+        // `contract_in_use` reads only the client_subscriptions /
+        // downstream_subscribers / active_subscriptions DashMaps — never
+        // `hosting_cache` — so calling it from inside the `hosting_cache`
+        // write guard does not re-enter that lock. `sweep_expired_hosting`
+        // uses this same pattern.
+        let result = self.hosting_cache.write().record_access(
+            key,
+            size_bytes,
+            access_type,
+            |k: &ContractKey| self.contract_in_use(k),
+        );
 
         // Persist hosting metadata for the accessed contract
         if let Some(storage) = self.storage.read().as_ref() {
@@ -830,16 +845,19 @@ impl HostingManager {
 
     /// Sweep for expired entries in the hosting cache.
     ///
-    /// Contracts are protected from eviction if they have client subscriptions
-    /// OR downstream subscribers (other peers relying on us for updates).
+    /// Contracts are protected from eviction while `contract_in_use` returns
+    /// true — i.e. they have client subscriptions, downstream subscribers, or
+    /// an active upstream network subscription. This is the same predicate
+    /// used by `record_contract_access`, so all eviction paths agree.
     /// The downstream subscriber exemption is time-bounded: stale entries are
     /// removed by `expire_stale_downstream_subscribers()` (called periodically)
     /// after `SUBSCRIPTION_LEASE_DURATION` without renewal.
     /// Automatically removes persisted metadata for expired contracts.
     pub fn sweep_expired_hosting(&self) -> Vec<ContractKey> {
-        let expired = self.hosting_cache.write().sweep_expired(|key| {
-            self.has_client_subscriptions(key.id()) || self.has_downstream_subscribers(key)
-        });
+        let expired = self
+            .hosting_cache
+            .write()
+            .sweep_expired(|key| self.contract_in_use(key));
 
         // Clean up persisted metadata for expired contracts
         if !expired.is_empty() {
@@ -2444,6 +2462,94 @@ mod tests {
         );
     }
 
+    /// A contract with ONLY an active upstream network subscription (no local
+    /// client, no downstream subscriber) IS in use — this node still expects
+    /// UPDATEs, so its on-disk state must not be reclaimed.
+    #[test]
+    fn test_contract_in_use_true_with_network_subscription_only() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(4);
+
+        // No client subscription, no downstream subscriber yet.
+        assert!(!manager.has_client_subscriptions(contract.id()));
+        assert!(!manager.has_downstream_subscribers(&contract));
+        assert!(
+            !manager.contract_in_use(&contract),
+            "with no subscriptions of any kind the contract is not in use"
+        );
+
+        // Establish an active upstream network subscription only.
+        manager.subscribe(contract);
+        assert!(manager.is_subscribed(&contract));
+        assert!(
+            manager.contract_in_use(&contract),
+            "a contract with an active network subscription must be in use \
+             even with no local client or downstream subscriber"
+        );
+
+        // Once the network subscription is dropped, it becomes reclaimable.
+        manager.unsubscribe(&contract);
+        assert!(
+            !manager.contract_in_use(&contract),
+            "contract must become reclaimable once its network subscription \
+             is removed"
+        );
+    }
+
+    /// `record_contract_access` must not evict an in-use (subscribed)
+    /// contract when the cache is over budget; once the subscription is
+    /// removed the contract becomes evictable.
+    #[test]
+    fn test_record_contract_access_skips_in_use_contract() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        // Override with a tiny cache and ZERO TTL so every entry is instantly
+        // eviction-eligible — `contract_in_use` is then the only protection.
+        {
+            let mut cache = manager.hosting_cache.write();
+            *cache = cache::HostingCache::new(
+                200, // room for ~2 contracts at 100 bytes
+                std::time::Duration::ZERO,
+                crate::util::time_source::InstantTimeSrc::new(),
+            );
+        }
+
+        let in_use = make_contract_key(1);
+        let filler = make_contract_key(2);
+        let trigger = make_contract_key(3);
+
+        // `in_use` is the oldest LRU entry but has an active subscription.
+        manager.subscribe(in_use);
+        assert!(manager.contract_in_use(&in_use));
+
+        manager.record_contract_access(in_use, 100, AccessType::Get);
+        manager.record_contract_access(filler, 100, AccessType::Get);
+
+        // Inserting `trigger` puts the cache over budget. A naive LRU would
+        // evict `in_use` (oldest) — `contract_in_use` must protect it, so
+        // `filler` is evicted instead.
+        let result = manager.record_contract_access(trigger, 100, AccessType::Get);
+        assert_eq!(
+            result.evicted,
+            vec![filler],
+            "in-use subscribed contract must be skipped; the unprotected \
+             contract must be evicted instead"
+        );
+        assert!(manager.is_hosting_contract(&in_use));
+        assert!(!manager.is_hosting_contract(&filler));
+
+        // Drop the subscription: `in_use` is now evictable.
+        manager.unsubscribe(&in_use);
+        assert!(!manager.contract_in_use(&in_use));
+
+        let result = manager.record_contract_access(filler, 100, AccessType::Get);
+        assert!(
+            result.evicted.contains(&in_use),
+            "once the subscription is removed the contract must become \
+             evictable when the cache is over budget"
+        );
+        assert!(!manager.is_hosting_contract(&in_use));
+    }
+
     /// Removing from an untracked contract is a noop; other contracts unaffected.
     #[test]
     fn test_unsubscribe_handler_unknown_contract_is_noop() {
@@ -2498,8 +2604,8 @@ mod tests {
         let protected = make_contract_key(1);
         let unprotected = make_contract_key(2);
 
-        cache.record_access(protected, 100, AccessType::Get);
-        cache.record_access(unprotected, 100, AccessType::Get);
+        cache.record_access(protected, 100, AccessType::Get, |_| false);
+        cache.record_access(unprotected, 100, AccessType::Get, |_| false);
         assert_eq!(cache.current_bytes(), 200); // over budget
 
         // Advance past TTL
@@ -2535,7 +2641,7 @@ mod tests {
         let mut cache = HostingCache::new(80, min_ttl, time.clone());
 
         let contract = make_contract_key(100);
-        cache.record_access(contract, 100, AccessType::Get);
+        cache.record_access(contract, 100, AccessType::Get, |_| false);
         assert!(cache.contains(&contract));
 
         // Under TTL: should not be evicted even though over budget
