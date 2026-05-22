@@ -173,6 +173,28 @@ pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &Contr
     }
 }
 
+/// Reclaim the on-disk storage of a contract that was evicted from the
+/// hosting cache. Skips contracts that are still in use — an active client
+/// subscription or a downstream peer subscriber means something still
+/// depends on us hosting it, so its state/code must NOT be deleted.
+///
+/// Fire-and-forget: emits an `EvictContract` event to the contract handler,
+/// which routes it through the fair queue (serialized per-contract with other
+/// ops on the same key) and reclaims disk in `handle_contract_event`.
+pub(crate) fn reclaim_evicted_contract(op_manager: &OpManager, key: ContractKey) {
+    if op_manager.ring.contract_in_use(&key) {
+        tracing::debug!(
+            contract = %key,
+            "Skipping disk reclamation for evicted contract — still in use \
+             (client subscription or downstream subscriber)"
+        );
+        return;
+    }
+    op_manager.notify_contract_handler_fire_and_forget(
+        crate::contract::ContractHandlerEvent::EvictContract { key },
+    );
+}
+
 /// Complete subscription at the originator node via GET piggyback.
 ///
 /// The subscription tree was built by relay nodes during GET response propagation.
@@ -349,7 +371,8 @@ pub(crate) async fn has_contract(
         | crate::contract::ContractHandlerEvent::GetSummaryResponse { .. }
         | crate::contract::ContractHandlerEvent::GetDeltaQuery { .. }
         | crate::contract::ContractHandlerEvent::GetDeltaResponse { .. }
-        | crate::contract::ContractHandlerEvent::ClientDisconnect { .. } => Ok(None),
+        | crate::contract::ContractHandlerEvent::ClientDisconnect { .. }
+        | crate::contract::ContractHandlerEvent::EvictContract { .. } => Ok(None),
     }
 }
 

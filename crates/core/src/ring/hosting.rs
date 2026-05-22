@@ -574,6 +574,14 @@ impl HostingManager {
             .is_some_and(|peers| !peers.is_empty())
     }
 
+    /// Whether something still depends on this node hosting `contract` — i.e.
+    /// it has a live local client subscription or a downstream peer
+    /// subscriber. Used to gate hosting-cache eviction reclamation: a
+    /// contract that is in use must NOT have its on-disk state/code deleted.
+    pub fn contract_in_use(&self, contract: &ContractKey) -> bool {
+        self.has_client_subscriptions(contract.id()) || self.has_downstream_subscribers(contract)
+    }
+
     /// Remove downstream subscribers whose leases have expired.
     /// Returns each affected contract paired with the number of expired peers.
     pub fn expire_stale_downstream_subscribers(&self) -> Vec<(ContractKey, usize)> {
@@ -2372,6 +2380,68 @@ mod tests {
         assert!(!manager.remove_downstream_subscriber(&contract, &unknown_peer));
         assert!(manager.has_downstream_subscribers(&contract));
         assert!(!manager.should_unsubscribe_upstream(&contract));
+    }
+
+    // ----------------------------------------------------------------------
+    // contract_in_use — the eviction-reclamation gate.
+    //
+    // `operations::reclaim_evicted_contract` MUST NOT emit an EvictContract
+    // event (which would delete the contract's state/code from disk) for a
+    // contract that is still in use. `contract_in_use` is that gate.
+    // ----------------------------------------------------------------------
+
+    /// A freshly-evicted contract with no client or downstream subscribers is
+    /// NOT in use — reclamation may proceed.
+    #[test]
+    fn test_contract_in_use_false_when_no_subscribers() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(1);
+        assert!(
+            !manager.contract_in_use(&contract),
+            "a contract with no subscribers must not be considered in use"
+        );
+    }
+
+    /// A contract with a live client subscription IS in use — the gate must
+    /// keep its on-disk storage.
+    #[test]
+    fn test_contract_in_use_true_with_client_subscription() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(2);
+        let client = crate::client_events::ClientId::next();
+
+        manager.add_client_subscription(contract.id(), client);
+        assert!(
+            manager.contract_in_use(&contract),
+            "a contract with a client subscription must be considered in use"
+        );
+
+        // After the last client unsubscribes, the contract is reclaimable.
+        manager.remove_client_subscription(contract.id(), client);
+        assert!(
+            !manager.contract_in_use(&contract),
+            "contract must become reclaimable once its last client unsubscribes"
+        );
+    }
+
+    /// A contract with a downstream peer subscriber IS in use.
+    #[test]
+    fn test_contract_in_use_true_with_downstream_subscriber() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(3);
+        let peer = make_peer_key(7);
+
+        manager.add_downstream_subscriber(&contract, peer.clone());
+        assert!(
+            manager.contract_in_use(&contract),
+            "a contract with a downstream subscriber must be considered in use"
+        );
+
+        manager.remove_downstream_subscriber(&contract, &peer);
+        assert!(
+            !manager.contract_in_use(&contract),
+            "contract must become reclaimable once its last downstream subscriber leaves"
+        );
     }
 
     /// Removing from an untracked contract is a noop; other contracts unaffected.

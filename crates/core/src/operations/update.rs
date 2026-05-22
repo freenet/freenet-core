@@ -526,7 +526,8 @@ pub(crate) async fn update_contract(
                             | ContractHandlerEvent::GetSummaryResponse { .. }
                             | ContractHandlerEvent::GetDeltaQuery { .. }
                             | ContractHandlerEvent::GetDeltaResponse { .. }
-                            | ContractHandlerEvent::ClientDisconnect { .. } => None,
+                            | ContractHandlerEvent::ClientDisconnect { .. }
+                            | ContractHandlerEvent::EvictContract { .. } => None,
                         });
 
                     match fetched_state {

@@ -1178,6 +1178,14 @@ impl Ring {
                 "GET subscription cache sweep found expired entries"
             );
 
+            // Reclaim on-disk storage for the expired contracts so the hosting
+            // budget is a real disk bound. The sweep task only holds an
+            // `Arc<Ring>`; reach the `OpManager` the same way
+            // `recover_orphaned_subscriptions` does, via the weak back-reference.
+            // `reclaim_evicted_contract` re-checks the subscription gate per
+            // key before emitting the eviction event.
+            let op_manager = ring.upgrade_op_manager();
+
             // Clean up local subscription state for each expired contract.
             // Note: contracts with client subscriptions are protected from eviction
             // by the should_retain predicate in sweep_expired_hosting().
@@ -1187,6 +1195,9 @@ impl Ring {
                     %key,
                     "Cleaned up expired hosting subscription from local state"
                 );
+                if let Some(op_manager) = &op_manager {
+                    crate::operations::reclaim_evicted_contract(op_manager, key);
+                }
             }
         }
     }
@@ -1638,6 +1649,15 @@ impl Ring {
 
     pub fn has_downstream_subscribers(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.has_downstream_subscribers(contract)
+    }
+
+    /// Whether something still depends on this node hosting `contract` (a live
+    /// local client subscription or a downstream peer subscriber).
+    ///
+    /// Used to gate hosting-cache eviction reclamation: a contract that is in
+    /// use must not have its on-disk state/code deleted.
+    pub(crate) fn contract_in_use(&self, contract: &ContractKey) -> bool {
+        self.hosting_manager.contract_in_use(contract)
     }
 
     pub fn expire_stale_downstream_subscribers(&self) -> Vec<(ContractKey, usize)> {
