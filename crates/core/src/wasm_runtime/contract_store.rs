@@ -80,6 +80,20 @@ impl ContractStore {
 
     /// Returns a copy of the contract bytes if available, none otherwise.
     // todo: instead return Result<Option<_>, _> to handle IO errors upstream
+    //
+    // Known limitation: `key_to_code_part` is a per-`ContractStore` index
+    // (a fresh `Arc<DashMap>` per `ContractStore::new`), so when the
+    // executor pool holds multiple `ContractStore` instances each carries
+    // its own copy of the index. A contract stored via executor A may
+    // therefore be reported as "missing" by `fetch_contract` on executor
+    // B even though both share the same on-disk `.wasm` and the same
+    // process-wide `contract_cache`. The cache-hit fast path below
+    // masks this for shared-code reads when the code hash happens to be
+    // warm in the cache, which is the only reason cross-executor
+    // fetches currently work in production. This divergence is tracked
+    // as #4218; a proper fix would either share the index across
+    // pool members or rebuild it from the on-disk state at startup
+    // per executor.
     pub fn fetch_contract(
         &self,
         key: &ContractKey,
