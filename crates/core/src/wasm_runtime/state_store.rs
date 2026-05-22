@@ -68,6 +68,9 @@ pub trait StateStorage {
         &'a self,
         key: &'a ContractKey,
     ) -> impl Future<Output = Result<Option<Parameters<'static>>, Self::Error>> + Send + 'a;
+    /// Remove all persisted data for a contract (state and parameters).
+    /// Idempotent: removing a contract that is not stored is not an error.
+    fn remove(&self, key: &ContractKey) -> impl Future<Output = Result<(), Self::Error>> + Send;
 }
 
 /// StateStore wraps a persistent storage backend with an optional in-memory cache.
@@ -227,6 +230,17 @@ where
         }
         let r = self.store.get(key).await.map_err(Into::into)?;
         r.ok_or_else(|| StateStoreError::MissingContract(*key))
+    }
+
+    /// Delete a contract's persisted state and parameters and drop it from
+    /// the in-memory cache. Used to reclaim disk space when a contract is
+    /// evicted from the hosting cache. Idempotent.
+    pub async fn delete(&self, key: &ContractKey) -> Result<(), StateStoreError> {
+        if let Some(cache) = &self.state_mem_cache {
+            cache.invalidate(key);
+        }
+        self.store.remove(key).await.map_err(Into::into)?;
+        Ok(())
     }
 
     pub async fn get_params<'a>(
@@ -895,5 +909,54 @@ mod tests {
             retrieved, original_state,
             "Cache should serve last persisted state after failed update"
         );
+    }
+
+    // ============ delete() Tests ============
+
+    /// After store() then delete(), the contract's state and params must be gone.
+    #[tokio::test]
+    async fn test_state_store_delete_removes_state_and_params() {
+        let mock_storage = MockStateStorage::new();
+        let mut store = StateStore::new(mock_storage, 10_000).unwrap();
+
+        let key = make_test_key();
+        let state = make_test_state(&[1, 2, 3]);
+        let params = Parameters::from(vec![10, 20, 30]);
+
+        // Store state and params, confirm they are present
+        store
+            .store(key, state.clone(), params.clone())
+            .await
+            .unwrap();
+        assert_eq!(store.get(&key).await.unwrap(), state);
+        assert_eq!(store.get_params(&key).await.unwrap(), Some(params));
+
+        // Delete the contract
+        store.delete(&key).await.unwrap();
+
+        // State should no longer be retrievable
+        let get_result = store.get(&key).await;
+        assert!(
+            matches!(get_result, Err(StateStoreError::MissingContract(_))),
+            "Expected MissingContract after delete, got {get_result:?}"
+        );
+
+        // Params should be gone too
+        assert_eq!(store.get_params(&key).await.unwrap(), None);
+    }
+
+    /// delete() on a contract that was never stored is a no-op (idempotent).
+    #[tokio::test]
+    async fn test_state_store_delete_never_stored_is_idempotent() {
+        let mock_storage = MockStateStorage::new();
+        let store = StateStore::new(mock_storage, 10_000).unwrap();
+
+        let key = make_test_key();
+
+        // Deleting a contract that was never stored must succeed
+        store
+            .delete(&key)
+            .await
+            .expect("delete of a never-stored contract should be Ok");
     }
 }

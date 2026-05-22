@@ -313,6 +313,21 @@ impl StateStorage for Pool {
             Err(_) => Err(SqlDbError::ContractNotFound),
         }
     }
+
+    async fn remove(&self, key: &ContractKey) -> Result<(), Self::Error> {
+        // State and params share the `states` row; `hosting_metadata` is a
+        // separate table. A `DELETE` of an absent row is a no-op, so this is
+        // idempotent.
+        sqlx::query("DELETE FROM states WHERE contract = ?")
+            .bind(key.as_bytes())
+            .execute(&self.0)
+            .await?;
+        sqlx::query("DELETE FROM hosting_metadata WHERE contract = ?")
+            .bind(key.as_bytes())
+            .execute(&self.0)
+            .await?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -285,6 +285,14 @@ impl StateStorage for MockStateStorage {
 
         Ok(inner.params.get(key).cloned())
     }
+
+    async fn remove(&self, key: &ContractKey) -> Result<(), Self::Error> {
+        let mut inner = self.inner.lock().unwrap();
+        // HashMap::remove on an absent key is fine, so this is idempotent.
+        inner.states.remove(key);
+        inner.params.remove(key);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

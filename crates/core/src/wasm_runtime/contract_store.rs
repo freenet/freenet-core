@@ -173,28 +173,49 @@ impl ContractStore {
         Ok(self.contracts_dir.join(key_path).with_extension("wasm"))
     }
 
+    /// Remove a contract instance from the store.
+    ///
+    /// Removes this instance's index entries (ReDb + in-memory) and any
+    /// delegate subscriptions unconditionally. The on-disk `.wasm` blob and
+    /// the code cache entry are keyed by `code_hash`, which is shared across
+    /// every `ContractInstanceId` using the same code, so they are removed
+    /// only once no remaining instance references that code hash. File
+    /// removal is idempotent — an already-missing `.wasm` is not an error.
     pub fn remove_contract(&mut self, key: &ContractKey) -> RuntimeResult<()> {
         let contract_hash = *key.code_hash();
 
-        // Invalidate cache to prevent serving "ghost" contracts. See issue #3487.
-        self.contract_cache.invalidate(&contract_hash);
-
-        // Remove from ReDb index
+        // Remove this instance's index entries first.
         self.db
             .remove_contract_index(key.id())
             .map_err(|e| anyhow::anyhow!("Failed to remove contract index: {e}"))?;
-
-        // Remove from in-memory index
         self.key_to_code_part.remove(key.id());
 
-        // Clean up any delegate subscriptions for this contract
+        // Clean up any delegate subscriptions for this contract instance.
         super::DELEGATE_SUBSCRIPTIONS.remove(key.id());
 
-        let key_path = self
-            .contracts_dir
-            .join(contract_hash.encode())
-            .with_extension("wasm");
-        std::fs::remove_file(key_path)?;
+        // The WASM blob on disk is keyed by code hash and shared by every
+        // contract instance with the same code (e.g. all River rooms share
+        // one room-contract WASM — see issue #2380). Only delete the blob
+        // and its cache entry once no remaining instance references this
+        // code hash, otherwise the surviving instances break on cache miss.
+        let code_still_referenced = self
+            .key_to_code_part
+            .iter()
+            .any(|entry| entry.value() == &contract_hash);
+        if !code_still_referenced {
+            // Invalidate the code cache so a removed contract is never served
+            // as a "ghost" (issue #3487).
+            self.contract_cache.invalidate(&contract_hash);
+            let key_path = self
+                .contracts_dir
+                .join(contract_hash.encode())
+                .with_extension("wasm");
+            match std::fs::remove_file(&key_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
         Ok(())
     }
 
@@ -630,6 +651,139 @@ mod test {
             store.fetch_contract(&key, &params).is_none(),
             "Removed contract must not be served from cache (ghost contract)"
         );
+
+        Ok(())
+    }
+
+    /// Regression test for the latent shared-WASM deletion bug: removing one
+    /// contract instance must NOT delete the `.wasm` blob while another
+    /// instance still references the same code hash.
+    ///
+    /// Multiple `ContractInstanceId`s can share one code hash (e.g. every
+    /// River chat room shares one room-contract WASM — see issue #2380).
+    /// The on-disk blob is keyed by code hash, so an unconditional delete
+    /// would break the surviving instances after a cache miss / restart.
+    #[tokio::test]
+    async fn test_remove_contract_keeps_shared_wasm() -> Result<(), Box<dyn std::error::Error>> {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+        let db = create_test_db(contract_dir.path()).await;
+        let mut store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
+
+        // Two instances: SAME code, DIFFERENT params -> same code_hash,
+        // different ContractInstanceIds.
+        let shared_code = vec![1, 2, 3, 4, 5];
+        let params1 = Parameters::from(vec![1, 1, 1]);
+        let params2 = Parameters::from(vec![2, 2, 2]);
+        let contract1 = WrappedContract::new(
+            Arc::new(ContractCode::from(shared_code.clone())),
+            params1.clone(),
+        );
+        let contract2 = WrappedContract::new(
+            Arc::new(ContractCode::from(shared_code.clone())),
+            params2.clone(),
+        );
+        let key1 = *contract1.key();
+        let key2 = *contract2.key();
+
+        // Both instances share one code hash.
+        assert_eq!(key1.code_hash(), key2.code_hash());
+
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            contract1,
+        )))?;
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            contract2,
+        )))?;
+
+        let wasm_path = contract_dir
+            .path()
+            .join(key1.code_hash().encode())
+            .with_extension("wasm");
+        assert!(wasm_path.exists(), "WASM file should exist after store");
+
+        // Remove the first instance — the shared WASM must survive because
+        // the second instance still references the code hash.
+        store.remove_contract(&key1)?;
+        assert!(
+            wasm_path.exists(),
+            "Shared WASM file must NOT be deleted while another instance references it"
+        );
+
+        // The second instance must still be fetchable.
+        assert!(
+            store.fetch_contract(&key2, &params2).is_some(),
+            "Surviving instance must still be fetchable after the other is removed"
+        );
+
+        Ok(())
+    }
+
+    /// Removing the last instance referencing a code hash must delete the
+    /// `.wasm` blob from disk to reclaim space.
+    #[tokio::test]
+    async fn test_remove_contract_deletes_last_instance_wasm()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+        let db = create_test_db(contract_dir.path()).await;
+        let mut store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![9, 8, 7, 6])),
+            [4, 2].as_ref().into(),
+        );
+        let key = *contract.key();
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            contract,
+        )))?;
+
+        let wasm_path = contract_dir
+            .path()
+            .join(key.code_hash().encode())
+            .with_extension("wasm");
+        assert!(wasm_path.exists(), "WASM file should exist after store");
+
+        // Removing the only instance must delete the blob.
+        store.remove_contract(&key)?;
+        assert!(
+            !wasm_path.exists(),
+            "WASM file must be deleted when the last instance is removed"
+        );
+
+        Ok(())
+    }
+
+    /// `remove_contract` must tolerate an already-missing `.wasm` file
+    /// (idempotent file removal).
+    #[tokio::test]
+    async fn test_remove_contract_idempotent_when_file_missing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+        let db = create_test_db(contract_dir.path()).await;
+        let mut store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
+
+        let contract = WrappedContract::new(
+            Arc::new(ContractCode::from(vec![3, 3, 3])),
+            [7, 7].as_ref().into(),
+        );
+        let key = *contract.key();
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            contract,
+        )))?;
+
+        // Manually delete the WASM file out from under the store.
+        let wasm_path = contract_dir
+            .path()
+            .join(key.code_hash().encode())
+            .with_extension("wasm");
+        std::fs::remove_file(&wasm_path)?;
+
+        // remove_contract must still succeed despite the missing file.
+        store
+            .remove_contract(&key)
+            .expect("remove_contract must be Ok when the WASM file is already gone");
 
         Ok(())
     }

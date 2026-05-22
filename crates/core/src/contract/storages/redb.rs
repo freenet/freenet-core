@@ -788,6 +788,26 @@ impl StateStorage for ReDb {
             None => Ok(None),
         }
     }
+
+    async fn remove(&self, key: &ContractKey) -> Result<(), Self::Error> {
+        // Delete from all three per-key tables in a single write transaction
+        // so the removal is atomic. `redb`'s `Table::remove` does not error
+        // when the key is absent, so this is naturally idempotent.
+        let txn = self.0.begin_write()?;
+        {
+            let mut tbl = txn.open_table(STATE_TABLE)?;
+            tbl.remove(key.as_bytes())?;
+        }
+        {
+            let mut tbl = txn.open_table(CONTRACT_PARAMS_TABLE)?;
+            tbl.remove(key.as_bytes())?;
+        }
+        {
+            let mut tbl = txn.open_table(HOSTING_METADATA_TABLE)?;
+            tbl.remove(key.as_bytes())?;
+        }
+        txn.commit().map_err(Into::into)
+    }
 }
 
 #[cfg(test)]
@@ -919,5 +939,45 @@ mod tests {
     fn test_hosting_metadata_too_short() {
         assert!(HostingMetadata::from_bytes(&[0u8; 48]).is_none());
         assert!(HostingMetadata::from_bytes(&[]).is_none());
+    }
+
+    fn make_test_key() -> ContractKey {
+        let code = ContractCode::from(vec![1, 2, 3, 4]);
+        let params = Parameters::from(vec![5, 6, 7, 8]);
+        ContractKey::from_params_and_code(&params, &code)
+    }
+
+    /// `remove` deletes both the state and the params for a contract.
+    #[tokio::test]
+    async fn test_remove_deletes_state_and_params() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+
+        let key = make_test_key();
+        let state = WrappedState::new(vec![1, 2, 3]);
+        let params = Parameters::from(vec![10, 20, 30]);
+
+        // Store state + params and confirm they are present.
+        db.store(key, state.clone()).await.unwrap();
+        db.store_params(key, params.clone()).await.unwrap();
+        assert_eq!(db.get(&key).await.unwrap(), Some(state));
+        assert_eq!(db.get_params(&key).await.unwrap(), Some(params));
+
+        // Remove and confirm both are gone.
+        db.remove(&key).await.unwrap();
+        assert_eq!(db.get(&key).await.unwrap(), None);
+        assert_eq!(db.get_params(&key).await.unwrap(), None);
+    }
+
+    /// `remove` on a contract that was never stored is a no-op (idempotent).
+    #[tokio::test]
+    async fn test_remove_never_stored_is_idempotent() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+
+        let key = make_test_key();
+        db.remove(&key)
+            .await
+            .expect("removing a never-stored contract should be Ok");
     }
 }
