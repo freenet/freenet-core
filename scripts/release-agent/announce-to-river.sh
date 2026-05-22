@@ -31,6 +31,13 @@ FREENET_NODE_URL="${FREENET_NODE_URL:-http://127.0.0.1:7509/}"
 # was not writable by the announce user, so every log() call emitted a
 # spurious "Permission denied" line (issue #4208).
 LOG_FILE="${LOG_FILE:-}"
+# Node-reachability polling budget. A release announcement runs concurrently
+# with the gateway update that restarts the local node, so it must wait that
+# restart out (issue #4208). ATTEMPTS * INTERVAL is the wall-clock budget —
+# default ~5 min, comfortably over the ~90s gateway down-window observed on
+# the v0.2.61 release. Overridable (e.g. INTERVAL=0 in tests).
+NODE_WAIT_ATTEMPTS="${NODE_WAIT_ATTEMPTS:-60}"
+NODE_WAIT_INTERVAL="${NODE_WAIT_INTERVAL:-5}"
 
 log() {
     local timestamp
@@ -49,6 +56,41 @@ Usage: $0 <message>
 Posts <message> to the Freenet Official River room.
 EOF
     exit 1
+}
+
+# Poll FREENET_NODE_URL until it responds, or NODE_WAIT_ATTEMPTS is reached.
+# Returns 0 once reachable, 1 if it never became reachable.
+#
+# A release announcement runs concurrently with the gateway update that
+# restarts the local node (down ~90s), so a single probe routinely races
+# that window (issue #4208) — hence the polling.
+#
+# The polling also keeps this script alive past the release-agent's
+# 1-second early-exit probe: the agent treats a sub-1s exit as a failure
+# (HTTP 500) but returns 202 for a still-running script and reaps it in the
+# background. So a node that is merely restarting still yields a completed
+# announcement. The flip side: a node that stays down for the whole budget
+# fails only in this script's journald log, not visibly to the release
+# workflow (which already received its 202). A prolonged gateway outage on
+# release day is independently visible, so that trade-off is acceptable;
+# surfacing late failures to the workflow would need a release-agent change.
+wait_for_node() {
+    local attempt
+    for ((attempt = 1; attempt <= NODE_WAIT_ATTEMPTS; attempt++)); do
+        if curl -s --max-time 3 "$FREENET_NODE_URL" >/dev/null 2>&1; then
+            return 0
+        fi
+        if [[ "$attempt" -eq 1 ]]; then
+            log "Freenet node not reachable at $FREENET_NODE_URL yet — waiting (it is restarted by the concurrent gateway update)"
+        elif (( attempt % 12 == 0 )); then
+            log "still waiting for Freenet node ($attempt/$NODE_WAIT_ATTEMPTS)"
+        fi
+        # No sleep after the final attempt — nothing follows it.
+        if (( attempt < NODE_WAIT_ATTEMPTS )); then
+            sleep "$NODE_WAIT_INTERVAL"
+        fi
+    done
+    return 1
 }
 
 if [[ $# -ne 1 ]]; then
@@ -82,31 +124,11 @@ if [[ ! -f "$ROOMS_JSON" ]]; then
     exit 1
 fi
 
-# Wait for the Freenet node to be reachable (riverctl hangs otherwise).
-#
-# A release announcement runs concurrently with the gateway update that
-# restarts the local node, so a single probe routinely races that restart
-# window and the announce fails (issue #4208). Retry for several minutes —
-# the node is only briefly down.
-#
-# The sleep also keeps this script alive past the release-agent's 1-second
-# early-exit probe: the agent treats a sub-1s exit as a failure (HTTP 500)
-# but returns 202 for a script still running, then reaps it in the
-# background. Retrying here therefore lets the announce complete once the
-# node is back instead of dying inside that probe window.
-node_ready=false
-for attempt in $(seq 1 60); do
-    if curl -s --max-time 3 "$FREENET_NODE_URL" >/dev/null 2>&1; then
-        node_ready=true
-        break
-    fi
-    if [[ "$attempt" -eq 1 ]]; then
-        log "Freenet node not reachable at $FREENET_NODE_URL yet — waiting (it is restarted by the concurrent gateway update)"
-    fi
-    sleep 5
-done
-if [[ "$node_ready" != true ]]; then
-    log "ERROR: Freenet node still not reachable at $FREENET_NODE_URL after retries"
+# Wait for the local Freenet node before invoking riverctl (it hangs
+# otherwise). See wait_for_node() above for why this polls rather than
+# probing once.
+if ! wait_for_node; then
+    log "ERROR: Freenet node still not reachable at $FREENET_NODE_URL after $NODE_WAIT_ATTEMPTS attempts"
     exit 1
 fi
 
