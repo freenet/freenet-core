@@ -47,11 +47,11 @@ mod connection_manager;
 pub(crate) use connection_manager::ConnectionManager;
 mod connection;
 mod hosting;
-pub use hosting::{AccessType, RecordAccessResult};
 /// Single source of truth for the default hosted-contract-state budget.
 /// `config::default_max_hosting_storage()` resolves to this so the
 /// operator-facing default and the in-code fallback can never drift.
 pub(crate) use hosting::DEFAULT_HOSTING_BUDGET_BYTES;
+pub use hosting::{AccessType, RecordAccessResult};
 pub mod interest;
 mod live_tx;
 mod location;
