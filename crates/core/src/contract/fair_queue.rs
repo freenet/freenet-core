@@ -746,10 +746,7 @@ mod tests {
             ),
             // EvictContract must route to the contract's per-key queue so
             // disk reclamation is serialized with other ops on that key.
-            (
-                "EvictContract",
-                ContractHandlerEvent::EvictContract { key },
-            ),
+            ("EvictContract", ContractHandlerEvent::EvictContract { key }),
         ];
 
         for (name, event) in &contract_events {
