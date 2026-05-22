@@ -219,7 +219,7 @@ impl Ring {
             max_hops_to_live,
             router,
             connection_manager,
-            hosting_manager: hosting::HostingManager::new(),
+            hosting_manager: hosting::HostingManager::new(config.config.max_hosting_storage),
             live_tx_tracker: live_tx_tracker.clone(),
             event_register: Box::new(event_register),
             op_manager: RwLock::new(None),

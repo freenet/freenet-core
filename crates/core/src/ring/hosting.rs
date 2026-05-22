@@ -194,14 +194,14 @@ pub(crate) struct HostingManager {
 }
 
 impl HostingManager {
-    pub fn new() -> Self {
+    pub fn new(budget_bytes: u64) -> Self {
         let backoff_config =
             ExponentialBackoff::new(INITIAL_SUBSCRIPTION_BACKOFF, MAX_SUBSCRIPTION_BACKOFF);
         Self {
             active_subscriptions: DashMap::new(),
             client_subscriptions: DashMap::new(),
             hosting_cache: RwLock::new(HostingCache::new(
-                DEFAULT_HOSTING_BUDGET_BYTES,
+                budget_bytes,
                 DEFAULT_MIN_TTL,
                 InstantTimeSrc::new(),
             )),
@@ -732,6 +732,12 @@ impl HostingManager {
     /// Get the number of contracts in the hosting cache.
     pub fn hosting_contracts_count(&self) -> usize {
         self.hosting_cache.read().len()
+    }
+
+    /// Get the configured byte-budget of the hosting cache.
+    #[cfg(test)]
+    pub(crate) fn hosting_budget_bytes(&self) -> u64 {
+        self.hosting_cache.read().budget_bytes()
     }
 
     /// Check if we should continue hosting a contract.
@@ -1419,7 +1425,7 @@ impl HostingManager {
 
 impl Default for HostingManager {
     fn default() -> Self {
-        Self::new()
+        Self::new(DEFAULT_HOSTING_BUDGET_BYTES)
     }
 }
 
@@ -1441,7 +1447,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_creates_new_subscription() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         let result = manager.subscribe(contract);
@@ -1451,8 +1457,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_new_uses_configured_budget() {
+        let custom_budget = 256 * 1024 * 1024_u64;
+        let manager = HostingManager::new(custom_budget);
+        assert_eq!(
+            manager.hosting_budget_bytes(),
+            custom_budget,
+            "HostingManager::new should pass the budget through to the cache"
+        );
+
+        // The default constructor still uses the in-code default.
+        let default_manager = HostingManager::default();
+        assert_eq!(
+            default_manager.hosting_budget_bytes(),
+            DEFAULT_HOSTING_BUDGET_BYTES
+        );
+    }
+
+    #[tokio::test]
     async fn test_subscribe_renews_existing() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         let first = manager.subscribe(contract);
@@ -1465,7 +1489,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unsubscribe_removes_subscription() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         manager.subscribe(contract);
@@ -1477,7 +1501,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_renew_subscription() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         // Renew non-existent subscription fails
@@ -1490,7 +1514,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_subscribed_contracts() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let c1 = make_contract_key(1);
         let c2 = make_contract_key(2);
         let c3 = make_contract_key(3);
@@ -1513,7 +1537,7 @@ mod tests {
     /// after the SUBSCRIBE migration (PR #3806 → #3981).
     #[tokio::test]
     async fn dashboard_snapshot_reflects_active_subscriptions() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let c1 = make_contract_key(1);
         let c2 = make_contract_key(2);
 
@@ -1559,7 +1583,7 @@ mod tests {
     /// entries) must break by contract-key bytes.
     #[tokio::test]
     async fn dashboard_snapshot_sort_is_deterministic_on_ties() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         // Three contracts with distinct, ordered key-byte prefixes
         // (`make_contract_key(seed)` writes `[seed; 32]` into the
         // ContractInstanceId, so seeds 0x10/0x40/0xF0 sort low/mid/high).
@@ -1605,7 +1629,7 @@ mod tests {
     /// to ~0 every renewal interval (2 min) for every River user.
     #[tokio::test]
     async fn dashboard_snapshot_preserves_subscribed_since_across_renewals() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let c = make_contract_key(1);
 
         let read_lease = || {
@@ -1633,7 +1657,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_active_subscription_count() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
 
         assert_eq!(manager.active_subscription_count(), 0);
 
@@ -1647,7 +1671,7 @@ mod tests {
 
     #[test]
     fn test_client_subscription_basic() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let instance_id = ContractInstanceId::new([1; 32]);
         let client_id = crate::client_events::ClientId::next();
 
@@ -1662,7 +1686,7 @@ mod tests {
 
     #[test]
     fn test_client_subscription_multiple_clients() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let instance_id = ContractInstanceId::new([1; 32]);
         let client1 = crate::client_events::ClientId::next();
         let client2 = crate::client_events::ClientId::next();
@@ -1682,7 +1706,7 @@ mod tests {
 
     #[test]
     fn test_hosting_cache_basic() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let key = make_contract_key(1);
 
         assert!(!manager.is_hosting_contract(&key));
@@ -1696,7 +1720,7 @@ mod tests {
 
     #[test]
     fn test_subscription_backoff() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         // Initially can request
@@ -1717,7 +1741,7 @@ mod tests {
 
     #[test]
     fn test_should_host() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         // Not hosting initially
@@ -1732,7 +1756,7 @@ mod tests {
     /// renewal list. Including them caused subscription storms (#3763 incident).
     #[test]
     fn test_hosted_contract_not_in_renewal_after_restart() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(42);
         manager.record_contract_access(contract, 1000, AccessType::Get);
         assert!(manager.is_hosting_contract(&contract));
@@ -1746,7 +1770,7 @@ mod tests {
     /// a contract is only in the hosting LRU cache (no active subscription).
     #[test]
     fn test_is_receiving_updates_excludes_hosting_cache_only() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         // Not receiving updates initially
@@ -1768,7 +1792,7 @@ mod tests {
     /// Regression test for #3340: is_receiving_updates with client subscriptions.
     #[test]
     fn test_is_receiving_updates_with_client_subscription() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
         let client_id = crate::client_events::ClientId::next();
 
@@ -1780,7 +1804,7 @@ mod tests {
 
     #[test]
     fn test_contracts_needing_renewal_excludes_hosted_only() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         // Add to hosting cache (simulating GET operation)
@@ -1822,7 +1846,7 @@ mod tests {
     /// is that such a relay does not get recruited into the renewal cycle.
     #[test]
     fn test_relay_downstream_only_not_in_renewal() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(77);
         let downstream = make_peer_key(42);
 
@@ -1869,7 +1893,7 @@ mod tests {
     #[ignore]
     #[test]
     fn test_hosted_contract_renewed_despite_no_interest() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(42);
         manager.record_contract_access(contract, 1000, AccessType::Get);
         assert!(manager.is_hosting_contract(&contract));
@@ -1887,7 +1911,7 @@ mod tests {
     #[ignore]
     #[test]
     fn test_startup_revalidation_includes_hosted_contracts() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
         manager.record_contract_access(contract, 1000, AccessType::Get);
         // Before #3546: during startup window, this would be in renewal list
@@ -1903,7 +1927,7 @@ mod tests {
     #[ignore]
     #[test]
     fn test_startup_revalidation_skips_already_subscribed() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
         manager.record_contract_access(contract, 1000, AccessType::Get);
         manager.subscribe(contract);
@@ -1918,7 +1942,7 @@ mod tests {
     #[ignore]
     #[test]
     fn test_startup_revalidation_window_expires() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
         manager.record_contract_access(contract, 1000, AccessType::Get);
         let needs_renewal = manager.contracts_needing_renewal();
@@ -1932,7 +1956,7 @@ mod tests {
     #[ignore]
     #[test]
     fn test_startup_revalidation_multiple_contracts() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract_a = make_contract_key(1);
         let contract_b = make_contract_key(2);
         let contract_c = make_contract_key(3);
@@ -1965,7 +1989,7 @@ mod tests {
     /// prevents subscription storms by processing at most 10 per cycle.
     #[test]
     fn test_hosted_contracts_not_renewed_at_scale() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
 
         // Simulate 200 relay-cached contracts loaded from disk
         for i in 0..200u8 {
@@ -2051,7 +2075,7 @@ mod tests {
     /// tracked (simulates "contract not found" early return in the Unsubscribe handler).
     #[test]
     fn test_should_unsubscribe_upstream_unknown_contract() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let unknown_contract = make_contract_key(99);
 
         // Contract never added to any tracking structure
@@ -2065,7 +2089,7 @@ mod tests {
 
     #[test]
     fn test_should_unsubscribe_upstream() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
         let peer = make_peer_key(10);
         let client_id = crate::client_events::ClientId::next();
@@ -2098,7 +2122,7 @@ mod tests {
     /// should propagate the unsubscribe to A.
     #[test]
     fn test_chain_propagation_single_downstream() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(10);
         let downstream_c = make_peer_key(30);
 
@@ -2120,7 +2144,7 @@ mod tests {
     /// B should NOT propagate upstream because A remains as a downstream subscriber.
     #[test]
     fn test_no_propagation_with_remaining_downstream() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(10);
         let downstream_a = make_peer_key(10);
         let downstream_c = make_peer_key(30);
@@ -2144,7 +2168,7 @@ mod tests {
     /// Node should NOT propagate upstream because a local WebSocket client is subscribed.
     #[test]
     fn test_no_propagation_with_local_client() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(10);
         let downstream_peer = make_peer_key(10);
         let client_id = crate::client_events::ClientId::next();
@@ -2169,7 +2193,7 @@ mod tests {
     /// is correct.
     #[test]
     fn test_client_disconnect_triggers_unsubscribe_decision() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(10);
         let client_id = crate::client_events::ClientId::next();
 
@@ -2200,7 +2224,7 @@ mod tests {
     /// no remaining interest should trigger the unsubscribe decision.
     #[test]
     fn test_client_disconnect_partial_unsubscribe() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract_a = make_contract_key(10);
         let contract_b = make_contract_key(20);
         let client_id = crate::client_events::ClientId::next();
@@ -2236,7 +2260,7 @@ mod tests {
     /// Uses manual timestamp manipulation via DashMap to simulate time passing.
     #[test]
     fn test_expire_downstream_triggers_unsubscribe_decision() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(10);
         let peer = make_peer_key(10);
 
@@ -2276,7 +2300,7 @@ mod tests {
     /// Should NOT trigger unsubscribe.
     #[test]
     fn test_partial_downstream_expiry_no_unsubscribe() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(10);
         let stale_peer = make_peer_key(10);
         let fresh_peer = make_peer_key(20);
@@ -2319,7 +2343,7 @@ mod tests {
     /// triggers upstream unsubscribe propagation.
     #[test]
     fn test_unsubscribe_handler_contract_found_peer_resolved() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let interest = make_interest_manager();
         let contract = make_contract_key(1);
         let peer = make_peer_key(10);
@@ -2338,7 +2362,7 @@ mod tests {
     /// Removing an unknown peer is a noop; existing entries remain intact.
     #[test]
     fn test_unsubscribe_handler_unknown_peer_is_noop() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(2);
         let known_peer = make_peer_key(20);
         let unknown_peer = make_peer_key(99);
@@ -2353,7 +2377,7 @@ mod tests {
     /// Removing from an untracked contract is a noop; other contracts unaffected.
     #[test]
     fn test_unsubscribe_handler_unknown_contract_is_noop() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let known_contract = make_contract_key(3);
         let unknown_contract = make_contract_key(99);
         let peer = make_peer_key(30);
@@ -2369,7 +2393,7 @@ mod tests {
     /// independent of `InterestManager` state.
     #[test]
     fn test_unsubscribe_dual_tracking_authority() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let interest = make_interest_manager();
         let contract = make_contract_key(4);
         let peer = make_peer_key(40);
@@ -2469,7 +2493,7 @@ mod tests {
 
     #[test]
     fn test_downstream_subscriber_limit_enforced() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(50);
 
         // Use a small limit for testing to avoid issues with peer key generation.
@@ -2525,7 +2549,7 @@ mod tests {
 
     #[test]
     fn test_downstream_subscriber_existing_peer_can_renew_at_limit() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(51);
 
         // Fill up to the limit
@@ -2557,7 +2581,7 @@ mod tests {
     /// count of expired peers so the interest manager can be decremented.
     #[test]
     fn test_expire_returns_expired_count_for_interest_sync() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let interest = make_interest_manager();
         let contract = make_contract_key(90);
         let peer_a = make_peer_key(90);
@@ -2606,7 +2630,7 @@ mod tests {
     /// renewal, but relay-cached contracts should NOT.
     #[test]
     fn test_local_client_access_enables_renewal() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let local_contract = make_contract_key(1);
         let relay_contract = make_contract_key(2);
 
@@ -2633,7 +2657,7 @@ mod tests {
     /// Regression test for #3763/#3765 (the subscription storm incident).
     #[test]
     fn test_relay_cached_contracts_not_renewed_at_scale() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
 
         // Simulate 200 relay-cached contracts (no local_client_access)
         for i in 0..200u8 {
@@ -2662,7 +2686,7 @@ mod tests {
     /// double-counted in the renewal list.
     #[test]
     fn test_local_client_access_with_active_subscription_no_duplicate() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         manager.record_contract_access(contract, 1000, AccessType::Get);
@@ -2681,7 +2705,7 @@ mod tests {
     /// Marking and querying unknown contracts should be no-ops (no panic).
     #[test]
     fn test_local_client_access_unknown_contract() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         assert!(!manager.has_local_client_access(&contract));
@@ -2693,7 +2717,7 @@ mod tests {
     /// persist even after the contract's access type changes.
     #[test]
     fn test_local_client_access_sticky_across_access_type_changes() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         manager.record_contract_access(contract, 1000, AccessType::Get);
@@ -2712,7 +2736,7 @@ mod tests {
     /// should appear in contracts_needing_renewal().
     #[test]
     fn test_local_client_access_survives_restart_via_load() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
 
         // Simulate loading from disk with local_client_access=true
         {
@@ -2750,7 +2774,7 @@ mod tests {
     #[test]
     fn test_eviction_clears_local_client_access() {
         // Small budget to force eviction
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         // Override with a tiny cache
         {
             let mut cache = manager.hosting_cache.write();

@@ -18,8 +18,10 @@ use tokio::time::Instant;
 
 use crate::util::time_source::TimeSource;
 
-/// Default hosting cache budget: 100MB
-pub const DEFAULT_HOSTING_BUDGET_BYTES: u64 = 100 * 1024 * 1024;
+/// Default hosting storage budget (1 GiB). The operator-facing default lives in
+/// `config.rs` as `DEFAULT_MAX_HOSTING_STORAGE`; keep the two consistent. This
+/// constant is the in-code default used by tests and as a fallback.
+pub const DEFAULT_HOSTING_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Multiplier for TTL relative to subscription renewal interval.
 /// Gives this many renewal attempts before eviction if renewals keep failing.

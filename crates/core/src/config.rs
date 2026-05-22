@@ -63,6 +63,11 @@ const DEFAULT_TRANSIENT_BUDGET: usize = 2048;
 const DEFAULT_TRANSIENT_TTL_SECS: u64 = 30;
 const DEFAULT_EVENT_LOOP_CHANNEL_CAPACITY: usize = 2048;
 
+/// Default operator-facing budget for hosted contract storage (1 GiB).
+/// Must stay consistent with `ring::hosting::cache::DEFAULT_HOSTING_BUDGET_BYTES`,
+/// which is the in-code fallback used by tests.
+const DEFAULT_MAX_HOSTING_STORAGE: u64 = 1024 * 1024 * 1024; // 1 GiB
+
 const QUALIFIER: &str = "";
 const ORGANIZATION: &str = "The Freenet Project Inc";
 const APPLICATION: &str = "Freenet";
@@ -102,6 +107,12 @@ pub struct ConfigArgs {
     /// Default: 2x CPU cores, clamped to 4-32.
     #[arg(long, env = "MAX_BLOCKING_THREADS")]
     pub max_blocking_threads: Option<usize>,
+
+    /// Maximum disk space in bytes for hosted contract storage. Once exceeded,
+    /// contracts are evicted oldest-first (LRU) and their on-disk state
+    /// reclaimed. Default: 1 GiB.
+    #[arg(long, env = "MAX_HOSTING_STORAGE")]
+    pub max_hosting_storage: Option<u64>,
 
     #[command(flatten)]
     pub telemetry: TelemetryArgs,
@@ -150,6 +161,7 @@ impl Default for ConfigArgs {
             id: None,
             version: false,
             max_blocking_threads: None,
+            max_hosting_storage: None,
             telemetry: Default::default(),
         }
     }
@@ -354,6 +366,8 @@ impl ConfigArgs {
                 self.network_api.bbr_startup_rate = cfg.network_api.bbr_startup_rate;
             }
             self.log_level.get_or_insert(cfg.log_level);
+            self.max_hosting_storage
+                .get_or_insert(cfg.max_hosting_storage);
             self.config_paths.merge(cfg.config_paths.as_ref().clone());
             // Merge telemetry config - CLI args override file config
             // Note: enabled defaults to true via clap, so we only override
@@ -695,6 +709,9 @@ impl ConfigArgs {
             max_blocking_threads: self
                 .max_blocking_threads
                 .unwrap_or_else(default_max_blocking_threads),
+            max_hosting_storage: self
+                .max_hosting_storage
+                .unwrap_or(DEFAULT_MAX_HOSTING_STORAGE),
             telemetry: TelemetryConfig {
                 enabled: self.telemetry.enabled,
                 endpoint: self
@@ -801,6 +818,14 @@ pub struct Config {
     /// Maximum number of threads for blocking operations (WASM execution, etc.).
     #[serde(default = "default_max_blocking_threads")]
     pub max_blocking_threads: usize,
+    /// Maximum disk space in bytes for hosted contract storage. Once exceeded,
+    /// contracts are evicted oldest-first (LRU) and their on-disk state
+    /// reclaimed.
+    #[serde(
+        default = "default_max_hosting_storage",
+        rename = "max-hosting-storage"
+    )]
+    pub max_hosting_storage: u64,
     /// Telemetry configuration
     #[serde(flatten)]
     pub telemetry: TelemetryConfig,
@@ -811,6 +836,11 @@ fn default_max_blocking_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| (n.get() * 2).clamp(4, 32))
         .unwrap_or(8)
+}
+
+/// Default operator-facing budget for hosted contract storage (1 GiB).
+fn default_max_hosting_storage() -> u64 {
+    DEFAULT_MAX_HOSTING_STORAGE
 }
 
 impl Config {
@@ -2702,6 +2732,50 @@ mod tests {
         let cfg = args.build().await.unwrap();
         let serialized = toml::to_string(&cfg).unwrap();
         let _: Config = toml::from_str(&serialized).unwrap();
+    }
+
+    #[tokio::test]
+    async fn max_hosting_storage_defaults_to_one_gib() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            ..Default::default()
+        };
+        let cfg = args.build().await.unwrap();
+        assert_eq!(
+            cfg.max_hosting_storage, DEFAULT_MAX_HOSTING_STORAGE,
+            "default max_hosting_storage should resolve to 1 GiB"
+        );
+        assert_eq!(DEFAULT_MAX_HOSTING_STORAGE, 1024 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn max_hosting_storage_explicit_value_round_trips() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let custom = 256 * 1024 * 1024_u64;
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            max_hosting_storage: Some(custom),
+            ..Default::default()
+        };
+        let cfg = args.build().await.unwrap();
+        assert_eq!(cfg.max_hosting_storage, custom);
+
+        // Round-trips through TOML serialization.
+        let serialized = toml::to_string(&cfg).unwrap();
+        assert!(serialized.contains("max-hosting-storage"));
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.max_hosting_storage, custom);
     }
 
     /// Build a minimal local-mode ConfigArgs with the given CIDR list and
