@@ -18,9 +18,15 @@ use tokio::time::Instant;
 
 use crate::util::time_source::TimeSource;
 
-/// Default hosting storage budget (1 GiB). The operator-facing default lives in
-/// `config.rs` as `DEFAULT_MAX_HOSTING_STORAGE`; keep the two consistent. This
-/// constant is the in-code default used by tests and as a fallback.
+/// Default hosting storage budget (1 GiB).
+///
+/// This is the single source of truth for the default budget: the operator-
+/// facing `config::default_max_hosting_storage()` resolves to it (re-exported
+/// via `ring::hosting::DEFAULT_HOSTING_BUDGET_BYTES`).
+///
+/// The budget tracks hosted contract **state** bytes only. WASM code blobs and
+/// ReDb/SQLite database overhead are additional and not counted against it, so
+/// this is not a hard bound on total on-disk usage.
 pub const DEFAULT_HOSTING_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// Multiplier for TTL relative to subscription renewal interval.
@@ -82,7 +88,9 @@ pub struct HostedContract {
 ///
 /// This cache maintains contracts that this peer is "hosting" - keeping available
 /// for the network. The cache has:
-/// - Byte budget: Large contracts consume more budget
+/// - Byte budget: Large contracts consume more budget. The budget is measured
+///   in tracked contract **state** bytes only; WASM code blobs and database
+///   overhead are not counted against it.
 /// - TTL protection: Contracts can't be evicted until min_ttl has passed
 /// - LRU ordering: Oldest contracts evicted first when over budget
 ///

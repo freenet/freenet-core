@@ -33,8 +33,12 @@ mod cache;
 
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 use crate::util::time_source::{InstantTimeSrc, TimeSource};
+/// Re-exported as the single source of truth for the default hosting storage
+/// budget. `config::default_max_hosting_storage()` resolves to this constant so
+/// the operator-facing default and the in-code fallback can never drift.
+pub(crate) use cache::DEFAULT_HOSTING_BUDGET_BYTES;
 pub use cache::{AccessType, RecordAccessResult};
-use cache::{DEFAULT_HOSTING_BUDGET_BYTES, DEFAULT_MIN_TTL, HostingCache};
+use cache::{DEFAULT_MIN_TTL, HostingCache};
 use dashmap::{DashMap, DashSet};
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;

@@ -63,11 +63,6 @@ const DEFAULT_TRANSIENT_BUDGET: usize = 2048;
 const DEFAULT_TRANSIENT_TTL_SECS: u64 = 30;
 const DEFAULT_EVENT_LOOP_CHANNEL_CAPACITY: usize = 2048;
 
-/// Default operator-facing budget for hosted contract storage (1 GiB).
-/// Must stay consistent with `ring::hosting::cache::DEFAULT_HOSTING_BUDGET_BYTES`,
-/// which is the in-code fallback used by tests.
-const DEFAULT_MAX_HOSTING_STORAGE: u64 = 1024 * 1024 * 1024; // 1 GiB
-
 const QUALIFIER: &str = "";
 const ORGANIZATION: &str = "The Freenet Project Inc";
 const APPLICATION: &str = "Freenet";
@@ -108,9 +103,11 @@ pub struct ConfigArgs {
     #[arg(long, env = "MAX_BLOCKING_THREADS")]
     pub max_blocking_threads: Option<usize>,
 
-    /// Maximum disk space in bytes for hosted contract storage. Once exceeded,
-    /// contracts are evicted oldest-first (LRU) and their on-disk state
-    /// reclaimed. Default: 1 GiB.
+    /// Budget in bytes for hosted contract *state*. Once exceeded, contracts
+    /// are evicted (least-valuable-first) and their on-disk state reclaimed.
+    /// This bounds tracked contract state only — WASM code blobs and ReDb/
+    /// SQLite database overhead are additional and not counted against it.
+    /// Default: 1 GiB.
     #[arg(long, env = "MAX_HOSTING_STORAGE")]
     pub max_hosting_storage: Option<u64>,
 
@@ -711,7 +708,7 @@ impl ConfigArgs {
                 .unwrap_or_else(default_max_blocking_threads),
             max_hosting_storage: self
                 .max_hosting_storage
-                .unwrap_or(DEFAULT_MAX_HOSTING_STORAGE),
+                .unwrap_or(crate::ring::DEFAULT_HOSTING_BUDGET_BYTES),
             telemetry: TelemetryConfig {
                 enabled: self.telemetry.enabled,
                 endpoint: self
@@ -818,9 +815,10 @@ pub struct Config {
     /// Maximum number of threads for blocking operations (WASM execution, etc.).
     #[serde(default = "default_max_blocking_threads")]
     pub max_blocking_threads: usize,
-    /// Maximum disk space in bytes for hosted contract storage. Once exceeded,
-    /// contracts are evicted oldest-first (LRU) and their on-disk state
-    /// reclaimed.
+    /// Budget in bytes for hosted contract *state*. Once exceeded, contracts
+    /// are evicted (least-valuable-first) and their on-disk state reclaimed.
+    /// This bounds tracked contract state only — WASM code blobs and ReDb/
+    /// SQLite database overhead are additional and not counted against it.
     #[serde(
         default = "default_max_hosting_storage",
         rename = "max-hosting-storage"
@@ -838,9 +836,14 @@ fn default_max_blocking_threads() -> usize {
         .unwrap_or(8)
 }
 
-/// Default operator-facing budget for hosted contract storage (1 GiB).
+/// Default operator-facing budget for hosted contract state (1 GiB).
+///
+/// Resolves to [`crate::ring::DEFAULT_HOSTING_BUDGET_BYTES`], which is
+/// the single source of truth for this value — the in-code fallback used by the
+/// hosting cache and its tests. This indirection keeps the operator-facing
+/// default and the in-code default from ever drifting apart.
 fn default_max_hosting_storage() -> u64 {
-    DEFAULT_MAX_HOSTING_STORAGE
+    crate::ring::DEFAULT_HOSTING_BUDGET_BYTES
 }
 
 impl Config {
@@ -2748,10 +2751,16 @@ mod tests {
         };
         let cfg = args.build().await.unwrap();
         assert_eq!(
-            cfg.max_hosting_storage, DEFAULT_MAX_HOSTING_STORAGE,
-            "default max_hosting_storage should resolve to 1 GiB"
+            cfg.max_hosting_storage,
+            crate::ring::DEFAULT_HOSTING_BUDGET_BYTES,
+            "default max_hosting_storage should resolve to the hosting cache's \
+             single-source-of-truth default budget"
         );
-        assert_eq!(DEFAULT_MAX_HOSTING_STORAGE, 1024 * 1024 * 1024);
+        assert_eq!(
+            crate::ring::DEFAULT_HOSTING_BUDGET_BYTES,
+            1024 * 1024 * 1024,
+            "default hosting budget should be 1 GiB"
+        );
     }
 
     #[tokio::test]

@@ -48,6 +48,10 @@ pub(crate) use connection_manager::ConnectionManager;
 mod connection;
 mod hosting;
 pub use hosting::{AccessType, RecordAccessResult};
+/// Single source of truth for the default hosted-contract-state budget.
+/// `config::default_max_hosting_storage()` resolves to this so the
+/// operator-facing default and the in-code fallback can never drift.
+pub(crate) use hosting::DEFAULT_HOSTING_BUDGET_BYTES;
 pub mod interest;
 mod live_tx;
 mod location;
@@ -1185,6 +1189,16 @@ impl Ring {
             // `reclaim_evicted_contract` re-checks the subscription gate per
             // key before emitting the eviction event.
             let op_manager = ring.upgrade_op_manager();
+            if op_manager.is_none() {
+                // The weak back-reference is dropped only during node shutdown;
+                // surface the skipped reclamation so an unexpected `None` (and
+                // the resulting on-disk leak for this cycle) is observable.
+                tracing::debug!(
+                    expired_count = expired.len(),
+                    "OpManager unavailable during GET subscription sweep — \
+                     on-disk reclamation skipped for the expired contracts this cycle"
+                );
+            }
 
             // Clean up local subscription state for each expired contract.
             // Note: contracts with client subscriptions are protected from eviction
