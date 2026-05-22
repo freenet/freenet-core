@@ -49,14 +49,28 @@ check() {
     fi
 }
 
+# ── LOG_FILE default ─────────────────────────────────────────────────
+
+# The #4208 logging fix: with nothing in the environment, LOG_FILE must
+# default to empty — the old default was an unwritable /var/log path.
+# The default-assignment line is extracted and eval'd verbatim, so
+# reverting it to a /var/log path fails this assertion.
+unset LOG_FILE
+eval "$(grep -E '^LOG_FILE=' "$ANNOUNCE_SH")"
+check "LOG_FILE defaults to empty when unset" "$LOG_FILE" ""
+
 # ── log() ────────────────────────────────────────────────────────────
 
-# Empty LOG_FILE (the new default): nothing is written to disk, and the
-# call still succeeds.
+# Empty LOG_FILE: log() must skip the file write entirely. The pre-fix
+# code wrote unconditionally; with no file configured that write fails
+# and bash prints a redirection diagnostic — the exact "Permission
+# denied" spam issue #4208 reports. Assert log()'s stderr carries only
+# the intended message line, no such diagnostic. (Removing the
+# `[[ -n "$LOG_FILE" ]]` guard makes this assertion fail.)
 LOG_FILE=""
-log "hello" 2>/dev/null
-check "log() with empty LOG_FILE writes no file" \
-    "$(find "$TMP" -type f | wc -l)" "0"
+log_stderr=$(log "hello" 2>&1)
+check "log() with empty LOG_FILE emits no redirection error" \
+    "$(printf '%s\n' "$log_stderr" | grep -cE 'No such file|Permission denied|ambiguous redirect' || true)" "0"
 
 # LOG_FILE set: each call is appended.
 LOG_FILE="$TMP/river.log"
