@@ -434,6 +434,19 @@ pub(crate) trait ContractExecutor: Send + 'static {
     /// Default implementation is a no-op (for mock executors that don't track subscriptions).
     fn remove_client(&self, _client_id: ClientId) {}
 
+    /// Reclaim a contract's on-disk storage (persisted state + parameters and
+    /// the WASM code blob) after the contract was evicted from the hosting
+    /// cache. Best-effort and idempotent: a double eviction is a no-op.
+    ///
+    /// Default implementation is a no-op (for mock executors that keep state
+    /// in memory and have no on-disk storage to reclaim).
+    fn remove_contract(
+        &mut self,
+        _key: &ContractKey,
+    ) -> impl Future<Output = Result<(), ExecutorError>> + Send {
+        async { Ok(()) }
+    }
+
     /// Compute the state summary for a contract using the contract's summarize_state method.
     fn summarize_contract_state(
         &mut self,

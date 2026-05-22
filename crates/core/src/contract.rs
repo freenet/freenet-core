@@ -776,7 +776,8 @@ async fn send_queue_full_response(
         | ContractHandlerEvent::QuerySubscriptionsResponse
         | ContractHandlerEvent::GetSummaryResponse { .. }
         | ContractHandlerEvent::GetDeltaResponse { .. }
-        | ContractHandlerEvent::ClientDisconnect { .. } => {
+        | ContractHandlerEvent::ClientDisconnect { .. }
+        | ContractHandlerEvent::EvictContract { .. } => {
             channel.drop_waiting_response(rejected.id);
             return;
         }
@@ -1409,6 +1410,26 @@ where
         }
         ContractHandlerEvent::ClientDisconnect { client_id } => {
             contract_handler.executor().remove_client(client_id);
+            contract_handler.channel().drop_waiting_response(id);
+        }
+        ContractHandlerEvent::EvictContract { key } => {
+            // Reclaim the contract's on-disk storage after it was evicted
+            // from the hosting cache. Routed here (not inline-fast-pathed in
+            // the drain loop) so it goes through the fair queue and is
+            // serialized per-contract with any other in-flight ops on the
+            // same key. Fire-and-forget: no response is sent.
+            match contract_handler.executor().remove_contract(&key).await {
+                Ok(()) => {
+                    tracing::info!(contract = %key, "Reclaimed on-disk storage for evicted contract");
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        contract = %key,
+                        error = %error,
+                        "Failed to reclaim on-disk storage for evicted contract"
+                    );
+                }
+            }
             contract_handler.channel().drop_waiting_response(id);
         }
         ContractHandlerEvent::DelegateResponse(_)

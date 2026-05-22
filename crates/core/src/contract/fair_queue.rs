@@ -216,7 +216,11 @@ fn extract_contract_id(event: &ContractHandlerEvent) -> Option<ContractInstanceI
         ContractHandlerEvent::PutQuery { key, .. }
         | ContractHandlerEvent::UpdateQuery { key, .. }
         | ContractHandlerEvent::GetSummaryQuery { key, .. }
-        | ContractHandlerEvent::GetDeltaQuery { key, .. } => Some(*key.id()),
+        | ContractHandlerEvent::GetDeltaQuery { key, .. }
+        // EvictContract is routed to its contract's per-key queue so disk
+        // reclamation is serialized with any other in-flight ops on that
+        // key (e.g. a concurrent GET/PUT touching the same contract).
+        | ContractHandlerEvent::EvictContract { key, .. } => Some(*key.id()),
         ContractHandlerEvent::GetQuery { instance_id, .. }
         | ContractHandlerEvent::RegisterSubscriberListener {
             key: instance_id, ..
@@ -739,6 +743,12 @@ mod tests {
                     summary: None,
                     subscriber_listener: mpsc::channel(64).0,
                 },
+            ),
+            // EvictContract must route to the contract's per-key queue so
+            // disk reclamation is serialized with other ops on that key.
+            (
+                "EvictContract",
+                ContractHandlerEvent::EvictContract { key },
             ),
         ];
 

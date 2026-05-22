@@ -685,6 +685,11 @@ pub(crate) enum ContractHandlerEvent {
     ClientDisconnect {
         client_id: ClientId,
     },
+    /// Reclaim a contract's on-disk storage (state + WASM code) after it was
+    /// evicted from the hosting cache. Fire-and-forget: no response is sent.
+    EvictContract {
+        key: ContractKey,
+    },
 }
 
 impl std::fmt::Display for ContractHandlerEvent {
@@ -795,6 +800,9 @@ impl std::fmt::Display for ContractHandlerEvent {
             },
             ContractHandlerEvent::ClientDisconnect { client_id } => {
                 write!(f, "client disconnect {{ {client_id} }}")
+            }
+            ContractHandlerEvent::EvictContract { key } => {
+                write!(f, "evict contract {{ {key} }}")
             }
         }
     }

@@ -557,6 +557,15 @@ impl OpManager {
             .await
     }
 
+    /// Fire-and-forget notification to the contract handler. Used for
+    /// maintenance events (e.g. EvictContract) where no response is needed
+    /// and the caller must not block.
+    pub fn notify_contract_handler_fire_and_forget(&self, ev: ContractHandlerEvent) {
+        if let Err(e) = self.ch_outbound.send_to_handler_fire_and_forget(ev) {
+            tracing::warn!(error = %e, "failed to send fire-and-forget event to contract handler");
+        }
+    }
+
     /// Peek at the next hop address for an outbound initial request.
     ///
     /// Always returns `None` — every op now runs on a driver

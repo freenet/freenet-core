@@ -511,6 +511,20 @@ impl ContractExecutor for RuntimePool {
         result
     }
 
+    async fn remove_contract(&mut self, key: &ContractKey) -> Result<(), ExecutorError> {
+        // Mirror the pop-an-executor pattern from `fetch_contract`: the
+        // checked-out executor owns the `ContractStore` whose on-disk `.wasm`
+        // blob must be removed, while the `StateStore` is shared across the
+        // pool. Delegating to `Executor::reclaim_contract_storage` keeps the
+        // best-effort, idempotent reclaim logic in one place.
+        self.track_contract_checkout(key);
+        let mut executor = self.pop_executor().await;
+        let result = executor.reclaim_contract_storage(key).await;
+        self.return_checked(executor, "remove_contract").await;
+        self.track_contract_return(key);
+        result
+    }
+
     async fn upsert_contract_state(
         &mut self,
         key: ContractKey,
@@ -2570,6 +2584,10 @@ impl ContractExecutor for Executor<Runtime> {
         self.bridged_get_contract_state_delta(key, their_summary)
             .await
     }
+
+    async fn remove_contract(&mut self, key: &ContractKey) -> Result<(), ExecutorError> {
+        self.reclaim_contract_storage(key).await
+    }
 }
 
 impl Executor<Runtime> {
@@ -3344,6 +3362,63 @@ impl Executor<Runtime> {
 
         Ok(())
     }
+
+    /// Reclaim a contract's on-disk storage after it was evicted from the
+    /// hosting cache.
+    ///
+    /// Deletes (1) the persisted state and parameters from the `StateStore`
+    /// and (2) the WASM code blob from the `ContractStore`. The contract-store
+    /// removal is code-hash refcount-safe: the shared `.wasm` blob is only
+    /// deleted once no other contract instance references the same code.
+    ///
+    /// Both steps are best-effort and independent: if one fails, the other is
+    /// still attempted so a partial reclaim is achieved rather than none. The
+    /// method is idempotent — both `StateStore::delete` and
+    /// `ContractStore::remove_contract` tolerate already-missing entries — so a
+    /// double eviction is harmless. Returns `Ok(())` whenever either step
+    /// succeeds (or both were already clean); only a failure of *both* steps is
+    /// surfaced as an error, since this is fire-and-forget maintenance.
+    ///
+    /// This is the inherent implementation; the `ContractExecutor::remove_contract`
+    /// trait method delegates to it.
+    async fn reclaim_contract_storage(&mut self, key: &ContractKey) -> Result<(), ExecutorError> {
+        let state_deleted = match self.state_store.delete(key).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    contract = %key,
+                    error = %e,
+                    "failed to delete persisted state while reclaiming evicted contract"
+                );
+                false
+            }
+        };
+        let code_deleted = match self.runtime.contract_store.remove_contract(key) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    contract = %key,
+                    error = %e,
+                    "failed to delete WASM code while reclaiming evicted contract"
+                );
+                false
+            }
+        };
+
+        if !state_deleted && !code_deleted {
+            return Err(ExecutorError::other(anyhow::anyhow!(
+                "failed to reclaim any on-disk storage for contract {key}"
+            )));
+        }
+
+        tracing::info!(
+            contract = %key,
+            state_deleted,
+            code_deleted,
+            "reclaimed on-disk storage for evicted contract"
+        );
+        Ok(())
+    }
 }
 
 impl Executor<Runtime> {
@@ -3925,5 +4000,180 @@ mod executor_pin_tests {
             "UPDATE-side inline related fetch must call \
              futures::future::join_all (#4077)"
         );
+    }
+}
+
+#[cfg(test)]
+mod remove_contract_tests {
+    //! Tests for `Executor::reclaim_contract_storage` — the disk-reclamation
+    //! path wired to hosting-cache eviction. The core proof here is that
+    //! evicting a contract actually frees its on-disk state and WASM code,
+    //! so the hosting budget is a real disk bound.
+
+    use std::sync::Arc;
+
+    use freenet_stdlib::prelude::{
+        ContractCode, ContractContainer, ContractKey, ContractWasmAPIVersion, Parameters,
+        WrappedContract, WrappedState,
+    };
+
+    use crate::contract::executor::Executor;
+    use crate::contract::storages::Storage;
+    use crate::wasm_runtime::{
+        ContractStore, DelegateStore, Runtime, SecretsStore, StateStore, StateStoreError,
+    };
+
+    /// Build a disk-backed `Executor<Runtime>` and return it alongside the
+    /// `contracts_dir` (so the test can probe the `.wasm` file directly) and
+    /// the `TempDir` (kept alive for the test's duration).
+    async fn build_disk_executor(
+        seed: &str,
+    ) -> (Executor<Runtime>, std::path::PathBuf, tempfile::TempDir) {
+        let temp_dir = crate::util::tests::get_temp_dir();
+        let db = Storage::new(temp_dir.path())
+            .await
+            .expect("create storage db");
+        let contracts_dir = temp_dir.path().join(format!("contracts-{seed}"));
+        let contract_store = ContractStore::new(contracts_dir.clone(), 10_000, db.clone())
+            .expect("create contract store");
+        let delegate_store =
+            DelegateStore::new(temp_dir.path().join("delegate"), 10_000, db.clone())
+                .expect("create delegate store");
+        let secrets_store = SecretsStore::new(
+            temp_dir.path().join("secrets"),
+            Default::default(),
+            db.clone(),
+        )
+        .expect("create secrets store");
+        let state_store = StateStore::new(db, 10_000_000).expect("create state store");
+        let runtime = Runtime::build(contract_store, delegate_store, secrets_store, false)
+            .expect("build runtime");
+        let executor = Executor::new(
+            state_store,
+            || Ok(()),
+            crate::contract::executor::OperationMode::Local,
+            runtime,
+            None,
+        )
+        .await
+        .expect("create executor");
+        (executor, contracts_dir, temp_dir)
+    }
+
+    /// Construct a synthetic contract container. The bytes are never executed
+    /// (`reclaim_contract_storage` only deletes files / DB rows), so a fake
+    /// blob is sufficient and far faster than compiling real WASM.
+    fn make_contract(code_seed: u8, param_seed: u8) -> (ContractContainer, ContractKey) {
+        let code = ContractCode::from(vec![code_seed; 64]);
+        let params = Parameters::from(vec![param_seed; 8]);
+        let key = ContractKey::from_params_and_code(&params, &code);
+        let wrapped = WrappedContract::new(Arc::new(code), params);
+        let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(wrapped));
+        (container, key)
+    }
+
+    fn wasm_path(contracts_dir: &std::path::Path, key: &ContractKey) -> std::path::PathBuf {
+        contracts_dir
+            .join(key.code_hash().encode())
+            .with_extension("wasm")
+    }
+
+    /// Core regression test: storing a contract makes its state retrievable
+    /// and its `.wasm` blob present on disk; `remove_contract` reclaims both.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remove_contract_reclaims_state_and_wasm_from_disk() {
+        let (mut executor, contracts_dir, _temp) = build_disk_executor("reclaim").await;
+        let (container, key) = make_contract(0x11, 0x22);
+        let params = container.params();
+        let state = WrappedState::new(b"hosted state payload".to_vec());
+
+        // Store the WASM blob and the persisted state.
+        executor
+            .runtime
+            .contract_store
+            .store_contract(container)
+            .expect("store contract code");
+        executor
+            .state_store
+            .store(key, state.clone(), params)
+            .await
+            .expect("store contract state");
+
+        // Pre-conditions: state retrievable and the .wasm file exists.
+        let fetched = executor
+            .state_store
+            .get(&key)
+            .await
+            .expect("state retrievable before eviction");
+        assert_eq!(fetched, state, "stored state must round-trip");
+        let blob = wasm_path(&contracts_dir, &key);
+        assert!(
+            blob.exists(),
+            "WASM blob must exist on disk before eviction: {blob:?}"
+        );
+
+        // Evict.
+        executor
+            .reclaim_contract_storage(&key)
+            .await
+            .expect("reclaim must succeed");
+
+        // Post-conditions: state gone, .wasm gone.
+        match executor.state_store.get(&key).await {
+            Err(StateStoreError::MissingContract(missing)) => assert_eq!(missing, key),
+            other => panic!("expected MissingContract after eviction, got {other:?}"),
+        }
+        assert!(
+            !blob.exists(),
+            "WASM blob must be deleted from disk after eviction: {blob:?}"
+        );
+    }
+
+    /// Double eviction is idempotent: a second `remove_contract` on an
+    /// already-reclaimed contract is a harmless no-op, not an error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remove_contract_is_idempotent_on_double_eviction() {
+        let (mut executor, contracts_dir, _temp) = build_disk_executor("idempotent").await;
+        let (container, key) = make_contract(0x33, 0x44);
+        let params = container.params();
+        let state = WrappedState::new(b"payload".to_vec());
+
+        executor
+            .runtime
+            .contract_store
+            .store_contract(container)
+            .expect("store contract code");
+        executor
+            .state_store
+            .store(key, state, params)
+            .await
+            .expect("store contract state");
+
+        executor
+            .reclaim_contract_storage(&key)
+            .await
+            .expect("first reclaim must succeed");
+        // Second reclaim: state and .wasm are already gone — must still be Ok.
+        executor
+            .reclaim_contract_storage(&key)
+            .await
+            .expect("second reclaim must be a no-op, not an error");
+        assert!(
+            !wasm_path(&contracts_dir, &key).exists(),
+            "WASM blob must remain absent after double eviction"
+        );
+    }
+
+    /// Reclaiming a never-stored contract is also a harmless no-op: both the
+    /// state-store delete and the contract-store removal tolerate a fully
+    /// absent contract.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remove_contract_unknown_contract_is_noop() {
+        let (mut executor, _contracts_dir, _temp) = build_disk_executor("unknown").await;
+        let (_container, key) = make_contract(0x55, 0x66);
+        executor
+            .reclaim_contract_storage(&key)
+            .await
+            .expect("reclaiming an unknown contract must be Ok");
     }
 }
