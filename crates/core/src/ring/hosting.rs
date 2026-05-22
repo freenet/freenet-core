@@ -195,6 +195,24 @@ pub(crate) struct HostingManager {
     storage: RwLock<Option<crate::contract::storages::Storage>>,
     #[cfg(all(feature = "sqlite", not(feature = "redb")))]
     storage: RwLock<Option<crate::contract::storages::Storage>>,
+
+    /// Monotonic per-contract state-write generation counter.
+    ///
+    /// Bumped at every persistent state write in the executor
+    /// (`state_store.store` / `state_store.update`). Captured atomically
+    /// when an `EvictContract` is enqueued (`HostedContract.write_generation`,
+    /// recorded under the hosting-cache write lock) and re-checked at
+    /// deletion time in `RuntimePool::remove_contract`. If the captured
+    /// generation no longer matches the current value, a state write
+    /// occurred between eviction and deletion (e.g. a PUT/UPDATE
+    /// re-hosted the contract) and the disk reclamation must be skipped
+    /// — the freshly-PUT state would otherwise be deleted.
+    ///
+    /// See `RuntimePool::remove_contract` and `EvictContract` for the
+    /// race this token closes (the driver-side `host_contract` re-mark
+    /// of a freshly-PUT contract runs after `PutQuery.await` returns,
+    /// so the existing `is_hosting_contract` check is not sufficient).
+    state_generation: DashMap<ContractKey, u64>,
 }
 
 impl HostingManager {
@@ -217,7 +235,46 @@ impl HostingManager {
                 MAX_SUBSCRIPTION_BACKOFF_ENTRIES,
             )),
             storage: RwLock::new(None),
+            state_generation: DashMap::new(),
         }
+    }
+
+    // =========================================================================
+    // State-Write Generation Token
+    // =========================================================================
+
+    /// Atomically increment the state-write generation for `key` and return
+    /// the new value. Called by the executor after every successful state
+    /// write (`state_store.store` / `state_store.update`) — see the chokepoint
+    /// comment in `Executor::commit_state_update` and the per-call-site
+    /// callouts in `contract/executor/runtime.rs`.
+    pub(crate) fn bump_state_generation(&self, key: &ContractKey) -> u64 {
+        use dashmap::mapref::entry::Entry;
+        match self.state_generation.entry(*key) {
+            Entry::Occupied(mut e) => {
+                let next = e.get().saturating_add(1);
+                *e.get_mut() = next;
+                next
+            }
+            Entry::Vacant(e) => {
+                e.insert(1);
+                1
+            }
+        }
+    }
+
+    /// Read the current state-write generation for `key` (0 if never written).
+    pub(crate) fn state_generation(&self, key: &ContractKey) -> u64 {
+        self.state_generation
+            .get(key)
+            .map(|v| *v.value())
+            .unwrap_or(0)
+    }
+
+    /// Remove the generation entry for `key`. Called after a successful disk
+    /// reclamation so the map does not grow unbounded.
+    pub(crate) fn forget_state_generation(&self, key: &ContractKey) {
+        self.state_generation.remove(key);
     }
 
     /// Set the storage reference for persisting hosting metadata.
@@ -649,7 +706,9 @@ impl HostingManager {
     ///
     /// Returns a `RecordAccessResult` containing:
     /// - `is_new`: Whether this contract was newly added (vs. refreshed existing)
-    /// - `evicted`: Contracts that were evicted to make room
+    /// - `evicted`: `(ContractKey, write_generation)` pairs for contracts
+    ///   evicted to make room — the generation snapshot is carried through
+    ///   `EvictContract` and re-checked at deletion time.
     ///
     /// Automatically persists hosting metadata for the accessed contract and
     /// removes persisted metadata for evicted contracts.
@@ -664,10 +723,20 @@ impl HostingManager {
         // `hosting_cache` — so calling it from inside the `hosting_cache`
         // write guard does not re-enter that lock. `sweep_expired_hosting`
         // uses this same pattern.
+        //
+        // Read the current state-write generation BEFORE taking the
+        // hosting-cache write lock to avoid nested lock order against the
+        // `state_generation` DashMap shards. The generation is monotonic so
+        // a value read here is a valid lower bound; if a write races and
+        // bumps it after this read, the cached entry will simply be
+        // refreshed by the subsequent `record_contract_access` from that
+        // write path.
+        let current_generation = self.state_generation(&key);
         let result = self.hosting_cache.write().record_access(
             key,
             size_bytes,
             access_type,
+            current_generation,
             |k: &ContractKey| self.contract_in_use(k),
         );
 
@@ -713,7 +782,7 @@ impl HostingManager {
             }
 
             // Clean up persisted metadata for evicted contracts
-            for evicted_key in &result.evicted {
+            for (evicted_key, _generation) in &result.evicted {
                 #[cfg(feature = "redb")]
                 {
                     if let Err(e) = storage.remove_hosting_metadata(evicted_key) {
@@ -857,7 +926,12 @@ impl HostingManager {
     /// removed by `expire_stale_downstream_subscribers()` (called periodically)
     /// after `SUBSCRIPTION_LEASE_DURATION` without renewal.
     /// Automatically removes persisted metadata for expired contracts.
-    pub fn sweep_expired_hosting(&self) -> Vec<ContractKey> {
+    ///
+    /// Returns `(ContractKey, write_generation)` pairs — the generation
+    /// captured atomically under the hosting-cache write lock travels with
+    /// the `EvictContract` event so the deletion-time guard can detect a
+    /// re-host race.
+    pub fn sweep_expired_hosting(&self) -> Vec<(ContractKey, u64)> {
         let expired = self
             .hosting_cache
             .write()
@@ -866,7 +940,7 @@ impl HostingManager {
         // Clean up persisted metadata for expired contracts
         if !expired.is_empty() {
             if let Some(storage) = self.storage.read().as_ref() {
-                for expired_key in &expired {
+                for (expired_key, _generation) in &expired {
                     #[cfg(feature = "redb")]
                     {
                         if let Err(e) = storage.remove_hosting_metadata(expired_key) {
@@ -2500,6 +2574,103 @@ mod tests {
         );
     }
 
+    /// Generation flow through `HostingManager`: bumping the state
+    /// generation BEFORE `record_contract_access` makes the captured
+    /// generation match; subsequently bumping the generation simulates
+    /// a write that raced ahead of an `EvictContract`, and the captured
+    /// snapshot on the evicted entry is now stale (less than current).
+    ///
+    /// This is the load-bearing flow the `RuntimePool::remove_contract`
+    /// generation-mismatch guard relies on. PR #4212 review round C.
+    #[test]
+    fn test_record_contract_access_captures_then_diverges_from_current_generation() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        // Tiny cache, zero TTL: any insert past the first immediately
+        // evicts the previous entry.
+        {
+            let mut cache = manager.hosting_cache.write();
+            *cache = cache::HostingCache::new(
+                100,
+                std::time::Duration::ZERO,
+                crate::util::time_source::InstantTimeSrc::new(),
+            );
+        }
+
+        let key = make_contract_key(1);
+        let trigger = make_contract_key(2);
+
+        // Simulate three state writes before the hosting record.
+        assert_eq!(manager.bump_state_generation(&key), 1);
+        assert_eq!(manager.bump_state_generation(&key), 2);
+        assert_eq!(manager.bump_state_generation(&key), 3);
+        assert_eq!(manager.state_generation(&key), 3);
+
+        // Recording the access captures the current generation (3).
+        manager.record_contract_access(key, 100, AccessType::Get);
+
+        // Simulate a state write that races ahead of `EvictContract`.
+        let new_generation = manager.bump_state_generation(&key);
+        assert_eq!(new_generation, 4);
+
+        // Now evict the entry by inserting `trigger`; the captured
+        // generation on the evicted tuple must be the snapshot taken at
+        // `record_contract_access` time (3), NOT the current value (4).
+        // `RuntimePool::remove_contract` will compare this captured
+        // value (3) against the current `state_generation` (4) and
+        // SKIP the on-disk reclamation, closing the re-host race.
+        let result = manager.record_contract_access(trigger, 100, AccessType::Get);
+        assert_eq!(
+            result.evicted,
+            vec![(key, 3)],
+            "evicted tuple must carry the generation captured atomically \
+             when the entry was inserted, NOT the current generation"
+        );
+        assert_eq!(
+            manager.state_generation(&key),
+            4,
+            "current generation must reflect the most recent write"
+        );
+        assert_ne!(
+            result.evicted[0].1,
+            manager.state_generation(&key),
+            "the mismatch between captured and current is exactly what \
+             `RuntimePool::remove_contract` keys off to skip reclamation"
+        );
+    }
+
+    /// `bump_state_generation` is monotonic and starts at 1 on first
+    /// bump (`state_generation` returns 0 for never-seen contracts).
+    /// `forget_state_generation` returns the entry to the absent state
+    /// so the next bump restarts at 1.
+    #[test]
+    fn test_state_generation_lifecycle() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let key = make_contract_key(42);
+
+        assert_eq!(
+            manager.state_generation(&key),
+            0,
+            "never-seen contract reads as generation 0"
+        );
+
+        assert_eq!(manager.bump_state_generation(&key), 1);
+        assert_eq!(manager.bump_state_generation(&key), 2);
+        assert_eq!(manager.bump_state_generation(&key), 3);
+        assert_eq!(manager.state_generation(&key), 3);
+
+        manager.forget_state_generation(&key);
+        assert_eq!(
+            manager.state_generation(&key),
+            0,
+            "after forget, generation reads as 0 again"
+        );
+        assert_eq!(
+            manager.bump_state_generation(&key),
+            1,
+            "after forget, next bump restarts at 1"
+        );
+    }
+
     /// `record_contract_access` must not evict an in-use (subscribed)
     /// contract when the cache is over budget; once the subscription is
     /// removed the contract becomes evictable.
@@ -2534,7 +2705,7 @@ mod tests {
         let result = manager.record_contract_access(trigger, 100, AccessType::Get);
         assert_eq!(
             result.evicted,
-            vec![filler],
+            vec![(filler, 0)],
             "in-use subscribed contract must be skipped; the unprotected \
              contract must be evicted instead"
         );
@@ -2547,7 +2718,7 @@ mod tests {
 
         let result = manager.record_contract_access(filler, 100, AccessType::Get);
         assert!(
-            result.evicted.contains(&in_use),
+            result.evicted.iter().any(|(k, _)| *k == in_use),
             "once the subscription is removed the contract must become \
              evictable when the cache is over budget"
         );
@@ -2608,8 +2779,8 @@ mod tests {
         let protected = make_contract_key(1);
         let unprotected = make_contract_key(2);
 
-        cache.record_access(protected, 100, AccessType::Get, |_| false);
-        cache.record_access(unprotected, 100, AccessType::Get, |_| false);
+        cache.record_access(protected, 100, AccessType::Get, 0, |_| false);
+        cache.record_access(unprotected, 100, AccessType::Get, 0, |_| false);
         assert_eq!(cache.current_bytes(), 200); // over budget
 
         // Advance past TTL
@@ -2620,11 +2791,11 @@ mod tests {
         let evicted = cache.sweep_expired(|k| *k == protected);
 
         assert!(
-            !evicted.contains(&protected),
+            !evicted.iter().any(|(k, _)| *k == protected),
             "Contract with downstream subscribers must not be evicted"
         );
         assert!(
-            evicted.contains(&unprotected),
+            evicted.iter().any(|(k, _)| *k == unprotected),
             "Unprotected contract should be evicted when over budget + past TTL"
         );
         assert!(cache.contains(&protected));
@@ -2645,7 +2816,7 @@ mod tests {
         let mut cache = HostingCache::new(80, min_ttl, time.clone());
 
         let contract = make_contract_key(100);
-        cache.record_access(contract, 100, AccessType::Get, |_| false);
+        cache.record_access(contract, 100, AccessType::Get, 0, |_| false);
         assert!(cache.contains(&contract));
 
         // Under TTL: should not be evicted even though over budget
@@ -2661,7 +2832,7 @@ mod tests {
         // Now should be evicted (over budget + past TTL + no retain predicate)
         let evicted = cache.sweep_expired(|_| false);
         assert!(
-            evicted.contains(&contract),
+            evicted.iter().any(|(k, _)| *k == contract),
             "Contract past TTL with no subscribers should be evicted"
         );
         assert!(!cache.contains(&contract));

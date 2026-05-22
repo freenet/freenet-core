@@ -1243,7 +1243,7 @@ async fn relay_put_store_locally(
         crate::operations::announce_contract_hosted(op_manager, &key).await;
 
         let mut removed_contracts = Vec::new();
-        for evicted_key in evicted {
+        for (evicted_key, expected_generation) in evicted {
             if op_manager
                 .interest_manager
                 .unregister_local_hosting(&evicted_key)
@@ -1251,8 +1251,13 @@ async fn relay_put_store_locally(
                 removed_contracts.push(evicted_key);
             }
             // Reclaim on-disk storage for the evicted contract so the hosting
-            // budget is a real disk bound (subscription-gated inside the helper).
-            crate::operations::reclaim_evicted_contract(op_manager, evicted_key);
+            // budget is a real disk bound (subscription- and generation-gated
+            // inside the helper).
+            crate::operations::reclaim_evicted_contract(
+                op_manager,
+                evicted_key,
+                expected_generation,
+            );
         }
 
         let became_interested = op_manager.interest_manager.register_local_hosting(&key);

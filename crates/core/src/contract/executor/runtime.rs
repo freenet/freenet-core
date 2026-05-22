@@ -511,7 +511,11 @@ impl ContractExecutor for RuntimePool {
         result
     }
 
-    async fn remove_contract(&mut self, key: &ContractKey) -> Result<(), ExecutorError> {
+    async fn remove_contract(
+        &mut self,
+        key: &ContractKey,
+        expected_generation: u64,
+    ) -> Result<(), ExecutorError> {
         // Re-check at deletion time. `EvictContract` is fire-and-forget and
         // fair-queued, so an arbitrary amount of time can pass between the
         // hosting cache evicting the contract and this event being processed.
@@ -522,6 +526,24 @@ impl ContractExecutor for RuntimePool {
         // out here closes that re-host / re-subscribe TOCTOU window — the
         // hosting cache will issue a fresh `EvictContract` if the contract is
         // genuinely evicted again later.
+        //
+        // Three guards, in order:
+        // 1. `is_hosting_contract` — the hosting cache itself re-added the
+        //    contract (a GET refreshed it).
+        // 2. `contract_in_use` — client / downstream / network subscription
+        //    re-registered interest in this contract.
+        // 3. `state_generation != expected_generation` — a state write
+        //    occurred between eviction and now. This is the load-bearing
+        //    check: `EvictContract{X}` and `PutQuery{X}` are serialized in
+        //    the per-key fair queue, but the driver-side `host_contract(X)`
+        //    that re-marks X as hosted runs on the driver task AFTER
+        //    `PutQuery{X}.await` returns — so the `is_hosting_contract`
+        //    re-check above can still see a freshly-PUT contract as "not
+        //    hosting" and delete its state. The state-write generation
+        //    is bumped under the executor in the contract-handler call
+        //    path (i.e. before the PUT response returns), so a write that
+        //    raced ahead of this handler will have already advanced it
+        //    past `expected_generation`.
         if self.op_manager.ring.is_hosting_contract(key)
             || self.op_manager.ring.contract_in_use(key)
         {
@@ -529,6 +551,16 @@ impl ContractExecutor for RuntimePool {
                 contract = %key,
                 "Skipping eviction reclamation — contract was re-hosted or re-subscribed \
                  since it was evicted"
+            );
+            return Ok(());
+        }
+        let current_generation = self.op_manager.ring.state_generation(key);
+        if current_generation != expected_generation {
+            tracing::debug!(
+                contract = %key,
+                expected_generation,
+                current_generation,
+                "Skipping eviction reclamation — contract was written since eviction"
             );
             return Ok(());
         }
@@ -543,6 +575,14 @@ impl ContractExecutor for RuntimePool {
         let result = executor.reclaim_contract_storage(key).await;
         self.return_checked(executor, "remove_contract").await;
         self.track_contract_return(key);
+
+        // On successful disk reclamation, forget the generation entry so
+        // the state_generation map does not grow unbounded. We only forget
+        // on success: leaving the entry behind on partial failures is safe
+        // (the next access will refresh it; the generation is monotonic).
+        if result.is_ok() {
+            self.op_manager.ring.forget_state_generation(key);
+        }
         result
     }
 
@@ -1096,6 +1136,14 @@ where
                                 .store(key, state_to_store, params.clone())
                                 .await
                                 .map_err(ExecutorError::other)?;
+                            // State-write chokepoint: bump the per-contract
+                            // generation counter so a racing `EvictContract`
+                            // captured before this store sees a stale
+                            // generation at deletion time and skips
+                            // reclamation. See `RuntimePool::remove_contract`.
+                            if let Some(op_manager) = &self.op_manager {
+                                op_manager.ring.bump_state_generation(&key);
+                            }
 
                             let completion_now = now_nanos();
                             if let Some(completion_info) = self
@@ -1913,6 +1961,13 @@ where
         Ok(Either::Left(new_state))
     }
 
+    /// Persist an updated contract state via `state_store.update`.
+    ///
+    /// This is the canonical chokepoint for UPDATE-shaped writes: every
+    /// in-place state update funnels through here. Bumping the per-contract
+    /// state-write generation immediately after the store succeeds is what
+    /// closes the EvictContract re-host race for UPDATE — see
+    /// `RuntimePool::remove_contract`.
     async fn commit_state_update(
         &mut self,
         key: &ContractKey,
@@ -1940,6 +1995,11 @@ where
             .update(key, new_state.clone())
             .await
             .map_err(ExecutorError::other)?;
+        // State-write chokepoint (UPDATE): see `commit_state_update` docs
+        // and `RuntimePool::remove_contract` for the race this bump closes.
+        if let Some(op_manager) = &self.op_manager {
+            op_manager.ring.bump_state_generation(key);
+        }
 
         tracing::info!(
             contract = %key,
@@ -2606,7 +2666,15 @@ impl ContractExecutor for Executor<Runtime> {
             .await
     }
 
-    async fn remove_contract(&mut self, key: &ContractKey) -> Result<(), ExecutorError> {
+    async fn remove_contract(
+        &mut self,
+        key: &ContractKey,
+        _expected_generation: u64,
+    ) -> Result<(), ExecutorError> {
+        // The inner Executor does not own a Ring (and so cannot consult
+        // the state-write generation directly). Race detection lives at
+        // the `RuntimePool::remove_contract` layer; the inner impl just
+        // performs the disk reclamation.
         self.reclaim_contract_storage(key).await
     }
 }
@@ -3078,6 +3146,11 @@ impl Executor<Runtime> {
                 .update(&key, new_state.clone())
                 .await
                 .map_err(ExecutorError::other)?;
+            // State-write chokepoint: see `commit_state_update` doc comment
+            // and `RuntimePool::remove_contract` for the race this bump closes.
+            if let Some(op_manager) = &self.op_manager {
+                op_manager.ring.bump_state_generation(&key);
+            }
 
             self.send_update_notification(&key, &params, &new_state)
                 .await
@@ -3380,6 +3453,12 @@ impl Executor<Runtime> {
                 );
                 ExecutorError::other(e)
             })?;
+        // State-write chokepoint (verify_and_store PUT): see
+        // `commit_state_update` doc comment and
+        // `RuntimePool::remove_contract` for the race this bump closes.
+        if let Some(op_manager) = &self.op_manager {
+            op_manager.ring.bump_state_generation(&key);
+        }
 
         Ok(())
     }
@@ -4036,12 +4115,13 @@ mod remove_contract_tests {
     //! evicting a contract actually frees its on-disk state and WASM code,
     //! so the hosting budget is a real disk bound.
     //!
-    //! Note: the `RuntimePool::remove_contract` re-host / re-subscribe
-    //! TOCTOU guard (which consults `op_manager.ring`) is not unit-tested
-    //! here because constructing a `RuntimePool` requires a fully-built
-    //! `OpManager` (config, `NetEventRegister`, ring, etc.), which is too
-    //! heavy for a focused unit test. The `Ring::is_hosting_contract` /
-    //! `Ring::contract_in_use` predicates the guard relies on are covered
+    //! Note: the `RuntimePool::remove_contract` re-host / re-subscribe /
+    //! generation-mismatch TOCTOU guards (which consult `op_manager.ring`)
+    //! are not unit-tested here because constructing a `RuntimePool`
+    //! requires a fully-built `OpManager` (config, `NetEventRegister`,
+    //! ring, etc.), which is too heavy for a focused unit test. The
+    //! `Ring::is_hosting_contract` / `Ring::contract_in_use` /
+    //! `Ring::state_generation` predicates the guards rely on are covered
     //! directly in `ring/hosting.rs`. End-to-end coverage of the guarded
     //! eviction path is a deferred `#[freenet_test]` follow-up.
 

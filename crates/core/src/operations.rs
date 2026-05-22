@@ -175,23 +175,39 @@ pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &Contr
 
 /// Reclaim the on-disk storage of a contract that was evicted from the
 /// hosting cache. Skips contracts that are still in use — an active client
-/// subscription or a downstream peer subscriber means something still
-/// depends on us hosting it, so its state/code must NOT be deleted.
+/// subscription, a downstream peer subscriber, or an active upstream
+/// network subscription means something still depends on us hosting it,
+/// so its state/code must NOT be deleted.
+///
+/// `expected_generation` is the state-write generation captured atomically
+/// with the eviction decision (see `HostingCache::record_access` /
+/// `sweep_expired`). It is carried through `EvictContract` so the
+/// deletion-time guard in `RuntimePool::remove_contract` can detect a
+/// state write (PUT/UPDATE) that re-hosted the contract between eviction
+/// and this handler running — that case must skip disk reclamation
+/// because the freshly written state would otherwise be deleted.
 ///
 /// Fire-and-forget: emits an `EvictContract` event to the contract handler,
 /// which routes it through the fair queue (serialized per-contract with other
 /// ops on the same key) and reclaims disk in `handle_contract_event`.
-pub(crate) fn reclaim_evicted_contract(op_manager: &OpManager, key: ContractKey) {
+pub(crate) fn reclaim_evicted_contract(
+    op_manager: &OpManager,
+    key: ContractKey,
+    expected_generation: u64,
+) {
     if op_manager.ring.contract_in_use(&key) {
         tracing::debug!(
             contract = %key,
             "Skipping disk reclamation for evicted contract — still in use \
-             (client subscription or downstream subscriber)"
+             (client subscription, downstream subscriber, or network subscription)"
         );
         return;
     }
     op_manager.notify_contract_handler_fire_and_forget(
-        crate::contract::ContractHandlerEvent::EvictContract { key },
+        crate::contract::ContractHandlerEvent::EvictContract {
+            key,
+            expected_generation,
+        },
     );
 }
 

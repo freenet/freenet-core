@@ -1412,13 +1412,24 @@ where
             contract_handler.executor().remove_client(client_id);
             contract_handler.channel().drop_waiting_response(id);
         }
-        ContractHandlerEvent::EvictContract { key } => {
+        ContractHandlerEvent::EvictContract {
+            key,
+            expected_generation,
+        } => {
             // Reclaim the contract's on-disk storage after it was evicted
             // from the hosting cache. Routed here (not inline-fast-pathed in
             // the drain loop) so it goes through the fair queue and is
             // serialized per-contract with any other in-flight ops on the
             // same key. Fire-and-forget: no response is sent.
-            match contract_handler.executor().remove_contract(&key).await {
+            //
+            // `expected_generation` is consulted by
+            // `RuntimePool::remove_contract` to skip deletion if the
+            // contract's state was rewritten since eviction (re-host race).
+            match contract_handler
+                .executor()
+                .remove_contract(&key, expected_generation)
+                .await
+            {
                 Ok(()) => {
                     tracing::info!(contract = %key, "Reclaimed on-disk storage for evicted contract");
                 }

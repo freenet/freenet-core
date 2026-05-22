@@ -438,11 +438,19 @@ pub(crate) trait ContractExecutor: Send + 'static {
     /// the WASM code blob) after the contract was evicted from the hosting
     /// cache. Best-effort and idempotent: a double eviction is a no-op.
     ///
+    /// `expected_generation` is the state-write generation captured
+    /// atomically with the eviction decision. Implementations that wire
+    /// through to a real `Ring`/`HostingManager` re-read the current
+    /// generation and skip reclamation if it has advanced (closing the
+    /// EvictContract re-host race). Implementations without a `Ring` may
+    /// ignore the argument.
+    ///
     /// Default implementation is a no-op (for mock executors that keep state
     /// in memory and have no on-disk storage to reclaim).
     fn remove_contract(
         &mut self,
         _key: &ContractKey,
+        _expected_generation: u64,
     ) -> impl Future<Output = Result<(), ExecutorError>> + Send {
         async { Ok(()) }
     }

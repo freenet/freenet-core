@@ -687,8 +687,19 @@ pub(crate) enum ContractHandlerEvent {
     },
     /// Reclaim a contract's on-disk storage (state + WASM code) after it was
     /// evicted from the hosting cache. Fire-and-forget: no response is sent.
+    ///
+    /// `expected_generation` is the state-write generation captured
+    /// atomically when the contract was evicted (see
+    /// `HostingCache::record_access` / `sweep_expired`). The eviction
+    /// handler in `RuntimePool::remove_contract` re-reads the current
+    /// generation and skips disk reclamation if it has advanced — that
+    /// means a state write (PUT/UPDATE) occurred between eviction and
+    /// this handler running, and the contract has been re-hosted with
+    /// fresh state we must not delete. This closes the re-host TOCTOU
+    /// window described on `RuntimePool::remove_contract`.
     EvictContract {
         key: ContractKey,
+        expected_generation: u64,
     },
 }
 
@@ -801,8 +812,14 @@ impl std::fmt::Display for ContractHandlerEvent {
             ContractHandlerEvent::ClientDisconnect { client_id } => {
                 write!(f, "client disconnect {{ {client_id} }}")
             }
-            ContractHandlerEvent::EvictContract { key } => {
-                write!(f, "evict contract {{ {key} }}")
+            ContractHandlerEvent::EvictContract {
+                key,
+                expected_generation,
+            } => {
+                write!(
+                    f,
+                    "evict contract {{ {key}, expected_generation: {expected_generation} }}"
+                )
             }
         }
     }
