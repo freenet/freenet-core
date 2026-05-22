@@ -18,8 +18,10 @@ pub struct ContractStore {
     /// ReDb storage for persistent index
     db: Storage,
 }
-// TODO: add functionality to delete old contracts which have not been used for a while
-//       to keep the total space used under a configured threshold
+// Eviction-driven reclamation of unused contracts now exists: the hosting
+// cache evicts least-valuable contracts past its budget and the resulting
+// `EvictContract` event drives `Executor::reclaim_contract_storage`, which
+// calls `ContractStore::remove_contract` to delete the on-disk `.wasm` blob.
 
 impl ContractStore {
     /// # Arguments

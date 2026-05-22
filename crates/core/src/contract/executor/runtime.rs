@@ -512,6 +512,27 @@ impl ContractExecutor for RuntimePool {
     }
 
     async fn remove_contract(&mut self, key: &ContractKey) -> Result<(), ExecutorError> {
+        // Re-check at deletion time. `EvictContract` is fire-and-forget and
+        // fair-queued, so an arbitrary amount of time can pass between the
+        // hosting cache evicting the contract and this event being processed.
+        // In that window a GET/PUT can re-store the contract (re-hosting it) or
+        // a subscription can re-register interest. Reclaiming the on-disk
+        // storage then would either leave the contract in-cache-but-not-on-disk
+        // or delete the state of a contract that is once again wanted. Bailing
+        // out here closes that re-host / re-subscribe TOCTOU window — the
+        // hosting cache will issue a fresh `EvictContract` if the contract is
+        // genuinely evicted again later.
+        if self.op_manager.ring.is_hosting_contract(key)
+            || self.op_manager.ring.contract_in_use(key)
+        {
+            tracing::debug!(
+                contract = %key,
+                "Skipping eviction reclamation — contract was re-hosted or re-subscribed \
+                 since it was evicted"
+            );
+            return Ok(());
+        }
+
         // Mirror the pop-an-executor pattern from `fetch_contract`: the
         // checked-out executor owns the `ContractStore` whose on-disk `.wasm`
         // blob must be removed, while the `StateStore` is shared across the
@@ -3379,6 +3400,11 @@ impl Executor<Runtime> {
     /// succeeds (or both were already clean); only a failure of *both* steps is
     /// surfaced as an error, since this is fire-and-forget maintenance.
     ///
+    /// Note that `Ok(())` does NOT mean the contract is fully consistent: a
+    /// partial failure (state deleted but code kept, or vice versa) leaves the
+    /// contract half-present on disk until a subsequent access re-fetches it.
+    /// Callers must not treat `Ok` as "fully reclaimed" or "fully consistent".
+    ///
     /// This is the inherent implementation; the `ContractExecutor::remove_contract`
     /// trait method delegates to it.
     async fn reclaim_contract_storage(&mut self, key: &ContractKey) -> Result<(), ExecutorError> {
@@ -4009,6 +4035,15 @@ mod remove_contract_tests {
     //! path wired to hosting-cache eviction. The core proof here is that
     //! evicting a contract actually frees its on-disk state and WASM code,
     //! so the hosting budget is a real disk bound.
+    //!
+    //! Note: the `RuntimePool::remove_contract` re-host / re-subscribe
+    //! TOCTOU guard (which consults `op_manager.ring`) is not unit-tested
+    //! here because constructing a `RuntimePool` requires a fully-built
+    //! `OpManager` (config, `NetEventRegister`, ring, etc.), which is too
+    //! heavy for a focused unit test. The `Ring::is_hosting_contract` /
+    //! `Ring::contract_in_use` predicates the guard relies on are covered
+    //! directly in `ring/hosting.rs`. End-to-end coverage of the guarded
+    //! eviction path is a deferred `#[freenet_test]` follow-up.
 
     use std::sync::Arc;
 
