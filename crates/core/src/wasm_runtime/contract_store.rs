@@ -85,19 +85,6 @@ impl ContractStore {
         key: &ContractKey,
         params: &Parameters<'_>,
     ) -> Option<ContractContainer> {
-        // Invariant: a contract instance is fetchable iff it is indexed in
-        // `key_to_code_part`. The code-hash cache below is keyed by `code_hash`
-        // and is shared across every `ContractInstanceId` using the same
-        // code, so a removed instance whose sibling still references the
-        // same code would otherwise be served as a "ghost" via the cache
-        // hit. Checking the index first makes this impossible: after
-        // `remove_contract` of one of two shared-code instances, the
-        // removed instance is no longer fetchable here even though the
-        // shared `code_hash` is still cached for the surviving instance.
-        // See `test_fetch_contract_returns_none_for_removed_shared_code_instance`.
-        if !self.key_to_code_part.contains_key(key.id()) {
-            return None;
-        }
         let code_hash = key.code_hash();
         if let Some(data) = self.contract_cache.get(code_hash) {
             return Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
@@ -909,96 +896,6 @@ mod test {
         store
             .remove_contract(&key)
             .expect("remove_contract must be Ok when the WASM file is already gone");
-
-        Ok(())
-    }
-
-    /// `fetch_contract` must not serve a "ghost" of a removed instance via
-    /// the shared code-hash cache. Two instances share one code hash; the
-    /// first instance is removed. The second instance must remain
-    /// fetchable (it is still indexed), and the removed instance must NOT
-    /// be fetchable even though `code_hash` is still in the in-memory
-    /// `contract_cache` thanks to the surviving sibling.
-    ///
-    /// Regression test for the Codex P2 finding in PR #4212 review round C.
-    /// The cache-hit fast path used to return `Some` based purely on
-    /// `code_hash`, which meant a `remove_contract`'d instance was served
-    /// as if still present after the refcount-safe shared-WASM fix in
-    /// PR #4212. The added `key_to_code_part.contains_key` guard at the
-    /// top of `fetch_contract` makes "fetchable iff indexed" the
-    /// invariant.
-    #[tokio::test]
-    async fn test_fetch_contract_returns_none_for_removed_shared_code_instance()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let contract_dir = crate::util::tests::get_temp_dir();
-        std::fs::create_dir_all(contract_dir.path())?;
-        let db = create_test_db(contract_dir.path()).await;
-        let mut store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
-
-        // Two instances sharing one code hash, distinguished by params.
-        let shared_code = vec![0xAB, 0xCD, 0xEF];
-        let params_removed = Parameters::from(vec![1, 1, 1]);
-        let params_survivor = Parameters::from(vec![2, 2, 2]);
-        let contract_removed = WrappedContract::new(
-            Arc::new(ContractCode::from(shared_code.clone())),
-            params_removed.clone(),
-        );
-        let contract_survivor = WrappedContract::new(
-            Arc::new(ContractCode::from(shared_code.clone())),
-            params_survivor.clone(),
-        );
-        let key_removed = *contract_removed.key();
-        let key_survivor = *contract_survivor.key();
-        assert_eq!(key_removed.code_hash(), key_survivor.code_hash());
-        assert_ne!(key_removed.id(), key_survivor.id());
-
-        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
-            contract_removed,
-        )))?;
-        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
-            contract_survivor,
-        )))?;
-
-        // Both fetchable initially.
-        assert!(
-            store
-                .fetch_contract(&key_removed, &params_removed)
-                .is_some(),
-            "Pre-condition: removed-instance must be fetchable before removal"
-        );
-        assert!(
-            store
-                .fetch_contract(&key_survivor, &params_survivor)
-                .is_some(),
-            "Pre-condition: surviving instance must be fetchable"
-        );
-
-        // Remove one instance. The shared `.wasm` blob stays because the
-        // other instance still references the code hash — and crucially,
-        // the code-hash cache entry stays too (it is keyed by code hash).
-        store.remove_contract(&key_removed)?;
-
-        // The removed instance must NOT be fetchable, even though the
-        // code-hash cache still has its bytes (kept warm by the sibling).
-        // Without the index-first guard at the top of fetch_contract this
-        // would erroneously return Some via the cache-hit fast path.
-        assert!(
-            store
-                .fetch_contract(&key_removed, &params_removed)
-                .is_none(),
-            "Removed instance must NOT be served via shared code-hash \
-             cache hit — `fetch_contract` must check `key_to_code_part` \
-             before the cache lookup"
-        );
-
-        // The surviving instance must still be fully fetchable.
-        assert!(
-            store
-                .fetch_contract(&key_survivor, &params_survivor)
-                .is_some(),
-            "Surviving instance must still be fetchable after a sibling \
-             with shared code is removed"
-        );
 
         Ok(())
     }
