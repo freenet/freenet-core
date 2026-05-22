@@ -325,6 +325,31 @@ impl<T: TimeSource> HostingCache<T> {
         }
     }
 
+    /// Update the cached `write_generation` snapshot for `key` to `new_gen`.
+    ///
+    /// Called paired with `HostingManager::bump_state_generation` from
+    /// every state-write chokepoint (executor PUT/UPDATE and V2 delegate
+    /// PUT/UPDATE). Without this refresh, an UPDATE (or re-PUT) to an
+    /// already-hosted contract would leave the cached snapshot stuck at
+    /// its `record_access`-time value while the `state_generation` counter
+    /// kept advancing; a later eviction would carry the stale snapshot,
+    /// the deletion-time generation guard in
+    /// `RuntimePool::remove_contract` would see a mismatch, and disk
+    /// reclamation would be permanently skipped — leaking the on-disk
+    /// state and code blob.
+    ///
+    /// No-op when `key` is not in the cache: if the contract has been
+    /// evicted between the bump and this refresh, the `EvictContract`
+    /// already carried the pre-bump snapshot and the deletion-time guard
+    /// will skip on the mismatch. That residual leak is narrower than
+    /// the "permanent leak on every UPDATE" failure mode this method
+    /// closes — see the call-site comment in `runtime.rs`.
+    pub fn refresh_entry_generation(&mut self, key: &ContractKey, new_gen: u64) {
+        if let Some(existing) = self.contracts.get_mut(key) {
+            existing.write_generation = new_gen;
+        }
+    }
+
     /// Check if a contract is in the cache.
     pub fn contains(&self, key: &ContractKey) -> bool {
         self.contracts.contains_key(key)

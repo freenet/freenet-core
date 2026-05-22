@@ -1140,9 +1140,17 @@ where
                             // generation counter so a racing `EvictContract`
                             // captured before this store sees a stale
                             // generation at deletion time and skips
-                            // reclamation. See `RuntimePool::remove_contract`.
+                            // reclamation. Then refresh the hosting-cache
+                            // snapshot so subsequent evictions of this
+                            // already-hosted contract carry the new
+                            // generation rather than the stale snapshot
+                            // captured at first `record_access` — without
+                            // the refresh, every UPDATE leaks on eviction.
+                            // See `RuntimePool::remove_contract` and
+                            // `HostingCache::refresh_entry_generation`.
                             if let Some(op_manager) = &self.op_manager {
-                                op_manager.ring.bump_state_generation(&key);
+                                let new_gen = op_manager.ring.bump_state_generation(&key);
+                                op_manager.ring.refresh_cache_generation(&key, new_gen);
                             }
 
                             let completion_now = now_nanos();
@@ -1997,8 +2005,14 @@ where
             .map_err(ExecutorError::other)?;
         // State-write chokepoint (UPDATE): see `commit_state_update` docs
         // and `RuntimePool::remove_contract` for the race this bump closes.
+        // Refresh the hosting-cache snapshot in lock-step so an UPDATE to
+        // an already-hosted contract doesn't leave the cached generation
+        // stuck at its first-`record_access` value — that mismatch would
+        // make later evictions silently skip reclamation. See
+        // `HostingCache::refresh_entry_generation`.
         if let Some(op_manager) = &self.op_manager {
-            op_manager.ring.bump_state_generation(key);
+            let new_gen = op_manager.ring.bump_state_generation(key);
+            op_manager.ring.refresh_cache_generation(key, new_gen);
         }
 
         tracing::info!(
@@ -2697,6 +2711,17 @@ impl Executor<Runtime> {
         let mut rt = Runtime::build(contract_store, delegate_store, secret_store, false).unwrap();
         // Enable V2 delegate contract access by providing the state store DB
         rt.set_state_store_db(state_store.storage());
+        // V2 delegate state writes bypass the executor's
+        // `state_store.{store,update}` chokepoints, so install a callback that
+        // mirrors the bump+refresh those chokepoints perform. Without this,
+        // V2 delegate PUT/UPDATE leaves the EvictContract re-host race open.
+        if let Some(op_manager_ref) = &op_manager {
+            let op_manager_clone = op_manager_ref.clone();
+            rt.set_state_write_callback(Arc::new(move |key: &ContractKey| {
+                let new_gen = op_manager_clone.ring.bump_state_generation(key);
+                op_manager_clone.ring.refresh_cache_generation(key, new_gen);
+            }));
+        }
         Executor::new(
             state_store,
             move || {
@@ -2753,6 +2778,17 @@ impl Executor<Runtime> {
         )
         .unwrap();
         rt.set_state_store_db(db);
+        // V2 delegate state writes bypass the executor chokepoints — install
+        // the bump+refresh callback so the EvictContract re-host race is
+        // closed for that path too. See `from_config` and
+        // `Runtime::set_state_write_callback`.
+        if let Some(op_manager_ref) = &op_manager {
+            let op_manager_clone = op_manager_ref.clone();
+            rt.set_state_write_callback(Arc::new(move |key: &ContractKey| {
+                let new_gen = op_manager_clone.ring.bump_state_generation(key);
+                op_manager_clone.ring.refresh_cache_generation(key, new_gen);
+            }));
+        }
         Executor::new(
             shared_state_store,
             || Ok(()),
@@ -3148,8 +3184,12 @@ impl Executor<Runtime> {
                 .map_err(ExecutorError::other)?;
             // State-write chokepoint: see `commit_state_update` doc comment
             // and `RuntimePool::remove_contract` for the race this bump closes.
+            // Refresh the hosting-cache snapshot so already-hosted contracts
+            // don't leak on eviction after this re-PUT — see
+            // `HostingCache::refresh_entry_generation`.
             if let Some(op_manager) = &self.op_manager {
-                op_manager.ring.bump_state_generation(&key);
+                let new_gen = op_manager.ring.bump_state_generation(&key);
+                op_manager.ring.refresh_cache_generation(&key, new_gen);
             }
 
             self.send_update_notification(&key, &params, &new_state)
@@ -3456,8 +3496,12 @@ impl Executor<Runtime> {
         // State-write chokepoint (verify_and_store PUT): see
         // `commit_state_update` doc comment and
         // `RuntimePool::remove_contract` for the race this bump closes.
+        // Refresh the hosting-cache snapshot so already-hosted contracts
+        // don't leak on eviction after this re-PUT — see
+        // `HostingCache::refresh_entry_generation`.
         if let Some(op_manager) = &self.op_manager {
-            op_manager.ring.bump_state_generation(&key);
+            let new_gen = op_manager.ring.bump_state_generation(&key);
+            op_manager.ring.refresh_cache_generation(&key, new_gen);
         }
 
         Ok(())

@@ -1705,6 +1705,15 @@ impl Ring {
         self.hosting_manager.forget_state_generation(contract)
     }
 
+    /// Refresh the hosting-cache snapshot of `contract`'s state-write
+    /// generation to `new_gen`. Paired with `bump_state_generation` at
+    /// every state-write chokepoint — see
+    /// `HostingManager::refresh_cache_generation`.
+    pub(crate) fn refresh_cache_generation(&self, contract: &ContractKey, new_gen: u64) {
+        self.hosting_manager
+            .refresh_cache_generation(contract, new_gen)
+    }
+
     pub fn expire_stale_downstream_subscribers(&self) -> Vec<(ContractKey, usize)> {
         self.hosting_manager.expire_stale_downstream_subscribers()
     }

@@ -277,6 +277,20 @@ impl HostingManager {
         self.state_generation.remove(key);
     }
 
+    /// Update the hosting-cache snapshot of `key`'s state-write generation
+    /// to `new_gen`. Paired with `bump_state_generation` at every state-write
+    /// chokepoint (executor PUT/UPDATE and V2 delegate PUT/UPDATE) so a
+    /// later eviction's snapshot reflects the current generation and the
+    /// deletion-time guard in `RuntimePool::remove_contract` does not
+    /// permanently skip reclamation after an UPDATE-then-evict. No-op when
+    /// the entry is not currently cached. See
+    /// `HostingCache::refresh_entry_generation`.
+    pub(crate) fn refresh_cache_generation(&self, key: &ContractKey, new_gen: u64) {
+        self.hosting_cache
+            .write()
+            .refresh_entry_generation(key, new_gen);
+    }
+
     /// Set the storage reference for persisting hosting metadata.
     /// Must be called after executor creation.
     pub fn set_storage(&self, storage: crate::contract::storages::Storage) {
@@ -2635,6 +2649,96 @@ mod tests {
             manager.state_generation(&key),
             "the mismatch between captured and current is exactly what \
              `RuntimePool::remove_contract` keys off to skip reclamation"
+        );
+    }
+
+    /// Without `refresh_cache_generation`, a hosted contract that receives
+    /// a subsequent state write (UPDATE or re-PUT) has its `state_generation`
+    /// advance while the cached `write_generation` snapshot stays at the
+    /// `record_contract_access`-time value. Later, when this contract is
+    /// evicted (LRU pressure, expiry sweep, etc.), the `EvictContract` event
+    /// carries the stale snapshot. The deletion-time guard in
+    /// `RuntimePool::remove_contract` compares the snapshot against the
+    /// current generation and — seeing a mismatch — skips reclamation.
+    /// Result: every UPDATE-then-evict leaks the on-disk state and code blob.
+    ///
+    /// The fix is to call `refresh_cache_generation` paired with every
+    /// `bump_state_generation` so the snapshot tracks the counter. This
+    /// test asserts the refresh updates the snapshot, so the
+    /// subsequently-evicted entry carries the current generation rather
+    /// than the stale one.
+    ///
+    /// Regression test for PR #4212 review round D (skeptical r3 #2).
+    #[test]
+    fn test_record_access_refresh_updates_write_generation() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        // Tiny cache, zero TTL so the next insert evicts immediately.
+        {
+            let mut cache = manager.hosting_cache.write();
+            *cache = cache::HostingCache::new(
+                100,
+                std::time::Duration::ZERO,
+                crate::util::time_source::InstantTimeSrc::new(),
+            );
+        }
+
+        let key = make_contract_key(1);
+        let trigger = make_contract_key(2);
+
+        // Initial write + hosting record: snapshot captures generation 1.
+        let new_gen = manager.bump_state_generation(&key);
+        assert_eq!(new_gen, 1);
+        manager.refresh_cache_generation(&key, new_gen);
+        manager.record_contract_access(key, 100, AccessType::Get);
+
+        // Simulate an UPDATE that bumps the counter to 2 AND refreshes
+        // the cached snapshot — this is the bump+refresh pair installed
+        // at every state-write chokepoint.
+        let new_gen = manager.bump_state_generation(&key);
+        assert_eq!(new_gen, 2);
+        manager.refresh_cache_generation(&key, new_gen);
+
+        // Now force eviction. With the refresh, the evicted tuple should
+        // carry the post-UPDATE generation (2). Without the refresh, it
+        // would carry the stale snapshot (1), and `RuntimePool::remove_contract`
+        // would see a mismatch against the current generation (2) and
+        // SKIP reclamation — leaking the on-disk state forever.
+        let result = manager.record_contract_access(trigger, 100, AccessType::Get);
+        assert_eq!(
+            result.evicted,
+            vec![(key, 2)],
+            "evicted tuple must carry the refreshed generation (post-UPDATE), \
+             not the stale snapshot from initial record_contract_access"
+        );
+        assert_eq!(
+            result.evicted[0].1,
+            manager.state_generation(&key),
+            "with bump+refresh in lock-step, the evicted snapshot matches \
+             the current generation — deletion-time guard would proceed \
+             with reclamation rather than skipping it"
+        );
+    }
+
+    /// `refresh_cache_generation` is a no-op when the entry is not in the
+    /// cache: if the contract was evicted between bump and refresh, the
+    /// `EvictContract` already carried the pre-bump snapshot and the
+    /// deletion-time guard will skip on that narrower mismatch. The
+    /// no-op behavior is intentional — see the comment on
+    /// `HostingCache::refresh_entry_generation`.
+    #[test]
+    fn test_refresh_cache_generation_is_noop_when_entry_absent() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let key = make_contract_key(99);
+
+        // The contract is not in the hosting cache. The bump+refresh
+        // pair runs from a state-write chokepoint, but the entry was
+        // already evicted in a prior eviction wave. The refresh must
+        // simply do nothing — not panic, not insert.
+        let new_gen = manager.bump_state_generation(&key);
+        manager.refresh_cache_generation(&key, new_gen);
+        assert!(
+            !manager.hosting_cache.read().contains(&key),
+            "refresh must not insert a phantom entry for an absent contract"
         );
     }
 
