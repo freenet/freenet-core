@@ -1221,6 +1221,34 @@ impl Ring {
                     );
                 }
             }
+
+            // Retry pending reclamations queued by the two skip points
+            // (fair-queue rejection of `EvictContract` and the
+            // `contract_in_use` skip in `RuntimePool::remove_contract`).
+            // The snapshot iterates without holding the DashMap shard
+            // guards. Each retry routes through
+            // `reclaim_evicted_contract`, which re-checks
+            // `contract_in_use` — entries that are still in use stay in
+            // the queue (no event emitted) and will be retried next
+            // cycle. Successful reclamations clear their pending entry
+            // in `RuntimePool::remove_contract`.
+            if let Some(op_manager) = &op_manager {
+                let pending = ring.pending_reclamation_snapshot();
+                if !pending.is_empty() {
+                    tracing::debug!(
+                        pending_count = pending.len(),
+                        "Retrying pending reclamations from previous skipped \
+                         `EvictContract` events"
+                    );
+                    for (key, expected_generation) in pending {
+                        crate::operations::reclaim_evicted_contract(
+                            op_manager,
+                            key,
+                            expected_generation,
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1714,6 +1742,31 @@ impl Ring {
     pub(crate) fn refresh_cache_generation(&self, contract: &ContractKey, new_gen: u64) {
         self.hosting_manager
             .refresh_cache_generation(contract, new_gen)
+    }
+
+    /// Add `contract` to the pending-reclamation retry queue with the
+    /// captured `expected_generation`. Called from the two skip points
+    /// that drop an `EvictContract` event before it can complete (fair
+    /// queue rejection, `contract_in_use` skip in `RuntimePool::remove_contract`).
+    /// See `HostingManager::pending_reclamation_add` for the queue's
+    /// invariants and how the periodic sweep retries entries.
+    pub(crate) fn pending_reclamation_add(&self, contract: ContractKey, expected_generation: u64) {
+        self.hosting_manager
+            .pending_reclamation_add(contract, expected_generation)
+    }
+
+    /// Remove `contract` from the pending-reclamation retry queue after
+    /// a successful disk reclamation. See
+    /// `HostingManager::pending_reclamation_remove`.
+    pub(crate) fn pending_reclamation_remove(&self, contract: &ContractKey) {
+        self.hosting_manager.pending_reclamation_remove(contract)
+    }
+
+    /// Snapshot the pending-reclamation queue for the periodic sweep
+    /// to iterate without holding any DashMap shard guard. See
+    /// `HostingManager::pending_reclamation_snapshot`.
+    pub(crate) fn pending_reclamation_snapshot(&self) -> Vec<(ContractKey, u64)> {
+        self.hosting_manager.pending_reclamation_snapshot()
     }
 
     pub fn expire_stale_downstream_subscribers(&self) -> Vec<(ContractKey, usize)> {

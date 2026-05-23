@@ -682,6 +682,7 @@ where
                         continue;
                     }
                     if let Err(rejected) = fair_queue.try_push(id, event) {
+                        track_pending_reclamation_if_evict(&mut contract_handler, &rejected);
                         send_queue_full_response(contract_handler.channel(), rejected).await;
                     }
                 }
@@ -714,6 +715,7 @@ where
             result = contract_handler.channel().recv_from_sender() => {
                 let (id, event) = result?;
                 if let Err(rejected) = fair_queue.try_push(id, event) {
+                    track_pending_reclamation_if_evict(&mut contract_handler, &rejected);
                     send_queue_full_response(contract_handler.channel(), rejected).await;
                 }
             }
@@ -721,6 +723,30 @@ where
                 handle_delegate_notification(&mut contract_handler, notification, &prompter).await;
             }
         }
+    }
+}
+
+/// When the fair queue rejects an `EvictContract` event (queue-full),
+/// the hosting-cache entry is already gone — no later sweep would
+/// re-emit on its own. Record the key in the pending-reclamation retry
+/// queue so the periodic sweep retries via `reclaim_evicted_contract`.
+///
+/// This closes disk-leak edge case #1 in PR #4212 review round 7
+/// (other variants are no-ops here — they have their own error paths).
+fn track_pending_reclamation_if_evict<CH>(
+    contract_handler: &mut CH,
+    rejected: &fair_queue::RejectedEvent,
+) where
+    CH: ContractHandler + Send + 'static,
+{
+    if let ContractHandlerEvent::EvictContract {
+        key,
+        expected_generation,
+    } = &rejected.event
+    {
+        contract_handler
+            .executor()
+            .track_pending_reclamation(*key, *expected_generation);
     }
 }
 

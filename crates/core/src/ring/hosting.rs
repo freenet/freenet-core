@@ -213,6 +213,39 @@ pub(crate) struct HostingManager {
     /// of a freshly-PUT contract runs after `PutQuery.await` returns,
     /// so the existing `is_hosting_contract` check is not sufficient).
     state_generation: DashMap<ContractKey, u64>,
+
+    /// Retry queue for contracts whose `EvictContract` could not be
+    /// completed at the original eviction time. Maps contract key →
+    /// `expected_generation` captured when the original `EvictContract`
+    /// event was emitted.
+    ///
+    /// Two skip points add entries here (both close narrow disk-leak
+    /// edge cases — see PR #4212 review round 7):
+    ///
+    /// 1. **Queue-full drop**: when the per-contract fair queue rejects
+    ///    an `EvictContract` event (queue-full), the hosting-cache
+    ///    entry is already gone so no later sweep would re-emit. The
+    ///    pending entry lets the periodic sweep retry.
+    /// 2. **In-use-then-subscriber-expires**: when
+    ///    `RuntimePool::remove_contract` skips reclamation because
+    ///    `contract_in_use` is true (a subscriber appeared between
+    ///    eviction and processing), the contract is gone from the
+    ///    hosting cache. When that subscriber later expires no cache
+    ///    entry remains to emit another eviction — the pending entry
+    ///    lets the periodic sweep retry once `contract_in_use`
+    ///    becomes false.
+    ///
+    /// Entries are removed by `pending_reclamation_remove` after a
+    /// successful disk reclamation. The map is monotonically draining
+    /// under steady load — bounded by the contracts the node has ever
+    /// stored. The pending entries are a *retry queue* for
+    /// reclamation, NOT a *block* on reclamation, so they do not
+    /// constitute an unbounded cleanup exemption (AGENTS.md cleanup
+    /// rule): the on-disk state stays until the retry succeeds.
+    ///
+    /// Behind an `Arc` so the periodic sweep snapshot can iterate
+    /// without re-entering the `HostingManager` borrow.
+    pending_reclamation: std::sync::Arc<DashMap<ContractKey, u64>>,
 }
 
 impl HostingManager {
@@ -236,6 +269,7 @@ impl HostingManager {
             )),
             storage: RwLock::new(None),
             state_generation: DashMap::new(),
+            pending_reclamation: std::sync::Arc::new(DashMap::new()),
         }
     }
 
@@ -295,6 +329,47 @@ impl HostingManager {
     /// Must be called after executor creation.
     pub fn set_storage(&self, storage: crate::contract::storages::Storage) {
         *self.storage.write() = Some(storage);
+    }
+
+    // =========================================================================
+    // Pending Reclamation Retry Queue
+    // =========================================================================
+
+    /// Add `key` to the pending-reclamation retry queue, recording the
+    /// `expected_generation` captured at the original `EvictContract`
+    /// emission time. If `key` is already present, replaces the entry —
+    /// the most recent attempt's generation is the relevant one for the
+    /// retry, and over-writing avoids unbounded growth from repeated
+    /// add calls on the same key.
+    ///
+    /// See `pending_reclamation` field docs for the two skip points
+    /// that feed this queue.
+    pub(crate) fn pending_reclamation_add(&self, key: ContractKey, expected_generation: u64) {
+        self.pending_reclamation.insert(key, expected_generation);
+    }
+
+    /// Remove `key` from the pending-reclamation queue. Called after a
+    /// successful disk reclamation so the queue drains under steady
+    /// load.
+    pub(crate) fn pending_reclamation_remove(&self, key: &ContractKey) {
+        self.pending_reclamation.remove(key);
+    }
+
+    /// Snapshot every pending reclamation entry as an owned vector so
+    /// the periodic sweep can iterate without holding any DashMap
+    /// shard guard.
+    pub(crate) fn pending_reclamation_snapshot(&self) -> Vec<(ContractKey, u64)> {
+        self.pending_reclamation
+            .iter()
+            .map(|entry| (*entry.key(), *entry.value()))
+            .collect()
+    }
+
+    /// Number of contracts currently in the pending-reclamation queue
+    /// (used in tests and diagnostics).
+    #[cfg(test)]
+    pub(crate) fn pending_reclamation_len(&self) -> usize {
+        self.pending_reclamation.len()
     }
 
     // =========================================================================
@@ -3281,5 +3356,133 @@ mod tests {
         // After local client re-accesses, flag is restored
         manager.mark_local_client_access(&contract_a);
         assert!(manager.has_local_client_access(&contract_a));
+    }
+
+    // =========================================================================
+    // Pending Reclamation Retry Queue (PR #4212 review round 7)
+    //
+    // The queue catches two narrow disk-leak edge cases — fair-queue
+    // rejection of `EvictContract`, and the `contract_in_use` skip in
+    // `RuntimePool::remove_contract` — where an `EvictContract` event
+    // is dropped before reclamation runs but the hosting-cache entry is
+    // already gone. The queue is drained by the periodic sweep, which
+    // re-emits `EvictContract` via `reclaim_evicted_contract`.
+    //
+    // End-to-end coverage of the periodic sweep retry path (which
+    // requires a wired `OpManager`) is intentionally deferred —
+    // constructing a `RuntimePool` is too heavy for a unit test (see
+    // the note on `remove_contract_tests` in
+    // `contract/executor/runtime.rs`). These tests cover the manager-
+    // level API the sweep relies on.
+    // =========================================================================
+
+    /// Basic API: add → snapshot reflects the entry; remove → snapshot
+    /// becomes empty. The snapshot returns owned tuples (no lock held
+    /// across iteration), which is the property the periodic sweep
+    /// relies on.
+    #[test]
+    fn test_pending_reclamation_add_remove_snapshot() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let key_a = make_contract_key(1);
+        let key_b = make_contract_key(2);
+
+        assert_eq!(manager.pending_reclamation_len(), 0);
+        assert!(manager.pending_reclamation_snapshot().is_empty());
+
+        manager.pending_reclamation_add(key_a, 7);
+        manager.pending_reclamation_add(key_b, 13);
+        assert_eq!(manager.pending_reclamation_len(), 2);
+
+        let mut snapshot = manager.pending_reclamation_snapshot();
+        snapshot.sort_by(|a, b| a.0.id().as_bytes().cmp(b.0.id().as_bytes()));
+        assert_eq!(snapshot, vec![(key_a, 7), (key_b, 13)]);
+
+        // Re-adding the same key replaces the generation. This matters
+        // for the queue-full skip point: if multiple eviction events
+        // for the same key race the queue, the most recent generation
+        // is the relevant one for the retry.
+        manager.pending_reclamation_add(key_a, 99);
+        let snapshot = manager.pending_reclamation_snapshot();
+        let gen_a = snapshot
+            .iter()
+            .find(|(k, _)| *k == key_a)
+            .map(|(_, g)| *g)
+            .expect("key_a still present");
+        assert_eq!(gen_a, 99, "re-add must replace the generation");
+
+        manager.pending_reclamation_remove(&key_a);
+        assert_eq!(manager.pending_reclamation_len(), 1);
+        let remaining = manager.pending_reclamation_snapshot();
+        assert_eq!(remaining, vec![(key_b, 13)]);
+
+        manager.pending_reclamation_remove(&key_b);
+        assert_eq!(manager.pending_reclamation_len(), 0);
+
+        // Removing a key that is not present is a no-op (matters because
+        // the success path in `RuntimePool::remove_contract` calls
+        // `pending_reclamation_remove` unconditionally — the queue must
+        // tolerate non-pending keys).
+        manager.pending_reclamation_remove(&key_a);
+        assert_eq!(manager.pending_reclamation_len(), 0);
+    }
+
+    /// Simulate the `contract_in_use` skip path: an EvictContract event
+    /// could not complete because a subscriber appeared between
+    /// eviction and processing. The pending entry survives subsequent
+    /// snapshots so the periodic sweep can keep retrying; once the
+    /// subscriber expires the snapshot still contains the entry and a
+    /// successful retry would call `pending_reclamation_remove` to
+    /// clear it.
+    ///
+    /// This is the manager-level invariant; end-to-end coverage of the
+    /// sweep loop calling `reclaim_evicted_contract` for each entry
+    /// (which requires a wired `OpManager`) is deferred — see the
+    /// module-level test note.
+    #[test]
+    fn test_pending_reclamation_survives_in_use_skip_and_retries() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(42);
+        let client = crate::client_events::ClientId::next();
+        let captured_generation = 5u64;
+
+        // Step 1: a client subscription means `contract_in_use` is true.
+        // In production this is the state `RuntimePool::remove_contract`
+        // observes when it hits the in-use skip and adds the key to the
+        // pending queue.
+        manager.add_client_subscription(contract.id(), client);
+        assert!(manager.contract_in_use(&contract));
+        manager.pending_reclamation_add(contract, captured_generation);
+        assert_eq!(manager.pending_reclamation_len(), 1);
+
+        // Step 2: the periodic sweep snapshots the queue. The entry is
+        // returned with its captured generation intact, and the queue
+        // state is unchanged (the sweep does not consume entries —
+        // `reclaim_evicted_contract`'s `contract_in_use` gate filters
+        // them, and successful retries call `pending_reclamation_remove`
+        // explicitly).
+        let snapshot = manager.pending_reclamation_snapshot();
+        assert_eq!(snapshot, vec![(contract, captured_generation)]);
+        assert_eq!(
+            manager.pending_reclamation_len(),
+            1,
+            "snapshot must NOT drain the queue — entries stay until \
+             explicit removal so the sweep can keep retrying until \
+             `contract_in_use` becomes false"
+        );
+
+        // Step 3: subscriber leaves; `contract_in_use` becomes false.
+        // The next sweep would route this through
+        // `reclaim_evicted_contract`, which (with the gate now open)
+        // emits a fresh `EvictContract`. On successful reclamation,
+        // `RuntimePool::remove_contract` calls
+        // `pending_reclamation_remove`. We model the successful retry
+        // here by calling `pending_reclamation_remove` directly.
+        manager.remove_client_subscription(contract.id(), client);
+        assert!(!manager.contract_in_use(&contract));
+        // The sweep would re-snapshot at this point and route through
+        // reclaim_evicted_contract — model the successful path.
+        manager.pending_reclamation_remove(&contract);
+        assert_eq!(manager.pending_reclamation_len(), 0);
+        assert!(manager.pending_reclamation_snapshot().is_empty());
     }
 }

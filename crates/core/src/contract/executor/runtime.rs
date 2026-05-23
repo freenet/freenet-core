@@ -487,6 +487,17 @@ impl RuntimePool {
 }
 
 impl ContractExecutor for RuntimePool {
+    /// Forward the pending-reclamation registration to the ring's retry
+    /// queue. See `Ring::pending_reclamation_add` and the
+    /// `pending_reclamation` field docs on `HostingManager`. Called by
+    /// the `contract_handling` event loop when a fair-queue rejection
+    /// drops an `EvictContract` event before it can complete.
+    fn track_pending_reclamation(&self, key: ContractKey, expected_generation: u64) {
+        self.op_manager
+            .ring
+            .pending_reclamation_add(key, expected_generation);
+    }
+
     fn lookup_key(&self, instance_id: &ContractInstanceId) -> Option<ContractKey> {
         // Try to find the key in any available executor
         self.runtimes.iter().flatten().find_map(|executor| {
@@ -544,18 +555,66 @@ impl ContractExecutor for RuntimePool {
         //    path (i.e. before the PUT response returns), so a write that
         //    raced ahead of this handler will have already advanced it
         //    past `expected_generation`.
-        if self.op_manager.ring.is_hosting_contract(key)
-            || self.op_manager.ring.contract_in_use(key)
-        {
+        if self.op_manager.ring.is_hosting_contract(key) {
+            // The hosting cache itself re-added the contract — a later
+            // genuine eviction will emit a fresh `EvictContract`, so we
+            // do NOT need a pending-reclamation entry. Adding one here
+            // would race the cache and risk a spurious retry against a
+            // contract that is still hosted.
+            //
+            // If a pending entry already exists (e.g. an earlier
+            // `contract_in_use` skip queued the key, then a later write
+            // re-hosted it via the cache), clear it: the cache is now
+            // responsible for emitting a fresh `EvictContract` if and
+            // when the contract is evicted again. Leaving the stale
+            // pending entry behind would let the sweep keep emitting
+            // `EvictContract` events that hit `is_hosting_contract` and
+            // bail without progress.
+            self.op_manager.ring.pending_reclamation_remove(key);
             tracing::debug!(
                 contract = %key,
-                "Skipping eviction reclamation — contract was re-hosted or re-subscribed \
-                 since it was evicted"
+                "Skipping eviction reclamation — contract was re-hosted \
+                 (hosting cache contains it) since it was evicted"
+            );
+            return Ok(());
+        }
+        if self.op_manager.ring.contract_in_use(key) {
+            // A subscriber (client or downstream peer) appeared in the
+            // window between eviction and this handler running. The
+            // hosting-cache entry is already gone, so when that
+            // subscriber later expires/disconnects no cache entry will
+            // remain to emit another `EvictContract`. Stash the key in
+            // the pending-reclamation queue so the periodic sweep
+            // retries once `contract_in_use` becomes false.
+            //
+            // Disk-leak edge case #2 in PR #4212 review round 7 — see
+            // `HostingManager::pending_reclamation` docs.
+            self.op_manager
+                .ring
+                .pending_reclamation_add(*key, expected_generation);
+            tracing::debug!(
+                contract = %key,
+                "Skipping eviction reclamation — contract is in use \
+                 (client subscription or downstream subscriber); queued \
+                 for retry by the periodic sweep"
             );
             return Ok(());
         }
         let current_generation = self.op_manager.ring.state_generation(key);
         if current_generation != expected_generation {
+            // A state write (PUT/UPDATE) occurred between eviction and
+            // now. The contract has been re-hosted by the write path;
+            // a later genuine eviction will emit a fresh
+            // `EvictContract` with the current generation. We do NOT
+            // add a pending entry — the write path will naturally
+            // re-host and re-evict if appropriate.
+            //
+            // Clear any stale pending entry for the same reason: the
+            // write path's re-host+re-evict cycle owns subsequent
+            // reclamation, so leaving an entry behind only produces
+            // spurious sweep retries that all bail at the
+            // generation-mismatch check.
+            self.op_manager.ring.pending_reclamation_remove(key);
             tracing::debug!(
                 contract = %key,
                 expected_generation,
@@ -582,6 +641,11 @@ impl ContractExecutor for RuntimePool {
         // (the next access will refresh it; the generation is monotonic).
         if result.is_ok() {
             self.op_manager.ring.forget_state_generation(key);
+            // A successful retry from the pending-reclamation queue
+            // must clear the queue entry too. No-op when the key was
+            // not previously pending (the common case — most evictions
+            // succeed on the first attempt).
+            self.op_manager.ring.pending_reclamation_remove(key);
         }
         result
     }

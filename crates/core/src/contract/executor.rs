@@ -455,6 +455,15 @@ pub(crate) trait ContractExecutor: Send + 'static {
         async { Ok(()) }
     }
 
+    /// Record that an `EvictContract` event was dropped before it could
+    /// complete (queue-full rejection in `contract_handling`), so the
+    /// periodic sweep can retry it via `reclaim_evicted_contract`.
+    ///
+    /// Default implementation is a no-op (for mock executors with no
+    /// `Ring` to record into). The real implementation on `RuntimePool`
+    /// forwards to `op_manager.ring.pending_reclamation_add`.
+    fn track_pending_reclamation(&self, _key: ContractKey, _expected_generation: u64) {}
+
     /// Compute the state summary for a contract using the contract's summarize_state method.
     fn summarize_contract_state(
         &mut self,
