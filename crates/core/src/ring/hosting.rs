@@ -649,20 +649,30 @@ impl HostingManager {
             .is_some_and(|peers| !peers.is_empty())
     }
 
-    /// Whether something still depends on this node hosting `contract` — i.e.
-    /// it has a live local client subscription, a downstream peer subscriber,
-    /// or an active upstream network subscription. Used to gate hosting-cache
-    /// eviction reclamation: a contract that is in use must NOT have its
-    /// on-disk state/code deleted.
+    /// Whether something still depends on this node hosting `contract` — a
+    /// live local client subscription or a downstream peer subscriber. Used
+    /// to gate hosting-cache eviction reclamation: a contract that is in
+    /// use must NOT have its on-disk state/code deleted.
     ///
-    /// The network-subscription term (`is_subscribed`) matters because a node
-    /// can hold an active upstream subscription for a contract with no local
-    /// client and no downstream subscriber — it still expects UPDATEs, so its
-    /// disk state must be retained.
+    /// **Why `is_subscribed` (this node's own upstream subscription) is NOT
+    /// included.** It would seem natural to also exempt contracts the node
+    /// is actively subscribed to. The problem is `contracts_needing_renewal`
+    /// section 1 renews ANY soon-to-expire active subscription
+    /// unconditionally, with no gate on local interest. So an
+    /// `is_subscribed`-only exemption is effectively unbounded — the renewal
+    /// machinery would keep extending the lease forever, blocking
+    /// reclamation indefinitely. That would violate the cleanup-exemption
+    /// rule in `AGENTS.md` (exemptions must be time-bounded). Local-client
+    /// subscriptions and downstream subscribers ARE both time-bounded:
+    /// client subscriptions expire on disconnect; downstream subscribers
+    /// expire via `expire_stale_downstream_subscribers` after
+    /// `SUBSCRIPTION_LEASE_DURATION` without renewal.
+    ///
+    /// The narrow case "subscribed but no local interest" should be handled
+    /// by tearing down the orphaned upstream subscription, not by carrying
+    /// an unbounded GC exemption here.
     pub fn contract_in_use(&self, contract: &ContractKey) -> bool {
-        self.has_client_subscriptions(contract.id())
-            || self.has_downstream_subscribers(contract)
-            || self.is_subscribed(contract)
+        self.has_client_subscriptions(contract.id()) || self.has_downstream_subscribers(contract)
     }
 
     /// Remove downstream subscribers whose leases have expired.
@@ -2554,38 +2564,37 @@ mod tests {
         );
     }
 
-    /// A contract with ONLY an active upstream network subscription (no local
-    /// client, no downstream subscriber) IS in use — this node still expects
-    /// UPDATEs, so its on-disk state must not be reclaimed.
+    /// A contract with ONLY an active upstream network subscription (no
+    /// local client, no downstream subscriber) is NOT in use for
+    /// reclamation purposes. Documented in `contract_in_use`'s rustdoc:
+    /// `contracts_needing_renewal` renews active subscriptions
+    /// unconditionally, so including `is_subscribed` here would be an
+    /// effectively unbounded GC exemption (AGENTS.md cleanup-exemption
+    /// rule). Local-client subscriptions and downstream-peer subscribers
+    /// are both time-bounded and remain in the predicate.
     #[test]
-    fn test_contract_in_use_true_with_network_subscription_only() {
+    fn test_contract_in_use_excludes_network_subscription_only() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(4);
 
-        // No client subscription, no downstream subscriber yet.
         assert!(!manager.has_client_subscriptions(contract.id()));
         assert!(!manager.has_downstream_subscribers(&contract));
-        assert!(
-            !manager.contract_in_use(&contract),
-            "with no subscriptions of any kind the contract is not in use"
-        );
+        assert!(!manager.contract_in_use(&contract));
 
-        // Establish an active upstream network subscription only.
+        // Establishing an upstream network subscription alone must NOT
+        // make the contract appear in-use, because the renewal machinery
+        // would keep extending the lease forever.
         manager.subscribe(contract);
         assert!(manager.is_subscribed(&contract));
         assert!(
-            manager.contract_in_use(&contract),
-            "a contract with an active network subscription must be in use \
-             even with no local client or downstream subscriber"
+            !manager.contract_in_use(&contract),
+            "an active upstream network subscription alone must NOT block \
+             reclamation (the renewal machinery would keep it alive \
+             unboundedly — see contract_in_use rustdoc)"
         );
 
-        // Once the network subscription is dropped, it becomes reclaimable.
         manager.unsubscribe(&contract);
-        assert!(
-            !manager.contract_in_use(&contract),
-            "contract must become reclaimable once its network subscription \
-             is removed"
-        );
+        assert!(!manager.contract_in_use(&contract));
     }
 
     /// Generation flow through `HostingManager`: bumping the state
@@ -2775,9 +2784,12 @@ mod tests {
         );
     }
 
-    /// `record_contract_access` must not evict an in-use (subscribed)
-    /// contract when the cache is over budget; once the subscription is
-    /// removed the contract becomes evictable.
+    /// `record_contract_access` must not evict an in-use contract when the
+    /// cache is over budget; once the in-use signal is removed the contract
+    /// becomes evictable. The in-use signal here is a local client
+    /// subscription — the time-bounded form `contract_in_use` actually
+    /// checks (see its rustdoc for why an upstream network subscription
+    /// alone is excluded).
     #[test]
     fn test_record_contract_access_skips_in_use_contract() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
@@ -2796,8 +2808,9 @@ mod tests {
         let filler = make_contract_key(2);
         let trigger = make_contract_key(3);
 
-        // `in_use` is the oldest LRU entry but has an active subscription.
-        manager.subscribe(in_use);
+        // `in_use` is the oldest LRU entry but has a local client subscription.
+        let client = crate::client_events::ClientId::next();
+        manager.add_client_subscription(in_use.id(), client);
         assert!(manager.contract_in_use(&in_use));
 
         manager.record_contract_access(in_use, 100, AccessType::Get);
@@ -2810,14 +2823,14 @@ mod tests {
         assert_eq!(
             result.evicted,
             vec![(filler, 0)],
-            "in-use subscribed contract must be skipped; the unprotected \
-             contract must be evicted instead"
+            "in-use (client-subscribed) contract must be skipped; the \
+             unprotected contract must be evicted instead"
         );
         assert!(manager.is_hosting_contract(&in_use));
         assert!(!manager.is_hosting_contract(&filler));
 
-        // Drop the subscription: `in_use` is now evictable.
-        manager.unsubscribe(&in_use);
+        // Drop the client subscription: `in_use` is now evictable.
+        manager.remove_client_subscription(in_use.id(), client);
         assert!(!manager.contract_in_use(&in_use));
 
         let result = manager.record_contract_access(filler, 100, AccessType::Get);

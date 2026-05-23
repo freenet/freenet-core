@@ -175,9 +175,10 @@ pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &Contr
 
 /// Reclaim the on-disk storage of a contract that was evicted from the
 /// hosting cache. Skips contracts that are still in use — an active client
-/// subscription, a downstream peer subscriber, or an active upstream
-/// network subscription means something still depends on us hosting it,
-/// so its state/code must NOT be deleted.
+/// subscription or a downstream peer subscriber means something still
+/// depends on us hosting it, so its state/code must NOT be deleted. See
+/// `HostingManager::contract_in_use` for why an active upstream network
+/// subscription alone is NOT included in the gate.
 ///
 /// `expected_generation` is the state-write generation captured atomically
 /// with the eviction decision (see `HostingCache::record_access` /
@@ -199,7 +200,7 @@ pub(crate) fn reclaim_evicted_contract(
         tracing::debug!(
             contract = %key,
             "Skipping disk reclamation for evicted contract — still in use \
-             (client subscription, downstream subscriber, or network subscription)"
+             (client subscription or downstream subscriber)"
         );
         return;
     }

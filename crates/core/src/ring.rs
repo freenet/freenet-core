@@ -1673,12 +1673,14 @@ impl Ring {
         self.hosting_manager.has_downstream_subscribers(contract)
     }
 
-    /// Whether something still depends on this node hosting `contract` — i.e.
-    /// it has a live local client subscription, a downstream peer subscriber,
-    /// or an active upstream network subscription.
+    /// Whether something still depends on this node hosting `contract` — a
+    /// live local client subscription or a downstream peer subscriber.
     ///
     /// Used to gate hosting-cache eviction reclamation: a contract that is in
-    /// use must not have its on-disk state/code deleted.
+    /// use must not have its on-disk state/code deleted. See
+    /// `HostingManager::contract_in_use` for why an active upstream network
+    /// subscription alone does NOT make the contract in-use (the renewal
+    /// machinery would refresh the lease unboundedly).
     pub(crate) fn contract_in_use(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.contract_in_use(contract)
     }
