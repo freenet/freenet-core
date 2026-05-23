@@ -149,9 +149,12 @@ group and other bits.
 Operators who configured a custom `umask` for the freenet service
 (e.g. `UMask=0027` in the systemd unit, or a shell `umask` in a wrapper
 script) **will see their setting overridden** — the node always
-tightens to `0o077`. A future release may make this configurable for
-operators who want, for example, `0o007` so a privileged backup group
-can read the secrets tree, but the current default is owner-only.
+tightens to `0o077`. The override is logged at INFO on startup with
+both the prior and new mask so operators can confirm what happened
+without inspecting on-disk file modes. There is currently no knob to
+relax this; if you have a concrete need for a different policy (e.g.
+`0o007` so a privileged backup group can read the secrets tree), open
+an issue under the secrets-at-rest umbrella (#4137).
 
 The tightening MUST happen before any thread is spawned: `umask(2)` is
 per-thread on macOS (BSD-derived semantics) and worker threads inherit
