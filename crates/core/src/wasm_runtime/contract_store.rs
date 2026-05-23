@@ -138,15 +138,24 @@ impl ContractStore {
             ContractContainer::Wasm(_) | _ => unimplemented!(),
         };
         let code_hash = key.code_hash();
-        if self.contract_cache.get(code_hash).is_some() {
-            // WASM code is cached, but we still need to ensure this instance_id is indexed.
-            // Different ContractInstanceIds with the same code need their own mapping.
-            // See issue #2380.
+        let key_path = code_hash.encode();
+        let key_path = self.contracts_dir.join(key_path).with_extension("wasm");
+        if self.contract_cache.get(code_hash).is_some() && key_path.exists() {
+            // WASM code is cached AND the blob is still on disk: fast path. We
+            // still need to ensure this instance_id is indexed (different
+            // ContractInstanceIds with the same code each need their own
+            // mapping — see issue #2380).
+            //
+            // We MUST also verify the blob is on disk: this `contract_cache` is
+            // per-`ContractStore` (per pool executor), and a `remove_contract`
+            // on a sibling executor can delete the shared blob without
+            // invalidating our cache. Falling through to the disk-write branch
+            // below restores the blob in that case so the new instance is
+            // durably stored. See issue #4218 for the underlying per-executor
+            // map divergence and Codex's round-4 finding.
             self.ensure_key_indexed(&key)?;
             return Ok(());
         }
-        let key_path = code_hash.encode();
-        let key_path = self.contracts_dir.join(key_path).with_extension("wasm");
         if let Ok((code, _ver)) = ContractCode::load_versioned_from_path(&key_path) {
             // WASM file exists on disk. Add to cache AND ensure the index is updated.
             // See issue #2344 for why this is critical after crash recovery.
@@ -910,6 +919,73 @@ mod test {
         store
             .remove_contract(&key)
             .expect("remove_contract must be Ok when the WASM file is already gone");
+
+        Ok(())
+    }
+
+    /// Regression test for Codex's round-4 finding: the `contract_cache` is
+    /// per-`ContractStore` (one per pool executor), but the `.wasm` blob on
+    /// disk is shared. A sibling executor's `remove_contract` can delete the
+    /// blob without invalidating this store's cache. A subsequent
+    /// `store_contract` for a new instance with the same code hash must NOT
+    /// take the cache-hit fast path silently — it must verify the blob still
+    /// exists on disk and re-write it if not. Otherwise the new instance is
+    /// indexed but blobless until the cache evicts and a fetch fails.
+    #[tokio::test]
+    async fn test_store_contract_rewrites_blob_when_cache_hit_but_disk_missing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let contract_dir = crate::util::tests::get_temp_dir();
+        std::fs::create_dir_all(contract_dir.path())?;
+        let db = create_test_db(contract_dir.path()).await;
+        let mut store = ContractStore::new(contract_dir.path().into(), 10_000, db)?;
+
+        let shared_code = vec![9, 9, 9, 9];
+
+        // Store instance X1: caches the code AND writes the blob.
+        let x1 = WrappedContract::new(
+            Arc::new(ContractCode::from(shared_code.clone())),
+            [1, 1].as_ref().into(),
+        );
+        let x1_code_hash = *x1.key().code_hash();
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(x1)))?;
+
+        let wasm_path = contract_dir
+            .path()
+            .join(x1_code_hash.encode())
+            .with_extension("wasm");
+        assert!(wasm_path.exists(), "blob must exist after first store");
+
+        // Simulate a sibling executor's `remove_contract` deleting the shared
+        // blob WITHOUT invalidating this store's `contract_cache`.
+        std::fs::remove_file(&wasm_path)?;
+        assert!(!wasm_path.exists());
+        assert!(
+            store.contract_cache.get(&x1_code_hash).is_some(),
+            "this store's cache still has the code (sibling did not invalidate it)"
+        );
+
+        // Store a NEW instance X2 with the SAME code hash. Pre-fix, the
+        // cache-hit fast path returned Ok without re-writing the blob,
+        // leaving X2 indexed but blobless. Post-fix, the disk-existence
+        // check forces a re-write.
+        let x2 = WrappedContract::new(
+            Arc::new(ContractCode::from(shared_code)),
+            [2, 2].as_ref().into(),
+        );
+        let x2_key = *x2.key();
+        let params: Parameters = [2, 2].as_ref().into();
+        store.store_contract(ContractContainer::Wasm(ContractWasmAPIVersion::V1(x2)))?;
+
+        assert!(
+            wasm_path.exists(),
+            "blob must be re-written after store_contract for a new instance \
+             whose shared code was in cache but missing from disk"
+        );
+        // And the new instance is fetchable end-to-end.
+        assert!(
+            store.fetch_contract(&x2_key, &params).is_some(),
+            "new instance must be fetchable after rewrite"
+        );
 
         Ok(())
     }
