@@ -249,7 +249,9 @@ impl ContractStore {
                 // blob is unreferenced. A leaked blob is recoverable disk
                 // space; deleting a still-referenced shared blob corrupts
                 // every surviving contract using that code. Fail safe:
-                // keep the blob.
+                // keep the blob — and return an error so the caller knows
+                // the code half was NOT fully reclaimed and will requeue
+                // for retry rather than clearing the pending entry.
                 tracing::warn!(
                     code_hash = %contract_hash,
                     error = %e,
@@ -257,7 +259,11 @@ impl ContractStore {
                      contract; keeping the .wasm blob to avoid corrupting \
                      contracts that may still reference this code"
                 );
-                return Ok(());
+                return Err(anyhow::anyhow!(
+                    "kept WASM blob for {contract_hash}: shared contract \
+                     index read failed: {e}"
+                )
+                .into());
             }
         };
         if !code_still_referenced {
