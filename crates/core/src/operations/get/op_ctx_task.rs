@@ -2134,21 +2134,21 @@ async fn drive_relay_get_inner(
                         phase = "not_found",
                         "GET relay: all peers exhausted — sending NotFound upstream"
                     );
+                    // Exhaustion NotFound: this relay is reporting its own
+                    // exhaustion of downstream candidates. hop_count is its
+                    // forward depth (max_htl - htl).
+                    let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
                     if let Some(event) = crate::tracing::NetEventLog::get_not_found(
                         &incoming_tx,
                         &op_manager.ring,
                         instance_id,
-                        None,
+                        Some(hop_count),
                     ) {
                         op_manager
                             .ring
                             .register_events(either::Either::Left(event))
                             .await;
                     }
-                    // Exhaustion NotFound: this relay is reporting its own
-                    // exhaustion of downstream candidates. hop_count is its
-                    // forward depth (max_htl - htl).
-                    let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
                     relay_send_not_found(
                         op_manager,
                         incoming_tx,
