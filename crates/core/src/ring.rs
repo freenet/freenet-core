@@ -47,6 +47,10 @@ mod connection_manager;
 pub(crate) use connection_manager::ConnectionManager;
 mod connection;
 mod hosting;
+/// Single source of truth for the default hosted-contract-state budget.
+/// `config::default_max_hosting_storage()` resolves to this so the
+/// operator-facing default and the in-code fallback can never drift.
+pub(crate) use hosting::DEFAULT_HOSTING_BUDGET_BYTES;
 pub use hosting::{AccessType, RecordAccessResult};
 pub mod interest;
 mod live_tx;
@@ -219,7 +223,7 @@ impl Ring {
             max_hops_to_live,
             router,
             connection_manager,
-            hosting_manager: hosting::HostingManager::new(),
+            hosting_manager: hosting::HostingManager::new(config.config.max_hosting_storage),
             live_tx_tracker: live_tx_tracker.clone(),
             event_register: Box::new(event_register),
             op_manager: RwLock::new(None),
@@ -1169,24 +1173,84 @@ impl Ring {
             // Sweep expired entries from GET subscription cache
             let expired = ring.sweep_expired_get_subscriptions();
 
-            if expired.is_empty() {
-                continue;
+            // Do NOT early-continue when `expired` is empty: pending
+            // reclamation retries below must run every cycle, otherwise
+            // entries queued by the in-use / queue-full skip points stay
+            // leaked indefinitely whenever the cache is under budget
+            // (the common case). See Codex r10 P2.
+            if !expired.is_empty() {
+                tracing::debug!(
+                    expired_count = expired.len(),
+                    "GET subscription cache sweep found expired entries"
+                );
             }
 
-            tracing::debug!(
-                expired_count = expired.len(),
-                "GET subscription cache sweep found expired entries"
-            );
+            // Reclaim on-disk storage for the expired contracts so the hosting
+            // budget is a real disk bound. The sweep task only holds an
+            // `Arc<Ring>`; reach the `OpManager` the same way
+            // `recover_orphaned_subscriptions` does, via the weak back-reference.
+            // `reclaim_evicted_contract` re-checks the subscription gate per
+            // key before emitting the eviction event.
+            let op_manager = ring.upgrade_op_manager();
+            if op_manager.is_none() {
+                // The weak back-reference is dropped only during node shutdown;
+                // surface the skipped reclamation so an unexpected `None` (and
+                // the resulting on-disk leak for this cycle) is observable.
+                tracing::debug!(
+                    expired_count = expired.len(),
+                    "OpManager unavailable during GET subscription sweep — \
+                     on-disk reclamation skipped for the expired contracts this cycle"
+                );
+            }
 
             // Clean up local subscription state for each expired contract.
             // Note: contracts with client subscriptions are protected from eviction
             // by the should_retain predicate in sweep_expired_hosting().
-            for key in expired {
+            // The `expected_generation` snapshot is captured atomically with
+            // the eviction decision in `HostingCache::record_access` /
+            // `sweep_expired`; it is re-checked at deletion time by
+            // `RuntimePool::remove_contract` to close the re-host race.
+            for (key, expected_generation) in expired {
                 ring.unsubscribe(&key);
                 tracing::info!(
                     %key,
                     "Cleaned up expired hosting subscription from local state"
                 );
+                if let Some(op_manager) = &op_manager {
+                    crate::operations::reclaim_evicted_contract(
+                        op_manager,
+                        key,
+                        expected_generation,
+                    );
+                }
+            }
+
+            // Retry pending reclamations queued by the two skip points
+            // (fair-queue rejection of `EvictContract` and the
+            // `contract_in_use` skip in `RuntimePool::remove_contract`).
+            // The snapshot iterates without holding the DashMap shard
+            // guards. Each retry routes through
+            // `reclaim_evicted_contract`, which re-checks
+            // `contract_in_use` — entries that are still in use stay in
+            // the queue (no event emitted) and will be retried next
+            // cycle. Successful reclamations clear their pending entry
+            // in `RuntimePool::remove_contract`.
+            if let Some(op_manager) = &op_manager {
+                let pending = ring.pending_reclamation_snapshot();
+                if !pending.is_empty() {
+                    tracing::debug!(
+                        pending_count = pending.len(),
+                        "Retrying pending reclamations from previous skipped \
+                         `EvictContract` events"
+                    );
+                    for (key, expected_generation) in pending {
+                        crate::operations::reclaim_evicted_contract(
+                            op_manager,
+                            key,
+                            expected_generation,
+                        );
+                    }
+                }
             }
         }
     }
@@ -1673,6 +1737,74 @@ impl Ring {
         self.hosting_manager.has_downstream_subscribers(contract)
     }
 
+    /// Whether something still depends on this node hosting `contract` — a
+    /// live local client subscription or a downstream peer subscriber.
+    ///
+    /// Used to gate hosting-cache eviction reclamation: a contract that is in
+    /// use must not have its on-disk state/code deleted. See
+    /// `HostingManager::contract_in_use` for why an active upstream network
+    /// subscription alone does NOT make the contract in-use (the renewal
+    /// machinery would refresh the lease unboundedly).
+    pub(crate) fn contract_in_use(&self, contract: &ContractKey) -> bool {
+        self.hosting_manager.contract_in_use(contract)
+    }
+
+    /// Atomically bump the state-write generation for `contract`.
+    ///
+    /// Called from the executor's state-write chokepoints
+    /// (`state_store.store` / `state_store.update`). Pairs with the
+    /// generation captured in `HostedContract.write_generation` at
+    /// eviction time to close the EvictContract re-host race — see
+    /// `HostingManager::state_generation` for full rationale.
+    pub(crate) fn bump_state_generation(&self, contract: &ContractKey) -> u64 {
+        self.hosting_manager.bump_state_generation(contract)
+    }
+
+    /// Read the current state-write generation for `contract` (0 if never written).
+    pub(crate) fn state_generation(&self, contract: &ContractKey) -> u64 {
+        self.hosting_manager.state_generation(contract)
+    }
+
+    /// Forget the state-write generation entry for `contract` after a
+    /// successful disk reclamation. Keeps the generation map bounded.
+    pub(crate) fn forget_state_generation(&self, contract: &ContractKey) {
+        self.hosting_manager.forget_state_generation(contract)
+    }
+
+    /// Refresh the hosting-cache snapshot of `contract`'s state-write
+    /// generation to `new_gen`. Paired with `bump_state_generation` at
+    /// every state-write chokepoint — see
+    /// `HostingManager::refresh_cache_generation`.
+    pub(crate) fn refresh_cache_generation(&self, contract: &ContractKey, new_gen: u64) {
+        self.hosting_manager
+            .refresh_cache_generation(contract, new_gen)
+    }
+
+    /// Add `contract` to the pending-reclamation retry queue with the
+    /// captured `expected_generation`. Called from the two skip points
+    /// that drop an `EvictContract` event before it can complete (fair
+    /// queue rejection, `contract_in_use` skip in `RuntimePool::remove_contract`).
+    /// See `HostingManager::pending_reclamation_add` for the queue's
+    /// invariants and how the periodic sweep retries entries.
+    pub(crate) fn pending_reclamation_add(&self, contract: ContractKey, expected_generation: u64) {
+        self.hosting_manager
+            .pending_reclamation_add(contract, expected_generation)
+    }
+
+    /// Remove `contract` from the pending-reclamation retry queue after
+    /// a successful disk reclamation. See
+    /// `HostingManager::pending_reclamation_remove`.
+    pub(crate) fn pending_reclamation_remove(&self, contract: &ContractKey) {
+        self.hosting_manager.pending_reclamation_remove(contract)
+    }
+
+    /// Snapshot the pending-reclamation queue for the periodic sweep
+    /// to iterate without holding any DashMap shard guard. See
+    /// `HostingManager::pending_reclamation_snapshot`.
+    pub(crate) fn pending_reclamation_snapshot(&self) -> Vec<(ContractKey, u64)> {
+        self.hosting_manager.pending_reclamation_snapshot()
+    }
+
     pub fn expire_stale_downstream_subscribers(&self) -> Vec<(ContractKey, usize)> {
         self.hosting_manager.expire_stale_downstream_subscribers()
     }
@@ -1803,18 +1935,22 @@ impl Ring {
 
     /// Sweep for expired entries in the hosting cache.
     ///
-    /// Returns contracts evicted from this cache. Contracts with client
-    /// subscriptions are protected from eviction.
-    pub fn sweep_expired_hosting(&self) -> Vec<ContractKey> {
+    /// Returns `(ContractKey, write_generation)` pairs for contracts
+    /// evicted from this cache. Contracts with client subscriptions
+    /// (or downstream/network subscribers) are protected from eviction.
+    /// The generation snapshot is carried through `EvictContract` so the
+    /// deletion-time guard can detect a re-host race.
+    pub fn sweep_expired_hosting(&self) -> Vec<(ContractKey, u64)> {
         self.hosting_manager.sweep_expired_hosting()
     }
 
     // ==================== Legacy GET Auto-Subscription (delegating to hosting cache) ====================
     /// Sweep for expired entries (delegated to hosting cache).
     ///
-    /// Returns contracts evicted from the cache. Contracts with client
-    /// subscriptions are protected from eviction.
-    pub fn sweep_expired_get_subscriptions(&self) -> Vec<ContractKey> {
+    /// Returns `(ContractKey, write_generation)` pairs for contracts
+    /// evicted from the cache. Contracts with client subscriptions are
+    /// protected from eviction.
+    pub fn sweep_expired_get_subscriptions(&self) -> Vec<(ContractKey, u64)> {
         // Delegate to hosting cache
         self.sweep_expired_hosting()
     }

@@ -103,6 +103,14 @@ pub struct ConfigArgs {
     #[arg(long, env = "MAX_BLOCKING_THREADS")]
     pub max_blocking_threads: Option<usize>,
 
+    /// Budget in bytes for hosted contract *state*. Once exceeded, contracts
+    /// are evicted (least-valuable-first) and their on-disk state reclaimed.
+    /// This bounds tracked contract state only — WASM code blobs and ReDb/
+    /// SQLite database overhead are additional and not counted against it.
+    /// Default: 1 GiB.
+    #[arg(long, env = "MAX_HOSTING_STORAGE")]
+    pub max_hosting_storage: Option<u64>,
+
     #[command(flatten)]
     pub telemetry: TelemetryArgs,
 }
@@ -150,6 +158,7 @@ impl Default for ConfigArgs {
             id: None,
             version: false,
             max_blocking_threads: None,
+            max_hosting_storage: None,
             telemetry: Default::default(),
         }
     }
@@ -354,6 +363,8 @@ impl ConfigArgs {
                 self.network_api.bbr_startup_rate = cfg.network_api.bbr_startup_rate;
             }
             self.log_level.get_or_insert(cfg.log_level);
+            self.max_hosting_storage
+                .get_or_insert(cfg.max_hosting_storage);
             self.config_paths.merge(cfg.config_paths.as_ref().clone());
             // Merge telemetry config - CLI args override file config
             // Note: enabled defaults to true via clap, so we only override
@@ -695,6 +706,9 @@ impl ConfigArgs {
             max_blocking_threads: self
                 .max_blocking_threads
                 .unwrap_or_else(default_max_blocking_threads),
+            max_hosting_storage: self
+                .max_hosting_storage
+                .unwrap_or(crate::ring::DEFAULT_HOSTING_BUDGET_BYTES),
             telemetry: TelemetryConfig {
                 enabled: self.telemetry.enabled,
                 endpoint: self
@@ -801,6 +815,15 @@ pub struct Config {
     /// Maximum number of threads for blocking operations (WASM execution, etc.).
     #[serde(default = "default_max_blocking_threads")]
     pub max_blocking_threads: usize,
+    /// Budget in bytes for hosted contract *state*. Once exceeded, contracts
+    /// are evicted (least-valuable-first) and their on-disk state reclaimed.
+    /// This bounds tracked contract state only — WASM code blobs and ReDb/
+    /// SQLite database overhead are additional and not counted against it.
+    #[serde(
+        default = "default_max_hosting_storage",
+        rename = "max-hosting-storage"
+    )]
+    pub max_hosting_storage: u64,
     /// Telemetry configuration
     #[serde(flatten)]
     pub telemetry: TelemetryConfig,
@@ -811,6 +834,16 @@ fn default_max_blocking_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| (n.get() * 2).clamp(4, 32))
         .unwrap_or(8)
+}
+
+/// Default operator-facing budget for hosted contract state (1 GiB).
+///
+/// Resolves to [`crate::ring::DEFAULT_HOSTING_BUDGET_BYTES`], which is
+/// the single source of truth for this value — the in-code fallback used by the
+/// hosting cache and its tests. This indirection keeps the operator-facing
+/// default and the in-code default from ever drifting apart.
+fn default_max_hosting_storage() -> u64 {
+    crate::ring::DEFAULT_HOSTING_BUDGET_BYTES
 }
 
 impl Config {
@@ -2702,6 +2735,56 @@ mod tests {
         let cfg = args.build().await.unwrap();
         let serialized = toml::to_string(&cfg).unwrap();
         let _: Config = toml::from_str(&serialized).unwrap();
+    }
+
+    #[tokio::test]
+    async fn max_hosting_storage_defaults_to_one_gib() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            ..Default::default()
+        };
+        let cfg = args.build().await.unwrap();
+        assert_eq!(
+            cfg.max_hosting_storage,
+            crate::ring::DEFAULT_HOSTING_BUDGET_BYTES,
+            "default max_hosting_storage should resolve to the hosting cache's \
+             single-source-of-truth default budget"
+        );
+        assert_eq!(
+            crate::ring::DEFAULT_HOSTING_BUDGET_BYTES,
+            1024 * 1024 * 1024,
+            "default hosting budget should be 1 GiB"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_hosting_storage_explicit_value_round_trips() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let custom = 256 * 1024 * 1024_u64;
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            max_hosting_storage: Some(custom),
+            ..Default::default()
+        };
+        let cfg = args.build().await.unwrap();
+        assert_eq!(cfg.max_hosting_storage, custom);
+
+        // Round-trips through TOML serialization.
+        let serialized = toml::to_string(&cfg).unwrap();
+        assert!(serialized.contains("max-hosting-storage"));
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.max_hosting_storage, custom);
     }
 
     /// Build a minimal local-mode ConfigArgs with the given CIDR list and

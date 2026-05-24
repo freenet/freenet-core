@@ -173,6 +173,54 @@ pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &Contr
     }
 }
 
+/// Reclaim the on-disk storage of a contract that was evicted from the
+/// hosting cache. Skips contracts that are still in use — an active client
+/// subscription or a downstream peer subscriber means something still
+/// depends on us hosting it, so its state/code must NOT be deleted. See
+/// `HostingManager::contract_in_use` for why an active upstream network
+/// subscription alone is NOT included in the gate.
+///
+/// `expected_generation` is the state-write generation captured atomically
+/// with the eviction decision (see `HostingCache::record_access` /
+/// `sweep_expired`). It is carried through `EvictContract` so the
+/// deletion-time guard in `RuntimePool::remove_contract` can detect a
+/// state write (PUT/UPDATE) that re-hosted the contract between eviction
+/// and this handler running — that case must skip disk reclamation
+/// because the freshly written state would otherwise be deleted.
+///
+/// Fire-and-forget: emits an `EvictContract` event to the contract handler,
+/// which routes it through the fair queue (serialized per-contract with other
+/// ops on the same key) and reclaims disk in `handle_contract_event`.
+pub(crate) fn reclaim_evicted_contract(
+    op_manager: &OpManager,
+    key: ContractKey,
+    expected_generation: u64,
+) {
+    if op_manager.ring.contract_in_use(&key) {
+        tracing::debug!(
+            contract = %key,
+            "Skipping disk reclamation for evicted contract — still in use \
+             (client subscription or downstream subscriber); queued for retry"
+        );
+        // Queue for retry by the periodic sweep: the hosting-cache entry is
+        // already gone (we are processing its `evicted` tuple), so when the
+        // subscriber later expires nothing else would emit another
+        // EvictContract for this key — without this, the disk state/code
+        // would leak permanently. Mirrors the symmetric in-use skip in
+        // RuntimePool::remove_contract.
+        op_manager
+            .ring
+            .pending_reclamation_add(key, expected_generation);
+        return;
+    }
+    op_manager.notify_contract_handler_fire_and_forget(
+        crate::contract::ContractHandlerEvent::EvictContract {
+            key,
+            expected_generation,
+        },
+    );
+}
+
 /// Complete subscription at the originator node via GET piggyback.
 ///
 /// The subscription tree was built by relay nodes during GET response propagation.
@@ -349,7 +397,8 @@ pub(crate) async fn has_contract(
         | crate::contract::ContractHandlerEvent::GetSummaryResponse { .. }
         | crate::contract::ContractHandlerEvent::GetDeltaQuery { .. }
         | crate::contract::ContractHandlerEvent::GetDeltaResponse { .. }
-        | crate::contract::ContractHandlerEvent::ClientDisconnect { .. } => Ok(None),
+        | crate::contract::ContractHandlerEvent::ClientDisconnect { .. }
+        | crate::contract::ContractHandlerEvent::EvictContract { .. } => Ok(None),
     }
 }
 

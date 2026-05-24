@@ -110,10 +110,11 @@ Pattern (logic in native_api.rs):
 USE: StateStore trait
 Backends: redb (default), sqlite
 
-Operations:
-  - get_state(key) → Option<State>
-  - put_state(key, state) → Result
-  - delete_state(key) → Result
+Operations (StateStore methods):
+  - get(key) → WrappedState
+  - store(key, state, params) → Result
+  - update(key, state) → Result
+  - delete(key) → Result
 
 MUST:
   - Handle missing state gracefully (new contract)

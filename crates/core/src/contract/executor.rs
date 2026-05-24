@@ -434,6 +434,36 @@ pub(crate) trait ContractExecutor: Send + 'static {
     /// Default implementation is a no-op (for mock executors that don't track subscriptions).
     fn remove_client(&self, _client_id: ClientId) {}
 
+    /// Reclaim a contract's on-disk storage (persisted state + parameters and
+    /// the WASM code blob) after the contract was evicted from the hosting
+    /// cache. Best-effort and idempotent: a double eviction is a no-op.
+    ///
+    /// `expected_generation` is the state-write generation captured
+    /// atomically with the eviction decision. Implementations that wire
+    /// through to a real `Ring`/`HostingManager` re-read the current
+    /// generation and skip reclamation if it has advanced (closing the
+    /// EvictContract re-host race). Implementations without a `Ring` may
+    /// ignore the argument.
+    ///
+    /// Default implementation is a no-op (for mock executors that keep state
+    /// in memory and have no on-disk storage to reclaim).
+    fn remove_contract(
+        &mut self,
+        _key: &ContractKey,
+        _expected_generation: u64,
+    ) -> impl Future<Output = Result<(), ExecutorError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Record that an `EvictContract` event was dropped before it could
+    /// complete (queue-full rejection in `contract_handling`), so the
+    /// periodic sweep can retry it via `reclaim_evicted_contract`.
+    ///
+    /// Default implementation is a no-op (for mock executors with no
+    /// `Ring` to record into). The real implementation on `RuntimePool`
+    /// forwards to `op_manager.ring.pending_reclamation_add`.
+    fn track_pending_reclamation(&self, _key: ContractKey, _expected_generation: u64) {}
+
     /// Compute the state summary for a contract using the contract's summarize_state method.
     fn summarize_contract_state(
         &mut self,
