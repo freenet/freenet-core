@@ -391,24 +391,36 @@ pub(super) async fn fetch_contract_if_missing(
 ///    this, the peer registers as a subscriber but answers `NotFound`
 ///    on GETs that route through it because the contract body never
 ///    arrived.
-/// 5. **Announce that we host this contract to neighbors**, so they
-///    include us as a broadcast target for UPDATEs.
+/// 5. **Announce that we host this contract to neighbors**, *only when
+///    the body is locally present after step 4*. Announcing without a
+///    body would tell neighbors to forward UPDATEs to a peer that
+///    cannot validate or store them. If the body lands later via the
+///    sub-op GET's own cache path, `get/op_ctx_task.rs` calls
+///    `announce_contract_hosted` there — so the announce eventually
+///    fires either way.
 /// 6. Register the contract in our local interest manager (so inbound
 ///    `ChangeInterests` for this contract get processed) and broadcast
 ///    a `ChangeInterests` so connected peers learn we became interested.
-///    Gated on `!is_renewal` — renewals do not re-add the local-client
-///    entry (idempotent, but skipping the broadcast prevents a noisy
-///    spam every renewal cycle).
+///    Gated on `!is_renewal` — `add_local_client` is NOT idempotent
+///    (`ring::interest::Contract::add_client` increments
+///    `local_client_count` on every call); calling it on every renewal
+///    cycle (~2 minutes) would leak the gauge unboundedly.
 ///
-/// All side effects are idempotent for repeat subscribes / renewals.
+/// Latency note: because this function is awaited before the driver
+/// publishes `SubscribeResponse` to the client, a first-time subscribe
+/// to a contract we don't host can take up to `CONTRACT_WAIT_TIMEOUT_MS`
+/// (2 s) longer than the prior task-per-tx path took. This implements
+/// issue #4223's proposed approach point 2 ("do not emit
+/// subscribe_success to the client until fetch_contract_if_missing
+/// completes"); the latency is the cost of the client knowing the
+/// subscriber can actually serve a follow-up GET.
 ///
-/// The fetch step is best-effort: on timeout or sub-op failure the
-/// subscription is still finalized (lease installed, peer registered).
-/// The contract body can arrive later via UPDATE propagation, and a
-/// future GET through this peer would still return `NotFound` until
-/// then — but the alternative (failing the whole subscribe on a
-/// contract-fetch timeout) would leave the client without notifications
-/// it does want.
+/// See also: `crate::operations::complete_piggyback_subscription` —
+/// the GET-piggyback originator finalization path, which performs the
+/// same conceptual steps in a different order (it does NOT need the
+/// fetch step because the contract just arrived inside the GET
+/// response that carried the piggyback). Keep the two helpers in sync
+/// when adding new originator-side side effects.
 pub(super) async fn finalize_originator_subscribe(
     op_manager: &OpManager,
     key: ContractKey,
@@ -429,22 +441,45 @@ pub(super) async fn finalize_originator_subscribe(
     op_manager.ring.subscribe(key);
     op_manager.ring.complete_subscription_request(&key, true);
 
-    // Fetch the contract body if we don't have it locally. Best-effort:
-    // a timeout / sub-op failure does not abort finalization.
-    if let Err(err) = fetch_contract_if_missing(op_manager, *key.id()).await {
-        tracing::debug!(
-            contract = %key,
-            error = %err,
-            "subscribe: fetch_contract_if_missing failed; \
-             state will arrive via UPDATE if/when available"
-        );
-    }
+    // Fetch the contract body if we don't have it locally. The result
+    // gates the announce step: we only advertise hosting to neighbors
+    // when the body actually lands. On timeout (Ok(None)) or
+    // infrastructure failure (Err), the subscription is still finalized
+    // (lease installed, peer registered) — the contract may arrive
+    // later via UPDATE propagation or the sub-op GET completing past
+    // the 2 s wait window, at which point the GET driver's own
+    // `announce_contract_hosted` call fires.
+    let have_body = match fetch_contract_if_missing(op_manager, *key.id()).await {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            tracing::debug!(
+                contract = %key,
+                timeout_ms = CONTRACT_WAIT_TIMEOUT_MS,
+                "subscribe: contract body did not arrive within timeout; \
+                 deferring announce_contract_hosted — the sub-op GET will \
+                 announce when it caches, or UPDATE delivery will fill the gap"
+            );
+            false
+        }
+        Err(err) => {
+            // Infrastructure failure (notification channel closed,
+            // contract handler down). `warn` rather than `debug`
+            // because this signals broken local plumbing, not a
+            // routine cache miss.
+            tracing::warn!(
+                contract = %key,
+                error = %err,
+                "subscribe: fetch_contract_if_missing returned infra error; \
+                 deferring announce_contract_hosted — operator should \
+                 investigate (contract handler / notification channel)"
+            );
+            false
+        }
+    };
 
-    // Announce that we host this contract so neighbors include us as a
-    // broadcast target. Must come AFTER the fetch attempt — announcing
-    // before the body is present would tell neighbors to forward
-    // UPDATEs to a peer that cannot validate them.
-    super::announce_contract_hosted(op_manager, &key).await;
+    if have_body {
+        super::announce_contract_hosted(op_manager, &key).await;
+    }
 
     if !is_renewal {
         let became_interested = op_manager.interest_manager.add_local_client(&key);
