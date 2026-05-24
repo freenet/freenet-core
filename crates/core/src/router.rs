@@ -13,6 +13,33 @@ use crate::ring::{Distance, Location, PeerKeyLocation};
 pub(crate) use isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
 use util::{Mean, TransferSpeed};
 
+/// Default size of the candidate window the prediction-based router considers.
+///
+/// The router truncates candidates to the N geographically closest peers
+/// BEFORE the isotonic estimator scores them, so any peer outside this window
+/// is invisible to routing for that hop. The historical value was 5, set when
+/// `min_connections` was tiny and the comment in the original PR (#903) said
+/// "Later we can experiment with increasing this limit." That experiment never
+/// happened. Production telemetry on 2026-05 then showed 63% of failing GETs
+/// on subscribed contracts never visited any subscriber, because a small
+/// window misses uniformly-distributed subscribers most hops (issue #4222).
+///
+/// 25 matches `ring::Ring::DEFAULT_MIN_CONNECTIONS`, so a node at its minimum
+/// connection count surfaces its entire routing table to the predictor. Larger
+/// tables still favor the closest 25; the predictor's distance penalty
+/// preserves small-world routing.
+const DEFAULT_CONSIDER_N_CLOSEST_PEERS: usize = 25;
+
+// Compile-time link between this default and `Ring::DEFAULT_MIN_CONNECTIONS`
+// so future changes to either constant fail the build instead of silently
+// diverging. If you intentionally want this window to differ from
+// `DEFAULT_MIN_CONNECTIONS`, drop this assertion and document why.
+const _: () = assert!(
+    DEFAULT_CONSIDER_N_CLOSEST_PEERS == crate::ring::Ring::DEFAULT_MIN_CONNECTIONS,
+    "DEFAULT_CONSIDER_N_CLOSEST_PEERS must match Ring::DEFAULT_MIN_CONNECTIONS — \
+     see comment above."
+);
+
 // ==================== Telemetry types ====================
 
 /// A snapshot of a single routing decision for telemetry.
@@ -352,7 +379,7 @@ impl Router {
                 EstimatorType::Negative,
             ),
             mean_transfer_size,
-            consider_n_closest_peers: 5,
+            consider_n_closest_peers: DEFAULT_CONSIDER_N_CLOSEST_PEERS,
             per_op_failure: per_op_failure
                 .into_iter()
                 .map(|(k, v)| (k, IsotonicEstimator::new(v, EstimatorType::Positive)))
@@ -1105,6 +1132,94 @@ mod tests {
                 .considering_n_closest_peers(CAP)
                 .select_closest_peers(&create_peers(NUM_PEERS), &Location::random())
                 .len()
+        );
+    }
+
+    /// Regression test for issue #4222.
+    ///
+    /// Production telemetry on 2026-05 showed that 63% of failing GETs on
+    /// subscribed contracts never visited any of the contract's subscribers
+    /// during routing. Hop chains terminated early at mean 3.9 hops out of
+    /// max htl 10. The root cause was the historical
+    /// `consider_n_closest_peers = 5` cap in `select_closest_peers`: it
+    /// truncates candidates to the N geographically closest peers BEFORE the
+    /// isotonic estimator ranks them, so subscribers outside the 5-window are
+    /// invisible to routing for that hop. With median 31 subscribers
+    /// distributed roughly uniformly across the keyspace, a 5-peer window
+    /// includes a subscriber on fewer than half of all target locations —
+    /// matching the observed failure rate.
+    ///
+    /// This test models the production regime — many uniformly-distributed
+    /// connected peers, a smaller fraction subscribed to the contract being
+    /// fetched — and asserts the router's window is wide enough that at
+    /// least one subscriber appears in the candidate set on the overwhelming
+    /// majority of target locations. With the historical default of 5, this
+    /// test fails (subscriber coverage ≈ 42%). With the corrected default of
+    /// 25, it passes (coverage > 90% — hypergeometric expected value 93.4%).
+    #[test]
+    fn select_closest_peers_includes_subscribers_4222() {
+        let _guard = crate::config::GlobalRng::seed_guard(0x4222_5AFE);
+
+        const NUM_CONNECTIONS: u32 = 100;
+        const NUM_SUBSCRIBERS: usize = 10;
+        const NUM_TRIALS: usize = 200;
+        const REQUIRED_COVERAGE: f64 = 0.85;
+
+        // Default-constructed router uses DEFAULT_CONSIDER_N_CLOSEST_PEERS,
+        // matching production. Do NOT call `considering_n_closest_peers` here:
+        // the test pins the SHIPPED default, not an ad-hoc test override.
+        let router = Router::new(&[]);
+
+        // Pin the shipped window value explicitly. The statistical assertion
+        // below is calibrated against a window of 25 (~93% coverage); a silent
+        // drop to e.g. 18 would still produce ~85% coverage and pass the
+        // hypergeometric threshold by luck, hiding a regression. Fail loudly
+        // on any drift.
+        assert_eq!(
+            router.consider_n_closest_peers, 25,
+            "issue #4222 regression: expected DEFAULT_CONSIDER_N_CLOSEST_PEERS = 25"
+        );
+
+        let mut covered = 0usize;
+        for _ in 0..NUM_TRIALS {
+            let peers = create_peers(NUM_CONNECTIONS);
+            // create_peers generates random locations, so taking the first N
+            // is effectively a uniform random sample of "subscribers".
+            // NOTE: peer identity is keyed on `peer_addr` rather than `pub_key`
+            // because the test helper shares a thread-local pub_key across all
+            // synthetic peers — keying on pub_key would trivially match every
+            // peer, hiding the structural window behavior we are asserting.
+            let subscriber_addrs: std::collections::HashSet<_> = peers
+                .iter()
+                .take(NUM_SUBSCRIBERS)
+                .filter_map(|p| p.socket_addr())
+                .collect();
+            let target = Location::random();
+
+            let window = router.select_closest_peers(&peers, &target);
+            if window.iter().any(|p| {
+                p.socket_addr()
+                    .is_some_and(|a| subscriber_addrs.contains(&a))
+            }) {
+                covered += 1;
+            }
+        }
+
+        let coverage = covered as f64 / NUM_TRIALS as f64;
+        assert!(
+            coverage > REQUIRED_COVERAGE,
+            "subscriber coverage {:.3} below required {:.2} — issue #4222 root cause \
+             may have regressed: the router's candidate window \
+             (consider_n_closest_peers = {}) is too small to reliably include \
+             subscribers when they are uniformly distributed across the keyspace \
+             ({}/{} trials covered with {} subscribers in {} peers)",
+            coverage,
+            REQUIRED_COVERAGE,
+            router.consider_n_closest_peers,
+            covered,
+            NUM_TRIALS,
+            NUM_SUBSCRIBERS,
+            NUM_CONNECTIONS,
         );
     }
 
