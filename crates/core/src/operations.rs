@@ -157,17 +157,20 @@ pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &Contr
             %key,
             "NEIGHBOR_HOSTING: Announcing contract hosted to neighbors"
         );
-        if let Err(err) = op_manager
-            .notify_node_event(crate::message::NodeEvent::BroadcastHostingUpdate {
+        // Non-blocking emit: hosting announcements are best-effort
+        // gossip and missing one is recoverable via the next
+        // BroadcastStateChange or InterestSync round. A blocking
+        // `.await` here can stall the executor under load (#4145).
+        if let Err(err) =
+            op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastHostingUpdate {
                 message: announcement,
             })
-            .await
         {
             tracing::warn!(
                 contract = %key,
                 error = %err,
                 phase = "error",
-                "NEIGHBOR_HOSTING: Failed to broadcast hosting announcement"
+                "NEIGHBOR_HOSTING: Failed to broadcast hosting announcement (best-effort)"
             );
         }
     }
@@ -263,16 +266,18 @@ pub(crate) async fn broadcast_change_interests(
         "Broadcasting ChangeInterests to neighbors"
     );
 
-    if let Err(err) = op_manager
-        .notify_node_event(crate::message::NodeEvent::BroadcastChangeInterests {
+    // Non-blocking emit: interest changes are best-effort gossip;
+    // a missed one will be re-broadcast on the next change or
+    // converged via the periodic InterestSync exchange (#4145).
+    if let Err(err) =
+        op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastChangeInterests {
             added: added_hashes,
             removed: removed_hashes,
         })
-        .await
     {
         tracing::warn!(
             error = %err,
-            "Failed to broadcast ChangeInterests"
+            "Failed to broadcast ChangeInterests (best-effort)"
         );
     }
 }

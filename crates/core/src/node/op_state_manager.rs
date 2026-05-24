@@ -428,6 +428,33 @@ impl OpManager {
         }
     }
 
+    /// Non-blocking variant of [`Self::notify_node_event`] for best-effort
+    /// broadcast / heartbeat events whose loss is recoverable.
+    ///
+    /// Use when:
+    ///   1. The caller would otherwise block the WASM commit / executor
+    ///      path on the event-loop notification channel (issue #4145: a
+    ///      30-second `notify_node_event(...).await` from `runtime.rs` on
+    ///      every UPDATE was the primary back-pressure path that wedged
+    ///      both nova and vega gateways on 2026-05-24).
+    ///   2. Dropping the broadcast is acceptable — typically because a
+    ///      subsequent state apply, periodic renewal, or summary-mismatch
+    ///      `SyncStateToPeer` round will cover the missed signal.
+    ///
+    /// Returns `Ok(())` when the event was enqueued and
+    /// `Err(OpError::NotificationError)` (after logging at warn level)
+    /// when the channel was full or closed. **Callers should treat the
+    /// error as advisory and continue.**
+    pub fn try_notify_node_event(&self, msg: NodeEvent) -> Result<(), OpError> {
+        tracing::debug!(event = %msg, "try_notify_node_event: queuing node event (non-blocking)");
+        try_notify_node_event_on(
+            self.to_event_listener.notifications_sender(),
+            self.to_event_listener.notification_channel_pending(),
+            self.to_event_listener.notifications_sender().capacity(),
+            msg,
+        )
+    }
+
     /// Get all active subscriptions.
     /// In the simplified lease-based model, this returns contracts we're actively subscribed to.
     /// Note: We no longer track per-contract subscriber lists.
@@ -878,6 +905,46 @@ fn try_release_pending_op_slot_on(
     }
 }
 
+/// Non-blocking emit of a [`NodeEvent`] on the event-loop notification
+/// channel.
+///
+/// Extracted from [`OpManager::try_notify_node_event`] so the try-send
+/// path is testable in isolation without building a full `OpManager`.
+/// On `Full` or `Closed` the event is dropped, a warn-level log is
+/// emitted, and the function returns `Err(OpError::NotificationError)`.
+/// Best-effort by design — see the OpManager method doc for the wedge
+/// (#4145) this prevents.
+///
+/// `channel_pending` and `channel_capacity` are passed by the caller
+/// purely for log enrichment; they are read at the call site to avoid
+/// requiring the wrapper type here.
+fn try_notify_node_event_on(
+    notifications_sender: &mpsc::Sender<Either<NetMessage, NodeEvent>>,
+    channel_pending: usize,
+    channel_capacity: usize,
+    msg: NodeEvent,
+) -> Result<(), OpError> {
+    match notifications_sender.try_send(Either::Right(msg)) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::warn!(
+                channel_pending,
+                channel_remaining = channel_capacity,
+                "try_notify_node_event: event-loop notification channel full; \
+                 dropping best-effort broadcast event (#4145)"
+            );
+            Err(OpError::NotificationError)
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::warn!(
+                "try_notify_node_event: event-loop notification channel closed; \
+                 receiver likely dropped"
+            );
+            Err(OpError::NotificationError)
+        }
+    }
+}
+
 /// Notify the event loop about a timed-out transaction without blocking.
 ///
 /// Uses `try_send` instead of `.send().await` to avoid blocking the garbage
@@ -1200,7 +1267,7 @@ mod tests {
     use super::*;
     use crate::node::network_bridge::EventLoopNotificationsReceiver;
     use either::Either;
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{Duration, Instant, timeout};
 
     #[tokio::test]
     async fn notify_timeout_succeeds_when_receiver_alive() {
@@ -1514,6 +1581,186 @@ mod tests {
                 "driver did not wake after orphan handling — \
                  pre-#4154 behavior reproduced"
             ),
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // `try_notify_node_event_on` tests (issue #4145).
+    //
+    // The blocking `notify_node_event` was the primary back-pressure
+    // path that wedged nova and vega on 2026-05-24: every successful
+    // contract UPDATE called `notify_node_event(BroadcastStateChange{…}).await`
+    // from `runtime.rs` with a 30s timeout, so when the event-loop
+    // notification channel filled up under fan-out the executor
+    // stalled too. These tests pin the non-blocking variant we now
+    // use on those paths.
+    // ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn try_notify_node_event_enqueues_on_live_channel() {
+        // Happy path: the helper enqueues exactly one event on the
+        // notification channel.
+        let (receiver, notifier) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut notifications_receiver,
+            ..
+        } = receiver;
+
+        let tx = Transaction::ttl_transaction();
+        let event = NodeEvent::TransactionCompleted(tx);
+
+        super::try_notify_node_event_on(notifier.notifications_sender(), 0, 1024, event)
+            .expect("helper must enqueue on a live, non-full channel");
+
+        let received = timeout(Duration::from_millis(100), notifications_receiver.recv())
+            .await
+            .expect("timed out waiting for emission")
+            .expect("notification channel closed");
+
+        match received {
+            Either::Right(NodeEvent::TransactionCompleted(observed)) => {
+                assert_eq!(observed, tx, "emitted tx must match the argument");
+            }
+            other @ Either::Left(_) | other @ Either::Right(_) => {
+                panic!("expected TransactionCompleted, got {other:?}")
+            }
+        }
+    }
+
+    /// Regression pin for #4145: `try_notify_node_event_on` MUST NOT
+    /// block when the channel is full. The blocking
+    /// `notify_node_event` waits up to 30 s; the try-variant must
+    /// return `Err` essentially immediately.
+    #[tokio::test]
+    async fn try_notify_node_event_returns_err_on_full_channel_without_blocking() {
+        let (_receiver, notifier) = event_loop_notification_channel();
+
+        // Saturate the channel using try_send so the helper hits Full.
+        let filler_tx = Transaction::ttl_transaction();
+        let mut pre_filled = 0usize;
+        loop {
+            match notifier
+                .notifications_sender()
+                .try_send(Either::Right(NodeEvent::TransactionCompleted(filler_tx)))
+            {
+                Ok(()) => pre_filled += 1,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => break,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    panic!("channel unexpectedly closed while pre-filling")
+                }
+            }
+            // Safety valve mirroring release_pending_op_slot_blocks_through_backpressure
+            // — bounded channel must backpressure within a sane cap.
+            if pre_filled > 4096 {
+                panic!("channel did not backpressure after 4096 entries");
+            }
+        }
+        assert!(
+            pre_filled > 0,
+            "expected a bounded channel; got what appears to be unbounded"
+        );
+
+        // The try-variant must return Err essentially instantly. We
+        // cap at 100 ms — orders of magnitude under
+        // `OpManager::NOTIFICATION_SEND_TIMEOUT` (30 s) but still
+        // generous for slow CI runners. The pre-fix blocking path
+        // would not return within this window.
+        let tx = Transaction::ttl_transaction();
+        let start = Instant::now();
+        let result = timeout(
+            Duration::from_millis(100),
+            // Wrap in async{} so timeout can still poll the (sync)
+            // function and not be optimized into a single poll.
+            async {
+                super::try_notify_node_event_on(
+                    notifier.notifications_sender(),
+                    pre_filled,
+                    0,
+                    NodeEvent::TransactionCompleted(tx),
+                )
+            },
+        )
+        .await
+        .expect("try-variant must NOT block — pre-fix it could stall the executor 30s (#4145)");
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "try-variant must return Err when channel is full"
+        );
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "try-variant must complete near-instantly, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_notify_node_event_returns_err_on_closed_channel() {
+        // Closed channel: helper returns Err rather than panic — must
+        // remain robust during shutdown races.
+        let (receiver, notifier) = event_loop_notification_channel();
+        drop(receiver);
+
+        let tx = Transaction::ttl_transaction();
+        let result = super::try_notify_node_event_on(
+            notifier.notifications_sender(),
+            0,
+            0,
+            NodeEvent::TransactionCompleted(tx),
+        );
+        assert!(
+            result.is_err(),
+            "helper must return Err once receiver is dropped"
+        );
+    }
+
+    /// Source-scrape regression guard for #4145. Pin that the four
+    /// best-effort Broadcast emission sites use `try_notify_node_event`
+    /// (non-blocking) rather than `notify_node_event(...).await`. If
+    /// a future refactor reintroduces the blocking variant here, the
+    /// executor stall the original PR was supposed to fix will return.
+    #[test]
+    fn broadcast_emission_sites_use_try_notify() {
+        for (path, src) in [
+            (
+                "crates/core/src/contract/executor/runtime.rs",
+                include_str!("../contract/executor/runtime.rs"),
+            ),
+            (
+                "crates/core/src/operations.rs",
+                include_str!("../operations.rs"),
+            ),
+        ] {
+            // Pin: try_notify is used (non-blocking).
+            let try_uses = src.matches("try_notify_node_event").count();
+            assert!(
+                try_uses >= 1,
+                "{path} must call try_notify_node_event for Broadcast emissions \
+                 (issue #4145). The blocking notify_node_event(...).await on \
+                 these paths wedged both production gateways on 2026-05-24."
+            );
+            // Anti-pin: blocking variant must NOT be used to emit any
+            // Broadcast* event from these files. Inspect every
+            // `notify_node_event(` occurrence (NOT preceded by
+            // `try_`) and verify a Broadcast variant doesn't appear in
+            // the next ~200 chars.
+            let needle = ".notify_node_event(";
+            let mut search_idx = 0;
+            while let Some(rel) = src[search_idx..].find(needle) {
+                let abs = search_idx + rel;
+                let preceded_by_try = abs.checked_sub(4).is_some_and(|i| &src[i..abs] == ".try");
+                if !preceded_by_try {
+                    let window_end = (abs + 200).min(src.len());
+                    let window = &src[abs..window_end];
+                    assert!(
+                        !window.contains("Broadcast"),
+                        "{path}: blocking notify_node_event(...).await is used to \
+                         emit a Broadcast event near offset {abs}. Use \
+                         try_notify_node_event instead (#4145). Window:\n{window}"
+                    );
+                }
+                search_idx = abs + needle.len();
+            }
         }
     }
 
