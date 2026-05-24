@@ -4260,10 +4260,17 @@ impl P2pConnManager {
                 // event loop, only its own detached task. Switching to
                 // `try_notify_node_event` here would silently drop the
                 // retry in the exact recovery path the executor-side
-                // try_notify sites depend on for healing. Spawn-task
-                // accumulation is bounded by `MAX_BROADCAST_RETRIES = 3`
-                // and `BROADCAST_RETRY_BASE_DELAY = 1s`, so there is no
-                // resource concern. (Per PR #4231 re-review.)
+                // try_notify sites depend on for healing.
+                //
+                // Spawn-task accumulation is bounded per-contract by
+                // `MAX_BROADCAST_RETRIES = 3` and
+                // `BROADCAST_RETRY_BASE_DELAY = 1s`. Worst-case under
+                // simultaneous wedges is
+                // `MAX_BROADCAST_RETRIES × concurrent_contracts_in_flight`
+                // spawn tasks blocked up to 30 s each on the same
+                // saturated channel — bounded by the small per-tick
+                // contract-touch count, so soft memory pressure only.
+                // (Per PR #4231 re-review.)
                 let op_mgr = op_manager.clone();
                 let delay = Self::BROADCAST_RETRY_BASE_DELAY * u32::from(attempt);
                 tokio::spawn(async move {
@@ -5936,13 +5943,17 @@ mod tests {
             "StreamSend dispatch must signal completion_tx in all three \
              non-success arms (closed / timeout / no-connection) — found \
              {fire_count} `tx.send(())` occurrences, expected exactly 3. \
-             A missing arm reintroduces the 120 s STREAM_COMPLETION_TIMEOUT \
-             stall (#4145). Body:\n{body}"
+             If you REMOVED one, a refactor reintroduced the 120 s \
+             STREAM_COMPLETION_TIMEOUT stall (#4145). If you ADDED a new \
+             arm with its own fire, bump this count to match. Body:\n{body}"
         );
     }
 
     /// Source-scrape regression guard for #4145 — PipeStream variant.
     /// Same rationale as `stream_send_branch_uses_timed_reserve_pattern`.
+    /// Tight scoping bounded at the next match arm (`ConnEvent::ClosedChannel`)
+    /// so the assertion can't bleed into unrelated code if PipeStream is
+    /// later reordered or expanded.
     #[test]
     fn pipe_stream_branch_uses_timed_reserve_pattern() {
         let src = include_str!("p2p_protoc.rs");
@@ -5951,7 +5962,12 @@ mod tests {
         let (idx, _) = occurrences
             .next()
             .expect("PipeStream branch must exist in p2p_protoc.rs");
-        let window_end = (idx + 6000).min(src.len());
+        // Bound at the next match arm — `ConnEvent::ClosedChannel(...)`
+        // immediately follows PipeStream in the event-loop dispatch.
+        let closed_channel_rel = src[idx..]
+            .find("ConnEvent::ClosedChannel(")
+            .expect("ClosedChannel branch must follow PipeStream in p2p_protoc.rs");
+        let window_end = idx + closed_channel_rel;
         let body = &src[idx..window_end];
         assert!(
             body.contains("tokio::time::timeout("),

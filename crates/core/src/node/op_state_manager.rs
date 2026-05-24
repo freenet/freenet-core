@@ -407,8 +407,6 @@ impl OpManager {
         notify_node_event_on(
             self.to_event_listener.notifications_sender(),
             Self::NOTIFICATION_SEND_TIMEOUT,
-            self.to_event_listener.notification_channel_pending(),
-            self.to_event_listener.notifications_sender().capacity(),
             msg,
         )
         .await
@@ -909,20 +907,25 @@ fn try_release_pending_op_slot_on(
 ///   - `Err(OpError::NotificationChannelError(...))` after the timeout
 ///     elapses (a strong signal the event loop is stuck).
 ///
-/// `channel_pending` and `channel_remaining` are read at the call site
-/// purely for log enrichment (see [`try_notify_node_event_on`] for the
-/// same convention).
+/// Diagnostic enrichment (channel pending / remaining slots) is sampled
+/// INSIDE the error arm so the logged values reflect the channel state
+/// at the moment of timeout, not the moment of the call. (Per PR #4231
+/// third-pass review.)
 async fn notify_node_event_on(
     notifications_sender: &mpsc::Sender<Either<NetMessage, NodeEvent>>,
     timeout: Duration,
-    channel_pending: usize,
-    channel_remaining: usize,
     msg: NodeEvent,
 ) -> Result<(), OpError> {
     match tokio::time::timeout(timeout, notifications_sender.send(Either::Right(msg))).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e.into()),
         Err(_) => {
+            // Sample current channel state — accurate at log-emission
+            // time, not 30s stale (M1 from PR #4231 third-pass review).
+            let channel_remaining = notifications_sender.capacity();
+            let channel_pending = notifications_sender
+                .max_capacity()
+                .saturating_sub(channel_remaining);
             tracing::error!(
                 timeout_secs = timeout.as_secs(),
                 channel_pending,
@@ -1634,6 +1637,11 @@ mod tests {
     /// with zero coverage of its failure mode.
     #[tokio::test(start_paused = true)]
     async fn notify_node_event_returns_err_after_timeout_on_saturated_channel() {
+        // `_receiver` binding: kept alive (not dropped, not drained) so
+        // the channel stays saturated for the full timeout window. If
+        // dropped, the helper would land in the `Err(SendError)` arm
+        // and we'd test the wrong path; if drained, the saturation
+        // would lift and the send would succeed.
         let (_receiver, notifier) = event_loop_notification_channel();
 
         // Saturate via try_send so the timeout-wrapped send never
@@ -1657,6 +1665,11 @@ mod tests {
             }
         }
 
+        // `pre_filled` is meaningful (asserts the channel is bounded and
+        // we actually saturated it); we don't pass it through any more
+        // since the helper now samples diagnostic state internally.
+        let _ = pre_filled;
+
         let test_timeout = Duration::from_secs(30);
         let tx = Transaction::ttl_transaction();
 
@@ -1664,8 +1677,6 @@ mod tests {
         let result = super::notify_node_event_on(
             notifier.notifications_sender(),
             test_timeout,
-            pre_filled,
-            0,
             NodeEvent::TransactionCompleted(tx),
         )
         .await;
@@ -1814,25 +1825,55 @@ mod tests {
         );
     }
 
+    /// Single source of truth for the source-scrape coverage list.
+    /// Both `broadcast_emission_sites_use_try_notify_or_are_deliberately_blocking`
+    /// (primary scrape) and `broadcast_emission_files_are_in_allowlist`
+    /// (complementary walker) read from this so the two cannot drift —
+    /// adding a file to one without the other was a real risk flagged
+    /// in PR #4231's third pass (Skeptical M2).
+    ///
+    /// Paths are `src/`-relative (matching what the walker reports).
+    /// `include_str!` calls below are written relative to *this* file's
+    /// location; the two formats stay in sync visually but are not
+    /// derivable from each other at the macro level, so add entries to
+    /// both columns together.
+    const EMISSION_SITES: &[(&str, &str)] = &[
+        (
+            "contract/executor/runtime.rs",
+            include_str!("../contract/executor/runtime.rs"),
+        ),
+        (
+            "contract/executor/mock_runtime.rs",
+            include_str!("../contract/executor/mock_runtime.rs"),
+        ),
+        ("operations.rs", include_str!("../operations.rs")),
+        ("node.rs", include_str!("../node.rs")),
+        (
+            "node/network_bridge/p2p_protoc.rs",
+            include_str!("network_bridge/p2p_protoc.rs"),
+        ),
+    ];
+
+    /// Returns true if `forward_window` names a best-effort gossip event
+    /// variant that the channel-safety gate enforces non-blocking emission
+    /// for. Currently covers `Broadcast*` and `SyncStateToPeer` — both
+    /// are "lossy ok" by design and either heals via subsequent rounds.
+    fn names_gossip_emit(forward_window: &str) -> bool {
+        forward_window.contains("Broadcast") || forward_window.contains("SyncStateToPeer")
+    }
+
     /// Source-scrape regression guard for #4145. Pin that every
-    /// Broadcast-event emission site either uses `try_notify_node_event`
-    /// (non-blocking) OR is explicitly annotated `DELIBERATELY blocking`
-    /// with a load-bearing justification.
+    /// best-effort-gossip emission site (Broadcast*, SyncStateToPeer)
+    /// either uses `try_notify_node_event` (non-blocking) OR is
+    /// explicitly annotated `DELIBERATELY blocking` with a load-bearing
+    /// justification.
     ///
-    /// Scope covers every file in the freenet crate currently known to
-    /// emit a Broadcast* event:
-    ///   - contract/executor/runtime.rs (executor commit path)
-    ///   - contract/executor/mock_runtime.rs (test variant; mirrors prod)
-    ///   - operations.rs (hosting + interest gossip)
-    ///   - node/network_bridge/p2p_protoc.rs (retry-spawn path,
-    ///     DELIBERATELY blocking — runs inside tokio::spawn)
-    ///
-    /// The complementary test
-    /// `broadcast_emission_files_are_in_allowlist` walks every `.rs`
-    /// file in `crates/core/src/` at compile time and fails if a new
-    /// `NodeEvent::Broadcast` emission appears outside the allowlist
-    /// above, so a future refactor that introduces a Broadcast emission
-    /// in a new file cannot silently bypass this gate.
+    /// Scope is driven by the shared `EMISSION_SITES` constant. The
+    /// complementary test `broadcast_emission_files_are_in_allowlist`
+    /// walks every `.rs` file in `crates/core/src/` and catches any
+    /// emission that lands outside this allowlist, so a future refactor
+    /// moving an emission into a previously-unscanned file cannot
+    /// silently bypass this gate.
     ///
     /// Allowlist marker: `DELIBERATELY blocking` within ~2 KB BEFORE
     /// the call site. Used at:
@@ -1850,24 +1891,7 @@ mod tests {
         const MARKER: &str = "DELIBERATELY blocking";
         const LOOKBACK_BYTES: usize = 2048;
 
-        for (path, src) in [
-            (
-                "crates/core/src/contract/executor/runtime.rs",
-                include_str!("../contract/executor/runtime.rs"),
-            ),
-            (
-                "crates/core/src/contract/executor/mock_runtime.rs",
-                include_str!("../contract/executor/mock_runtime.rs"),
-            ),
-            (
-                "crates/core/src/operations.rs",
-                include_str!("../operations.rs"),
-            ),
-            (
-                "crates/core/src/node/network_bridge/p2p_protoc.rs",
-                include_str!("network_bridge/p2p_protoc.rs"),
-            ),
-        ] {
+        for (rel_path, src) in EMISSION_SITES {
             let needle = ".notify_node_event(";
             let mut search_idx = 0;
             while let Some(rel) = src[search_idx..].find(needle) {
@@ -1876,19 +1900,22 @@ mod tests {
                 if !preceded_by_try {
                     let window_end = (abs + 200).min(src.len());
                     let forward_window = &src[abs..window_end];
-                    if forward_window.contains("Broadcast") {
+                    if names_gossip_emit(forward_window) {
                         let lookback_start = abs.saturating_sub(LOOKBACK_BYTES);
                         let backward_window = &src[lookback_start..abs];
                         assert!(
                             backward_window.contains(MARKER),
-                            "{path}: blocking notify_node_event(...).await is used \
-                             to emit a Broadcast event near offset {abs}, but no \
+                            "crates/core/src/{rel_path}: blocking \
+                             notify_node_event(...).await is used to emit a \
+                             best-effort gossip event (Broadcast* or \
+                             SyncStateToPeer) near offset {abs}, but no \
                              '{MARKER}' marker comment appears in the preceding \
-                             ~{LOOKBACK_BYTES} bytes. Either use try_notify_node_event \
-                             (preferred — see #4145) or add a '{MARKER}' comment \
-                             above the call explaining the deliberate exception, \
-                             as `announce_contract_hosted` does for the one-shot \
-                             hosting transition. Forward window:\n{forward_window}"
+                             ~{LOOKBACK_BYTES} bytes. Either use \
+                             try_notify_node_event (preferred — see #4145) or \
+                             add a '{MARKER}' comment above the call explaining \
+                             the deliberate exception, as `announce_contract_hosted` \
+                             does for the one-shot hosting transition. Forward \
+                             window:\n{forward_window}"
                         );
                     }
                 }
@@ -1898,44 +1925,47 @@ mod tests {
     }
 
     /// Complementary source-scrape that walks every `.rs` file in
-    /// `crates/core/src/` and fails if a file outside the
-    /// `broadcast_emission_sites_use_try_notify_or_are_deliberately_blocking`
-    /// allowlist contains a `NodeEvent::Broadcast` emission. Catches the
-    /// scenario where a refactor introduces a new Broadcast emission in
-    /// a previously-unscanned file (e.g. moving emission into a new
-    /// per-op task module) — the primary allowlist scrape would silently
+    /// `crates/core/src/` and fails if a file outside `EMISSION_SITES`
+    /// contains a best-effort-gossip emission. Catches the scenario
+    /// where a refactor introduces a new emission in a previously-
+    /// unscanned file — the primary allowlist scrape would silently
     /// miss it; this one yells.
+    ///
+    /// Also asserts that every `EMISSION_SITES` entry was actually
+    /// visited by the walk (rules out silent vacuous-pass if a CI
+    /// sandbox change disables `read_dir`).
     #[test]
     fn broadcast_emission_files_are_in_allowlist() {
-        const ALLOWLIST: &[&str] = &[
-            "contract/executor/runtime.rs",
-            "contract/executor/mock_runtime.rs",
-            "operations.rs",
-            "node/network_bridge/p2p_protoc.rs",
-        ];
+        use std::collections::HashSet;
+
+        let allowlist: HashSet<&str> = EMISSION_SITES.iter().map(|(p, _)| *p).collect();
 
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let src_root = std::path::Path::new(manifest_dir).join("src");
 
         // Recursively walk src_root collecting (relative_path, contents).
+        // `.expect()` rather than silently swallowing errors so a broken
+        // CI sandbox surfaces as a loud failure, not a vacuous pass
+        // (PR #4231 third-pass review, Skeptical L3 + Testing Imp #1).
         fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
-            let entries = match std::fs::read_dir(dir) {
-                Ok(e) => e,
-                Err(_) => return,
-            };
-            for entry in entries.flatten() {
+            let entries = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("read_dir({}) failed: {e}", dir.display()));
+            for entry in entries {
+                let entry =
+                    entry.unwrap_or_else(|e| panic!("dir entry in {} failed: {e}", dir.display()));
                 let path = entry.path();
                 if path.is_dir() {
                     walk(&path, root, out);
                 } else if path.extension().is_some_and(|e| e == "rs") {
-                    if let Ok(contents) = std::fs::read_to_string(&path) {
-                        let rel = path
-                            .strip_prefix(root)
-                            .unwrap_or(&path)
-                            .to_string_lossy()
-                            .replace('\\', "/");
-                        out.push((rel, contents));
-                    }
+                    let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                        panic!("read_to_string({}) failed: {e}", path.display())
+                    });
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.push((rel, contents));
                 }
             }
         }
@@ -1943,23 +1973,36 @@ mod tests {
         let mut files = Vec::new();
         walk(&src_root, &src_root, &mut files);
 
+        // Vacuous-pass guard: every allowlist file MUST be present in
+        // the walk. If the walk found zero files (broken sandbox) or
+        // missed an allowlisted file (path typo), fail loudly.
+        for allow in &allowlist {
+            assert!(
+                files.iter().any(|(rel, _)| rel == *allow),
+                "allowlist file '{allow}' was NOT visited by the source walk \
+                 (walked {} files total). Either EMISSION_SITES has a stale path \
+                 or the walk failed silently — a vacuous pass would silently \
+                 disable the regression guard.",
+                files.len()
+            );
+        }
+
         for (rel, contents) in &files {
-            // Skip the allowlist + this test file (the test body itself
-            // contains "notify_node_event(" and "Broadcast" string
-            // literals in error messages).
-            if ALLOWLIST.iter().any(|a| rel == a) {
+            // Skip allowlisted files + this test file (the test body
+            // itself contains "notify_node_event(", "Broadcast", and
+            // "SyncStateToPeer" string literals in error messages).
+            if allowlist.contains(rel.as_str()) {
                 continue;
             }
             if rel == "node/op_state_manager.rs" {
                 continue;
             }
 
-            // Look for actual EMISSION sites: a `.notify_node_event(`
-            // (try_ or blocking) whose argument expression names a
-            // Broadcast variant within a small forward window. This
-            // mirrors the primary scrape's matching strategy so the
-            // two stay coherent. Variant DEFINITIONS / `Display` match
-            // arms / etc. are correctly ignored.
+            // Look for actual EMISSION sites: a `notify_node_event(`
+            // (try_ or blocking) whose argument names a Broadcast or
+            // SyncStateToPeer variant within a small forward window.
+            // Mirrors the primary scrape's matching strategy so the
+            // two stay coherent.
             let needle = "notify_node_event(";
             let mut search_idx = 0;
             while let Some(rel_idx) = contents[search_idx..].find(needle) {
@@ -1967,16 +2010,15 @@ mod tests {
                 let window_end = (abs + 200).min(contents.len());
                 let forward_window = &contents[abs..window_end];
                 assert!(
-                    !forward_window.contains("Broadcast"),
-                    "{rel} contains a `notify_node_event(...Broadcast...)` \
-                     emission near offset {abs}, but {rel} is NOT in the \
-                     allowlist of files scanned by the primary source-scrape \
-                     test `broadcast_emission_sites_use_try_notify_or_are_deliberately_blocking`. \
-                     Either (a) add {rel:?} to that test's scrape list AND \
-                     to this test's ALLOWLIST, or (b) move the emission to \
-                     one of the existing allowlisted files. Otherwise the \
-                     source-scrape regression guard for #4145 silently \
-                     misses this site. Window:\n{forward_window}"
+                    !names_gossip_emit(forward_window),
+                    "{rel} contains a `notify_node_event(...)` best-effort \
+                     gossip emission (Broadcast* or SyncStateToPeer) near \
+                     offset {abs}, but {rel} is NOT in the shared EMISSION_SITES \
+                     allowlist used by both source-scrape tests. Add an entry \
+                     to `EMISSION_SITES` in op_state_manager.rs covering this \
+                     file (both `include_str!` and the relative path) — that \
+                     single change updates both the primary scrape and this \
+                     walker. Window:\n{forward_window}"
                 );
                 search_idx = abs + needle.len();
             }
