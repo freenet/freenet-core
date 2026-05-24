@@ -1268,37 +1268,59 @@ impl P2pConnManager {
                             metadata,
                             completion_tx,
                         } => {
-                            // Route stream data to the per-connection channel.
-                            // If dispatch fails, signal completion_tx so the
+                            // The event loop must never block indefinitely on a single
+                            // congested peer. Reserve a slot with the same 500 ms
+                            // ceiling as OutboundMessageWithTarget; if the peer's
+                            // channel cannot drain within that window we drop the
+                            // stream fragment and fire `completion_tx` so the
                             // broadcast queue releases its semaphore permit
-                            // immediately instead of waiting for the 120s timeout.
+                            // immediately instead of waiting STREAM_COMPLETION_TIMEOUT
+                            // (120 s). Issue #4145. Using `reserve()` (rather than
+                            // `timeout(send())`) lets us keep ownership of
+                            // `completion_tx` when the timeout fires, so we can
+                            // signal it manually on the drop path.
+                            const SEND_TIMEOUT: std::time::Duration =
+                                std::time::Duration::from_millis(500);
                             if let Some(peer_connection) = ctx.connections.get(&target_addr) {
-                                if let Err(e) = peer_connection
-                                    .sender
-                                    .send(Right(ConnEvent::StreamSend {
-                                        target_addr,
-                                        stream_id,
-                                        data,
-                                        metadata,
-                                        completion_tx,
-                                    }))
-                                    .await
+                                match tokio::time::timeout(
+                                    SEND_TIMEOUT,
+                                    peer_connection.sender.reserve(),
+                                )
+                                .await
                                 {
-                                    tracing::error!(
-                                        stream_id = %stream_id,
-                                        peer_addr = %target_addr,
-                                        error = %e,
-                                        phase = "error",
-                                        "Failed to send stream data to peer connection"
-                                    );
-                                    // The completion_tx is inside the failed send;
-                                    // extract and signal it so the permit is released.
-                                    if let Right(ConnEvent::StreamSend {
-                                        completion_tx: Some(tx),
-                                        ..
-                                    }) = e.0
-                                    {
-                                        let _ignored = tx.send(());
+                                    Ok(Ok(permit)) => {
+                                        permit.send(Right(ConnEvent::StreamSend {
+                                            target_addr,
+                                            stream_id,
+                                            data,
+                                            metadata,
+                                            completion_tx,
+                                        }));
+                                    }
+                                    Ok(Err(_closed)) => {
+                                        tracing::error!(
+                                            stream_id = %stream_id,
+                                            peer_addr = %target_addr,
+                                            phase = "error",
+                                            "Peer connection channel closed; \
+                                             cannot route stream fragment"
+                                        );
+                                        if let Some(tx) = completion_tx {
+                                            let _ignored = tx.send(());
+                                        }
+                                    }
+                                    Err(_timeout) => {
+                                        tracing::warn!(
+                                            stream_id = %stream_id,
+                                            peer_addr = %target_addr,
+                                            timeout_ms = SEND_TIMEOUT.as_millis() as u64,
+                                            phase = "backpressure",
+                                            "Peer congested; dropping stream fragment \
+                                             to keep event loop responsive"
+                                        );
+                                        if let Some(tx) = completion_tx {
+                                            let _ignored = tx.send(());
+                                        }
                                     }
                                 }
                             } else {
@@ -1321,25 +1343,46 @@ impl P2pConnManager {
                             inbound_handle,
                             metadata,
                         } => {
-                            // Route piped stream to the per-connection channel
+                            // Same 500 ms reserve ceiling as StreamSend /
+                            // OutboundMessageWithTarget. If the peer is congested
+                            // we drop the pipe rather than stall the loop; the
+                            // associated stream-level error path will eventually
+                            // surface a timeout to the originating op. Issue #4145.
+                            const SEND_TIMEOUT: std::time::Duration =
+                                std::time::Duration::from_millis(500);
                             if let Some(peer_connection) = ctx.connections.get(&target_addr) {
-                                if let Err(e) = peer_connection
-                                    .sender
-                                    .send(Right(ConnEvent::PipeStream {
-                                        target_addr,
-                                        outbound_stream_id,
-                                        inbound_handle,
-                                        metadata,
-                                    }))
-                                    .await
+                                match tokio::time::timeout(
+                                    SEND_TIMEOUT,
+                                    peer_connection.sender.reserve(),
+                                )
+                                .await
                                 {
-                                    tracing::error!(
-                                        stream_id = %outbound_stream_id,
-                                        peer_addr = %target_addr,
-                                        error = %e,
-                                        phase = "error",
-                                        "Failed to pipe stream to peer connection"
-                                    );
+                                    Ok(Ok(permit)) => {
+                                        permit.send(Right(ConnEvent::PipeStream {
+                                            target_addr,
+                                            outbound_stream_id,
+                                            inbound_handle,
+                                            metadata,
+                                        }));
+                                    }
+                                    Ok(Err(_closed)) => {
+                                        tracing::error!(
+                                            stream_id = %outbound_stream_id,
+                                            peer_addr = %target_addr,
+                                            phase = "error",
+                                            "Peer connection channel closed; cannot pipe stream"
+                                        );
+                                    }
+                                    Err(_timeout) => {
+                                        tracing::warn!(
+                                            stream_id = %outbound_stream_id,
+                                            peer_addr = %target_addr,
+                                            timeout_ms = SEND_TIMEOUT.as_millis() as u64,
+                                            phase = "backpressure",
+                                            "Peer congested; dropping stream pipe \
+                                             to keep event loop responsive"
+                                        );
+                                    }
                                 }
                             } else {
                                 tracing::warn!(
@@ -4211,7 +4254,23 @@ impl P2pConnManager {
                     max_retries = Self::MAX_BROADCAST_RETRIES,
                     "BROADCAST_NO_TARGETS: scheduling retry - subscriptions may still be in-flight"
                 );
-                // Schedule a delayed re-emission of BroadcastStateChange
+                // Schedule a delayed re-emission of BroadcastStateChange.
+                // DELIBERATELY blocking — this whole block runs inside a
+                // `tokio::spawn`, so the blocking await cannot wedge the
+                // event loop, only its own detached task. Switching to
+                // `try_notify_node_event` here would silently drop the
+                // retry in the exact recovery path the executor-side
+                // try_notify sites depend on for healing.
+                //
+                // Spawn-task accumulation is bounded per-contract by
+                // `MAX_BROADCAST_RETRIES = 3` and
+                // `BROADCAST_RETRY_BASE_DELAY = 1s`. Worst-case under
+                // simultaneous wedges is
+                // `MAX_BROADCAST_RETRIES × concurrent_contracts_in_flight`
+                // spawn tasks blocked up to 30 s each on the same
+                // saturated channel — bounded by the small per-tick
+                // contract-touch count, so soft memory pressure only.
+                // (Per PR #4231 re-review.)
                 let op_mgr = op_manager.clone();
                 let delay = Self::BROADCAST_RETRY_BASE_DELAY * u32::from(attempt);
                 tokio::spawn(async move {
@@ -5690,5 +5749,234 @@ mod tests {
             false,
             large_ttl
         ));
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // Regression tests for #4145: the event loop must not stall
+    // indefinitely on a single congested peer when dispatching
+    // StreamSend / PipeStream. Pre-fix these branches called
+    // `peer_connection.sender.send(...).await` with no timeout, so
+    // a wedged peer's full per-connection mpsc could freeze the
+    // whole p2p_protoc event loop — exactly the symptom seen on
+    // the nova / vega gateways on 2026-05-24.
+    // ──────────────────────────────────────────────────────────
+
+    /// Behavioral pin: the `reserve()` + `timeout(500 ms)` pattern
+    /// used in the StreamSend / PipeStream dispatch branches must
+    /// return `Err(_timeout)` when the per-peer channel is saturated,
+    /// and must do so within a bounded window (timeout + slack).
+    ///
+    /// If this fails, either:
+    ///   - someone reverted the timeout in p2p_protoc.rs::StreamSend / PipeStream
+    ///   - or tokio's mpsc reserve semantics changed
+    /// Either way, the event loop is once again exposed to the wedge.
+    #[tokio::test]
+    async fn peer_send_timeout_drops_when_channel_saturated() {
+        // Use the same 500 ms ceiling encoded in the SEND_TIMEOUT
+        // constant of StreamSend / PipeStream (kept in sync by
+        // `stream_send_branch_uses_timed_reserve_pattern` below).
+        const SEND_TIMEOUT: Duration = Duration::from_millis(500);
+        // 1-deep channel so we can saturate it with a single message.
+        let (tx, _rx) = mpsc::channel::<u32>(1);
+        tx.try_send(0).expect("first send must succeed");
+
+        let start = Instant::now();
+        let result = timeout(SEND_TIMEOUT, tx.reserve()).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "reserve must time out when channel is saturated"
+        );
+        assert!(
+            elapsed >= SEND_TIMEOUT,
+            "must wait the full {SEND_TIMEOUT:?} before giving up, waited {elapsed:?}"
+        );
+        // Generous slack for slow CI runners (release_pending_op_slot test
+        // allows a similar margin). The key invariant is "bounded", not
+        // "exactly N ms".
+        assert!(
+            elapsed < SEND_TIMEOUT + Duration::from_millis(500),
+            "must not block significantly past {SEND_TIMEOUT:?}, took {elapsed:?}"
+        );
+    }
+
+    /// Behavioral pin: when `reserve()` succeeds before the timeout
+    /// fires (transient congestion that clears in <500 ms), the
+    /// dispatch proceeds normally — we don't accidentally drop the
+    /// stream fragment in the fast path.
+    #[tokio::test]
+    async fn peer_send_succeeds_when_consumer_drains_in_time() {
+        const SEND_TIMEOUT: Duration = Duration::from_millis(500);
+        let (tx, mut rx) = mpsc::channel::<u32>(1);
+        tx.try_send(0).expect("first send must succeed");
+
+        // Drain the slot after a short delay so reserve completes
+        // before the timeout fires.
+        let consumer = GlobalExecutor::spawn(async move {
+            sleep(Duration::from_millis(50)).await;
+            rx.recv().await.expect("must drain pre-filled entry");
+            rx.recv().await.expect("must receive reserved value")
+        });
+
+        let result = timeout(SEND_TIMEOUT, tx.reserve()).await;
+        let permit = result
+            .expect("reserve must complete within timeout")
+            .expect("channel must be open");
+        permit.send(42u32);
+
+        let received = consumer.await.expect("consumer task must succeed");
+        assert_eq!(received, 42, "reserved permit must deliver our value");
+    }
+
+    /// Load-bearing invariant for #4145: when the per-peer channel is
+    /// saturated and the dispatch times out, the StreamSend branch MUST
+    /// signal `completion_tx` so the broadcast queue's semaphore permit
+    /// releases immediately instead of waiting `STREAM_COMPLETION_TIMEOUT`
+    /// (120 s). This is the entire reason the dispatch uses `reserve()`
+    /// (so we retain ownership of `completion_tx`) instead of
+    /// `timeout(send())` (which moves it into the dropped future).
+    ///
+    /// This test pins the *pattern* — production code is exercised by
+    /// the source-scrape pin `stream_send_branch_uses_timed_reserve_pattern`.
+    /// A behavioural mismatch between the two is a CI failure here, not
+    /// a 120 s production stall.
+    #[tokio::test]
+    async fn stream_send_pattern_fires_completion_tx_on_timeout() {
+        const SEND_TIMEOUT: Duration = Duration::from_millis(100);
+        let (tx, _rx) = mpsc::channel::<u32>(1);
+        tx.try_send(0).expect("first send must succeed");
+
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Mirror the StreamSend dispatch pattern:
+        //   reserve() → permit OR closed OR timeout
+        // The timeout branch MUST signal completion_tx (we retain
+        // ownership because reserve() never consumed it).
+        match tokio::time::timeout(SEND_TIMEOUT, tx.reserve()).await {
+            Ok(Ok(_permit)) => {
+                // Wouldn't happen in this test (channel saturated), but
+                // the production happy path passes completion_tx into
+                // the message and the receiver task fires it.
+                panic!("reserve unexpectedly succeeded on saturated channel");
+            }
+            Ok(Err(_closed)) => {
+                let _ignored = completion_tx.send(());
+            }
+            Err(_timeout) => {
+                let _ignored = completion_tx.send(());
+            }
+        }
+
+        let signal = timeout(Duration::from_millis(50), completion_rx).await;
+        assert!(
+            matches!(signal, Ok(Ok(()))),
+            "completion_tx must be fired on the dispatch timeout path so the \
+             broadcast queue releases its permit immediately (not after \
+             120s STREAM_COMPLETION_TIMEOUT). Got {signal:?}"
+        );
+    }
+
+    /// Source-scrape regression guard for #4145. If a future refactor
+    /// removes the `tokio::time::timeout(SEND_TIMEOUT, … .reserve())`
+    /// pattern from the StreamSend dispatch branch, fail loudly.
+    /// Pin the *dispatch pattern*, not the surrounding logic, so that
+    /// reasonable refactors (renaming locals, moving the match arm)
+    /// still pass.
+    ///
+    /// Also pins that the branch contains a `completion_tx` fire path
+    /// outside the success arm — the load-bearing invariant tested
+    /// behaviourally by `stream_send_pattern_fires_completion_tx_on_timeout`.
+    #[test]
+    fn stream_send_branch_uses_timed_reserve_pattern() {
+        let src = include_str!("p2p_protoc.rs");
+        // Locate the StreamSend dispatch branch in the event loop.
+        let needle = "ConnEvent::StreamSend {";
+        let mut occurrences = src.match_indices(needle);
+        // The first occurrence is the event-loop dispatch branch we
+        // care about (the second is inside the re-wrap when we
+        // forward the message to the peer connection). Take the first.
+        let (idx, _) = occurrences
+            .next()
+            .expect("StreamSend branch must exist in p2p_protoc.rs");
+        // Tight window: bound at the next `ConnEvent::PipeStream {`
+        // declaration (the immediately-following match arm). Falling
+        // back to a generous fixed window prevents the test from
+        // breaking on unrelated refactors that move PipeStream around,
+        // but the tight bound is the primary scoping mechanism.
+        let pipe_stream_needle = "ConnEvent::PipeStream {";
+        let pipe_stream_rel = src[idx..]
+            .find(pipe_stream_needle)
+            .expect("PipeStream branch must follow StreamSend in p2p_protoc.rs");
+        let window_end = idx + pipe_stream_rel;
+        let body = &src[idx..window_end];
+        assert!(
+            body.contains("tokio::time::timeout("),
+            "StreamSend dispatch must wrap the peer send in a timeout — \
+             see #4145 (gateway wedge). Body:\n{body}"
+        );
+        assert!(
+            body.contains(".reserve()"),
+            "StreamSend dispatch must use `reserve()` (not `send().await`) \
+             so we keep ownership of completion_tx on the timeout path. \
+             See #4145. Body:\n{body}"
+        );
+        assert!(
+            body.contains("SEND_TIMEOUT"),
+            "StreamSend dispatch must define a named SEND_TIMEOUT constant \
+             so the bound is greppable. See #4145. Body:\n{body}"
+        );
+        // Load-bearing invariant: ALL THREE non-success arms (closed /
+        // timeout / no-connection) MUST signal `completion_tx` so the
+        // broadcast queue's semaphore permit releases immediately.
+        // Per-arm count instead of a single match: a refactor that
+        // drops just the timeout arm's fire (the one this PR added)
+        // would otherwise silently reintroduce the 120 s
+        // STREAM_COMPLETION_TIMEOUT stall. Pre-fix the StreamSend
+        // branch had ONE `tx.send(())` (channel-closed only); the
+        // current PR adds two more (timeout + no-connection).
+        // Tested behaviourally by
+        // `stream_send_pattern_fires_completion_tx_on_timeout`.
+        let fire_count = body.matches("tx.send(())").count();
+        assert_eq!(
+            fire_count, 3,
+            "StreamSend dispatch must signal completion_tx in all three \
+             non-success arms (closed / timeout / no-connection) — found \
+             {fire_count} `tx.send(())` occurrences, expected exactly 3. \
+             If you REMOVED one, a refactor reintroduced the 120 s \
+             STREAM_COMPLETION_TIMEOUT stall (#4145). If you ADDED a new \
+             arm with its own fire, bump this count to match. Body:\n{body}"
+        );
+    }
+
+    /// Source-scrape regression guard for #4145 — PipeStream variant.
+    /// Same rationale as `stream_send_branch_uses_timed_reserve_pattern`.
+    /// Tight scoping bounded at the next match arm (`ConnEvent::ClosedChannel`)
+    /// so the assertion can't bleed into unrelated code if PipeStream is
+    /// later reordered or expanded.
+    #[test]
+    fn pipe_stream_branch_uses_timed_reserve_pattern() {
+        let src = include_str!("p2p_protoc.rs");
+        let needle = "ConnEvent::PipeStream {";
+        let mut occurrences = src.match_indices(needle);
+        let (idx, _) = occurrences
+            .next()
+            .expect("PipeStream branch must exist in p2p_protoc.rs");
+        // Bound at the next match arm — `ConnEvent::ClosedChannel(...)`
+        // immediately follows PipeStream in the event-loop dispatch.
+        let closed_channel_rel = src[idx..]
+            .find("ConnEvent::ClosedChannel(")
+            .expect("ClosedChannel branch must follow PipeStream in p2p_protoc.rs");
+        let window_end = idx + closed_channel_rel;
+        let body = &src[idx..window_end];
+        assert!(
+            body.contains("tokio::time::timeout("),
+            "PipeStream dispatch must wrap the peer send in a timeout — see #4145. Body:\n{body}"
+        );
+        assert!(
+            body.contains(".reserve()"),
+            "PipeStream dispatch must use `reserve()` instead of `send().await` — \
+             see #4145. Body:\n{body}"
+        );
     }
 }

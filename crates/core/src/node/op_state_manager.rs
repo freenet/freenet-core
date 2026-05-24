@@ -404,29 +404,47 @@ impl OpManager {
     // network communication with other nodes.
     pub async fn notify_node_event(&self, msg: NodeEvent) -> Result<(), OpError> {
         tracing::debug!(event = %msg, "notify_node_event: queuing node event");
-        match tokio::time::timeout(
+        notify_node_event_on(
+            self.to_event_listener.notifications_sender(),
             Self::NOTIFICATION_SEND_TIMEOUT,
-            self.to_event_listener
-                .notifications_sender
-                .send(Either::Right(msg)),
+            msg,
         )
         .await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(e.into()),
-            Err(_) => {
-                tracing::error!(
-                    timeout_secs = Self::NOTIFICATION_SEND_TIMEOUT.as_secs(),
-                    channel_pending = self.to_event_listener.notification_channel_pending(),
-                    channel_remaining = self.to_event_listener.notifications_sender().capacity(),
-                    "notify_node_event: Notification channel full for too long, event loop may be stuck"
-                );
-                Err(OpError::NotificationChannelError(
-                    "notification channel send timed out — event loop is likely stuck".into(),
-                ))
-            }
-        }
     }
+
+    /// Non-blocking variant of [`Self::notify_node_event`] for best-effort
+    /// broadcast / heartbeat events whose loss is recoverable.
+    ///
+    /// Use when:
+    ///   1. The caller would otherwise block the WASM commit / executor
+    ///      path on the event-loop notification channel (issue #4145: a
+    ///      30-second `notify_node_event(...).await` from `runtime.rs` on
+    ///      every UPDATE was the primary back-pressure path that wedged
+    ///      both nova and vega gateways on 2026-05-24).
+    ///   2. Dropping the broadcast is acceptable — typically because a
+    ///      subsequent state apply, periodic renewal, or summary-mismatch
+    ///      `SyncStateToPeer` round will cover the missed signal.
+    ///
+    /// Returns `Ok(())` when the event was enqueued and
+    /// `Err(OpError::NotificationError)` (after logging at warn level)
+    /// when the channel was full or closed. **Callers should treat the
+    /// error as advisory and continue.**
+    pub fn try_notify_node_event(&self, msg: NodeEvent) -> Result<(), OpError> {
+        tracing::debug!(event = %msg, "try_notify_node_event: queuing node event (non-blocking)");
+        try_notify_node_event_on(
+            self.to_event_listener.notifications_sender(),
+            self.to_event_listener.notification_channel_pending(),
+            self.to_event_listener.notifications_sender().capacity(),
+            msg,
+        )
+    }
+
+    // The blocking `notify_node_event` is still used by callers that
+    // require delivery (or, in the case of `announce_contract_hosted`,
+    // need a delivery error rather than silent drop because the caller
+    // has already consumed a one-shot transition). See
+    // `try_notify_node_event` and `.claude/rules/channel-safety.md` for
+    // the broader pattern.
 
     /// Get all active subscriptions.
     /// In the simplified lease-based model, this returns contracts we're actively subscribed to.
@@ -887,6 +905,91 @@ fn try_release_pending_op_slot_on(
     }
 }
 
+/// Blocking emit of a [`NodeEvent`] on the event-loop notification
+/// channel, bounded by `timeout`.
+///
+/// Extracted from [`OpManager::notify_node_event`] so the
+/// timeout-on-saturation path is testable in isolation without building
+/// a full `OpManager`. Returns:
+///   - `Ok(())` on successful enqueue,
+///   - `Err(OpError::from(SendError))` if the channel is closed,
+///   - `Err(OpError::NotificationChannelError(...))` after the timeout
+///     elapses (a strong signal the event loop is stuck).
+///
+/// Diagnostic enrichment (channel pending / remaining slots) is sampled
+/// INSIDE the error arm so the logged values reflect the channel state
+/// at the moment of timeout, not the moment of the call. (Per PR #4231
+/// third-pass review.)
+async fn notify_node_event_on(
+    notifications_sender: &mpsc::Sender<Either<NetMessage, NodeEvent>>,
+    timeout: Duration,
+    msg: NodeEvent,
+) -> Result<(), OpError> {
+    match tokio::time::timeout(timeout, notifications_sender.send(Either::Right(msg))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(e.into()),
+        Err(_) => {
+            // Sample current channel state — accurate at log-emission
+            // time, not 30s stale (M1 from PR #4231 third-pass review).
+            let channel_remaining = notifications_sender.capacity();
+            let channel_pending = notifications_sender
+                .max_capacity()
+                .saturating_sub(channel_remaining);
+            tracing::error!(
+                timeout_secs = timeout.as_secs(),
+                channel_pending,
+                channel_remaining,
+                "notify_node_event: Notification channel full for too long, event loop may be stuck"
+            );
+            Err(OpError::NotificationChannelError(
+                "notification channel send timed out — event loop is likely stuck".into(),
+            ))
+        }
+    }
+}
+
+/// Non-blocking emit of a [`NodeEvent`] on the event-loop notification
+/// channel.
+///
+/// Extracted from [`OpManager::try_notify_node_event`] so the try-send
+/// path is testable in isolation without building a full `OpManager`.
+/// On `Full` or `Closed` the event is dropped, a warn-level log is
+/// emitted, and the function returns `Err(OpError::NotificationError)`.
+/// Best-effort by design — see the OpManager method doc for the wedge
+/// (#4145) this prevents.
+///
+/// `channel_pending` and `channel_remaining` are passed by the caller
+/// purely for log enrichment; they are read at the call site to avoid
+/// requiring the wrapper type here. `channel_remaining` is the value
+/// returned by `tokio::sync::mpsc::Sender::capacity()`, which is the
+/// *current* available slot count, not the channel's max capacity.
+fn try_notify_node_event_on(
+    notifications_sender: &mpsc::Sender<Either<NetMessage, NodeEvent>>,
+    channel_pending: usize,
+    channel_remaining: usize,
+    msg: NodeEvent,
+) -> Result<(), OpError> {
+    match notifications_sender.try_send(Either::Right(msg)) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::warn!(
+                channel_pending,
+                channel_remaining,
+                "try_notify_node_event: event-loop notification channel full; \
+                 dropping best-effort broadcast event (#4145)"
+            );
+            Err(OpError::NotificationError)
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            tracing::warn!(
+                "try_notify_node_event: event-loop notification channel closed; \
+                 receiver likely dropped"
+            );
+            Err(OpError::NotificationError)
+        }
+    }
+}
+
 /// Notify the event loop about a timed-out transaction without blocking.
 ///
 /// Uses `try_send` instead of `.send().await` to avoid blocking the garbage
@@ -1209,7 +1312,7 @@ mod tests {
     use super::*;
     use crate::node::network_bridge::EventLoopNotificationsReceiver;
     use either::Either;
-    use tokio::time::{Duration, timeout};
+    use tokio::time::{Duration, Instant, timeout};
 
     #[tokio::test]
     async fn notify_timeout_succeeds_when_receiver_alive() {
@@ -1523,6 +1626,411 @@ mod tests {
                 "driver did not wake after orphan handling — \
                  pre-#4154 behavior reproduced"
             ),
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // `notify_node_event_on` tests — the blocking variant retained
+    // for sites like `announce_contract_hosted` that consume a one-shot
+    // transition before emitting (so silent drop on Full would
+    // permanently lose the announcement). Pins that the timeout
+    // actually fires under sustained saturation, returning Err rather
+    // than hanging the caller indefinitely. (PR #4231 re-review.)
+    // ──────────────────────────────────────────────────────────
+
+    /// Regression pin for the explicitly-permitted blocking path
+    /// (`announce_contract_hosted` and friends): when the notification
+    /// channel is saturated for the full configured timeout, the
+    /// helper MUST return `Err` within bounded time, not hang. Without
+    /// this pin, the `DELIBERATELY blocking` exception is shipping
+    /// with zero coverage of its failure mode.
+    #[tokio::test(start_paused = true)]
+    async fn notify_node_event_returns_err_after_timeout_on_saturated_channel() {
+        // `_receiver` binding: kept alive (not dropped, not drained) so
+        // the channel stays saturated for the full timeout window. If
+        // dropped, the helper would land in the `Err(SendError)` arm
+        // and we'd test the wrong path; if drained, the saturation
+        // would lift and the send would succeed.
+        let (_receiver, notifier) = event_loop_notification_channel();
+
+        // Saturate via try_send so the timeout-wrapped send never
+        // finds a slot. Deliberately don't drain — we want the
+        // timeout to elapse.
+        let filler_tx = Transaction::ttl_transaction();
+        let mut pre_filled = 0usize;
+        loop {
+            match notifier
+                .notifications_sender()
+                .try_send(Either::Right(NodeEvent::TransactionCompleted(filler_tx)))
+            {
+                Ok(()) => pre_filled += 1,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => break,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    panic!("channel unexpectedly closed while pre-filling")
+                }
+            }
+            if pre_filled > 4096 {
+                panic!("channel did not backpressure after 4096 entries");
+            }
+        }
+
+        // `pre_filled` is meaningful (asserts the channel is bounded and
+        // we actually saturated it); we don't pass it through any more
+        // since the helper now samples diagnostic state internally.
+        let _ = pre_filled;
+
+        let test_timeout = Duration::from_secs(30);
+        let tx = Transaction::ttl_transaction();
+
+        let start = Instant::now();
+        let result = super::notify_node_event_on(
+            notifier.notifications_sender(),
+            test_timeout,
+            NodeEvent::TransactionCompleted(tx),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(OpError::NotificationChannelError(_))),
+            "blocking helper must return NotificationChannelError after timeout \
+             on saturated channel, got {result:?}"
+        );
+        // With start_paused=true the timer advances deterministically;
+        // elapsed should equal the timeout (within tokio's resolution).
+        assert!(
+            elapsed >= test_timeout,
+            "helper returned before the configured timeout elapsed ({elapsed:?} < {test_timeout:?})"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // `try_notify_node_event_on` tests (issue #4145).
+    //
+    // The blocking `notify_node_event` was the primary back-pressure
+    // path that wedged nova and vega on 2026-05-24: every successful
+    // contract UPDATE called `notify_node_event(BroadcastStateChange{…}).await`
+    // from `runtime.rs` with a 30s timeout, so when the event-loop
+    // notification channel filled up under fan-out the executor
+    // stalled too. These tests pin the non-blocking variant we now
+    // use on those paths.
+    // ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn try_notify_node_event_enqueues_on_live_channel() {
+        // Happy path: the helper enqueues exactly one event on the
+        // notification channel.
+        let (receiver, notifier) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut notifications_receiver,
+            ..
+        } = receiver;
+
+        let tx = Transaction::ttl_transaction();
+        let event = NodeEvent::TransactionCompleted(tx);
+
+        super::try_notify_node_event_on(notifier.notifications_sender(), 0, 1024, event)
+            .expect("helper must enqueue on a live, non-full channel");
+
+        let received = timeout(Duration::from_millis(100), notifications_receiver.recv())
+            .await
+            .expect("timed out waiting for emission")
+            .expect("notification channel closed");
+
+        match received {
+            Either::Right(NodeEvent::TransactionCompleted(observed)) => {
+                assert_eq!(observed, tx, "emitted tx must match the argument");
+            }
+            other @ Either::Left(_) | other @ Either::Right(_) => {
+                panic!("expected TransactionCompleted, got {other:?}")
+            }
+        }
+    }
+
+    /// Regression pin for #4145: `try_notify_node_event_on` MUST NOT
+    /// block when the channel is full. The blocking
+    /// `notify_node_event` waits up to 30 s; the try-variant must
+    /// return `Err` essentially immediately.
+    #[tokio::test]
+    async fn try_notify_node_event_returns_err_on_full_channel_without_blocking() {
+        let (_receiver, notifier) = event_loop_notification_channel();
+
+        // Saturate the channel using try_send so the helper hits Full.
+        let filler_tx = Transaction::ttl_transaction();
+        let mut pre_filled = 0usize;
+        loop {
+            match notifier
+                .notifications_sender()
+                .try_send(Either::Right(NodeEvent::TransactionCompleted(filler_tx)))
+            {
+                Ok(()) => pre_filled += 1,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => break,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    panic!("channel unexpectedly closed while pre-filling")
+                }
+            }
+            // Safety valve mirroring release_pending_op_slot_blocks_through_backpressure
+            // — bounded channel must backpressure within a sane cap.
+            if pre_filled > 4096 {
+                panic!("channel did not backpressure after 4096 entries");
+            }
+        }
+        assert!(
+            pre_filled > 0,
+            "expected a bounded channel; got what appears to be unbounded"
+        );
+
+        // The try-variant must return Err essentially instantly. We
+        // cap at 100 ms — orders of magnitude under
+        // `OpManager::NOTIFICATION_SEND_TIMEOUT` (30 s) but still
+        // generous for slow CI runners. The pre-fix blocking path
+        // would not return within this window.
+        let tx = Transaction::ttl_transaction();
+        let start = Instant::now();
+        let result = timeout(
+            Duration::from_millis(100),
+            // Wrap in async{} so timeout can still poll the (sync)
+            // function and not be optimized into a single poll.
+            async {
+                super::try_notify_node_event_on(
+                    notifier.notifications_sender(),
+                    pre_filled,
+                    0,
+                    NodeEvent::TransactionCompleted(tx),
+                )
+            },
+        )
+        .await
+        .expect("try-variant must NOT block — pre-fix it could stall the executor 30s (#4145)");
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_err(),
+            "try-variant must return Err when channel is full"
+        );
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "try-variant must complete near-instantly, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_notify_node_event_returns_err_on_closed_channel() {
+        // Closed channel: helper returns Err rather than panic — must
+        // remain robust during shutdown races.
+        let (receiver, notifier) = event_loop_notification_channel();
+        drop(receiver);
+
+        let tx = Transaction::ttl_transaction();
+        let result = super::try_notify_node_event_on(
+            notifier.notifications_sender(),
+            0,
+            0,
+            NodeEvent::TransactionCompleted(tx),
+        );
+        assert!(
+            result.is_err(),
+            "helper must return Err once receiver is dropped"
+        );
+    }
+
+    /// Single source of truth for the source-scrape coverage list.
+    /// Both `broadcast_emission_sites_use_try_notify_or_are_deliberately_blocking`
+    /// (primary scrape) and `broadcast_emission_files_are_in_allowlist`
+    /// (complementary walker) read from this so the two cannot drift —
+    /// adding a file to one without the other was a real risk flagged
+    /// in PR #4231's third pass (Skeptical M2).
+    ///
+    /// Paths are `src/`-relative (matching what the walker reports).
+    /// `include_str!` calls below are written relative to *this* file's
+    /// location; the two formats stay in sync visually but are not
+    /// derivable from each other at the macro level, so add entries to
+    /// both columns together.
+    const EMISSION_SITES: &[(&str, &str)] = &[
+        (
+            "contract/executor/runtime.rs",
+            include_str!("../contract/executor/runtime.rs"),
+        ),
+        (
+            "contract/executor/mock_runtime.rs",
+            include_str!("../contract/executor/mock_runtime.rs"),
+        ),
+        ("operations.rs", include_str!("../operations.rs")),
+        ("node.rs", include_str!("../node.rs")),
+        (
+            "node/network_bridge/p2p_protoc.rs",
+            include_str!("network_bridge/p2p_protoc.rs"),
+        ),
+    ];
+
+    /// Returns true if `forward_window` names a best-effort gossip event
+    /// variant that the channel-safety gate enforces non-blocking emission
+    /// for. Currently covers `Broadcast*` and `SyncStateToPeer` — both
+    /// are "lossy ok" by design and either heals via subsequent rounds.
+    fn names_gossip_emit(forward_window: &str) -> bool {
+        forward_window.contains("Broadcast") || forward_window.contains("SyncStateToPeer")
+    }
+
+    /// Source-scrape regression guard for #4145. Pin that every
+    /// best-effort-gossip emission site (Broadcast*, SyncStateToPeer)
+    /// either uses `try_notify_node_event` (non-blocking) OR is
+    /// explicitly annotated `DELIBERATELY blocking` with a load-bearing
+    /// justification.
+    ///
+    /// Scope is driven by the shared `EMISSION_SITES` constant. The
+    /// complementary test `broadcast_emission_files_are_in_allowlist`
+    /// walks every `.rs` file in `crates/core/src/` and catches any
+    /// emission that lands outside this allowlist, so a future refactor
+    /// moving an emission into a previously-unscanned file cannot
+    /// silently bypass this gate.
+    ///
+    /// Allowlist marker: `DELIBERATELY blocking` within ~2 KB BEFORE
+    /// the call site. Used at:
+    ///
+    /// - `announce_contract_hosted` (one-shot transition consumed
+    ///   before emit; silent drop would be permanent loss)
+    /// - `p2p_protoc.rs` retry-spawn (runs in `tokio::spawn`, so
+    ///   blocking is event-loop-safe by isolation; switching to
+    ///   try_notify would silently drop wedge-recovery retries)
+    ///
+    /// Any future addition to the allowlist requires the same kind of
+    /// explicit justification at the call site.
+    #[test]
+    fn broadcast_emission_sites_use_try_notify_or_are_deliberately_blocking() {
+        const MARKER: &str = "DELIBERATELY blocking";
+        const LOOKBACK_BYTES: usize = 2048;
+
+        for (rel_path, src) in EMISSION_SITES {
+            let needle = ".notify_node_event(";
+            let mut search_idx = 0;
+            while let Some(rel) = src[search_idx..].find(needle) {
+                let abs = search_idx + rel;
+                let preceded_by_try = abs.checked_sub(4).is_some_and(|i| &src[i..abs] == ".try");
+                if !preceded_by_try {
+                    let window_end = (abs + 200).min(src.len());
+                    let forward_window = &src[abs..window_end];
+                    if names_gossip_emit(forward_window) {
+                        let lookback_start = abs.saturating_sub(LOOKBACK_BYTES);
+                        let backward_window = &src[lookback_start..abs];
+                        assert!(
+                            backward_window.contains(MARKER),
+                            "crates/core/src/{rel_path}: blocking \
+                             notify_node_event(...).await is used to emit a \
+                             best-effort gossip event (Broadcast* or \
+                             SyncStateToPeer) near offset {abs}, but no \
+                             '{MARKER}' marker comment appears in the preceding \
+                             ~{LOOKBACK_BYTES} bytes. Either use \
+                             try_notify_node_event (preferred — see #4145) or \
+                             add a '{MARKER}' comment above the call explaining \
+                             the deliberate exception, as `announce_contract_hosted` \
+                             does for the one-shot hosting transition. Forward \
+                             window:\n{forward_window}"
+                        );
+                    }
+                }
+                search_idx = abs + needle.len();
+            }
+        }
+    }
+
+    /// Complementary source-scrape that walks every `.rs` file in
+    /// `crates/core/src/` and fails if a file outside `EMISSION_SITES`
+    /// contains a best-effort-gossip emission. Catches the scenario
+    /// where a refactor introduces a new emission in a previously-
+    /// unscanned file — the primary allowlist scrape would silently
+    /// miss it; this one yells.
+    ///
+    /// Also asserts that every `EMISSION_SITES` entry was actually
+    /// visited by the walk (rules out silent vacuous-pass if a CI
+    /// sandbox change disables `read_dir`).
+    #[test]
+    fn broadcast_emission_files_are_in_allowlist() {
+        use std::collections::HashSet;
+
+        let allowlist: HashSet<&str> = EMISSION_SITES.iter().map(|(p, _)| *p).collect();
+
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let src_root = std::path::Path::new(manifest_dir).join("src");
+
+        // Recursively walk src_root collecting (relative_path, contents).
+        // `.expect()` rather than silently swallowing errors so a broken
+        // CI sandbox surfaces as a loud failure, not a vacuous pass
+        // (PR #4231 third-pass review, Skeptical L3 + Testing Imp #1).
+        fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<(String, String)>) {
+            let entries = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("read_dir({}) failed: {e}", dir.display()));
+            for entry in entries {
+                let entry =
+                    entry.unwrap_or_else(|e| panic!("dir entry in {} failed: {e}", dir.display()));
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, root, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                        panic!("read_to_string({}) failed: {e}", path.display())
+                    });
+                    let rel = path
+                        .strip_prefix(root)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    out.push((rel, contents));
+                }
+            }
+        }
+
+        let mut files = Vec::new();
+        walk(&src_root, &src_root, &mut files);
+
+        // Vacuous-pass guard: every allowlist file MUST be present in
+        // the walk. If the walk found zero files (broken sandbox) or
+        // missed an allowlisted file (path typo), fail loudly.
+        for allow in &allowlist {
+            assert!(
+                files.iter().any(|(rel, _)| rel == *allow),
+                "allowlist file '{allow}' was NOT visited by the source walk \
+                 (walked {} files total). Either EMISSION_SITES has a stale path \
+                 or the walk failed silently — a vacuous pass would silently \
+                 disable the regression guard.",
+                files.len()
+            );
+        }
+
+        for (rel, contents) in &files {
+            // Skip allowlisted files + this test file (the test body
+            // itself contains "notify_node_event(", "Broadcast", and
+            // "SyncStateToPeer" string literals in error messages).
+            if allowlist.contains(rel.as_str()) {
+                continue;
+            }
+            if rel == "node/op_state_manager.rs" {
+                continue;
+            }
+
+            // Look for actual EMISSION sites: a `notify_node_event(`
+            // (try_ or blocking) whose argument names a Broadcast or
+            // SyncStateToPeer variant within a small forward window.
+            // Mirrors the primary scrape's matching strategy so the
+            // two stay coherent.
+            let needle = "notify_node_event(";
+            let mut search_idx = 0;
+            while let Some(rel_idx) = contents[search_idx..].find(needle) {
+                let abs = search_idx + rel_idx;
+                let window_end = (abs + 200).min(contents.len());
+                let forward_window = &contents[abs..window_end];
+                assert!(
+                    !names_gossip_emit(forward_window),
+                    "{rel} contains a `notify_node_event(...)` best-effort \
+                     gossip emission (Broadcast* or SyncStateToPeer) near \
+                     offset {abs}, but {rel} is NOT in the shared EMISSION_SITES \
+                     allowlist used by both source-scrape tests. Add an entry \
+                     to `EMISSION_SITES` in op_state_manager.rs covering this \
+                     file (both `include_str!` and the relative path) — that \
+                     single change updates both the primary scrape and this \
+                     walker. Window:\n{forward_window}"
+                );
+                search_idx = abs + needle.len();
+            }
         }
     }
 

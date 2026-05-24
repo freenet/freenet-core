@@ -1302,18 +1302,22 @@ where
                         peer = %source_pub_key,
                         "Proximity cache overlap — syncing state to neighbor"
                     );
-                    if let Err(e) = op_manager
-                        .notify_node_event(NodeEvent::SyncStateToPeer {
-                            key,
-                            new_state: state,
-                            target: source,
-                        })
-                        .await
-                    {
+                    // Non-blocking emit: SyncStateToPeer is best-effort
+                    // gossip — if dropped, the next interest-sync round
+                    // or a subsequent summary mismatch will catch it. A
+                    // blocking 30 s `.await` here would itself stack on
+                    // the same notification channel that the executor's
+                    // try_notify path is trying to keep responsive
+                    // (#4145 / #4234).
+                    if let Err(e) = op_manager.try_notify_node_event(NodeEvent::SyncStateToPeer {
+                        key,
+                        new_state: state,
+                        target: source,
+                    }) {
                         tracing::warn!(
                             contract = %instance_id,
                             error = %e,
-                            "Failed to emit SyncStateToPeer for proximity sync"
+                            "Failed to emit SyncStateToPeer for proximity sync (best-effort)"
                         );
                     }
                 }
@@ -1554,18 +1558,20 @@ async fn handle_interest_sync_message(
                     stale_peer = %source,
                     "Summary mismatch in interest sync — syncing state to stale peer"
                 );
-                if let Err(e) = op_manager
-                    .notify_node_event(NodeEvent::SyncStateToPeer {
-                        key: contract,
-                        new_state: state,
-                        target: source,
-                    })
-                    .await
-                {
+                // Non-blocking emit: SyncStateToPeer is best-effort
+                // gossip — if dropped, the next interest-sync round
+                // will retry. Blocking here would stack the heal
+                // path on the same notification channel the executor
+                // is trying to keep responsive (#4145 / #4234).
+                if let Err(e) = op_manager.try_notify_node_event(NodeEvent::SyncStateToPeer {
+                    key: contract,
+                    new_state: state,
+                    target: source,
+                }) {
                     tracing::warn!(
                         contract = %contract,
                         error = %e,
-                        "Failed to emit SyncStateToPeer for stale peer correction"
+                        "Failed to emit SyncStateToPeer for stale peer correction (best-effort)"
                     );
                 }
             }

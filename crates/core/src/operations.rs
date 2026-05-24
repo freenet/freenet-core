@@ -157,6 +157,26 @@ pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &Contr
             %key,
             "NEIGHBOR_HOSTING: Announcing contract hosted to neighbors"
         );
+        // DELIBERATELY blocking — unlike the other Broadcast* emission
+        // sites in this PR, `announce_contract_hosted` carries a
+        // one-shot transition: `on_contract_hosted(key)` above just
+        // inserted `key` into `my_contracts`, and any subsequent call
+        // for the same key returns `None` (the `if let Some(...)`
+        // arm we are inside never re-fires). Dropping this emission
+        // on `Full` would silently lose the only hosting
+        // announcement we will ever send for this contract, leaving
+        // neighbors unaware that this node hosts it until a
+        // reconnect or unrelated state-exchange round.
+        //
+        // Acceptable trade-off because this path runs only on the
+        // *first* PUT/GET of a new contract — low frequency, so a
+        // 30s blocking await under wedge conditions is rare and the
+        // error is preferable to silent loss. If this becomes a
+        // wedge contributor in its own right, the right fix is to
+        // separate the `my_contracts` insertion from the
+        // announcement (so the transition isn't consumed until the
+        // broadcast is queued), not to switch back to try_notify.
+        // See review on PR #4231 (Codex P1) and #4145.
         if let Err(err) = op_manager
             .notify_node_event(crate::message::NodeEvent::BroadcastHostingUpdate {
                 message: announcement,
@@ -311,16 +331,18 @@ pub(crate) async fn broadcast_change_interests(
         "Broadcasting ChangeInterests to neighbors"
     );
 
-    if let Err(err) = op_manager
-        .notify_node_event(crate::message::NodeEvent::BroadcastChangeInterests {
+    // Non-blocking emit: interest changes are best-effort gossip;
+    // a missed one will be re-broadcast on the next change or
+    // converged via the periodic InterestSync exchange (#4145).
+    if let Err(err) =
+        op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastChangeInterests {
             added: added_hashes,
             removed: removed_hashes,
         })
-        .await
     {
         tracing::warn!(
             error = %err,
-            "Failed to broadcast ChangeInterests"
+            "Failed to broadcast ChangeInterests (best-effort)"
         );
     }
 }

@@ -2167,17 +2167,21 @@ where
         self.send_delegate_contract_notifications(key, new_state);
 
         if let Some(op_manager) = &self.op_manager {
-            if let Err(err) = op_manager
-                .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
+            // Non-blocking emit: a 30-second `notify_node_event(...).await`
+            // on this commit path was the primary back-pressure source
+            // that wedged both gateways on 2026-05-24 (#4145). Missed
+            // broadcasts heal via the next UPDATE or via summary-mismatch
+            // SyncStateToPeer rounds — the executor must not stall here.
+            if let Err(err) =
+                op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
                     key: *key,
                     new_state: new_state.clone(),
                 })
-                .await
             {
                 tracing::warn!(
                     contract = %key,
                     error = %err,
-                    "Failed to broadcast state change to network peers"
+                    "Failed to broadcast state change to network peers (best-effort)"
                 );
             }
         }
@@ -2503,17 +2507,18 @@ where
 
     async fn broadcast_state_change(&self, key: ContractKey, new_state: WrappedState) {
         if let Some(op_manager) = &self.op_manager {
-            if let Err(err) = op_manager
-                .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
+            // Non-blocking emit — see comment in the update path above
+            // and #4145 for the wedge this prevents.
+            if let Err(err) =
+                op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
                     key,
                     new_state,
                 })
-                .await
             {
                 tracing::warn!(
                     contract = %key,
                     error = %err,
-                    "Failed to broadcast state change to network peers"
+                    "Failed to broadcast state change to network peers (best-effort)"
                 );
             }
         }
