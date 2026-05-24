@@ -245,6 +245,31 @@ fn finalize_originator_subscribe_contains_all_required_side_effects() {
          forward UPDATEs to a peer that cannot validate them (Codex \
          HIGH finding on PR #4224)"
     );
+    // (5b) The announce MUST be conditionally gated on the fetch
+    // returning Ok(Some(_)) — ordering alone is not enough. Codex r2
+    // + skeptical r2 LOW: a future unconditional
+    // `announce_contract_hosted` after the fetch would still satisfy
+    // the ordering pin above. Anchor on a `have_body` binding +
+    // verify the announce call sits in the `if have_body { ... }`
+    // block (i.e. AFTER the `have_body` binding line).
+    let have_body_pos = body
+        .find("have_body")
+        .expect("finalize_originator_subscribe must bind `have_body` from the fetch match");
+    assert!(
+        body.contains("if have_body"),
+        "finalize_originator_subscribe MUST gate `announce_contract_hosted` \
+         on an `if have_body {{ ... }}` conditional — the gate is the \
+         Codex HIGH fix invariant, not just the ordering. Without it a \
+         future refactor could re-introduce the announce-without-body \
+         bug while keeping fetch < announce order."
+    );
+    assert!(
+        have_body_pos < announce_pos,
+        "the `have_body` binding MUST appear before the \
+         `announce_contract_hosted` call site so the announce is \
+         actually gated by the fetch result, not by some unrelated \
+         later binding of the same name"
+    );
     // (6) add_local_client gated on !is_renewal. Anchor on the API,
     // not the variable name.
     assert!(
@@ -289,7 +314,22 @@ fn drive_client_subscribe_inner_calls_finalize_helper_on_subscribed() {
         .find("ReplyClass::NotFound =>")
         .expect("end of Subscribed branch not found")
         + branch_start;
-    let branch = &SOURCE[branch_start..branch_end];
+    let raw_branch = &SOURCE[branch_start..branch_end];
+
+    // Strip line comments so doc / explanatory comments that mention
+    // the API names as negative context (e.g. "delegated to the
+    // helper which calls announce_contract_hosted") don't trip the
+    // negative substring pins. Mirrors the helper-side pin and the
+    // relay-side pin in op_ctx_task.rs.
+    let branch: String = raw_branch
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(idx) => &line[..idx],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let branch = branch.as_str();
 
     assert!(
         branch.contains("finalize_originator_subscribe"),
