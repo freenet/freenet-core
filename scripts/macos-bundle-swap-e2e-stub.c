@@ -3,7 +3,7 @@
  * via clang and dropped into each test .app bundle as Contents/MacOS/
  * freenet-bin.
  *
- * Rationale: the updater script (scripts/macos-bundle-updater.sh) uses
+ * Rationale: the updater script (crates/core/scripts/macos-bundle-updater.sh) uses
  * `pgrep -f "^${bundle}/Contents/MacOS/"` to detect the running Freenet
  * process. That pattern assumes the kernel invoked a real Mach-O at the
  * bundle path, so the process command line begins with that path. A

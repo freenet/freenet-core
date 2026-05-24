@@ -148,6 +148,39 @@ jobs:
             exit 1
           fi
 
+      # Regression gate for #4240: cargo publish only bundles files
+      # inside the crate, so an include_str!/include_bytes! path that
+      # walks outside the crate root ships a broken tarball that fails
+      # to build for crates.io users.
+      #
+      # When adding a new embedded resource (include_str!/include_bytes!),
+      # add its package-list path to `required` below. A general
+      # auto-discovery variant (resolve every embed site in
+      # crates/core/src/ and assert each appears in the package list)
+      # is a sensible follow-up but is out of scope for this fix.
+      - name: Verify freenet crate package includes embedded resources
+        run: |
+          set -eu
+          required=(
+            scripts/macos-bundle-updater.sh
+          )
+          package_list=$(cargo package --list -p freenet)
+          fail=0
+          for f in "${required[@]}"; do
+            if ! echo "$package_list" | grep -qFx "$f"; then
+              echo "::error::Missing from published freenet crate: $f"
+              fail=1
+            fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "Files referenced by include_str!/include_bytes! must live"
+            echo "inside crates/core/ so cargo publish bundles them."
+            echo
+            echo "Package contents:"
+            echo "$package_list"
+            exit 1
+          fi
+
   # Grep-based lint for banned patterns in crates/core/ (DST-breaking APIs).
   # Only checks added lines in the diff — pre-existing violations are grandfathered.
   # Fast (~2s on GitHub-hosted runner), no Rust toolchain needed.
