@@ -334,14 +334,7 @@ impl NodeConfig {
             Address::HostAddress(addr) => return Ok(*addr),
         };
 
-        let (conf, opts) = hickory_resolver::system_conf::read_system_conf()?;
-        let resolver = hickory_resolver::TokioAsyncResolver::new(
-            conf,
-            opts,
-            hickory_resolver::name_server::GenericConnector::new(
-                hickory_resolver::name_server::TokioRuntimeProvider::new(),
-            ),
-        );
+        let resolver = hickory_resolver::TokioResolver::builder_tokio()?.build()?;
 
         // only issue one query with .
         let hostname = if hostname.ends_with('.') {
@@ -351,7 +344,7 @@ impl NodeConfig {
         };
 
         let ips = resolver.lookup_ip(hostname.as_ref()).await?;
-        match ips.into_iter().next() {
+        match ips.iter().next() {
             Some(ip) => Ok(SocketAddr::new(
                 ip,
                 port.unwrap_or_else(crate::config::default_network_api_port),
