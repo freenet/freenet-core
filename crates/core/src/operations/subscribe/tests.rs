@@ -118,6 +118,252 @@ fn subscribe_dispatch_routes_unsubscribe_to_inbound_handler() {
     );
 }
 
+/// Pin: `finalize_originator_subscribe` MUST call all six originator
+/// finalization side effects, AND the fetch must come before the
+/// conditional announce. The hand-inlined sequence at the task-per-tx
+/// driver's `ReplyClass::Subscribed` branch previously omitted
+/// `fetch_contract_if_missing` and `announce_contract_hosted`, causing
+/// issue #4223 (subscribed peers returning `get_not_found` on the same
+/// contract). Each missing call has a documented production failure
+/// mode — if any is dropped, this test fails and points at the issue.
+///
+/// Assertion shape: substring-match on the API surface (e.g.
+/// `ring.subscribe(`) rather than on full call expressions with
+/// variable names (e.g. `ring.subscribe(key)`). A variable rename
+/// (`key` → `contract_key`) should not silently break the pin while
+/// still passing the bug class through.
+#[test]
+fn finalize_originator_subscribe_contains_all_required_side_effects() {
+    const SOURCE: &str = include_str!("../subscribe.rs");
+    let fn_start = SOURCE
+        .find("pub(super) async fn finalize_originator_subscribe(")
+        .expect(
+            "finalize_originator_subscribe not found in subscribe.rs — \
+             rename or removal must trip this pin (issue #4223)",
+        );
+    // Anchor end: scan to the next top-level item declaration. Using
+    // `\n///` or `\nfn ` / `\nasync fn` / `\npub` would all work; the
+    // brace-counted approach is the most robust against helper
+    // insertions between this function and the next pub item. Count
+    // braces from the function body's opening `{` until they balance.
+    let body_open = SOURCE[fn_start..]
+        .find('{')
+        .expect("function body open brace not found")
+        + fn_start;
+    let mut depth = 0i32;
+    let mut body_end = body_open;
+    for (i, c) in SOURCE[body_open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    body_end = body_open + i + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        body_end > body_open,
+        "could not find balanced closing brace for \
+         finalize_originator_subscribe — body anchor is broken"
+    );
+    let raw_body = &SOURCE[fn_start..body_end];
+
+    // Strip line comments so doc strings and inline comments that
+    // mention the API names as context do not contaminate the
+    // substring + ordering scans. Mirrors the same pattern used by
+    // `relay_subscribe_does_not_install_lease_on_relayed_response` in
+    // `op_ctx_task.rs`.
+    let body: String = raw_body
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(idx) => &line[..idx],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = body.as_str();
+
+    // (1) upstream-peer registration → enables `send_unsubscribe_upstream` (#3874).
+    assert!(
+        body.contains("register_peer_interest"),
+        "finalize_originator_subscribe must register the responding peer as \
+         upstream interest — without it `send_unsubscribe_upstream` cannot \
+         find the peer to notify on client disconnect (#3874)"
+    );
+    // (2) install lease in active_subscriptions. Anchor on the API,
+    // not the variable name, so renaming `key` does not break the pin.
+    assert!(
+        body.contains("ring.subscribe("),
+        "finalize_originator_subscribe must call `ring.subscribe(...)` to \
+         install the lease in `active_subscriptions` — without it the \
+         contract is not picked up by `contracts_needing_renewal` and the \
+         subscription silently dies at TTL expiry (#3851)"
+    );
+    // (3) clear pending backoff state. Match on the API + success arg,
+    // independent of the contract-key variable name.
+    assert!(
+        body.contains("complete_subscription_request(") && body.contains(", true)"),
+        "finalize_originator_subscribe must call \
+         `complete_subscription_request(..., true)` to clear the pending \
+         mark and reset backoff"
+    );
+    // (4) fetch contract body if missing → THIS is the core #4223 fix.
+    assert!(
+        body.contains("fetch_contract_if_missing"),
+        "finalize_originator_subscribe MUST call `fetch_contract_if_missing` \
+         so the originator has the contract body locally and can answer \
+         subsequent GETs from local state instead of returning NotFound \
+         (#4223 — 37% of GETs through subscriber peers were failing)"
+    );
+    // (5) announce_contract_hosted → tells neighbors to include us in
+    // UPDATE broadcasts. Ordering: MUST come after the fetch attempt
+    // so it is gated on the body being locally present (Codex finding;
+    // pre-fetch announce would tell neighbors to forward UPDATEs we
+    // cannot validate).
+    assert!(
+        body.contains("announce_contract_hosted"),
+        "finalize_originator_subscribe MUST call `announce_contract_hosted` \
+         (gated on fetch success) so neighbors include us as an UPDATE \
+         broadcast target — without this, UPDATEs may not reach the \
+         subscriber even after the contract body is local (#3851)"
+    );
+    let fetch_pos = body
+        .find("fetch_contract_if_missing")
+        .expect("fetch call site already asserted above");
+    let announce_pos = body
+        .find("announce_contract_hosted")
+        .expect("announce call site already asserted above");
+    assert!(
+        fetch_pos < announce_pos,
+        "fetch_contract_if_missing must appear BEFORE \
+         announce_contract_hosted in finalize_originator_subscribe — \
+         announcing before the body is local would tell neighbors to \
+         forward UPDATEs to a peer that cannot validate them (Codex \
+         HIGH finding on PR #4224)"
+    );
+    // (5b) The announce MUST be conditionally gated on the fetch
+    // returning Ok(Some(_)) — ordering alone is not enough. Codex r2
+    // + skeptical r2 LOW: a future unconditional
+    // `announce_contract_hosted` after the fetch would still satisfy
+    // the ordering pin above. Anchor on a `have_body` binding +
+    // verify the announce call sits in the `if have_body { ... }`
+    // block (i.e. AFTER the `have_body` binding line).
+    let have_body_pos = body
+        .find("have_body")
+        .expect("finalize_originator_subscribe must bind `have_body` from the fetch match");
+    assert!(
+        body.contains("if have_body"),
+        "finalize_originator_subscribe MUST gate `announce_contract_hosted` \
+         on an `if have_body {{ ... }}` conditional — the gate is the \
+         Codex HIGH fix invariant, not just the ordering. Without it a \
+         future refactor could re-introduce the announce-without-body \
+         bug while keeping fetch < announce order."
+    );
+    assert!(
+        have_body_pos < announce_pos,
+        "the `have_body` binding MUST appear before the \
+         `announce_contract_hosted` call site so the announce is \
+         actually gated by the fetch result, not by some unrelated \
+         later binding of the same name"
+    );
+    // (6) add_local_client gated on !is_renewal. Anchor on the API,
+    // not the variable name.
+    assert!(
+        body.contains("add_local_client("),
+        "finalize_originator_subscribe must call `add_local_client(...)` \
+         so inbound ChangeInterests for this contract get processed"
+    );
+    assert!(
+        body.contains("!is_renewal"),
+        "finalize_originator_subscribe must gate `add_local_client` on \
+         `!is_renewal` — `add_client` is NOT idempotent \
+         (`ring::interest::Contract::add_client` increments \
+         `local_client_count` on every call), so an unconditional call \
+         on every ~2-minute renewal cycle would leak the gauge \
+         unboundedly"
+    );
+}
+
+/// Pin: the task-per-tx subscribe driver's `ReplyClass::Subscribed`
+/// branch MUST delegate to `finalize_originator_subscribe`. Inlining
+/// the side effects directly at the branch is what caused issue #4223
+/// — the original inline sequence was missing
+/// `fetch_contract_if_missing` and `announce_contract_hosted`. By
+/// pinning the call site to the helper, any future refactor that
+/// reverts to inlining will trip this test.
+///
+/// Negative-pin shape: matches on the API surface (`ring.subscribe(`)
+/// rather than full expressions, so a variable rename can't slip a
+/// re-inlined call past the guard.
+#[test]
+fn drive_client_subscribe_inner_calls_finalize_helper_on_subscribed() {
+    const SOURCE: &str = include_str!("op_ctx_task.rs");
+    let fn_start = SOURCE
+        .find("async fn drive_client_subscribe_inner(")
+        .expect("drive_client_subscribe_inner not found");
+    let branch_anchor = "ReplyClass::Subscribed { key } =>";
+    let branch_start = SOURCE[fn_start..]
+        .find(branch_anchor)
+        .expect("ReplyClass::Subscribed branch not found in drive_client_subscribe_inner")
+        + fn_start;
+    let branch_end = SOURCE[branch_start..]
+        .find("ReplyClass::NotFound =>")
+        .expect("end of Subscribed branch not found")
+        + branch_start;
+    let raw_branch = &SOURCE[branch_start..branch_end];
+
+    // Strip line comments so doc / explanatory comments that mention
+    // the API names as negative context (e.g. "delegated to the
+    // helper which calls announce_contract_hosted") don't trip the
+    // negative substring pins. Mirrors the helper-side pin and the
+    // relay-side pin in op_ctx_task.rs.
+    let branch: String = raw_branch
+        .lines()
+        .map(|line| match line.find("//") {
+            Some(idx) => &line[..idx],
+            None => line,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let branch = branch.as_str();
+
+    assert!(
+        branch.contains("finalize_originator_subscribe"),
+        "Subscribed branch must delegate to `finalize_originator_subscribe` \
+         — inlining the side effects is what caused #4223 (missing \
+         fetch_contract_if_missing + announce_contract_hosted). Keep the \
+         helper as the single source of truth."
+    );
+
+    // Negative pins: the inlined calls must NOT come back. Anchor on
+    // the API surface — `ring.subscribe(` rather than
+    // `op_manager.ring.subscribe(key)` — so a rename of either the
+    // receiver (e.g. `om.ring.subscribe(...)`) or the contract-key
+    // variable can't silently bypass the guard.
+    assert!(
+        !branch.contains("ring.subscribe("),
+        "Subscribed branch must not call `ring.subscribe(...)` directly — go \
+         through `finalize_originator_subscribe` so the fetch + announce \
+         steps stay grouped with the lease install"
+    );
+    assert!(
+        !branch.contains("complete_subscription_request("),
+        "Subscribed branch must not call `complete_subscription_request(...)` \
+         directly — go through `finalize_originator_subscribe`"
+    );
+    assert!(
+        !branch.contains("announce_contract_hosted"),
+        "Subscribed branch must not call `announce_contract_hosted` directly \
+         — the fetch-success gate lives inside `finalize_originator_subscribe`; \
+         inlining it would re-introduce the Codex HIGH finding on PR #4224 \
+         (announcing without the contract body)"
+    );
+}
+
 /// Pin: `SubscribeMsg::ForwardingAck` wire-format compatibility. The
 /// variant has no production reader, but a serde round-trip guards
 /// against bincode-discriminant shifts that would break cross-version
