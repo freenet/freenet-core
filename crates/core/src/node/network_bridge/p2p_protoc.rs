@@ -4255,24 +4255,30 @@ impl P2pConnManager {
                     "BROADCAST_NO_TARGETS: scheduling retry - subscriptions may still be in-flight"
                 );
                 // Schedule a delayed re-emission of BroadcastStateChange.
-                // Use try_notify because this is itself part of the healing
-                // path the PR's executor-side try_notify_node_event sites
-                // rely on; stacking a 30-second blocking await here would
-                // make wedge-recovery itself a wedge contributor. If the
-                // channel is full at retry time, the next state apply or
-                // the natural retry of the failing operation will cover us
-                // (#4145).
+                // DELIBERATELY blocking — this whole block runs inside a
+                // `tokio::spawn`, so the blocking await cannot wedge the
+                // event loop, only its own detached task. Switching to
+                // `try_notify_node_event` here would silently drop the
+                // retry in the exact recovery path the executor-side
+                // try_notify sites depend on for healing. Spawn-task
+                // accumulation is bounded by `MAX_BROADCAST_RETRIES = 3`
+                // and `BROADCAST_RETRY_BASE_DELAY = 1s`, so there is no
+                // resource concern. (Per PR #4231 re-review.)
                 let op_mgr = op_manager.clone();
                 let delay = Self::BROADCAST_RETRY_BASE_DELAY * u32::from(attempt);
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
-                    if let Err(e) = op_mgr.try_notify_node_event(
-                        crate::message::NodeEvent::BroadcastStateChange { key, new_state },
-                    ) {
+                    if let Err(e) = op_mgr
+                        .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
+                            key,
+                            new_state,
+                        })
+                        .await
+                    {
                         tracing::warn!(
                             contract = %key,
                             error = %e,
-                            "Failed to re-emit BroadcastStateChange for retry (best-effort)"
+                            "Failed to re-emit BroadcastStateChange for retry"
                         );
                     }
                 });
@@ -5886,9 +5892,16 @@ mod tests {
         let (idx, _) = occurrences
             .next()
             .expect("StreamSend branch must exist in p2p_protoc.rs");
-        // Bound the branch body at a reasonable forward window.
-        // The branch is currently ~70 lines but we allow generous slack.
-        let window_end = (idx + 8000).min(src.len());
+        // Tight window: bound at the next `ConnEvent::PipeStream {`
+        // declaration (the immediately-following match arm). Falling
+        // back to a generous fixed window prevents the test from
+        // breaking on unrelated refactors that move PipeStream around,
+        // but the tight bound is the primary scoping mechanism.
+        let pipe_stream_needle = "ConnEvent::PipeStream {";
+        let pipe_stream_rel = src[idx..]
+            .find(pipe_stream_needle)
+            .expect("PipeStream branch must follow StreamSend in p2p_protoc.rs");
+        let window_end = idx + pipe_stream_rel;
         let body = &src[idx..window_end];
         assert!(
             body.contains("tokio::time::timeout("),
@@ -5906,16 +5919,25 @@ mod tests {
             "StreamSend dispatch must define a named SEND_TIMEOUT constant \
              so the bound is greppable. See #4145. Body:\n{body}"
         );
-        // Load-bearing invariant: the timeout / closed paths MUST signal
-        // completion_tx so the broadcast queue's semaphore permit
-        // releases immediately. Tested behaviourally by
+        // Load-bearing invariant: ALL THREE non-success arms (closed /
+        // timeout / no-connection) MUST signal `completion_tx` so the
+        // broadcast queue's semaphore permit releases immediately.
+        // Per-arm count instead of a single match: a refactor that
+        // drops just the timeout arm's fire (the one this PR added)
+        // would otherwise silently reintroduce the 120 s
+        // STREAM_COMPLETION_TIMEOUT stall. Pre-fix the StreamSend
+        // branch had ONE `tx.send(())` (channel-closed only); the
+        // current PR adds two more (timeout + no-connection).
+        // Tested behaviourally by
         // `stream_send_pattern_fires_completion_tx_on_timeout`.
-        assert!(
-            body.contains("tx.send(())"),
-            "StreamSend dispatch must signal completion_tx (e.g. `tx.send(())`) \
-             on the timeout / closed paths so the broadcast queue's semaphore \
-             permit releases immediately instead of waiting \
-             STREAM_COMPLETION_TIMEOUT (120s). See #4145. Body:\n{body}"
+        let fire_count = body.matches("tx.send(())").count();
+        assert_eq!(
+            fire_count, 3,
+            "StreamSend dispatch must signal completion_tx in all three \
+             non-success arms (closed / timeout / no-connection) — found \
+             {fire_count} `tx.send(())` occurrences, expected exactly 3. \
+             A missing arm reintroduces the 120 s STREAM_COMPLETION_TIMEOUT \
+             stall (#4145). Body:\n{body}"
         );
     }
 
