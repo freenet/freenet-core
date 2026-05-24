@@ -9501,3 +9501,191 @@ async fn sim_network_regular_node_labels_start_at_gateway_count() {
         GATEWAYS + NODES
     );
 }
+
+// =============================================================================
+// Routing Hop-Count Sweep
+//
+// Empirical evidence for the O(log n) routing claim. Sweeps network size N and
+// records the hop_count of completed GET operations. Prints summary statistics
+// per N so the resulting series can be fit / plotted offline (whitepaper).
+//
+// Marked `#[ignore]` — long-running, manually triggered. Invoke with:
+//   cargo test -p freenet --features "simulation_tests,testing" \
+//       --test simulation_integration bench_hop_count_sweep \
+//       -- --ignored --nocapture
+// =============================================================================
+
+/// Sweep network size N and collect terminal-GET hop counts for each case.
+///
+/// Uses `run_direct()` (paused-time single-thread runtime) for scale: turmoil's
+/// link bookkeeping is O(n²) in node count and becomes the bottleneck well
+/// before the simulation itself does.
+///
+/// Per-case parameters are tuned to (a) yield enough completed GETs to give a
+/// meaningful distribution and (b) keep wall-clock time bounded. The HTL
+/// settings scale with N so that requests can plausibly traverse the network.
+#[test_log::test]
+#[ignore = "long-running hop-count sweep; run via `cargo test ... -- --ignored bench_hop_count_sweep`"]
+fn bench_hop_count_sweep() {
+    const SEED: u64 = 0x5EED_C0F1;
+
+    // (gateways, nodes, iters, max_contracts, duration_secs, sleep_secs,
+    //  min_conns, max_conns, ring_max_htl, rnd_if_htl_above)
+    let cases: [(usize, usize, usize, usize, u64, u64, usize, usize, usize, usize); 4] = [
+        (1, 20, 100, 5, 60, 3, 3, 15, 10, 7),
+        (2, 50, 200, 8, 120, 5, 3, 20, 12, 8),
+        (2, 100, 300, 10, 240, 8, 3, 25, 14, 10),
+        (3, 200, 500, 15, 480, 10, 3, 30, 16, 12),
+    ];
+
+    #[derive(Default)]
+    struct CaseSummary {
+        n_total: usize,
+        gw: usize,
+        get_success: usize,
+        get_not_found: usize,
+        get_failure: usize,
+        hops: Vec<usize>,
+        hops_missing: usize,
+        wall_secs: f64,
+    }
+
+    let mut all: Vec<CaseSummary> = Vec::new();
+
+    for (gw, n, iters, max_c, dur, sleep, min_c, max_c2, htl, rnd_above) in cases {
+        let case_start = std::time::Instant::now();
+        tracing::info!(
+            "=== sweep case: gateways={gw} nodes={n} iters={iters} max_contracts={max_c} \
+             duration={dur}s htl={htl}/{rnd_above} conns={min_c}..{max_c2} ==="
+        );
+
+        let result = TestConfig::medium("hop-sweep", SEED ^ n as u64)
+            .with_gateways(gw)
+            .with_nodes(n)
+            .with_iterations(iters)
+            .with_max_contracts(max_c)
+            .with_duration(Duration::from_secs(dur))
+            .with_sleep(Duration::from_secs(sleep))
+            .with_connections(min_c, max_c2)
+            .with_htl(htl, rnd_above)
+            .run_direct()
+            .assert_ok();
+
+        let rt = create_runtime();
+        let case = rt.block_on(async {
+            let logs = result.logs_handle.lock().await;
+            let mut summary = CaseSummary {
+                n_total: n + gw,
+                gw,
+                ..CaseSummary::default()
+            };
+            for m in logs.iter() {
+                match m.kind.get_outcome() {
+                    Some(true) => summary.get_success += 1,
+                    Some(false) => {
+                        // Cannot cheaply distinguish NotFound vs Failure without
+                        // adding another accessor; treat both as "non-success
+                        // terminal" and bucket via elapsed_ms heuristic for
+                        // visibility. Hop counts are pulled below.
+                        if let Some(ms) = m.kind.get_elapsed_ms() {
+                            if ms >= 55_000 {
+                                summary.get_failure += 1;
+                            } else {
+                                summary.get_not_found += 1;
+                            }
+                        } else {
+                            summary.get_failure += 1;
+                        }
+                    }
+                    None => {}
+                }
+                // Pull hop count from any terminal GET event.
+                if m.kind.get_outcome().is_some() {
+                    match m.kind.hop_count() {
+                        Some(h) => summary.hops.push(h),
+                        None => summary.hops_missing += 1,
+                    }
+                }
+            }
+            summary
+        });
+        let mut case = case;
+        case.wall_secs = case_start.elapsed().as_secs_f64();
+        tracing::info!(
+            "case N={} done in {:.1}s: success={}, not_found={}, failure={}, \
+             hop_samples={}, hop_missing={}",
+            case.n_total,
+            case.wall_secs,
+            case.get_success,
+            case.get_not_found,
+            case.get_failure,
+            case.hops.len(),
+            case.hops_missing,
+        );
+        all.push(case);
+    }
+
+    fn pct(sorted: &[usize], p: usize) -> usize {
+        if sorted.is_empty() {
+            return 0;
+        }
+        let idx = ((sorted.len().saturating_sub(1)) * p) / 100;
+        sorted[idx]
+    }
+
+    println!();
+    println!("=== HOP COUNT SWEEP ===");
+    println!(
+        "{:>5} {:>5} {:>5} {:>7} {:>8} {:>8} {:>6} {:>6} {:>6} {:>6} {:>8} {:>9}",
+        "N", "gw", "succ", "nfound", "fail", "samples", "mean", "median", "p95", "p99", "max",
+        "wall_s"
+    );
+    for case in &all {
+        let mut hops = case.hops.clone();
+        hops.sort_unstable();
+        if hops.is_empty() {
+            println!(
+                "{:>5} {:>5} {:>5} {:>7} {:>8} {:>8}    no hop data        wall_s={:.1}",
+                case.n_total,
+                case.gw,
+                case.get_success,
+                case.get_not_found,
+                case.get_failure,
+                0,
+                case.wall_secs,
+            );
+            continue;
+        }
+        let len = hops.len();
+        let mean = hops.iter().sum::<usize>() as f64 / len as f64;
+        let median = hops[len / 2];
+        let p95 = pct(&hops, 95);
+        let p99 = pct(&hops, 99);
+        let max = hops[len - 1];
+        println!(
+            "{:>5} {:>5} {:>5} {:>7} {:>8} {:>8} {:>6.2} {:>6} {:>6} {:>6} {:>6} {:>9.1}",
+            case.n_total,
+            case.gw,
+            case.get_success,
+            case.get_not_found,
+            case.get_failure,
+            len,
+            mean,
+            median,
+            p95,
+            p99,
+            max,
+            case.wall_secs,
+        );
+    }
+    println!("=== END HOP COUNT SWEEP ===");
+
+    // Soft check: we want at least one case with non-trivial hop data so a
+    // future regression that loses hop_count propagation gets caught here.
+    let total_hops: usize = all.iter().map(|c| c.hops.len()).sum();
+    assert!(
+        total_hops > 0,
+        "sweep collected zero hop_count samples — either no GETs completed or hop_count is \
+         not being propagated to terminal GET events"
+    );
+}

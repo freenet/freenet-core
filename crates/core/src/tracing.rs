@@ -2929,6 +2929,22 @@ impl EventKind {
         }
     }
 
+    /// Returns the `hop_count` recorded in this event, if any.
+    ///
+    /// Currently populated for terminal GET events (`GetSuccess`, `GetNotFound`,
+    /// `GetFailure`). The value is the number of hops the GET request traversed
+    /// before reaching its terminal state. Returns `None` for non-terminal GET
+    /// events (e.g. `Request`) and for all non-GET events.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub fn hop_count(&self) -> Option<usize> {
+        match self {
+            EventKind::Get(GetEvent::GetSuccess { hop_count, .. })
+            | EventKind::Get(GetEvent::GetNotFound { hop_count, .. })
+            | EventKind::Get(GetEvent::GetFailure { hop_count, .. }) => *hop_count,
+            _ => None,
+        }
+    }
+
     /// Returns the variant name of this event kind.
     pub fn variant_name(&self) -> &'static str {
         match self {
