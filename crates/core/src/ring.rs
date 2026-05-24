@@ -1173,14 +1173,17 @@ impl Ring {
             // Sweep expired entries from GET subscription cache
             let expired = ring.sweep_expired_get_subscriptions();
 
-            if expired.is_empty() {
-                continue;
+            // Do NOT early-continue when `expired` is empty: pending
+            // reclamation retries below must run every cycle, otherwise
+            // entries queued by the in-use / queue-full skip points stay
+            // leaked indefinitely whenever the cache is under budget
+            // (the common case). See Codex r10 P2.
+            if !expired.is_empty() {
+                tracing::debug!(
+                    expired_count = expired.len(),
+                    "GET subscription cache sweep found expired entries"
+                );
             }
-
-            tracing::debug!(
-                expired_count = expired.len(),
-                "GET subscription cache sweep found expired entries"
-            );
 
             // Reclaim on-disk storage for the expired contracts so the hosting
             // budget is a real disk bound. The sweep task only holds an
