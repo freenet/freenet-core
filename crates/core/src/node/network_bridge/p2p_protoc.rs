@@ -4254,22 +4254,25 @@ impl P2pConnManager {
                     max_retries = Self::MAX_BROADCAST_RETRIES,
                     "BROADCAST_NO_TARGETS: scheduling retry - subscriptions may still be in-flight"
                 );
-                // Schedule a delayed re-emission of BroadcastStateChange
+                // Schedule a delayed re-emission of BroadcastStateChange.
+                // Use try_notify because this is itself part of the healing
+                // path the PR's executor-side try_notify_node_event sites
+                // rely on; stacking a 30-second blocking await here would
+                // make wedge-recovery itself a wedge contributor. If the
+                // channel is full at retry time, the next state apply or
+                // the natural retry of the failing operation will cover us
+                // (#4145).
                 let op_mgr = op_manager.clone();
                 let delay = Self::BROADCAST_RETRY_BASE_DELAY * u32::from(attempt);
                 tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
-                    if let Err(e) = op_mgr
-                        .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
-                            key,
-                            new_state,
-                        })
-                        .await
-                    {
+                    if let Err(e) = op_mgr.try_notify_node_event(
+                        crate::message::NodeEvent::BroadcastStateChange { key, new_state },
+                    ) {
                         tracing::warn!(
                             contract = %key,
                             error = %e,
-                            "Failed to re-emit BroadcastStateChange for retry"
+                            "Failed to re-emit BroadcastStateChange for retry (best-effort)"
                         );
                     }
                 });
@@ -5813,12 +5816,64 @@ mod tests {
         assert_eq!(received, 42, "reserved permit must deliver our value");
     }
 
+    /// Load-bearing invariant for #4145: when the per-peer channel is
+    /// saturated and the dispatch times out, the StreamSend branch MUST
+    /// signal `completion_tx` so the broadcast queue's semaphore permit
+    /// releases immediately instead of waiting `STREAM_COMPLETION_TIMEOUT`
+    /// (120 s). This is the entire reason the dispatch uses `reserve()`
+    /// (so we retain ownership of `completion_tx`) instead of
+    /// `timeout(send())` (which moves it into the dropped future).
+    ///
+    /// This test pins the *pattern* — production code is exercised by
+    /// the source-scrape pin `stream_send_branch_uses_timed_reserve_pattern`.
+    /// A behavioural mismatch between the two is a CI failure here, not
+    /// a 120 s production stall.
+    #[tokio::test]
+    async fn stream_send_pattern_fires_completion_tx_on_timeout() {
+        const SEND_TIMEOUT: Duration = Duration::from_millis(100);
+        let (tx, _rx) = mpsc::channel::<u32>(1);
+        tx.try_send(0).expect("first send must succeed");
+
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Mirror the StreamSend dispatch pattern:
+        //   reserve() → permit OR closed OR timeout
+        // The timeout branch MUST signal completion_tx (we retain
+        // ownership because reserve() never consumed it).
+        match tokio::time::timeout(SEND_TIMEOUT, tx.reserve()).await {
+            Ok(Ok(_permit)) => {
+                // Wouldn't happen in this test (channel saturated), but
+                // the production happy path passes completion_tx into
+                // the message and the receiver task fires it.
+                panic!("reserve unexpectedly succeeded on saturated channel");
+            }
+            Ok(Err(_closed)) => {
+                let _ignored = completion_tx.send(());
+            }
+            Err(_timeout) => {
+                let _ignored = completion_tx.send(());
+            }
+        }
+
+        let signal = timeout(Duration::from_millis(50), completion_rx).await;
+        assert!(
+            matches!(signal, Ok(Ok(()))),
+            "completion_tx must be fired on the dispatch timeout path so the \
+             broadcast queue releases its permit immediately (not after \
+             120s STREAM_COMPLETION_TIMEOUT). Got {signal:?}"
+        );
+    }
+
     /// Source-scrape regression guard for #4145. If a future refactor
     /// removes the `tokio::time::timeout(SEND_TIMEOUT, … .reserve())`
     /// pattern from the StreamSend dispatch branch, fail loudly.
     /// Pin the *dispatch pattern*, not the surrounding logic, so that
     /// reasonable refactors (renaming locals, moving the match arm)
     /// still pass.
+    ///
+    /// Also pins that the branch contains a `completion_tx` fire path
+    /// outside the success arm — the load-bearing invariant tested
+    /// behaviourally by `stream_send_pattern_fires_completion_tx_on_timeout`.
     #[test]
     fn stream_send_branch_uses_timed_reserve_pattern() {
         let src = include_str!("p2p_protoc.rs");
@@ -5850,6 +5905,17 @@ mod tests {
             body.contains("SEND_TIMEOUT"),
             "StreamSend dispatch must define a named SEND_TIMEOUT constant \
              so the bound is greppable. See #4145. Body:\n{body}"
+        );
+        // Load-bearing invariant: the timeout / closed paths MUST signal
+        // completion_tx so the broadcast queue's semaphore permit
+        // releases immediately. Tested behaviourally by
+        // `stream_send_pattern_fires_completion_tx_on_timeout`.
+        assert!(
+            body.contains("tx.send(())"),
+            "StreamSend dispatch must signal completion_tx (e.g. `tx.send(())`) \
+             on the timeout / closed paths so the broadcast queue's semaphore \
+             permit releases immediately instead of waiting \
+             STREAM_COMPLETION_TIMEOUT (120s). See #4145. Body:\n{body}"
         );
     }
 

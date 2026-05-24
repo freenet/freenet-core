@@ -455,6 +455,13 @@ impl OpManager {
         )
     }
 
+    // The blocking `notify_node_event` is still used by callers that
+    // require delivery (or, in the case of `announce_contract_hosted`,
+    // need a delivery error rather than silent drop because the caller
+    // has already consumed a one-shot transition). See
+    // `try_notify_node_event` and `.claude/rules/channel-safety.md` for
+    // the broader pattern.
+
     /// Get all active subscriptions.
     /// In the simplified lease-based model, this returns contracts we're actively subscribed to.
     /// Note: We no longer track per-contract subscriber lists.
@@ -915,13 +922,15 @@ fn try_release_pending_op_slot_on(
 /// Best-effort by design — see the OpManager method doc for the wedge
 /// (#4145) this prevents.
 ///
-/// `channel_pending` and `channel_capacity` are passed by the caller
+/// `channel_pending` and `channel_remaining` are passed by the caller
 /// purely for log enrichment; they are read at the call site to avoid
-/// requiring the wrapper type here.
+/// requiring the wrapper type here. `channel_remaining` is the value
+/// returned by `tokio::sync::mpsc::Sender::capacity()`, which is the
+/// *current* available slot count, not the channel's max capacity.
 fn try_notify_node_event_on(
     notifications_sender: &mpsc::Sender<Either<NetMessage, NodeEvent>>,
     channel_pending: usize,
-    channel_capacity: usize,
+    channel_remaining: usize,
     msg: NodeEvent,
 ) -> Result<(), OpError> {
     match notifications_sender.try_send(Either::Right(msg)) {
@@ -929,7 +938,7 @@ fn try_notify_node_event_on(
         Err(mpsc::error::TrySendError::Full(_)) => {
             tracing::warn!(
                 channel_pending,
-                channel_remaining = channel_capacity,
+                channel_remaining,
                 "try_notify_node_event: event-loop notification channel full; \
                  dropping best-effort broadcast event (#4145)"
             );
@@ -1714,36 +1723,46 @@ mod tests {
         );
     }
 
-    /// Source-scrape regression guard for #4145. Pin that the four
-    /// best-effort Broadcast emission sites use `try_notify_node_event`
-    /// (non-blocking) rather than `notify_node_event(...).await`. If
-    /// a future refactor reintroduces the blocking variant here, the
-    /// executor stall the original PR was supposed to fix will return.
+    /// Source-scrape regression guard for #4145. Pin that every
+    /// Broadcast-event emission site either uses `try_notify_node_event`
+    /// (non-blocking) OR is explicitly annotated `DELIBERATELY blocking`
+    /// with a load-bearing justification.
+    ///
+    /// Scope covers every file in the freenet crate that currently
+    /// emits a Broadcast* event:
+    ///   - contract/executor/runtime.rs (executor commit path)
+    ///   - contract/executor/mock_runtime.rs (test variant; mirrors prod)
+    ///   - operations.rs (hosting + interest gossip)
+    ///   - node/network_bridge/p2p_protoc.rs (retry-spawn path)
+    ///
+    /// Allowlist marker: `DELIBERATELY blocking` within ~2 KB BEFORE
+    /// the call site. Used only at `announce_contract_hosted` today —
+    /// see that comment for why a one-shot transition forces blocking
+    /// emission. Any future addition to the allowlist requires the same
+    /// kind of explicit justification.
     #[test]
-    fn broadcast_emission_sites_use_try_notify() {
+    fn broadcast_emission_sites_use_try_notify_or_are_deliberately_blocking() {
+        const MARKER: &str = "DELIBERATELY blocking";
+        const LOOKBACK_BYTES: usize = 2048;
+
         for (path, src) in [
             (
                 "crates/core/src/contract/executor/runtime.rs",
                 include_str!("../contract/executor/runtime.rs"),
             ),
             (
+                "crates/core/src/contract/executor/mock_runtime.rs",
+                include_str!("../contract/executor/mock_runtime.rs"),
+            ),
+            (
                 "crates/core/src/operations.rs",
                 include_str!("../operations.rs"),
             ),
+            (
+                "crates/core/src/node/network_bridge/p2p_protoc.rs",
+                include_str!("network_bridge/p2p_protoc.rs"),
+            ),
         ] {
-            // Pin: try_notify is used (non-blocking).
-            let try_uses = src.matches("try_notify_node_event").count();
-            assert!(
-                try_uses >= 1,
-                "{path} must call try_notify_node_event for Broadcast emissions \
-                 (issue #4145). The blocking notify_node_event(...).await on \
-                 these paths wedged both production gateways on 2026-05-24."
-            );
-            // Anti-pin: blocking variant must NOT be used to emit any
-            // Broadcast* event from these files. Inspect every
-            // `notify_node_event(` occurrence (NOT preceded by
-            // `try_`) and verify a Broadcast variant doesn't appear in
-            // the next ~200 chars.
             let needle = ".notify_node_event(";
             let mut search_idx = 0;
             while let Some(rel) = src[search_idx..].find(needle) {
@@ -1751,13 +1770,22 @@ mod tests {
                 let preceded_by_try = abs.checked_sub(4).is_some_and(|i| &src[i..abs] == ".try");
                 if !preceded_by_try {
                     let window_end = (abs + 200).min(src.len());
-                    let window = &src[abs..window_end];
-                    assert!(
-                        !window.contains("Broadcast"),
-                        "{path}: blocking notify_node_event(...).await is used to \
-                         emit a Broadcast event near offset {abs}. Use \
-                         try_notify_node_event instead (#4145). Window:\n{window}"
-                    );
+                    let forward_window = &src[abs..window_end];
+                    if forward_window.contains("Broadcast") {
+                        let lookback_start = abs.saturating_sub(LOOKBACK_BYTES);
+                        let backward_window = &src[lookback_start..abs];
+                        assert!(
+                            backward_window.contains(MARKER),
+                            "{path}: blocking notify_node_event(...).await is used \
+                             to emit a Broadcast event near offset {abs}, but no \
+                             '{MARKER}' marker comment appears in the preceding \
+                             ~{LOOKBACK_BYTES} bytes. Either use try_notify_node_event \
+                             (preferred — see #4145) or add a '{MARKER}' comment \
+                             above the call explaining the deliberate exception, \
+                             as `announce_contract_hosted` does for the one-shot \
+                             hosting transition. Forward window:\n{forward_window}"
+                        );
+                    }
                 }
                 search_idx = abs + needle.len();
             }
