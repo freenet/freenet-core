@@ -675,18 +675,32 @@ impl ContractExecutor for RuntimePool {
                 self.op_manager.ring.pending_reclamation_remove(key);
             }
             Ok(ReclaimOutcome::Partial) => {
-                // Leave both pending-reclamation and state_generation in
-                // place: the entry will be retried by the periodic sweep
-                // (or by a fresh `EvictContract` if the cache re-emits
-                // one) until the remaining half is reclaimable.
+                // Upsert pending-reclamation so the periodic sweep retries
+                // the unreclaimed half. On the first EvictContract attempt
+                // there is NO prior pending entry, so "retaining" alone
+                // would leave the failed half permanently leaked — we must
+                // affirmatively insert. The current state_generation is
+                // captured so the deletion-time guard matches on retry
+                // unless new writes have happened in the meantime.
+                let current_gen = self.op_manager.ring.state_generation(key);
+                self.op_manager
+                    .ring
+                    .pending_reclamation_add(*key, current_gen);
                 tracing::debug!(
                     contract = %key,
-                    "partial reclaim — retaining pending-reclamation entry for retry"
+                    "partial reclaim — queued for retry via pending_reclamation"
                 );
             }
             Err(_) => {
-                // Both halves failed; keep pending so the sweep retries.
-                // (The error is logged inside `reclaim_contract_storage`.)
+                // Both halves failed. Same logic as Partial: on a first
+                // attempt there is no prior pending entry, so we must
+                // affirmatively insert one so the periodic sweep retries
+                // both halves. (The error itself is logged inside
+                // `reclaim_contract_storage`.)
+                let current_gen = self.op_manager.ring.state_generation(key);
+                self.op_manager
+                    .ring
+                    .pending_reclamation_add(*key, current_gen);
             }
         }
         // Drop the outcome detail at the trait boundary: callers expect

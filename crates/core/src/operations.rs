@@ -200,8 +200,17 @@ pub(crate) fn reclaim_evicted_contract(
         tracing::debug!(
             contract = %key,
             "Skipping disk reclamation for evicted contract — still in use \
-             (client subscription or downstream subscriber)"
+             (client subscription or downstream subscriber); queued for retry"
         );
+        // Queue for retry by the periodic sweep: the hosting-cache entry is
+        // already gone (we are processing its `evicted` tuple), so when the
+        // subscriber later expires nothing else would emit another
+        // EvictContract for this key — without this, the disk state/code
+        // would leak permanently. Mirrors the symmetric in-use skip in
+        // RuntimePool::remove_contract.
+        op_manager
+            .ring
+            .pending_reclamation_add(key, expected_generation);
         return;
     }
     op_manager.notify_contract_handler_fire_and_forget(
