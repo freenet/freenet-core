@@ -340,6 +340,120 @@ async fn complete_local_subscription(
     Ok(())
 }
 
+/// Fetch the contract body locally if we do not already have it.
+///
+/// Fire-and-forget GET sub-op + bounded wait for the contract to land in
+/// local storage. Used by the originator finalization helper so that a
+/// peer that successfully subscribed to a contract it had never seen can
+/// answer subsequent GETs from local state rather than returning
+/// `get_not_found`. See issue #4223 — the v0.2.51+ task-per-tx SUBSCRIBE
+/// migration dropped this call, leaving subscribers with the lease
+/// installed but no contract body, so 37% of GETs that routed through a
+/// subscriber were returning NotFound.
+///
+/// Returns `Ok(Some(key))` if the contract is locally available after the
+/// fetch attempt (including the case where it was already present),
+/// `Ok(None)` if it could not be obtained within `CONTRACT_WAIT_TIMEOUT_MS`
+/// (the originator's subscribe still completes — the contract may arrive
+/// later via UPDATE), and `Err` only for local infrastructure failures
+/// (channel closed, etc.).
+pub(super) async fn fetch_contract_if_missing(
+    op_manager: &OpManager,
+    instance_id: ContractInstanceId,
+) -> Result<Option<ContractKey>, OpError> {
+    if let Some(key) = super::has_contract(op_manager, instance_id).await? {
+        return Ok(Some(key));
+    }
+
+    // Spawn the sub-op GET. We drop the receiver — we don't care about
+    // the structured `SubOpGetOutcome`, only the side effect of caching
+    // the contract locally. `wait_for_contract_with_timeout` (storage
+    // poll + wait_for_contract channel + timeout) detects arrival.
+    let (_tx, _rx) = super::get::op_ctx_task::start_sub_op_get(op_manager, instance_id, true);
+
+    wait_for_contract_with_timeout(op_manager, instance_id, CONTRACT_WAIT_TIMEOUT_MS).await
+}
+
+/// Finalize an originator-side subscribe success.
+///
+/// Called from the task-per-tx SUBSCRIBE driver
+/// (`op_ctx_task::drive_client_subscribe_inner`) after a `Subscribed`
+/// reply arrives. Performs every side-effect the originator needs so the
+/// subscription is fully usable end-to-end:
+///
+/// 1. Register the responding peer as our upstream interest (so
+///    `send_unsubscribe_upstream` can find it on client disconnect — #3874).
+/// 2. Install the lease in `active_subscriptions`
+///    (`op_manager.ring.subscribe`).
+/// 3. Clear pending backoff state for this contract
+///    (`op_manager.ring.complete_subscription_request(..., true)`).
+/// 4. **Fetch the contract body locally if missing** (#4223). Without
+///    this, the peer registers as a subscriber but answers `NotFound`
+///    on GETs that route through it because the contract body never
+///    arrived.
+/// 5. **Announce that we host this contract to neighbors**, so they
+///    include us as a broadcast target for UPDATEs.
+/// 6. Register the contract in our local interest manager (so inbound
+///    `ChangeInterests` for this contract get processed) and broadcast
+///    a `ChangeInterests` so connected peers learn we became interested.
+///    Gated on `!is_renewal` — renewals do not re-add the local-client
+///    entry (idempotent, but skipping the broadcast prevents a noisy
+///    spam every renewal cycle).
+///
+/// All side effects are idempotent for repeat subscribes / renewals.
+///
+/// The fetch step is best-effort: on timeout or sub-op failure the
+/// subscription is still finalized (lease installed, peer registered).
+/// The contract body can arrive later via UPDATE propagation, and a
+/// future GET through this peer would still return `NotFound` until
+/// then — but the alternative (failing the whole subscribe on a
+/// contract-fetch timeout) would leave the client without notifications
+/// it does want.
+pub(super) async fn finalize_originator_subscribe(
+    op_manager: &OpManager,
+    key: ContractKey,
+    upstream_addr: std::net::SocketAddr,
+    is_renewal: bool,
+) {
+    if let Some(pkl) = op_manager
+        .ring
+        .connection_manager
+        .get_peer_by_addr(upstream_addr)
+    {
+        let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key);
+        op_manager
+            .interest_manager
+            .register_peer_interest(&key, peer_key, None, true);
+    }
+
+    op_manager.ring.subscribe(key);
+    op_manager.ring.complete_subscription_request(&key, true);
+
+    // Fetch the contract body if we don't have it locally. Best-effort:
+    // a timeout / sub-op failure does not abort finalization.
+    if let Err(err) = fetch_contract_if_missing(op_manager, *key.id()).await {
+        tracing::debug!(
+            contract = %key,
+            error = %err,
+            "subscribe: fetch_contract_if_missing failed; \
+             state will arrive via UPDATE if/when available"
+        );
+    }
+
+    // Announce that we host this contract so neighbors include us as a
+    // broadcast target. Must come AFTER the fetch attempt — announcing
+    // before the body is present would tell neighbors to forward
+    // UPDATEs to a peer that cannot validate them.
+    super::announce_contract_hosted(op_manager, &key).await;
+
+    if !is_renewal {
+        let became_interested = op_manager.interest_manager.add_local_client(&key);
+        if became_interested {
+            super::broadcast_change_interests(op_manager, vec![key], vec![]).await;
+        }
+    }
+}
+
 /// Register a downstream subscriber for a contract.
 ///
 /// Resolves the requester's `PeerKey` from the pre-resolved public key (preferred,
