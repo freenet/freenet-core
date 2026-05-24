@@ -982,23 +982,24 @@ impl RelayContext for RelayEnv<'_> {
         );
 
         // Score candidates by acceptor reliability, filtering out recency cooldown.
+        // Single pass: score candidates, track the best reliability,
+        // discard peers in recency cooldown.
+        let mut best_reliability = 0.0_f64;
         let scored: Vec<(f64, PeerKeyLocation)> = candidates
             .into_iter()
-            .filter(|cand| {
+            .filter_map(|cand| {
                 // Skip peers we recently forwarded to
-                if let Some(ts) = recency.get(cand) {
+                if let Some(ts) = recency.get(&cand) {
                     if now.duration_since(*ts) < RECENCY_COOLDOWN {
-                        return false;
+                        return None;
                     }
                 }
-                true
-            })
-            .map(|cand| {
                 let reliability = cand
                     .socket_addr()
                     .map(|addr| conn_mgr.peer_acceptor_reliability(addr, now))
                     .unwrap_or(0.5);
-                (reliability, cand)
+                best_reliability = best_reliability.max(reliability);
+                Some((reliability, cand))
             })
             .collect();
 
@@ -1010,25 +1011,19 @@ impl RelayContext for RelayEnv<'_> {
             return None;
         }
 
-        // Keep candidates whose reliability is within 0.1 of the best.
-        // This avoids discarding close-to-target peers over tiny reliability
-        // differences while still filtering out genuinely unreliable ones.
-        let best_reliability = scored.iter().map(|(r, _)| *r).fold(0.0_f64, f64::max);
-        let best_candidates: Vec<PeerKeyLocation> = scored
+        // Keep candidates whose reliability is within 0.1 of the best and
+        // immediately partition into "close uphill" (within 2× NEAR_TERMINUS_DISTANCE of target)
+        // and "far uphill". This avoids an intermediate Vec allocation.
+        let close_threshold = NEAR_TERMINUS_DISTANCE * 2.0;
+        let (close, far): (Vec<_>, Vec<_>) = scored
             .into_iter()
             .filter(|(r, _)| best_reliability - *r < UPHILL_RELIABILITY_TOLERANCE)
             .map(|(_, c)| c)
-            .collect();
-
-        // Partition into "close uphill" (within 2× NEAR_TERMINUS_DISTANCE of target)
-        // and "far uphill". Prefer close uphill peers as they're more likely to know
-        // peers near the target that we don't.
-        let close_threshold = NEAR_TERMINUS_DISTANCE * 2.0;
-        let (close, far): (Vec<_>, Vec<_>) = best_candidates.into_iter().partition(|cand| {
-            cand.location()
-                .map(|loc| loc.distance(desired_location).as_f64() < close_threshold)
-                .unwrap_or(false)
-        });
+            .partition(|cand: &PeerKeyLocation| {
+                cand.location()
+                    .map(|loc| loc.distance(desired_location).as_f64() < close_threshold)
+                    .unwrap_or(false)
+            });
 
         if !close.is_empty() {
             tracing::debug!(
