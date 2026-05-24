@@ -1302,19 +1302,18 @@ impl<'a> NetEventLog<'a> {
             NetMessageV1::Get(GetMsg::Response {
                 id,
                 result: GetMsgResult::Found { key, value },
+                hop_count,
                 ..
             }) if value.state.is_some() => {
                 let this_peer = op_manager.ring.connection_manager.own_location();
-                // Calculate hop_count from operation state: max_htl - current_hop
-                let hop_count = op_manager.get_current_hop(id).map(|current_hop| {
-                    op_manager.ring.max_hops_to_live.saturating_sub(current_hop)
-                });
+                // hop_count is carried on the wire Response: set by the storer
+                // (max_htl - htl_at_storer) and preserved by relays bubbling up.
                 EventKind::Get(GetEvent::GetSuccess {
                     id: *id,
                     requester: this_peer.clone(),
                     target: this_peer,
                     key: *key,
-                    hop_count,
+                    hop_count: Some(*hop_count),
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                     state_hash: None, // Hash not available from message
@@ -1324,18 +1323,18 @@ impl<'a> NetEventLog<'a> {
                 id,
                 instance_id,
                 result: GetMsgResult::NotFound,
+                hop_count,
             }) => {
                 let this_peer = op_manager.ring.connection_manager.own_location();
-                // Calculate hop_count from operation state: max_htl - current_hop
-                let hop_count = op_manager.get_current_hop(id).map(|current_hop| {
-                    op_manager.ring.max_hops_to_live.saturating_sub(current_hop)
-                });
+                // hop_count is carried on the wire Response (same semantics
+                // as GetSuccess: forward-path depth from originator to the
+                // node that produced the NotFound).
                 EventKind::Get(GetEvent::GetNotFound {
                     id: *id,
                     requester: this_peer.clone(),
                     instance_id: *instance_id,
                     target: this_peer,
-                    hop_count,
+                    hop_count: Some(*hop_count),
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
