@@ -1534,6 +1534,22 @@ impl Ring {
             candidates = not_ready_fallback;
         }
 
+        // If the entire connection set was filtered out and transients carried
+        // weight in that filtering, warn the operator. There is no transient
+        // fallback by design — transient peers are short-TTL coordination slots
+        // and routing through them just wastes hops — but a sustained
+        // empty-candidate state means the local node has no viable routing
+        // options for this hop, which is operator-visible information that
+        // would otherwise only surface as an `EmptyRing` higher up.
+        if candidates.is_empty() && skipped_transient > 0 {
+            tracing::warn!(
+                skipped_transient,
+                target_location = %target_location.as_f64(),
+                "k_closest: no viable peers — all eligible connections were transient \
+                 (no fallback by design; routing will fail this hop)"
+            );
+        }
+
         // Sort candidates for deterministic input to select_k_best_peers
         candidates.sort();
 
@@ -2921,6 +2937,97 @@ fn deferred_swap_drops_to_execute(
 #[inline]
 fn classify_suspend_jump(boot_elapsed: Duration, mono_elapsed: Duration) -> Duration {
     boot_elapsed.saturating_sub(mono_elapsed)
+}
+
+#[cfg(test)]
+mod k_closest_source_tests {
+    //! Source-scrape pin tests for `Ring::k_closest_potentially_hosting`.
+    //!
+    //! Constructing a real `Ring` for behavioral tests requires significant
+    //! scaffolding (NodeConfig, EventLoopNotificationsSender, NetEventRegister,
+    //! BackgroundTaskMonitor) that does not currently exist in the test suite.
+    //! These tests instead scrape the production source to ensure load-bearing
+    //! filter invariants stay wired in — a future refactor that silently drops
+    //! the transient filter (issue #4222) or the readiness fallback should fail
+    //! CI rather than silently regress production routing behavior.
+    //!
+    //! Behavioral coverage exists transitively via the simulation_integration
+    //! tests; a dedicated integration test for the transient filter is filed
+    //! as a follow-up to the Ring test-scaffolding work.
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("ring.rs");
+        // ring.rs has inline `#[cfg(test)]` annotations on individual const
+        // declarations inside `connection_maintenance` (lines ~1894–1940), so
+        // a plain `find("#[cfg(test)]")` would cut off the file mid-impl and
+        // miss the function we want to scrape. Anchor on the first *top-level*
+        // test module declaration instead.
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("ring.rs must have a top-level #[cfg(test)] mod section");
+        &FULL[..cutoff]
+    }
+
+    fn extract_fn_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
+        let start = source
+            .find(signature_prefix)
+            .unwrap_or_else(|| panic!("could not find {signature_prefix}"));
+        let brace = source[start..].find('{').expect("fn sig must have body");
+        let body_start = start + brace + 1;
+        let bytes = source.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unbalanced braces while extracting {signature_prefix}");
+    }
+
+    /// Issue #4222: `k_closest_potentially_hosting` must skip transient peers
+    /// so GET/SUBSCRIBE doesn't route through about-to-be-dropped connections.
+    /// The PUT/UPDATE path already filters them via `routing_candidates`; this
+    /// pin makes sure the GET path stays in sync.
+    #[test]
+    fn k_closest_potentially_hosting_filters_transient_peers() {
+        let src = production_source();
+        let body = extract_fn_body(src, "pub fn k_closest_potentially_hosting<K>(");
+        assert!(
+            body.contains("is_transient(addr)"),
+            "k_closest_potentially_hosting must call is_transient(addr) on each \
+             candidate connection. If the filter was deliberately removed, also \
+             update .claude/rules/ring.md (which documents the filter rule) and \
+             this test. Issue #4222 / #3570."
+        );
+        assert!(
+            body.contains("skipped_transient"),
+            "k_closest_potentially_hosting must surface a skipped_transient \
+             counter so operators can see when the filter is removing peers."
+        );
+    }
+
+    /// The existing readiness fallback must remain — without it, a node whose
+    /// peers haven't yet sent ReadyState would fail every GET with EmptyRing.
+    /// Pinning it here so a future refactor of the filter chain can't silently
+    /// drop the fallback.
+    #[test]
+    fn k_closest_potentially_hosting_preserves_not_ready_fallback() {
+        let src = production_source();
+        let body = extract_fn_body(src, "pub fn k_closest_potentially_hosting<K>(");
+        assert!(
+            body.contains("not_ready_fallback"),
+            "k_closest_potentially_hosting must keep the not-yet-ready peer \
+             fallback so cold-start nodes don't fail every GET with EmptyRing."
+        );
+    }
 }
 
 #[cfg(test)]

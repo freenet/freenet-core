@@ -24,11 +24,21 @@ use util::{Mean, TransferSpeed};
 /// on subscribed contracts never visited any subscriber, because a small
 /// window misses uniformly-distributed subscribers most hops (issue #4222).
 ///
-/// 25 matches `ring::DEFAULT_MIN_CONNECTIONS`, so a node at its minimum
+/// 25 matches `ring::Ring::DEFAULT_MIN_CONNECTIONS`, so a node at its minimum
 /// connection count surfaces its entire routing table to the predictor. Larger
 /// tables still favor the closest 25; the predictor's distance penalty
 /// preserves small-world routing.
 const DEFAULT_CONSIDER_N_CLOSEST_PEERS: usize = 25;
+
+// Compile-time link between this default and `Ring::DEFAULT_MIN_CONNECTIONS`
+// so future changes to either constant fail the build instead of silently
+// diverging. If you intentionally want this window to differ from
+// `DEFAULT_MIN_CONNECTIONS`, drop this assertion and document why.
+const _: () = assert!(
+    DEFAULT_CONSIDER_N_CLOSEST_PEERS == crate::ring::Ring::DEFAULT_MIN_CONNECTIONS,
+    "DEFAULT_CONSIDER_N_CLOSEST_PEERS must match Ring::DEFAULT_MIN_CONNECTIONS — \
+     see comment above."
+);
 
 // ==================== Telemetry types ====================
 
@@ -1159,6 +1169,16 @@ mod tests {
         // matching production. Do NOT call `considering_n_closest_peers` here:
         // the test pins the SHIPPED default, not an ad-hoc test override.
         let router = Router::new(&[]);
+
+        // Pin the shipped window value explicitly. The statistical assertion
+        // below is calibrated against a window of 25 (~93% coverage); a silent
+        // drop to e.g. 18 would still produce ~85% coverage and pass the
+        // hypergeometric threshold by luck, hiding a regression. Fail loudly
+        // on any drift.
+        assert_eq!(
+            router.consider_n_closest_peers, 25,
+            "issue #4222 regression: expected DEFAULT_CONSIDER_N_CLOSEST_PEERS = 25"
+        );
 
         let mut covered = 0usize;
         for _ in 0..NUM_TRIALS {
