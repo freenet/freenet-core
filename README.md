@@ -32,6 +32,14 @@ available and robust.
 Today’s web is a series of siloed services, but every system built on Freenet is fully interoperable by default. Freenet
 apps can be built with popular web frameworks, accessed through any browser just like the web.
 
+## Whitepaper
+
+For an architectural overview — covering the contract model (idempotent commutative
+monoids on application state), summary/delta synchronization, small-world adaptive
+routing, and the delegate model for private state — see the
+[Freenet whitepaper](https://freenet.org/whitepaper/).
+Source: [github.com/freenet/paper-1](https://github.com/freenet/paper-1).
+
 ## Build Instructions
 
 Before installing anything you need to run the following in the repository,
