@@ -1470,6 +1470,7 @@ impl Ring {
         let mut candidates: Vec<PeerKeyLocation> = Vec::new();
         let mut not_ready_fallback: Vec<PeerKeyLocation> = Vec::new();
         let mut skipped_not_ready: usize = 0;
+        let mut skipped_transient: usize = 0;
 
         let connections = self.connection_manager.get_connections_by_location();
         // Sort keys for deterministic iteration order (HashMap iteration is non-deterministic)
@@ -1484,6 +1485,21 @@ impl Ring {
             for conn in sorted_conns {
                 if let Some(addr) = conn.location.socket_addr() {
                     if skip_list.has_element(addr) || !seen.insert(addr) {
+                        continue;
+                    }
+                    // Skip transient peers — these are short-TTL connections used for
+                    // CONNECT coordination, not stable routing targets. PUT/UPDATE
+                    // already exclude them via `ConnectionManager::routing_candidates`
+                    // (see connection_manager.rs:1578); previously GET/SUBSCRIBE
+                    // could route through them and waste hops on a forwarder that
+                    // was about to be dropped. Issue #4222 / #3570.
+                    if self.connection_manager.is_transient(addr) {
+                        tracing::debug!(
+                            %addr,
+                            target_location = %target_location.as_f64(),
+                            "k_closest: skipping transient peer"
+                        );
+                        skipped_transient += 1;
                         continue;
                     }
                     // Skip peers that haven't advertised readiness, but collect them
@@ -1548,6 +1564,7 @@ impl Ring {
             target_location = %target_location.as_f64(),
             candidates_found = selected.len(),
             skipped_not_ready,
+            skipped_transient,
             "k_closest_potentially_hosting result"
         );
 
