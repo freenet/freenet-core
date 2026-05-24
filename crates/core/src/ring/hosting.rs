@@ -3485,4 +3485,87 @@ mod tests {
         assert_eq!(manager.pending_reclamation_len(), 0);
         assert!(manager.pending_reclamation_snapshot().is_empty());
     }
+
+    /// Generation-mismatch + not-in-cache → keep pending and update its
+    /// captured generation to the current one. Models the
+    /// `RuntimePool::remove_contract` branch added in PR #4212 review
+    /// round 8: an evicted-then-in-use-then-UPDATEd contract must keep
+    /// its retry entry, otherwise the on-disk storage leaks once the
+    /// subscriber later expires (UPDATE does not call `host_contract`,
+    /// so the cache cannot emit another `EvictContract`).
+    #[test]
+    fn test_pending_reclamation_kept_on_generation_mismatch_when_not_hosted() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(0xA1);
+
+        // Initial state: contract has been written 5 times (gen=5), was
+        // evicted with `expected_generation=5`, and queued for retry
+        // because a subscriber was still attached at the time.
+        for _ in 0..5 {
+            manager.bump_state_generation(&contract);
+        }
+        let captured_generation = manager.state_generation(&contract);
+        assert_eq!(captured_generation, 5);
+        manager.pending_reclamation_add(contract, captured_generation);
+
+        // Simulate UPDATEs while the contract is still evicted (not in
+        // cache): `state_generation` advances past the captured value.
+        // UPDATE does not call `host_contract`, so the cache stays
+        // empty.
+        manager.bump_state_generation(&contract);
+        manager.bump_state_generation(&contract);
+        manager.bump_state_generation(&contract);
+        let current_generation = manager.state_generation(&contract);
+        assert_eq!(current_generation, captured_generation + 3);
+
+        // Precondition: the contract is NOT in the hosting cache.
+        assert!(!manager.is_hosting_contract(&contract));
+
+        // The `RuntimePool::remove_contract` generation-mismatch +
+        // not-hosted branch upserts the pending entry to the current
+        // generation. Model that here via `pending_reclamation_add`.
+        manager.pending_reclamation_add(contract, current_generation);
+
+        let snapshot = manager.pending_reclamation_snapshot();
+        assert_eq!(
+            snapshot,
+            vec![(contract, current_generation)],
+            "pending entry must survive the generation mismatch AND its \
+             expected_generation must advance to the current generation"
+        );
+    }
+
+    /// Generation-mismatch + IS-in-cache → clear pending. Models the
+    /// other half of the new branch: when the contract is back in the
+    /// hosting cache (a PUT re-hosted it), the cache owns subsequent
+    /// re-eviction and a stale pending entry would only produce
+    /// spurious sweep retries.
+    #[test]
+    fn test_pending_reclamation_cleared_on_generation_mismatch_when_hosted() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(0xA2);
+
+        // Queue a stale pending entry.
+        let captured_generation = 7u64;
+        manager.pending_reclamation_add(contract, captured_generation);
+        assert_eq!(manager.pending_reclamation_len(), 1);
+
+        // Simulate a PUT that re-hosted: bump generation AND add to
+        // the hosting cache (record_contract_access ≈ what
+        // `host_contract` does in production).
+        manager.bump_state_generation(&contract);
+        manager.record_contract_access(contract, 128, AccessType::Put);
+        assert!(manager.is_hosting_contract(&contract));
+
+        // The `RuntimePool::remove_contract` generation-mismatch +
+        // is-hosting branch removes the pending entry. Model that here.
+        manager.pending_reclamation_remove(&contract);
+        assert_eq!(
+            manager.pending_reclamation_len(),
+            0,
+            "pending entry must be cleared once the cache owns the contract \
+             again — leaving it would let the sweep emit `EvictContract` \
+             events that all bail at the `is_hosting_contract` check"
+        );
+    }
 }

@@ -603,18 +603,40 @@ impl ContractExecutor for RuntimePool {
         let current_generation = self.op_manager.ring.state_generation(key);
         if current_generation != expected_generation {
             // A state write (PUT/UPDATE) occurred between eviction and
-            // now. The contract has been re-hosted by the write path;
-            // a later genuine eviction will emit a fresh
-            // `EvictContract` with the current generation. We do NOT
-            // add a pending entry — the write path will naturally
-            // re-host and re-evict if appropriate.
+            // now. Two sub-cases matter for whether we keep the
+            // pending-reclamation entry:
             //
-            // Clear any stale pending entry for the same reason: the
-            // write path's re-host+re-evict cycle owns subsequent
-            // reclamation, so leaving an entry behind only produces
-            // spurious sweep retries that all bail at the
-            // generation-mismatch check.
-            self.op_manager.ring.pending_reclamation_remove(key);
+            // (a) The contract IS in the hosting cache: PUT's write
+            //     path re-hosts via `host_contract`, so the cache
+            //     itself now owns subsequent eviction. A later genuine
+            //     eviction will emit a fresh `EvictContract` with the
+            //     up-to-date generation. Clear the pending entry —
+            //     leaving it would let the sweep keep emitting
+            //     `EvictContract` events that all bail at the
+            //     `is_hosting_contract` check above.
+            //
+            // (b) The contract is NOT in the hosting cache: UPDATE
+            //     bumps `state_generation` without calling
+            //     `host_contract`, so a subscriber-only contract that
+            //     was evicted and then UPDATEd reaches this branch
+            //     with an advanced generation but no cache entry.
+            //     Clearing pending here would permanently leak the
+            //     on-disk storage once the subscriber later expires
+            //     (there is no cache entry left to emit another
+            //     `EvictContract`). Upsert the pending entry with the
+            //     current generation so the periodic sweep retries
+            //     with a fresh `EvictContract{key, current_generation}`;
+            //     if no further writes happen the next pass will reach
+            //     the reclaim step, and if more writes happen this
+            //     upsert repeats until the generation stabilises.
+            //     See PR #4212 review round 8.
+            if self.op_manager.ring.is_hosting_contract(key) {
+                self.op_manager.ring.pending_reclamation_remove(key);
+            } else {
+                self.op_manager
+                    .ring
+                    .pending_reclamation_add(*key, current_generation);
+            }
             tracing::debug!(
                 contract = %key,
                 expected_generation,
@@ -635,19 +657,41 @@ impl ContractExecutor for RuntimePool {
         self.return_checked(executor, "remove_contract").await;
         self.track_contract_return(key);
 
-        // On successful disk reclamation, forget the generation entry so
-        // the state_generation map does not grow unbounded. We only forget
-        // on success: leaving the entry behind on partial failures is safe
-        // (the next access will refresh it; the generation is monotonic).
-        if result.is_ok() {
-            self.op_manager.ring.forget_state_generation(key);
-            // A successful retry from the pending-reclamation queue
-            // must clear the queue entry too. No-op when the key was
-            // not previously pending (the common case — most evictions
-            // succeed on the first attempt).
-            self.op_manager.ring.pending_reclamation_remove(key);
+        // Translate the `ReclaimOutcome` into pending-reclamation management:
+        //   - Full   → forget state_generation + clear pending (existing behavior).
+        //   - Partial → keep pending and keep state_generation; the next sweep
+        //               retries the half that failed. Avoids leaking the
+        //               unreclaimed half forever when a transient DB/FS error
+        //               struck only one of the two delete steps. See PR #4212
+        //               review round 8.
+        //   - Err    → both halves failed; log and keep pending for retry.
+        match &result {
+            Ok(ReclaimOutcome::Full) => {
+                self.op_manager.ring.forget_state_generation(key);
+                // A successful retry from the pending-reclamation queue
+                // must clear the queue entry too. No-op when the key was
+                // not previously pending (the common case — most evictions
+                // succeed on the first attempt).
+                self.op_manager.ring.pending_reclamation_remove(key);
+            }
+            Ok(ReclaimOutcome::Partial) => {
+                // Leave both pending-reclamation and state_generation in
+                // place: the entry will be retried by the periodic sweep
+                // (or by a fresh `EvictContract` if the cache re-emits
+                // one) until the remaining half is reclaimable.
+                tracing::debug!(
+                    contract = %key,
+                    "partial reclaim — retaining pending-reclamation entry for retry"
+                );
+            }
+            Err(_) => {
+                // Both halves failed; keep pending so the sweep retries.
+                // (The error is logged inside `reclaim_contract_storage`.)
+            }
         }
-        result
+        // Drop the outcome detail at the trait boundary: callers expect
+        // `Result<(), ExecutorError>` and cannot act on Full vs Partial.
+        result.map(|_| ())
     }
 
     async fn upsert_contract_state(
@@ -2750,10 +2794,14 @@ impl ContractExecutor for Executor<Runtime> {
         _expected_generation: u64,
     ) -> Result<(), ExecutorError> {
         // The inner Executor does not own a Ring (and so cannot consult
-        // the state-write generation directly). Race detection lives at
-        // the `RuntimePool::remove_contract` layer; the inner impl just
-        // performs the disk reclamation.
-        self.reclaim_contract_storage(key).await
+        // the state-write generation directly). Race detection and
+        // partial-failure retry both live at the
+        // `RuntimePool::remove_contract` layer; the inner impl just
+        // performs the disk reclamation. Trait-level callers that go
+        // through this method (i.e. not via `RuntimePool`) cannot make
+        // a Full/Partial distinction anyway, so collapse to
+        // `Result<(), _>` — `Partial` is reported as `Ok` here.
+        self.reclaim_contract_storage(key).await.map(|_| ())
     }
 }
 
@@ -3583,55 +3631,87 @@ impl Executor<Runtime> {
     /// still attempted so a partial reclaim is achieved rather than none. The
     /// method is idempotent — both `StateStore::delete` and
     /// `ContractStore::remove_contract` tolerate already-missing entries — so a
-    /// double eviction is harmless. Returns `Ok(())` whenever either step
-    /// succeeds (or both were already clean); only a failure of *both* steps is
-    /// surfaced as an error, since this is fire-and-forget maintenance.
+    /// double eviction is harmless.
     ///
-    /// Note that `Ok(())` does NOT mean the contract is fully consistent: a
-    /// partial failure (state deleted but code kept, or vice versa) leaves the
-    /// contract half-present on disk until a subsequent access re-fetches it.
-    /// Callers must not treat `Ok` as "fully reclaimed" or "fully consistent".
+    /// Return value:
+    ///   - `Ok(ReclaimOutcome::Full)` — both halves are absent at end (either
+    ///     both deleted in this call, or one was already missing and the other
+    ///     was deleted, or both were already missing).
+    ///   - `Ok(ReclaimOutcome::Partial)` — exactly one half failed with a real
+    ///     error while the other succeeded. The caller MUST retain the
+    ///     pending-reclamation entry so a future sweep retries the remaining
+    ///     work. Closes the disk-leak edge case where a transient DB/FS
+    ///     error in one half leaves the other half permanently leaked. See
+    ///     PR #4212 review round 8.
+    ///   - `Err` — BOTH halves failed; surfaced so the caller can log/retry.
     ///
     /// This is the inherent implementation; the `ContractExecutor::remove_contract`
-    /// trait method delegates to it.
-    async fn reclaim_contract_storage(&mut self, key: &ContractKey) -> Result<(), ExecutorError> {
-        let state_deleted = match self.state_store.delete(key).await {
-            Ok(()) => true,
+    /// trait method delegates to it and translates the outcome into
+    /// pending-reclamation management.
+    async fn reclaim_contract_storage(
+        &mut self,
+        key: &ContractKey,
+    ) -> Result<ReclaimOutcome, ExecutorError> {
+        let state_result = match self.state_store.delete(key).await {
+            Ok(()) => Ok(()),
             Err(e) => {
                 tracing::warn!(
                     contract = %key,
                     error = %e,
                     "failed to delete persisted state while reclaiming evicted contract"
                 );
-                false
+                Err(())
             }
         };
-        let code_deleted = match self.runtime.contract_store.remove_contract(key) {
-            Ok(()) => true,
+        let code_result = match self.runtime.contract_store.remove_contract(key) {
+            Ok(()) => Ok(()),
             Err(e) => {
                 tracing::warn!(
                     contract = %key,
                     error = %e,
                     "failed to delete WASM code while reclaiming evicted contract"
                 );
-                false
+                Err(())
             }
         };
 
-        if !state_deleted && !code_deleted {
+        let state_ok = state_result.is_ok();
+        let code_ok = code_result.is_ok();
+        if !state_ok && !code_ok {
             return Err(ExecutorError::other(anyhow::anyhow!(
                 "failed to reclaim any on-disk storage for contract {key}"
             )));
         }
 
+        let outcome = if state_ok && code_ok {
+            ReclaimOutcome::Full
+        } else {
+            ReclaimOutcome::Partial
+        };
         tracing::info!(
             contract = %key,
-            state_deleted,
-            code_deleted,
+            state_deleted = state_ok,
+            code_deleted = code_ok,
+            ?outcome,
             "reclaimed on-disk storage for evicted contract"
         );
-        Ok(())
+        Ok(outcome)
     }
+}
+
+/// Outcome of [`Executor::reclaim_contract_storage`].
+///
+/// The split exists so the caller (`RuntimePool::remove_contract`) can decide
+/// whether to clear the pending-reclamation entry (on `Full`) or leave it for
+/// a future retry (on `Partial`). See PR #4212 review round 8.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReclaimOutcome {
+    /// Both state and code are absent at end of the reclaim call.
+    Full,
+    /// Exactly one half failed with a real error; the other succeeded (or was
+    /// already absent). The pending-reclamation entry should be retained so a
+    /// future sweep retries the remaining work.
+    Partial,
 }
 
 impl Executor<Runtime> {
@@ -4240,6 +4320,7 @@ mod remove_contract_tests {
         WrappedContract, WrappedState,
     };
 
+    use super::ReclaimOutcome;
     use crate::contract::executor::Executor;
     use crate::contract::storages::Storage;
     use crate::wasm_runtime::{
@@ -4336,10 +4417,15 @@ mod remove_contract_tests {
         );
 
         // Evict.
-        executor
+        let outcome = executor
             .reclaim_contract_storage(&key)
             .await
             .expect("reclaim must succeed");
+        assert_eq!(
+            outcome,
+            ReclaimOutcome::Full,
+            "fresh-evict path with both halves present must be Full"
+        );
 
         // Post-conditions: state gone, .wasm gone.
         match executor.state_store.get(&key).await {
@@ -4372,15 +4458,29 @@ mod remove_contract_tests {
             .await
             .expect("store contract state");
 
-        executor
+        let first = executor
             .reclaim_contract_storage(&key)
             .await
             .expect("first reclaim must succeed");
-        // Second reclaim: state and .wasm are already gone — must still be Ok.
-        executor
+        assert_eq!(
+            first,
+            ReclaimOutcome::Full,
+            "first reclaim with both halves present must be Full"
+        );
+        // Second reclaim: state and .wasm are already gone — both
+        // backends treat missing entries as a successful no-op, so the
+        // outcome stays Full (not Partial). This pins down the
+        // "idempotent double-evict" invariant after the Full/Partial
+        // refactor.
+        let second = executor
             .reclaim_contract_storage(&key)
             .await
             .expect("second reclaim must be a no-op, not an error");
+        assert_eq!(
+            second,
+            ReclaimOutcome::Full,
+            "double-evict must report Full (both backends treat missing as ok)"
+        );
         assert!(
             !wasm_path(&contracts_dir, &key).exists(),
             "WASM blob must remain absent after double eviction"
@@ -4394,9 +4494,66 @@ mod remove_contract_tests {
     async fn remove_contract_unknown_contract_is_noop() {
         let (mut executor, _contracts_dir, _temp) = build_disk_executor("unknown").await;
         let (_container, key) = make_contract(0x55, 0x66);
-        executor
+        let outcome = executor
             .reclaim_contract_storage(&key)
             .await
             .expect("reclaiming an unknown contract must be Ok");
+        assert_eq!(
+            outcome,
+            ReclaimOutcome::Full,
+            "unknown-contract path is treated as already-clean, hence Full"
+        );
+    }
+
+    /// `ReclaimOutcome` discrimination compiles and the `Full` vs `Partial`
+    /// shape works in trivial cases.
+    ///
+    /// Full coverage:
+    ///   - state present + code present → Full (covered above in
+    ///     `remove_contract_reclaims_state_and_wasm_from_disk`).
+    ///   - both absent → Full (covered above in
+    ///     `remove_contract_is_idempotent_on_double_eviction` and
+    ///     `remove_contract_unknown_contract_is_noop`).
+    ///   - state present + code already gone → still Full (because
+    ///     `ContractStore::remove_contract` treats a missing blob as
+    ///     `Ok(())`, and the state half deletes cleanly).
+    ///
+    /// Partial coverage: a real `Partial` outcome would require fault
+    /// injection at the `StateStore::delete` or
+    /// `ContractStore::remove_contract` level (e.g. a poisoned redb
+    /// transaction or a permissions error on the contracts dir). The
+    /// current backends do not surface a "failed but not for missing"
+    /// error mode that's safe to provoke from a unit test without
+    /// reaching into private state — so genuine `Partial` is exercised
+    /// only via the manager-layer logic (`RuntimePool::remove_contract`
+    /// retains the pending entry on `Partial` and forgets it on
+    /// `Full`). A `#[freenet_test]` follow-up could simulate a backend
+    /// fault, but that's out of scope here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reclaim_outcome_state_present_code_absent_is_full() {
+        let (mut executor, _contracts_dir, _temp) = build_disk_executor("partial-state-only").await;
+        let (container, key) = make_contract(0x77, 0x88);
+        let params = container.params();
+        let state = WrappedState::new(b"state without code".to_vec());
+
+        // Skip storing the contract code; only persist state. The
+        // contract store's `remove_contract` for an absent key is
+        // `Ok(())`, so the outcome should still be Full.
+        executor
+            .state_store
+            .store(key, state, params)
+            .await
+            .expect("store contract state");
+
+        let outcome = executor
+            .reclaim_contract_storage(&key)
+            .await
+            .expect("reclaim must succeed even when code half is already absent");
+        assert_eq!(
+            outcome,
+            ReclaimOutcome::Full,
+            "state-only present + code-already-gone counts as Full because \
+             both halves are absent at end"
+        );
     }
 }
