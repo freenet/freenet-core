@@ -9517,33 +9517,34 @@ async fn sim_network_regular_node_labels_start_at_gateway_count() {
 
 /// Sweep network size N and collect terminal-GET hop counts for each case.
 ///
-/// Workload: gateway 0 PUTs a known contract; every node then GETs that same
-/// contract. This is the `test_get_reliability_diagnostic` pattern — it gives
-/// a controlled, GET-success-heavy distribution rather than the random
-/// gen_event workload which produces almost only NotFound events.
-///
-/// Uses `run_controlled_simulation` (Turmoil-based) for deterministic
-/// scheduled operations. Turmoil link bookkeeping is O(n²), so N=200 takes
-/// disproportionately longer than smaller sizes — we cap the sweep at N=100
-/// to keep total wall time under ~15 minutes.
+/// Workload notes:
+/// - `run_direct()` with the random `gen_event` workload is used because the
+///   alternative `run_controlled_simulation` (Turmoil) was observed to have
+///   poor connection-formation at N >= 20 in this codebase — most peers
+///   never finished `connect` before operations were dispatched, so >95% of
+///   ops were rejected with "peer has not joined network yet" and the
+///   resulting hop-count sample was n<=10. The random workload tolerates
+///   the slow startup because operations keep firing during the
+///   stabilisation window.
+/// - The random workload produces mostly `GetNotFound` outcomes (random GETs
+///   target random pre-existing contracts; routing exhausts before finding
+///   them). Both `GetSuccess` and `GetNotFound` carry a valid forward-path
+///   `hop_count` — same routing metric, different terminal outcome — so the
+///   sweep tables report both together. The `GetSuccess`-only subtable
+///   captures the "GET on a contract that exists" subset most directly
+///   relevant to the whitepaper's claim, where samples permit.
 #[test_log::test]
 #[ignore = "long-running hop-count sweep; run via `cargo test ... -- --ignored bench_hop_count_sweep`"]
 fn bench_hop_count_sweep() {
-    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+    const SEED: u64 = 0x5EED_C0F1;
 
-    const SEED_BASE: u64 = 0x5EED_C0F1;
-
-    // (gateways, nodes, ring_max_htl, rnd_if_htl_above, min_conns, max_conns,
-    //  sim_duration_secs, post_wait_secs)
-    //
-    // ring_max_htl scales loosely with log2(N). max_conns scales sublinearly to
-    // keep the topology connected without making every node a hub. Duration
-    // scales with N because the originator-loopback path through every node
-    // takes longer to drain on bigger networks.
-    let cases: [(usize, usize, usize, usize, usize, usize, u64, u64); 3] = [
-        (1, 20, 8, 5, 3, 10, 120, 30),
-        (2, 50, 10, 7, 4, 12, 240, 60),
-        (3, 100, 12, 8, 4, 14, 600, 120),
+    // (gateways, nodes, iters, max_contracts, duration_secs, sleep_secs,
+    //  min_conns, max_conns, ring_max_htl, rnd_if_htl_above)
+    let cases: [(usize, usize, usize, usize, u64, u64, usize, usize, usize, usize); 4] = [
+        (1, 20, 100, 5, 60, 3, 3, 15, 10, 7),
+        (2, 50, 200, 8, 120, 5, 3, 20, 12, 8),
+        (2, 100, 300, 10, 240, 8, 3, 25, 14, 10),
+        (3, 200, 500, 15, 480, 10, 3, 30, 16, 12),
     ];
 
     #[derive(Default)]
@@ -9561,75 +9562,28 @@ fn bench_hop_count_sweep() {
 
     let mut all: Vec<CaseSummary> = Vec::new();
 
-    for (gw, n, htl, rnd_above, min_conns, max_conns, dur, post_wait) in cases {
+    for (gw, n, iters, max_c, dur, sleep, min_c, max_c2, htl, rnd_above) in cases {
         let case_start = std::time::Instant::now();
-        let network_name = "hop-sweep";
-        let case_seed = SEED_BASE ^ (n as u64);
-
         tracing::info!(
-            "=== sweep case: gateways={gw} nodes={n} htl={htl}/{rnd_above} \
-             conns={min_conns}..{max_conns} duration={dur}s post_wait={post_wait}s ==="
+            "=== sweep case: gateways={gw} nodes={n} iters={iters} max_contracts={max_c} \
+             duration={dur}s htl={htl}/{rnd_above} conns={min_c}..{max_c2} ==="
         );
 
-        GlobalTestMetrics::reset();
-        setup_deterministic_state(case_seed);
-        let rt = create_runtime();
-
-        let (sim, logs_handle) = rt.block_on(async {
-            let sim = SimNetwork::new(
-                network_name,
-                gw,
-                n,
-                htl,
-                rnd_above,
-                max_conns,
-                min_conns,
-                case_seed,
-            )
-            .await;
-            let logs_handle = sim.event_logs_handle();
-            (sim, logs_handle)
-        });
-
-        // PUT a known contract from gateway 0, then every node GETs it.
-        // Distinct contract bytes per case so trees can't poison each other.
-        let contract_seed_byte = (case_seed & 0xFF) as u8;
-        let contract = SimOperation::create_test_contract(contract_seed_byte);
-        let contract_id = *contract.key().id();
-
-        let mut operations = vec![ScheduledOperation::new(
-            NodeLabel::gateway(network_name, 0),
-            SimOperation::Put {
-                contract: contract.clone(),
-                state: vec![contract_seed_byte; 64],
-                subscribe: true,
-            },
-        )];
-
-        for i in 0..n {
-            operations.push(ScheduledOperation::new(
-                NodeLabel::node(network_name, i),
-                SimOperation::Get {
-                    contract_id,
-                    return_contract_code: true,
-                    subscribe: false,
-                },
-            ));
-        }
-
-        let result = sim.run_controlled_simulation(
-            case_seed,
-            operations,
-            Duration::from_secs(dur),
-            Duration::from_secs(post_wait),
-        );
-        if let Err(e) = &result.turmoil_result {
-            panic!("sweep case N={n} turmoil failed: {e:?}");
-        }
+        let result = TestConfig::medium("hop-sweep", SEED ^ n as u64)
+            .with_gateways(gw)
+            .with_nodes(n)
+            .with_iterations(iters)
+            .with_max_contracts(max_c)
+            .with_duration(Duration::from_secs(dur))
+            .with_sleep(Duration::from_secs(sleep))
+            .with_connections(min_c, max_c2)
+            .with_htl(htl, rnd_above)
+            .run_direct()
+            .assert_ok();
 
         let rt = create_runtime();
         let case = rt.block_on(async {
-            let logs = logs_handle.lock().await;
+            let logs = result.logs_handle.lock().await;
             let mut summary = CaseSummary {
                 n_total: n + gw,
                 gw,
