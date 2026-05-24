@@ -94,6 +94,22 @@ mod messages {
             id: Transaction,
             instance_id: ContractInstanceId,
             result: GetMsgResult,
+            /// Forward-path hop count: how many hops the originating Request
+            /// traversed before reaching the node that produced this Response
+            /// (the storer for Found, or the HTL-exhausted relay for NotFound).
+            ///
+            /// Computed as `max_hops_to_live - htl_at_responder`. The relay
+            /// chain preserves this value as the Response bubbles back to the
+            /// originator — it does NOT increment on the return path. This
+            /// gives the whitepaper's "routing depth" metric (forward hops),
+            /// not round-trip.
+            ///
+            /// `#[serde(default)]` is set for source-level clarity. Bincode
+            /// does not honour serde defaults (positional encoding), so wire
+            /// compat with peers that lack this field is handled at the
+            /// handshake layer via `MIN_COMPATIBLE_VERSION`.
+            #[serde(default)]
+            hop_count: usize,
         },
 
         /// Streaming response for large contract data. Used when the response payload
@@ -264,6 +280,7 @@ mod tests {
                     contract: None,
                 },
             },
+            hop_count: 0,
         };
         let display = format!("{}", msg);
         assert!(
@@ -284,6 +301,7 @@ mod tests {
             id: tx,
             instance_id,
             result: GetMsgResult::NotFound,
+            hop_count: 0,
         };
         let display = format!("{}", msg);
         assert!(
@@ -345,6 +363,7 @@ mod tests {
                     contract: None,
                 },
             },
+            hop_count: 0,
         };
         let location_found = msg_found.requested_location();
         assert!(
@@ -362,6 +381,7 @@ mod tests {
             id: tx,
             instance_id,
             result: GetMsgResult::NotFound,
+            hop_count: 0,
         };
         let location_notfound = msg_notfound.requested_location();
         assert!(
