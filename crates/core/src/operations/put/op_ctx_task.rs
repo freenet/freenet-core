@@ -820,12 +820,15 @@ where
                         "PUT relay: next hop has no socket address"
                     );
                     // No next hop — act as final destination.
+                    // This node IS the storer; hop_count = max_htl - htl_we_received.
+                    let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
                     return relay_put_finalize_local(
                         op_manager,
                         incoming_tx,
                         key,
                         merged_value,
                         upstream_addr,
+                        hop_count,
                     )
                     .await;
                 }
@@ -840,12 +843,15 @@ where
                 phase = "relay_put_complete",
                 "PUT relay: no next hop, finalizing at this node"
             );
+            // Same arm as above: this node IS the storer.
+            let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
             return relay_put_finalize_local(
                 op_manager,
                 incoming_tx,
                 key,
                 merged_value,
                 upstream_addr,
+                hop_count,
             )
             .await;
         }
@@ -1127,7 +1133,11 @@ where
     // future routing decisions are informed by relay-observed outcomes,
     // not just events from ops this node originated.
     match reply {
-        NetMessage::V1(NetMessageV1::Put(PutMsg::Response { key: reply_key, .. })) => {
+        NetMessage::V1(NetMessageV1::Put(PutMsg::Response {
+            key: reply_key,
+            hop_count: downstream_hop_count,
+            ..
+        })) => {
             tracing::info!(
                 tx = %incoming_tx,
                 contract = %reply_key,
@@ -1141,9 +1151,23 @@ where
                 crate::router::RouteOutcome::SuccessUntimed,
                 crate::node::network_status::OpType::Put,
             );
-            relay_put_send_response(op_manager, incoming_tx, reply_key, upstream_addr).await
+            // Preserve the storer-side hop_count so the originator sees the
+            // *forward* depth from Request to storer, not the depth from
+            // Request to this relay. Mirrors GET relay bubble-up.
+            relay_put_send_response(
+                op_manager,
+                incoming_tx,
+                reply_key,
+                upstream_addr,
+                downstream_hop_count,
+            )
+            .await
         }
-        NetMessage::V1(NetMessageV1::Put(PutMsg::ResponseStreaming { key: reply_key, .. })) => {
+        NetMessage::V1(NetMessageV1::Put(PutMsg::ResponseStreaming {
+            key: reply_key,
+            hop_count: downstream_hop_count,
+            ..
+        })) => {
             // Streaming response arrived from downstream. Slice A does
             // not relay-forward streaming payloads, so log and
             // synthesize a non-streaming Response upstream. This
@@ -1164,7 +1188,15 @@ where
                 crate::router::RouteOutcome::SuccessUntimed,
                 crate::node::network_status::OpType::Put,
             );
-            relay_put_send_response(op_manager, incoming_tx, reply_key, upstream_addr).await
+            // Downgrade still preserves the storer-side forward depth.
+            relay_put_send_response(
+                op_manager,
+                incoming_tx,
+                reply_key,
+                upstream_addr,
+                downstream_hop_count,
+            )
+            .await
         }
         other => {
             // Unexpected reply variant: unclear whether it's a local
@@ -1278,12 +1310,18 @@ async fn relay_put_store_locally(
 
 /// Finalize at this node when there's no next hop. Emits `put_success`
 /// telemetry and sends `PutMsg::Response` upstream.
+///
+/// `hop_count` is the forward-path depth this relay finalised at — for the
+/// non-originator-as-storer arm this is `max_htl - htl_we_received`. Caller
+/// computes it from the inbound `htl` so this helper stays oblivious to
+/// ring state and is mechanically easy to audit.
 async fn relay_put_finalize_local(
     op_manager: &OpManager,
     incoming_tx: Transaction,
     key: ContractKey,
     merged_value: WrappedState,
     upstream_addr: SocketAddr,
+    hop_count: usize,
 ) -> Result<(), OpError> {
     // Telemetry: non-originator target peer — emit put_success for
     // convergence checking (mirrors put.rs:798-811 non-originator arm).
@@ -1295,18 +1333,24 @@ async fn relay_put_finalize_local(
         &op_manager.ring,
         key,
         own_location,
-        None,
+        Some(hop_count),
         hash,
         size,
     ) {
         op_manager.ring.register_events(Either::Left(event)).await;
     }
 
-    relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await
+    relay_put_send_response(op_manager, incoming_tx, key, upstream_addr, hop_count).await
 }
 
 /// Send `PutMsg::Response` upstream (fire-and-forget: upstream relay
 /// awaits via its own `send_to_and_await`, no reply expected).
+///
+/// `hop_count` is the forward-path depth to embed in the Response. For a
+/// relay that finalised locally (this node IS the storer), pass
+/// `max_htl - incoming_htl`. For a relay bubbling a downstream Response
+/// upstream, pass the downstream's `hop_count` verbatim — relays do NOT
+/// increment on the return path.
 ///
 /// Originator-loopback case (`upstream_addr == own_addr`): when
 /// the relay driver runs on the originator's own node, the
@@ -1319,10 +1363,12 @@ async fn relay_put_send_response(
     incoming_tx: Transaction,
     key: ContractKey,
     upstream_addr: SocketAddr,
+    hop_count: usize,
 ) -> Result<(), OpError> {
     let msg = NetMessage::from(PutMsg::Response {
         id: incoming_tx,
         key,
+        hop_count,
     });
     let mut ctx = op_manager.op_ctx(incoming_tx);
     let own_addr = op_manager.ring.connection_manager.get_own_addr();
@@ -1818,7 +1864,18 @@ where
                     );
                 }
                 op_manager.release_pending_op_slot(incoming_tx).await;
-                return relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await;
+                // Best-effort upstream reply after downstream failure: this
+                // node IS the storer (contract was put locally in step 6),
+                // so hop_count = max_htl - htl_we_received.
+                let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+                return relay_put_send_response(
+                    op_manager,
+                    incoming_tx,
+                    key,
+                    upstream_addr,
+                    hop_count,
+                )
+                .await;
             }
             Err(_elapsed) => {
                 tracing::warn!(
@@ -1836,15 +1893,31 @@ where
                     );
                 }
                 op_manager.release_pending_op_slot(incoming_tx).await;
-                return relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await;
+                // Same as the channel-closed arm: this node stored locally
+                // in step 6 so we report our own forward depth.
+                let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+                return relay_put_send_response(
+                    op_manager,
+                    incoming_tx,
+                    key,
+                    upstream_addr,
+                    hop_count,
+                )
+                .await;
             }
         };
         op_manager.release_pending_op_slot(incoming_tx).await;
 
         match reply {
-            NetMessage::V1(NetMessageV1::Put(PutMsg::Response { key: reply_key, .. }))
+            NetMessage::V1(NetMessageV1::Put(PutMsg::Response {
+                key: reply_key,
+                hop_count: downstream_hop_count,
+                ..
+            }))
             | NetMessage::V1(NetMessageV1::Put(PutMsg::ResponseStreaming {
-                key: reply_key, ..
+                key: reply_key,
+                hop_count: downstream_hop_count,
+                ..
             })) => {
                 tracing::info!(
                     tx = %incoming_tx,
@@ -1861,7 +1934,15 @@ where
                         crate::node::network_status::OpType::Put,
                     );
                 }
-                relay_put_send_response(op_manager, incoming_tx, reply_key, upstream_addr).await
+                // Preserve downstream storer's forward depth.
+                relay_put_send_response(
+                    op_manager,
+                    incoming_tx,
+                    reply_key,
+                    upstream_addr,
+                    downstream_hop_count,
+                )
+                .await
             }
             other => {
                 // Unexpected reply variant: unclear attribution. Skip the
@@ -1873,13 +1954,26 @@ where
                     reply_variant = ?std::mem::discriminant(&other),
                     "PUT streaming relay: unexpected reply variant"
                 );
-                relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await
+                // Same as the error arms: this node stored locally.
+                let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+                relay_put_send_response(op_manager, incoming_tx, key, upstream_addr, hop_count)
+                    .await
             }
         }
     } else {
         // No next hop, streaming not appropriate, or register_waiter failed —
         // finalize locally and bubble Response upstream.
-        relay_put_finalize_local(op_manager, incoming_tx, key, merged_value, upstream_addr).await
+        // This node IS the storer; hop_count = max_htl - htl_we_received.
+        let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+        relay_put_finalize_local(
+            op_manager,
+            incoming_tx,
+            key,
+            merged_value,
+            upstream_addr,
+            hop_count,
+        )
+        .await
     }
 }
 
@@ -1901,7 +1995,11 @@ mod tests {
     fn classify_reply_response_is_stored() {
         let tx = dummy_tx();
         let key = dummy_key();
-        let msg = NetMessage::V1(NetMessageV1::Put(PutMsg::Response { id: tx, key }));
+        let msg = NetMessage::V1(NetMessageV1::Put(PutMsg::Response {
+            id: tx,
+            key,
+            hop_count: 0,
+        }));
         assert!(matches!(classify_reply(&msg), ReplyClass::Stored { .. }));
     }
 
@@ -1913,8 +2011,65 @@ mod tests {
             id: tx,
             key,
             continue_forwarding: false,
+            hop_count: 0,
         }));
         assert!(matches!(classify_reply(&msg), ReplyClass::Stored { .. }));
+    }
+
+    /// Regression pin: `classify_reply` MUST extract the wire-carried
+    /// `hop_count` from `Response`/`ResponseStreaming` and propagate it
+    /// (via the bubble-up call site immediately following the classifier)
+    /// into the upstream Response unchanged.  Mirrors the GET classifier
+    /// pin `classify_response_found_preserves_hop_count`.  Since
+    /// `ReplyClass::Stored` itself doesn't carry the hop_count
+    /// (the bubble-up grabs the field directly from the matched message),
+    /// this test pins the classifier *and* the matcher contract by
+    /// destructuring the message and asserting the field survives
+    /// classification — that is, classify_reply doesn't conditionally
+    /// reject Stored on hop_count = 0 or any other value.
+    #[test]
+    fn classify_reply_preserves_hop_count_for_stored() {
+        for hc in [0_usize, 1, 4, 10, 64] {
+            let tx = dummy_tx();
+            let key = dummy_key();
+            // Response variant
+            let msg = NetMessage::V1(NetMessageV1::Put(PutMsg::Response {
+                id: tx,
+                key,
+                hop_count: hc,
+            }));
+            assert!(
+                matches!(classify_reply(&msg), ReplyClass::Stored { .. }),
+                "Response with hop_count={hc} must classify as Stored"
+            );
+            // Destructure to assert the field is preserved on the
+            // message itself — the bubble-up reads it directly here.
+            match msg {
+                NetMessage::V1(NetMessageV1::Put(PutMsg::Response { hop_count: got, .. })) => {
+                    assert_eq!(got, hc, "Response.hop_count preserved ({hc})")
+                }
+                _ => unreachable!(),
+            }
+
+            // ResponseStreaming variant
+            let msg = NetMessage::V1(NetMessageV1::Put(PutMsg::ResponseStreaming {
+                id: tx,
+                key,
+                continue_forwarding: false,
+                hop_count: hc,
+            }));
+            assert!(
+                matches!(classify_reply(&msg), ReplyClass::Stored { .. }),
+                "ResponseStreaming with hop_count={hc} must classify as Stored"
+            );
+            match msg {
+                NetMessage::V1(NetMessageV1::Put(PutMsg::ResponseStreaming {
+                    hop_count: got,
+                    ..
+                })) => assert_eq!(got, hc, "ResponseStreaming.hop_count preserved ({hc})"),
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]
@@ -2873,10 +3028,11 @@ mod tests {
         let pos = b
             .find("downstream reply timed out")
             .expect("timeout arm not found");
-        // Window widened from 400 → 800 bytes to accommodate the
+        // Window widened from 400 → 800 → 1200 bytes to accommodate the
         // record_relay_route_event hook inserted between the timeout
-        // log and the bubble-Response call.
-        let arm = &b[pos..pos + 800.min(b.len() - pos)];
+        // log and the bubble-Response call, plus the multi-line
+        // hop_count computation + multi-line call site added in #4248.
+        let arm = &b[pos..pos + 1200.min(b.len() - pos)];
         assert!(
             arm.contains("relay_put_send_response"),
             "timeout arm must still call relay_put_send_response so the \

@@ -2551,6 +2551,7 @@ mod tests {
                 id: sub_tx,
                 instance_id,
                 result: SubscribeMsgResult::Subscribed { key },
+                hop_count: 0,
             };
 
             let taken = subscribe_branch_would_forward(&op, Some(&tx));
@@ -2627,6 +2628,7 @@ mod tests {
                 id: sub_tx,
                 instance_id,
                 result: SubscribeMsgResult::NotFound,
+                hop_count: 0,
             };
 
             let taken = subscribe_branch_would_forward(&op, None);
@@ -2726,7 +2728,11 @@ mod tests {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
             let put_tx = Transaction::new::<PutMsg>();
             let key = dummy_put_key(10, 11);
-            let op = PutMsg::Response { id: put_tx, key };
+            let op = PutMsg::Response {
+                id: put_tx,
+                key,
+                hop_count: 0,
+            };
 
             let taken = put_branch_would_forward(&op, Some(&tx));
             assert!(taken, "Response with callback → must be forwarded");
@@ -2744,6 +2750,7 @@ mod tests {
                 id: put_tx,
                 key,
                 continue_forwarding: false,
+                hop_count: 0,
             };
 
             let taken = put_branch_would_forward(&op, Some(&tx));
@@ -2803,7 +2810,11 @@ mod tests {
         async fn put_response_without_callback_falls_through() {
             let put_tx = Transaction::new::<PutMsg>();
             let key = dummy_put_key(16, 17);
-            let op = PutMsg::Response { id: put_tx, key };
+            let op = PutMsg::Response {
+                id: put_tx,
+                key,
+                hop_count: 0,
+            };
 
             let taken = put_branch_would_forward(&op, None);
             assert!(

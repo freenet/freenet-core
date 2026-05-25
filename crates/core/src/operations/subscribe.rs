@@ -702,6 +702,26 @@ mod messages {
             id: Transaction,
             instance_id: ContractInstanceId,
             result: SubscribeMsgResult,
+            /// Forward-path hop count: how many hops the originating Request
+            /// traversed before reaching the node that produced this Response
+            /// (the hosting peer for `Subscribed`, or the relay that reported
+            /// exhaustion / no-candidates / forward-failure for `NotFound`).
+            ///
+            /// Computed as `max_hops_to_live - htl_at_responder`. The relay
+            /// chain preserves this value as the Response bubbles back to the
+            /// originator — it does NOT increment on the return path. For
+            /// `NotFound`, treat this as the depth at which exhaustion
+            /// occurred, not depth-to-the-contract.
+            ///
+            /// `#[serde(default)]` is set for source-level clarity. Bincode
+            /// does not honour serde defaults (positional encoding), so wire
+            /// compat with peers that lack this field is handled at the
+            /// handshake layer via `MIN_COMPATIBLE_VERSION`.
+            ///
+            /// Mirror of `GetMsg::Response.hop_count` (PR #4245); see also
+            /// `PutMsg::Response.hop_count`.
+            #[serde(default)]
+            hop_count: usize,
         },
         /// Explicit unsubscribe notification sent upstream for fast cleanup.
         /// Fire-and-forget: does not require a response or existing operation state.

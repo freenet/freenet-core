@@ -1115,7 +1115,7 @@ impl<'a> NetEventLog<'a> {
                     initiated_by: Some(peer_id.clone()), // We (the joiner) initiated
                 })
             }
-            NetMessage::V1(NetMessageV1::Put(PutMsg::Response { id, key })) => {
+            NetMessage::V1(NetMessageV1::Put(PutMsg::Response { id, key, .. })) => {
                 // Track outbound Put response for message routing visibility
                 let to = target_addr
                     .and_then(|addr| ring.connection_manager.get_peer_by_addr(addr))
@@ -1265,18 +1265,20 @@ impl<'a> NetEventLog<'a> {
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
-            NetMessageV1::Put(PutMsg::Response { id, key }) => {
+            NetMessageV1::Put(PutMsg::Response { id, key, hop_count }) => {
                 let this_peer = &op_manager.ring.connection_manager.own_location();
-                // Calculate hop_count from operation state: max_htl - current_htl
-                let hop_count = op_manager.get_current_hop(id).map(|current_htl| {
-                    op_manager.ring.max_hops_to_live.saturating_sub(current_htl)
-                });
+                // hop_count is carried on the wire Response: set by the storer
+                // (max_htl - htl_at_storer) and preserved by relays bubbling up.
+                // Clamp to ring.max_hops_to_live so a malicious or buggy peer
+                // sending hop_count = usize::MAX can't pollute telemetry.
+                // Mirrors the GET extraction logic (PR #4245).
+                let max_htl = op_manager.ring.max_hops_to_live;
                 EventKind::Put(PutEvent::PutSuccess {
                     id: *id,
                     requester: this_peer.clone(),
                     target: this_peer.clone(),
                     key: *key,
-                    hop_count,
+                    hop_count: Some((*hop_count).min(max_htl)),
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                     state_hash: None, // Hash not available from message
@@ -1372,14 +1374,21 @@ impl<'a> NetEventLog<'a> {
             NetMessageV1::Subscribe(SubscribeMsg::Response {
                 id,
                 result: SubscribeMsgResult::Subscribed { key },
+                hop_count,
                 ..
             }) => {
                 let this_peer = op_manager.ring.connection_manager.own_location();
+                // hop_count is carried on the wire Response: set by the
+                // hosting peer (max_htl - htl_at_storer) and preserved by
+                // relays bubbling up.  Clamp to ring.max_hops_to_live so
+                // a malicious or buggy peer sending hop_count = usize::MAX
+                // can't pollute telemetry.  Mirrors GET (PR #4245).
+                let max_htl = op_manager.ring.max_hops_to_live;
                 EventKind::Subscribe(SubscribeEvent::SubscribeSuccess {
                     id: *id,
                     key: *key,
                     at: this_peer.clone(),
-                    hop_count: None, // TODO: Track hop count from operation state
+                    hop_count: Some((*hop_count).min(max_htl)),
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                     requester: this_peer,
@@ -1389,14 +1398,28 @@ impl<'a> NetEventLog<'a> {
                 id,
                 instance_id,
                 result: SubscribeMsgResult::NotFound,
+                hop_count,
             }) => {
                 let this_peer = op_manager.ring.connection_manager.own_location();
+                // hop_count is carried on the wire Response (same semantics
+                // as SubscribeSuccess: forward-path depth from originator
+                // to the node that produced the response).
+                //
+                // Caveat for NotFound interpretation: the value is the
+                // forward depth of *the relay that produced the NotFound*
+                // (HTL exhaustion, no candidates, or downstream forward
+                // failure).  For analytics, treat NotFound hop_count as
+                // "exhaustion depth", not "depth to the hosting peer".
+                //
+                // Same clamp as SubscribeSuccess: bound by max_hops_to_live
+                // to guard against malicious or buggy peer values.
+                let max_htl = op_manager.ring.max_hops_to_live;
                 EventKind::Subscribe(SubscribeEvent::SubscribeNotFound {
                     id: *id,
                     requester: this_peer.clone(),
                     instance_id: *instance_id,
                     target: this_peer,
-                    hop_count: None, // TODO: Track hop count from operation state
+                    hop_count: Some((*hop_count).min(max_htl)),
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
@@ -2944,16 +2967,24 @@ impl EventKind {
 
     /// Returns the `hop_count` recorded in this event, if any.
     ///
-    /// Currently populated for terminal GET events (`GetSuccess`, `GetNotFound`,
-    /// `GetFailure`). The value is the number of hops the GET request traversed
-    /// before reaching its terminal state. Returns `None` for non-terminal GET
-    /// events (e.g. `Request`) and for all non-GET events.
+    /// Populated for terminal GET events (`GetSuccess`, `GetNotFound`,
+    /// `GetFailure`) since PR #4245, and for terminal PUT/SUBSCRIBE
+    /// events (`PutSuccess`, `SubscribeSuccess`, `SubscribeNotFound`)
+    /// since PR #4248.  The value is the number of forward hops the
+    /// originating request traversed before reaching its terminal state.
+    /// Returns `None` for non-terminal events (e.g. `Request`) and for
+    /// events that don't carry a hop_count field.
     #[allow(clippy::wildcard_enum_match_arm)]
     pub fn hop_count(&self) -> Option<usize> {
         match self {
             EventKind::Get(GetEvent::GetSuccess { hop_count, .. })
             | EventKind::Get(GetEvent::GetNotFound { hop_count, .. })
-            | EventKind::Get(GetEvent::GetFailure { hop_count, .. }) => *hop_count,
+            | EventKind::Get(GetEvent::GetFailure { hop_count, .. })
+            | EventKind::Put(PutEvent::PutSuccess { hop_count, .. })
+            | EventKind::Subscribe(SubscribeEvent::SubscribeSuccess { hop_count, .. })
+            | EventKind::Subscribe(SubscribeEvent::SubscribeNotFound { hop_count, .. }) => {
+                *hop_count
+            }
             _ => None,
         }
     }
