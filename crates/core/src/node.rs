@@ -1546,7 +1546,10 @@ async fn handle_interest_sync_message(
                     );
                     continue;
                 };
-                tracing::info!(
+                // Fires per stale-peer detection during interest sync, which
+                // is dominant on hot contracts. Diagnostic-grade rather than
+                // user-actionable; keep accessible via RUST_LOG=…=debug.
+                tracing::debug!(
                     contract = %contract,
                     stale_peer = %source,
                     "Summary mismatch in interest sync — syncing state to stale peer"
@@ -1783,11 +1786,18 @@ async fn handle_interest_sync_message(
                     );
                 }
                 Ok(other) => {
-                    tracing::warn!(
+                    // Display, not Debug, for `other` — `?other` Debug-prints
+                    // the full UpdateResponse, expands the inner
+                    // anyhow::Error, and emits a ~15-line backtrace per call
+                    // under queue saturation (issue #4251).
+                    // ContractHandlerEvent's hand-written Display
+                    // (`contract/handler.rs:706`) gives a single-line variant
+                    // summary without expanding nested anyhow chains.
+                    tracing::debug!(
                         from = %source,
                         contract = %key,
                         event = "resync_failed",
-                        response = ?other,
+                        response = %other,
                         "Unexpected response to resync update"
                     );
                 }
@@ -1883,7 +1893,11 @@ async fn get_contract_summary(
         Ok(ContractHandlerEvent::GetSummaryResponse {
             summary: Err(e), ..
         }) => {
-            tracing::warn!(
+            // Fires repeatedly when the executor queue is saturated for a hot
+            // contract (issue #4251). Demoted to debug because the actionable
+            // signal is the queue saturation itself, not the per-summary
+            // failure.
+            tracing::debug!(
                 contract = %key,
                 error = %e,
                 "Failed to get contract summary"
@@ -2137,6 +2151,75 @@ mod tests {
 
     use super::*;
     use rstest::rstest;
+
+    /// Source-level pins for the three log sites in this file that were
+    /// demoted / format-fixed in PR #4252 for issue #4251. Each pin
+    /// asserts the macro family of the call site by scanning a 400-byte
+    /// window before the anchor message. Same shape as the
+    /// `bug-prevention-patterns.md` FreeConsole pins in `service.rs`.
+    /// Window widened from 240 to 400 in re-review #3 to absorb future
+    /// added structured fields without false-breaking the pin.
+    fn assert_log_site_pin(needle: &str, must_contain: &[&str], must_not_contain: &[&str]) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/node.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("must read own source at {}: {e}", path.display()));
+        let idx = source
+            .find(needle)
+            .unwrap_or_else(|| panic!("log message `{needle}` must still exist in source"));
+        let start = idx.saturating_sub(400);
+        let window = &source[start..idx];
+        for needle in must_contain {
+            assert!(
+                window.contains(needle),
+                "site `{needle}` must appear in the 240-byte window before message:\n{window}",
+                needle = needle
+            );
+        }
+        for forbidden in must_not_contain {
+            assert!(
+                !window.contains(forbidden),
+                "site must NOT contain `{forbidden}` (would restore an issue #4251 regression):\n{window}",
+                forbidden = forbidden
+            );
+        }
+    }
+
+    #[test]
+    fn summary_mismatch_in_interest_sync_logs_at_debug_pin_test() {
+        // Demoted from INFO to DEBUG to stop dominating peer logs on
+        // hot contracts. Per #4251 review (testing reviewer #1).
+        assert_log_site_pin(
+            "Summary mismatch in interest sync \u{2014} syncing state to stale peer",
+            &["tracing::debug!"],
+            &["tracing::info!", "tracing::warn!"],
+        );
+    }
+
+    #[test]
+    fn unexpected_resync_response_uses_display_not_debug_pin_test() {
+        // Switched from `response = ?other` (Debug-expanded UpdateResponse
+        // → anyhow chain → ~15-line backtrace per call) to `response =
+        // %other` (single-line Display via ContractHandlerEvent's
+        // hand-written impl). Per #4251 review (code-first + Codex).
+        assert_log_site_pin(
+            "Unexpected response to resync update",
+            &["tracing::debug!", "response = %other"],
+            &["response = ?other", "tracing::warn!", "tracing::info!"],
+        );
+    }
+
+    #[test]
+    fn failed_to_get_contract_summary_logs_at_debug_pin_test() {
+        // Demoted from WARN to DEBUG: this site fires repeatedly when
+        // the executor queue is saturated for a hot contract (#4251).
+        // The actionable signal is the queue saturation itself, not
+        // the per-summary failure. Caught by rule-review on PR #4252.
+        assert_log_site_pin(
+            "Failed to get contract summary",
+            &["tracing::debug!"],
+            &["tracing::warn!", "tracing::info!"],
+        );
+    }
 
     // Hostname resolution tests
     #[tokio::test]

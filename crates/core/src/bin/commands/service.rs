@@ -2575,10 +2575,19 @@ SuccessExitStatus=42 43
 # Do NOT restart — the existing instance is healthy.
 RestartPreventExitStatus=43
 
-# Logging - write to files for systems without active user journald
-# (headless servers, systems without lingering enabled, etc.)
-StandardOutput=append:{log_dir}/freenet.log
-StandardError=append:{log_dir}/freenet.error.log
+# Logging
+# - The node's tracing layer writes its own size-capped, hourly-rotated
+#   logs to {log_dir}/freenet.YYYY-MM-DD-HH.log (LOG_RETENTION_HOURS +
+#   LOG_DIR_MAX_BYTES; see crates/core/src/tracing.rs).
+# - systemd's StandardOutput/StandardError previously appended to a fixed
+#   freenet.log / freenet.error.log that the time-based cleanup never
+#   pruned (mtime stayed fresh while the file was being written), so they
+#   grew without bound on long-running nodes (issue #4251).
+# - Routing both to the journal lets journald handle rotation, and panics
+#   or pre-tracing-init output remain queryable via
+#   `journalctl --user-unit freenet`.
+StandardOutput=journal
+StandardError=journal
 SyslogIdentifier=freenet
 
 # Resource limits to prevent runaway resource consumption
@@ -2640,9 +2649,19 @@ SuccessExitStatus=42 43
 # Do NOT restart — the existing instance is healthy.
 RestartPreventExitStatus=43
 
-# Logging - write to files for systems without active user journald
-StandardOutput=append:{log_dir}/freenet.log
-StandardError=append:{log_dir}/freenet.error.log
+# Logging
+# - The node's tracing layer writes its own size-capped, hourly-rotated
+#   logs to {log_dir}/freenet.YYYY-MM-DD-HH.log (LOG_RETENTION_HOURS +
+#   LOG_DIR_MAX_BYTES; see crates/core/src/tracing.rs).
+# - systemd's StandardOutput/StandardError previously appended to a fixed
+#   freenet.log / freenet.error.log that the time-based cleanup never
+#   pruned (mtime stayed fresh while the file was being written), so they
+#   grew without bound on long-running nodes (issue #4251).
+# - Routing both to the journal lets journald handle rotation, and panics
+#   or pre-tracing-init output remain queryable via
+#   `journalctl -u freenet`.
+StandardOutput=journal
+StandardError=journal
 SyslogIdentifier=freenet
 
 # Resource limits to prevent runaway resource consumption
@@ -2830,14 +2849,24 @@ CONSECUTIVE_FAILURES=0
 PORT_CONFLICT_KILLS=0
 MAX_PORT_CONFLICT_KILLS=3  # Give up after this many kill attempts
 
-LOG="$HOME/Library/Logs/freenet/freenet.log"
+# Lifecycle messages route through `logger`, which writes to macOS unified
+# logging (auto-rotated, queryable via `log show --predicate 'process ==
+# "logger"' --info`). Previously these were appended to a fixed
+# ~/Library/Logs/freenet/freenet.log that the cleanup pass never touched
+# (its mtime stayed fresh while being written), so the file grew without
+# bound on long-running nodes (issue #4251). The transient
+# freenet.error.log.last scratch file below is overwritten on every launch
+# and so does not accumulate.
+log_event() {{
+    logger -t freenet "$1"
+}}
 
 # Kill any stale freenet network processes before starting.
 # This handles the case where a previous launch daemon restart left a child
 # process still holding the port (e.g. port 7509).
 # Scoped to the current user to avoid killing processes owned by other users.
 if pkill -f -u "$(id -u)" "freenet network" 2>/dev/null; then
-    echo "$(date): Killed stale freenet network process(es) on startup" >> "$LOG"
+    log_event "Killed stale freenet network process(es) on startup"
     sleep 2
 fi
 
@@ -2846,44 +2875,44 @@ while true; do
     EXIT_CODE=$?
 
     if [ $EXIT_CODE -eq 42 ]; then
-        echo "$(date): Update needed, running freenet update..." >> "$LOG"
+        log_event "Update needed, running freenet update..."
         if "{binary}" update --quiet; then
-            echo "$(date): Update successful, restarting..." >> "$LOG"
+            log_event "Update successful, restarting..."
             CONSECUTIVE_FAILURES=0
             PORT_CONFLICT_KILLS=0
             BACKOFF=10
             sleep 2
         else
             CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
-            echo "$(date): Update failed (attempt $CONSECUTIVE_FAILURES), backing off $BACKOFF seconds..." >> "$LOG"
+            log_event "Update failed (attempt $CONSECUTIVE_FAILURES), backing off $BACKOFF seconds..."
             sleep $BACKOFF
             BACKOFF=$((BACKOFF * 2))
             [ $BACKOFF -gt $MAX_BACKOFF ] && BACKOFF=$MAX_BACKOFF
         fi
         continue
     elif [ $EXIT_CODE -eq 43 ]; then
-        echo "$(date): Another instance is already running, exiting cleanly" >> "$LOG"
+        log_event "Another instance is already running, exiting cleanly"
         exit 0
     elif [ $EXIT_CODE -eq 0 ]; then
-        echo "$(date): Normal shutdown" >> "$LOG"
+        log_event "Normal shutdown"
         exit 0
     else
         # Check if this looks like a port-already-in-use failure.
         if grep -q "already in use" "$HOME/Library/Logs/freenet/freenet.error.log.last" 2>/dev/null; then
             PORT_CONFLICT_KILLS=$((PORT_CONFLICT_KILLS + 1))
             if [ $PORT_CONFLICT_KILLS -le $MAX_PORT_CONFLICT_KILLS ]; then
-                echo "$(date): Port conflict detected (attempt $PORT_CONFLICT_KILLS/$MAX_PORT_CONFLICT_KILLS) — killing stale freenet process and retrying..." >> "$LOG"
+                log_event "Port conflict detected (attempt $PORT_CONFLICT_KILLS/$MAX_PORT_CONFLICT_KILLS) — killing stale freenet process and retrying..."
                 pkill -f -u "$(id -u)" "freenet network" 2>/dev/null || true
                 sleep 2
                 BACKOFF=10
                 continue
             else
-                echo "$(date): Port conflict persists after $MAX_PORT_CONFLICT_KILLS kill attempts. Manual intervention may be required ('pkill freenet'). Backing off..." >> "$LOG"
+                log_event "Port conflict persists after $MAX_PORT_CONFLICT_KILLS kill attempts. Manual intervention may be required ('pkill freenet'). Backing off..."
             fi
         fi
         CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
         PORT_CONFLICT_KILLS=0
-        echo "$(date): Exited with code $EXIT_CODE, restarting after backoff..." >> "$LOG"
+        log_event "Exited with code $EXIT_CODE, restarting after backoff..."
         sleep $BACKOFF
         BACKOFF=$((BACKOFF * 2))
         [ $BACKOFF -gt $MAX_BACKOFF ] && BACKOFF=$MAX_BACKOFF
@@ -2895,7 +2924,7 @@ done
 }
 
 #[cfg(target_os = "macos")]
-fn generate_plist(wrapper_path: &Path, log_dir: &Path) -> String {
+pub(super) fn generate_plist(wrapper_path: &Path, log_dir: &Path) -> String {
     // Note: wrapper_path is the auto-update wrapper script, not the freenet binary directly.
     // The wrapper handles the loop: run freenet, check exit code, update if needed.
     format!(
@@ -2916,10 +2945,23 @@ fn generate_plist(wrapper_path: &Path, log_dir: &Path) -> String {
         <key>SuccessfulExit</key>
         <false/>
     </dict>
+    <!--
+        Logging
+        - The node's tracing layer writes its own size-capped, hourly-
+          rotated logs to {log_dir}/freenet.YYYY-MM-DD-HH.log
+          (LOG_RETENTION_HOURS + LOG_DIR_MAX_BYTES; see
+          crates/core/src/tracing.rs).
+        - launchd previously appended to fixed freenet.log / freenet.error.log
+          that the time-based cleanup never pruned, so they grew without
+          bound (issue #4251). macOS does not offer a journal target for
+          launchd, so the cleanest option is /dev/null — diagnostics
+          remain available via `freenet service report`, which collects
+          the rotated tracing logs.
+    -->
     <key>StandardOutPath</key>
-    <string>{log_dir}/freenet.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
-    <string>{log_dir}/freenet.error.log</string>
+    <string>/dev/null</string>
     <key>SoftResourceLimits</key>
     <dict>
         <key>NumberOfFiles</key>
@@ -4054,9 +4096,16 @@ mod tests {
         // Verify it references the correct binary
         assert!(service_content.contains("/usr/local/bin/freenet network"));
 
-        // Verify log paths are set correctly (file-based logging for headless systems)
-        assert!(service_content.contains("/home/test/.local/state/freenet/freenet.log"));
-        assert!(service_content.contains("/home/test/.local/state/freenet/freenet.error.log"));
+        // Logging routes to journal so journald handles rotation. The tracing
+        // layer writes its own size-capped rolling files; routing systemd
+        // stdout/stderr to a fixed freenet.log / freenet.error.log caused
+        // unbounded growth (issue #4251 / log-spam fix).
+        assert!(service_content.contains("StandardOutput=journal"));
+        assert!(service_content.contains("StandardError=journal"));
+        assert!(
+            !service_content.contains("append:"),
+            "regression: must not append systemd output to fixed unrotated file (#4251)"
+        );
 
         // Verify resource limits are set
         assert!(service_content.contains("LimitNOFILE=65536"));
@@ -4125,6 +4174,14 @@ mod tests {
 
         // Verify exit code 43 prevents restart (another instance already running)
         assert!(service_content.contains("RestartPreventExitStatus=43"));
+
+        // Logging routes to journal (same reasoning as the user-unit test).
+        assert!(service_content.contains("StandardOutput=journal"));
+        assert!(service_content.contains("StandardError=journal"));
+        assert!(
+            !service_content.contains("append:"),
+            "regression: must not append systemd output to fixed unrotated file (#4251)"
+        );
     }
 
     #[test]
@@ -4132,6 +4189,23 @@ mod tests {
     fn test_macos_wrapper_script_generation() {
         let binary_path = PathBuf::from("/usr/local/bin/freenet");
         let script = generate_wrapper_script(&binary_path);
+
+        // Regression for issue #4251: lifecycle messages MUST go through
+        // `logger -t freenet` (auto-rotated by macOS unified logging),
+        // not appended to a fixed ~/Library/Logs/freenet/freenet.log file
+        // that grows without bound.
+        assert!(
+            script.contains("logger -t freenet"),
+            "wrapper must route lifecycle messages through logger(1)"
+        );
+        assert!(
+            !script.contains("Library/Logs/freenet/freenet.log\""),
+            "regression: wrapper must NOT append to fixed unrotated freenet.log (#4251)"
+        );
+        assert!(
+            !script.contains(">> \"$LOG\""),
+            "regression: wrapper must not use the legacy LOG file variable (#4251)"
+        );
 
         // Regression for #3301: startup stale-process cleanup, scoped to current user
         assert!(
@@ -4200,9 +4274,19 @@ mod tests {
         // Verify it references the correct binary
         assert!(plist_content.contains("/usr/local/bin/freenet"));
 
-        // Verify log paths are set correctly
-        assert!(plist_content.contains("/Users/test/Library/Logs/freenet/freenet.log"));
-        assert!(plist_content.contains("/Users/test/Library/Logs/freenet/freenet.error.log"));
+        // Stdout/stderr are discarded; the tracing layer writes its own
+        // size-capped rolling logs and `freenet service report` collects
+        // them. Writing launchd output to a fixed freenet.log /
+        // freenet.error.log caused unbounded growth (issue #4251).
+        assert!(plist_content.contains("<string>/dev/null</string>"));
+        assert!(
+            !plist_content.contains("/Users/test/Library/Logs/freenet/freenet.log"),
+            "regression: launchd must not write stdout to a fixed unrotated log file (#4251)"
+        );
+        assert!(
+            !plist_content.contains("/Users/test/Library/Logs/freenet/freenet.error.log"),
+            "regression: launchd must not write stderr to a fixed unrotated log file (#4251)"
+        );
 
         // Verify resource limits are set
         assert!(plist_content.contains("<key>NumberOfFiles</key>"));

@@ -752,13 +752,19 @@ fn track_pending_reclamation_if_evict<CH>(
 
 /// Send an error response to the event sender when the per-contract queue is full.
 ///
-/// Logs a warning and sends the appropriate error response variant for the rejected event.
+/// Logs at DEBUG (per-event backpressure is not user-actionable; see #4251)
+/// and sends the appropriate error response variant for the rejected event.
 /// For fire-and-forget events (delegates, disconnects), no response is sent.
 async fn send_queue_full_response(
     channel: &mut handler::ContractHandlerChannel<handler::ContractHandlerHalve>,
     rejected: Box<fair_queue::RejectedEvent>,
 ) {
-    tracing::warn!(
+    // Per-event backpressure is normal under sustained load on a hot contract
+    // and is not user-actionable. Logging at WARN once per rejection drowns
+    // node logs (millions of lines/day on a saturated contract). Aggregate
+    // backpressure visibility belongs in metrics, not per-event logs.
+    // See issue #4251 for the underlying queue-saturation tracking.
+    tracing::debug!(
         event = %rejected.event,
         "Rejected event due to per-contract queue capacity limit"
     );
@@ -1507,6 +1513,46 @@ mod tests {
     use super::*;
     use crate::config::GlobalExecutor;
     use std::time::Duration;
+
+    /// Pin the rejection log site to DEBUG.
+    ///
+    /// Demoting `Rejected event due to per-contract queue capacity limit`
+    /// from WARN to DEBUG was the user-visible point of the #4251 fix —
+    /// at WARN it produced millions of lines/day on saturated contracts.
+    /// A future refactor that re-promotes it would silently restore that
+    /// regression. This is a source-level pin (per
+    /// `.claude/rules/bug-prevention-patterns.md`'s precedent for
+    /// regression-guard pins) rather than a tracing-subscriber capture,
+    /// because the level is the *only* thing being asserted and a string
+    /// scan over our own source is more robust than runtime-subscriber
+    /// state-machine plumbing.
+    #[test]
+    fn send_queue_full_response_logs_at_debug_not_warn_pin_test() {
+        // file!() returns a workspace-rooted path but tests run from
+        // CARGO_MANIFEST_DIR. Anchor explicitly.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/contract.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("must read own source at {}: {e}", path.display()));
+        let needle = "Rejected event due to per-contract queue capacity limit";
+        let idx = source
+            .find(needle)
+            .expect("rejection log message must still exist in source");
+        // Window the 200 bytes preceding the message: the `tracing::*!`
+        // macro that emits it lives within that window.
+        let start = idx.saturating_sub(200);
+        let window = &source[start..idx];
+        assert!(
+            window.contains("tracing::debug!"),
+            "Rejected-event log site must be at DEBUG. \
+             Re-promotion to WARN/INFO restores the issue #4251 log-volume regression.\n\
+             Source window:\n{window}"
+        );
+        assert!(
+            !window.contains("tracing::warn!") && !window.contains("tracing::info!"),
+            "Rejected-event log site must NOT be at WARN or INFO. \
+             Source window:\n{window}"
+        );
+    }
 
     fn make_contract_key() -> ContractKey {
         let code = ContractCode::from(vec![42u8; 32]);

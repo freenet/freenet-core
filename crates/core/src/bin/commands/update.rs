@@ -1099,6 +1099,35 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
     Ok(())
 }
 
+/// Pure helper: decide whether a Linux systemd unit file needs to be
+/// regenerated. Returns true when EITHER the auto-update markers
+/// (`ExecStopPost=` + `SuccessExitStatus=42` + `RestartPreventExitStatus=43`)
+/// are missing, OR the legacy unrotated log target (`StandardOutput=append:`
+/// / `StandardError=append:` — issue #4251) is still present.
+///
+/// Filters out comment lines (those whose first non-whitespace character is
+/// `#`) so a unit annotated with the legacy directive in a comment doesn't
+/// trip a false-positive regen. Marker-presence check is whole-content
+/// because the markers we look for are uniquely-spelled and unlikely to
+/// appear in comments.
+///
+/// Cross-platform-compiled (no `#[cfg(target_os = "linux")]`) so non-Linux
+/// CI runners can exercise the predicate per code-style.md / deployment.md
+/// preference for pure decision helpers. The `#[allow(dead_code)]`
+/// suppresses the dead-code lint on non-Linux builds where the only
+/// non-test caller (`update_service_file`) is cfg'd out.
+#[allow(dead_code)]
+pub(super) fn systemd_unit_needs_regen(content: &str) -> bool {
+    let has_auto_update_markers = content.contains("ExecStopPost=")
+        && content.contains("SuccessExitStatus=42")
+        && content.contains("RestartPreventExitStatus=43");
+    let has_legacy_log_target = content
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .any(|l| l.contains("StandardOutput=append:") || l.contains("StandardError=append:"));
+    !has_auto_update_markers || has_legacy_log_target
+}
+
 /// Update a specific service file if it's missing the auto-update hook.
 #[cfg(target_os = "linux")]
 fn update_service_file(
@@ -1112,10 +1141,13 @@ fn update_service_file(
     // Check if the service file has all required directives.
     // RestartPreventExitStatus=43 prevents restart loops when another instance
     // is already running (added in 0.2.5).
-    if content.contains("ExecStopPost=")
-        && content.contains("SuccessExitStatus=42")
-        && content.contains("RestartPreventExitStatus=43")
-    {
+    //
+    // Also force regeneration when the legacy `StandardOutput=append:` or
+    // `StandardError=append:` directive is present (issue #4251). That target
+    // wrote stdout/stderr to a fixed freenet.log / freenet.error.log that was
+    // never rotated, growing without bound on long-running nodes. The current
+    // template routes both to the systemd journal.
+    if !systemd_unit_needs_regen(&content) {
         return Ok(()); // Already up to date
     }
 
@@ -1185,6 +1217,30 @@ fn update_service_file(
 }
 
 /// Check if the wrapper script needs updating (missing or outdated) and update if so.
+/// Pure helper: decide whether a launchd plist needs regeneration. Returns
+/// true when the plist still references either legacy unrotated log path
+/// (`Library/Logs/freenet/freenet.log` for StandardOutPath, or
+/// `Library/Logs/freenet/freenet.error.log` for StandardErrorPath — issue
+/// #4251). Newer plists send both standard streams to `/dev/null`.
+///
+/// Both substrings are checked independently: the second is NOT a
+/// substring of the first (`.error.log` does not contain `.log` as a
+/// contiguous tail — the dot precedes `error`). A partially-migrated
+/// plist (stdout already `/dev/null` but stderr still legacy) must still
+/// be detected; round-3 review caught the regression from collapsing
+/// these into one check.
+///
+/// Cross-platform-compiled (no `#[cfg(target_os = "macos")]`) so non-macOS
+/// CI runners can exercise the predicate per code-style.md / deployment.md
+/// preference for pure decision helpers. The `#[allow(dead_code)]`
+/// suppresses the dead-code lint on non-macOS builds where the only
+/// non-test caller (`ensure_service_file_updated`) is cfg'd out.
+#[allow(dead_code)]
+pub(super) fn launchd_plist_needs_regen(content: &str) -> bool {
+    content.contains("Library/Logs/freenet/freenet.log")
+        || content.contains("Library/Logs/freenet/freenet.error.log")
+}
+
 #[cfg(target_os = "macos")]
 fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
     let home_dir = match dirs::home_dir() {
@@ -1202,58 +1258,133 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
     let wrapper_path = home_dir.join(".local/bin/freenet-service-wrapper.sh");
 
     // Check if wrapper script exists and has the update logic
-    let needs_update = if wrapper_path.exists() {
+    let wrapper_needs_update = if wrapper_path.exists() {
         let content = fs::read_to_string(&wrapper_path).context("Failed to read wrapper script")?;
         // Check for key auto-update markers
-        !content.contains("EXIT_CODE=$?") || !content.contains("freenet update")
+        !content.contains("EXIT_CODE=$?")
+            || !content.contains("freenet update")
+            // Force regeneration if the wrapper still writes lifecycle messages
+            // to a fixed unrotated freenet.log (issue #4251). Newer wrappers
+            // route those messages through `logger -t freenet`.
+            || content.contains("$HOME/Library/Logs/freenet/freenet.log")
     } else {
         true
     };
 
-    if !needs_update {
-        return Ok(());
-    }
-
-    if !quiet {
-        println!("Updating service wrapper to add auto-update support...");
-    }
-
-    // Ensure wrapper directory exists
-    let wrapper_dir = wrapper_path
-        .parent()
-        .context("Wrapper path has no parent directory")?;
-    fs::create_dir_all(wrapper_dir).context("Failed to create wrapper directory")?;
-
-    // Create backup of existing wrapper script if it exists
-    if wrapper_path.exists() {
-        let backup_path = wrapper_path.with_extension("sh.bak");
-        if let Err(e) = fs::copy(&wrapper_path, &backup_path) {
+    // Also force regeneration of the plist if it still points
+    // StandardOutPath/StandardErrorPath at the unrotated freenet.log
+    // paths (issue #4251). Read fails non-fatally: a transient FS
+    // error should not kill the whole auto-update path. If we cannot
+    // read the plist we conservatively skip the plist-regen step and
+    // log a warning; the wrapper-side update still gets a chance.
+    let plist_needs_update = match fs::read_to_string(&plist_path) {
+        Ok(content) => launchd_plist_needs_regen(&content),
+        Err(e) => {
             if !quiet {
                 eprintln!(
-                    "Warning: Failed to backup wrapper script: {}. Continuing anyway.",
+                    "Warning: failed to read launchd plist at {} for migration check: {}. \
+                     Skipping plist regen.",
+                    plist_path.display(),
                     e
                 );
             }
-        } else if !quiet {
-            println!("Backed up existing wrapper script to {:?}", backup_path);
+            false
+        }
+    };
+
+    // Step 1: regenerate the wrapper FIRST. The plist's ProgramArguments
+    // points at this wrapper path, so the wrapper must exist and be
+    // executable before we point launchd at it. If wrapper regen fails,
+    // we exit BEFORE rewriting the plist so the system stays in its
+    // previous-working state.
+    if wrapper_needs_update {
+        if !quiet {
+            println!("Updating service wrapper to add auto-update support...");
+        }
+
+        // Ensure wrapper directory exists
+        let wrapper_dir = wrapper_path
+            .parent()
+            .context("Wrapper path has no parent directory")?;
+        fs::create_dir_all(wrapper_dir).context("Failed to create wrapper directory")?;
+
+        // Create backup of existing wrapper script if it exists
+        if wrapper_path.exists() {
+            let backup_path = wrapper_path.with_extension("sh.bak");
+            if let Err(e) = fs::copy(&wrapper_path, &backup_path) {
+                if !quiet {
+                    eprintln!(
+                        "Warning: Failed to backup wrapper script: {}. Continuing anyway.",
+                        e
+                    );
+                }
+            } else if !quiet {
+                println!("Backed up existing wrapper script to {:?}", backup_path);
+            }
+        }
+
+        // Generate and write new wrapper script
+        let wrapper_content = generate_wrapper_script(binary_path);
+        fs::write(&wrapper_path, &wrapper_content).context("Failed to write wrapper script")?;
+
+        // Make executable
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&wrapper_path)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&wrapper_path, perms)?;
+        }
+
+        if !quiet {
+            println!("Service wrapper updated with auto-update hook.");
         }
     }
 
-    // Generate and write new wrapper script
-    let wrapper_content = generate_wrapper_script(binary_path);
-    fs::write(&wrapper_path, &wrapper_content).context("Failed to write wrapper script")?;
+    // Step 2: regenerate the plist AFTER the wrapper is in place,
+    // then reload launchd so the new config takes effect immediately
+    // (rather than waiting for the next user logout / reboot — see
+    // issue #4251 re-review #1).
+    if plist_needs_update {
+        if !quiet {
+            println!("Updating launchd plist to drop legacy log paths (issue #4251)...");
+        }
+        let log_dir = home_dir.join("Library/Logs/freenet");
+        let plist_content = super::service::generate_plist(&wrapper_path, &log_dir);
+        // Best-effort backup so a botched rewrite is recoverable.
+        let backup_path = plist_path.with_extension("plist.bak");
+        if let Err(e) = fs::copy(&plist_path, &backup_path) {
+            if !quiet {
+                eprintln!(
+                    "Warning: failed to back up plist: {}. Continuing anyway.",
+                    e
+                );
+            }
+        }
+        fs::write(&plist_path, plist_content).context("Failed to write updated plist")?;
 
-    // Make executable
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&wrapper_path)?.permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&wrapper_path, perms)?;
-    }
-
-    if !quiet {
-        println!("Service wrapper updated with auto-update hook.");
+        // No automatic launchctl reload: when auto-update is driven by
+        // the launchd-managed wrapper, `freenet update` runs as a child
+        // of the wrapper's job tree. Apple documents `launchctl bootout`
+        // as terminating the ENTIRE process tree of the agent — which
+        // would kill the in-flight `freenet update` mid-call before the
+        // subsequent `bootstrap` can run, silently failing in exactly
+        // the auto-update path this code exists to support. (Detached
+        // helpers race the bootout; `kickstart` does not re-read the
+        // plist.) The new plist therefore takes effect at the next
+        // user-driven reload or reboot. The wrapper-script rewrite
+        // (issue #4251) DOES take effect at the next wrapper iteration
+        // — that's where the dominant unbounded freenet.log growth was
+        // coming from. Once the OS reads the new plist, the smaller
+        // launchd-captured stdout/stderr also stops accumulating.
+        if !quiet {
+            println!(
+                "launchd plist updated. To apply immediately without rebooting, run:\n  \
+                 launchctl bootout gui/$(id -u) {plist}\n  \
+                 launchctl bootstrap gui/$(id -u) {plist}",
+                plist = plist_path.display()
+            );
+        }
     }
 
     Ok(())
@@ -1611,6 +1742,159 @@ fn spawn_detached_updater(script: &Path, current_app: &Path, staged_app: &Path) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Regression tests for the issue #4251 auto-update migration logic:
+    // verify that existing units carrying the legacy unrotated log
+    // target are correctly detected as needing regen, AND that fresh
+    // units (current template) are NOT regenerated.
+    //
+    // The helpers (systemd_unit_needs_regen, launchd_plist_needs_regen)
+    // are cross-platform-compiled (string ops only), so these tests run
+    // on every CI platform per deployment.md's preference.
+    #[test]
+    fn systemd_unit_with_legacy_append_log_needs_regen() {
+        let legacy = r#"[Service]
+Type=simple
+ExecStart=/usr/local/bin/freenet network
+Restart=always
+ExecStopPost=-/bin/sh -c '...'
+SuccessExitStatus=42 43
+RestartPreventExitStatus=43
+StandardOutput=append:/home/u/.local/state/freenet/freenet.log
+StandardError=append:/home/u/.local/state/freenet/freenet.error.log
+"#;
+        assert!(
+            systemd_unit_needs_regen(legacy),
+            "legacy append:freenet.log unit must be detected as needing regen (#4251)"
+        );
+    }
+
+    #[test]
+    fn systemd_unit_with_journal_target_is_up_to_date() {
+        let current = r#"[Service]
+Type=simple
+ExecStart=/usr/local/bin/freenet network
+Restart=always
+ExecStopPost=-/bin/sh -c '...'
+SuccessExitStatus=42 43
+RestartPreventExitStatus=43
+StandardOutput=journal
+StandardError=journal
+"#;
+        assert!(
+            !systemd_unit_needs_regen(current),
+            "current journal-target unit must NOT be flagged for regen"
+        );
+    }
+
+    #[test]
+    fn systemd_unit_with_commented_out_append_does_not_force_regen() {
+        // Regression for re-review M4: a unit that ALREADY migrated
+        // to `StandardOutput=journal` but kept a comment referencing
+        // the old directive must NOT be flagged as needing regen.
+        // Otherwise every auto-update would overwrite operator-edited
+        // units forever.
+        let migrated = r#"[Service]
+Type=simple
+ExecStart=/usr/local/bin/freenet network
+Restart=always
+ExecStopPost=-/bin/sh -c '...'
+SuccessExitStatus=42 43
+RestartPreventExitStatus=43
+# StandardOutput=append:/old/path (replaced with journal on 2026-05-25)
+# StandardError=append:/old/path  (replaced with journal on 2026-05-25)
+StandardOutput=journal
+StandardError=journal
+"#;
+        assert!(
+            !systemd_unit_needs_regen(migrated),
+            "commented-out legacy append directive must NOT force regen (#4251)"
+        );
+    }
+
+    #[test]
+    fn systemd_unit_without_auto_update_markers_needs_regen() {
+        // Pre-auto-update unit (no exit-42 handling) — must regen even
+        // though it has no legacy log target.
+        let ancient = r#"[Service]
+Type=simple
+ExecStart=/usr/local/bin/freenet network
+Restart=always
+StandardOutput=journal
+StandardError=journal
+"#;
+        assert!(
+            systemd_unit_needs_regen(ancient),
+            "unit without ExecStopPost/SuccessExitStatus must regen"
+        );
+    }
+
+    #[test]
+    fn launchd_plist_with_legacy_log_paths_needs_regen() {
+        let legacy = r#"<plist version="1.0"><dict>
+    <key>StandardOutPath</key>
+    <string>/Users/u/Library/Logs/freenet/freenet.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/u/Library/Logs/freenet/freenet.error.log</string>
+</dict></plist>"#;
+        assert!(
+            launchd_plist_needs_regen(legacy),
+            "legacy plist must be detected as needing regen (#4251)"
+        );
+    }
+
+    #[test]
+    fn launchd_plist_with_stderr_only_legacy_path_still_needs_regen() {
+        // Regression for round-3 review: a partially-migrated plist
+        // (stdout already /dev/null, stderr still pointing at the
+        // legacy freenet.error.log) must still be detected. The
+        // single-substring shortcut for `freenet.log` was wrong
+        // because `.error.log` does NOT contain `.log` as a
+        // contiguous substring (`.` precedes `error`).
+        let partial = r#"<plist version="1.0"><dict>
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/u/Library/Logs/freenet/freenet.error.log</string>
+</dict></plist>"#;
+        assert!(
+            launchd_plist_needs_regen(partial),
+            "plist with legacy stderr-only path must still need regen (round-3 review)"
+        );
+    }
+
+    /// Round-3 review L2: assert the freshly-generated plist template
+    /// does NOT contain the legacy-path substrings, otherwise every
+    /// auto-update would loop rewriting it. Calls the real generator
+    /// with synthetic inputs so a future edit to `generate_plist` that
+    /// accidentally adds the legacy path is caught at test time.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn freshly_generated_plist_does_not_trigger_regen_loop() {
+        use std::path::PathBuf;
+        let wrapper = PathBuf::from("/Users/test/.local/bin/freenet-service-wrapper.sh");
+        let log_dir = PathBuf::from("/Users/test/Library/Logs/freenet");
+        let generated = super::super::service::generate_plist(&wrapper, &log_dir);
+        assert!(
+            !launchd_plist_needs_regen(&generated),
+            "freshly-generated plist must not match the legacy-path predicate \
+             — otherwise every auto-update would loop rewriting it.\n\nGenerated:\n{generated}"
+        );
+    }
+
+    #[test]
+    fn launchd_plist_with_dev_null_is_up_to_date() {
+        let current = r#"<plist version="1.0"><dict>
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
+</dict></plist>"#;
+        assert!(
+            !launchd_plist_needs_regen(current),
+            "current /dev/null plist must NOT be flagged for regen"
+        );
+    }
 
     // Synthesize an ExitStatus with a specific numeric code. Uses the
     // Unix-specific `ExitStatusExt::from_raw` so this test module is
