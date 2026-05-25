@@ -2849,14 +2849,24 @@ CONSECUTIVE_FAILURES=0
 PORT_CONFLICT_KILLS=0
 MAX_PORT_CONFLICT_KILLS=3  # Give up after this many kill attempts
 
-LOG="$HOME/Library/Logs/freenet/freenet.log"
+# Lifecycle messages route through `logger`, which writes to macOS unified
+# logging (auto-rotated, queryable via `log show --predicate 'process ==
+# "logger"' --info`). Previously these were appended to a fixed
+# ~/Library/Logs/freenet/freenet.log that the cleanup pass never touched
+# (its mtime stayed fresh while being written), so the file grew without
+# bound on long-running nodes (issue #4251). The transient
+# freenet.error.log.last scratch file below is overwritten on every launch
+# and so does not accumulate.
+log_event() {{
+    logger -t freenet "$1"
+}}
 
 # Kill any stale freenet network processes before starting.
 # This handles the case where a previous launch daemon restart left a child
 # process still holding the port (e.g. port 7509).
 # Scoped to the current user to avoid killing processes owned by other users.
 if pkill -f -u "$(id -u)" "freenet network" 2>/dev/null; then
-    echo "$(date): Killed stale freenet network process(es) on startup" >> "$LOG"
+    log_event "Killed stale freenet network process(es) on startup"
     sleep 2
 fi
 
@@ -2865,44 +2875,44 @@ while true; do
     EXIT_CODE=$?
 
     if [ $EXIT_CODE -eq 42 ]; then
-        echo "$(date): Update needed, running freenet update..." >> "$LOG"
+        log_event "Update needed, running freenet update..."
         if "{binary}" update --quiet; then
-            echo "$(date): Update successful, restarting..." >> "$LOG"
+            log_event "Update successful, restarting..."
             CONSECUTIVE_FAILURES=0
             PORT_CONFLICT_KILLS=0
             BACKOFF=10
             sleep 2
         else
             CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
-            echo "$(date): Update failed (attempt $CONSECUTIVE_FAILURES), backing off $BACKOFF seconds..." >> "$LOG"
+            log_event "Update failed (attempt $CONSECUTIVE_FAILURES), backing off $BACKOFF seconds..."
             sleep $BACKOFF
             BACKOFF=$((BACKOFF * 2))
             [ $BACKOFF -gt $MAX_BACKOFF ] && BACKOFF=$MAX_BACKOFF
         fi
         continue
     elif [ $EXIT_CODE -eq 43 ]; then
-        echo "$(date): Another instance is already running, exiting cleanly" >> "$LOG"
+        log_event "Another instance is already running, exiting cleanly"
         exit 0
     elif [ $EXIT_CODE -eq 0 ]; then
-        echo "$(date): Normal shutdown" >> "$LOG"
+        log_event "Normal shutdown"
         exit 0
     else
         # Check if this looks like a port-already-in-use failure.
         if grep -q "already in use" "$HOME/Library/Logs/freenet/freenet.error.log.last" 2>/dev/null; then
             PORT_CONFLICT_KILLS=$((PORT_CONFLICT_KILLS + 1))
             if [ $PORT_CONFLICT_KILLS -le $MAX_PORT_CONFLICT_KILLS ]; then
-                echo "$(date): Port conflict detected (attempt $PORT_CONFLICT_KILLS/$MAX_PORT_CONFLICT_KILLS) — killing stale freenet process and retrying..." >> "$LOG"
+                log_event "Port conflict detected (attempt $PORT_CONFLICT_KILLS/$MAX_PORT_CONFLICT_KILLS) — killing stale freenet process and retrying..."
                 pkill -f -u "$(id -u)" "freenet network" 2>/dev/null || true
                 sleep 2
                 BACKOFF=10
                 continue
             else
-                echo "$(date): Port conflict persists after $MAX_PORT_CONFLICT_KILLS kill attempts. Manual intervention may be required ('pkill freenet'). Backing off..." >> "$LOG"
+                log_event "Port conflict persists after $MAX_PORT_CONFLICT_KILLS kill attempts. Manual intervention may be required ('pkill freenet'). Backing off..."
             fi
         fi
         CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
         PORT_CONFLICT_KILLS=0
-        echo "$(date): Exited with code $EXIT_CODE, restarting after backoff..." >> "$LOG"
+        log_event "Exited with code $EXIT_CODE, restarting after backoff..."
         sleep $BACKOFF
         BACKOFF=$((BACKOFF * 2))
         [ $BACKOFF -gt $MAX_BACKOFF ] && BACKOFF=$MAX_BACKOFF
@@ -2914,7 +2924,7 @@ done
 }
 
 #[cfg(target_os = "macos")]
-fn generate_plist(wrapper_path: &Path, log_dir: &Path) -> String {
+pub(super) fn generate_plist(wrapper_path: &Path, log_dir: &Path) -> String {
     // Note: wrapper_path is the auto-update wrapper script, not the freenet binary directly.
     // The wrapper handles the loop: run freenet, check exit code, update if needed.
     format!(
@@ -4179,6 +4189,23 @@ mod tests {
     fn test_macos_wrapper_script_generation() {
         let binary_path = PathBuf::from("/usr/local/bin/freenet");
         let script = generate_wrapper_script(&binary_path);
+
+        // Regression for issue #4251: lifecycle messages MUST go through
+        // `logger -t freenet` (auto-rotated by macOS unified logging),
+        // not appended to a fixed ~/Library/Logs/freenet/freenet.log file
+        // that grows without bound.
+        assert!(
+            script.contains("logger -t freenet"),
+            "wrapper must route lifecycle messages through logger(1)"
+        );
+        assert!(
+            !script.contains("Library/Logs/freenet/freenet.log\""),
+            "regression: wrapper must NOT append to fixed unrotated freenet.log (#4251)"
+        );
+        assert!(
+            !script.contains(">> \"$LOG\""),
+            "regression: wrapper must not use the legacy LOG file variable (#4251)"
+        );
 
         // Regression for #3301: startup stale-process cleanup, scoped to current user
         assert!(

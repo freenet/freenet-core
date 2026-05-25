@@ -271,9 +271,11 @@ impl OpManager {
                 targets.insert(pkl);
             } else {
                 interest_resolve_failed += 1;
-                // Counter (interest_resolve_failed) is the actionable signal;
-                // per-peer-miss log fires hundreds of times/hour on hot
-                // contracts. The aggregate is logged once at INFO below.
+                // Counter (interest_resolve_failed) feeds the aggregate
+                // logged below — at INFO when targets were found,
+                // promoted to WARN when ALL targets failed to resolve
+                // (worst case, NO_TARGETS branch). Per-peer-miss DEBUG
+                // avoids the hundreds-per-hour spam on hot contracts.
                 tracing::debug!(
                     contract = %format!("{:.8}", key),
                     interest_peer = %peer_key.0,
@@ -304,12 +306,20 @@ impl OpManager {
                 "UPDATE_PROPAGATION"
             );
         } else {
-            tracing::debug!(
+            // NO_TARGETS is the worst-case outcome: every candidate
+            // target failed to resolve, so the UPDATE will not
+            // propagate at all. Keep this at WARN so operators see it
+            // at default log level even after the per-peer miss
+            // demotion above (issue #4251 review). When this fires on
+            // a hot contract, the per-event WARN volume is bounded by
+            // attempts-per-update, not by attempts-per-peer.
+            tracing::warn!(
                 contract = %format!("{:.8}", key),
                 peer_addr = %sender,
                 self_addr = ?self_addr.map(|a| format!("{:.8}", a)),
                 proximity_sources = proximity_found,
                 interest_sources = interest_found,
+                interest_resolve_failed,
                 phase = "warning",
                 "UPDATE_PROPAGATION: NO_TARGETS - update will not propagate further"
             );

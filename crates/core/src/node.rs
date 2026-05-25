@@ -1786,16 +1786,18 @@ async fn handle_interest_sync_message(
                     );
                 }
                 Ok(other) => {
-                    // Use Display, not Debug, for `other`. Debug-formatting an
-                    // UpdateResponse expands the inner anyhow::Error and
-                    // prints a ~15-line backtrace per call. Under queue
-                    // saturation (issue #4251) this fires constantly and
-                    // dominates log volume. Display gives a one-line summary.
+                    // Display, not Debug, for `other` — `?other` Debug-prints
+                    // the full UpdateResponse, expands the inner
+                    // anyhow::Error, and emits a ~15-line backtrace per call
+                    // under queue saturation (issue #4251).
+                    // ContractHandlerEvent's hand-written Display
+                    // (`contract/handler.rs:706`) gives a single-line variant
+                    // summary without expanding nested anyhow chains.
                     tracing::debug!(
                         from = %source,
                         contract = %key,
                         event = "resync_failed",
-                        response_kind = std::any::type_name_of_val(&other),
+                        response = %other,
                         "Unexpected response to resync update"
                     );
                 }
