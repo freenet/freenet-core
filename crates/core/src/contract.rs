@@ -752,7 +752,8 @@ fn track_pending_reclamation_if_evict<CH>(
 
 /// Send an error response to the event sender when the per-contract queue is full.
 ///
-/// Logs a warning and sends the appropriate error response variant for the rejected event.
+/// Logs at DEBUG (per-event backpressure is not user-actionable; see #4251)
+/// and sends the appropriate error response variant for the rejected event.
 /// For fire-and-forget events (delegates, disconnects), no response is sent.
 async fn send_queue_full_response(
     channel: &mut handler::ContractHandlerChannel<handler::ContractHandlerHalve>,

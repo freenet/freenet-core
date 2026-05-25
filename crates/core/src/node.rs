@@ -2152,6 +2152,60 @@ mod tests {
     use super::*;
     use rstest::rstest;
 
+    /// Source-level pins for the three log sites in this file that were
+    /// demoted / format-fixed in PR #4252 for issue #4251. Each pin
+    /// asserts the macro family of the call site by scanning a 240-byte
+    /// window before the anchor message. Same shape as the
+    /// `bug-prevention-patterns.md` FreeConsole pins in `service.rs`.
+    fn assert_log_site_pin(needle: &str, must_contain: &[&str], must_not_contain: &[&str]) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/node.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("must read own source at {}: {e}", path.display()));
+        let idx = source
+            .find(needle)
+            .unwrap_or_else(|| panic!("log message `{needle}` must still exist in source"));
+        let start = idx.saturating_sub(240);
+        let window = &source[start..idx];
+        for needle in must_contain {
+            assert!(
+                window.contains(needle),
+                "site `{needle}` must appear in the 240-byte window before message:\n{window}",
+                needle = needle
+            );
+        }
+        for forbidden in must_not_contain {
+            assert!(
+                !window.contains(forbidden),
+                "site must NOT contain `{forbidden}` (would restore an issue #4251 regression):\n{window}",
+                forbidden = forbidden
+            );
+        }
+    }
+
+    #[test]
+    fn summary_mismatch_in_interest_sync_logs_at_debug_pin_test() {
+        // Demoted from INFO to DEBUG to stop dominating peer logs on
+        // hot contracts. Per #4251 review (testing reviewer #1).
+        assert_log_site_pin(
+            "Summary mismatch in interest sync \u{2014} syncing state to stale peer",
+            &["tracing::debug!"],
+            &["tracing::info!", "tracing::warn!"],
+        );
+    }
+
+    #[test]
+    fn unexpected_resync_response_uses_display_not_debug_pin_test() {
+        // Switched from `response = ?other` (Debug-expanded UpdateResponse
+        // → anyhow chain → ~15-line backtrace per call) to `response =
+        // %other` (single-line Display via ContractHandlerEvent's
+        // hand-written impl). Per #4251 review (code-first + Codex).
+        assert_log_site_pin(
+            "Unexpected response to resync update",
+            &["tracing::debug!", "response = %other"],
+            &["response = ?other", "tracing::warn!", "tracing::info!"],
+        );
+    }
+
     // Hostname resolution tests
     #[tokio::test]
     async fn test_hostname_resolution_localhost() {

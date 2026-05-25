@@ -306,14 +306,16 @@ impl OpManager {
                 "UPDATE_PROPAGATION"
             );
         } else {
-            // NO_TARGETS is the worst-case outcome: every candidate
-            // target failed to resolve, so the UPDATE will not
-            // propagate at all. Keep this at WARN so operators see it
-            // at default log level even after the per-peer miss
-            // demotion above (issue #4251 review). When this fires on
-            // a hot contract, the per-event WARN volume is bounded by
-            // attempts-per-update, not by attempts-per-peer.
-            tracing::warn!(
+            // NO_TARGETS at DEBUG: this function is called up to 4
+            // times per BroadcastStateChange (initial + 3 retries) so
+            // per-attempt WARN amplifies 4x on stuck contracts. The
+            // operator-actionable signal is the outer streak-suppressed
+            // "no targets after 3 retries, giving up" WARN in
+            // p2p_protoc.rs (search for "BroadcastTo: no targets after");
+            // the per-attempt detail belongs in metrics/structured
+            // counters (interest_resolve_failed). Issue #4251 re-review
+            // M2.
+            tracing::debug!(
                 contract = %format!("{:.8}", key),
                 peer_addr = %sender,
                 self_addr = ?self_addr.map(|a| format!("{:.8}", a)),
@@ -911,6 +913,38 @@ mod messages {
 mod tests {
     use super::*;
     use crate::operations::test_utils::make_contract_key;
+
+    /// Source-level pin for the UPDATE_PROPAGATION NO_TARGETS log site.
+    /// Originally INFO; briefly promoted to WARN in PR #4252 commit 2;
+    /// then demoted back to DEBUG in commit 3 because
+    /// `get_broadcast_targets_update` is called up to 4 times per
+    /// `BroadcastStateChange` (initial + 3 retries) — per-attempt WARN
+    /// 4x amplifies on stuck contracts. The operator-actionable summary
+    /// lives in the outer streak-suppressed WARN at
+    /// `p2p_protoc.rs::BroadcastTo: no targets after …`. Per #4251
+    /// re-review M2 (skeptical).
+    #[test]
+    fn no_targets_propagation_logs_at_debug_pin_test() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/operations/update.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("must read own source at {}: {e}", path.display()));
+        let needle = "UPDATE_PROPAGATION: NO_TARGETS - update will not propagate further";
+        let idx = source
+            .find(needle)
+            .expect("NO_TARGETS log message must still exist in source");
+        let start = idx.saturating_sub(400);
+        let window = &source[start..idx];
+        assert!(
+            window.contains("tracing::debug!"),
+            "NO_TARGETS log site must be DEBUG to avoid 4x amplification on retries. \
+             Re-promotion to WARN/INFO regresses #4251 review M2.\nWindow:\n{window}"
+        );
+        assert!(
+            !window.contains("tracing::warn!") && !window.contains("tracing::info!"),
+            "NO_TARGETS log site must NOT be WARN/INFO.\nWindow:\n{window}"
+        );
+    }
 
     /// Regression tests for issue #3914: misleading ERROR/WARN log noise from
     /// benign WASM rejections of stale broadcast UPDATEs. The contract correctly
