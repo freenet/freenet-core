@@ -218,7 +218,10 @@ async fn drive_client_put_inner(
     }
 
     impl RetryDriver for PutRetryDriver<'_> {
-        type Terminal = ContractKey;
+        // `(key, hop_count)`. `hop_count = None` for `LocalCompletion`
+        // (originator stored locally, no hops traversed); `Some(hop_count)`
+        // for `Stored` (wire-carried forward depth from the storer).
+        type Terminal = (ContractKey, Option<usize>);
 
         fn new_attempt_tx(&mut self) -> Transaction {
             Transaction::new::<PutMsg>()
@@ -244,11 +247,12 @@ async fn drive_client_put_inner(
             })
         }
 
-        fn classify(&mut self, reply: NetMessage) -> AttemptOutcome<ContractKey> {
+        fn classify(&mut self, reply: NetMessage) -> AttemptOutcome<Self::Terminal> {
             match classify_reply(&reply) {
-                ReplyClass::Stored { key } | ReplyClass::LocalCompletion { key } => {
-                    AttemptOutcome::Terminal(key)
+                ReplyClass::Stored { key, hop_count } => {
+                    AttemptOutcome::Terminal((key, Some(hop_count)))
                 }
+                ReplyClass::LocalCompletion { key } => AttemptOutcome::Terminal((key, None)),
                 ReplyClass::Unexpected => AttemptOutcome::Unexpected,
             }
         }
@@ -292,7 +296,7 @@ async fn drive_client_put_inner(
     let loop_result = drive_retry_loop(op_manager, client_tx, "put", &mut driver).await;
 
     match loop_result {
-        RetryLoopOutcome::Done(reply_key) => {
+        RetryLoopOutcome::Done((reply_key, wire_hop_count)) => {
             // Clean up the DashMap entry that process_message created.
             // Without this, the GC task finds a stale AwaitingResponse
             // entry and launches speculative retries on the completed op.
@@ -325,13 +329,22 @@ async fn drive_client_put_inner(
             );
 
             // Telemetry only — subscribe=false to avoid double-subscribe.
+            //
+            // `hop_count`: clamp the wire value to `ring.max_hops_to_live`
+            // for the same defence-in-depth reason `tracing.rs` clamps the
+            // implicit `PutSuccess` from `from_inbound_msg_v1` — a buggy or
+            // malicious peer must not be able to poison originator
+            // telemetry with `usize::MAX`. `None` is preserved for the
+            // `LocalCompletion` arm (no remote hops traversed).
+            let max_htl = op_manager.ring.max_hops_to_live;
+            let hop_count = wire_hop_count.map(|hc| hc.min(max_htl));
             super::finalize_put_at_originator(
                 op_manager,
                 client_tx,
                 reply_key,
                 PutFinalizationData {
                     sender: driver.current_target,
-                    hop_count: None,
+                    hop_count,
                     state_hash: None,
                     state_size: None,
                 },
@@ -368,13 +381,23 @@ async fn drive_client_put_inner(
 
 #[derive(Debug)]
 enum ReplyClass {
-    /// Remote peer accepted the PUT.
+    /// Remote peer accepted the PUT. `hop_count` is the forward-path
+    /// depth carried on the wire `PutMsg::Response`/`ResponseStreaming`.
+    /// Used by the originator's driver to populate
+    /// `PutFinalizationData.hop_count` so the explicit `PutSuccess`
+    /// event emitted from `finalize_put_at_originator` carries the
+    /// same value as the implicit one emitted from
+    /// `NetEventLog::from_inbound_msg_v1` — without this, the
+    /// originator's two `PutSuccess` events for the same tx would
+    /// disagree (one populated, one `None`).
     Stored {
         key: ContractKey,
+        hop_count: usize,
     },
     /// Local completion: process_message stored locally but found no
     /// next hop, so forward_pending_op_result_if_completed sent back
-    /// the original Request. The contract is stored at the originator.
+    /// the original Request. The contract is stored at the originator,
+    /// so no hops were traversed.
     LocalCompletion {
         key: ContractKey,
     },
@@ -383,9 +406,13 @@ enum ReplyClass {
 
 fn classify_reply(msg: &NetMessage) -> ReplyClass {
     match msg {
-        NetMessage::V1(NetMessageV1::Put(
-            PutMsg::Response { key, .. } | PutMsg::ResponseStreaming { key, .. },
-        )) => ReplyClass::Stored { key: *key },
+        NetMessage::V1(NetMessageV1::Put(PutMsg::Response { key, hop_count, .. }))
+        | NetMessage::V1(NetMessageV1::Put(PutMsg::ResponseStreaming { key, hop_count, .. })) => {
+            ReplyClass::Stored {
+                key: *key,
+                hop_count: *hop_count,
+            }
+        }
         // When process_message completes locally (no next hop), the
         // Request is echoed back via forward_pending_op_result_if_completed.
         NetMessage::V1(NetMessageV1::Put(PutMsg::Request {
@@ -2038,17 +2065,23 @@ mod tests {
                 key,
                 hop_count: hc,
             }));
-            assert!(
-                matches!(classify_reply(&msg), ReplyClass::Stored { .. }),
-                "Response with hop_count={hc} must classify as Stored"
-            );
-            // Destructure to assert the field is preserved on the
-            // message itself — the bubble-up reads it directly here.
-            match msg {
-                NetMessage::V1(NetMessageV1::Put(PutMsg::Response { hop_count: got, .. })) => {
-                    assert_eq!(got, hc, "Response.hop_count preserved ({hc})")
+            // Stored variant must extract the wire hop_count into the
+            // classifier output — the originator driver uses this to
+            // populate `PutFinalizationData.hop_count`. A regression that
+            // re-introduced `Stored { key }` without the field would
+            // silently revert PutSuccess from `finalize_put_at_originator`
+            // back to `None` (codex review of #4248).
+            match classify_reply(&msg) {
+                ReplyClass::Stored {
+                    key: got_key,
+                    hop_count: got_hc,
+                } => {
+                    assert_eq!(got_key, key, "Stored.key preserved");
+                    assert_eq!(got_hc, hc, "Stored.hop_count preserved ({hc})");
                 }
-                _ => unreachable!(),
+                other @ (ReplyClass::LocalCompletion { .. } | ReplyClass::Unexpected) => {
+                    panic!("expected Stored, got {other:?} for hc={hc}")
+                }
             }
 
             // ResponseStreaming variant
@@ -2058,18 +2091,70 @@ mod tests {
                 continue_forwarding: false,
                 hop_count: hc,
             }));
-            assert!(
-                matches!(classify_reply(&msg), ReplyClass::Stored { .. }),
-                "ResponseStreaming with hop_count={hc} must classify as Stored"
-            );
-            match msg {
-                NetMessage::V1(NetMessageV1::Put(PutMsg::ResponseStreaming {
-                    hop_count: got,
-                    ..
-                })) => assert_eq!(got, hc, "ResponseStreaming.hop_count preserved ({hc})"),
-                _ => unreachable!(),
+            match classify_reply(&msg) {
+                ReplyClass::Stored {
+                    key: got_key,
+                    hop_count: got_hc,
+                } => {
+                    assert_eq!(got_key, key, "ResponseStreaming Stored.key preserved");
+                    assert_eq!(
+                        got_hc, hc,
+                        "ResponseStreaming Stored.hop_count preserved ({hc})"
+                    );
+                }
+                other @ (ReplyClass::LocalCompletion { .. } | ReplyClass::Unexpected) => {
+                    panic!("expected Stored, got {other:?} for hc={hc}")
+                }
             }
         }
+    }
+
+    /// Regression pin: the client-PUT driver's `RetryLoopOutcome::Done`
+    /// branch MUST pass the wire-carried `hop_count` into
+    /// `PutFinalizationData` (clamped to `max_hops_to_live`). Without
+    /// this, the originator emits TWO `PutSuccess` events per tx: the
+    /// implicit one from `from_inbound_msg_v1` (populated) and the
+    /// explicit one from `finalize_put_at_originator` (`None`) — exactly
+    /// the inconsistency codex flagged on the first review pass of
+    /// #4248. Scrapes the source so a regression that re-introduces
+    /// `hop_count: None,` literal in the PutFinalizationData
+    /// construction trips immediately.
+    #[test]
+    fn finalize_put_at_originator_uses_wire_hop_count() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        // Anchor: the `RetryLoopOutcome::Done` match arm in
+        // `start_client_put`. Scan forward to the next
+        // `finalize_put_at_originator(` call and verify the field shape.
+        let done_arm = SOURCE
+            .find("RetryLoopOutcome::Done((reply_key, wire_hop_count))")
+            .expect(
+                "RetryLoopOutcome::Done destructure not found — \
+                 if you've refactored to use named struct destructuring \
+                 update this anchor but keep the wire_hop_count threading",
+            );
+        let finalize_call = SOURCE[done_arm..]
+            .find("finalize_put_at_originator(")
+            .expect("no finalize_put_at_originator call in Done arm");
+        let region = &SOURCE[done_arm..done_arm + finalize_call + 500];
+        // The construction MUST NOT hard-code `hop_count: None,`. It must
+        // pass `hop_count` computed from `wire_hop_count`.
+        assert!(
+            !region.contains("hop_count: None,"),
+            "PutFinalizationData construction in start_client_put's \
+             Done arm must NOT hard-code hop_count: None — that emits a \
+             PutSuccess with hop_count=None alongside the populated one \
+             from from_inbound_msg_v1, defeating #4248"
+        );
+        assert!(
+            region.contains("hop_count,"),
+            "PutFinalizationData construction in start_client_put's \
+             Done arm must pass hop_count from the wire value"
+        );
+        assert!(
+            region.contains("wire_hop_count.map"),
+            "wire_hop_count must be mapped (e.g. clamp via .min(max_htl)) \
+             before being passed into PutFinalizationData"
+        );
     }
 
     #[test]
@@ -2259,17 +2344,18 @@ mod tests {
         // Verify that RetryLoopOutcome::Exhausted maps to a client-visible
         // OperationError, not a silent drop or infrastructure error.
         let cause = "PUT to contract failed after 3 attempts".to_string();
-        let outcome: DriverOutcome = match RetryLoopOutcome::<ContractKey>::Exhausted(cause) {
-            RetryLoopOutcome::Exhausted(cause) => {
-                DriverOutcome::Publish(Err(ErrorKind::OperationError {
-                    cause: cause.into(),
+        let outcome: DriverOutcome =
+            match RetryLoopOutcome::<(ContractKey, Option<usize>)>::Exhausted(cause) {
+                RetryLoopOutcome::Exhausted(cause) => {
+                    DriverOutcome::Publish(Err(ErrorKind::OperationError {
+                        cause: cause.into(),
+                    }
+                    .into()))
                 }
-                .into()))
-            }
-            RetryLoopOutcome::Done(_)
-            | RetryLoopOutcome::Unexpected
-            | RetryLoopOutcome::InfraError(_) => unreachable!(),
-        };
+                RetryLoopOutcome::Done(_)
+                | RetryLoopOutcome::Unexpected
+                | RetryLoopOutcome::InfraError(_) => unreachable!(),
+            };
         assert!(
             matches!(outcome, DriverOutcome::Publish(Err(_))),
             "Exhaustion must produce a client error, not be swallowed"
