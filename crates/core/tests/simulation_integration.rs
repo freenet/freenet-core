@@ -9520,7 +9520,7 @@ async fn sim_network_regular_node_labels_start_at_gateway_count() {
 // `run_controlled_simulation`; once that pattern is generalised, this test
 // can be rebuilt on top of it without `#[ignore]`.
 #[test_log::test]
-#[ignore = "default event_chain workload doesn't produce terminal GETs at CI scales; see test_get_msg_response_hop_count_roundtrip in get.rs for the regression test that does cover this fix"]
+#[ignore = "tracking issue #4250 — default event_chain workload doesn't produce terminal GETs at CI scales; primary regression coverage lives in test_get_msg_response_hop_count_roundtrip (get.rs) and classify_response_found_preserves_hop_count (op_ctx_task.rs). Un-ignore once a deterministic GET-producing workload is wired through TestConfig"]
 fn test_hop_count_populated_on_terminal_get_events() {
     // Parameters match test_router_accumulates_feedback_events (a known-good
     // workload that produces GET events in CI).
