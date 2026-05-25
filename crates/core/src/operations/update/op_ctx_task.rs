@@ -392,13 +392,30 @@ async fn drive_client_update(
                         .into())));
                     }
 
-                    tracing::error!(
-                        tx = %client_tx,
-                        contract = %key,
-                        error = %err,
-                        phase = "error",
-                        "update: failed to apply update locally before forwarding"
-                    );
+                    // Issue #4251: per-contract queue saturation is
+                    // transient backpressure, not an operator-actionable
+                    // failure. On a hot contract this fires hundreds of
+                    // times per second; ERROR-level here drowns real
+                    // failures on the originator path. Real WASM faults
+                    // (OOG, traps, missing parameters) keep the ERROR
+                    // level.
+                    if err.is_contract_queue_full() {
+                        tracing::debug!(
+                            tx = %client_tx,
+                            contract = %key,
+                            error = %err,
+                            event = "queue_full",
+                            "update: per-contract queue saturated before forwarding"
+                        );
+                    } else {
+                        tracing::error!(
+                            tx = %client_tx,
+                            contract = %key,
+                            error = %err,
+                            phase = "error",
+                            "update: failed to apply update locally before forwarding"
+                        );
+                    }
                     return Err(err);
                 }
             };

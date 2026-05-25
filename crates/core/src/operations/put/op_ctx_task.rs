@@ -1214,13 +1214,31 @@ async fn relay_put_store_locally(
     {
         Ok(result) => result,
         Err(err) => {
-            tracing::error!(
-                tx = %incoming_tx,
-                contract = %key,
-                error = %err,
-                htl,
-                "PUT relay: put_contract failed"
-            );
+            // Issue #4251: per-contract queue saturation is transient
+            // platform backpressure, not a real PUT failure. The PUT
+            // relay path doesn't trigger the auto-fetch / ResyncRequest
+            // amplification that UPDATE does (see PR for analysis), so
+            // we only have the log-spam half of the bug to fix here.
+            // Real PUT failures (validation, storage, missing
+            // parameters) keep the ERROR level.
+            if err.is_contract_queue_full() {
+                tracing::debug!(
+                    tx = %incoming_tx,
+                    contract = %key,
+                    error = %err,
+                    htl,
+                    event = "queue_full",
+                    "PUT relay: per-contract queue saturated"
+                );
+            } else {
+                tracing::error!(
+                    tx = %incoming_tx,
+                    contract = %key,
+                    error = %err,
+                    htl,
+                    "PUT relay: put_contract failed"
+                );
+            }
             if let Some(event) = NetEventLog::put_failure(
                 &incoming_tx,
                 &op_manager.ring,

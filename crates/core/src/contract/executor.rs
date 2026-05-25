@@ -289,16 +289,22 @@ impl ExecutorError {
         }
     }
 
-    /// Returns true if this error is the typed `ContractQueueFull` marker
-    /// from `send_queue_full_response` (per-contract fair queue at capacity).
+    /// Returns true if this error is the typed `ContractQueueFull` marker.
+    ///
+    /// Produced by:
+    /// - `send_queue_full_response` (per-contract fair queue at capacity),
+    /// - the `InitCheckResult::QueueFull` arm in `executor/runtime.rs` (per-contract
+    ///   initialization queue at capacity).
     ///
     /// **Platform-resilience invariant**: queue-full is transient
     /// backpressure, not a contract-level fault, missing-contract condition,
-    /// or WASM failure. Callers MUST gate amplification side effects on this
-    /// predicate — auto-fetch GETs (the contract code is present), ResyncRequest
-    /// broadcasts (the merge never ran), and ERROR-level logging (volume on a
-    /// hot contract drowns real failures). Without it, a single saturated
-    /// contract induces a network-wide storm. See issue #4251.
+    /// or WASM failure. Callers in paths that have amplification side effects
+    /// (today: UPDATE relay's `try_auto_fetch_contract` and `ResyncRequest`)
+    /// MUST gate those branches on this predicate so a saturated contract
+    /// doesn't induce a network-wide storm. Paths without amplification
+    /// (today: PUT, GET, SUBSCRIBE) only need to gate **ERROR-level logging**
+    /// off this predicate, since on a hot contract the volume otherwise drowns
+    /// real failures. See issue #4251.
     pub fn is_contract_queue_full(&self) -> bool {
         match &self.inner {
             Either::Left(_) => false,

@@ -368,17 +368,20 @@ fn log_update_contract_failure(key: &ContractKey, err: &ExecutorError) {
 /// - Log severity uses `is_invalid_update_rejection` (narrow): only the
 ///   contract WASM's typed "invalid contract update" rejection counts as
 ///   benign. Out-of-gas, traps, timeouts stay at WARN even though the
-///   contract code is present.
+///   contract code is present. Issue #4251 adds a third level: queue-full
+///   logs at DEBUG (transient backpressure, not an operator-actionable
+///   fault).
 ///
-/// - Auto-fetch uses `is_contract_exec_rejection` (broad): any time the
-///   contract code DID execute (whether successfully rejecting a stale
-///   state or running out of gas), the code is present locally and a
-///   self-heal GET would be wasted. Auto-fetch only fires for failures
-///   where the contract is actually missing (e.g., missing parameters
-///   after restart, storage error).
+/// - Auto-fetch uses `is_contract_exec_rejection` (broad) AND
+///   `!is_contract_queue_full` (issue #4251): any time the contract code
+///   DID execute (whether successfully rejecting a stale state or running
+///   out of gas), OR the contract's queue is just saturated, the code is
+///   present locally and a self-heal GET would be wasted. Auto-fetch only
+///   fires for failures where the contract is actually missing (e.g.,
+///   missing parameters after restart, storage error).
 ///
 /// Returning `true` means "fetch missing contract code"; returning `false`
-/// means "contract is present, skip auto-fetch".
+/// means "contract is present (or queue saturated), skip auto-fetch".
 ///
 /// Note: this helper takes `&OpError` while `log_update_contract_failure`
 /// takes `&ExecutorError` because the two call sites have different error

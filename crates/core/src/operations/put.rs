@@ -135,7 +135,19 @@ pub(super) async fn put_contract(
             new_value: Err(err),
             ..
         }) => {
-            tracing::error!(contract = %key, error = %err, phase = "error", "Failed to update contract value");
+            // Issue #4251: per-contract queue saturation logs at DEBUG, not
+            // ERROR — same rationale as the matching site in
+            // `update.rs::log_update_contract_failure`.
+            if err.is_contract_queue_full() {
+                tracing::debug!(
+                    contract = %key,
+                    error = %err,
+                    event = "queue_full",
+                    "PUT skipped: per-contract queue saturated"
+                );
+            } else {
+                tracing::error!(contract = %key, error = %err, phase = "error", "Failed to update contract value");
+            }
             Err(OpError::from(err))
         }
         Err(err) => Err(err.into()),
