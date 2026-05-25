@@ -9501,3 +9501,75 @@ async fn sim_network_regular_node_labels_start_at_gateway_count() {
         GATEWAYS + NODES
     );
 }
+
+// =============================================================================
+// hop_count Regression Test (simulation-level, currently disabled)
+// =============================================================================
+//
+// Direct regression coverage for the wire-format fix is provided by
+// `test_get_msg_response_hop_count_roundtrip` in `crates/core/src/operations/get.rs`.
+// That unit test asserts the new `hop_count` field roundtrips through bincode
+// for both `Found` and `NotFound` variants, which is the specific regression
+// scenario this PR addresses.
+//
+// The simulation-level integration test below is left in tree, but marked
+// `#[ignore]` because the default `TestConfig`/`event_chain` workload at the
+// scales reasonable for CI does not reliably produce terminal GET events
+// (most operations are PUT/UPDATE/SUBSCRIBE).  The `nightly_tests`-gated
+// `test_get_reliability_diagnostic` above does drive GETs via
+// `run_controlled_simulation`; once that pattern is generalised, this test
+// can be rebuilt on top of it without `#[ignore]`.
+#[test_log::test]
+#[ignore = "tracking issue #4250 — default event_chain workload doesn't produce terminal GETs at CI scales; primary regression coverage lives in test_get_msg_response_hop_count_roundtrip (get.rs) and classify_response_found_preserves_hop_count (op_ctx_task.rs). Un-ignore once a deterministic GET-producing workload is wired through TestConfig"]
+fn test_hop_count_populated_on_terminal_get_events() {
+    // Parameters match test_router_accumulates_feedback_events (a known-good
+    // workload that produces GET events in CI).
+    let result = TestConfig::small("hop-count-regression", 0xCAFE_0001)
+        .with_nodes(4)
+        .with_max_contracts(5)
+        .with_iterations(50)
+        .with_duration(Duration::from_secs(60))
+        .with_sleep(Duration::from_secs(2))
+        .run()
+        .assert_ok();
+
+    // TestConfig::small uses ring_max_htl = 7, so any populated hop_count must
+    // be within [0, 7].  Anything outside that range would indicate either
+    // garbage-value propagation or a regression in how relays compute their
+    // forward depth.
+    const RING_MAX_HTL: usize = 7;
+
+    let rt = create_runtime();
+    let (populated, max_hop) = rt.block_on(async {
+        let logs = result.logs_handle.lock().await;
+        let hop_counts: Vec<usize> = logs
+            .iter()
+            .filter(|m| m.kind.variant_name() == "Get")
+            .filter_map(|m| m.kind.hop_count())
+            .collect();
+        let max_hop = hop_counts.iter().copied().max().unwrap_or(0);
+        (hop_counts.len(), max_hop)
+    });
+
+    // Presence: before the fix the wire-carried hop_count is dropped on the
+    // floor and every terminal GET event has hop_count = None.  After the
+    // fix every terminal GET event carries it.
+    assert!(
+        populated > 0,
+        "expected at least one terminal GET event with populated hop_count; \
+         got 0.  Indicates hop_count is no longer being threaded through the \
+         GetMsg::Response wire format (PR #4245)."
+    );
+
+    // Sanity-bound: hop_count is computed as `max_htl - htl` on the storer
+    // side (and at exhaustion relays), so it must be within [0, max_htl].
+    // A regression that, say, started writing the originator's htl_max into
+    // the field instead of (max_htl - htl) would trip this.
+    assert!(
+        max_hop <= RING_MAX_HTL,
+        "max observed hop_count {} exceeds ring_max_htl {}; suggests garbage \
+         value propagation rather than (max_htl - htl) accounting",
+        max_hop,
+        RING_MAX_HTL
+    );
+}

@@ -320,6 +320,7 @@ async fn drive_client_get_inner(
                     key,
                     state,
                     contract,
+                    hop_count: _,
                 } => {
                     // InlineFound delivers state + optional contract in
                     // the same envelope as the Response header, so the
@@ -606,6 +607,11 @@ enum Terminal {
         key: ContractKey,
         state: WrappedState,
         contract: Option<ContractContainer>,
+        /// Forward-path hop count from the originating Request to the
+        /// storer, as carried on the wire Response. Preserved across the
+        /// relay bubble-up chain (relays do NOT increment on the return
+        /// path). Used by tracing to populate `GetSuccess.hop_count`.
+        hop_count: usize,
     },
     /// ResponseStreaming: the envelope references a stream_id whose
     /// bytes arrive separately via the orphan stream registry. The
@@ -643,11 +649,13 @@ fn classify(reply: NetMessage) -> AttemptOutcome<Terminal> {
                             contract,
                         },
                 },
+            hop_count,
             ..
         })) => AttemptOutcome::Terminal(Terminal::InlineFound {
             key,
             state,
             contract,
+            hop_count,
         }),
         NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
             result: GetMsgResult::Found { value, .. },
@@ -1376,6 +1384,7 @@ async fn drive_sub_op_get(
                     key,
                     state,
                     contract,
+                    hop_count: _,
                 } => {
                     cache_contract_locally(
                         op_manager,
@@ -1700,7 +1709,15 @@ async fn drive_relay_get(
             );
             // On infrastructure error, send NotFound upstream so the upstream
             // doesn't time out waiting for us.
-            relay_send_not_found(op_manager, incoming_tx, instance_id, upstream_addr).await;
+            let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+            relay_send_not_found(
+                op_manager,
+                incoming_tx,
+                instance_id,
+                upstream_addr,
+                hop_count,
+            )
+            .await;
             Err(err)
         }
     }
@@ -1821,16 +1838,24 @@ fn relay_advance_to_next_peer(
 }
 
 /// Build and send a `GetMsg::Response{NotFound}` to `upstream_addr`.
+///
+/// `hop_count` is the forward-path hop count to embed in the Response. For
+/// a relay that's producing the NotFound itself (HTL exhaustion or downstream
+/// exhaustion), this is `max_htl - incoming_htl`. For an originator-side
+/// originator-loopback NotFound from `start_client_get` after exhaustion,
+/// pass 0 (no remote hops traversed).
 async fn relay_send_not_found(
     op_manager: &OpManager,
     tx: Transaction,
     instance_id: ContractInstanceId,
     upstream_addr: SocketAddr,
+    hop_count: usize,
 ) {
     let msg = NetMessage::from(GetMsg::Response {
         id: tx,
         instance_id,
         result: GetMsgResult::NotFound,
+        hop_count,
     });
     let mut ctx = op_manager.op_ctx(tx);
     // Originator-loopback: when this driver runs on the originator's
@@ -1860,6 +1885,12 @@ async fn relay_send_not_found(
 
 /// Build and send a `GetMsg::Response{Found}` (inline, non-streaming) to
 /// `upstream_addr`.  Returns an error on serialization failure.
+///
+/// `hop_count` is the forward-path hop count to embed in the Response. For
+/// the storer's own initial Found, this is `max_htl - incoming_htl`. For a
+/// relay bubbling up a downstream Found, this is the downstream Response's
+/// `hop_count` (preserved through the bubble-up chain).
+#[allow(clippy::too_many_arguments)]
 async fn relay_send_found(
     op_manager: &OpManager,
     tx: Transaction,
@@ -1868,6 +1899,7 @@ async fn relay_send_found(
     key: ContractKey,
     state: WrappedState,
     contract: Option<ContractContainer>,
+    hop_count: usize,
 ) -> Result<(), OpError> {
     let msg = NetMessage::from(GetMsg::Response {
         id: tx,
@@ -1879,6 +1911,7 @@ async fn relay_send_found(
                 contract,
             },
         },
+        hop_count,
     });
     let mut ctx = op_manager.op_ctx(tx);
     // Originator-loopback: route via `send_local_loopback` to avoid
@@ -1931,7 +1964,18 @@ async fn drive_relay_get_inner(
                 .register_events(either::Either::Left(event))
                 .await;
         }
-        relay_send_not_found(op_manager, incoming_tx, instance_id, upstream_addr).await;
+        // HTL=0 path: the original Request reached us with htl already at 0,
+        // meaning the request traversed the full max_htl forward hops to get
+        // here. hop_count = max_htl - 0 = max_htl.
+        let hop_count = op_manager.ring.max_hops_to_live;
+        relay_send_not_found(
+            op_manager,
+            incoming_tx,
+            instance_id,
+            upstream_addr,
+            hop_count,
+        )
+        .await;
         return Ok(());
     }
 
@@ -2009,6 +2053,9 @@ async fn drive_relay_get_inner(
         // `local_client_access` flag — that's exclusively for the
         // client-originating node. Legacy mirror: `get.rs:2260-2262`
         // gates on `is_original_requester`.
+        // R4 (local cache hit): this relay IS the storer. hop_count =
+        // max_htl - htl_we_received.
+        let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
         let send_result = relay_send_found(
             op_manager,
             incoming_tx,
@@ -2017,6 +2064,7 @@ async fn drive_relay_get_inner(
             key,
             state.clone(),
             contract.clone(),
+            hop_count,
         )
         .await;
         cache_contract_locally(op_manager, key, state, contract, false).await;
@@ -2062,6 +2110,9 @@ async fn drive_relay_get_inner(
                     // runs after forwarding so LRU/TTL bookkeeping fires
                     // even when the forward errors. Relay path:
                     // `is_client_requester=false` on the cache call.
+                    // R10 (local fallback): this relay is acting as the
+                    // storer; same hop_count semantics as R4.
+                    let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
                     let send_result = relay_send_found(
                         op_manager,
                         incoming_tx,
@@ -2070,6 +2121,7 @@ async fn drive_relay_get_inner(
                         key,
                         state.clone(),
                         contract.clone(),
+                        hop_count,
                     )
                     .await;
                     cache_contract_locally(op_manager, key, state, contract, false).await;
@@ -2082,18 +2134,29 @@ async fn drive_relay_get_inner(
                         phase = "not_found",
                         "GET relay: all peers exhausted — sending NotFound upstream"
                     );
+                    // Exhaustion NotFound: this relay is reporting its own
+                    // exhaustion of downstream candidates. hop_count is its
+                    // forward depth (max_htl - htl).
+                    let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
                     if let Some(event) = crate::tracing::NetEventLog::get_not_found(
                         &incoming_tx,
                         &op_manager.ring,
                         instance_id,
-                        None,
+                        Some(hop_count),
                     ) {
                         op_manager
                             .ring
                             .register_events(either::Either::Left(event))
                             .await;
                     }
-                    relay_send_not_found(op_manager, incoming_tx, instance_id, upstream_addr).await;
+                    relay_send_not_found(
+                        op_manager,
+                        incoming_tx,
+                        instance_id,
+                        upstream_addr,
+                        hop_count,
+                    )
+                    .await;
                 }
                 return Ok(());
             }
@@ -2253,6 +2316,7 @@ async fn drive_relay_get_inner(
                 key,
                 state,
                 contract,
+                hop_count: downstream_hop_count,
             }) => {
                 tracing::info!(
                     tx = %incoming_tx,
@@ -2285,6 +2349,9 @@ async fn drive_relay_get_inner(
                 // runs after forwarding so LRU/TTL and
                 // `announce_contract_hosted` semantics are preserved
                 // even on send error.
+                // Preserve the storer-side hop_count so the originator
+                // sees the *forward* depth from Request to storer, not
+                // the depth from Request to this relay.
                 let send_result = relay_send_found(
                     op_manager,
                     incoming_tx,
@@ -2293,6 +2360,7 @@ async fn drive_relay_get_inner(
                     key,
                     state.clone(),
                     contract.clone(),
+                    downstream_hop_count,
                 )
                 .await;
 
@@ -2410,11 +2478,49 @@ mod tests {
                     contract: None,
                 },
             },
+            hop_count: 0,
         }));
         assert!(matches!(
             classify(msg),
             AttemptOutcome::Terminal(Terminal::InlineFound { .. })
         ));
+    }
+
+    /// Regression pin: `classify` MUST extract the wire-carried hop_count
+    /// from `Response{Found}` and propagate it into `Terminal::InlineFound`
+    /// unchanged.  The relay bubble-up at line 2355 uses this field as the
+    /// hop_count for the upstream Response; a regression that synthesised 0
+    /// here (or dropped the field) would silently collapse the storer's
+    /// forward-path depth at every relay, defeating the whole PR.  The
+    /// bincode-roundtrip unit test in `get.rs` catches the wire format only.
+    /// This pins the classifier side.
+    #[test]
+    fn classify_response_found_preserves_hop_count() {
+        for hc in [0_usize, 1, 4, 10, 64] {
+            let tx = dummy_tx();
+            let key = dummy_key();
+            let msg = NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
+                id: tx,
+                instance_id: *key.id(),
+                result: GetMsgResult::Found {
+                    key,
+                    value: StoreResponse {
+                        state: Some(WrappedState::new(vec![1u8])),
+                        contract: None,
+                    },
+                },
+                hop_count: hc,
+            }));
+            match classify(msg) {
+                AttemptOutcome::Terminal(Terminal::InlineFound { hop_count, .. }) => {
+                    assert_eq!(
+                        hop_count, hc,
+                        "classifier must preserve hop_count={hc} unchanged"
+                    );
+                }
+                _ => panic!("expected Terminal(InlineFound) for hop_count={hc}"),
+            }
+        }
     }
 
     #[test]
@@ -2425,6 +2531,7 @@ mod tests {
             id: tx,
             instance_id: *key.id(),
             result: GetMsgResult::NotFound,
+            hop_count: 0,
         }));
         assert!(matches!(classify(msg), AttemptOutcome::Retry));
     }
@@ -2509,6 +2616,7 @@ mod tests {
                     contract: None,
                 },
             },
+            hop_count: 0,
         }));
         assert!(matches!(classify(msg), AttemptOutcome::Unexpected));
     }
