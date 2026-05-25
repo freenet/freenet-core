@@ -252,7 +252,13 @@ async fn drive_client_put_inner(
                 ReplyClass::Stored { key, hop_count } => {
                     AttemptOutcome::Terminal((key, Some(hop_count)))
                 }
-                ReplyClass::LocalCompletion { key } => AttemptOutcome::Terminal((key, None)),
+                // LocalCompletion = no remote hops traversed (originator
+                // is the storer). Forward depth is exactly 0 — emit it
+                // explicitly so local-only PUTs are distinguishable from
+                // "telemetry missing" in dashboards. Codex r2 review of
+                // #4248 flagged that mapping this to `None` leaked an
+                // unpopulated `PutSuccess` for a known-zero-depth path.
+                ReplyClass::LocalCompletion { key } => AttemptOutcome::Terminal((key, Some(0))),
                 ReplyClass::Unexpected => AttemptOutcome::Unexpected,
             }
         }
