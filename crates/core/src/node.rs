@@ -2154,9 +2154,11 @@ mod tests {
 
     /// Source-level pins for the three log sites in this file that were
     /// demoted / format-fixed in PR #4252 for issue #4251. Each pin
-    /// asserts the macro family of the call site by scanning a 240-byte
+    /// asserts the macro family of the call site by scanning a 400-byte
     /// window before the anchor message. Same shape as the
     /// `bug-prevention-patterns.md` FreeConsole pins in `service.rs`.
+    /// Window widened from 240 to 400 in re-review #3 to absorb future
+    /// added structured fields without false-breaking the pin.
     fn assert_log_site_pin(needle: &str, must_contain: &[&str], must_not_contain: &[&str]) {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/node.rs");
         let source = std::fs::read_to_string(&path)
@@ -2164,7 +2166,7 @@ mod tests {
         let idx = source
             .find(needle)
             .unwrap_or_else(|| panic!("log message `{needle}` must still exist in source"));
-        let start = idx.saturating_sub(240);
+        let start = idx.saturating_sub(400);
         let window = &source[start..idx];
         for needle in must_contain {
             assert!(

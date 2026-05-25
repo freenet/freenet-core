@@ -1215,20 +1215,24 @@ fn update_service_file(
 
 /// Check if the wrapper script needs updating (missing or outdated) and update if so.
 /// Pure helper: decide whether a launchd plist needs regeneration. Returns
-/// true when the plist still references the legacy unrotated log path
-/// (`Library/Logs/freenet/freenet.log` — issue #4251). Newer plists send
-/// both standard streams to `/dev/null`.
+/// true when the plist still references either legacy unrotated log path
+/// (`Library/Logs/freenet/freenet.log` for StandardOutPath, or
+/// `Library/Logs/freenet/freenet.error.log` for StandardErrorPath — issue
+/// #4251). Newer plists send both standard streams to `/dev/null`.
 ///
-/// Single substring check: any plist that references
-/// `Library/Logs/freenet/freenet.error.log` necessarily contains
-/// `Library/Logs/freenet/freenet.log` as a substring of that path, so the
-/// one check covers both legacy fields.
+/// Both substrings are checked independently: the second is NOT a
+/// substring of the first (`.error.log` does not contain `.log` as a
+/// contiguous tail — the dot precedes `error`). A partially-migrated
+/// plist (stdout already `/dev/null` but stderr still legacy) must still
+/// be detected; round-3 review caught the regression from collapsing
+/// these into one check.
 ///
 /// Cross-platform-compiled (no `#[cfg(target_os = "macos")]`) so non-macOS
 /// CI runners can exercise the predicate per code-style.md / deployment.md
 /// preference for pure decision helpers.
 pub(super) fn launchd_plist_needs_regen(content: &str) -> bool {
     content.contains("Library/Logs/freenet/freenet.log")
+        || content.contains("Library/Logs/freenet/freenet.error.log")
 }
 
 #[cfg(target_os = "macos")]
@@ -1353,89 +1357,31 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
         }
         fs::write(&plist_path, plist_content).context("Failed to write updated plist")?;
 
-        // launchd caches the in-memory job from the plist contents at
-        // bootstrap time. Without bootout/bootstrap the new plist
-        // takes effect only on next login or reboot. Failures here are
-        // non-fatal: the next launchd-driven restart will still use
-        // the OLD config until reload, but the file is at least
-        // correct on disk.
-        reload_launchd_agent(&plist_path, quiet);
-
+        // No automatic launchctl reload: when auto-update is driven by
+        // the launchd-managed wrapper, `freenet update` runs as a child
+        // of the wrapper's job tree. Apple documents `launchctl bootout`
+        // as terminating the ENTIRE process tree of the agent — which
+        // would kill the in-flight `freenet update` mid-call before the
+        // subsequent `bootstrap` can run, silently failing in exactly
+        // the auto-update path this code exists to support. (Detached
+        // helpers race the bootout; `kickstart` does not re-read the
+        // plist.) The new plist therefore takes effect at the next
+        // user-driven reload or reboot. The wrapper-script rewrite
+        // (issue #4251) DOES take effect at the next wrapper iteration
+        // — that's where the dominant unbounded freenet.log growth was
+        // coming from. Once the OS reads the new plist, the smaller
+        // launchd-captured stdout/stderr also stops accumulating.
         if !quiet {
-            println!("launchd plist updated.");
+            println!(
+                "launchd plist updated. To apply immediately without rebooting, run:\n  \
+                 launchctl bootout gui/$(id -u) {plist}\n  \
+                 launchctl bootstrap gui/$(id -u) {plist}",
+                plist = plist_path.display()
+            );
         }
     }
 
     Ok(())
-}
-
-/// Reload the freenet launchd agent so the rewritten plist takes
-/// effect immediately. Uses the modern `bootout`/`bootstrap` interface
-/// scoped to the current user's GUI domain (`gui/<uid>`); falls back
-/// to the legacy `unload`/`load` pair on systems where `bootout`
-/// returns a non-zero status. Failures are surfaced as warnings, not
-/// errors — the rewritten plist is correct on disk regardless.
-#[cfg(target_os = "macos")]
-fn reload_launchd_agent(plist_path: &Path, quiet: bool) {
-    use std::process::Command;
-
-    // SAFETY: getuid() is async-signal-safe and has no failure mode.
-    let uid = unsafe { libc::getuid() };
-    let domain = format!("gui/{uid}");
-
-    // bootout is idempotent: returns 0 if the service was loaded and
-    // is now unloaded, non-zero if it wasn't loaded. Either is fine.
-    let _ = Command::new("launchctl")
-        .args(["bootout", &domain])
-        .arg(plist_path)
-        .status();
-
-    let bootstrap_status = Command::new("launchctl")
-        .args(["bootstrap", &domain])
-        .arg(plist_path)
-        .status();
-
-    match bootstrap_status {
-        Ok(s) if s.success() => {
-            if !quiet {
-                println!("Reloaded launchd agent ({}).", domain);
-            }
-        }
-        Ok(s) => {
-            // bootstrap failed. Try the legacy unload/load fallback.
-            let _ = Command::new("launchctl")
-                .args(["unload", "-w"])
-                .arg(plist_path)
-                .status();
-            let load_status = Command::new("launchctl")
-                .args(["load", "-w"])
-                .arg(plist_path)
-                .status();
-            match load_status {
-                Ok(s) if s.success() => {
-                    if !quiet {
-                        println!("Reloaded launchd agent via legacy load/unload.");
-                    }
-                }
-                _ => {
-                    if !quiet {
-                        eprintln!(
-                            "Warning: launchctl bootstrap (status: {s}) and load fallback both \
-                             failed; new plist takes effect on next user login or reboot."
-                        );
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            if !quiet {
-                eprintln!(
-                    "Warning: failed to invoke launchctl bootstrap: {e}; new plist takes \
-                     effect on next user login or reboot."
-                );
-            }
-        }
-    }
 }
 
 /// Migrate old-style Windows Task Scheduler entries to registry Run key,
@@ -1888,6 +1834,45 @@ StandardError=journal
         assert!(
             launchd_plist_needs_regen(legacy),
             "legacy plist must be detected as needing regen (#4251)"
+        );
+    }
+
+    #[test]
+    fn launchd_plist_with_stderr_only_legacy_path_still_needs_regen() {
+        // Regression for round-3 review: a partially-migrated plist
+        // (stdout already /dev/null, stderr still pointing at the
+        // legacy freenet.error.log) must still be detected. The
+        // single-substring shortcut for `freenet.log` was wrong
+        // because `.error.log` does NOT contain `.log` as a
+        // contiguous substring (`.` precedes `error`).
+        let partial = r#"<plist version="1.0"><dict>
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/u/Library/Logs/freenet/freenet.error.log</string>
+</dict></plist>"#;
+        assert!(
+            launchd_plist_needs_regen(partial),
+            "plist with legacy stderr-only path must still need regen (round-3 review)"
+        );
+    }
+
+    /// Round-3 review L2: assert the freshly-generated plist template
+    /// does NOT contain the legacy-path substrings, otherwise every
+    /// auto-update would loop rewriting it. Calls the real generator
+    /// with synthetic inputs so a future edit to `generate_plist` that
+    /// accidentally adds the legacy path is caught at test time.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn freshly_generated_plist_does_not_trigger_regen_loop() {
+        use std::path::PathBuf;
+        let wrapper = PathBuf::from("/Users/test/.local/bin/freenet-service-wrapper.sh");
+        let log_dir = PathBuf::from("/Users/test/Library/Logs/freenet");
+        let generated = super::super::service::generate_plist(&wrapper, &log_dir);
+        assert!(
+            !launchd_plist_needs_regen(&generated),
+            "freshly-generated plist must not match the legacy-path predicate \
+             — otherwise every auto-update would loop rewriting it.\n\nGenerated:\n{generated}"
         );
     }
 
