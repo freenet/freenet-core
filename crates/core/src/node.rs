@@ -2208,6 +2208,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failed_to_get_contract_summary_logs_at_debug_pin_test() {
+        // Demoted from WARN to DEBUG: this site fires repeatedly when
+        // the executor queue is saturated for a hot contract (#4251).
+        // The actionable signal is the queue saturation itself, not
+        // the per-summary failure. Caught by rule-review on PR #4252.
+        assert_log_site_pin(
+            "Failed to get contract summary",
+            &["tracing::debug!"],
+            &["tracing::warn!", "tracing::info!"],
+        );
+    }
+
     // Hostname resolution tests
     #[tokio::test]
     async fn test_hostname_resolution_localhost() {
