@@ -218,7 +218,10 @@ async fn drive_client_put_inner(
     }
 
     impl RetryDriver for PutRetryDriver<'_> {
-        type Terminal = ContractKey;
+        // `(key, hop_count)`. `hop_count = None` for `LocalCompletion`
+        // (originator stored locally, no hops traversed); `Some(hop_count)`
+        // for `Stored` (wire-carried forward depth from the storer).
+        type Terminal = (ContractKey, Option<usize>);
 
         fn new_attempt_tx(&mut self) -> Transaction {
             Transaction::new::<PutMsg>()
@@ -244,11 +247,18 @@ async fn drive_client_put_inner(
             })
         }
 
-        fn classify(&mut self, reply: NetMessage) -> AttemptOutcome<ContractKey> {
+        fn classify(&mut self, reply: NetMessage) -> AttemptOutcome<Self::Terminal> {
             match classify_reply(&reply) {
-                ReplyClass::Stored { key } | ReplyClass::LocalCompletion { key } => {
-                    AttemptOutcome::Terminal(key)
+                ReplyClass::Stored { key, hop_count } => {
+                    AttemptOutcome::Terminal((key, Some(hop_count)))
                 }
+                // LocalCompletion = no remote hops traversed (originator
+                // is the storer). Forward depth is exactly 0 — emit it
+                // explicitly so local-only PUTs are distinguishable from
+                // "telemetry missing" in dashboards. Codex r2 review of
+                // #4248 flagged that mapping this to `None` leaked an
+                // unpopulated `PutSuccess` for a known-zero-depth path.
+                ReplyClass::LocalCompletion { key } => AttemptOutcome::Terminal((key, Some(0))),
                 ReplyClass::Unexpected => AttemptOutcome::Unexpected,
             }
         }
@@ -292,7 +302,7 @@ async fn drive_client_put_inner(
     let loop_result = drive_retry_loop(op_manager, client_tx, "put", &mut driver).await;
 
     match loop_result {
-        RetryLoopOutcome::Done(reply_key) => {
+        RetryLoopOutcome::Done((reply_key, wire_hop_count)) => {
             // Clean up the DashMap entry that process_message created.
             // Without this, the GC task finds a stale AwaitingResponse
             // entry and launches speculative retries on the completed op.
@@ -325,13 +335,22 @@ async fn drive_client_put_inner(
             );
 
             // Telemetry only — subscribe=false to avoid double-subscribe.
+            //
+            // `hop_count`: clamp the wire value to `ring.max_hops_to_live`
+            // for the same defence-in-depth reason `tracing.rs` clamps the
+            // implicit `PutSuccess` from `from_inbound_msg_v1` — a buggy or
+            // malicious peer must not be able to poison originator
+            // telemetry with `usize::MAX`. `None` is preserved for the
+            // `LocalCompletion` arm (no remote hops traversed).
+            let max_htl = op_manager.ring.max_hops_to_live;
+            let hop_count = wire_hop_count.map(|hc| hc.min(max_htl));
             super::finalize_put_at_originator(
                 op_manager,
                 client_tx,
                 reply_key,
                 PutFinalizationData {
                     sender: driver.current_target,
-                    hop_count: None,
+                    hop_count,
                     state_hash: None,
                     state_size: None,
                 },
@@ -368,13 +387,23 @@ async fn drive_client_put_inner(
 
 #[derive(Debug)]
 enum ReplyClass {
-    /// Remote peer accepted the PUT.
+    /// Remote peer accepted the PUT. `hop_count` is the forward-path
+    /// depth carried on the wire `PutMsg::Response`/`ResponseStreaming`.
+    /// Used by the originator's driver to populate
+    /// `PutFinalizationData.hop_count` so the explicit `PutSuccess`
+    /// event emitted from `finalize_put_at_originator` carries the
+    /// same value as the implicit one emitted from
+    /// `NetEventLog::from_inbound_msg_v1` — without this, the
+    /// originator's two `PutSuccess` events for the same tx would
+    /// disagree (one populated, one `None`).
     Stored {
         key: ContractKey,
+        hop_count: usize,
     },
     /// Local completion: process_message stored locally but found no
     /// next hop, so forward_pending_op_result_if_completed sent back
-    /// the original Request. The contract is stored at the originator.
+    /// the original Request. The contract is stored at the originator,
+    /// so no hops were traversed.
     LocalCompletion {
         key: ContractKey,
     },
@@ -383,9 +412,13 @@ enum ReplyClass {
 
 fn classify_reply(msg: &NetMessage) -> ReplyClass {
     match msg {
-        NetMessage::V1(NetMessageV1::Put(
-            PutMsg::Response { key, .. } | PutMsg::ResponseStreaming { key, .. },
-        )) => ReplyClass::Stored { key: *key },
+        NetMessage::V1(NetMessageV1::Put(PutMsg::Response { key, hop_count, .. }))
+        | NetMessage::V1(NetMessageV1::Put(PutMsg::ResponseStreaming { key, hop_count, .. })) => {
+            ReplyClass::Stored {
+                key: *key,
+                hop_count: *hop_count,
+            }
+        }
         // When process_message completes locally (no next hop), the
         // Request is echoed back via forward_pending_op_result_if_completed.
         NetMessage::V1(NetMessageV1::Put(PutMsg::Request {
@@ -820,12 +853,15 @@ where
                         "PUT relay: next hop has no socket address"
                     );
                     // No next hop — act as final destination.
+                    // This node IS the storer; hop_count = max_htl - htl_we_received.
+                    let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
                     return relay_put_finalize_local(
                         op_manager,
                         incoming_tx,
                         key,
                         merged_value,
                         upstream_addr,
+                        hop_count,
                     )
                     .await;
                 }
@@ -840,12 +876,15 @@ where
                 phase = "relay_put_complete",
                 "PUT relay: no next hop, finalizing at this node"
             );
+            // Same arm as above: this node IS the storer.
+            let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
             return relay_put_finalize_local(
                 op_manager,
                 incoming_tx,
                 key,
                 merged_value,
                 upstream_addr,
+                hop_count,
             )
             .await;
         }
@@ -1127,7 +1166,11 @@ where
     // future routing decisions are informed by relay-observed outcomes,
     // not just events from ops this node originated.
     match reply {
-        NetMessage::V1(NetMessageV1::Put(PutMsg::Response { key: reply_key, .. })) => {
+        NetMessage::V1(NetMessageV1::Put(PutMsg::Response {
+            key: reply_key,
+            hop_count: downstream_hop_count,
+            ..
+        })) => {
             tracing::info!(
                 tx = %incoming_tx,
                 contract = %reply_key,
@@ -1141,9 +1184,23 @@ where
                 crate::router::RouteOutcome::SuccessUntimed,
                 crate::node::network_status::OpType::Put,
             );
-            relay_put_send_response(op_manager, incoming_tx, reply_key, upstream_addr).await
+            // Preserve the storer-side hop_count so the originator sees the
+            // *forward* depth from Request to storer, not the depth from
+            // Request to this relay. Mirrors GET relay bubble-up.
+            relay_put_send_response(
+                op_manager,
+                incoming_tx,
+                reply_key,
+                upstream_addr,
+                downstream_hop_count,
+            )
+            .await
         }
-        NetMessage::V1(NetMessageV1::Put(PutMsg::ResponseStreaming { key: reply_key, .. })) => {
+        NetMessage::V1(NetMessageV1::Put(PutMsg::ResponseStreaming {
+            key: reply_key,
+            hop_count: downstream_hop_count,
+            ..
+        })) => {
             // Streaming response arrived from downstream. Slice A does
             // not relay-forward streaming payloads, so log and
             // synthesize a non-streaming Response upstream. This
@@ -1164,7 +1221,15 @@ where
                 crate::router::RouteOutcome::SuccessUntimed,
                 crate::node::network_status::OpType::Put,
             );
-            relay_put_send_response(op_manager, incoming_tx, reply_key, upstream_addr).await
+            // Downgrade still preserves the storer-side forward depth.
+            relay_put_send_response(
+                op_manager,
+                incoming_tx,
+                reply_key,
+                upstream_addr,
+                downstream_hop_count,
+            )
+            .await
         }
         other => {
             // Unexpected reply variant: unclear whether it's a local
@@ -1296,12 +1361,18 @@ async fn relay_put_store_locally(
 
 /// Finalize at this node when there's no next hop. Emits `put_success`
 /// telemetry and sends `PutMsg::Response` upstream.
+///
+/// `hop_count` is the forward-path depth this relay finalised at — for the
+/// non-originator-as-storer arm this is `max_htl - htl_we_received`. Caller
+/// computes it from the inbound `htl` so this helper stays oblivious to
+/// ring state and is mechanically easy to audit.
 async fn relay_put_finalize_local(
     op_manager: &OpManager,
     incoming_tx: Transaction,
     key: ContractKey,
     merged_value: WrappedState,
     upstream_addr: SocketAddr,
+    hop_count: usize,
 ) -> Result<(), OpError> {
     // Telemetry: non-originator target peer — emit put_success for
     // convergence checking (mirrors put.rs:798-811 non-originator arm).
@@ -1313,18 +1384,24 @@ async fn relay_put_finalize_local(
         &op_manager.ring,
         key,
         own_location,
-        None,
+        Some(hop_count),
         hash,
         size,
     ) {
         op_manager.ring.register_events(Either::Left(event)).await;
     }
 
-    relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await
+    relay_put_send_response(op_manager, incoming_tx, key, upstream_addr, hop_count).await
 }
 
 /// Send `PutMsg::Response` upstream (fire-and-forget: upstream relay
 /// awaits via its own `send_to_and_await`, no reply expected).
+///
+/// `hop_count` is the forward-path depth to embed in the Response. For a
+/// relay that finalised locally (this node IS the storer), pass
+/// `max_htl - incoming_htl`. For a relay bubbling a downstream Response
+/// upstream, pass the downstream's `hop_count` verbatim — relays do NOT
+/// increment on the return path.
 ///
 /// Originator-loopback case (`upstream_addr == own_addr`): when
 /// the relay driver runs on the originator's own node, the
@@ -1337,10 +1414,12 @@ async fn relay_put_send_response(
     incoming_tx: Transaction,
     key: ContractKey,
     upstream_addr: SocketAddr,
+    hop_count: usize,
 ) -> Result<(), OpError> {
     let msg = NetMessage::from(PutMsg::Response {
         id: incoming_tx,
         key,
+        hop_count,
     });
     let mut ctx = op_manager.op_ctx(incoming_tx);
     let own_addr = op_manager.ring.connection_manager.get_own_addr();
@@ -1836,7 +1915,18 @@ where
                     );
                 }
                 op_manager.release_pending_op_slot(incoming_tx).await;
-                return relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await;
+                // Best-effort upstream reply after downstream failure: this
+                // node IS the storer (contract was put locally in step 6),
+                // so hop_count = max_htl - htl_we_received.
+                let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+                return relay_put_send_response(
+                    op_manager,
+                    incoming_tx,
+                    key,
+                    upstream_addr,
+                    hop_count,
+                )
+                .await;
             }
             Err(_elapsed) => {
                 tracing::warn!(
@@ -1854,15 +1944,31 @@ where
                     );
                 }
                 op_manager.release_pending_op_slot(incoming_tx).await;
-                return relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await;
+                // Same as the channel-closed arm: this node stored locally
+                // in step 6 so we report our own forward depth.
+                let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+                return relay_put_send_response(
+                    op_manager,
+                    incoming_tx,
+                    key,
+                    upstream_addr,
+                    hop_count,
+                )
+                .await;
             }
         };
         op_manager.release_pending_op_slot(incoming_tx).await;
 
         match reply {
-            NetMessage::V1(NetMessageV1::Put(PutMsg::Response { key: reply_key, .. }))
+            NetMessage::V1(NetMessageV1::Put(PutMsg::Response {
+                key: reply_key,
+                hop_count: downstream_hop_count,
+                ..
+            }))
             | NetMessage::V1(NetMessageV1::Put(PutMsg::ResponseStreaming {
-                key: reply_key, ..
+                key: reply_key,
+                hop_count: downstream_hop_count,
+                ..
             })) => {
                 tracing::info!(
                     tx = %incoming_tx,
@@ -1879,7 +1985,15 @@ where
                         crate::node::network_status::OpType::Put,
                     );
                 }
-                relay_put_send_response(op_manager, incoming_tx, reply_key, upstream_addr).await
+                // Preserve downstream storer's forward depth.
+                relay_put_send_response(
+                    op_manager,
+                    incoming_tx,
+                    reply_key,
+                    upstream_addr,
+                    downstream_hop_count,
+                )
+                .await
             }
             other => {
                 // Unexpected reply variant: unclear attribution. Skip the
@@ -1891,13 +2005,26 @@ where
                     reply_variant = ?std::mem::discriminant(&other),
                     "PUT streaming relay: unexpected reply variant"
                 );
-                relay_put_send_response(op_manager, incoming_tx, key, upstream_addr).await
+                // Same as the error arms: this node stored locally.
+                let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+                relay_put_send_response(op_manager, incoming_tx, key, upstream_addr, hop_count)
+                    .await
             }
         }
     } else {
         // No next hop, streaming not appropriate, or register_waiter failed —
         // finalize locally and bubble Response upstream.
-        relay_put_finalize_local(op_manager, incoming_tx, key, merged_value, upstream_addr).await
+        // This node IS the storer; hop_count = max_htl - htl_we_received.
+        let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+        relay_put_finalize_local(
+            op_manager,
+            incoming_tx,
+            key,
+            merged_value,
+            upstream_addr,
+            hop_count,
+        )
+        .await
     }
 }
 
@@ -1919,7 +2046,11 @@ mod tests {
     fn classify_reply_response_is_stored() {
         let tx = dummy_tx();
         let key = dummy_key();
-        let msg = NetMessage::V1(NetMessageV1::Put(PutMsg::Response { id: tx, key }));
+        let msg = NetMessage::V1(NetMessageV1::Put(PutMsg::Response {
+            id: tx,
+            key,
+            hop_count: 0,
+        }));
         assert!(matches!(classify_reply(&msg), ReplyClass::Stored { .. }));
     }
 
@@ -1931,8 +2062,123 @@ mod tests {
             id: tx,
             key,
             continue_forwarding: false,
+            hop_count: 0,
         }));
         assert!(matches!(classify_reply(&msg), ReplyClass::Stored { .. }));
+    }
+
+    /// Regression pin: `classify_reply` MUST extract the wire-carried
+    /// `hop_count` from `Response`/`ResponseStreaming` and propagate it
+    /// (via the bubble-up call site immediately following the classifier)
+    /// into the upstream Response unchanged.  Mirrors the GET classifier
+    /// pin `classify_response_found_preserves_hop_count`.  Since
+    /// `ReplyClass::Stored` itself doesn't carry the hop_count
+    /// (the bubble-up grabs the field directly from the matched message),
+    /// this test pins the classifier *and* the matcher contract by
+    /// destructuring the message and asserting the field survives
+    /// classification — that is, classify_reply doesn't conditionally
+    /// reject Stored on hop_count = 0 or any other value.
+    #[test]
+    fn classify_reply_preserves_hop_count_for_stored() {
+        for hc in [0_usize, 1, 4, 10, 64] {
+            let tx = dummy_tx();
+            let key = dummy_key();
+            // Response variant
+            let msg = NetMessage::V1(NetMessageV1::Put(PutMsg::Response {
+                id: tx,
+                key,
+                hop_count: hc,
+            }));
+            // Stored variant must extract the wire hop_count into the
+            // classifier output — the originator driver uses this to
+            // populate `PutFinalizationData.hop_count`. A regression that
+            // re-introduced `Stored { key }` without the field would
+            // silently revert PutSuccess from `finalize_put_at_originator`
+            // back to `None` (codex review of #4248).
+            match classify_reply(&msg) {
+                ReplyClass::Stored {
+                    key: got_key,
+                    hop_count: got_hc,
+                } => {
+                    assert_eq!(got_key, key, "Stored.key preserved");
+                    assert_eq!(got_hc, hc, "Stored.hop_count preserved ({hc})");
+                }
+                other @ (ReplyClass::LocalCompletion { .. } | ReplyClass::Unexpected) => {
+                    panic!("expected Stored, got {other:?} for hc={hc}")
+                }
+            }
+
+            // ResponseStreaming variant
+            let msg = NetMessage::V1(NetMessageV1::Put(PutMsg::ResponseStreaming {
+                id: tx,
+                key,
+                continue_forwarding: false,
+                hop_count: hc,
+            }));
+            match classify_reply(&msg) {
+                ReplyClass::Stored {
+                    key: got_key,
+                    hop_count: got_hc,
+                } => {
+                    assert_eq!(got_key, key, "ResponseStreaming Stored.key preserved");
+                    assert_eq!(
+                        got_hc, hc,
+                        "ResponseStreaming Stored.hop_count preserved ({hc})"
+                    );
+                }
+                other @ (ReplyClass::LocalCompletion { .. } | ReplyClass::Unexpected) => {
+                    panic!("expected Stored, got {other:?} for hc={hc}")
+                }
+            }
+        }
+    }
+
+    /// Regression pin: the client-PUT driver's `RetryLoopOutcome::Done`
+    /// branch MUST pass the wire-carried `hop_count` into
+    /// `PutFinalizationData` (clamped to `max_hops_to_live`). Without
+    /// this, the originator emits TWO `PutSuccess` events per tx: the
+    /// implicit one from `from_inbound_msg_v1` (populated) and the
+    /// explicit one from `finalize_put_at_originator` (`None`) — exactly
+    /// the inconsistency codex flagged on the first review pass of
+    /// #4248. Scrapes the source so a regression that re-introduces
+    /// `hop_count: None,` literal in the PutFinalizationData
+    /// construction trips immediately.
+    #[test]
+    fn finalize_put_at_originator_uses_wire_hop_count() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        // Anchor: the `RetryLoopOutcome::Done` match arm in
+        // `start_client_put`. Scan forward to the next
+        // `finalize_put_at_originator(` call and verify the field shape.
+        let done_arm = SOURCE
+            .find("RetryLoopOutcome::Done((reply_key, wire_hop_count))")
+            .expect(
+                "RetryLoopOutcome::Done destructure not found — \
+                 if you've refactored to use named struct destructuring \
+                 update this anchor but keep the wire_hop_count threading",
+            );
+        let finalize_call = SOURCE[done_arm..]
+            .find("finalize_put_at_originator(")
+            .expect("no finalize_put_at_originator call in Done arm");
+        let region = &SOURCE[done_arm..done_arm + finalize_call + 500];
+        // The construction MUST NOT hard-code `hop_count: None,`. It must
+        // pass `hop_count` computed from `wire_hop_count`.
+        assert!(
+            !region.contains("hop_count: None,"),
+            "PutFinalizationData construction in start_client_put's \
+             Done arm must NOT hard-code hop_count: None — that emits a \
+             PutSuccess with hop_count=None alongside the populated one \
+             from from_inbound_msg_v1, defeating #4248"
+        );
+        assert!(
+            region.contains("hop_count,"),
+            "PutFinalizationData construction in start_client_put's \
+             Done arm must pass hop_count from the wire value"
+        );
+        assert!(
+            region.contains("wire_hop_count.map"),
+            "wire_hop_count must be mapped (e.g. clamp via .min(max_htl)) \
+             before being passed into PutFinalizationData"
+        );
     }
 
     #[test]
@@ -2122,17 +2368,18 @@ mod tests {
         // Verify that RetryLoopOutcome::Exhausted maps to a client-visible
         // OperationError, not a silent drop or infrastructure error.
         let cause = "PUT to contract failed after 3 attempts".to_string();
-        let outcome: DriverOutcome = match RetryLoopOutcome::<ContractKey>::Exhausted(cause) {
-            RetryLoopOutcome::Exhausted(cause) => {
-                DriverOutcome::Publish(Err(ErrorKind::OperationError {
-                    cause: cause.into(),
+        let outcome: DriverOutcome =
+            match RetryLoopOutcome::<(ContractKey, Option<usize>)>::Exhausted(cause) {
+                RetryLoopOutcome::Exhausted(cause) => {
+                    DriverOutcome::Publish(Err(ErrorKind::OperationError {
+                        cause: cause.into(),
+                    }
+                    .into()))
                 }
-                .into()))
-            }
-            RetryLoopOutcome::Done(_)
-            | RetryLoopOutcome::Unexpected
-            | RetryLoopOutcome::InfraError(_) => unreachable!(),
-        };
+                RetryLoopOutcome::Done(_)
+                | RetryLoopOutcome::Unexpected
+                | RetryLoopOutcome::InfraError(_) => unreachable!(),
+            };
         assert!(
             matches!(outcome, DriverOutcome::Publish(Err(_))),
             "Exhaustion must produce a client error, not be swallowed"
@@ -2891,10 +3138,11 @@ mod tests {
         let pos = b
             .find("downstream reply timed out")
             .expect("timeout arm not found");
-        // Window widened from 400 → 800 bytes to accommodate the
+        // Window widened from 400 → 800 → 1200 bytes to accommodate the
         // record_relay_route_event hook inserted between the timeout
-        // log and the bubble-Response call.
-        let arm = &b[pos..pos + 800.min(b.len() - pos)];
+        // log and the bubble-Response call, plus the multi-line
+        // hop_count computation + multi-line call site added in #4248.
+        let arm = &b[pos..pos + 1200.min(b.len() - pos)];
         assert!(
             arm.contains("relay_put_send_response"),
             "timeout arm must still call relay_put_send_response so the \

@@ -392,3 +392,75 @@ fn subscribe_forwarding_ack_serde_roundtrip() {
         }
     }
 }
+
+/// Regression test: `SubscribeMsg::Response.hop_count` roundtrips through
+/// bincode for both `Subscribed` and `NotFound` result variants.
+///
+/// Before #4248 the SUBSCRIBE telemetry path emitted `hop_count: None` at
+/// every terminal SUBSCRIBE event (`SubscribeSuccess`, `SubscribeNotFound`)
+/// because no value was being threaded through the wire.  The fix carries
+/// the field on `SubscribeMsg::Response` so the originator has it when
+/// constructing the log event.  This test asserts that the new field
+/// survives round-trip serialisation for both result variants — i.e., the
+/// wire format actually carries it.
+///
+/// bincode-positional caveat: any future positional change here will
+/// break older binaries; see the `MIN_COMPATIBLE_VERSION` bump that
+/// accompanies this PR.
+#[test]
+fn test_subscribe_msg_response_hop_count_roundtrip() {
+    use freenet_stdlib::prelude::{CodeHash, ContractKey};
+    let key =
+        ContractKey::from_id_and_code(ContractInstanceId::new([7u8; 32]), CodeHash::new([8u8; 32]));
+    let instance_id = *key.id();
+    let cases: &[(&str, usize)] = &[
+        ("zero", 0),
+        ("one", 1),
+        ("mid", 4),
+        ("htl", 10),
+        ("large", 64),
+    ];
+    for (label, hop_count) in cases.iter().copied() {
+        // Subscribed variant
+        let subscribed = SubscribeMsg::Response {
+            id: Transaction::new::<SubscribeMsg>(),
+            instance_id,
+            result: SubscribeMsgResult::Subscribed { key },
+            hop_count,
+        };
+        let bytes = bincode::serialize(&subscribed).expect(label);
+        let restored: SubscribeMsg = bincode::deserialize(&bytes).expect(label);
+        match restored {
+            SubscribeMsg::Response { hop_count: hc, .. } => assert_eq!(
+                hc, hop_count,
+                "Subscribed Response.hop_count must roundtrip ({label})"
+            ),
+            SubscribeMsg::Request { .. }
+            | SubscribeMsg::Unsubscribe { .. }
+            | SubscribeMsg::ForwardingAck { .. } => {
+                panic!("expected Response for {label}")
+            }
+        }
+
+        // NotFound variant
+        let notfound = SubscribeMsg::Response {
+            id: Transaction::new::<SubscribeMsg>(),
+            instance_id,
+            result: SubscribeMsgResult::NotFound,
+            hop_count,
+        };
+        let bytes = bincode::serialize(&notfound).expect(label);
+        let restored: SubscribeMsg = bincode::deserialize(&bytes).expect(label);
+        match restored {
+            SubscribeMsg::Response { hop_count: hc, .. } => assert_eq!(
+                hc, hop_count,
+                "NotFound Response.hop_count must roundtrip ({label})"
+            ),
+            SubscribeMsg::Request { .. }
+            | SubscribeMsg::Unsubscribe { .. }
+            | SubscribeMsg::ForwardingAck { .. } => {
+                panic!("expected Response for {label}")
+            }
+        }
+    }
+}

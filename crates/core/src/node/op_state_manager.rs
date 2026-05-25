@@ -608,20 +608,6 @@ impl OpManager {
         None
     }
 
-    /// Get the current hop count (remaining HTL) for an operation.
-    /// Always returns `None` — no live op reports a hop here.
-    ///
-    /// Currently called only by the PUT tracing path at
-    /// `crates/core/src/tracing.rs:1271`.  The corresponding GET path
-    /// was migrated to a wire-carried `hop_count` field on
-    /// `GetMsg::Response` in PR #4245 (this method returned `None` on
-    /// ~99% of GETs because op_manager had cleaned up the op by the
-    /// time the response was logged).  PUT / UPDATE / SUBSCRIBE are
-    /// expected to follow.
-    pub fn get_current_hop(&self, _id: &Transaction) -> Option<usize> {
-        None
-    }
-
     /// Emit a `NodeEvent::TransactionCompleted(tx)` to the event loop,
     /// triggering cleanup of any `pending_op_results` entry keyed by `tx`.
     ///
