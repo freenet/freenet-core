@@ -440,10 +440,10 @@ mod tests {
     fn test_get_msg_response_hop_count_roundtrip() {
         let key = make_contract_key(7);
         let cases: &[(&str, usize)] = &[
-            ("zero",  0),
-            ("one",   1),
-            ("mid",   4),
-            ("htl",   10),
+            ("zero", 0),
+            ("one", 1),
+            ("mid", 4),
+            ("htl", 10),
             ("large", 64),
         ];
         for (label, hop_count) in cases.iter().copied() {
@@ -463,10 +463,9 @@ mod tests {
             let bytes = bincode::serialize(&found).expect(label);
             let restored: GetMsg = bincode::deserialize(&bytes).expect(label);
             match restored {
-                GetMsg::Response { hop_count: hc, .. } => assert_eq!(
-                    hc, hop_count,
-                    "Found.hop_count must roundtrip ({label})"
-                ),
+                GetMsg::Response { hop_count: hc, .. } => {
+                    assert_eq!(hc, hop_count, "Found.hop_count must roundtrip ({label})")
+                }
                 _ => panic!("expected Response for {label}"),
             }
 
@@ -480,10 +479,9 @@ mod tests {
             let bytes = bincode::serialize(&notfound).expect(label);
             let restored: GetMsg = bincode::deserialize(&bytes).expect(label);
             match restored {
-                GetMsg::Response { hop_count: hc, .. } => assert_eq!(
-                    hc, hop_count,
-                    "NotFound.hop_count must roundtrip ({label})"
-                ),
+                GetMsg::Response { hop_count: hc, .. } => {
+                    assert_eq!(hc, hop_count, "NotFound.hop_count must roundtrip ({label})")
+                }
                 _ => panic!("expected Response for {label}"),
             }
         }
