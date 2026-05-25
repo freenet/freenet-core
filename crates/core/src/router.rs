@@ -540,8 +540,18 @@ impl Router {
             .collect();
 
         GlobalRng::shuffle(&mut peer_distances);
+
+        // Partial sort: find the k closest peers in O(n), then sort only
+        // those k elements. This avoids O(n log n) when n ≫ k.
+        // select_nth_unstable_by(0, ...) is valid and puts the minimum at
+        // index 0 — the k>0 guard only excludes the degenerate k=0 case.
+        // See PR #4247 review: https://github.com/freenet/freenet-core/pull/4247
+        let k = self.consider_n_closest_peers.min(peer_distances.len());
+        if k > 0 && k < peer_distances.len() {
+            peer_distances.select_nth_unstable_by(k - 1, |a, b| a.1.cmp(&b.1));
+        }
+        peer_distances.truncate(k);
         peer_distances.sort_by_key(|&(_, distance)| distance);
-        peer_distances.truncate(self.consider_n_closest_peers);
         peer_distances.into_iter().map(|(peer, _)| peer).collect()
     }
 
