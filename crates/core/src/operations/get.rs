@@ -422,6 +422,73 @@ mod tests {
         }
     }
 
+    /// Regression test: GetMsg::Response.hop_count roundtrips through bincode.
+    ///
+    /// Before this fix `hop_count` was computed at log time via
+    /// `op_manager.get_current_hop(id)`, which returned `None` once the
+    /// operation had been cleaned up — i.e., on the vast majority of
+    /// terminal GET events.  The fix carries the value on the wire so the
+    /// originator has it when constructing log events.  This test asserts
+    /// that the new field survives round-trip serialisation for both
+    /// `Found` and `NotFound` variants of `GetMsg::Response` — i.e., the
+    /// wire format actually carries it.
+    ///
+    /// bincode-positional caveat: any future positional change here will
+    /// break older binaries; see the MIN_COMPATIBLE_VERSION bump that
+    /// accompanies this PR.
+    #[test]
+    fn test_get_msg_response_hop_count_roundtrip() {
+        let key = make_contract_key(7);
+        let cases: &[(&str, usize)] = &[
+            ("zero",  0),
+            ("one",   1),
+            ("mid",   4),
+            ("htl",   10),
+            ("large", 64),
+        ];
+        for (label, hop_count) in cases.iter().copied() {
+            // Found variant
+            let found = GetMsg::Response {
+                id: Transaction::new::<GetMsg>(),
+                instance_id: *key.id(),
+                result: GetMsgResult::Found {
+                    key,
+                    value: StoreResponse {
+                        state: Some(WrappedState::new(vec![hop_count as u8])),
+                        contract: None,
+                    },
+                },
+                hop_count,
+            };
+            let bytes = bincode::serialize(&found).expect(label);
+            let restored: GetMsg = bincode::deserialize(&bytes).expect(label);
+            match restored {
+                GetMsg::Response { hop_count: hc, .. } => assert_eq!(
+                    hc, hop_count,
+                    "Found.hop_count must roundtrip ({label})"
+                ),
+                _ => panic!("expected Response for {label}"),
+            }
+
+            // NotFound variant
+            let notfound = GetMsg::Response {
+                id: Transaction::new::<GetMsg>(),
+                instance_id: *key.id(),
+                result: GetMsgResult::NotFound,
+                hop_count,
+            };
+            let bytes = bincode::serialize(&notfound).expect(label);
+            let restored: GetMsg = bincode::deserialize(&bytes).expect(label);
+            match restored {
+                GetMsg::Response { hop_count: hc, .. } => assert_eq!(
+                    hc, hop_count,
+                    "NotFound.hop_count must roundtrip ({label})"
+                ),
+                _ => panic!("expected Response for {label}"),
+            }
+        }
+    }
+
     /// Round-trip serialization: subscribe field is preserved through bincode.
     /// Note: bincode uses positional encoding, so #[serde(default)] does NOT
     /// provide backward compat with older binaries missing the field. Wire
