@@ -540,8 +540,16 @@ impl Router {
             .collect();
 
         GlobalRng::shuffle(&mut peer_distances);
+
+        // Partial sort: find the k closest peers in O(n), then sort only
+        // those k elements. This avoids O(n log n) when n ≫ k.
+        let k = self.consider_n_closest_peers.min(peer_distances.len());
+        let k_sat = k.saturating_sub(1);
+        if k_sat > 0 && k_sat < peer_distances.len() - 1 {
+            peer_distances.select_nth_unstable_by(k_sat, |a, b| a.1.cmp(&b.1));
+        }
+        peer_distances.truncate(k);
         peer_distances.sort_by_key(|&(_, distance)| distance);
-        peer_distances.truncate(self.consider_n_closest_peers);
         peer_distances.into_iter().map(|(peer, _)| peer).collect()
     }
 

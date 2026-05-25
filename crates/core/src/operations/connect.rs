@@ -845,8 +845,8 @@ impl RelayContext for RelayEnv<'_> {
             .self_location
             .location()
             .map(|loc| loc.distance(desired_location));
-        let mut scored: Vec<(f64, PeerKeyLocation)> = Vec::new();
-        let mut fallbacks: Vec<PeerKeyLocation> = Vec::new();
+        let mut scored: Vec<(f64, PeerKeyLocation)> = Vec::with_capacity(candidates.len());
+        let mut fallbacks: Vec<PeerKeyLocation> = Vec::with_capacity(candidates.len());
 
         let conn_mgr = &self.op_manager.ring.connection_manager;
 
@@ -1106,7 +1106,7 @@ impl ConnectOp {
     }
 
     pub(crate) fn expire_forward_attempts(&mut self, now: Instant) {
-        let mut expired = Vec::new();
+        let mut expired = Vec::with_capacity(self.forward_attempts.len());
         for (peer, attempt) in self.forward_attempts.iter() {
             if now.duration_since(attempt.sent_at) >= FORWARD_ATTEMPT_TIMEOUT {
                 expired.push((peer.clone(), attempt.desired));
