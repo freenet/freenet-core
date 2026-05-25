@@ -1044,10 +1044,15 @@ where
                     limit = MAX_QUEUED_OPS_PER_CONTRACT,
                     "Contract initialization queue full, rejecting operation"
                 );
-                return Err(ExecutorError::request(StdContractError::Update {
-                    key,
-                    cause: "contract initialization queue is full, try again later".into(),
-                }));
+                // Use the typed `ContractQueueFull` marker so the same
+                // amplification suppression and DEBUG log severity that
+                // the per-contract fair queue gets via
+                // `send_queue_full_response` also applies here. Without
+                // the typed marker, an init-queue-full looks like a
+                // generic StdContractError::Update to callers and
+                // re-enters the `try_auto_fetch_contract` /
+                // `ResyncRequest` paths. Issue #4251.
+                return Err(ExecutorError::other(super::ContractQueueFull));
             }
             InitCheckResult::Queued { queue_size } => {
                 tracing::info!(
