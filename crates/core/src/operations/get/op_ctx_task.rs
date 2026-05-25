@@ -2486,6 +2486,43 @@ mod tests {
         ));
     }
 
+    /// Regression pin: `classify` MUST extract the wire-carried hop_count
+    /// from `Response{Found}` and propagate it into `Terminal::InlineFound`
+    /// unchanged.  The relay bubble-up at line 2355 uses this field as the
+    /// hop_count for the upstream Response; a regression that synthesised 0
+    /// here (or dropped the field) would silently collapse the storer's
+    /// forward-path depth at every relay, defeating the whole PR.  The
+    /// bincode-roundtrip unit test in `get.rs` catches the wire format only.
+    /// This pins the classifier side.
+    #[test]
+    fn classify_response_found_preserves_hop_count() {
+        for hc in [0_usize, 1, 4, 10, 64] {
+            let tx = dummy_tx();
+            let key = dummy_key();
+            let msg = NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
+                id: tx,
+                instance_id: *key.id(),
+                result: GetMsgResult::Found {
+                    key,
+                    value: StoreResponse {
+                        state: Some(WrappedState::new(vec![1u8])),
+                        contract: None,
+                    },
+                },
+                hop_count: hc,
+            }));
+            match classify(msg) {
+                AttemptOutcome::Terminal(Terminal::InlineFound { hop_count, .. }) => {
+                    assert_eq!(
+                        hop_count, hc,
+                        "classifier must preserve hop_count={hc} unchanged"
+                    );
+                }
+                _ => panic!("expected Terminal(InlineFound) for hop_count={hc}"),
+            }
+        }
+    }
+
     #[test]
     fn classify_response_notfound_is_retry() {
         let tx = dummy_tx();

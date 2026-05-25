@@ -1308,12 +1308,15 @@ impl<'a> NetEventLog<'a> {
                 let this_peer = op_manager.ring.connection_manager.own_location();
                 // hop_count is carried on the wire Response: set by the storer
                 // (max_htl - htl_at_storer) and preserved by relays bubbling up.
+                // Clamp to ring.max_hops_to_live so a malicious or buggy peer
+                // sending hop_count = usize::MAX can't pollute telemetry.
+                let max_htl = op_manager.ring.max_hops_to_live;
                 EventKind::Get(GetEvent::GetSuccess {
                     id: *id,
                     requester: this_peer.clone(),
                     target: this_peer,
                     key: *key,
-                    hop_count: Some(*hop_count),
+                    hop_count: Some((*hop_count).min(max_htl)),
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                     state_hash: None, // Hash not available from message
@@ -1329,12 +1332,23 @@ impl<'a> NetEventLog<'a> {
                 // hop_count is carried on the wire Response (same semantics
                 // as GetSuccess: forward-path depth from originator to the
                 // node that produced the NotFound).
+                //
+                // Caveat for NotFound interpretation: the value is the
+                // forward depth of *the relay that produced the NotFound*,
+                // which is the deepest peer the request reached before
+                // exhaustion / store-miss.  For analytics, treat NotFound
+                // hop_count as "exhaustion depth", not "path depth to the
+                // contract location" — there is no storer.
+                //
+                // Same clamp as GetSuccess: bound by max_hops_to_live to
+                // guard against malicious or buggy peer values.
+                let max_htl = op_manager.ring.max_hops_to_live;
                 EventKind::Get(GetEvent::GetNotFound {
                     id: *id,
                     requester: this_peer.clone(),
                     instance_id: *instance_id,
                     target: this_peer,
-                    hop_count: Some(*hop_count),
+                    hop_count: Some((*hop_count).min(max_htl)),
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
