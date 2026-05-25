@@ -142,12 +142,11 @@ impl OpError {
         matches!(self, Self::ExecutorError(e) if e.is_invalid_update_rejection())
     }
 
-    /// Returns true if the underlying error is the typed
-    /// `ContractQueueFull` marker (per-contract executor queue at capacity).
-    /// Callers MUST gate amplification side effects (auto-fetch,
-    /// ResyncRequest, ERROR logs) on this predicate so a saturated contract
-    /// queue doesn't induce network-wide storms. See
-    /// `ExecutorError::is_contract_queue_full` and issue #4251.
+    /// Returns true for the typed `ContractQueueFull` marker. Callers MUST
+    /// gate amplification side effects (auto-fetch, ResyncRequest, ERROR
+    /// logs) on this predicate so a saturated contract queue doesn't induce
+    /// network-wide storms. See `ExecutorError::is_contract_queue_full` and
+    /// issue #4251.
     pub fn is_contract_queue_full(&self) -> bool {
         matches!(self, Self::ExecutorError(e) if e.is_contract_queue_full())
     }

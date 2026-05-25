@@ -340,11 +340,9 @@ fn log_update_contract_failure(key: &ContractKey, err: &ExecutorError) {
             "Update rejected by contract: incoming state invalid (likely stale rebroadcast), keeping local"
         );
     } else if err.is_contract_queue_full() {
-        // Issue #4251: per-contract queue saturation is transient
-        // platform backpressure, not an operator-actionable failure.
-        // On a hot contract this fires hundreds of times per second
-        // — keep the log at DEBUG so disks don't fill and so real
-        // failures stay visible at ERROR.
+        // Issue #4251: transient backpressure, not operator-actionable. A
+        // hot contract fires this hundreds of times/sec — DEBUG keeps real
+        // failures visible at ERROR.
         tracing::debug!(
             contract = %key,
             error = %err,
@@ -400,10 +398,8 @@ pub(crate) fn log_broadcast_to_streaming_failure(
             "BroadcastToStreaming merge rejected: incoming state invalid (likely stale rebroadcast), keeping local"
         );
     } else if err.is_contract_queue_full() {
-        // Issue #4251: queue-full is transient platform backpressure,
-        // not a contract failure. Keep the log at DEBUG so a hot
-        // contract doesn't drown operators in scary WARNs, and (via
-        // the return value below) skip the spurious auto-fetch GET.
+        // Issue #4251: transient backpressure. DEBUG (not WARN), and (via the
+        // return value) skip the spurious auto-fetch GET.
         tracing::debug!(
             tx = %tx,
             %key,
@@ -419,12 +415,10 @@ pub(crate) fn log_broadcast_to_streaming_failure(
             "BroadcastToStreaming update skipped: contract not ready locally"
         );
     }
-    // Trigger self-heal GET only when the contract is genuinely missing.
-    // Skip when the WASM merge ran and rejected the update (pre-#3914
-    // semantics) AND when the queue was simply saturated (#4251) — in
-    // both cases the contract code is present locally, and enqueuing a
-    // GET right back onto the saturated handler only amplifies the
-    // storm.
+    // Self-heal GET only when the contract is genuinely missing. Skip when
+    // the WASM merge ran (pre-#3914) or when the queue was saturated (#4251)
+    // — in both cases the contract code is present, and enqueuing a GET on
+    // a saturated handler only amplifies the storm.
     !err.is_contract_exec_rejection() && !err.is_contract_queue_full()
 }
 
@@ -981,9 +975,7 @@ mod tests {
         }
 
         fn queue_full_failure() -> ExecutorError {
-            // Mirrors what `send_queue_full_response` (contract.rs) produces
-            // when the per-contract fair queue rejects an event. The typed
-            // marker is what powers `ExecutorError::is_contract_queue_full`.
+            // Mirrors `send_queue_full_response` (contract.rs).
             ExecutorError::other(crate::contract::ContractQueueFull)
         }
 

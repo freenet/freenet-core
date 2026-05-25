@@ -762,12 +762,8 @@ async fn send_queue_full_response(
         event = %rejected.event,
         "Rejected event due to per-contract queue capacity limit"
     );
-    // Use the typed `ContractQueueFull` marker so callers can distinguish
-    // queue saturation from real executor failures via
-    // `ExecutorError::is_contract_queue_full`. This is what suppresses the
-    // auto-fetch / ResyncRequest amplification in the UPDATE relay drivers
-    // (op_ctx_task.rs) when a single contract is saturating its own queue.
-    // See issue #4251.
+    // Typed `ContractQueueFull` marker powers `is_contract_queue_full` at
+    // every caller; the UPDATE relay drivers gate amplification on it. #4251.
     let make_err = || ExecutorError::other(ContractQueueFull);
     let response = match &rejected.event {
         ContractHandlerEvent::PutQuery { .. } => ContractHandlerEvent::PutResponse {
@@ -1846,11 +1842,9 @@ mod tests {
                      re-enabled the auto-fetch / ResyncRequest amplification storm — see \
                      issue #4251."
                 );
-                // The other predicates must NOT also match, otherwise the
-                // gating in op_ctx_task.rs becomes ambiguous.
-                assert!(!err.is_contract_exec_rejection());
-                assert!(!err.is_invalid_update_rejection());
-                assert!(!err.is_missing_contract_parameters());
+                // Disjointness from other predicates is covered by
+                // `test_contract_queue_full_disjoint_from_other_predicates`
+                // in executor.rs.
             }
             other => panic!("expected UpdateResponse, got {other}"),
         }

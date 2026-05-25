@@ -99,17 +99,13 @@ pub(crate) use init_tracker::{
 };
 pub(crate) use runtime::RuntimePool;
 
-/// Marker error returned by `send_queue_full_response` when the
-/// per-contract fair queue rejects an event because the contract's
-/// queue (or the global queue) has reached capacity.
+/// Typed marker for queue-full errors so callers can downcast and
+/// distinguish transient per-contract queue saturation from real
+/// executor failures (OOG, traps, missing parameters, storage errors).
 ///
-/// Wrapping this in `ExecutorError::other(ContractQueueFull)` instead
-/// of an opaque `anyhow::anyhow!("contract queue full...")` lets
-/// callers distinguish queue saturation from real executor failures
-/// (OOG, traps, missing parameters, storage errors). Queue-full is a
-/// transient platform-level condition — not a contract-level fault —
-/// so callers should avoid amplification (auto-fetch, ResyncRequest)
-/// and ERROR-level logging on this path. See issue #4251.
+/// Constructed by `send_queue_full_response`; recognized by
+/// `ExecutorError::is_contract_queue_full` (see that predicate for the
+/// platform-resilience invariant it enforces). Issue #4251.
 #[derive(Debug, Clone, Copy)]
 pub struct ContractQueueFull;
 
@@ -293,31 +289,16 @@ impl ExecutorError {
         }
     }
 
-    /// Returns true if this error was produced by the per-contract fair
-    /// queue rejecting an event because the queue is at capacity (see
-    /// `send_queue_full_response` in `contract.rs` and `ContractQueueFull`
-    /// above).
+    /// Returns true if this error is the typed `ContractQueueFull` marker
+    /// from `send_queue_full_response` (per-contract fair queue at capacity).
     ///
-    /// Queue-full is a transient platform-level backpressure signal — not
-    /// a contract-level fault, not a missing-contract condition, not a
-    /// WASM execution failure. Callers MUST use this predicate to suppress
-    /// amplification side effects that only make sense for real failures:
-    ///
-    /// - The UPDATE full-state relay path must NOT trigger
-    ///   `try_auto_fetch_contract` (the contract code is present; the
-    ///   queue is just busy).
-    /// - The UPDATE delta relay path must NOT emit `ResyncRequest`
-    ///   (asking the sender for full-state resends makes the storm
-    ///   worse).
-    /// - Originator-side error logging should drop from ERROR to DEBUG
-    ///   (a temporarily-saturated executor is not an operator-actionable
-    ///   alert; the volume on a hot contract can be enormous).
-    ///
-    /// Without this predicate, a single buggy / abusive / merely-popular
-    /// contract that saturates its own queue would induce the local peer
-    /// to fire auto-fetch GET storms and ResyncRequest broadcasts that
-    /// amplify the saturation onto every other peer subscribed to the
-    /// contract — see issue #4251.
+    /// **Platform-resilience invariant**: queue-full is transient
+    /// backpressure, not a contract-level fault, missing-contract condition,
+    /// or WASM failure. Callers MUST gate amplification side effects on this
+    /// predicate — auto-fetch GETs (the contract code is present), ResyncRequest
+    /// broadcasts (the merge never ran), and ERROR-level logging (volume on a
+    /// hot contract drowns real failures). Without it, a single saturated
+    /// contract induces a network-wide storm. See issue #4251.
     pub fn is_contract_queue_full(&self) -> bool {
         match &self.inner {
             Either::Left(_) => false,
@@ -1016,10 +997,8 @@ mod tests {
 
         // ── ContractQueueFull predicate (issue #4251) ─────────────────────
         //
-        // The queue-full marker must be cleanly distinguishable from every
-        // other error class so callers can suppress amplification side
-        // effects (auto-fetch, ResyncRequest, ERROR logs) specifically for
-        // this case without paying for them on real failures.
+        // The marker must be cleanly distinguishable from every other error
+        // class so amplification suppression fires only on queue-full.
 
         #[test]
         fn test_contract_queue_full_true_for_marker_error() {
@@ -1034,11 +1013,8 @@ mod tests {
 
         #[test]
         fn test_contract_queue_full_false_for_anyhow_string_lookalike() {
-            // Regression: an opaque anyhow error whose message happens to
-            // contain "contract queue full" must NOT satisfy the predicate.
-            // The predicate is typed (downcast), not string-matched, so a
-            // future caller that produces a similarly-worded error doesn't
-            // accidentally inherit queue-full semantics.
+            // Predicate is typed (downcast), not string-matched: a similarly-
+            // worded anyhow error must not inherit queue-full semantics.
             let err = ExecutorError::other(anyhow::anyhow!("contract queue full, try again later"));
             assert!(
                 !err.is_contract_queue_full(),
@@ -1074,10 +1050,8 @@ mod tests {
 
         #[test]
         fn test_contract_queue_full_disjoint_from_other_predicates() {
-            // Ensures the new predicate doesn't collide with the existing
-            // predicates' truth values for the queue-full case. This is the
-            // load-bearing property used in op_ctx_task.rs:1064/1107 to
-            // suppress amplification.
+            // Load-bearing property used by the gating in op_ctx_task.rs:
+            // the queue-full marker must trip its own predicate and no other.
             let err = ExecutorError::other(ContractQueueFull);
             assert!(err.is_contract_queue_full());
             assert!(!err.is_request());
