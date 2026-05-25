@@ -2575,10 +2575,19 @@ SuccessExitStatus=42 43
 # Do NOT restart — the existing instance is healthy.
 RestartPreventExitStatus=43
 
-# Logging - write to files for systems without active user journald
-# (headless servers, systems without lingering enabled, etc.)
-StandardOutput=append:{log_dir}/freenet.log
-StandardError=append:{log_dir}/freenet.error.log
+# Logging
+# - The node's tracing layer writes its own size-capped, hourly-rotated
+#   logs to {log_dir}/freenet.YYYY-MM-DD-HH.log (LOG_RETENTION_HOURS +
+#   LOG_DIR_MAX_BYTES; see crates/core/src/tracing.rs).
+# - systemd's StandardOutput/StandardError previously appended to a fixed
+#   freenet.log / freenet.error.log that the time-based cleanup never
+#   pruned (mtime stayed fresh while the file was being written), so they
+#   grew without bound on long-running nodes (issue #4251).
+# - Routing both to the journal lets journald handle rotation, and panics
+#   or pre-tracing-init output remain queryable via
+#   `journalctl --user-unit freenet`.
+StandardOutput=journal
+StandardError=journal
 SyslogIdentifier=freenet
 
 # Resource limits to prevent runaway resource consumption
@@ -2640,9 +2649,19 @@ SuccessExitStatus=42 43
 # Do NOT restart — the existing instance is healthy.
 RestartPreventExitStatus=43
 
-# Logging - write to files for systems without active user journald
-StandardOutput=append:{log_dir}/freenet.log
-StandardError=append:{log_dir}/freenet.error.log
+# Logging
+# - The node's tracing layer writes its own size-capped, hourly-rotated
+#   logs to {log_dir}/freenet.YYYY-MM-DD-HH.log (LOG_RETENTION_HOURS +
+#   LOG_DIR_MAX_BYTES; see crates/core/src/tracing.rs).
+# - systemd's StandardOutput/StandardError previously appended to a fixed
+#   freenet.log / freenet.error.log that the time-based cleanup never
+#   pruned (mtime stayed fresh while the file was being written), so they
+#   grew without bound on long-running nodes (issue #4251).
+# - Routing both to the journal lets journald handle rotation, and panics
+#   or pre-tracing-init output remain queryable via
+#   `journalctl -u freenet`.
+StandardOutput=journal
+StandardError=journal
 SyslogIdentifier=freenet
 
 # Resource limits to prevent runaway resource consumption
@@ -2916,10 +2935,23 @@ fn generate_plist(wrapper_path: &Path, log_dir: &Path) -> String {
         <key>SuccessfulExit</key>
         <false/>
     </dict>
+    <!--
+        Logging
+        - The node's tracing layer writes its own size-capped, hourly-
+          rotated logs to {log_dir}/freenet.YYYY-MM-DD-HH.log
+          (LOG_RETENTION_HOURS + LOG_DIR_MAX_BYTES; see
+          crates/core/src/tracing.rs).
+        - launchd previously appended to fixed freenet.log / freenet.error.log
+          that the time-based cleanup never pruned, so they grew without
+          bound (issue #4251). macOS does not offer a journal target for
+          launchd, so the cleanest option is /dev/null — diagnostics
+          remain available via `freenet service report`, which collects
+          the rotated tracing logs.
+    -->
     <key>StandardOutPath</key>
-    <string>{log_dir}/freenet.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
-    <string>{log_dir}/freenet.error.log</string>
+    <string>/dev/null</string>
     <key>SoftResourceLimits</key>
     <dict>
         <key>NumberOfFiles</key>
@@ -4054,9 +4086,16 @@ mod tests {
         // Verify it references the correct binary
         assert!(service_content.contains("/usr/local/bin/freenet network"));
 
-        // Verify log paths are set correctly (file-based logging for headless systems)
-        assert!(service_content.contains("/home/test/.local/state/freenet/freenet.log"));
-        assert!(service_content.contains("/home/test/.local/state/freenet/freenet.error.log"));
+        // Logging routes to journal so journald handles rotation. The tracing
+        // layer writes its own size-capped rolling files; routing systemd
+        // stdout/stderr to a fixed freenet.log / freenet.error.log caused
+        // unbounded growth (issue #4251 / log-spam fix).
+        assert!(service_content.contains("StandardOutput=journal"));
+        assert!(service_content.contains("StandardError=journal"));
+        assert!(
+            !service_content.contains("append:"),
+            "regression: must not append systemd output to fixed unrotated file (#4251)"
+        );
 
         // Verify resource limits are set
         assert!(service_content.contains("LimitNOFILE=65536"));
@@ -4125,6 +4164,14 @@ mod tests {
 
         // Verify exit code 43 prevents restart (another instance already running)
         assert!(service_content.contains("RestartPreventExitStatus=43"));
+
+        // Logging routes to journal (same reasoning as the user-unit test).
+        assert!(service_content.contains("StandardOutput=journal"));
+        assert!(service_content.contains("StandardError=journal"));
+        assert!(
+            !service_content.contains("append:"),
+            "regression: must not append systemd output to fixed unrotated file (#4251)"
+        );
     }
 
     #[test]
@@ -4200,9 +4247,19 @@ mod tests {
         // Verify it references the correct binary
         assert!(plist_content.contains("/usr/local/bin/freenet"));
 
-        // Verify log paths are set correctly
-        assert!(plist_content.contains("/Users/test/Library/Logs/freenet/freenet.log"));
-        assert!(plist_content.contains("/Users/test/Library/Logs/freenet/freenet.error.log"));
+        // Stdout/stderr are discarded; the tracing layer writes its own
+        // size-capped rolling logs and `freenet service report` collects
+        // them. Writing launchd output to a fixed freenet.log /
+        // freenet.error.log caused unbounded growth (issue #4251).
+        assert!(plist_content.contains("<string>/dev/null</string>"));
+        assert!(
+            !plist_content.contains("/Users/test/Library/Logs/freenet/freenet.log"),
+            "regression: launchd must not write stdout to a fixed unrotated log file (#4251)"
+        );
+        assert!(
+            !plist_content.contains("/Users/test/Library/Logs/freenet/freenet.error.log"),
+            "regression: launchd must not write stderr to a fixed unrotated log file (#4251)"
+        );
 
         // Verify resource limits are set
         assert!(plist_content.contains("<key>NumberOfFiles</key>"));

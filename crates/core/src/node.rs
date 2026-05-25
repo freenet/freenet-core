@@ -1546,7 +1546,10 @@ async fn handle_interest_sync_message(
                     );
                     continue;
                 };
-                tracing::info!(
+                // Fires per stale-peer detection during interest sync, which
+                // is dominant on hot contracts. Diagnostic-grade rather than
+                // user-actionable; keep accessible via RUST_LOG=…=debug.
+                tracing::debug!(
                     contract = %contract,
                     stale_peer = %source,
                     "Summary mismatch in interest sync — syncing state to stale peer"
@@ -1783,11 +1786,16 @@ async fn handle_interest_sync_message(
                     );
                 }
                 Ok(other) => {
-                    tracing::warn!(
+                    // Use Display, not Debug, for `other`. Debug-formatting an
+                    // UpdateResponse expands the inner anyhow::Error and
+                    // prints a ~15-line backtrace per call. Under queue
+                    // saturation (issue #4251) this fires constantly and
+                    // dominates log volume. Display gives a one-line summary.
+                    tracing::debug!(
                         from = %source,
                         contract = %key,
                         event = "resync_failed",
-                        response = ?other,
+                        response_kind = std::any::type_name_of_val(&other),
                         "Unexpected response to resync update"
                     );
                 }
@@ -1883,7 +1891,11 @@ async fn get_contract_summary(
         Ok(ContractHandlerEvent::GetSummaryResponse {
             summary: Err(e), ..
         }) => {
-            tracing::warn!(
+            // Fires repeatedly when the executor queue is saturated for a hot
+            // contract (issue #4251). Demoted to debug because the actionable
+            // signal is the queue saturation itself, not the per-summary
+            // failure.
+            tracing::debug!(
                 contract = %key,
                 error = %e,
                 "Failed to get contract summary"

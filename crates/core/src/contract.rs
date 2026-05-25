@@ -758,7 +758,12 @@ async fn send_queue_full_response(
     channel: &mut handler::ContractHandlerChannel<handler::ContractHandlerHalve>,
     rejected: Box<fair_queue::RejectedEvent>,
 ) {
-    tracing::warn!(
+    // Per-event backpressure is normal under sustained load on a hot contract
+    // and is not user-actionable. Logging at WARN once per rejection drowns
+    // node logs (millions of lines/day on a saturated contract). Aggregate
+    // backpressure visibility belongs in metrics, not per-event logs.
+    // See issue #4251 for the underlying queue-saturation tracking.
+    tracing::debug!(
         event = %rejected.event,
         "Rejected event due to per-contract queue capacity limit"
     );

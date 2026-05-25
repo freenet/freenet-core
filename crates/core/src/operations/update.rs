@@ -271,7 +271,10 @@ impl OpManager {
                 targets.insert(pkl);
             } else {
                 interest_resolve_failed += 1;
-                tracing::warn!(
+                // Counter (interest_resolve_failed) is the actionable signal;
+                // per-peer-miss log fires hundreds of times/hour on hot
+                // contracts. The aggregate is logged once at INFO below.
+                tracing::debug!(
                     contract = %format!("{:.8}", key),
                     interest_peer = %peer_key.0,
                     is_local = is_local_update_initiator,
