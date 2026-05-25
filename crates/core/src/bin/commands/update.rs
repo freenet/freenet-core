@@ -1113,7 +1113,10 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
 ///
 /// Cross-platform-compiled (no `#[cfg(target_os = "linux")]`) so non-Linux
 /// CI runners can exercise the predicate per code-style.md / deployment.md
-/// preference for pure decision helpers.
+/// preference for pure decision helpers. The `#[allow(dead_code)]`
+/// suppresses the dead-code lint on non-Linux builds where the only
+/// non-test caller (`update_service_file`) is cfg'd out.
+#[allow(dead_code)]
 pub(super) fn systemd_unit_needs_regen(content: &str) -> bool {
     let has_auto_update_markers = content.contains("ExecStopPost=")
         && content.contains("SuccessExitStatus=42")
@@ -1229,7 +1232,10 @@ fn update_service_file(
 ///
 /// Cross-platform-compiled (no `#[cfg(target_os = "macos")]`) so non-macOS
 /// CI runners can exercise the predicate per code-style.md / deployment.md
-/// preference for pure decision helpers.
+/// preference for pure decision helpers. The `#[allow(dead_code)]`
+/// suppresses the dead-code lint on non-macOS builds where the only
+/// non-test caller (`ensure_service_file_updated`) is cfg'd out.
+#[allow(dead_code)]
 pub(super) fn launchd_plist_needs_regen(content: &str) -> bool {
     content.contains("Library/Logs/freenet/freenet.log")
         || content.contains("Library/Logs/freenet/freenet.error.log")
