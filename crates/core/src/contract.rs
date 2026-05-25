@@ -31,7 +31,7 @@ pub(crate) use handler::{
     },
 };
 
-pub use executor::{Executor, ExecutorError, OperationMode};
+pub use executor::{ContractQueueFull, Executor, ExecutorError, OperationMode};
 pub use handler::reset_event_id_counter;
 
 use freenet_stdlib::client_api::DelegateRequest;
@@ -762,7 +762,13 @@ async fn send_queue_full_response(
         event = %rejected.event,
         "Rejected event due to per-contract queue capacity limit"
     );
-    let make_err = || ExecutorError::other(anyhow::anyhow!("contract queue full, try again later"));
+    // Use the typed `ContractQueueFull` marker so callers can distinguish
+    // queue saturation from real executor failures via
+    // `ExecutorError::is_contract_queue_full`. This is what suppresses the
+    // auto-fetch / ResyncRequest amplification in the UPDATE relay drivers
+    // (op_ctx_task.rs) when a single contract is saturating its own queue.
+    // See issue #4251.
+    let make_err = || ExecutorError::other(ContractQueueFull);
     let response = match &rejected.event {
         ContractHandlerEvent::PutQuery { .. } => ContractHandlerEvent::PutResponse {
             new_value: Err(make_err()),
@@ -1797,6 +1803,56 @@ mod tests {
                 assert!(delta.is_err(), "should be an error response");
             }
             other => panic!("expected GetDeltaResponse, got {other}"),
+        }
+    }
+
+    /// Issue #4251: the queue-full response MUST carry the typed
+    /// `ContractQueueFull` marker, not just an opaque anyhow error, so
+    /// callers can suppress amplification side effects (auto-fetch,
+    /// ResyncRequest, ERROR logs) via
+    /// `ExecutorError::is_contract_queue_full`. A regression here would
+    /// silently bring back the storm-on-saturation behavior.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_queue_full_response_carries_typed_queue_full_marker() {
+        let (send_halve, mut rcv_halve, _) = handler::contract_handler_channel();
+        let key = make_contract_key();
+
+        let (rejected, handle) = setup_rejected_event(
+            send_halve,
+            &mut rcv_halve,
+            ContractHandlerEvent::UpdateQuery {
+                key,
+                data: UpdateData::Delta(StateDelta::from(vec![1])),
+                related_contracts: RelatedContracts::default(),
+            },
+        )
+        .await;
+
+        send_queue_full_response(&mut rcv_halve, rejected).await;
+
+        let response = tokio::time::timeout(Duration::from_millis(200), handle)
+            .await
+            .expect("timeout")
+            .expect("task should complete")
+            .expect("should get response");
+
+        match response {
+            ContractHandlerEvent::UpdateResponse { new_value, .. } => {
+                let err = new_value.expect_err("UpdateResponse should carry an error");
+                assert!(
+                    err.is_contract_queue_full(),
+                    "queue-full response MUST be classified by is_contract_queue_full; \
+                     got err = {err:?}. If you removed this classification, you have also \
+                     re-enabled the auto-fetch / ResyncRequest amplification storm — see \
+                     issue #4251."
+                );
+                // The other predicates must NOT also match, otherwise the
+                // gating in op_ctx_task.rs becomes ambiguous.
+                assert!(!err.is_contract_exec_rejection());
+                assert!(!err.is_invalid_update_rejection());
+                assert!(!err.is_missing_contract_parameters());
+            }
+            other => panic!("expected UpdateResponse, got {other}"),
         }
     }
 

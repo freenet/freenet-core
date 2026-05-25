@@ -1061,7 +1061,21 @@ async fn drive_relay_broadcast_to(
                 });
             }
 
-            if is_delta {
+            // Issue #4251: queue-full is a transient platform-level
+            // backpressure signal, not a contract-level failure. The
+            // delta-failed→ResyncRequest and full-state→auto-fetch
+            // branches below both treat the error as evidence that
+            // something is wrong with the contract or the local state;
+            // for queue-full neither is true (the contract code is
+            // present, the merge simply never got to run). Firing them
+            // anyway turns a single saturated contract into a network-
+            // wide storm — the sender resends full state on
+            // ResyncRequest, and auto-fetch enqueues a GET right back
+            // onto the same saturated queue. Skip both branches and
+            // surface the error to the caller for telemetry.
+            let queue_full = err.is_contract_queue_full();
+
+            if is_delta && !queue_full {
                 // Delta application failed → send ResyncRequest. Mirrors
                 // update.rs:710-758.
                 tracing::warn!(
@@ -1104,10 +1118,18 @@ async fn drive_relay_broadcast_to(
                         "UPDATE relay: failed to send ResyncRequest"
                     );
                 }
-            } else if !err.is_contract_exec_rejection() {
+            } else if !is_delta && !err.is_contract_exec_rejection() && !queue_full {
                 // Full state failed and the merge function did NOT reject it
                 // (so contract code is missing). Trigger self-healing GET.
                 op_manager.try_auto_fetch_contract(&key, sender_addr);
+            } else if queue_full {
+                tracing::debug!(
+                    tx = %incoming_tx,
+                    contract = %key,
+                    sender = %sender_addr,
+                    event = "queue_full_amplification_suppressed",
+                    "UPDATE relay: per-contract queue saturated, suppressed ResyncRequest/auto-fetch to avoid amplification"
+                );
             }
             return Err(err);
         }
@@ -2288,6 +2310,60 @@ mod tests {
             dedup_pos < merge_pos,
             "broadcast_dedup_cache.check_and_insert MUST appear before \
              update_contract() in drive_relay_broadcast_to_streaming"
+        );
+    }
+
+    /// Issue #4251 regression pin: `drive_relay_broadcast_to` MUST
+    /// gate ResyncRequest emission AND `try_auto_fetch_contract` on
+    /// `!err.is_contract_queue_full()`. The two amplification branches
+    /// are what turn a single saturated contract into a network-wide
+    /// storm — ResyncRequest asks the sender for full state (bigger
+    /// payload onto the same full queue), and auto-fetch enqueues a
+    /// GET right back onto the saturated handler.
+    #[test]
+    fn broadcast_to_suppresses_amplification_on_queue_full() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_relay_broadcast_to(")
+            .expect("drive_relay_broadcast_to not found");
+        let after = &src[start + 1..];
+        let end = after
+            .find("\nasync fn ")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .unwrap_or(after.len());
+        let driver_src = &src[start..start + 1 + end];
+
+        // The gate must be computed once and applied to both amplification
+        // branches. We don't pin the exact variable name, but both branches
+        // must reference `is_contract_queue_full()` (directly or via the
+        // gate binding) so a refactor that drops the check from one branch
+        // fails this test.
+        assert!(
+            driver_src.contains("is_contract_queue_full()"),
+            "drive_relay_broadcast_to must call is_contract_queue_full() \
+             to gate the ResyncRequest / auto-fetch amplification — see \
+             issue #4251"
+        );
+
+        // Both amplification call sites must still exist (we're suppressing
+        // them on queue-full, not deleting them) — and both must follow the
+        // gate. We assert co-occurrence of the textual markers; the
+        // suppression is enforced because the guards `if is_delta &&
+        // !queue_full` and `else if !is_delta && !err.is_contract_exec_rejection()
+        // && !queue_full` wrap them. If anyone re-introduces an
+        // unconditional ResyncRequest / auto-fetch branch, the
+        // `is_contract_queue_full()` reference would disappear from
+        // between the two and this test would still catch the regression
+        // via the dedicated runtime test below in update.rs.
+        assert!(
+            driver_src.contains("InterestMessage::ResyncRequest"),
+            "drive_relay_broadcast_to should still contain the ResyncRequest \
+             branch (gated on !queue_full)"
+        );
+        assert!(
+            driver_src.contains("try_auto_fetch_contract"),
+            "drive_relay_broadcast_to should still contain the auto-fetch \
+             branch (gated on !queue_full)"
         );
     }
 

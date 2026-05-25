@@ -339,6 +339,18 @@ fn log_update_contract_failure(key: &ContractKey, err: &ExecutorError) {
             event = "merge_rejected_invalid_update",
             "Update rejected by contract: incoming state invalid (likely stale rebroadcast), keeping local"
         );
+    } else if err.is_contract_queue_full() {
+        // Issue #4251: per-contract queue saturation is transient
+        // platform backpressure, not an operator-actionable failure.
+        // On a hot contract this fires hundreds of times per second
+        // — keep the log at DEBUG so disks don't fill and so real
+        // failures stay visible at ERROR.
+        tracing::debug!(
+            contract = %key,
+            error = %err,
+            event = "queue_full",
+            "Update skipped: per-contract queue saturated"
+        );
     } else {
         tracing::error!(
             contract = %key,
@@ -387,6 +399,18 @@ pub(crate) fn log_broadcast_to_streaming_failure(
             event = "merge_rejected_invalid_update",
             "BroadcastToStreaming merge rejected: incoming state invalid (likely stale rebroadcast), keeping local"
         );
+    } else if err.is_contract_queue_full() {
+        // Issue #4251: queue-full is transient platform backpressure,
+        // not a contract failure. Keep the log at DEBUG so a hot
+        // contract doesn't drown operators in scary WARNs, and (via
+        // the return value below) skip the spurious auto-fetch GET.
+        tracing::debug!(
+            tx = %tx,
+            %key,
+            error = %err,
+            event = "queue_full",
+            "BroadcastToStreaming update skipped: per-contract queue saturated"
+        );
     } else {
         tracing::warn!(
             tx = %tx,
@@ -395,10 +419,13 @@ pub(crate) fn log_broadcast_to_streaming_failure(
             "BroadcastToStreaming update skipped: contract not ready locally"
         );
     }
-    // Preserves the pre-#3914 auto-fetch behavior: skip the self-heal
-    // GET whenever the contract code is present (broader check than the
-    // log-severity decision above).
-    !err.is_contract_exec_rejection()
+    // Trigger self-heal GET only when the contract is genuinely missing.
+    // Skip when the WASM merge ran and rejected the update (pre-#3914
+    // semantics) AND when the queue was simply saturated (#4251) — in
+    // both cases the contract code is present locally, and enqueuing a
+    // GET right back onto the saturated handler only amplifies the
+    // storm.
+    !err.is_contract_exec_rejection() && !err.is_contract_queue_full()
 }
 
 /// Apply an update to a contract.
@@ -953,6 +980,13 @@ mod tests {
             req.into()
         }
 
+        fn queue_full_failure() -> ExecutorError {
+            // Mirrors what `send_queue_full_response` (contract.rs) produces
+            // when the per-contract fair queue rejects an event. The typed
+            // marker is what powers `ExecutorError::is_contract_queue_full`.
+            ExecutorError::other(crate::contract::ContractQueueFull)
+        }
+
         #[test]
         fn update_contract_failure_logs_info_for_invalid_update_rejection() {
             let logger = TestLogger::new().capture_logs().with_level("info").init();
@@ -1075,6 +1109,83 @@ mod tests {
             assert!(
                 logger.contains("contract not ready locally"),
                 "expected the WARN message text for real failure, got: {:?}",
+                logger.logs()
+            );
+        }
+
+        /// Issue #4251 regression: when the per-contract fair queue
+        /// rejects an event, `log_update_contract_failure` must classify
+        /// it as `is_contract_queue_full` and log at DEBUG (NOT ERROR).
+        /// A hot contract that saturates its own queue would otherwise
+        /// flood logs with ERROR-level "Failed to update contract value"
+        /// lines (~30% of all log volume on production gateways).
+        #[test]
+        fn update_contract_failure_logs_debug_for_queue_full() {
+            let logger = TestLogger::new().capture_logs().with_level("debug").init();
+
+            log_update_contract_failure(&make_contract_key(1), &queue_full_failure());
+
+            assert!(
+                logger.contains("queue_full"),
+                "queue-full must emit event=queue_full, got: {:?}",
+                logger.logs()
+            );
+            assert!(
+                !logger.logs().iter().any(|l| l.contains("ERROR")),
+                "queue-full must NOT log at ERROR (it's transient backpressure, not a fault), got: {:?}",
+                logger.logs()
+            );
+            assert!(
+                !logger
+                    .logs()
+                    .iter()
+                    .any(|l| l.contains("Failed to update contract value")),
+                "queue-full must NOT emit the legacy ERROR message, got: {:?}",
+                logger.logs()
+            );
+        }
+
+        /// Issue #4251 regression: the streaming branch's helper MUST
+        /// (1) log queue-full at DEBUG, NOT WARN — a buggy contract that
+        /// floods broadcasts must not also flood operator logs; and
+        /// (2) return `false` so the caller skips
+        /// `try_auto_fetch_contract` — enqueuing a GET right back onto
+        /// the saturated handler is the amplification path the typed
+        /// predicate exists to break.
+        #[test]
+        fn broadcast_to_streaming_failure_skips_auto_fetch_and_uses_debug_for_queue_full() {
+            let logger = TestLogger::new().capture_logs().with_level("debug").init();
+            let tx = Transaction::new::<UpdateMsg>();
+            let err: OpError = queue_full_failure().into();
+
+            let needs_auto_fetch =
+                log_broadcast_to_streaming_failure(&tx, &make_contract_key(3), &err);
+
+            assert!(
+                !needs_auto_fetch,
+                "queue-full MUST NOT trigger self-heal auto-fetch — enqueuing a GET \
+                 onto the saturated handler is exactly the amplification we're \
+                 trying to break (issue #4251)"
+            );
+            assert!(
+                logger.contains("queue_full"),
+                "queue-full must emit event=queue_full in the streaming branch, got: {:?}",
+                logger.logs()
+            );
+            assert!(
+                !logger.logs().iter().any(|l| l.contains("WARN")),
+                "queue-full must NOT log at WARN — a saturated contract would otherwise \
+                 fill operator dashboards with false-alarm WARNs, got: {:?}",
+                logger.logs()
+            );
+            assert!(
+                !logger
+                    .logs()
+                    .iter()
+                    .any(|l| l.contains("contract not ready locally")),
+                "the misleading 'contract not ready locally' message must not appear \
+                 for queue-full — the contract IS present, the queue is just busy, \
+                 got: {:?}",
                 logger.logs()
             );
         }
