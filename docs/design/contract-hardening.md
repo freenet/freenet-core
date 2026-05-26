@@ -2,6 +2,32 @@
 
 > Draft for review · 2026-05-25 · context: tonight's `4PjqN5…` incident PRs (#4253, #4231, #4252, #4212)
 
+## Design principle: dashboard reflects back-end, not the other way around
+
+The dashboard visualises what the system already does (or what the
+governance algorithm in this plan adds). It does **not** invent
+operator affordances that would require new back-end mechanisms to
+exist behind them.
+
+Concrete failure mode this principle prevents: showing a "pinned" or
+"protected" state for a contract in the UI implies the operator can
+mark a contract as exempt. That requires storage, a CLI, reconciliation,
+and persistence — none of which exist. A future agent seeing the UI
+would then feel pressure to build the back-end to match the mockup.
+Tail wagging dog.
+
+When you come to implementation, the constraint is: every state, badge,
+event, and number in the dashboard must correspond to data the system
+actually produces. If a panel can't be sourced from real state, the
+panel doesn't ship.
+
+Reasons for "why a contract is hosted" come from real sources:
+`HostingManager.client_subscriptions`, `downstream_subscribers`,
+`hosting_cache` access type / recency. Reasons for "why a contract is
+flagged or evicted" come from the governance algorithm landing in
+Phase 4. Banning comes from the automatic Phase 7 repeat-offender TTL.
+Nothing else.
+
 ## Goal
 
 Make a misbehaving contract bounded in its blast radius **without operator intervention**, while keeping legitimate popular-contract traffic (e.g. River official room) on the same defaults. All decisions local to the node — no gossiped reputation, no globally-coordinated block-list.
@@ -326,13 +352,44 @@ Governance panel. Distribution histogram. Cascade-latency metric (forcing functi
 
 `SubscribeMsg::Cancelled` variant. Wire-format-additive; bumps `min-compatible-version`.
 
-### Phase 6 — Operator pin/ban list
+### Phase 6 — DROPPED (was: Operator pin/ban list)
 
-Config + CLI: `freenet contract {pin,ban,unpin,unban} <key>`.
+Originally proposed `freenet contract {pin,ban,unpin,unban} <key>` as
+operator-facing CLI affordances. Removed after design review surfaced
+two problems:
+
+1. **No "marking" mechanism exists.** Pin/unpin requires a persistent
+   per-contract operator flag with its own storage, CLI surface, and
+   reconciliation logic. The existing `HostingManager` has nothing
+   like it.
+
+2. **The math already protects valuable contracts.** A contract with
+   real subscribers (local clients or downstream peers) has a high
+   `benefit_score` and therefore needs a much higher cost to trip the
+   threshold. River-style popular contracts are protected because
+   people use them, not because the operator declared exempt status.
+
+3. **The dashboard should visualize what the system does, not invent
+   affordances that then have to be built.** A future agent looking
+   at "pinned" in the UI mock would feel pressure to implement the
+   mechanism behind it — tail wagging dog. The dashboard surfaces
+   *automatic* state (which contracts the math is acting on, why
+   they're hosted via existing subscription tracking); it does not
+   show operator-defined overrides that don't exist in the back-end.
+
+If a future use case genuinely demands per-contract operator override,
+revisit then with concrete justification — but not as a speculative
+feature.
+
+**Banning is preserved**, but only as the **automatic** behaviour in
+Phase 7 — the system bans a contract from itself after observed
+repeat eviction. No operator CLI invokes a ban.
 
 ### Phase 7 — Repeat-offender ban TTL
 
-Memory-only ban map with TTL. Trigger on second eviction within window.
+Memory-only ban map with TTL. Trigger on second eviction within
+window. **Automatic** — no operator action; the system reaches this
+state on its own based on observed repeat-evict behaviour.
 
 ### Phase 8 — Flip governance to `enforce`
 
@@ -341,7 +398,7 @@ One release after Phase 4. Operators have had a release to see dry-run logs and 
 ## Implementation: split into two PRs
 
 - **PR #1 (foundational, no wire changes):** Phase 0 + Phase 1 + Phase 3. Lights up both peer-side and contract-side meters. Pure observability — no reaping behavior added.
-- **PR #2 (governance system):** Phase 5 + Phase 4 + Phase 4.5 + Phase 2 + Phase 6 + Phase 7. Adds wire variant, governance module (dry-run default), dashboards, refinements.
+- **PR #2 (governance system):** Phase 5 + Phase 4 + Phase 4.5 + Phase 2 + Phase 7. Adds wire variant, governance module (dry-run default), dashboards, refinements. Phase 6 was dropped — see its section above.
 
 Both PRs ship in the same release. No release window required between them. Phase 8 (flip to enforce) is a deliberate later release-cycle gate after calibration data has been collected.
 
