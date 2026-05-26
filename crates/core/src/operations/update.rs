@@ -290,7 +290,7 @@ impl OpManager {
         result.sort();
 
         if !result.is_empty() {
-            tracing::info!(
+            tracing::debug!(
                 contract = %format!("{:.8}", key),
                 peer_addr = %sender,
                 targets = %result

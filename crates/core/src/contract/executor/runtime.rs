@@ -2142,7 +2142,7 @@ where
             op_manager.ring.refresh_cache_generation(key, new_gen);
         }
 
-        tracing::info!(
+        tracing::debug!(
             contract = %key,
             new_size_bytes = new_state.as_ref().len(),
             phase = "update_complete",

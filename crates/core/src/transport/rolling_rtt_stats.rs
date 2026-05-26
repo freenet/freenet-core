@@ -348,7 +348,7 @@ fn emit_aggregate_snapshot() {
             "shadow_rtt_per_peer"
         );
     }
-    tracing::info!(
+    tracing::debug!(
         target: "freenet::transport::shadow_rtt",
         active_peers,
         peers_with_recent,
