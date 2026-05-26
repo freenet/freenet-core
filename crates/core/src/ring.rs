@@ -99,6 +99,12 @@ pub(crate) struct Ring {
     /// non-idempotent `update_state`). Used to gate outbound broadcast
     /// so a broken contract's state changes don't leave the node.
     broken_invariants: BrokenInvariantsTracker,
+    /// Per-contract governance scoring + reaper. Routes every
+    /// per-contract resource report through `ingest_cost` so the
+    /// governance state for a contract reflects what the meter
+    /// already records. Mode defaults to `DryRun` per the staged-
+    /// rollout plan.
+    pub(crate) governance: Arc<crate::contract::governance::GovernanceManager>,
     event_register: Box<dyn NetEventRegister>,
     op_manager: RwLock<Option<Weak<OpManager>>>,
     /// Whether this peer is a gateway or not. This will affect behavior of the node when acquiring
@@ -225,19 +231,26 @@ impl Ring {
         } else {
             Some(config.config.data_dir())
         };
+        let time_source: Arc<dyn crate::util::time_source::TimeSource + Send + Sync> =
+            Arc::new(InstantTimeSrc::new());
+        let governance = Arc::new(crate::contract::governance::GovernanceManager::new(
+            crate::contract::governance::GovernanceConfig::default(),
+            time_source.clone(),
+        ));
         let ring = Ring {
             max_hops_to_live,
             router,
             connection_manager,
             hosting_manager: hosting::HostingManager::new(config.config.max_hosting_storage),
             broken_invariants: BrokenInvariantsTracker::new(),
+            governance,
             live_tx_tracker: live_tx_tracker.clone(),
             event_register: Box::new(event_register),
             op_manager: RwLock::new(None),
             is_gateway,
             connection_backoff: Arc::new(Mutex::new(ConnectionBackoff::new())),
             contract_connect_backoff: Mutex::new(HashMap::new()),
-            time_source: Arc::new(InstantTimeSrc::new()),
+            time_source,
             peer_cache_dir,
         };
 
@@ -1968,8 +1981,71 @@ impl Ring {
             amount,
             now,
         );
+        drop(topo);
+        // Also feed the governance manager — the meter stores rates
+        // for telemetry/the dashboard's bandwidth view, while the
+        // governance manager aggregates these samples into the
+        // cost/benefit ratio that drives state. Both ingest in
+        // parallel from this one entry point so there's no risk of
+        // them diverging (governance reading from a stale meter
+        // snapshot, etc).
+        //
+        // Per-resource weight: identity (1.0) for now. Future tuning
+        // could weight CPU-µs and fanout-cost higher than
+        // state-bytes, but until we have live data to calibrate
+        // against, unit weights match what the design doc proposed
+        // as a starting point.
+        let weight = resource_weight(resource);
+        self.governance.ingest_cost(contract_id, amount * weight);
     }
 
+    /// Record a demand event for a contract. Called from
+    /// subscription-registration sites in `HostingManager` so the
+    /// governance manager's `benefit_score` for the contract reflects
+    /// who's actually asking for it.
+    ///
+    /// `weight` is the caller's chance to differentiate local-client
+    /// subscriptions from forwarded-peer ones (Sybil resistance). A
+    /// reasonable default per the design doc: 1.0 for local,
+    /// 0.1 for forwarded.
+    #[allow(dead_code)] // wired by HostingManager-side reporters in subsequent commit
+    pub(crate) fn ingest_contract_demand(
+        &self,
+        contract_id: freenet_stdlib::prelude::ContractInstanceId,
+        weight: f64,
+    ) {
+        self.governance.ingest_demand(contract_id, weight);
+    }
+
+    /// Run one governance reaper tick. Caller (a periodic task in
+    /// `connection_maintenance` or similar) is expected to feed
+    /// `tick_interval` = wall-time since the previous tick for decay.
+    /// Returns the `ReaperTickResult` for the caller to act on (emit
+    /// `EvictContract` events for actionable decisions, log dry-run
+    /// decisions, surface stats on the dashboard).
+    #[allow(dead_code)] // periodic driver task lands in subsequent commit
+    pub(crate) fn governance_tick(
+        &self,
+        tick_interval: Duration,
+    ) -> crate::contract::governance::ReaperTickResult {
+        self.governance.tick(tick_interval)
+    }
+}
+
+/// Per-resource weight for cost aggregation. Defaults to 1.0 for all
+/// dimensions so total cost = simple sum of meter samples. Hooks here
+/// for future tuning if any one dimension proves to dominate the
+/// signal-to-noise ratio.
+fn resource_weight(resource: crate::topology::meter::ResourceType) -> f64 {
+    use crate::topology::meter::ResourceType::*;
+    match resource {
+        InboundBandwidthBytes | OutboundBandwidthBytes => 1.0,
+        ExecCpuMicros | ExecFuelUnits => 1.0,
+        StateBytesWritten | BroadcastFanoutCost => 1.0,
+    }
+}
+
+impl Ring {
     // ==================== Subscription Retry Spam Prevention ====================
 
     /// Check if a subscription request can be made for a contract.

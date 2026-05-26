@@ -387,7 +387,12 @@ pub(crate) struct ReaperTickResult {
 /// state and every network-level statistic in the dashboard is read
 /// from this manager (or from data it commands). No fields exist on
 /// the dashboard that aren't computed here.
-pub(crate) struct GovernanceManager<T: TimeSource> {
+///
+/// The time source is a trait object so the manager slots into `Ring`
+/// without generic bound propagation through every consumer. Tests
+/// wrap a `MockTimeSource` in `Arc<dyn TimeSource + Send + Sync>` and
+/// pass it through unchanged.
+pub(crate) struct GovernanceManager {
     /// Per-contract scoring state. `DashMap` chosen per code-style
     /// rule: fine-grained shard locking lets the meter + the reaper
     /// tick + the receive-boundary check all read/write
@@ -397,11 +402,14 @@ pub(crate) struct GovernanceManager<T: TimeSource> {
     /// fields.
     config: GovernanceConfig,
     /// Time source — every timestamp goes through this for DST.
-    time_source: Arc<T>,
+    time_source: Arc<dyn TimeSource + Send + Sync>,
 }
 
-impl<T: TimeSource> GovernanceManager<T> {
-    pub(crate) fn new(config: GovernanceConfig, time_source: Arc<T>) -> Self {
+impl GovernanceManager {
+    pub(crate) fn new(
+        config: GovernanceConfig,
+        time_source: Arc<dyn TimeSource + Send + Sync>,
+    ) -> Self {
         Self {
             scores: DashMap::new(),
             config,
@@ -831,7 +839,7 @@ mod tests {
         }
     }
 
-    fn mk_mgr_shared(mode: GovernanceMode) -> (GovernanceManager<SharedTs>, Arc<SharedTs>) {
+    fn mk_mgr_shared(mode: GovernanceMode) -> (GovernanceManager, Arc<SharedTs>) {
         let ts = SharedTs::new();
         let outlier = OutlierConfig {
             min_samples: 5,
@@ -844,7 +852,8 @@ mod tests {
             ramp_up: Duration::from_secs(1),
             ..Default::default()
         };
-        let mgr = GovernanceManager::new(config, ts.clone());
+        let ts_dyn: Arc<dyn TimeSource + Send + Sync> = ts.clone();
+        let mgr = GovernanceManager::new(config, ts_dyn);
         (mgr, ts)
     }
 
