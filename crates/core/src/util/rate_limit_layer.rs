@@ -765,8 +765,7 @@ mod tests {
 
         // summary_interval = 1ns means the summary path fires on
         // essentially every call from the summary thread.
-        let limiter =
-            PerCallsiteRateLimiter::with_summary_interval(CAP, Duration::from_nanos(1));
+        let limiter = PerCallsiteRateLimiter::with_summary_interval(CAP, Duration::from_nanos(1));
         let limiter_arc = Arc::new(limiter);
 
         let allowed_total = Arc::new(AtomicUsize::new(0));
