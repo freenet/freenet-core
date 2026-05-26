@@ -613,8 +613,10 @@ fn is_caller_trusted(
 /// 2. **LAN / operator-configured CIDR** — Host header IP is private
 ///    (RFC1918 / loopback / link-local / IPv6 ULA) **or** matches
 ///    `allowed-source-cidrs`, **and** the Origin is a same-IP literal
-///    (or `null` when the operator opted into CIDRs). See
-///    [`host_header_ip_in_cidrs`] for the CSWSH/DNS-rebind rationale.
+///    (or `null` when the operator opted into CIDRs). The default-LAN
+///    sub-branch is on for every caller; the operator CIDR set only
+///    widens which non-private ranges (e.g. Tailnet CGNAT) qualify.
+///    See [`host_header_ip_in_cidrs`] for the CSWSH/DNS-rebind rationale.
 /// 3. **Explicit `allowed-host` hostname** — Host header is in
 ///    `allowed_hosts` **and** the Origin's authority matches the Host
 ///    header. The Origin-vs-Host check is stricter than the WebSocket
@@ -625,8 +627,9 @@ fn is_caller_trusted(
 ///    otherwise pass an Origin-less allowed-host check.
 ///
 /// When the `AllowedHosts` / `AllowedSourceCidrs` extensions are absent
-/// (e.g. `run_local_node` or older tests), branches 2 and 3 degrade to
-/// loopback-only — preserving today's behaviour for those callers.
+/// (e.g. `run_local_node` or older tests), branch 3 is disabled and
+/// branch 2 keeps only its default-LAN sub-branch — preserving today's
+/// behaviour for those callers.
 fn is_origin_trusted(
     headers: &HeaderMap,
     origin: &str,
@@ -636,14 +639,9 @@ fn is_origin_trusted(
     if is_localhost_origin(origin) {
         return true;
     }
-    // `host_header_ip_in_cidrs` itself contains the default-LAN branch
-    // (private RFC1918 / link-local / IPv6 ULA Host with same-IP-literal
-    // Origin), so we ALWAYS call it — even when no operator CIDR is
-    // configured. The operator CIDR set only widens which non-private
-    // ranges (e.g. Tailnet CGNAT) qualify; the default-LAN branch is on
-    // for everyone. When the `AllowedSourceCidrs` extension is missing
-    // (e.g. `run_local_node`, older tests), an empty set is used and
-    // the default-LAN branch still works.
+    // Always call `host_header_ip_in_cidrs` — when the extension is
+    // missing we pass an empty CIDR set so only its default-LAN
+    // sub-branch runs.
     let empty_cidrs = AllowedSourceCidrs::default();
     let cidrs = allowed_source_cidrs.unwrap_or(&empty_cidrs);
     if host_header_ip_in_cidrs(headers, origin, cidrs) {
@@ -668,20 +666,19 @@ fn origin_matches_allowed_host(
     headers: &HeaderMap,
     allowed_hosts: &AllowedHosts,
 ) -> bool {
+    if !is_allowed_host(headers, allowed_hosts) {
+        return false;
+    }
     let Some(host_header) = headers
         .get(axum::http::header::HOST)
         .and_then(|h| h.to_str().ok())
     else {
         return false;
     };
-    let host_lower = host_header.to_lowercase();
-    if !is_allowed_host(headers, allowed_hosts) {
-        return false;
-    }
     let Some(origin_authority) = origin_authority(origin) else {
         return false;
     };
-    origin_authority.eq_ignore_ascii_case(&host_lower)
+    origin_authority.eq_ignore_ascii_case(host_header)
 }
 
 /// Returns the scheme-stripped authority of an Origin header value (e.g.
@@ -2233,16 +2230,13 @@ mod tests {
         let pending = empty_pending();
         let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", webapp_caller("c"));
 
-        let (status, value) = {
-            let (s, _, v) = call_pending_full_with_policy(
-                lan_browser_headers("192.168.1.42", 7509),
-                pending,
-                None,
-                None,
-            )
-            .await;
-            (s, v)
-        };
+        let (status, _, value) = call_pending_full_with_policy(
+            lan_browser_headers("192.168.1.42", 7509),
+            pending,
+            None,
+            None,
+        )
+        .await;
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(value.as_array().unwrap().len(), 1);
     }
