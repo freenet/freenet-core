@@ -67,6 +67,22 @@ pub mod topology_registry;
 /// to receive updates. This is controlled by hosting cache eviction.
 pub const AUTO_SUBSCRIBE_ON_GET: bool = true;
 
+/// Governance demand weight for a local-client subscription. Strong
+/// signal: a real user on this node opted in. Hard to fake without
+/// running an actual freenet client locally.
+///
+/// Sourced from the design doc — see "Sybil weighting falls out
+/// naturally" in `docs/design/contract-hardening.md`.
+const LOCAL_DEMAND_WEIGHT: f64 = 1.0;
+
+/// Governance demand weight for a downstream peer's subscription.
+/// Weaker signal because peer identity is attacker-rotatable —
+/// without an identity layer, a single attacker can spin up many
+/// peers and each "subscribes." We weight forwarded demand at 0.1
+/// so an attacker would need 10 peers to fake the demand of one
+/// local user.
+const FORWARDED_DEMAND_WEIGHT: f64 = 0.1;
+
 use connection_backoff::ConnectionBackoff;
 pub use connection_backoff::ConnectionFailureReason;
 pub(crate) use peer_connection_backoff::PeerConnectionBackoff;
@@ -1738,8 +1754,18 @@ impl Ring {
     // ==================== Downstream Subscriber Tracking ====================
 
     pub fn add_downstream_subscriber(&self, contract: &ContractKey, peer: PeerKey) -> bool {
-        self.hosting_manager
-            .add_downstream_subscriber(contract, peer)
+        let added = self
+            .hosting_manager
+            .add_downstream_subscriber(contract, peer);
+        if added {
+            // Downstream peer subscription = demand signal for this
+            // contract. Forwarded weight (per design doc Sybil
+            // resistance): 0.1, since peer identities are
+            // attacker-rotatable.
+            self.governance
+                .ingest_demand(*contract.id(), FORWARDED_DEMAND_WEIGHT);
+        }
+        added
     }
 
     #[allow(dead_code)] // Only used in tests
@@ -1872,8 +1898,15 @@ impl Ring {
         instance_id: &ContractInstanceId,
         client_id: crate::client_events::ClientId,
     ) -> AddClientSubscriptionResult {
-        self.hosting_manager
-            .add_client_subscription(instance_id, client_id)
+        let result = self
+            .hosting_manager
+            .add_client_subscription(instance_id, client_id);
+        // Local client subscription = strong demand signal. Full
+        // weight: this is our own user telling us they care about
+        // this contract, harder to fake than a peer-side signal.
+        self.governance
+            .ingest_demand(*instance_id, LOCAL_DEMAND_WEIGHT);
+        result
     }
 
     /// Remove a client from all its subscriptions (used when client disconnects).
