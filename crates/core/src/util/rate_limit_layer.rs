@@ -21,7 +21,11 @@
 //! let global = RateLimiter::with_defaults();           // 1000 ev/sec total
 //! let per_site = PerCallsiteRateLimiter::with_defaults(); // 30 ev/sec per callsite
 //!
-//! let filter = tracing_subscriber::filter::filter_fn(move |meta| {
+//! // IMPORTANT: use `DynFilterFn`, NOT `filter_fn`. The latter is
+//! // callsite-cacheable (only invoked once per callsite at registration),
+//! // which silently disables every stateful rate-limit filter. See the
+//! // comment in `init_tracer` for the full story.
+//! let filter = tracing_subscriber::filter::DynFilterFn::new(move |meta, _cx| {
 //!     per_site.should_allow(meta) && global.should_allow()
 //! });
 //! ```
@@ -320,6 +324,10 @@ impl PerCallsiteRateLimiter {
                     }
                     return true;
                 }
+                // `or_insert_with` returns a write guard (`RefMut`); downgrade
+                // to a read guard so we have a uniform `Ref` to drop before
+                // `maybe_log_summary` takes iter-wide read locks. Avoids the
+                // re-fetch + `.expect("just inserted")` panic path.
                 self.inner
                     .callsites
                     .entry(id.clone())
@@ -329,9 +337,8 @@ impl PerCallsiteRateLimiter {
                         dropped_this_interval: AtomicU64::new(0),
                         total_dropped: AtomicU64::new(0),
                         name,
-                    });
-                // Re-fetch as an immutable reference (release the write guard).
-                self.inner.callsites.get(&id).expect("just inserted")
+                    })
+                    .downgrade()
             }
         };
 
@@ -661,6 +668,63 @@ mod tests {
             limiter.inner.max_events_per_second_per_callsite,
             DEFAULT_MAX_EVENTS_PER_CALLSITE_PER_SECOND
         );
+    }
+
+    #[test]
+    fn per_callsite_cap_hit_path_degrades_and_warns_once() {
+        // testing.md mandates "at capacity" boundary coverage for any
+        // bounded collection. Drive the table to MAX_TRACKED_CALLSITES,
+        // then assert the cap-hit branch: new callsites pass through
+        // unrate-limited, the AtomicBool latch fires exactly once, and
+        // the existing table doesn't grow further.
+        //
+        // We `Box::leak` 4096 distinct callsite instances; they live for
+        // the process lifetime, which is fine for a unit test.
+
+        let limiter = PerCallsiteRateLimiter::new(3);
+
+        // Fill the table to capacity with distinct addresses.
+        for i in 0..MAX_TRACKED_CALLSITES {
+            let cs: &'static TestCallsite = Box::leak(Box::new(TestCallsite { _tag: 1_000 + i }));
+            limiter.should_allow_inner(Identifier(cs), "filler");
+        }
+        assert_eq!(
+            limiter.inner.callsites.len(),
+            MAX_TRACKED_CALLSITES,
+            "table should fill exactly to the cap"
+        );
+        assert!(
+            !limiter.inner.cap_hit_warned.load(Ordering::SeqCst),
+            "cap-hit latch should not fire while inserting still succeeds"
+        );
+
+        // The 4097th distinct callsite must pass through (degraded mode).
+        let overflow_a: &'static TestCallsite =
+            Box::leak(Box::new(TestCallsite { _tag: 9_000_001 }));
+        let allowed = limiter.should_allow_inner(Identifier(overflow_a), "overflow_a");
+        assert!(allowed, "cap-hit path must degrade to allow");
+        assert!(
+            limiter.inner.cap_hit_warned.load(Ordering::SeqCst),
+            "cap-hit must flip the warned latch"
+        );
+        assert_eq!(
+            limiter.inner.callsites.len(),
+            MAX_TRACKED_CALLSITES,
+            "cap-hit must NOT grow the table past the cap"
+        );
+
+        // A second distinct overflow callsite also passes; latch stays set;
+        // table still at the cap. (Latch is one-shot — verify it doesn't
+        // get reset and re-fire.)
+        let overflow_b: &'static TestCallsite =
+            Box::leak(Box::new(TestCallsite { _tag: 9_000_002 }));
+        let allowed_again = limiter.should_allow_inner(Identifier(overflow_b), "overflow_b");
+        assert!(allowed_again);
+        assert!(
+            limiter.inner.cap_hit_warned.load(Ordering::SeqCst),
+            "latch must remain set"
+        );
+        assert_eq!(limiter.inner.callsites.len(), MAX_TRACKED_CALLSITES);
     }
 
     #[test]
