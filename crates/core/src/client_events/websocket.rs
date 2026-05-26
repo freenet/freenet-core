@@ -135,7 +135,11 @@ use crate::server::client_api::OriginContractMap;
 ///
 /// Delimiter-aware: rejects origins like `http://localhost.evil.com` by requiring
 /// the hostname to be followed by `:`, `/`, or end-of-string.
-fn is_localhost_origin(origin: &str) -> bool {
+///
+/// Also reused by the permission-prompt endpoints
+/// (`crates/core/src/server/client_api/permission_prompts.rs`) so the HTTP and
+/// WS layers agree on what counts as a loopback Origin.
+pub(crate) fn is_localhost_origin(origin: &str) -> bool {
     let prefixes = [
         "http://localhost:",
         "http://localhost/",
@@ -162,7 +166,13 @@ fn is_localhost_origin(origin: &str) -> bool {
 }
 
 /// Returns `true` if the request's `Host` header is in the allowed set.
-fn is_allowed_host(headers: &axum::http::HeaderMap, allowed_hosts: &HashSet<String>) -> bool {
+///
+/// Reused by the permission-prompt endpoints (see [`crate::server::client_api`])
+/// so HTTP and WS layers share the same Host allowlist check.
+pub(crate) fn is_allowed_host(
+    headers: &axum::http::HeaderMap,
+    allowed_hosts: &HashSet<String>,
+) -> bool {
     let Some(host_header) = headers
         .get(axum::http::header::HOST)
         .and_then(|h| h.to_str().ok())
@@ -213,7 +223,7 @@ fn is_allowed_host(headers: &axum::http::HeaderMap, allowed_hosts: &HashSet<Stri
 /// parses to a hostname — not an IP, not matching the Host IP — so it's
 /// refused. DNS rebinding is defeated because no DNS resolution happens
 /// at this layer; only string-parseable IP literals are compared.
-fn host_header_ip_in_cidrs(
+pub(crate) fn host_header_ip_in_cidrs(
     headers: &axum::http::HeaderMap,
     origin_str: &str,
     allowed_cidrs: &crate::server::AllowedSourceCidrs,

@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.2.64"
+version = "0.2.65"
 edition = "2024"
 rust-version = "1.85"
 publish = true
@@ -95,6 +95,7 @@ opentelemetry-jaeger = { workspace = true, features = ["collector_client", "isah
 # release_max_level_info, reducing the number of spans EnvFilter must evaluate.
 # Debug builds retain all levels. RUST_LOG can filter among compiled-in levels.
 tracing = { workspace = true, features = ["release_max_level_info"] }
+tracing-core = { workspace = true }
 tracing-opentelemetry = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, features = ["json"], optional = true }
 tracing-appender = { workspace = true, optional = true }

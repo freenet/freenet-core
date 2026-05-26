@@ -90,8 +90,12 @@ BEFORE changing LEDBAT++ parameters:
 populated by `RollingRttStatsHandle` in every `RemoteConnection`. A
 1Hz aggregator spawned from `p2p_impl.rs` (registered with
 `BackgroundTaskMonitor` as `shadow_rtt_aggregator`) emits a
-`shadow_rtt_aggregate` event both as `tracing::info!` and via
-`send_standalone_event` so it reaches the OTLP collector.
+`shadow_rtt_aggregate` event both as `tracing::debug!` (file-log
+mirror; visible via `RUST_LOG=…=debug` in debug builds, compiled
+out entirely in release builds via the `release_max_level_info`
+feature in `crates/core/Cargo.toml`) and via `send_standalone_event`
+so it reaches the OTLP collector regardless of log level — the
+dashboard's 1 Hz feed is independent of the local tracing subscriber.
 
 ```
 NEVER read SHADOW_RTT_REGISTRY or cross_connection_median_inflation

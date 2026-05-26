@@ -290,7 +290,7 @@ impl OpManager {
         result.sort();
 
         if !result.is_empty() {
-            tracing::info!(
+            tracing::debug!(
                 contract = %format!("{:.8}", key),
                 peer_addr = %sender,
                 targets = %result
@@ -310,11 +310,10 @@ impl OpManager {
             // times per BroadcastStateChange (initial + 3 retries) so
             // per-attempt WARN amplifies 4x on stuck contracts. The
             // operator-actionable signal is the outer streak-suppressed
-            // "no targets after 3 retries, giving up" WARN in
-            // p2p_protoc.rs (search for "BroadcastTo: no targets after");
-            // the per-attempt detail belongs in metrics/structured
-            // counters (interest_resolve_failed). Issue #4251 re-review
-            // M2.
+            // WARN in p2p_protoc.rs (grep for
+            // "BROADCAST_NO_TARGETS: no targets found after"); the
+            // per-attempt detail belongs in metrics/structured counters
+            // (interest_resolve_failed). Issue #4251 re-review M2.
             tracing::debug!(
                 contract = %format!("{:.8}", key),
                 peer_addr = %sender,
@@ -944,8 +943,8 @@ mod tests {
     /// `get_broadcast_targets_update` is called up to 4 times per
     /// `BroadcastStateChange` (initial + 3 retries) — per-attempt WARN
     /// 4x amplifies on stuck contracts. The operator-actionable summary
-    /// lives in the outer streak-suppressed WARN at
-    /// `p2p_protoc.rs::BroadcastTo: no targets after …`. Per #4251
+    /// lives in the outer streak-suppressed WARN in `p2p_protoc.rs`
+    /// (grep `BROADCAST_NO_TARGETS: no targets found after`). Per #4251
     /// re-review M2 (skeptical).
     #[test]
     fn no_targets_propagation_logs_at_debug_pin_test() {
@@ -957,16 +956,74 @@ mod tests {
         let idx = source
             .find(needle)
             .expect("NO_TARGETS log message must still exist in source");
-        let start = idx.saturating_sub(400);
-        let window = &source[start..idx];
+        // Anchor on the closest preceding `tracing::` macro (rfind) rather
+        // than a byte window, so the assertion is immune to refactors that
+        // move the target site relative to other nearby tracing macros.
+        // Adopted from the #4272 pin tests; see those for rationale.
+        let preceding = &source[..idx];
+        let macro_idx = preceding
+            .rfind("tracing::")
+            .expect("a tracing macro must precede the NO_TARGETS log site");
+        let line_start = preceding[..macro_idx].rfind('\n').map_or(0, |n| n + 1);
+        let line_prefix = &preceding[line_start..macro_idx];
         assert!(
-            window.contains("tracing::debug!"),
-            "NO_TARGETS log site must be DEBUG to avoid 4x amplification on retries. \
-             Re-promotion to WARN/INFO regresses #4251 review M2.\nWindow:\n{window}"
+            line_prefix.chars().all(char::is_whitespace),
+            "rfind matched `tracing::` inside a string literal or comment, \
+             not a macro invocation. Prefix on its line: {line_prefix:?}"
         );
+        let after_macro = &preceding[macro_idx + "tracing::".len()..];
+        let macro_name = after_macro.split('!').next().unwrap_or("");
+        let tail = &preceding[preceding.len().saturating_sub(200)..];
+        assert_eq!(
+            macro_name, "debug",
+            "NO_TARGETS log site must be DEBUG to avoid 4x amplification on retries \
+             (closest preceding macro is `tracing::{macro_name}!`). \
+             Re-promotion to WARN/INFO regresses #4251 review M2.\n\
+             Preceding source (last 200 bytes):\n{tail}"
+        );
+    }
+
+    /// Source-level pin for the `UPDATE_PROPAGATION` broadcast (populated-
+    /// targets) branch. Fires once per fan-out per UPDATE — at INFO it was
+    /// ~43% of the post-#4252 log volume on a River-subscribed peer (see
+    /// #4251 follow-up). The `phase = "broadcast",` literal disambiguates
+    /// this site from the NO_TARGETS branch pinned above (whose phase is
+    /// `"warning"`).
+    ///
+    /// Anchored on the *closest* preceding `tracing::` macro via `rfind`
+    /// rather than a byte-window scan, so the assertion can't false-pass
+    /// when the macro's arg list grows and a window-based check sees an
+    /// earlier unrelated `tracing::debug!` site.
+    #[test]
+    fn broadcast_propagation_logs_at_debug_pin_test() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/operations/update.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("must read own source at {}: {e}", path.display()));
+        let needle = "phase = \"broadcast\",";
+        let idx = source
+            .find(needle)
+            .expect("UPDATE_PROPAGATION broadcast log site must still exist in source");
+        let preceding = &source[..idx];
+        let macro_idx = preceding
+            .rfind("tracing::")
+            .expect("a tracing macro must precede the broadcast log site");
+        let line_start = preceding[..macro_idx].rfind('\n').map_or(0, |n| n + 1);
+        let line_prefix = &preceding[line_start..macro_idx];
         assert!(
-            !window.contains("tracing::warn!") && !window.contains("tracing::info!"),
-            "NO_TARGETS log site must NOT be WARN/INFO.\nWindow:\n{window}"
+            line_prefix.chars().all(char::is_whitespace),
+            "rfind matched `tracing::` inside a string literal or comment, \
+             not a macro invocation. Prefix on its line: {line_prefix:?}"
+        );
+        let after_macro = &preceding[macro_idx + "tracing::".len()..];
+        let macro_name = after_macro.split('!').next().unwrap_or("");
+        let tail = &preceding[preceding.len().saturating_sub(200)..];
+        assert_eq!(
+            macro_name, "debug",
+            "UPDATE_PROPAGATION broadcast log site must be DEBUG \
+             (closest preceding macro is `tracing::{macro_name}!`). \
+             Re-promotion to INFO/WARN restores the #4251 / #4272 log-volume regression.\n\
+             Preceding source (last 200 bytes):\n{tail}"
         );
     }
 

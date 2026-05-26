@@ -2153,7 +2153,7 @@ where
             );
         }
 
-        tracing::info!(
+        tracing::debug!(
             contract = %key,
             new_size_bytes = new_state.as_ref().len(),
             phase = "update_complete",
@@ -2194,7 +2194,16 @@ where
                     new_state: new_state.clone(),
                 })
             {
-                tracing::warn!(
+                // Best-effort by design (see comment block above and
+                // #4145): a missed broadcast heals via the next UPDATE
+                // or summary-mismatch SyncStateToPeer round. Per-
+                // occurrence WARN here flooded gateways under fan-out
+                // at the same rate as the helper-internal log it
+                // mirrored (#4238). The rate-limited `notify_node_event:
+                // Notification channel full for too long` ERROR in
+                // op_state_manager.rs is the sustained-back-pressure
+                // alert operators should grep for.
+                tracing::debug!(
                     contract = %key,
                     error = %err,
                     "Failed to broadcast state change to network peers (best-effort)"
@@ -2531,7 +2540,11 @@ where
                     new_state,
                 })
             {
-                tracing::warn!(
+                // Best-effort by design — see #4145 and the sibling
+                // commit path above. Per-occurrence WARN here re-
+                // introduced the #4238 spam at the caller layer even
+                // after the helper-internal downgrade.
+                tracing::debug!(
                     contract = %key,
                     error = %err,
                     "Failed to broadcast state change to network peers (best-effort)"
@@ -4327,6 +4340,46 @@ mod executor_pin_tests {
             after_marker[..2_000].contains("join_all"),
             "UPDATE-side inline related fetch must call \
              futures::future::join_all (#4077)"
+        );
+    }
+
+    /// Pin: the `"Contract state updated"` notice fires on every successful
+    /// state write — at INFO it contributed ~44% of the post-#4252
+    /// log-volume regression on River-subscribed peers (see #4251 follow-up
+    /// PR). Re-promoting it would silently restore the disk-fill issue.
+    ///
+    /// Anchored on the *closest* preceding `tracing::` macro via `rfind` so
+    /// the assertion can't false-pass if an unrelated nearby site is at
+    /// DEBUG. An additional guard rejects matches inside string literals or
+    /// comments by requiring the match to start a code line (whitespace-only
+    /// prefix on its line).
+    #[test]
+    fn contract_state_updated_logs_at_debug_pin_test() {
+        let src = include_str!("runtime.rs");
+        let needle = "\"Contract state updated\"";
+        let idx = src
+            .find(needle)
+            .expect("Contract state updated log message must still exist in source");
+        let preceding = &src[..idx];
+        let macro_idx = preceding
+            .rfind("tracing::")
+            .expect("a tracing macro must precede the Contract-state-updated log site");
+        let line_start = preceding[..macro_idx].rfind('\n').map_or(0, |n| n + 1);
+        let line_prefix = &preceding[line_start..macro_idx];
+        assert!(
+            line_prefix.chars().all(char::is_whitespace),
+            "rfind matched `tracing::` inside a string literal or comment, \
+             not a macro invocation. Prefix on its line: {line_prefix:?}"
+        );
+        let after_macro = &preceding[macro_idx + "tracing::".len()..];
+        let macro_name = after_macro.split('!').next().unwrap_or("");
+        let tail = &preceding[preceding.len().saturating_sub(200)..];
+        assert_eq!(
+            macro_name, "debug",
+            "Contract-state-updated log site must be at DEBUG \
+             (closest preceding macro is `tracing::{macro_name}!`). \
+             Re-promotion to INFO/WARN restores the #4251 / #4272 log-volume regression.\n\
+             Preceding source (last 200 bytes):\n{tail}"
         );
     }
 }

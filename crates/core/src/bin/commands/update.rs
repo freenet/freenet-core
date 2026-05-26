@@ -1683,7 +1683,7 @@ fn hdiutil_detach(mount_point: &Path) -> Result<()> {
 /// even when installed from crates.io without the `scripts/` directory.
 #[cfg(target_os = "macos")]
 fn write_updater_script() -> Result<PathBuf> {
-    const SCRIPT: &str = include_str!("../../../../../scripts/macos-bundle-updater.sh");
+    const SCRIPT: &str = include_str!("../../../scripts/macos-bundle-updater.sh");
     let dir = updater_runtime_dir()?;
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("macos-bundle-updater.sh");
@@ -2031,5 +2031,19 @@ StandardError=journal
         // A hypothetical tag like `vv0.2.49` (broken, but should not
         // silently eat both leading chars): verify we strip just one.
         assert_eq!(macos_dmg_asset_name("vv0.2.49"), "Freenet-v0.2.49.dmg");
+    }
+
+    #[test]
+    fn embedded_updater_script_resolves_inside_freenet_crate() {
+        // Regression for #4240 — the include_str! path used to walk
+        // outside the crate, so cargo publish dropped the script and
+        // `cargo install freenet` failed at build time. Re-included
+        // here so non-macOS CI also exercises the path. The packaging
+        // half is asserted in .github/workflows/ci.yml.
+        const SCRIPT: &str = include_str!("../../../scripts/macos-bundle-updater.sh");
+        assert!(
+            SCRIPT.contains("macOS DMG-swap updater"),
+            "include_str! resolved to the wrong file"
+        );
     }
 }

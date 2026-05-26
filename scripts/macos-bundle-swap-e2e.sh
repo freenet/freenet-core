@@ -1,5 +1,5 @@
 #!/bin/bash
-# End-to-end test for scripts/macos-bundle-updater.sh.
+# End-to-end test for crates/core/scripts/macos-bundle-updater.sh.
 #
 # Builds two minimal unsigned .app bundles ("v1" and "v2"), launches v1 via
 # /usr/bin/open, invokes the updater script with v2 staged as a sibling,
@@ -26,7 +26,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-UPDATER="$REPO_ROOT/scripts/macos-bundle-updater.sh"
+UPDATER="$REPO_ROOT/crates/core/scripts/macos-bundle-updater.sh"
 STUB_SRC="$REPO_ROOT/scripts/macos-bundle-swap-e2e-stub.c"
 
 if [[ ! -x "$UPDATER" ]]; then
