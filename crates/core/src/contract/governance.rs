@@ -43,7 +43,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use freenet_stdlib::prelude::ContractKey;
+use freenet_stdlib::prelude::ContractInstanceId;
 use tokio::time::Instant;
 
 use crate::governance::{OutlierConfig, OutlierResult, SkipReason, detect_outliers};
@@ -346,7 +346,7 @@ impl Default for GovernanceConfig {
 /// always recorded in the contract's `history`, regardless of mode.
 #[derive(Clone, Debug)]
 pub(crate) struct ReaperDecision {
-    pub key: ContractKey,
+    pub key: ContractInstanceId,
     pub from: GovernanceState,
     pub to: GovernanceState,
     pub reason: TransitionReason,
@@ -392,7 +392,7 @@ pub(crate) struct GovernanceManager<T: TimeSource> {
     /// rule: fine-grained shard locking lets the meter + the reaper
     /// tick + the receive-boundary check all read/write
     /// independently without serializing on a global lock.
-    scores: DashMap<ContractKey, ContractScore>,
+    scores: DashMap<ContractInstanceId, ContractScore>,
     /// Configuration; cloned cheaply when the reaper tick reads its
     /// fields.
     config: GovernanceConfig,
@@ -412,7 +412,7 @@ impl<T: TimeSource> GovernanceManager<T> {
     /// Add a cost sample to a contract's `cost_used`. Called from the
     /// Meter wiring (subsequent commit) on every per-contract resource
     /// report. If the contract is new, creates a `Normal`-state score.
-    pub(crate) fn ingest_cost(&self, key: ContractKey, amount: f64) {
+    pub(crate) fn ingest_cost(&self, key: ContractInstanceId, amount: f64) {
         if !amount.is_finite() || amount < 0.0 {
             return;
         }
@@ -429,7 +429,7 @@ impl<T: TimeSource> GovernanceManager<T> {
     /// observed local/forwarded GET / SUBSCRIBE / client-attach.
     /// Weight comes from the caller (local vs forwarded weighting
     /// applied at the call site).
-    pub(crate) fn ingest_demand(&self, key: ContractKey, weight: f64) {
+    pub(crate) fn ingest_demand(&self, key: ContractInstanceId, weight: f64) {
         if !weight.is_finite() || weight <= 0.0 {
             return;
         }
@@ -444,7 +444,7 @@ impl<T: TimeSource> GovernanceManager<T> {
     /// Look up the current score for a contract, for dashboard reads.
     /// Returns a cloned snapshot; the dashboard doesn't need (and
     /// shouldn't have) write access.
-    pub(crate) fn score_snapshot(&self, key: &ContractKey) -> Option<ContractScore> {
+    pub(crate) fn score_snapshot(&self, key: &ContractInstanceId) -> Option<ContractScore> {
         self.scores.get(key).map(|s| s.clone())
     }
 
@@ -481,7 +481,7 @@ impl<T: TimeSource> GovernanceManager<T> {
         // Banned → Normal transition is unconditional after `ban_ttl`
         // passes since the BanTriggered transition (recorded in
         // `last_transition`).
-        let mut ban_lifted: Vec<ContractKey> = Vec::new();
+        let mut ban_lifted: Vec<ContractInstanceId> = Vec::new();
         for mut entry in self.scores.iter_mut() {
             entry.decay(tick_interval, self.config.decay_half_life);
             if entry.state == GovernanceState::Banned {
@@ -496,7 +496,7 @@ impl<T: TimeSource> GovernanceManager<T> {
         //    window are excluded — a new contract whose benefit hasn't
         //    accumulated yet would skew the distribution and might be
         //    flagged for being new rather than for being abusive.
-        let actionable_samples: HashMap<ContractKey, f64> = self
+        let actionable_samples: HashMap<ContractInstanceId, f64> = self
             .scores
             .iter()
             .filter_map(|entry| {
@@ -515,7 +515,7 @@ impl<T: TimeSource> GovernanceManager<T> {
             .collect();
 
         // 3. Run MAD detection on the sample.
-        let outlier_result: OutlierResult<ContractKey> = detect_outliers(
+        let outlier_result: OutlierResult<ContractInstanceId> = detect_outliers(
             &actionable_samples,
             |&r| Some(r),
             &self.config.outlier,
@@ -529,7 +529,7 @@ impl<T: TimeSource> GovernanceManager<T> {
         //    - Otherwise → Normal (or stay where it is if recently
         //      transitioned and recovering)
         let mut decisions: Vec<ReaperDecision> = Vec::new();
-        let flagged: std::collections::HashSet<ContractKey> =
+        let flagged: std::collections::HashSet<ContractInstanceId> =
             outlier_result.flagged.iter().cloned().collect();
         let actionable = self.config.mode.evicts();
         // Borderline cutoff is only meaningful when MAD is non-zero.
@@ -804,13 +804,10 @@ mod tests {
     // ============================================================
 
     use crate::util::time_source::MockTimeSource;
-    use freenet_stdlib::prelude::{CodeHash, ContractInstanceId};
+    use freenet_stdlib::prelude::ContractInstanceId;
 
-    fn mk_key(seed: u8) -> ContractKey {
-        ContractKey::from_id_and_code(
-            ContractInstanceId::new([seed; 32]),
-            CodeHash::new([seed.wrapping_add(1); 32]),
-        )
+    fn mk_key(seed: u8) -> ContractInstanceId {
+        ContractInstanceId::new([seed; 32])
     }
 
     /// Mutex-wrapping the time source for tests where we need to
