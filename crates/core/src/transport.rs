@@ -432,6 +432,9 @@ impl Socket for UdpSocket {
         // packets they delivered until operators raised the sysctls manually
         // (see #3844). The kernel silently clamps to net.core.rmem_max, so we
         // also surface the actual size to give operators actionable diagnostics.
+        //
+        // Best-effort: failures log a warn and bind proceeds with whatever
+        // buffer the kernel had — we don't fail bind over a tuning hint.
         const DESIRED_UDP_BUF_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
         if let Err(e) = sock.set_recv_buffer_size(DESIRED_UDP_BUF_BYTES) {
             tracing::warn!(error = %e, "failed to request UDP recv buffer size");
@@ -439,22 +442,38 @@ impl Socket for UdpSocket {
         if let Err(e) = sock.set_send_buffer_size(DESIRED_UDP_BUF_BYTES) {
             tracing::warn!(error = %e, "failed to request UDP send buffer size");
         }
-        let actual_rcv = sock.recv_buffer_size().unwrap_or(0);
-        let actual_snd = sock.send_buffer_size().unwrap_or(0);
-        // Linux doubles the requested value internally (kernel bookkeeping), so an
-        // unclamped 16 MiB request returns ~32 MiB. macOS/BSD do not double, so an
-        // unclamped request returns ~16 MiB. We treat anything below half the
-        // request as a clamp signal — that catches the stock-Linux case (rmem_max
-        // ≈ 208 KiB → ~416 KiB actual) without false-positives on platforms that
-        // don't double.
-        if actual_rcv < DESIRED_UDP_BUF_BYTES / 2 {
-            tracing::warn!(
-                requested = DESIRED_UDP_BUF_BYTES,
-                actual_rcv,
-                "UDP recv buffer smaller than requested — raise net.core.rmem_max (currently clamped by kernel)"
-            );
+        // `ok()` (not `unwrap_or(0)`) so a getsockopt failure doesn't masquerade
+        // as a 0-byte buffer and trip the clamp warning below.
+        let actual_rcv = sock.recv_buffer_size().ok();
+        let actual_snd = sock.send_buffer_size().ok();
+        // Linux's stock rmem_max ≈ 208 KiB is the documented production problem.
+        // setsockopt(SO_RCVBUF) on Linux sets sk_rcvbuf = min(val, rmem_max) * 2,
+        // so an unclamped 16 MiB request returns ~32 MiB. macOS/BSD default
+        // `kern.ipc.maxsockbuf` is 4 MiB and they don't double — already ~20x
+        // stock Linux, so a clamp there isn't worth alerting on, and the
+        // "raise net.core.rmem_max" advice in this warning is Linux-specific.
+        #[cfg(target_os = "linux")]
+        {
+            if let Some(rcv) = actual_rcv {
+                if rcv < DESIRED_UDP_BUF_BYTES / 2 {
+                    tracing::warn!(
+                        requested = DESIRED_UDP_BUF_BYTES,
+                        actual_rcv = rcv,
+                        "UDP recv buffer smaller than requested — raise net.core.rmem_max (kernel clamped the request)"
+                    );
+                }
+            }
+            if let Some(snd) = actual_snd {
+                if snd < DESIRED_UDP_BUF_BYTES / 2 {
+                    tracing::warn!(
+                        requested = DESIRED_UDP_BUF_BYTES,
+                        actual_snd = snd,
+                        "UDP send buffer smaller than requested — raise net.core.wmem_max (kernel clamped the request)"
+                    );
+                }
+            }
         }
-        tracing::info!(actual_rcv, actual_snd, "UDP socket buffer sizes");
+        tracing::info!(actual_rcv = ?actual_rcv, actual_snd = ?actual_snd, "UDP socket buffer sizes");
         sock.bind(&addr.into()).map_err(|e| {
             io::Error::new(
                 e.kind(),
@@ -1070,40 +1089,26 @@ mod dual_stack_tests {
         );
     }
 
-    /// Read the kernel's effective UDP recv buffer ceiling on Linux. Returns
-    /// `None` on other platforms or if the sysctl is unreadable. Used by the
-    /// SO_RCVBUF regression test below to decide whether the environment can
-    /// demonstrate the fix.
-    fn read_sysctl_rmem_max() -> Option<usize> {
-        if !cfg!(target_os = "linux") {
-            return None;
-        }
-        std::fs::read_to_string("/proc/sys/net/core/rmem_max")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-    }
-
-    /// Regression for #3844: `Socket::bind` must request a generous UDP socket
-    /// buffer (16 MiB) so production gateways aren't silently dropping packets
-    /// to the kernel's stock ~208 KiB default. Both nova and vega were
-    /// accumulating UdpRcvbufErrors at 15× the delivered-datagram rate until
-    /// operators raised `net.core.rmem_max` manually.
+    /// Bind a control socket via raw `tokio::net::UdpSocket::bind` and a tuned
+    /// socket via our `Socket::bind` impl at the same address family, read
+    /// back SO_RCVBUF / SO_SNDBUF on both, and enforce the regression
+    /// invariants below.
     ///
-    /// Method: bind a control socket directly (no buffer tuning) and a tuned
-    /// socket through our `Socket::bind` impl, then compare the resulting
-    /// SO_RCVBUF / SO_SNDBUF values. On constrained kernels where rmem_max
-    /// clamps both sockets to the same default, only the weak `tuned >=
-    /// control` invariant holds. On any system where rmem_max permits a
-    /// multi-megabyte request to materialize, the tuned socket must end up
-    /// with a strictly larger buffer than the untuned control — that's the
-    /// observable effect of the fix.
-    #[tokio::test]
-    async fn udp_socket_bind_requests_large_buffers() {
-        let v4_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
-
-        // Control: bind directly via tokio without going through our
-        // Socket::bind impl, so no buffer-size hints are applied.
-        let control = tokio::net::UdpSocket::bind(v4_addr)
+    /// **Weak invariant (all platforms):** the tuned socket must never end up
+    /// with a smaller buffer than the untuned control. setsockopt either
+    /// succeeds, gets clamped, or fails — none of those paths should produce
+    /// a smaller buffer than the un-tuned default.
+    ///
+    /// **Strict invariant (Linux):** `tuned > control`. Linux's
+    /// `setsockopt(SO_RCVBUF, val)` sets `sk_rcvbuf = min(val, rmem_max) * 2`,
+    /// but the un-tuned socket inherits `rmem_default` *without* the
+    /// doubling. So on stock Ubuntu (rmem_max = rmem_default = 212992) the
+    /// tuned socket lands at 425984 while the control sits at 212992 —
+    /// strictly larger. Deleting `set_recv_buffer_size` / `set_send_buffer_size`
+    /// collapses that gap and the strict assertion fires.
+    async fn assert_tuned_bind_grows_buffers(addr: SocketAddr) {
+        // Control: raw bind, no buffer-size hints applied.
+        let control = tokio::net::UdpSocket::bind(addr)
             .await
             .expect("control bind should succeed");
         let control_sock2 = socket2::Socket::from(control.into_std().expect("into_std"));
@@ -1116,7 +1121,7 @@ mod dual_stack_tests {
 
         // Tuned: bind via our Socket::bind, which should request 16 MiB
         // SO_RCVBUF / SO_SNDBUF before bind.
-        let tuned = <UdpSocket as Socket>::bind(v4_addr)
+        let tuned = <UdpSocket as Socket>::bind(addr)
             .await
             .expect("tuned bind should succeed");
         let tuned_sock2 = socket2::Socket::from(tuned.into_std().expect("into_std"));
@@ -1127,9 +1132,6 @@ mod dual_stack_tests {
             .send_buffer_size()
             .expect("tuned send_buffer_size");
 
-        // Weak invariant: the tuned socket must never end up with a smaller
-        // buffer than the untuned control. This holds on every platform,
-        // even when rmem_max clamps both to the same default.
         assert!(
             tuned_rcv >= control_rcv,
             "tuned recv buffer ({tuned_rcv}) must be at least as large as control ({control_rcv})"
@@ -1139,25 +1141,37 @@ mod dual_stack_tests {
             "tuned send buffer ({tuned_snd}) must be at least as large as control ({control_snd})"
         );
 
-        // Strict regression check: on Linux with rmem_max large enough to
-        // honor a multi-MB request, the tuned buffer MUST be strictly
-        // larger than the untuned default. This is the assertion that
-        // would have caught the missing set_recv_buffer_size call.
-        if let Some(rmem_max) = read_sysctl_rmem_max()
-            && rmem_max >= 4 * 1024 * 1024
+        #[cfg(target_os = "linux")]
         {
             assert!(
                 tuned_rcv > control_rcv,
-                "with rmem_max={rmem_max}, tuned SO_RCVBUF ({tuned_rcv}) must \
-                 strictly exceed untuned default ({control_rcv}) — the fix did not take effect"
+                "Linux: tuned SO_RCVBUF ({tuned_rcv}) must strictly exceed \
+                 untuned control ({control_rcv}) — the fix did not take effect"
             );
-        } else {
-            eprintln!(
-                "udp_socket_bind_requests_large_buffers: rmem_max={:?} too small \
-                 to demonstrate fix strictly; observed control_rcv={control_rcv}, \
-                 tuned_rcv={tuned_rcv}, control_snd={control_snd}, tuned_snd={tuned_snd}",
-                read_sysctl_rmem_max()
+            assert!(
+                tuned_snd > control_snd,
+                "Linux: tuned SO_SNDBUF ({tuned_snd}) must strictly exceed \
+                 untuned control ({control_snd}) — the fix did not take effect"
             );
         }
+    }
+
+    /// Regression for #3844 (IPv4 path): `Socket::bind` must request a generous
+    /// UDP socket buffer so production gateways aren't silently dropping
+    /// packets to the kernel's stock ~208 KiB default. Both nova and vega
+    /// were accumulating UdpRcvbufErrors at 15× the delivered-datagram rate
+    /// until operators raised `net.core.rmem_max` manually.
+    #[tokio::test]
+    async fn udp_socket_bind_requests_large_buffers_ipv4() {
+        let v4_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+        assert_tuned_bind_grows_buffers(v4_addr).await;
+    }
+
+    /// Regression for #3844 (IPv6 path): the tuning must apply equally to the
+    /// dual-stack `[::]:port` bind that gateways actually use in production.
+    #[tokio::test]
+    async fn udp_socket_bind_requests_large_buffers_ipv6() {
+        let v6_addr = SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0);
+        assert_tuned_bind_grows_buffers(v6_addr).await;
     }
 }
