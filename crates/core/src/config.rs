@@ -477,6 +477,24 @@ impl ConfigArgs {
                 // Inline gateways were provided via --gateways flag, use those
                 remotely_loaded_gateways
             }
+        } else if self.network_api.skip_load_from_network && has_cli_gateways {
+            // #3980: Strict additive --gateway semantics under
+            // skip_load_from_network. When the user explicitly passes
+            // --gateway, treat that as the complete bootstrap set: do NOT
+            // merge in the on-disk gateways.toml cache (which on a default
+            // install lists public production peers like nova/vega). The
+            // explicit --gateway entries are merged below.
+            //
+            // When --gateway is NOT supplied under skip_load_from_network,
+            // the on-disk gateways.toml is still read (next branch). This
+            // preserves the contract used by isolated test harnesses
+            // (e.g. freenet-test-network's Docker NAT setup) that
+            // pre-populate gateways.toml in a custom --config-dir.
+            tracing::info!(
+                "skip_load_from_network with --gateway entries: \
+                 ignoring on-disk gateways.toml; using only CLI-supplied gateways"
+            );
+            Gateways { gateways: vec![] }
         } else {
             // Either skip_load_from_network is set (use local file only), or the
             // remote fetch failed and we need to fall back to the local cache.
@@ -893,7 +911,12 @@ pub struct NetworkArgs {
     #[arg(long)]
     pub is_gateway: bool,
 
-    /// Skips loading gateway configurations from the network and merging it with existing one.
+    /// Skip fetching the remote gateway index. When combined with --gateway,
+    /// the explicit CLI entries also REPLACE (not merge with) any on-disk
+    /// gateways.toml cache — useful for fully isolated test setups. With
+    /// neither --gateway nor --gateways supplied, the on-disk gateways.toml
+    /// is still read (preserved for test harnesses that pre-populate it via
+    /// --config-dir).
     #[arg(long)]
     pub skip_load_from_network: bool,
 
@@ -1251,8 +1274,11 @@ pub struct NetworkApiConfig {
     pub bbr_startup_rate: Option<u64>,
 
     /// When true, this node is part of a local/test network and does not load
-    /// gateways from the public index. Used to disable the relay-ready gate
-    /// and other production-only features.
+    /// gateways from the public remote index. Used to disable the relay-ready
+    /// gate and other production-only features. When combined with --gateway,
+    /// the on-disk gateways.toml is also skipped (the explicit CLI entries
+    /// become the complete bootstrap set); without --gateway, the on-disk
+    /// gateways.toml is still read.
     #[serde(default)]
     pub skip_load_from_network: bool,
 }
@@ -3440,6 +3466,125 @@ mod tests {
             err.to_string()
                 .contains("Cannot initialize node without gateways"),
             "Expected 'Cannot initialize node without gateways', got: {err}"
+        );
+    }
+
+    /// Regression test for #3980: when `--skip-load-from-network` is combined
+    /// with an explicit `--gateway` entry, the on-disk `gateways.toml` must
+    /// NOT be merged into the result. Without this guarantee, a default-install
+    /// machine whose `gateways.toml` lists public peers (e.g. nova/vega) would
+    /// have those public peers dialed by an "isolated" test node — exactly
+    /// the leak #3980 reported.
+    ///
+    /// Note: when --gateway is NOT supplied under skip_load_from_network, the
+    /// on-disk gateways.toml IS still read — that path is the contract used
+    /// by isolated test harnesses (e.g. freenet-test-network's Docker NAT)
+    /// that pre-populate gateways.toml in a custom --config-dir.
+    #[tokio::test]
+    async fn test_skip_load_from_network_with_cli_gateway_ignores_on_disk_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path();
+        let gateways_file = config_dir.join("gateways.toml");
+
+        // Pre-populate gateways.toml with a "production" gateway entry that
+        // the test must NOT leak to the final config.
+        let public_gateway_addr: SocketAddr = "203.0.113.99:31337".parse().unwrap();
+        let preexisting = toml::to_string(&Gateways {
+            gateways: vec![GatewayConfig {
+                address: Address::HostAddress(public_gateway_addr),
+                public_key_path: PathBuf::from("public_gateway.pub"),
+                location: None,
+            }],
+        })
+        .unwrap();
+        fs::write(&gateways_file, preexisting).unwrap();
+
+        let isolated_keypair = TransportKeypair::new();
+        let isolated_key_hex = hex::encode(isolated_keypair.public().as_bytes());
+        let isolated_addr: SocketAddr = "127.0.0.1:31338".parse().unwrap();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir.to_path_buf()),
+                data_dir: Some(config_dir.to_path_buf()),
+                log_dir: Some(config_dir.to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                gateway: Some(vec![format!("{isolated_addr},{isolated_key_hex}")]),
+                skip_load_from_network: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let cfg = args.build().await.unwrap();
+
+        // The CLI-provided isolated gateway must be the ONLY entry. The public
+        // gateway from the on-disk file must NOT leak into the final list.
+        assert_eq!(cfg.gateways.len(), 1, "gateways={:?}", cfg.gateways);
+        assert_eq!(
+            cfg.gateways[0].address,
+            Address::HostAddress(isolated_addr),
+            "isolated gateway should be selected"
+        );
+        assert!(
+            !cfg.gateways
+                .iter()
+                .any(|gw| gw.address == Address::HostAddress(public_gateway_addr)),
+            "on-disk gateways.toml leaked into final config despite skip_load_from_network"
+        );
+    }
+
+    /// Companion to #3980: under `--skip-load-from-network` with NO `--gateway`
+    /// CLI entries, the on-disk `gateways.toml` MUST still be read. This is
+    /// the contract used by isolated test harnesses (notably
+    /// freenet-test-network's Docker NAT path) that pre-populate
+    /// `gateways.toml` in a custom `--config-dir`. Regressed once during
+    /// review of #4264 when the skip path was widened too aggressively;
+    /// keep this test to pin the contract.
+    #[tokio::test]
+    async fn test_skip_load_from_network_without_cli_gateways_reads_on_disk_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path();
+        let gateways_file = config_dir.join("gateways.toml");
+
+        let test_gateway_addr: SocketAddr = "10.20.30.40:31337".parse().unwrap();
+        let preexisting = toml::to_string(&Gateways {
+            gateways: vec![GatewayConfig {
+                address: Address::HostAddress(test_gateway_addr),
+                public_key_path: PathBuf::from("test_gateway.pub"),
+                location: None,
+            }],
+        })
+        .unwrap();
+        fs::write(&gateways_file, preexisting).unwrap();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir.to_path_buf()),
+                data_dir: Some(config_dir.to_path_buf()),
+                log_dir: Some(config_dir.to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                is_gateway: false,
+                // No --gateway / --gateways supplied; harness pre-populated
+                // gateways.toml is the only bootstrap source.
+                public_address: Some("198.51.100.1".parse().unwrap()),
+                public_port: Some(31338),
+                skip_load_from_network: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let cfg = args.build().await.unwrap();
+        assert_eq!(cfg.gateways.len(), 1, "gateways={:?}", cfg.gateways);
+        assert_eq!(
+            cfg.gateways[0].address,
+            Address::HostAddress(test_gateway_addr),
+            "on-disk gateways.toml must be honored when --gateway is not supplied"
         );
     }
 
