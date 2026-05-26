@@ -217,6 +217,38 @@ impl PartialOrd for AttributionSource {
     }
 }
 
+impl AttributionSource {
+    /// Whether this source can plausibly contribute samples to the given
+    /// resource type. Used to filter the `source_creation_times`
+    /// iteration in `topology::extrapolated_usage` so a Contract source
+    /// (which never produces bandwidth samples) doesn't get a phantom
+    /// non-zero bandwidth rate synthesized for it during its 5-min
+    /// ramp-up window — that synthesized rate would otherwise inflate
+    /// the topology's perceived bandwidth usage and trigger spurious
+    /// connection removals every time a contract is reported.
+    pub(crate) fn contributes_to(&self, resource: &ResourceType) -> bool {
+        use AttributionSource::*;
+        use ResourceType::*;
+        match (self, resource) {
+            // Peer sources produce the bandwidth samples that drive
+            // topology load-shedding.
+            (Peer(_), InboundBandwidthBytes | OutboundBandwidthBytes) => true,
+            // Delegate sources predate this PR; their existing usage
+            // pattern is bandwidth-relevant for accounting purposes.
+            (Delegate(_), InboundBandwidthBytes | OutboundBandwidthBytes) => true,
+            // Contract sources contribute the four contract-governance
+            // resource types (CPU, fuel, state-bytes, fan-out cost) and
+            // NEVER bandwidth — those are peer-attributed even when the
+            // contract is the originator.
+            (
+                Contract(_),
+                ExecCpuMicros | ExecFuelUnits | StateBytesWritten | BroadcastFanoutCost,
+            ) => true,
+            _ => false,
+        }
+    }
+}
+
 impl Ord for AttributionSource {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // Variant discriminant defines the cross-variant ordering;
