@@ -4336,17 +4336,28 @@ pub mod tracer {
                     ));
                 }
 
-                // Apply rate limiting as a global filter if enabled
-                // Layers must be created after the rate filter to ensure type compatibility
+                // Apply rate limiting as a global filter if enabled.
+                //
+                // We MUST use `DynFilterFn` here, NOT `filter_fn`. The latter
+                // assumes the closure is callsite-cacheable (no Context arg)
+                // and so calls `callsite_enabled` ONCE per callsite, caching
+                // the first result as `Interest::always`/`never`. That makes
+                // every stateful rate-limit filter a no-op for the second and
+                // subsequent events from the same macro — exactly the bug
+                // that let issue #4251 spam slip past the pre-existing global
+                // `RateLimiter`. `DynFilterFn` defaults to `Interest::sometimes`,
+                // so `enabled` is invoked per event. (Caught by codex review on
+                // PR #4273 — see the PR thread.)
                 if let Some(rate_limiter) = rate_limiter.clone() {
                     let per_callsite = per_callsite_limiter.clone();
-                    let rate_filter = tracing_subscriber::filter::filter_fn(move |meta| {
-                        per_callsite
-                            .as_ref()
-                            .map(|pc| pc.should_allow(meta))
-                            .unwrap_or(true)
-                            && rate_limiter.should_allow()
-                    });
+                    let rate_filter =
+                        tracing_subscriber::filter::DynFilterFn::new(move |meta, _cx| {
+                            per_callsite
+                                .as_ref()
+                                .map(|pc| pc.should_allow(meta))
+                                .unwrap_or(true)
+                                && rate_limiter.should_allow()
+                        });
                     let base = Registry::default().with(rate_filter);
 
                     // Create layers for main and error logs (typed against rate-filtered registry)
@@ -4489,11 +4500,12 @@ pub mod tracer {
             }
         }
 
-        // Apply rate limiting as a global filter if enabled
-        // Layers must be created after the rate filter to ensure type compatibility
+        // Apply rate limiting as a global filter if enabled.
+        // See the equivalent block in `init_tracer` above for why this MUST
+        // use `DynFilterFn` rather than `filter_fn`.
         if let Some(rate_limiter) = rate_limiter {
             let per_callsite = per_callsite_limiter.clone();
-            let rate_filter = tracing_subscriber::filter::filter_fn(move |meta| {
+            let rate_filter = tracing_subscriber::filter::DynFilterFn::new(move |meta, _cx| {
                 per_callsite
                     .as_ref()
                     .map(|pc| pc.should_allow(meta))

@@ -19,7 +19,7 @@
 //! use crate::util::rate_limit_layer::{PerCallsiteRateLimiter, RateLimiter};
 //!
 //! let global = RateLimiter::with_defaults();           // 1000 ev/sec total
-//! let per_site = PerCallsiteRateLimiter::with_defaults(); // 30 ev/sec per callsite
+//! let per_site = PerCallsiteRateLimiter::with_defaults(); // 100 ev/sec per callsite
 //!
 //! let filter = tracing_subscriber::filter::filter_fn(move |meta| {
 //!     per_site.should_allow(meta) && global.should_allow()
@@ -28,7 +28,7 @@
 
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::time::Instant;
 use tracing_core::Metadata;
@@ -39,11 +39,16 @@ pub const DEFAULT_MAX_EVENTS_PER_SECOND: u64 = 1000;
 
 /// Default maximum events per second per callsite.
 ///
-/// Picked so that a misbehaving WARN macro is capped at ~108k events/hr,
-/// well under the historical ~140 MB/hr error log baseline that triggered
-/// issue #4251. Real bursts (e.g. a flurry of legitimate errors on startup)
-/// still pass through up to this rate per callsite.
-pub const DEFAULT_MAX_EVENTS_PER_CALLSITE_PER_SECOND: u64 = 30;
+/// 100 / sec / callsite caps any single misbehaving WARN macro at
+/// ~360k events/hr — far under the ~140 MB/hr disk-fill rate that
+/// triggered issue #4251 — while still leaving enough headroom for
+/// legitimate WARN bursts during incident response (e.g. a
+/// "connection refused from {peer}" macro firing once per
+/// disconnected peer during a mass reconnect storm). The global
+/// 1000 / sec aggregate cap remains the next line of defence.
+/// Override via `FREENET_LOG_RATE_LIMIT_PER_CALLSITE` if your
+/// deployment needs tighter or looser bounds.
+pub const DEFAULT_MAX_EVENTS_PER_CALLSITE_PER_SECOND: u64 = 100;
 
 /// Cap on the number of distinct callsites tracked. Each callsite holds
 /// one [`CallsiteState`] (~64 B). Once the cap is hit, the per-callsite
@@ -219,6 +224,11 @@ struct PerCallsiteInner {
     last_summary_nanos: AtomicU64,
     summary_interval: Duration,
     start_instant: Instant,
+    /// One-shot latch — set the first time `MAX_TRACKED_CALLSITES` is hit
+    /// and a brand-new callsite has to degrade to "always pass". Operators
+    /// need a visible signal when the table is saturated; otherwise a
+    /// real spammer that arrives after the cap is silently unbounded.
+    cap_hit_warned: AtomicBool,
 }
 
 struct CallsiteState {
@@ -253,6 +263,7 @@ impl PerCallsiteRateLimiter {
                 last_summary_nanos: AtomicU64::new(0),
                 summary_interval,
                 start_instant: Instant::now(),
+                cap_hit_warned: AtomicBool::new(false),
             }),
         }
     }
@@ -286,7 +297,23 @@ impl PerCallsiteRateLimiter {
             None => {
                 if self.inner.callsites.len() >= MAX_TRACKED_CALLSITES {
                     // Cap hit. Don't insert; let the event through and don't
-                    // count it. Better to log than to OOM.
+                    // count it. Better to log than to OOM. Emit a one-shot
+                    // operator notice so this degraded mode isn't silent.
+                    if self
+                        .inner
+                        .cap_hit_warned
+                        .compare_exchange(false, true, Ordering::SeqCst, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        eprintln!(
+                            "[RATE LIMIT per-callsite] tracked-callsite cap reached \
+                             ({MAX_TRACKED_CALLSITES} entries). New callsites are \
+                             passing through unrate-limited until existing entries \
+                             are reclaimed (they aren't — there is no eviction). \
+                             Investigate whether something is generating unbounded \
+                             unique callsites."
+                        );
+                    }
                     return true;
                 }
                 self.inner
@@ -548,14 +575,79 @@ mod tests {
     }
 
     #[test]
-    fn per_callsite_summary_path_is_safe_against_dashmap_borrow_self_collision() {
-        // Reaching the summary path while a single entry has been borrowed
-        // earlier in the same call has caused deadlocks in past versions of
-        // similar limiters. Drive enough events at summary-interval=1ns to
-        // exercise the summary every iteration and confirm no panic / hang.
+    fn per_callsite_summary_path_smoke_single_threaded() {
+        // Single-threaded smoke test of the summary path: drive enough events
+        // at summary-interval=1ns to exercise the summary every iteration and
+        // confirm no panic. NOTE: this is intentionally only a smoke test —
+        // proving the `drop(entry)` before `maybe_log_summary` is required to
+        // avoid DashMap shard-lock self-collision needs a concurrent writer,
+        // which is hard to deterministically trigger. The drop is defensive
+        // by design.
         static CS_S: TestCallsite = TestCallsite { _tag: 6 };
         let limiter = PerCallsiteRateLimiter::with_summary_interval(2, Duration::from_nanos(1));
         let _ = drive(&limiter, &CS_S, 10, "summary_smoke");
+    }
+
+    /// Regression test for the codex finding on PR #4273: the limiter MUST be
+    /// wired through `DynFilterFn`, not `filter_fn`, or it will only run on
+    /// the first event from each callsite (the rest get `Interest::always`
+    /// from the cached callsite_enabled result).
+    ///
+    /// This test installs the same composition the production tracer uses,
+    /// emits 20 events from a single `tracing::warn!` macro (single callsite),
+    /// and asserts the cap actually fires. With the buggy `filter_fn` wiring
+    /// all 20 events would land at the collector; with `DynFilterFn` only the
+    /// configured cap should pass.
+    #[cfg(feature = "trace")]
+    #[test]
+    fn dynfilter_wiring_actually_filters_per_event() {
+        use std::sync::atomic::AtomicUsize;
+        use tracing_core::Event;
+        use tracing_subscriber::Layer;
+        use tracing_subscriber::layer::{Context, SubscriberExt};
+        use tracing_subscriber::registry::LookupSpan;
+
+        struct CountingLayer {
+            count: Arc<AtomicUsize>,
+        }
+        impl<S> Layer<S> for CountingLayer
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_event(&self, _event: &Event<'_>, _ctx: Context<'_, S>) {
+                self.count.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let count_layer = CountingLayer {
+            count: count.clone(),
+        };
+
+        let limiter = PerCallsiteRateLimiter::new(3);
+        let pc = limiter.clone();
+        let filter =
+            tracing_subscriber::filter::DynFilterFn::new(move |meta, _cx| pc.should_allow(meta));
+
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(count_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            for _ in 0..20 {
+                tracing::warn!(target: "dynfilter_test", "spam");
+            }
+        });
+
+        let observed = count.load(Ordering::SeqCst);
+        assert_eq!(
+            observed, 3,
+            "DynFilterFn must call the limiter per-event; saw {observed} \
+             of 20 events. If this is 20, the limiter is wired through \
+             `filter_fn` (which caches Interest per callsite and only \
+             invokes the closure once per callsite) — switch to \
+             `DynFilterFn`. See codex review on PR #4273."
+        );
     }
 
     #[test]
