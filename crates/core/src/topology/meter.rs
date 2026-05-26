@@ -172,7 +172,7 @@ impl Meter {
     /// Report the use of a resource. This should be done in the lowest-level
     /// functions that consume the resource, taking an AttributionMeter
     /// as a parameter.
-    #[allow(dead_code)] // fixme: use this
+    #[allow(dead_code)] // wired up incrementally by per-resource-type reporters
     pub(crate) fn report(
         &mut self,
         attribution: &AttributionSource,
@@ -193,11 +193,23 @@ impl Meter {
     }
 }
 
-#[allow(dead_code)] // todo use this
+/// What a resource sample is attributed to.
+///
+/// Peer and Delegate variants are the original cost-attribution targets.
+/// Contract was added as part of contract-hardening: every WASM call,
+/// state write, broadcast, and message decode that has a `ContractInstanceId`
+/// in scope can attribute its cost both to the originating peer AND to
+/// the contract, so the per-contract governance scoring can run on the
+/// same meter infrastructure that previously only fed peer-side
+/// load-shedding.
+///
+/// See `docs/design/contract-hardening.md` — "Shared governance module".
+#[allow(dead_code)] // variants constructed incrementally as reporters are wired up
 #[derive(Eq, Hash, PartialEq, Clone, Debug)]
 pub(crate) enum AttributionSource {
     Peer(PeerKeyLocation),
     Delegate(DelegateKey),
+    Contract(ContractInstanceId),
 }
 
 impl PartialOrd for AttributionSource {
@@ -208,33 +220,75 @@ impl PartialOrd for AttributionSource {
 
 impl Ord for AttributionSource {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Variant discriminant defines the cross-variant ordering;
+        // intra-variant comparisons use the inner key's natural ordering
+        // (or its Debug formatting where the inner type doesn't implement
+        // Ord — DelegateKey today, kept for cross-variant compat).
+        fn rank(source: &AttributionSource) -> u8 {
+            match source {
+                AttributionSource::Peer(_) => 0,
+                AttributionSource::Delegate(_) => 1,
+                AttributionSource::Contract(_) => 2,
+            }
+        }
         match (self, other) {
             (AttributionSource::Peer(a), AttributionSource::Peer(b)) => a.cmp(b),
-            (AttributionSource::Peer(_), AttributionSource::Delegate(_)) => {
-                std::cmp::Ordering::Less
-            }
-            (AttributionSource::Delegate(_), AttributionSource::Peer(_)) => {
-                std::cmp::Ordering::Greater
-            }
-            // DelegateKey doesn't implement Ord, but this variant is never used in practice
             (AttributionSource::Delegate(a), AttributionSource::Delegate(b)) => {
+                // DelegateKey doesn't implement Ord; fall back to Debug.
                 format!("{:?}", a).cmp(&format!("{:?}", b))
             }
+            (AttributionSource::Contract(a), AttributionSource::Contract(b)) => a.cmp(b),
+            (a, b) => rank(a).cmp(&rank(b)),
         }
     }
 }
 
+/// What kind of resource was consumed.
+///
+/// The first two variants (Inbound/OutboundBandwidthBytes) are the
+/// peer-side cost dimensions used by `topology::adjust_topology` for
+/// connection load-shedding.
+///
+/// The remaining variants were added for per-contract governance scoring:
+/// CPU and fuel from WASM execution, on-disk state-write volume, and the
+/// `Σ(subscriber × per-emit cost)` for state broadcast fan-out. Each is
+/// reported alongside the corresponding `AttributionSource::Contract`
+/// entry from the executor / runtime / broadcast pipeline.
 #[derive(Eq, Hash, PartialEq, PartialOrd, Ord, Clone, Copy, Debug)]
 pub(crate) enum ResourceType {
     InboundBandwidthBytes,
     OutboundBandwidthBytes,
+    ExecCpuMicros,
+    ExecFuelUnits,
+    StateBytesWritten,
+    BroadcastFanoutCost,
 }
 
 impl ResourceType {
+    /// Resource types that participate in topology-side bandwidth
+    /// capacity decisions (see `Limits::get` and
+    /// `calculate_usage_proportion`). Non-bandwidth resources (CPU /
+    /// fuel / state / fanout) are NOT included here: they are tracked
+    /// by the meter for contract-governance purposes but have no
+    /// rate-ceiling style limit configured.
     pub(crate) fn all() -> [ResourceType; 2] {
         [
             ResourceType::InboundBandwidthBytes,
             ResourceType::OutboundBandwidthBytes,
+        ]
+    }
+
+    /// Every resource type the meter understands, including non-bandwidth
+    /// resources added for contract governance.
+    #[allow(dead_code)] // wired up incrementally by per-resource-type reporters
+    pub(crate) fn all_tracked() -> [ResourceType; 6] {
+        [
+            ResourceType::InboundBandwidthBytes,
+            ResourceType::OutboundBandwidthBytes,
+            ResourceType::ExecCpuMicros,
+            ResourceType::ExecFuelUnits,
+            ResourceType::StateBytesWritten,
+            ResourceType::BroadcastFanoutCost,
         ]
     }
 }

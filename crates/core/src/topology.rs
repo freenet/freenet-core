@@ -246,7 +246,7 @@ impl TopologyManager {
         }
     }
 
-    #[allow(dead_code)] // fixme: use this
+    #[allow(dead_code)] // wired up incrementally by per-resource-type reporters
     pub(crate) fn report_resource_usage(
         &mut self,
         attribution: &AttributionSource,
@@ -2327,6 +2327,26 @@ impl Limits {
         match resource_type {
             ResourceType::OutboundBandwidthBytes => self.max_upstream_bandwidth,
             ResourceType::InboundBandwidthBytes => self.max_downstream_bandwidth,
+            // Non-bandwidth resource types (CPU / fuel / state / fanout
+            // — added for contract governance) have no `Limits` ceiling.
+            // They are tracked by the meter but not gated here. This
+            // arm exists so the match stays exhaustive; in practice
+            // these variants never reach this function because
+            // `ResourceType::all()` (the iterator that drives capacity
+            // decisions) returns only the bandwidth variants. Reaching
+            // here would indicate a future code change forgot to update
+            // `Limits`; surface that via panic rather than a silent
+            // INFINITY sentinel.
+            ResourceType::ExecCpuMicros
+            | ResourceType::ExecFuelUnits
+            | ResourceType::StateBytesWritten
+            | ResourceType::BroadcastFanoutCost => {
+                unreachable!(
+                    "Limits::get called for non-bandwidth resource {:?} — \
+                     these are tracked but not bandwidth-rate-limited",
+                    resource_type
+                )
+            }
         }
     }
 }
