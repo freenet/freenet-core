@@ -4262,13 +4262,29 @@ pub mod tracer {
             .and_then(|v| v.parse().ok())
             .unwrap_or(crate::util::rate_limit_layer::DEFAULT_MAX_EVENTS_PER_SECOND);
 
+        // Per-callsite cap (issue #4251 follow-up). Stops a single misbehaving
+        // tracing macro from dominating the log even when its rate stays
+        // below the global aggregate cap. Configurable via
+        // FREENET_LOG_RATE_LIMIT_PER_CALLSITE.
+        let per_callsite_limit: u64 = std::env::var("FREENET_LOG_RATE_LIMIT_PER_CALLSITE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(crate::util::rate_limit_layer::DEFAULT_MAX_EVENTS_PER_CALLSITE_PER_SECOND);
+
         // Rate limiting is disabled in tests and debug builds to avoid masking issues
         let rate_limit_enabled = !cfg!(any(test, debug_assertions))
             && std::env::var("FREENET_DISABLE_LOG_RATE_LIMIT").is_err();
 
-        // Create rate limiter (shared across all layers)
+        // Create rate limiters (shared across all layers)
         let rate_limiter = if rate_limit_enabled {
             Some(crate::util::rate_limit_layer::RateLimiter::new(rate_limit))
+        } else {
+            None
+        };
+        let per_callsite_limiter = if rate_limit_enabled {
+            Some(crate::util::rate_limit_layer::PerCallsiteRateLimiter::new(
+                per_callsite_limit,
+            ))
         } else {
             None
         };
@@ -4285,6 +4301,7 @@ pub mod tracer {
                         use_json,
                         filter_layer,
                         rate_limiter,
+                        per_callsite_limiter,
                     );
                 }
 
@@ -4322,8 +4339,14 @@ pub mod tracer {
                 // Apply rate limiting as a global filter if enabled
                 // Layers must be created after the rate filter to ensure type compatibility
                 if let Some(rate_limiter) = rate_limiter.clone() {
-                    let rate_filter =
-                        tracing_subscriber::filter::filter_fn(move |_| rate_limiter.should_allow());
+                    let per_callsite = per_callsite_limiter.clone();
+                    let rate_filter = tracing_subscriber::filter::filter_fn(move |meta| {
+                        per_callsite
+                            .as_ref()
+                            .map(|pc| pc.should_allow(meta))
+                            .unwrap_or(true)
+                            && rate_limiter.should_allow()
+                    });
                     let base = Registry::default().with(rate_filter);
 
                     // Create layers for main and error logs (typed against rate-filtered registry)
@@ -4410,6 +4433,7 @@ pub mod tracer {
             use_json,
             filter_layer,
             rate_limiter,
+            per_callsite_limiter,
         )
     }
 
@@ -4419,6 +4443,7 @@ pub mod tracer {
         use_json: bool,
         filter_layer: tracing_subscriber::EnvFilter,
         rate_limiter: Option<crate::util::rate_limit_layer::RateLimiter>,
+        per_callsite_limiter: Option<crate::util::rate_limit_layer::PerCallsiteRateLimiter>,
     ) -> anyhow::Result<()> {
         use tracing_subscriber::layer::SubscriberExt;
 
@@ -4467,8 +4492,14 @@ pub mod tracer {
         // Apply rate limiting as a global filter if enabled
         // Layers must be created after the rate filter to ensure type compatibility
         if let Some(rate_limiter) = rate_limiter {
-            let rate_filter =
-                tracing_subscriber::filter::filter_fn(move |_| rate_limiter.should_allow());
+            let per_callsite = per_callsite_limiter.clone();
+            let rate_filter = tracing_subscriber::filter::filter_fn(move |meta| {
+                per_callsite
+                    .as_ref()
+                    .map(|pc| pc.should_allow(meta))
+                    .unwrap_or(true)
+                    && rate_limiter.should_allow()
+            });
             let base = Registry::default().with(rate_filter);
             let layer = make_layer(to_stderr, use_json);
             let subscriber = base.with(layer.with_filter(filter_layer));
