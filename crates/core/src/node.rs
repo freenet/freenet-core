@@ -1307,7 +1307,11 @@ where
                         new_state: state,
                         target: source,
                     }) {
-                        tracing::warn!(
+                        // Best-effort by design (see comment above);
+                        // log at debug to keep the caller layer in
+                        // step with the helper-internal downgrade
+                        // (#4238).
+                        tracing::debug!(
                             contract = %instance_id,
                             error = %e,
                             "Failed to emit SyncStateToPeer for proximity sync (best-effort)"
@@ -1564,7 +1568,10 @@ async fn handle_interest_sync_message(
                     new_state: state,
                     target: source,
                 }) {
-                    tracing::warn!(
+                    // Best-effort by design (see comment above); log
+                    // at debug to keep the caller layer in step with
+                    // the helper-internal downgrade (#4238).
+                    tracing::debug!(
                         contract = %contract,
                         error = %e,
                         "Failed to emit SyncStateToPeer for stale peer correction (best-effort)"

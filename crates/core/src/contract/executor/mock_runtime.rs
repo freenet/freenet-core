@@ -260,7 +260,11 @@ where
                 key,
                 new_state: state.clone(),
             }) {
-                tracing::warn!(
+                // Best-effort by design (mirrors the production
+                // executor; see runtime.rs for the #4145 / #4238
+                // rationale). Per-occurrence WARN here would re-
+                // introduce the spam at the caller layer.
+                tracing::debug!(
                     contract = %key,
                     error = %err,
                     "MockRuntime: Failed to broadcast state change (best-effort)"

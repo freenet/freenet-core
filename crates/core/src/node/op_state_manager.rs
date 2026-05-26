@@ -870,8 +870,11 @@ async fn release_pending_op_slot_on(
 ///
 /// Extracted from [`OpManager::try_release_pending_op_slot`] so it can be
 /// exercised in unit tests without building a full `OpManager`. Best-effort:
-/// a momentarily-full or closed channel produces a warning and the parked
-/// driver falls back to its `OPERATION_TTL` timeout (#4154).
+/// a momentarily-full channel produces a debug-level log (benign back-
+/// pressure under load — was flooding gateways at 30K+/hr, see #4238); a
+/// closed channel produces a warn-level log (receiver torn down). Either
+/// arm leaves the parked driver to fall back to its `OPERATION_TTL`
+/// timeout (#4154).
 fn try_release_pending_op_slot_on(
     notifications_sender: &mpsc::Sender<Either<NetMessage, NodeEvent>>,
     tx: Transaction,
@@ -879,7 +882,14 @@ fn try_release_pending_op_slot_on(
     match notifications_sender.try_send(Either::Right(NodeEvent::TransactionCompleted(tx))) {
         Ok(()) => true,
         Err(mpsc::error::TrySendError::Full(_)) => {
-            tracing::warn!(
+            // Benign back-pressure: the driver parks on its
+            // OPERATION_TTL fallback and the 60s sweep reclaims the
+            // slot. Per-occurrence WARN here flooded production
+            // gateways at 30K+/hr (#4238); the rate-limited
+            // `release_pending_op_slot: notification channel full for
+            // too long` error in `release_pending_op_slot_on` is the
+            // signal operators should grep for.
+            tracing::debug!(
                 %tx,
                 "try_release_pending_op_slot: notification channel full; \
                  driver will wait for OPERATION_TTL timeout"
@@ -945,10 +955,12 @@ async fn notify_node_event_on(
 ///
 /// Extracted from [`OpManager::try_notify_node_event`] so the try-send
 /// path is testable in isolation without building a full `OpManager`.
-/// On `Full` or `Closed` the event is dropped, a warn-level log is
-/// emitted, and the function returns `Err(OpError::NotificationError)`.
-/// Best-effort by design — see the OpManager method doc for the wedge
-/// (#4145) this prevents.
+/// On `Full` the event is dropped at debug level (benign back-pressure
+/// under fan-out — was flooding gateways at 30K+/hr, see #4238); on
+/// `Closed` it is dropped at warn level (receiver torn down). Either
+/// arm returns `Err(OpError::NotificationError)`. Best-effort by
+/// design — see the OpManager method doc for the wedge (#4145) this
+/// prevents.
 ///
 /// `channel_pending` and `channel_remaining` are passed by the caller
 /// purely for log enrichment; they are read at the call site to avoid
@@ -964,7 +976,14 @@ fn try_notify_node_event_on(
     match notifications_sender.try_send(Either::Right(msg)) {
         Ok(()) => Ok(()),
         Err(mpsc::error::TrySendError::Full(_)) => {
-            tracing::warn!(
+            // Benign back-pressure under sustained fan-out (best-
+            // effort broadcast emission). Each occurrence isn't
+            // actionable — the aggregate is, and the rate-limited
+            // `notify_node_event: Notification channel full for too
+            // long` error above is the alert operators should care
+            // about. Per-occurrence WARN here flooded production
+            // gateways post-HN-spike (#4238).
+            tracing::debug!(
                 channel_pending,
                 channel_remaining,
                 "try_notify_node_event: event-loop notification channel full; \
@@ -999,7 +1018,14 @@ fn notify_transaction_timeout(
     {
         Ok(()) => true,
         Err(mpsc::error::TrySendError::Full(_)) => {
-            tracing::warn!(
+            // Benign back-pressure on the same event-loop notification
+            // channel as the two `try_*` helpers above: the GC sweep
+            // already removed the tx from the ops maps; this
+            // notification only lets the event loop clean up its
+            // `tx_to_client` map, so dropping it is tolerated. Per-
+            // occurrence WARN here would re-introduce the #4238 spam
+            // class during sustained back-pressure.
+            tracing::debug!(
                 tx = %tx,
                 "Notification channel full, skipping timeout notification for event loop"
             );
@@ -1823,6 +1849,237 @@ mod tests {
         assert!(
             result.is_err(),
             "helper must return Err once receiver is dropped"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // Log-level regression tests for #4238.
+    //
+    // Production gateways were emitting tens of thousands of WARNs
+    // per hour ("notification channel full") under normal back-
+    // pressure post-HN-spike: 8–14 MB/hour of log noise that buried
+    // genuinely-actionable signals like the rate-limited "channel
+    // full for too long" error. The fix downgrades the per-occurrence
+    // Full arm to DEBUG on both try-send helpers while keeping the
+    // Closed arm at WARN (closed-channel is abnormal: receiver was
+    // torn down, e.g. shutdown races).
+    //
+    // These tests pin the level split by initializing a captured
+    // subscriber filtered at WARN: with the fix, a Full event emits
+    // nothing (DEBUG is below the filter); without the fix, a WARN
+    // entry would appear. Closed must still emit WARN either way.
+    // ──────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn try_release_pending_op_slot_full_does_not_emit_warn() {
+        // #4238 regression pin: per-occurrence Full must NOT emit a
+        // WARN. Pre-fix this fired 30K+/hr on nova; post-fix the
+        // helper logs at DEBUG and a WARN-level subscriber sees
+        // nothing.
+        let logger = crate::test_utils::TestLogger::new()
+            .with_level("warn")
+            .capture_logs()
+            .init();
+
+        let (_receiver, notifier) = event_loop_notification_channel();
+
+        // Saturate the channel so the helper hits the Full arm.
+        let filler_tx = Transaction::ttl_transaction();
+        let mut pre_filled = 0usize;
+        loop {
+            match notifier
+                .notifications_sender()
+                .try_send(Either::Right(NodeEvent::TransactionCompleted(filler_tx)))
+            {
+                Ok(()) => pre_filled += 1,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => break,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    panic!("channel unexpectedly closed while pre-filling")
+                }
+            }
+            if pre_filled > 4096 {
+                panic!("channel did not backpressure after 4096 entries");
+            }
+        }
+
+        let tx = Transaction::ttl_transaction();
+        let delivered = super::try_release_pending_op_slot_on(notifier.notifications_sender(), tx);
+        assert!(!delivered, "helper must return false on a full channel");
+
+        assert!(
+            !logger.contains("try_release_pending_op_slot: notification channel full"),
+            "Full arm must not emit WARN (would re-spam gateways at 30K+/hr — #4238); \
+             captured: {:?}",
+            logger.logs()
+        );
+    }
+
+    #[tokio::test]
+    async fn try_release_pending_op_slot_closed_still_emits_warn() {
+        // #4238 inverse: the Closed arm is genuinely abnormal
+        // (receiver torn down) and MUST stay at WARN even after the
+        // Full-arm downgrade.
+        let logger = crate::test_utils::TestLogger::new()
+            .with_level("warn")
+            .capture_logs()
+            .init();
+
+        let (receiver, notifier) = event_loop_notification_channel();
+        drop(receiver);
+
+        let tx = Transaction::ttl_transaction();
+        let delivered = super::try_release_pending_op_slot_on(notifier.notifications_sender(), tx);
+        assert!(!delivered, "helper must return false on a closed channel");
+
+        assert!(
+            logger.contains("try_release_pending_op_slot: notification channel closed"),
+            "Closed arm must still emit WARN — receiver-dropped is not benign back-pressure; \
+             captured: {:?}",
+            logger.logs()
+        );
+    }
+
+    #[tokio::test]
+    async fn try_notify_node_event_full_does_not_emit_warn() {
+        // #4238 regression pin for the sibling helper introduced by
+        // #4231. Same shape as the release-pending variant above —
+        // best-effort broadcast emission must not spam WARN on every
+        // back-pressure drop.
+        let logger = crate::test_utils::TestLogger::new()
+            .with_level("warn")
+            .capture_logs()
+            .init();
+
+        let (_receiver, notifier) = event_loop_notification_channel();
+
+        let filler_tx = Transaction::ttl_transaction();
+        let mut pre_filled = 0usize;
+        loop {
+            match notifier
+                .notifications_sender()
+                .try_send(Either::Right(NodeEvent::TransactionCompleted(filler_tx)))
+            {
+                Ok(()) => pre_filled += 1,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => break,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    panic!("channel unexpectedly closed while pre-filling")
+                }
+            }
+            if pre_filled > 4096 {
+                panic!("channel did not backpressure after 4096 entries");
+            }
+        }
+
+        let tx = Transaction::ttl_transaction();
+        let result = super::try_notify_node_event_on(
+            notifier.notifications_sender(),
+            pre_filled,
+            0,
+            NodeEvent::TransactionCompleted(tx),
+        );
+        assert!(result.is_err(), "helper must return Err on a full channel");
+
+        assert!(
+            !logger.contains("try_notify_node_event: event-loop notification channel full"),
+            "Full arm must not emit WARN (would re-introduce #4238 spam under fan-out); \
+             captured: {:?}",
+            logger.logs()
+        );
+    }
+
+    #[tokio::test]
+    async fn try_notify_node_event_closed_still_emits_warn() {
+        let logger = crate::test_utils::TestLogger::new()
+            .with_level("warn")
+            .capture_logs()
+            .init();
+
+        let (receiver, notifier) = event_loop_notification_channel();
+        drop(receiver);
+
+        let tx = Transaction::ttl_transaction();
+        let result = super::try_notify_node_event_on(
+            notifier.notifications_sender(),
+            0,
+            0,
+            NodeEvent::TransactionCompleted(tx),
+        );
+        assert!(
+            result.is_err(),
+            "helper must return Err once receiver is dropped"
+        );
+
+        assert!(
+            logger.contains("try_notify_node_event: event-loop notification channel closed"),
+            "Closed arm must still emit WARN; captured: {:?}",
+            logger.logs()
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_transaction_timeout_full_does_not_emit_warn() {
+        // #4238 sibling pin: `notify_transaction_timeout` writes to
+        // the same event-loop notification channel as the two
+        // `try_*` helpers and is called once per timed-out tx by the
+        // GC sweep. Pre-fix it emitted WARN on every Full event;
+        // post-fix it must be DEBUG so a WARN-level subscriber sees
+        // nothing under sustained back-pressure.
+        let logger = crate::test_utils::TestLogger::new()
+            .with_level("warn")
+            .capture_logs()
+            .init();
+
+        let (_receiver, notifier) = event_loop_notification_channel();
+
+        let filler_tx = Transaction::ttl_transaction();
+        let mut pre_filled = 0usize;
+        loop {
+            match notifier
+                .notifications_sender()
+                .try_send(Either::Right(NodeEvent::TransactionCompleted(filler_tx)))
+            {
+                Ok(()) => pre_filled += 1,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => break,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    panic!("channel unexpectedly closed while pre-filling")
+                }
+            }
+            if pre_filled > 4096 {
+                panic!("channel did not backpressure after 4096 entries");
+            }
+        }
+
+        let tx = Transaction::ttl_transaction();
+        let delivered = super::notify_transaction_timeout(&notifier, tx);
+        assert!(!delivered, "helper must return false on a full channel");
+
+        assert!(
+            !logger.contains("Notification channel full, skipping timeout notification"),
+            "notify_transaction_timeout Full arm must not emit WARN \
+             (would re-introduce #4238 spam from the GC-sweep path); \
+             captured: {:?}",
+            logger.logs()
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_transaction_timeout_closed_still_emits_warn() {
+        let logger = crate::test_utils::TestLogger::new()
+            .with_level("warn")
+            .capture_logs()
+            .init();
+
+        let (receiver, notifier) = event_loop_notification_channel();
+        drop(receiver);
+
+        let tx = Transaction::ttl_transaction();
+        let delivered = super::notify_transaction_timeout(&notifier, tx);
+        assert!(!delivered, "helper must return false on a closed channel");
+
+        assert!(
+            logger.contains("Notification channel closed, receiver likely dropped"),
+            "Closed arm must still emit WARN; captured: {:?}",
+            logger.logs()
         );
     }
 
