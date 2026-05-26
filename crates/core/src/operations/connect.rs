@@ -2756,10 +2756,29 @@ mod tests {
         let joiner = make_peer(5200);
         let next_hop = make_peer(6200);
 
+        // Pin the invariant the fix relies on: `desired_location` must be
+        // far enough from `self_loc` that the near-terminus probabilistic
+        // accept branch (line ~624: `d < NEAR_TERMINUS_DISTANCE`) is
+        // statically unreachable. Using `next_hop`'s location makes this
+        // deterministic — but only because `make_peer` derives location
+        // from the loopback port. If port choices, `Location::from_address`,
+        // or `NEAR_TERMINUS_DISTANCE` ever change such that the gap shrinks,
+        // fail loudly here rather than silently re-flake. See #3944.
+        let target_loc = next_hop.location().expect("test peer has location");
+        let self_to_target = self_loc
+            .location()
+            .expect("test peer has location")
+            .distance(target_loc)
+            .as_f64();
+        assert!(
+            self_to_target > NEAR_TERMINUS_DISTANCE,
+            "test invariant: self_loc must be > NEAR_TERMINUS_DISTANCE ({NEAR_TERMINUS_DISTANCE}) from desired_location, got {self_to_target}"
+        );
+
         let mut state = RelayState {
             upstream_addr: joiner.socket_addr().expect("test peer must have address"),
             request: ConnectRequest {
-                desired_location: Location::random(),
+                desired_location: target_loc,
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
@@ -2827,6 +2846,69 @@ mod tests {
         assert!(
             actions2.forward.is_none(),
             "second call should not forward again"
+        );
+    }
+
+    /// Regression for #3944: directly exercises the "already forwarded → don't
+    /// accept" guard at the terminus-acceptance check without going through the
+    /// forwarding path first. The companion test
+    /// `relay_does_not_accept_after_forwarding_on_retry` was previously flaky
+    /// because its first call exercised near-terminus probabilistic acceptance
+    /// (driven by `GlobalRng`) before `forwarded_to` was set, sometimes
+    /// triggering acceptance regardless of the post-forward guard.
+    ///
+    /// This test sets `forwarded_to` and `forwarded_at` in the initial
+    /// `RelayState` so the only path under test is the terminus-acceptance
+    /// gate, which is fully deterministic. It would have failed before the
+    /// fix at `is_terminus && !self.accepted_locally && self.forwarded_to.is_none()`
+    /// was introduced, and is unaffected by RNG state.
+    #[test]
+    fn relay_with_forwarded_state_rejects_acceptance_at_terminus() {
+        let self_loc = make_peer(4250);
+        let joiner = make_peer(5250);
+        let prior_next_hop = make_peer(6250);
+
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: prior_next_hop.location().expect("test peer has location"),
+                joiner: joiner.clone(),
+                ttl: 3,
+                visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
+            },
+            // Simulate a prior forward that completed: the operation has
+            // already committed to a path and must not also accept locally.
+            forwarded_to: Some(prior_next_hop),
+            forwarded_at: Some(Instant::now()),
+            observed_sent: false,
+            accepted_locally: false,
+            response_forwarded: false,
+        };
+
+        // Terminus (next_hop=None) with should_accept=true — every condition
+        // that would normally green-light acceptance is in place EXCEPT the
+        // forwarded_to guard.
+        let ctx = TestRelayContext::new(self_loc).accept(true).next_hop(None);
+        let recency = HashMap::new();
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+
+        let actions = state.handle_request(
+            &ctx,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
+
+        assert!(
+            actions.accept.is_none(),
+            "relay must not accept once forwarded_to is set, even at terminus"
+        );
+        assert!(
+            actions.forward.is_none(),
+            "relay must not forward again when forwarded_to is already set"
         );
     }
 
