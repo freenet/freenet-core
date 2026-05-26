@@ -918,13 +918,14 @@ pub struct NetworkArgs {
 
     /// Skip fetching the remote gateway index. The on-disk gateways.toml
     /// cache is also skipped in two cases: (1) the node is a gateway
-    /// (--is-gateway), which always runs fully isolated under this flag;
-    /// (2) --gateway is explicitly supplied, in which case the CLI entries
-    /// (plus any --gateways JSON entries) REPLACE any file cache. Otherwise
-    /// — non-gateway peer with no --gateway/--gateways — the on-disk
-    /// gateways.toml is still read, preserving the contract used by test
-    /// harnesses (e.g. freenet-test-network) that pre-populate it via
-    /// --config-dir.
+    /// (--is-gateway), which always runs isolated under this flag (any
+    /// --gateways JSON entries are still honored); (2) an explicit
+    /// --gateway CLI entry is supplied, in which case the CLI entries
+    /// (plus any --gateways JSON entries) REPLACE the on-disk cache.
+    /// Otherwise — non-gateway peer with no --gateway CLI entry — the
+    /// on-disk gateways.toml is still read (and merged with any
+    /// --gateways JSON), preserving the contract used by test harnesses
+    /// (e.g. freenet-test-network) that pre-populate it via --config-dir.
     #[arg(long)]
     pub skip_load_from_network: bool,
 
@@ -3725,6 +3726,61 @@ mod tests {
             addrs.len(),
             2,
             "expected exactly cli + json entries: {addrs:?}"
+        );
+    }
+
+    /// Pin: `skip_load_from_network + is_gateway + --gateway X` with a public
+    /// gateway in the on-disk gateways.toml. The pre-existing
+    /// `skip_load && is_gateway` branch fires first and ignores the file;
+    /// the post-block merge then prepends the CLI --gateway entry. Final
+    /// gateways list must be exactly [X] with no on-disk leak. Covers the
+    /// four-way combination flagged in re-review for #4264.
+    #[tokio::test]
+    async fn test_skip_load_from_network_isolated_gateway_with_cli_gateway_ignores_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path();
+
+        let leaked_addr: SocketAddr = "192.0.2.77:31337".parse().unwrap();
+        let preexisting = toml::to_string(&Gateways {
+            gateways: vec![GatewayConfig {
+                address: Address::HostAddress(leaked_addr),
+                public_key_path: PathBuf::from("leaked.pub"),
+                location: None,
+            }],
+        })
+        .unwrap();
+        fs::write(config_dir.join("gateways.toml"), preexisting).unwrap();
+
+        let cli_keypair = TransportKeypair::new();
+        let cli_key_hex = hex::encode(cli_keypair.public().as_bytes());
+        let cli_addr: SocketAddr = "10.30.30.30:31337".parse().unwrap();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir.to_path_buf()),
+                data_dir: Some(config_dir.to_path_buf()),
+                log_dir: Some(config_dir.to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                is_gateway: true,
+                public_address: Some("198.51.100.7".parse().unwrap()),
+                public_port: Some(31337),
+                gateway: Some(vec![format!("{cli_addr},{cli_key_hex}")]),
+                skip_load_from_network: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let cfg = args.build().await.unwrap();
+        let addrs: Vec<_> = cfg.gateways.iter().map(|gw| gw.address.clone()).collect();
+        assert!(cfg.is_gateway);
+        assert_eq!(addrs.len(), 1, "expected only the CLI gateway: {addrs:?}");
+        assert_eq!(addrs[0], Address::HostAddress(cli_addr));
+        assert!(
+            !addrs.contains(&Address::HostAddress(leaked_addr)),
+            "isolated gateway leaked file content: {addrs:?}"
         );
     }
 
