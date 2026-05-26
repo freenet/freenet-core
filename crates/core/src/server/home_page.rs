@@ -32,6 +32,7 @@ fn homepage_html() -> String {
 
     let status_card = build_status_card(&snap);
     let peers_card = build_peers_card(&snap);
+    let governance_card = build_governance_card(&snap);
     let contracts_card = build_contracts_card(&snap);
     let ops_card = build_ops_card(&snap);
     let transfer_card = build_transfer_card(&snap);
@@ -68,6 +69,7 @@ fn homepage_html() -> String {
         {status_card}
         {peers_card}
         {transfer_card}
+        {governance_card}
         {contracts_card}
         {ops_card}
 
@@ -107,6 +109,7 @@ fn homepage_html() -> String {
         status_card = status_card,
         peers_card = peers_card,
         transfer_card = transfer_card,
+        governance_card = governance_card,
         contracts_card = contracts_card,
         ops_card = ops_card,
     )
@@ -613,6 +616,216 @@ fn build_ring_svg(own_location: Option<f64>, peers: &[network_status::PeerSnapsh
     ));
 
     svg
+}
+
+/// Build the governance card. Reads `snap.governance` (sourced from
+/// `Ring::dashboard_governance_snapshot` → `GovernanceManager`). Every
+/// field rendered here came from the back-end's computation —
+/// nothing is invented at render time.
+///
+/// Layout follows the prototype: verdict block on the left (big
+/// number + headline), mini-strip with network-norms on the right,
+/// then the per-contract table below. The histogram and ring inner-
+/// ring renderings are deliberately separate commits — this commit
+/// proves the data path end-to-end with the simplest visualisations.
+fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {
+    let Some(snap) = snap else {
+        return String::new();
+    };
+    let g = &snap.governance;
+
+    // Empty state: no contracts tracked yet (cold start, or this
+    // build doesn't have the governance manager enabled). Per the
+    // design principle — show nothing rather than show fabricated
+    // data. The "history strip" pattern from the prototype lives
+    // here as a single compact line so the absence reads as
+    // working-correctly rather than missing-panel.
+    if g.contracts.is_empty() {
+        return r#"<div class="card">
+            <h2>Contract Governance</h2>
+            <p class="empty">Not enough contracts observed yet. Governance scoring activates once this node has seen at least 30 contracts and they have had time to accumulate cost/benefit signals.</p>
+        </div>"#.to_string();
+    }
+
+    // Verdict counts. Mirror state-snapshot enum → string.
+    let mut counts = [0u32; 5];
+    for c in &g.contracts {
+        let idx = match c.state {
+            network_status::GovernanceStateSnapshot::Normal => 0,
+            network_status::GovernanceStateSnapshot::Borderline => 1,
+            network_status::GovernanceStateSnapshot::WouldEvict => 2,
+            network_status::GovernanceStateSnapshot::Evicted => 3,
+            network_status::GovernanceStateSnapshot::Banned => 4,
+        };
+        counts[idx] = counts[idx].saturating_add(1);
+    }
+    let borderline = counts[1];
+    let would_evict = counts[2];
+    let evicted = counts[3];
+    let banned = counts[4];
+    let flagged = borderline + would_evict + evicted + banned;
+    let total = g.contracts.len();
+
+    let verdict_class = if flagged == 0 {
+        "verdict-ok"
+    } else {
+        "verdict-alert"
+    };
+    let verdict_main = if flagged == 0 {
+        format!(
+            r#"<div class="verdict-num">✓</div>
+               <div class="verdict-headline">All {total} contracts within normal range</div>"#,
+        )
+    } else {
+        let mut detail_parts: Vec<String> = Vec::new();
+        if would_evict > 0 {
+            detail_parts.push(format!(
+                r#"<span class="sw sw-wouldevict"></span>{would_evict} would be evicted"#
+            ));
+        }
+        if borderline > 0 {
+            detail_parts.push(format!(
+                r#"<span class="sw sw-borderline"></span>{borderline} borderline"#
+            ));
+        }
+        if evicted > 0 {
+            detail_parts.push(format!(
+                r#"<span class="sw sw-evicted"></span>{evicted} evicted"#
+            ));
+        }
+        if banned > 0 {
+            detail_parts.push(format!(
+                r#"<span class="sw sw-banned"></span>{banned} banned"#
+            ));
+        }
+        format!(
+            r#"<div class="verdict-num">{flagged}</div>
+               <div class="verdict-headline">contracts flagged on this node</div>
+               <div class="verdict-detail">{detail}</div>"#,
+            detail = detail_parts.join(" &nbsp;·&nbsp; "),
+        )
+    };
+
+    // Network-norms mini-strip — sourced from the last reaper-tick
+    // result. Empty if no tick has run yet (cold start; sample size
+    // didn't reach min_samples; MAD collapsed).
+    let median_txt = g
+        .norms
+        .median_log_ratio
+        .map(|v| format!("{:.2}", v))
+        .unwrap_or_else(|| "—".to_string());
+    let mad_txt = g
+        .norms
+        .mad
+        .map(|v| format!("{:.2}", v))
+        .unwrap_or_else(|| "—".to_string());
+    let threshold_txt = g
+        .norms
+        .threshold
+        .map(|v| format!("{:.2}", v))
+        .unwrap_or_else(|| "—".to_string());
+    let sample_size_txt = g.norms.sample_size.to_string();
+    let mode_txt = match g.mode {
+        network_status::GovernanceModeSnapshot::Off => "off",
+        network_status::GovernanceModeSnapshot::DryRun => "dry-run",
+        network_status::GovernanceModeSnapshot::Enforce => "enforce",
+    };
+
+    // Per-contract table — flagged-only by default; an "all" link
+    // could come later. Honest principle: this table reflects the
+    // governance manager's `iter_scores()`, nothing else.
+    let mut rows = String::new();
+    let mut shown_count = 0;
+    // Sort: most-flagged first (Banned > Evicted > WouldEvict >
+    // Borderline > Normal), then by highest log-ratio descending so
+    // the worst offenders sit at the top.
+    let mut sorted: Vec<&network_status::ContractGovernanceEntry> = g.contracts.iter().collect();
+    sorted.sort_by(|a, b| {
+        let rank = |s: network_status::GovernanceStateSnapshot| match s {
+            network_status::GovernanceStateSnapshot::Banned => 0,
+            network_status::GovernanceStateSnapshot::Evicted => 1,
+            network_status::GovernanceStateSnapshot::WouldEvict => 2,
+            network_status::GovernanceStateSnapshot::Borderline => 3,
+            network_status::GovernanceStateSnapshot::Normal => 4,
+        };
+        rank(a.state).cmp(&rank(b.state)).then_with(|| {
+            b.log_ratio
+                .partial_cmp(&a.log_ratio)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+    for c in sorted.iter() {
+        // Default: only show flagged contracts. An "all" toggle could
+        // come later; for now keeping the table digestible.
+        if matches!(c.state, network_status::GovernanceStateSnapshot::Normal) {
+            continue;
+        }
+        shown_count += 1;
+        let state_label = match c.state {
+            network_status::GovernanceStateSnapshot::Normal => "normal",
+            network_status::GovernanceStateSnapshot::Borderline => "borderline",
+            network_status::GovernanceStateSnapshot::WouldEvict => "would evict",
+            network_status::GovernanceStateSnapshot::Evicted => "evicted",
+            network_status::GovernanceStateSnapshot::Banned => "banned",
+        };
+        let state_class = match c.state {
+            network_status::GovernanceStateSnapshot::Normal => "g-normal",
+            network_status::GovernanceStateSnapshot::Borderline => "g-borderline",
+            network_status::GovernanceStateSnapshot::WouldEvict => "g-wouldevict",
+            network_status::GovernanceStateSnapshot::Evicted => "g-evicted",
+            network_status::GovernanceStateSnapshot::Banned => "g-banned",
+        };
+        let log_ratio_txt = c
+            .log_ratio
+            .map(|v| format!("{:+.2}", v))
+            .unwrap_or_else(|| "—".to_string());
+        let age = format_ago(c.age_secs);
+        rows.push_str(&format!(
+            r#"<tr><td title="{full}"><code>{short}</code></td><td><span class="g-badge {state_class}">{state_label}</span></td><td class="right">{log_ratio}</td><td class="right">{cost:.2}</td><td class="right">{benefit:.2}</td><td class="right">{age}</td></tr>"#,
+            full = html_escape(&c.instance_id),
+            short = html_escape(&c.instance_id_short),
+            state_class = state_class,
+            state_label = state_label,
+            log_ratio = log_ratio_txt,
+            cost = c.cost_used,
+            benefit = c.benefit_score,
+            age = age,
+        ));
+    }
+    if shown_count == 0 {
+        rows = r#"<tr><td colspan="6" class="empty" style="padding: 0.5rem 0.9rem">All contracts within normal range.</td></tr>"#.to_string();
+    }
+
+    format!(
+        r##"<div class="card">
+            <div class="card-header"><h2>Contract Governance</h2><span class="g-mode g-mode-{mode}">{mode}</span></div>
+            <div class="g-verdict-row">
+                <div class="g-verdict {verdict_class}">{verdict_main}</div>
+                <div class="g-norms">
+                    <div class="g-norm"><div class="g-norm-label">Tracked</div><div class="g-norm-value">{total}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Sample size</div><div class="g-norm-value">{sample_size}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Median log-ratio</div><div class="g-norm-value">{median}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">MAD spread</div><div class="g-norm-value">{mad}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Eviction threshold</div><div class="g-norm-value">{threshold}</div></div>
+                </div>
+            </div>
+            <div class="table-wrap">
+                <table>
+                    <thead><tr><th>Contract</th><th>State</th><th class="right">log-ratio</th><th class="right">Cost</th><th class="right">Benefit</th><th class="right">Age</th></tr></thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
+        </div>"##,
+        mode = mode_txt,
+        verdict_class = verdict_class,
+        verdict_main = verdict_main,
+        total = total,
+        sample_size = sample_size_txt,
+        median = median_txt,
+        mad = mad_txt,
+        threshold = threshold_txt,
+        rows = rows,
+    )
 }
 
 fn build_contracts_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {
@@ -1312,6 +1525,128 @@ table.sortable thead th.sort-desc::after { content: "▼"; opacity: 1; color: va
     from { opacity: 0; transform: translateY(8px); }
     to   { opacity: 1; transform: translateY(0); }
 }
+
+/* ── Governance card (Phase 4.5) ───────────────────────────────────── */
+.g-mode {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    padding: 0.15rem 0.5rem;
+    border-radius: 3px;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    margin-left: auto;
+}
+.g-mode-dry-run {
+    background: rgba(255, 182, 16, 0.15);
+    color: #ffb610;
+    border: 1px solid rgba(255, 182, 16, 0.35);
+}
+.g-mode-enforce {
+    background: rgba(255, 102, 122, 0.15);
+    color: #ff667a;
+    border: 1px solid rgba(255, 102, 122, 0.35);
+}
+.g-mode-off {
+    background: rgba(148, 163, 184, 0.15);
+    color: var(--text-secondary);
+    border: 1px solid rgba(148, 163, 184, 0.35);
+}
+
+.g-verdict-row {
+    display: grid;
+    grid-template-columns: minmax(280px, 0.85fr) 2fr;
+    gap: 0.75rem;
+    margin: 0.5rem 0 0.75rem;
+}
+.g-verdict {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-left: 3px solid #ff8a3d;
+    border-radius: 6px;
+    padding: 0.85rem 1rem 0.85rem 1.1rem;
+    display: grid;
+    grid-template-columns: auto 1fr;
+    grid-template-rows: auto auto;
+    column-gap: 1rem;
+    align-items: center;
+}
+.verdict-ok { border-left-color: #43c178; }
+.verdict-alert { border-left-color: #ff8a3d; }
+.g-verdict .verdict-num {
+    grid-row: 1 / 3;
+    font-family: var(--font-mono);
+    font-size: 3.2rem;
+    font-weight: 500;
+    line-height: 0.95;
+    color: #ff8a3d;
+    letter-spacing: -0.04em;
+}
+.verdict-ok .verdict-num { color: #43c178; }
+.g-verdict .verdict-headline {
+    font-size: 0.95rem;
+    font-weight: 500;
+    color: var(--text-primary);
+}
+.g-verdict .verdict-detail {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+    margin-top: 0.15rem;
+}
+.g-verdict .sw {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    margin-right: 0.3rem;
+    vertical-align: 0.07rem;
+}
+.sw-borderline { background: #ffb610; }
+.sw-wouldevict { background: #ff8a3d; }
+.sw-evicted    { background: #ff667a; }
+.sw-banned     { background: #d33682; }
+
+.g-norms {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 0.5rem;
+}
+.g-norm {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 5px;
+    padding: 0.55rem 0.75rem;
+}
+.g-norm-label {
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+}
+.g-norm-value {
+    font-family: var(--font-mono);
+    font-size: 1rem;
+    font-weight: 500;
+    margin-top: 0.1rem;
+    color: var(--text-primary);
+}
+
+.g-badge {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    padding: 0.1rem 0.45rem;
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    font-weight: 500;
+}
+.g-normal     { background: rgba(67,193,120,0.16);  color: #43c178; }
+.g-borderline { background: rgba(255,182,16,0.16);  color: #ffb610; }
+.g-wouldevict { background: rgba(255,138,61,0.18);  color: #ff8a3d; }
+.g-evicted    { background: rgba(255,102,122,0.18); color: #ff667a; }
+.g-banned     { background: rgba(211,54,130,0.18);  color: #d33682; }
 "##;
 
 /// Inline JavaScript for the dark/light mode toggle.
@@ -3671,5 +4006,116 @@ mod tests {
             JS.contains("localStorage") && JS.contains("freenet-update-check"),
             "JS must persist the update check in localStorage under the freenet-update-check key"
         );
+    }
+
+    // ─── Governance card (Phase 4.5) ───────────────────────────────
+
+    use crate::node::network_status::{
+        ContractGovernanceEntry, GovernanceModeSnapshot, GovernanceSnapshot,
+        GovernanceStateSnapshot, NetworkNorms,
+    };
+
+    fn mk_entry(state: GovernanceStateSnapshot, instance_id: &str) -> ContractGovernanceEntry {
+        ContractGovernanceEntry {
+            instance_id: instance_id.to_string(),
+            instance_id_short: instance_id.chars().take(12).collect::<String>(),
+            state,
+            cost_used: 12.5,
+            benefit_score: 1.0,
+            log_ratio: Some(1.1),
+            age_secs: 3600,
+            last_transition_secs_ago: 60,
+            history: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn governance_card_empty_state_when_no_contracts() {
+        let snap = base_snapshot();
+        let html = build_governance_card(&Some(snap));
+        assert!(
+            html.contains("Not enough contracts observed yet"),
+            "empty state should explain why governance has nothing to show — got:\n{html}"
+        );
+        assert!(
+            !html.contains("verdict-alert"),
+            "empty state must not render the alert verdict block"
+        );
+    }
+
+    #[test]
+    fn governance_card_verdict_ok_when_all_normal() {
+        let mut snap = base_snapshot();
+        snap.governance = GovernanceSnapshot {
+            mode: GovernanceModeSnapshot::DryRun,
+            contracts: (0..5)
+                .map(|i| mk_entry(GovernanceStateSnapshot::Normal, &format!("aaa{i}")))
+                .collect(),
+            norms: NetworkNorms::default(),
+        };
+        let html = build_governance_card(&Some(snap));
+        assert!(
+            html.contains("verdict-ok"),
+            "5 normal contracts should produce verdict-ok styling — got:\n{html}"
+        );
+        assert!(
+            html.contains("All 5 contracts within normal range"),
+            "verdict should name the total — got:\n{html}"
+        );
+    }
+
+    #[test]
+    fn governance_card_verdict_alert_with_breakdown_when_flagged() {
+        let mut snap = base_snapshot();
+        snap.governance = GovernanceSnapshot {
+            mode: GovernanceModeSnapshot::DryRun,
+            contracts: vec![
+                mk_entry(GovernanceStateSnapshot::WouldEvict, "abuser1"),
+                mk_entry(GovernanceStateSnapshot::Borderline, "warn1"),
+                mk_entry(GovernanceStateSnapshot::Borderline, "warn2"),
+                mk_entry(GovernanceStateSnapshot::Normal, "ok1"),
+            ],
+            norms: NetworkNorms::default(),
+        };
+        let html = build_governance_card(&Some(snap));
+        assert!(html.contains("verdict-alert"));
+        // Total flagged = 1 + 2 = 3
+        assert!(
+            html.contains(">3<"),
+            "verdict number should be the flagged count — got:\n{html}"
+        );
+        assert!(html.contains("1 would be evicted"));
+        assert!(html.contains("2 borderline"));
+        // Table renders the flagged ones, not the normal one.
+        assert!(html.contains("abuser1"));
+        assert!(html.contains("warn1"));
+        assert!(!html.contains(r#"<code>ok1</code>"#));
+    }
+
+    #[test]
+    fn governance_card_mode_pill_reflects_snapshot_mode() {
+        for (mode, label) in [
+            (GovernanceModeSnapshot::Off, "off"),
+            (GovernanceModeSnapshot::DryRun, "dry-run"),
+            (GovernanceModeSnapshot::Enforce, "enforce"),
+        ] {
+            let mut snap = base_snapshot();
+            snap.governance = GovernanceSnapshot {
+                mode,
+                contracts: vec![mk_entry(GovernanceStateSnapshot::Normal, "ok")],
+                norms: NetworkNorms::default(),
+            };
+            let html = build_governance_card(&Some(snap));
+            assert!(
+                html.contains(&format!(r#"g-mode g-mode-{label}">{label}<"#)),
+                "mode pill should reflect {label} — got:\n{html}"
+            );
+        }
+    }
+
+    #[test]
+    fn governance_card_omits_when_snap_is_none() {
+        let html = build_governance_card(&None);
+        assert!(html.is_empty());
     }
 }
