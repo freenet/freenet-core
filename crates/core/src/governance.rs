@@ -383,12 +383,7 @@ mod tests {
         // Half the samples return None — should be excluded from the
         // ratio set. With 60 entries / 2 valid = 30, just at min.
         let pairs: Vec<(String, Option<f64>)> = (0..60)
-            .map(|i| {
-                (
-                    format!("c{i}"),
-                    if i % 2 == 0 { Some(-1.0) } else { None },
-                )
-            })
+            .map(|i| (format!("c{i}"), if i % 2 == 0 { Some(-1.0) } else { None }))
             .collect();
         let m: HashMap<_, _> = pairs.into_iter().collect();
         let r = detect_outliers(&m, |x: &Option<f64>| *x, &OutlierConfig::default(), 10.0);
