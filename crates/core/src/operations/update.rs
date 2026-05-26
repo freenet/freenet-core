@@ -956,16 +956,30 @@ mod tests {
         let idx = source
             .find(needle)
             .expect("NO_TARGETS log message must still exist in source");
-        let start = idx.saturating_sub(400);
-        let window = &source[start..idx];
+        // Anchor on the closest preceding `tracing::` macro (rfind) rather
+        // than a byte window, so the assertion is immune to refactors that
+        // move the target site relative to other nearby tracing macros.
+        // Adopted from the #4272 pin tests; see those for rationale.
+        let preceding = &source[..idx];
+        let macro_idx = preceding
+            .rfind("tracing::")
+            .expect("a tracing macro must precede the NO_TARGETS log site");
+        let line_start = preceding[..macro_idx].rfind('\n').map_or(0, |n| n + 1);
+        let line_prefix = &preceding[line_start..macro_idx];
         assert!(
-            window.contains("tracing::debug!"),
-            "NO_TARGETS log site must be DEBUG to avoid 4x amplification on retries. \
-             Re-promotion to WARN/INFO regresses #4251 review M2.\nWindow:\n{window}"
+            line_prefix.chars().all(char::is_whitespace),
+            "rfind matched `tracing::` inside a string literal or comment, \
+             not a macro invocation. Prefix on its line: {line_prefix:?}"
         );
-        assert!(
-            !window.contains("tracing::warn!") && !window.contains("tracing::info!"),
-            "NO_TARGETS log site must NOT be WARN/INFO.\nWindow:\n{window}"
+        let after_macro = &preceding[macro_idx + "tracing::".len()..];
+        let macro_name = after_macro.split('!').next().unwrap_or("");
+        let tail = &preceding[preceding.len().saturating_sub(200)..];
+        assert_eq!(
+            macro_name, "debug",
+            "NO_TARGETS log site must be DEBUG to avoid 4x amplification on retries \
+             (closest preceding macro is `tracing::{macro_name}!`). \
+             Re-promotion to WARN/INFO regresses #4251 review M2.\n\
+             Preceding source (last 200 bytes):\n{tail}"
         );
     }
 
@@ -994,6 +1008,13 @@ mod tests {
         let macro_idx = preceding
             .rfind("tracing::")
             .expect("a tracing macro must precede the broadcast log site");
+        let line_start = preceding[..macro_idx].rfind('\n').map_or(0, |n| n + 1);
+        let line_prefix = &preceding[line_start..macro_idx];
+        assert!(
+            line_prefix.chars().all(char::is_whitespace),
+            "rfind matched `tracing::` inside a string literal or comment, \
+             not a macro invocation. Prefix on its line: {line_prefix:?}"
+        );
         let after_macro = &preceding[macro_idx + "tracing::".len()..];
         let macro_name = after_macro.split('!').next().unwrap_or("");
         let tail = &preceding[preceding.len().saturating_sub(200)..];

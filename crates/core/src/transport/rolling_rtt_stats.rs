@@ -315,13 +315,16 @@ pub(crate) fn spawn_aggregator(
 }
 
 /// Emit one tracing event summarising the current cross-connection
-/// state. The local file-log mirror is at `debug` (gated behind
-/// `RUST_LOG=…=debug` and, in release builds, behind disabling the
-/// `max_level_info` feature). The local mirror at INFO was the
-/// third-largest contributor to the #4251 / #4272 log-volume
-/// regression at ~3,600 lines/hour per node; production telemetry
-/// reaches the OTLP collector via the `send_standalone_event` call
-/// below, which is independent of the tracing level.
+/// state. The local file-log mirror is at `debug`. In debug builds
+/// this is visible via `RUST_LOG=…=debug`; in release builds the
+/// `release_max_level_info` feature in `crates/core/Cargo.toml`
+/// compiles DEBUG events out entirely — `RUST_LOG` alone cannot
+/// revive them without a rebuild. This is intentional: the local
+/// mirror at INFO was the third-largest contributor to the
+/// #4251 / #4272 log-volume regression at ~3,600 lines/hour per
+/// node. Production telemetry reaches the OTLP collector via the
+/// `send_standalone_event` call below, which is independent of the
+/// tracing level, so the dashboard's 1 Hz feed survives.
 ///
 /// `send_standalone_event` pushes a structured event through the
 /// global telemetry sender (`crate::tracing::telemetry::send_standalone_event`)
@@ -776,9 +779,10 @@ mod tests {
     #[test]
     fn shadow_rtt_aggregate_logs_at_debug_pin_test() {
         let src = include_str!("rolling_rtt_stats.rs");
-        // The literal "shadow_rtt_aggregate" appears twice in the file:
-        // once as the tracing event message and once as the OTLP event
-        // name. The first occurrence is the tracing macro we want to pin.
+        // `"shadow_rtt_aggregate"` appears multiple times in the file
+        // (tracing event message, OTLP event name, doc comment, this
+        // comment). `find()` returns the first byte position, which is
+        // the tracing event message — the site we want to pin.
         let needle = "\"shadow_rtt_aggregate\"";
         let idx = src
             .find(needle)
@@ -787,6 +791,13 @@ mod tests {
         let macro_idx = preceding
             .rfind("tracing::")
             .expect("a tracing macro must precede the shadow_rtt_aggregate log site");
+        let line_start = preceding[..macro_idx].rfind('\n').map_or(0, |n| n + 1);
+        let line_prefix = &preceding[line_start..macro_idx];
+        assert!(
+            line_prefix.chars().all(char::is_whitespace),
+            "rfind matched `tracing::` inside a string literal or comment, \
+             not a macro invocation. Prefix on its line: {line_prefix:?}"
+        );
         let after_macro = &preceding[macro_idx + "tracing::".len()..];
         let macro_name = after_macro.split('!').next().unwrap_or("");
         let tail = &preceding[preceding.len().saturating_sub(200)..];

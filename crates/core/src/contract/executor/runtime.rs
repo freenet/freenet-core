@@ -4339,7 +4339,9 @@ mod executor_pin_tests {
     ///
     /// Anchored on the *closest* preceding `tracing::` macro via `rfind` so
     /// the assertion can't false-pass if an unrelated nearby site is at
-    /// DEBUG.
+    /// DEBUG. An additional guard rejects matches inside string literals or
+    /// comments by requiring the match to start a code line (whitespace-only
+    /// prefix on its line).
     #[test]
     fn contract_state_updated_logs_at_debug_pin_test() {
         let src = include_str!("runtime.rs");
@@ -4351,6 +4353,13 @@ mod executor_pin_tests {
         let macro_idx = preceding
             .rfind("tracing::")
             .expect("a tracing macro must precede the Contract-state-updated log site");
+        let line_start = preceding[..macro_idx].rfind('\n').map_or(0, |n| n + 1);
+        let line_prefix = &preceding[line_start..macro_idx];
+        assert!(
+            line_prefix.chars().all(char::is_whitespace),
+            "rfind matched `tracing::` inside a string literal or comment, \
+             not a macro invocation. Prefix on its line: {line_prefix:?}"
+        );
         let after_macro = &preceding[macro_idx + "tracing::".len()..];
         let macro_name = after_macro.split('!').next().unwrap_or("");
         let tail = &preceding[preceding.len().saturating_sub(200)..];
