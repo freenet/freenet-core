@@ -83,6 +83,13 @@ const LOCAL_DEMAND_WEIGHT: f64 = 1.0;
 /// local user.
 const FORWARDED_DEMAND_WEIGHT: f64 = 0.1;
 
+/// Interval between governance reaper ticks. Each tick applies
+/// decay and runs MAD-based outlier detection across the population.
+/// One minute balances responsiveness (a sustained-cost contract is
+/// flagged within a minute or two of crossing the threshold) against
+/// CPU overhead (MAD over the entire contract set every tick).
+const GOVERNANCE_TICK_INTERVAL: Duration = Duration::from_secs(60);
+
 use connection_backoff::ConnectionBackoff;
 pub use connection_backoff::ConnectionFailureReason;
 pub(crate) use peer_connection_backoff::PeerConnectionBackoff;
@@ -371,6 +378,19 @@ impl Ring {
             GlobalExecutor::spawn(Self::interest_heartbeat(ring.clone())),
         );
 
+        // Spawn periodic governance reaper tick.
+        // Computes per-contract state from accumulated cost/benefit
+        // samples and logs `ReaperDecision`s. Mode defaults to DryRun
+        // per the staged-rollout plan, so this task only ever logs —
+        // no eviction actions until the operator (or release default)
+        // flips to Enforce. The dashboard reads `governance.score_snapshot`
+        // independently of the tick; the tick is only the engine that
+        // updates state.
+        task_monitor.register(
+            "governance_reaper",
+            GlobalExecutor::spawn(Self::governance_reaper_loop(ring.clone())),
+        );
+
         Ok(ring)
     }
 
@@ -623,6 +643,72 @@ impl Ring {
     /// This prevents the death spiral where interest entries expire because no
     /// broadcasts are flowing, which in turn prevents broadcasts from ever
     /// flowing again. By periodically re-sending the full interest set, we
+    /// Periodic governance reaper loop. Ticks every
+    /// `GOVERNANCE_TICK_INTERVAL` and:
+    ///
+    ///   1. Calls `governance.tick(interval)` to apply decay and
+    ///      run the MAD detector over the per-contract distribution.
+    ///   2. Logs each `ReaperDecision` at INFO level with the from→to
+    ///      state and reason. In `DryRun` mode (the default) this is
+    ///      the only effect; in `Enforce` mode the caller would also
+    ///      emit `EvictContract` events here. Enforce-mode wiring
+    ///      lands in a subsequent commit.
+    ///   3. Logs the network-norms summary (median, MAD, threshold,
+    ///      sample size) at DEBUG so a busy node doesn't spam INFO.
+    ///
+    /// **Cancellation safety:** the loop's only `.await` points are
+    /// `tokio::time::sleep` / `interval.tick()`. No channel sends, no
+    /// long-running operations — the design-doc rule that "the
+    /// dashboard reflects the back-end" is respected here too: the
+    /// reaper writes governance state; readers consume it
+    /// asynchronously.
+    async fn governance_reaper_loop(ring: Arc<Self>) {
+        // Random initial delay so a fleet-wide restart doesn't have
+        // every node ticking in lockstep. 30-90 second offset; the
+        // tick itself runs every minute below.
+        let initial_delay = Duration::from_secs(GlobalRng::random_range(30u64..=90u64));
+        tokio::time::sleep(initial_delay).await;
+
+        let mut interval = tokio::time::interval(GOVERNANCE_TICK_INTERVAL);
+        interval.tick().await; // Skip first immediate tick.
+        let mut last_tick = ring.time_source.now();
+
+        loop {
+            interval.tick().await;
+            let now = ring.time_source.now();
+            let elapsed = now.saturating_duration_since(last_tick);
+            last_tick = now;
+
+            let result = ring.governance_tick(elapsed);
+
+            // Network-norms summary at DEBUG — useful when debugging
+            // calibration but too noisy for INFO on a healthy node.
+            tracing::debug!(
+                median = ?result.median_log_ratio,
+                mad = ?result.mad,
+                threshold = ?result.threshold,
+                sample_size = result.sample_size,
+                capacity_ceiling_binding = result.capacity_ceiling_binding,
+                skip_reason = ?result.skip_reason,
+                "governance reaper tick",
+            );
+
+            // Decisions at INFO — these are the dashboard-relevant
+            // events. Empty in healthy state, surfaces every
+            // transition during incidents.
+            for decision in result.decisions {
+                tracing::info!(
+                    contract = %decision.key,
+                    from = ?decision.from,
+                    to = ?decision.to,
+                    reason = ?decision.reason,
+                    actionable = decision.actionable,
+                    "governance state transition",
+                );
+            }
+        }
+    }
+
     /// keep entries alive on the remote side.
     ///
     /// Sends are spread evenly across the interval to avoid bursts.
@@ -2050,13 +2136,12 @@ impl Ring {
         self.governance.ingest_demand(contract_id, weight);
     }
 
-    /// Run one governance reaper tick. Caller (a periodic task in
-    /// `connection_maintenance` or similar) is expected to feed
+    /// Run one governance reaper tick. Caller (the periodic
+    /// `governance_reaper_loop` task) is expected to feed
     /// `tick_interval` = wall-time since the previous tick for decay.
     /// Returns the `ReaperTickResult` for the caller to act on (emit
     /// `EvictContract` events for actionable decisions, log dry-run
     /// decisions, surface stats on the dashboard).
-    #[allow(dead_code)] // periodic driver task lands in subsequent commit
     pub(crate) fn governance_tick(
         &self,
         tick_interval: Duration,
