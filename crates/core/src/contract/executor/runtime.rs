@@ -4331,6 +4331,31 @@ mod executor_pin_tests {
              futures::future::join_all (#4077)"
         );
     }
+
+    /// Pin: the `"Contract state updated"` notice fires on every successful
+    /// state write — at INFO it contributed ~44% of the post-#4252
+    /// log-volume regression on River-subscribed peers (see #4251 follow-up
+    /// PR). Re-promoting it would silently restore the disk-fill issue.
+    #[test]
+    fn contract_state_updated_logs_at_debug_pin_test() {
+        let src = include_str!("runtime.rs");
+        let needle = "\"Contract state updated\"";
+        let idx = src
+            .find(needle)
+            .expect("Contract state updated log message must still exist in source");
+        let start = idx.saturating_sub(400);
+        let window = &src[start..idx];
+        assert!(
+            window.contains("tracing::debug!"),
+            "Contract-state-updated log site must be at DEBUG. \
+             Re-promotion to INFO restores the #4251 / #4272 log-volume regression.\n\
+             Source window:\n{window}"
+        );
+        assert!(
+            !window.contains("tracing::info!") && !window.contains("tracing::warn!"),
+            "Contract-state-updated log site must NOT be INFO/WARN.\nWindow:\n{window}"
+        );
+    }
 }
 
 #[cfg(test)]

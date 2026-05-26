@@ -970,6 +970,38 @@ mod tests {
         );
     }
 
+    /// Source-level pin for the `UPDATE_PROPAGATION` broadcast (populated-
+    /// targets) branch. Fires once per fan-out per UPDATE — at INFO it was
+    /// ~43% of the post-#4252 log volume on a River-subscribed peer (see
+    /// #4251 follow-up). The `phase = "broadcast",` literal disambiguates
+    /// this site from the NO_TARGETS branch pinned above (whose phase is
+    /// `"warning"`).
+    #[test]
+    fn broadcast_propagation_logs_at_debug_pin_test() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/operations/update.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("must read own source at {}: {e}", path.display()));
+        let needle = "phase = \"broadcast\",";
+        let idx = source
+            .find(needle)
+            .expect("UPDATE_PROPAGATION broadcast log site must still exist in source");
+        // Generous window: the macro args (formatted targets list etc.)
+        // span >400 bytes before reaching the phase literal.
+        let start = idx.saturating_sub(800);
+        let window = &source[start..idx];
+        assert!(
+            window.contains("tracing::debug!"),
+            "UPDATE_PROPAGATION broadcast log site must be DEBUG. \
+             Re-promotion to INFO restores the #4251 / #4272 log-volume regression.\n\
+             Window:\n{window}"
+        );
+        assert!(
+            !window.contains("tracing::info!") && !window.contains("tracing::warn!"),
+            "UPDATE_PROPAGATION broadcast log site must NOT be INFO/WARN.\nWindow:\n{window}"
+        );
+    }
+
     /// Regression tests for issue #3914: misleading ERROR/WARN log noise from
     /// benign WASM rejections of stale broadcast UPDATEs. The contract correctly
     /// rejects an incoming state at a version we already hold (a re-broadcast

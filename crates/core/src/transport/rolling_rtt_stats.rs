@@ -755,4 +755,36 @@ mod tests {
 
         drop(h);
     }
+
+    /// Source-level pin for the `"shadow_rtt_aggregate"` local file-log
+    /// mirror. Fires at the 1 Hz aggregator cadence — at INFO that was
+    /// ~3,600 lines/hour on every node, the third-largest contributor to
+    /// the post-#4252 log volume regression (see #4251 follow-up PR).
+    /// The OTLP telemetry path (`send_standalone_event` immediately below
+    /// the `tracing!` call) is unaffected by the level; only the local-
+    /// file mirror is gated.
+    #[test]
+    fn shadow_rtt_aggregate_logs_at_debug_pin_test() {
+        let src = include_str!("rolling_rtt_stats.rs");
+        // The literal "shadow_rtt_aggregate" appears twice in the file:
+        // once as the tracing event message and once as the OTLP event
+        // name. The first occurrence is the tracing macro we want to pin.
+        let needle = "\"shadow_rtt_aggregate\"";
+        let idx = src
+            .find(needle)
+            .expect("shadow_rtt_aggregate log message must still exist in source");
+        let start = idx.saturating_sub(400);
+        let window = &src[start..idx];
+        assert!(
+            window.contains("tracing::debug!"),
+            "shadow_rtt_aggregate local-log mirror must be at DEBUG. \
+             Re-promotion to INFO restores the #4251 / #4272 1Hz-heartbeat regression. \
+             (The OTLP send_standalone_event call below is unaffected by the log level.)\n\
+             Window:\n{window}"
+        );
+        assert!(
+            !window.contains("tracing::info!") && !window.contains("tracing::warn!"),
+            "shadow_rtt_aggregate local-log mirror must NOT be INFO/WARN.\nWindow:\n{window}"
+        );
+    }
 }
