@@ -2518,7 +2518,11 @@ mod tests {
                         "classifier must preserve hop_count={hc} unchanged"
                     );
                 }
-                _ => panic!("expected Terminal(InlineFound) for hop_count={hc}"),
+                AttemptOutcome::Terminal(_)
+                | AttemptOutcome::Retry
+                | AttemptOutcome::Unexpected => {
+                    panic!("expected Terminal(InlineFound) for hop_count={hc}");
+                }
             }
         }
     }

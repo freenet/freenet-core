@@ -135,7 +135,19 @@ pub(super) async fn put_contract(
             new_value: Err(err),
             ..
         }) => {
-            tracing::error!(contract = %key, error = %err, phase = "error", "Failed to update contract value");
+            // Issue #4251: per-contract queue saturation logs at DEBUG, not
+            // ERROR — same rationale as the matching site in
+            // `update.rs::log_update_contract_failure`.
+            if err.is_contract_queue_full() {
+                tracing::debug!(
+                    contract = %key,
+                    error = %err,
+                    event = "queue_full",
+                    "PUT skipped: per-contract queue saturated"
+                );
+            } else {
+                tracing::error!(contract = %key, error = %err, phase = "error", "Failed to update contract value");
+            }
             Err(OpError::from(err))
         }
         Err(err) => Err(err.into()),
@@ -193,7 +205,30 @@ mod messages {
         },
         /// Response indicating the PUT completed. Routed hop-by-hop back to originator
         /// using each node's stored upstream_addr.
-        Response { id: Transaction, key: ContractKey },
+        Response {
+            id: Transaction,
+            key: ContractKey,
+            /// Forward-path hop count: how many hops the originating Request
+            /// traversed before reaching the node that produced this Response
+            /// (the final storer for `Response`, or the relay that finalised
+            /// locally because it had no next hop).
+            ///
+            /// Computed as `max_hops_to_live - htl_at_responder`. The relay
+            /// chain preserves this value as the Response bubbles back to the
+            /// originator — it does NOT increment on the return path. This
+            /// gives the whitepaper's "routing depth" metric (forward hops),
+            /// not round-trip.
+            ///
+            /// `#[serde(default)]` is set for source-level clarity. Bincode
+            /// does not honour serde defaults (positional encoding), so wire
+            /// compat with peers that lack this field is handled at the
+            /// handshake layer via `MIN_COMPATIBLE_VERSION`.
+            ///
+            /// Mirror of `GetMsg::Response.hop_count` (PR #4245); see also
+            /// `SubscribeMsg::Response.hop_count`.
+            #[serde(default)]
+            hop_count: usize,
+        },
 
         /// Streaming request to store a large contract. Used when payload exceeds
         /// streaming_threshold (default 64KB). The actual data is sent via a separate
@@ -224,6 +259,15 @@ mod messages {
             key: ContractKey,
             /// Whether the receiving node should continue forwarding to other peers
             continue_forwarding: bool,
+            /// Forward-path hop count — same semantics as
+            /// `PutMsg::Response.hop_count`. Carried for wire-format
+            /// symmetry: production code currently downgrades streaming
+            /// replies to non-streaming `Response` at the relay
+            /// (see `op_ctx_task::drive_relay_put` slice A note), but the
+            /// field is preserved here so any future streaming-passthrough
+            /// path can populate it without another wire bump.
+            #[serde(default)]
+            hop_count: usize,
         },
 
         /// Lightweight ACK sent by a relay peer back to its upstream when it forwards
@@ -274,7 +318,7 @@ mod messages {
                         htl
                     )
                 }
-                Self::Response { id, key } => {
+                Self::Response { id, key, .. } => {
                     write!(f, "PutResponse(id: {}, key: {})", id, key)
                 }
                 Self::RequestStreaming {
@@ -295,6 +339,7 @@ mod messages {
                     id,
                     key,
                     continue_forwarding,
+                    ..
                 } => {
                     write!(
                         f,
@@ -323,6 +368,7 @@ mod tests {
         let msg = PutMsg::Response {
             id: tx,
             key: make_contract_key(1),
+            hop_count: 0,
         };
         assert_eq!(*msg.id(), tx, "id() should return the transaction ID");
     }
@@ -333,6 +379,7 @@ mod tests {
         let msg = PutMsg::Response {
             id: tx,
             key: make_contract_key(1),
+            hop_count: 0,
         };
         let display = format!("{}", msg);
         assert!(
@@ -359,6 +406,66 @@ mod tests {
                 assert_eq!(contract_key, key);
             }
             other => panic!("Expected ForwardingAck, got {other}"),
+        }
+    }
+
+    /// Regression test: `PutMsg::Response.hop_count` and
+    /// `PutMsg::ResponseStreaming.hop_count` roundtrip through bincode.
+    ///
+    /// Before #4248 the PUT telemetry path computed `hop_count` at log time
+    /// via `op_manager.get_current_hop(id)`, which returned `None` once the
+    /// operation had been cleaned up — i.e., on the vast majority of
+    /// terminal PUT events.  The fix carries the value on the wire so the
+    /// originator has it when constructing `PutSuccess` log events.  This
+    /// test asserts that the new field survives round-trip serialisation
+    /// for both `Response` and `ResponseStreaming` variants — i.e., the
+    /// wire format actually carries it.
+    ///
+    /// bincode-positional caveat: any future positional change here will
+    /// break older binaries; see the `MIN_COMPATIBLE_VERSION` bump that
+    /// accompanies this PR.
+    #[test]
+    fn test_put_msg_response_hop_count_roundtrip() {
+        let key = make_contract_key(7);
+        let cases: &[(&str, usize)] = &[
+            ("zero", 0),
+            ("one", 1),
+            ("mid", 4),
+            ("htl", 10),
+            ("large", 64),
+        ];
+        for (label, hop_count) in cases.iter().copied() {
+            // Response variant
+            let response = PutMsg::Response {
+                id: Transaction::new::<PutMsg>(),
+                key,
+                hop_count,
+            };
+            let bytes = bincode::serialize(&response).expect(label);
+            let restored: PutMsg = bincode::deserialize(&bytes).expect(label);
+            match restored {
+                PutMsg::Response { hop_count: hc, .. } => {
+                    assert_eq!(hc, hop_count, "Response.hop_count must roundtrip ({label})")
+                }
+                _ => panic!("expected Response for {label}"),
+            }
+
+            // ResponseStreaming variant
+            let streaming = PutMsg::ResponseStreaming {
+                id: Transaction::new::<PutMsg>(),
+                key,
+                continue_forwarding: false,
+                hop_count,
+            };
+            let bytes = bincode::serialize(&streaming).expect(label);
+            let restored: PutMsg = bincode::deserialize(&bytes).expect(label);
+            match restored {
+                PutMsg::ResponseStreaming { hop_count: hc, .. } => assert_eq!(
+                    hc, hop_count,
+                    "ResponseStreaming.hop_count must roundtrip ({label})"
+                ),
+                _ => panic!("expected ResponseStreaming for {label}"),
+            }
         }
     }
 
