@@ -2036,6 +2036,112 @@ impl Ring {
         self.hosting_manager.dashboard_subscription_snapshot()
     }
 
+    /// Snapshot of per-contract governance state for the local-peer
+    /// dashboard. Reads directly from the canonical `GovernanceManager`
+    /// state — no mirror, no cache, no derived recomputation. If a
+    /// state appears here it's because the manager computed it from
+    /// real meter samples and real subscription events.
+    pub fn dashboard_governance_snapshot(&self) -> crate::node::network_status::GovernanceSnapshot {
+        use crate::contract::governance as gov;
+        use crate::node::network_status as ns;
+
+        let now = self.time_source.now();
+        let mode = match self.governance.mode() {
+            gov::GovernanceMode::Off => ns::GovernanceModeSnapshot::Off,
+            gov::GovernanceMode::DryRun => ns::GovernanceModeSnapshot::DryRun,
+            gov::GovernanceMode::Enforce => ns::GovernanceModeSnapshot::Enforce,
+        };
+
+        let map_state = |s: gov::GovernanceState| match s {
+            gov::GovernanceState::Normal => ns::GovernanceStateSnapshot::Normal,
+            gov::GovernanceState::Borderline => ns::GovernanceStateSnapshot::Borderline,
+            gov::GovernanceState::WouldEvict => ns::GovernanceStateSnapshot::WouldEvict,
+            gov::GovernanceState::Evicted => ns::GovernanceStateSnapshot::Evicted,
+            gov::GovernanceState::Banned => ns::GovernanceStateSnapshot::Banned,
+        };
+        let map_reason = |r: gov::TransitionReason| match r {
+            gov::TransitionReason::FirstSeen => ns::GovernanceTransitionReasonSnapshot::FirstSeen,
+            gov::TransitionReason::BorderlineEntered => {
+                ns::GovernanceTransitionReasonSnapshot::BorderlineEntered
+            }
+            gov::TransitionReason::ThresholdCrossed => {
+                ns::GovernanceTransitionReasonSnapshot::ThresholdCrossed
+            }
+            gov::TransitionReason::Evicted => ns::GovernanceTransitionReasonSnapshot::Evicted,
+            gov::TransitionReason::BanTriggered => {
+                ns::GovernanceTransitionReasonSnapshot::BanTriggered
+            }
+            gov::TransitionReason::Recovered => ns::GovernanceTransitionReasonSnapshot::Recovered,
+            gov::TransitionReason::BanLifted => ns::GovernanceTransitionReasonSnapshot::BanLifted,
+        };
+
+        let contracts: Vec<ns::ContractGovernanceEntry> = self
+            .governance
+            .iter_scores()
+            .into_iter()
+            .map(|(id, score)| {
+                let instance_id = id.to_string();
+                let instance_id_short = if instance_id.chars().count() > 12 {
+                    let trunc: String = instance_id.chars().take(12).collect();
+                    format!("{trunc}...")
+                } else {
+                    instance_id.clone()
+                };
+                let history = score
+                    .history
+                    .iter()
+                    .map(|t| ns::GovernanceTransitionEntry {
+                        secs_ago: now.saturating_duration_since(t.at).as_secs(),
+                        from: map_state(t.from),
+                        to: map_state(t.to),
+                        reason: map_reason(t.reason),
+                    })
+                    .collect();
+                ns::ContractGovernanceEntry {
+                    instance_id,
+                    instance_id_short,
+                    state: map_state(score.state),
+                    cost_used: score.cost_used,
+                    benefit_score: score.benefit_score,
+                    log_ratio: score.log_ratio(),
+                    age_secs: now.saturating_duration_since(score.first_seen).as_secs(),
+                    last_transition_secs_ago: now
+                        .saturating_duration_since(score.last_transition)
+                        .as_secs(),
+                    history,
+                }
+            })
+            .collect();
+
+        let norms = match self.governance.latest_norms() {
+            Some(n) => ns::NetworkNorms {
+                median_log_ratio: n.median_log_ratio,
+                mad: n.mad,
+                threshold: n.threshold,
+                sample_size: n.sample_size,
+                capacity_ceiling_binding: n.capacity_ceiling_binding,
+                skip_reason: n.skip_reason.map(|r| match r {
+                    crate::governance::SkipReason::InsufficientSamples => {
+                        ns::GovernanceSkipReasonSnapshot::InsufficientSamples
+                    }
+                    crate::governance::SkipReason::MadCollapsed => {
+                        ns::GovernanceSkipReasonSnapshot::MadCollapsed
+                    }
+                    crate::governance::SkipReason::NoExtractableRatios => {
+                        ns::GovernanceSkipReasonSnapshot::NoExtractableRatios
+                    }
+                }),
+            },
+            None => ns::NetworkNorms::default(),
+        };
+
+        ns::GovernanceSnapshot {
+            mode,
+            contracts,
+            norms,
+        }
+    }
+
     /// Record that a state update was observed for `contract`.
     /// No-op if the contract is not currently subscribed.
     pub fn record_contract_update(&self, contract: &ContractKey) {

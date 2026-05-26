@@ -2803,6 +2803,7 @@ mod tests {
             bytes_uploaded: 0,
             bytes_downloaded: 0,
             health: HealthLevel::Connecting,
+            governance: Default::default(),
         }
     }
 

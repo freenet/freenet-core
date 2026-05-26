@@ -403,6 +403,26 @@ pub(crate) struct GovernanceManager {
     config: GovernanceConfig,
     /// Time source — every timestamp goes through this for DST.
     time_source: Arc<dyn TimeSource + Send + Sync>,
+    /// Most recent reaper-tick stats (median / MAD / threshold /
+    /// sample size / skip reason). Stored so the dashboard snapshot
+    /// builder can read network-norms without re-running detection.
+    /// `parking_lot::RwLock` for cheap reads — the snapshot builder
+    /// hits this every dashboard refresh.
+    latest_tick: parking_lot::RwLock<Option<NetworkNormsCache>>,
+}
+
+/// Internal cache of the network-norms portion of a `ReaperTickResult`.
+/// Excludes the per-decision list (those are logged at tick time;
+/// the dashboard reads transitions from each contract's `history`).
+#[derive(Clone, Debug)]
+pub(crate) struct NetworkNormsCache {
+    pub median_log_ratio: Option<f64>,
+    pub mad: Option<f64>,
+    pub threshold: Option<f64>,
+    pub capacity_ceiling_binding: bool,
+    pub sample_size: usize,
+    pub skip_reason: Option<SkipReason>,
+    pub at: Instant,
 }
 
 impl GovernanceManager {
@@ -414,7 +434,28 @@ impl GovernanceManager {
             scores: DashMap::new(),
             config,
             time_source,
+            latest_tick: parking_lot::RwLock::new(None),
         }
+    }
+
+    /// Operating mode, for the dashboard snapshot.
+    pub(crate) fn mode(&self) -> GovernanceMode {
+        self.config.mode
+    }
+
+    /// Read the latest network-norms snapshot, if any tick has run.
+    /// Used by the dashboard snapshot builder.
+    pub(crate) fn latest_norms(&self) -> Option<NetworkNormsCache> {
+        self.latest_tick.read().clone()
+    }
+
+    /// Iterate per-contract scores. Yields cloned snapshots so the
+    /// caller doesn't need to hold the DashMap shard guards.
+    pub(crate) fn iter_scores(&self) -> Vec<(ContractInstanceId, ContractScore)> {
+        self.scores
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect()
     }
 
     /// Add a cost sample to a contract's `cost_used`. Called from the
@@ -624,6 +665,17 @@ impl GovernanceManager {
                 }
             }
         }
+
+        // Cache the network-norms for the dashboard snapshot builder.
+        *self.latest_tick.write() = Some(NetworkNormsCache {
+            median_log_ratio: outlier_result.median_log_ratio,
+            mad: outlier_result.mad,
+            threshold: outlier_result.threshold,
+            capacity_ceiling_binding: outlier_result.capacity_ceiling_binding,
+            sample_size: outlier_result.sample_size,
+            skip_reason: outlier_result.skip_reason,
+            at: now,
+        });
 
         ReaperTickResult {
             decisions,
