@@ -442,8 +442,21 @@ impl Socket for UdpSocket {
         if let Err(e) = sock.set_send_buffer_size(DESIRED_UDP_BUF_BYTES) {
             tracing::warn!(error = %e, "failed to request UDP send buffer size");
         }
-        // `ok()` (not `unwrap_or(0)`) so a getsockopt failure doesn't masquerade
-        // as a 0-byte buffer and trip the clamp warning below.
+        sock.bind(&addr.into()).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("Failed to bind UDP socket to {addr}: {e}"),
+            )
+        })?;
+        // Only emit the post-tuning diagnostics after a successful bind so we
+        // don't log buffer sizes (and clamp warnings) once per AddrInUse retry
+        // inside `bind_socket_with_retry`. The buffer-tuning calls above still
+        // run for every attempt, but their kernel side-effects belong to the
+        // socket fd that gets dropped on retry — what we want operators to see
+        // is the configuration of the fd that survives.
+        //
+        // `ok()` (not `unwrap_or(0)`) so a getsockopt failure doesn't
+        // masquerade as a 0-byte buffer and trip the clamp warning below.
         let actual_rcv = sock.recv_buffer_size().ok();
         let actual_snd = sock.send_buffer_size().ok();
         // Linux's stock rmem_max ≈ 208 KiB is the documented production problem.
@@ -474,12 +487,6 @@ impl Socket for UdpSocket {
             }
         }
         tracing::info!(actual_rcv = ?actual_rcv, actual_snd = ?actual_snd, "UDP socket buffer sizes");
-        sock.bind(&addr.into()).map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!("Failed to bind UDP socket to {addr}: {e}"),
-            )
-        })?;
         let std_socket: std::net::UdpSocket = sock.into();
         Self::from_std(std_socket)
     }
@@ -1169,9 +1176,11 @@ mod dual_stack_tests {
 
     /// Regression for #3844 (IPv6 path): the tuning must apply equally to the
     /// dual-stack `[::]:port` bind that gateways actually use in production.
+    /// `Ipv6Addr::UNSPECIFIED` exercises the same code path (the `is_ipv6`
+    /// branch + `set_only_v6(false)` + the new setsockopt calls).
     #[tokio::test]
     async fn udp_socket_bind_requests_large_buffers_ipv6() {
-        let v6_addr = SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0);
+        let v6_addr = SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0);
         assert_tuned_bind_grows_buffers(v6_addr).await;
     }
 }
