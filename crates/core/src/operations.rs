@@ -349,7 +349,9 @@ pub(crate) async fn broadcast_change_interests(
             removed: removed_hashes,
         })
     {
-        tracing::warn!(
+        // Best-effort by design — log at debug to keep the caller
+        // layer in step with the helper-internal downgrade (#4238).
+        tracing::debug!(
             error = %err,
             "Failed to broadcast ChangeInterests (best-effort)"
         );

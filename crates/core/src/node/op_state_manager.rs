@@ -870,8 +870,11 @@ async fn release_pending_op_slot_on(
 ///
 /// Extracted from [`OpManager::try_release_pending_op_slot`] so it can be
 /// exercised in unit tests without building a full `OpManager`. Best-effort:
-/// a momentarily-full or closed channel produces a warning and the parked
-/// driver falls back to its `OPERATION_TTL` timeout (#4154).
+/// a momentarily-full channel produces a debug-level log (benign back-
+/// pressure under load — was flooding gateways at 30K+/hr, see #4238); a
+/// closed channel produces a warn-level log (receiver torn down). Either
+/// arm leaves the parked driver to fall back to its `OPERATION_TTL`
+/// timeout (#4154).
 fn try_release_pending_op_slot_on(
     notifications_sender: &mpsc::Sender<Either<NetMessage, NodeEvent>>,
     tx: Transaction,

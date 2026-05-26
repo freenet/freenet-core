@@ -2183,7 +2183,16 @@ where
                     new_state: new_state.clone(),
                 })
             {
-                tracing::warn!(
+                // Best-effort by design (see comment block above and
+                // #4145): a missed broadcast heals via the next UPDATE
+                // or summary-mismatch SyncStateToPeer round. Per-
+                // occurrence WARN here flooded gateways under fan-out
+                // at the same rate as the helper-internal log it
+                // mirrored (#4238). The rate-limited `notify_node_event:
+                // Notification channel full for too long` ERROR in
+                // op_state_manager.rs is the sustained-back-pressure
+                // alert operators should grep for.
+                tracing::debug!(
                     contract = %key,
                     error = %err,
                     "Failed to broadcast state change to network peers (best-effort)"
@@ -2520,7 +2529,11 @@ where
                     new_state,
                 })
             {
-                tracing::warn!(
+                // Best-effort by design — see #4145 and the sibling
+                // commit path above. Per-occurrence WARN here re-
+                // introduced the #4238 spam at the caller layer even
+                // after the helper-internal downgrade.
+                tracing::debug!(
                     contract = %key,
                     error = %err,
                     "Failed to broadcast state change to network peers (best-effort)"
