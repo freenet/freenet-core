@@ -425,6 +425,36 @@ impl Socket for UdpSocket {
             sock.set_only_v6(false)?;
         }
         sock.set_nonblocking(true)?;
+        // Request a generous UDP socket buffer. Stock Linux net.core.rmem_default
+        // is only ~208 KiB, which is inadequate for a gateway under realistic
+        // load and causes kernel-level drops visible as UdpRcvbufErrors in
+        // /proc/net/snmp. Production gateways were silently losing ~15x the
+        // packets they delivered until operators raised the sysctls manually
+        // (see #3844). The kernel silently clamps to net.core.rmem_max, so we
+        // also surface the actual size to give operators actionable diagnostics.
+        const DESIRED_UDP_BUF_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+        if let Err(e) = sock.set_recv_buffer_size(DESIRED_UDP_BUF_BYTES) {
+            tracing::warn!(error = %e, "failed to request UDP recv buffer size");
+        }
+        if let Err(e) = sock.set_send_buffer_size(DESIRED_UDP_BUF_BYTES) {
+            tracing::warn!(error = %e, "failed to request UDP send buffer size");
+        }
+        let actual_rcv = sock.recv_buffer_size().unwrap_or(0);
+        let actual_snd = sock.send_buffer_size().unwrap_or(0);
+        // Linux doubles the requested value internally (kernel bookkeeping), so an
+        // unclamped 16 MiB request returns ~32 MiB. macOS/BSD do not double, so an
+        // unclamped request returns ~16 MiB. We treat anything below half the
+        // request as a clamp signal — that catches the stock-Linux case (rmem_max
+        // ≈ 208 KiB → ~416 KiB actual) without false-positives on platforms that
+        // don't double.
+        if actual_rcv < DESIRED_UDP_BUF_BYTES / 2 {
+            tracing::warn!(
+                requested = DESIRED_UDP_BUF_BYTES,
+                actual_rcv,
+                "UDP recv buffer smaller than requested — raise net.core.rmem_max (currently clamped by kernel)"
+            );
+        }
+        tracing::info!(actual_rcv, actual_snd, "UDP socket buffer sizes");
         sock.bind(&addr.into()).map_err(|e| {
             io::Error::new(
                 e.kind(),
@@ -1038,5 +1068,96 @@ mod dual_stack_tests {
             peers.iter().all(|(a, _, _)| *a != attacker_addr),
             "spoofed (un-authenticated) source MUST NOT create a per-peer entry"
         );
+    }
+
+    /// Read the kernel's effective UDP recv buffer ceiling on Linux. Returns
+    /// `None` on other platforms or if the sysctl is unreadable. Used by the
+    /// SO_RCVBUF regression test below to decide whether the environment can
+    /// demonstrate the fix.
+    fn read_sysctl_rmem_max() -> Option<usize> {
+        if !cfg!(target_os = "linux") {
+            return None;
+        }
+        std::fs::read_to_string("/proc/sys/net/core/rmem_max")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+    }
+
+    /// Regression for #3844: `Socket::bind` must request a generous UDP socket
+    /// buffer (16 MiB) so production gateways aren't silently dropping packets
+    /// to the kernel's stock ~208 KiB default. Both nova and vega were
+    /// accumulating UdpRcvbufErrors at 15× the delivered-datagram rate until
+    /// operators raised `net.core.rmem_max` manually.
+    ///
+    /// Method: bind a control socket directly (no buffer tuning) and a tuned
+    /// socket through our `Socket::bind` impl, then compare the resulting
+    /// SO_RCVBUF / SO_SNDBUF values. On constrained kernels where rmem_max
+    /// clamps both sockets to the same default, only the weak `tuned >=
+    /// control` invariant holds. On any system where rmem_max permits a
+    /// multi-megabyte request to materialize, the tuned socket must end up
+    /// with a strictly larger buffer than the untuned control — that's the
+    /// observable effect of the fix.
+    #[tokio::test]
+    async fn udp_socket_bind_requests_large_buffers() {
+        let v4_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0);
+
+        // Control: bind directly via tokio without going through our
+        // Socket::bind impl, so no buffer-size hints are applied.
+        let control = tokio::net::UdpSocket::bind(v4_addr)
+            .await
+            .expect("control bind should succeed");
+        let control_sock2 = socket2::Socket::from(control.into_std().expect("into_std"));
+        let control_rcv = control_sock2
+            .recv_buffer_size()
+            .expect("control recv_buffer_size");
+        let control_snd = control_sock2
+            .send_buffer_size()
+            .expect("control send_buffer_size");
+
+        // Tuned: bind via our Socket::bind, which should request 16 MiB
+        // SO_RCVBUF / SO_SNDBUF before bind.
+        let tuned = <UdpSocket as Socket>::bind(v4_addr)
+            .await
+            .expect("tuned bind should succeed");
+        let tuned_sock2 = socket2::Socket::from(tuned.into_std().expect("into_std"));
+        let tuned_rcv = tuned_sock2
+            .recv_buffer_size()
+            .expect("tuned recv_buffer_size");
+        let tuned_snd = tuned_sock2
+            .send_buffer_size()
+            .expect("tuned send_buffer_size");
+
+        // Weak invariant: the tuned socket must never end up with a smaller
+        // buffer than the untuned control. This holds on every platform,
+        // even when rmem_max clamps both to the same default.
+        assert!(
+            tuned_rcv >= control_rcv,
+            "tuned recv buffer ({tuned_rcv}) must be at least as large as control ({control_rcv})"
+        );
+        assert!(
+            tuned_snd >= control_snd,
+            "tuned send buffer ({tuned_snd}) must be at least as large as control ({control_snd})"
+        );
+
+        // Strict regression check: on Linux with rmem_max large enough to
+        // honor a multi-MB request, the tuned buffer MUST be strictly
+        // larger than the untuned default. This is the assertion that
+        // would have caught the missing set_recv_buffer_size call.
+        if let Some(rmem_max) = read_sysctl_rmem_max()
+            && rmem_max >= 4 * 1024 * 1024
+        {
+            assert!(
+                tuned_rcv > control_rcv,
+                "with rmem_max={rmem_max}, tuned SO_RCVBUF ({tuned_rcv}) must \
+                 strictly exceed untuned default ({control_rcv}) — the fix did not take effect"
+            );
+        } else {
+            eprintln!(
+                "udp_socket_bind_requests_large_buffers: rmem_max={:?} too small \
+                 to demonstrate fix strictly; observed control_rcv={control_rcv}, \
+                 tuned_rcv={tuned_rcv}, control_snd={control_snd}, tuned_snd={tuned_snd}",
+                read_sysctl_rmem_max()
+            );
+        }
     }
 }
