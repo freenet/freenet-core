@@ -47,6 +47,16 @@
 use std::collections::HashMap;
 use std::hash::Hash;
 
+/// Gaussian-consistency constant for MAD: under a normal distribution,
+/// `σ ≈ 1.4826 × MAD`. We scale MAD by this factor before applying `k`
+/// so that the doc-claimed false-positive rates (k=3 ≈ p99.7, k=5 ≈
+/// 1-in-a-million, k=6 ≈ 1-in-500M) actually hold under a log-normal
+/// honest population. Without this scaling, raw `k × MAD` is only
+/// `k × 0.6745 × σ`, so k=5 would correspond to ~3.37σ (≈ 1-in-1500),
+/// not the 1-in-a-million the design doc claims. See
+/// <https://en.wikipedia.org/wiki/Median_absolute_deviation#Relation_to_standard_deviation>.
+const MAD_GAUSSIAN_CONSISTENCY: f64 = 1.4826;
+
 /// Configuration for the outlier detector. Defaults match the
 /// design-doc values: k=5 (1-in-a-million false-positive rate under
 /// log-normal assumption), n≥30 minimum sample size (standard
@@ -159,10 +169,25 @@ where
     K: Clone + Eq + Hash,
     F: Fn(&S) -> Option<f64>,
 {
-    // Step 1: extract ratios, preserving key→ratio pairing.
+    // Step 1: extract ratios, dropping any non-finite values
+    // (NaN, ±inf). The extractor's contract is "return None for
+    // unscoreable samples", but callers can produce non-finite results
+    // by dividing by zero, taking log of zero, etc.; the primitive
+    // defends against that here so a single malformed sample can't
+    // poison median/MAD via NaN-propagation (every comparison with
+    // NaN is false, including `mad < f64::EPSILON`, so without this
+    // guard the function would silently flag nothing).
     let mut pairs: Vec<(K, f64)> = samples
         .iter()
-        .filter_map(|(k, s)| extract_log_ratio(s).map(|r| (k.clone(), r)))
+        .filter_map(|(k, s)| {
+            extract_log_ratio(s).and_then(|r| {
+                if r.is_finite() {
+                    Some((k.clone(), r))
+                } else {
+                    None
+                }
+            })
+        })
         .collect();
 
     let sample_size = pairs.len();
@@ -176,12 +201,10 @@ where
     // Step 2: trim the top tail BEFORE computing the statistic so the
     // very outliers we're detecting don't corrupt the threshold.
     //
-    // Sort by ratio ascending — partial_cmp because f64 isn't Ord. Any
-    // NaN would have been filtered upstream (extract_log_ratio is
-    // responsible for that); on the unlikely chance one slipped through,
-    // treat it as Less so it lands at the bottom and gets ignored by
-    // the trim step.
-    pairs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Less));
+    // Sort by ratio ascending — partial_cmp because f64 isn't Ord.
+    // Non-finite values were filtered above, so partial_cmp will always
+    // return Some; the unwrap_or is purely defensive.
+    pairs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
     let trim_count = (sample_size as f64 * config.trim_fraction).floor() as usize;
     let trimmed_len = sample_size.saturating_sub(trim_count);
@@ -217,8 +240,13 @@ where
         };
     }
 
-    // Step 5: threshold = median + k × mad, clamped at capacity ceiling.
-    let raw_threshold = median + config.k * mad;
+    // Step 5: threshold = median + k × (σ-scaled MAD), clamped at
+    // capacity ceiling. Under a normal honest population the scaling
+    // by `MAD_GAUSSIAN_CONSISTENCY` (≈1.4826) makes `k` interpretable
+    // as the number of standard deviations beyond the median, so
+    // k=5 ≈ 1-in-a-million as the design doc claims.
+    let scaled_mad = mad * MAD_GAUSSIAN_CONSISTENCY;
+    let raw_threshold = median + config.k * scaled_mad;
     let capacity_ceiling_binding = raw_threshold > capacity_ceiling_log;
     let threshold = raw_threshold.min(capacity_ceiling_log);
 
@@ -300,8 +328,15 @@ mod tests {
     #[test]
     fn worked_example_from_design_doc() {
         // 7 contracts: [-1.5, -1.2, -1.0, -0.9, -0.8, -0.6, +2.5]
-        // Expected: median=-0.9, MAD=0.3, threshold(k=5)=+0.6, flag={"abuser"}.
-        // n=7 is below default min_samples=30, so lower the threshold.
+        // Expected: median=-0.9, MAD=0.3.
+        // threshold(k=5) = median + k × 1.4826 × MAD
+        //                = -0.9 + 5 × 1.4826 × 0.3
+        //                = +1.32390
+        // abuser at +2.5 exceeds the threshold → flagged.
+        //
+        // n=7 is below default min_samples=30, so this test lowers
+        // min_samples to 5 to let the math run. The bracketed values are
+        // illustrative; production callers use the default min_samples=30.
         let m = map_from(&[
             ("a", -1.5),
             ("b", -1.2),
@@ -320,7 +355,8 @@ mod tests {
         let r = detect_outliers(&m, |x| Some(*x), &cfg, 10.0);
         assert!((r.median_log_ratio.unwrap() - (-0.9)).abs() < 1e-9);
         assert!((r.mad.unwrap() - 0.3).abs() < 1e-9);
-        assert!((r.threshold.unwrap() - 0.6).abs() < 1e-9);
+        let expected_threshold = -0.9 + 5.0 * MAD_GAUSSIAN_CONSISTENCY * 0.3;
+        assert!((r.threshold.unwrap() - expected_threshold).abs() < 1e-9);
         assert_eq!(r.flagged, vec!["abuser".to_string()]);
         assert_eq!(r.skip_reason, None);
     }
@@ -402,6 +438,154 @@ mod tests {
         assert_eq!(r.skip_reason, None);
         // No outliers in this gentle distribution.
         assert!(r.flagged.is_empty());
+    }
+
+    #[test]
+    fn non_finite_ratios_are_dropped_from_sample() {
+        // NaN, +inf, -inf in the extractor output must be excluded
+        // before median/MAD computation — otherwise NaN propagates
+        // through every comparison and the function silently flags
+        // nothing. Design doc §"Edge cases" line 287.
+        let mut pairs: Vec<(String, f64)> = (0..30)
+            .map(|i| (format!("c{i}"), (i as f64 - 15.0) * 0.05))
+            .collect();
+        pairs.push(("nan".into(), f64::NAN));
+        pairs.push(("pos_inf".into(), f64::INFINITY));
+        pairs.push(("neg_inf".into(), f64::NEG_INFINITY));
+        let m: HashMap<_, _> = pairs.into_iter().collect();
+        let r = detect_outliers(&m, |x| Some(*x), &OutlierConfig::default(), 10.0);
+        // Only the 30 finite samples count toward sample_size.
+        assert_eq!(r.sample_size, 30);
+        // No NaN-poisoning of median/MAD.
+        assert!(r.median_log_ratio.unwrap().is_finite());
+        // The non-finite keys are never flagged.
+        assert!(!r.flagged.iter().any(|k| k == "nan"));
+        assert!(!r.flagged.iter().any(|k| k == "pos_inf"));
+        assert!(!r.flagged.iter().any(|k| k == "neg_inf"));
+    }
+
+    #[test]
+    fn n_equals_one_with_min_samples_one() {
+        // Boundary: a single sample with min_samples=1. MAD is trivially
+        // zero (single sample has no spread), so we expect MadCollapsed.
+        // This pins behaviour so a future refactor that, say, treats
+        // n=1 as a special "always flag" or "always pass" case fails the
+        // test instead of silently changing semantics.
+        let m = map_from(&[("only", 0.5)]);
+        let cfg = OutlierConfig {
+            k: 5.0,
+            min_samples: 1,
+            trim_fraction: 0.05,
+        };
+        let r = detect_outliers(&m, |x| Some(*x), &cfg, 10.0);
+        assert_eq!(r.sample_size, 1);
+        assert_eq!(r.skip_reason, Some(SkipReason::MadCollapsed));
+        assert!(r.flagged.is_empty());
+    }
+
+    #[test]
+    fn n_equals_two_with_min_samples_two() {
+        // Boundary: n=2 with distinct values. Median is the mean of the
+        // two; MAD is the median of two equal deviations = that
+        // deviation. Verify the math runs and doesn't flag either
+        // sample (both sit exactly at ±MAD from the median, which is
+        // below the k×MAD threshold).
+        let m = map_from(&[("low", -0.1), ("high", 0.1)]);
+        let cfg = OutlierConfig {
+            k: 5.0,
+            min_samples: 2,
+            trim_fraction: 0.05,
+        };
+        let r = detect_outliers(&m, |x| Some(*x), &cfg, 10.0);
+        assert_eq!(r.sample_size, 2);
+        assert!((r.median_log_ratio.unwrap() - 0.0).abs() < 1e-9);
+        assert!((r.mad.unwrap() - 0.1).abs() < 1e-9);
+        assert!(r.flagged.is_empty());
+    }
+
+    #[test]
+    fn mad_collapses_after_trim_even_when_raw_set_varies() {
+        // Construct a 30-sample set whose top 5% trim (1 sample) is the
+        // only variation; the remaining 29 samples are all identical.
+        // MAD-of-trimmed should be 0 → MadCollapsed.
+        let mut pairs: Vec<(String, f64)> = (0..29).map(|i| (format!("c{i}"), -1.0)).collect();
+        pairs.push(("the_one_with_variation".into(), 5.0));
+        let m: HashMap<_, _> = pairs.into_iter().collect();
+        let r = detect_outliers(&m, |x| Some(*x), &OutlierConfig::default(), 10.0);
+        assert_eq!(r.sample_size, 30);
+        // trim removes the top 5% × 30 = 1 sample → MAD of the
+        // remaining 29 (all -1.0) collapses.
+        assert_eq!(r.skip_reason, Some(SkipReason::MadCollapsed));
+        assert!(r.flagged.is_empty());
+    }
+
+    #[test]
+    fn capacity_ceiling_not_binding_when_threshold_below() {
+        // Pin the OFF state of capacity_ceiling_binding so a refactor
+        // that inverts the comparison fails the test instead of
+        // silently shipping. Honest bulk distribution, ceiling well
+        // above the natural threshold.
+        let pairs: Vec<(String, f64)> = (0..30)
+            .map(|i| (format!("c{i}"), -1.0 + (i as f64 - 15.0) * 0.02))
+            .collect();
+        let m: HashMap<_, _> = pairs.into_iter().collect();
+        let r = detect_outliers(&m, |x| Some(*x), &OutlierConfig::default(), 100.0);
+        assert!(!r.capacity_ceiling_binding);
+        // Threshold should equal the raw `median + k × 1.4826 × MAD`,
+        // unclamped.
+        assert!(r.threshold.unwrap() < 100.0);
+    }
+
+    #[test]
+    fn three_outliers_exceeding_trim_fraction() {
+        // n=30 with trim_fraction=0.05 trims only 1 sample. With 3
+        // outliers, 2 remain in the MAD computation and could contaminate
+        // it. Verify MAD's 50% breakdown point still catches all 3 in
+        // the flagged set even when trim alone isn't enough.
+        let mut pairs: Vec<(String, f64)> = (0..27)
+            .map(|i| (format!("honest{i}"), -1.0 + (i as f64 - 13.0) * 0.02))
+            .collect();
+        pairs.push(("abuser1".into(), 5.0));
+        pairs.push(("abuser2".into(), 6.0));
+        pairs.push(("abuser3".into(), 7.0));
+        let m: HashMap<_, _> = pairs.into_iter().collect();
+        let r = detect_outliers(&m, |x| Some(*x), &OutlierConfig::default(), 100.0);
+        // All three abusers should be in the flagged set even though
+        // trim removed only the most-extreme one.
+        assert!(r.flagged.contains(&"abuser1".to_string()));
+        assert!(r.flagged.contains(&"abuser2".to_string()));
+        assert!(r.flagged.contains(&"abuser3".to_string()));
+        // No honest contracts in the flagged set.
+        assert!(!r.flagged.iter().any(|k| k.starts_with("honest")));
+    }
+
+    #[test]
+    fn sample_exactly_at_threshold_is_not_flagged() {
+        // The flag check is strictly `>` not `>=`. Pin that so a future
+        // change to `>=` doesn't silently widen the set. Construct a
+        // sample whose ratio equals the computed threshold and assert
+        // it is NOT in `flagged`.
+        let pairs: Vec<(String, f64)> = (0..30).map(|i| (format!("c{i}"), -1.0)).collect();
+        let mut m: HashMap<_, _> = pairs.into_iter().collect();
+        // Compute the same threshold logic by hand: 29 are -1.0 and one
+        // is -0.5 to give MAD a non-zero value. Median = -1.0, MAD = 0.
+        // Better: build a wider set so MAD is non-zero.
+        m.clear();
+        let widened: Vec<(String, f64)> = (0..30)
+            .map(|i| (format!("c{i}"), -1.0 + (i as f64 - 15.0) * 0.01))
+            .collect();
+        m.extend(widened);
+        let cfg = OutlierConfig::default();
+        let r_probe = detect_outliers(&m, |x| Some(*x), &cfg, 100.0);
+        let exact_threshold = r_probe.threshold.unwrap();
+        // Add a sample whose ratio is exactly the threshold value.
+        m.insert("at_threshold".into(), exact_threshold);
+        let r = detect_outliers(&m, |x| Some(*x), &cfg, 100.0);
+        assert!(
+            !r.flagged.contains(&"at_threshold".to_string()),
+            "sample at threshold should NOT be flagged (strict > semantics), flagged: {:?}",
+            r.flagged
+        );
     }
 
     #[test]

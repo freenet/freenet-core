@@ -94,7 +94,7 @@ This is principled — not "pick a multiplier that feels right" — for three re
 
 - **MAD has a 50% breakdown point.** Up to half the network can be malicious before MAD itself gets corrupted. Standard deviation breaks under a single outlier; MAD doesn't.
 - **Log-space handles heavy tails.** Cost ratios compound multiplicatively. A contract 1000× the median is roughly 3× as far in log-space as one at 10× — matches the actual signal.
-- **`k` translates directly to false-positive rate.** Under a roughly log-normal honest population: k=3 ≈ p99.7, k=4 ≈ 1-in-16k, **k=5 ≈ 1-in-a-million**, k=6 ≈ 1-in-500M. **k=5 default.**
+- **`k` translates directly to false-positive rate.** Under a roughly log-normal honest population: k=3 ≈ p99.7, k=4 ≈ 1-in-16k, **k=5 ≈ 1-in-a-million**, k=6 ≈ 1-in-500M. **k=5 default.** These sigma-equivalent rates hold because the implementation scales MAD by the Gaussian consistency constant `1.4826` (so `σ ≈ 1.4826 × MAD` under normality) — see `MAD_GAUSSIAN_CONSISTENCY` in `crates/core/src/governance.rs`. Without that scaling, raw `k=5` would correspond to only ≈3.37σ.
 
 ### Sanity guardrails (also principled)
 
@@ -107,14 +107,14 @@ This is principled — not "pick a multiplier that feels right" — for three re
 
 Imagine 100 known contracts on a node, with log10 cost/benefit ratios distributed around median = −1.0, MAD = 0.4.
 
-Threshold (k=5): log10 ratio > +1.0 → flag if cost/benefit > 10× the typical ratio.
+Threshold (k=5): `median + k × 1.4826 × MAD = −1.0 + 5 × 1.4826 × 0.4 ≈ +1.965` → flag if log-ratio above that, i.e. cost/benefit ≳ 92× the typical ratio.
 
 | Scenario | Log-ratio | Verdict |
 |----------|-----------|---------|
 | River (high cost, high benefit, ratio near median) | ≈ −0.8 | Under threshold ✓ |
 | Efficient audio (50 KB/s, 50 real subs) | ≈ −0.5 | Under ✓ |
 | Inefficient audio (500 KB/s, 50 real subs) | ≈ +0.5 | Below threshold — tolerated ✓ |
-| `4PjqN5…`-style (very high cost, low benefit) | ≈ +2.0 | Flagged |
+| `4PjqN5…`-style (very high cost, low benefit) | ≈ +2.5 | Flagged |
 | New audio stream (1 self-sub, building) | n/a | Ramp-up window applies — not flagged |
 
 *If realtime audio becomes common, the median shifts up, MAD grows (the spread widens), and the threshold accommodates it automatically.*
