@@ -2062,6 +2062,51 @@ mod tests {
         Transaction::new::<PutMsg>()
     }
 
+    /// Issue #4251 follow-up: the PUT relay wrappers must mirror the UPDATE
+    /// wrappers' queue-full gating. Without it, a contract whose PUTs
+    /// saturate the per-contract queue would emit unbounded WARN spam
+    /// from `relay_put_error` / `relay_put_streaming_error` — the same
+    /// failure mode that filled `nova`'s error log with ~40 WARN/sec from
+    /// `relay_update_broadcast_error`. PUT volume is incidental today but
+    /// the regression risk is identical to UPDATE. Sibling pin test for
+    /// the UPDATE wrappers lives in `update/op_ctx_task.rs`.
+    #[test]
+    fn run_relay_put_wrappers_gate_queue_full_log_severity() {
+        let src = include_str!("op_ctx_task.rs");
+        for wrapper in [
+            "async fn run_relay_put<",
+            "async fn run_relay_put_streaming<",
+        ] {
+            let start = src
+                .find(wrapper)
+                .unwrap_or_else(|| panic!("{wrapper} not found"));
+            let after = &src[start + 1..];
+            let end = after
+                .find("\nasync fn ")
+                .or_else(|| after.find("\n#[cfg(test)]"))
+                .unwrap_or(after.len());
+            let body = &src[start..start + 1 + end];
+
+            assert!(
+                body.contains("is_contract_queue_full()"),
+                "{wrapper} must gate its WARN log on \
+                 err.is_contract_queue_full() — see issue #4251 and PR #4253"
+            );
+            assert!(
+                body.contains("event = \"queue_full\""),
+                "{wrapper} must tag the DEBUG branch with \
+                 event = \"queue_full\" so log filtering / telemetry can \
+                 distinguish queue-full backpressure from real failures"
+            );
+            assert!(
+                body.contains("tracing::debug!") && body.contains("tracing::warn!"),
+                "{wrapper} must keep BOTH a debug! (queue_full) and a warn! \
+                 (real failures) call — an inversion that maps queue_full to \
+                 warn would re-open the spam"
+            );
+        }
+    }
+
     #[test]
     fn classify_reply_response_is_stored() {
         let tx = dummy_tx();

@@ -2449,6 +2449,12 @@ mod tests {
                  event = \"queue_full\" so log filtering / telemetry can \
                  distinguish queue-full backpressure from real failures"
             );
+            assert!(
+                body.contains("tracing::debug!") && body.contains("tracing::warn!"),
+                "{wrapper} must keep BOTH a debug! (queue_full) and a warn! \
+                 (real failures) call — an inversion that maps queue_full to \
+                 warn would re-open the spam"
+            );
         }
     }
 
