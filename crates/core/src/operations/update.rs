@@ -310,11 +310,10 @@ impl OpManager {
             // times per BroadcastStateChange (initial + 3 retries) so
             // per-attempt WARN amplifies 4x on stuck contracts. The
             // operator-actionable signal is the outer streak-suppressed
-            // "no targets after 3 retries, giving up" WARN in
-            // p2p_protoc.rs (search for "BroadcastTo: no targets after");
-            // the per-attempt detail belongs in metrics/structured
-            // counters (interest_resolve_failed). Issue #4251 re-review
-            // M2.
+            // WARN in p2p_protoc.rs (grep for
+            // "BROADCAST_NO_TARGETS: no targets found after"); the
+            // per-attempt detail belongs in metrics/structured counters
+            // (interest_resolve_failed). Issue #4251 re-review M2.
             tracing::debug!(
                 contract = %format!("{:.8}", key),
                 peer_addr = %sender,
@@ -944,8 +943,8 @@ mod tests {
     /// `get_broadcast_targets_update` is called up to 4 times per
     /// `BroadcastStateChange` (initial + 3 retries) — per-attempt WARN
     /// 4x amplifies on stuck contracts. The operator-actionable summary
-    /// lives in the outer streak-suppressed WARN at
-    /// `p2p_protoc.rs::BroadcastTo: no targets after …`. Per #4251
+    /// lives in the outer streak-suppressed WARN in `p2p_protoc.rs`
+    /// (grep `BROADCAST_NO_TARGETS: no targets found after`). Per #4251
     /// re-review M2 (skeptical).
     #[test]
     fn no_targets_propagation_logs_at_debug_pin_test() {
@@ -976,6 +975,11 @@ mod tests {
     /// #4251 follow-up). The `phase = "broadcast",` literal disambiguates
     /// this site from the NO_TARGETS branch pinned above (whose phase is
     /// `"warning"`).
+    ///
+    /// Anchored on the *closest* preceding `tracing::` macro via `rfind`
+    /// rather than a byte-window scan, so the assertion can't false-pass
+    /// when the macro's arg list grows and a window-based check sees an
+    /// earlier unrelated `tracing::debug!` site.
     #[test]
     fn broadcast_propagation_logs_at_debug_pin_test() {
         let path =
@@ -986,19 +990,19 @@ mod tests {
         let idx = source
             .find(needle)
             .expect("UPDATE_PROPAGATION broadcast log site must still exist in source");
-        // Generous window: the macro args (formatted targets list etc.)
-        // span >400 bytes before reaching the phase literal.
-        let start = idx.saturating_sub(800);
-        let window = &source[start..idx];
-        assert!(
-            window.contains("tracing::debug!"),
-            "UPDATE_PROPAGATION broadcast log site must be DEBUG. \
-             Re-promotion to INFO restores the #4251 / #4272 log-volume regression.\n\
-             Window:\n{window}"
-        );
-        assert!(
-            !window.contains("tracing::info!") && !window.contains("tracing::warn!"),
-            "UPDATE_PROPAGATION broadcast log site must NOT be INFO/WARN.\nWindow:\n{window}"
+        let preceding = &source[..idx];
+        let macro_idx = preceding
+            .rfind("tracing::")
+            .expect("a tracing macro must precede the broadcast log site");
+        let after_macro = &preceding[macro_idx + "tracing::".len()..];
+        let macro_name = after_macro.split('!').next().unwrap_or("");
+        let tail = &preceding[preceding.len().saturating_sub(200)..];
+        assert_eq!(
+            macro_name, "debug",
+            "UPDATE_PROPAGATION broadcast log site must be DEBUG \
+             (closest preceding macro is `tracing::{macro_name}!`). \
+             Re-promotion to INFO/WARN restores the #4251 / #4272 log-volume regression.\n\
+             Preceding source (last 200 bytes):\n{tail}"
         );
     }
 

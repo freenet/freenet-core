@@ -315,14 +315,20 @@ pub(crate) fn spawn_aggregator(
 }
 
 /// Emit one tracing event summarising the current cross-connection
-/// state. Logged at `info` because Phase 1 must reach production
-/// telemetry; debug! would be compiled out of release builds.
+/// state. The local file-log mirror is at `debug` (gated behind
+/// `RUST_LOG=…=debug` and, in release builds, behind disabling the
+/// `max_level_info` feature). The local mirror at INFO was the
+/// third-largest contributor to the #4251 / #4272 log-volume
+/// regression at ~3,600 lines/hour per node; production telemetry
+/// reaches the OTLP collector via the `send_standalone_event` call
+/// below, which is independent of the tracing level.
 ///
-/// Also pushes a structured event through `send_standalone_event` so
-/// it reaches the central OTLP collector (per the `NetEventLog` path
-/// that `TelemetryReporter` consumes). Without that, the aggregate
-/// would land only in per-node file logs and the 2-4 week observation
-/// the RFC calls for would require manual log scraping.
+/// `send_standalone_event` pushes a structured event through the
+/// global telemetry sender (`crate::tracing::telemetry::send_standalone_event`)
+/// so it reaches the central OTLP collector (per the `NetEventLog`
+/// path that `TelemetryReporter` consumes). Without that, the
+/// aggregate would land only in per-node file logs and the 2-4 week
+/// observation the RFC calls for would require manual log scraping.
 fn emit_aggregate_snapshot() {
     let snap = registry_snapshot();
     let active_peers = snap.len();
@@ -763,6 +769,10 @@ mod tests {
     /// The OTLP telemetry path (`send_standalone_event` immediately below
     /// the `tracing!` call) is unaffected by the level; only the local-
     /// file mirror is gated.
+    ///
+    /// Anchored on the *closest* preceding `tracing::` macro via `rfind`
+    /// (rather than a byte window) so the assertion can't false-pass if
+    /// a refactor introduces another tracing macro nearby.
     #[test]
     fn shadow_rtt_aggregate_logs_at_debug_pin_test() {
         let src = include_str!("rolling_rtt_stats.rs");
@@ -773,18 +783,20 @@ mod tests {
         let idx = src
             .find(needle)
             .expect("shadow_rtt_aggregate log message must still exist in source");
-        let start = idx.saturating_sub(400);
-        let window = &src[start..idx];
-        assert!(
-            window.contains("tracing::debug!"),
-            "shadow_rtt_aggregate local-log mirror must be at DEBUG. \
-             Re-promotion to INFO restores the #4251 / #4272 1Hz-heartbeat regression. \
+        let preceding = &src[..idx];
+        let macro_idx = preceding
+            .rfind("tracing::")
+            .expect("a tracing macro must precede the shadow_rtt_aggregate log site");
+        let after_macro = &preceding[macro_idx + "tracing::".len()..];
+        let macro_name = after_macro.split('!').next().unwrap_or("");
+        let tail = &preceding[preceding.len().saturating_sub(200)..];
+        assert_eq!(
+            macro_name, "debug",
+            "shadow_rtt_aggregate local-log mirror must be at DEBUG \
+             (closest preceding macro is `tracing::{macro_name}!`). \
+             Re-promotion to INFO/WARN restores the #4251 / #4272 1Hz-heartbeat regression. \
              (The OTLP send_standalone_event call below is unaffected by the log level.)\n\
-             Window:\n{window}"
-        );
-        assert!(
-            !window.contains("tracing::info!") && !window.contains("tracing::warn!"),
-            "shadow_rtt_aggregate local-log mirror must NOT be INFO/WARN.\nWindow:\n{window}"
+             Preceding source (last 200 bytes):\n{tail}"
         );
     }
 }

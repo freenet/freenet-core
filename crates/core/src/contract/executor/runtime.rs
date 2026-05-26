@@ -4336,6 +4336,10 @@ mod executor_pin_tests {
     /// state write — at INFO it contributed ~44% of the post-#4252
     /// log-volume regression on River-subscribed peers (see #4251 follow-up
     /// PR). Re-promoting it would silently restore the disk-fill issue.
+    ///
+    /// Anchored on the *closest* preceding `tracing::` macro via `rfind` so
+    /// the assertion can't false-pass if an unrelated nearby site is at
+    /// DEBUG.
     #[test]
     fn contract_state_updated_logs_at_debug_pin_test() {
         let src = include_str!("runtime.rs");
@@ -4343,17 +4347,19 @@ mod executor_pin_tests {
         let idx = src
             .find(needle)
             .expect("Contract state updated log message must still exist in source");
-        let start = idx.saturating_sub(400);
-        let window = &src[start..idx];
-        assert!(
-            window.contains("tracing::debug!"),
-            "Contract-state-updated log site must be at DEBUG. \
-             Re-promotion to INFO restores the #4251 / #4272 log-volume regression.\n\
-             Source window:\n{window}"
-        );
-        assert!(
-            !window.contains("tracing::info!") && !window.contains("tracing::warn!"),
-            "Contract-state-updated log site must NOT be INFO/WARN.\nWindow:\n{window}"
+        let preceding = &src[..idx];
+        let macro_idx = preceding
+            .rfind("tracing::")
+            .expect("a tracing macro must precede the Contract-state-updated log site");
+        let after_macro = &preceding[macro_idx + "tracing::".len()..];
+        let macro_name = after_macro.split('!').next().unwrap_or("");
+        let tail = &preceding[preceding.len().saturating_sub(200)..];
+        assert_eq!(
+            macro_name, "debug",
+            "Contract-state-updated log site must be at DEBUG \
+             (closest preceding macro is `tracing::{macro_name}!`). \
+             Re-promotion to INFO/WARN restores the #4251 / #4272 log-volume regression.\n\
+             Preceding source (last 200 bytes):\n{tail}"
         );
     }
 }
