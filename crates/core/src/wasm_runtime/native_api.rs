@@ -576,6 +576,13 @@ impl DelegateCallEnv {
         };
 
         let contract_key = self.resolve_contract_key(instance_id)?;
+        // Capture the byte count BEFORE the move into store_state_sync —
+        // the callback needs it for governance attribution. The
+        // bug-prevention-patterns rule about "Manually-inlined originator
+        // side effects after a task-per-tx migration" applies here too:
+        // a future refactor that drops state_size from the callback path
+        // would silently undercount StateBytesWritten for V2 delegate PUT.
+        let state_size = state.len();
 
         db.store_state_sync(
             &contract_key,
@@ -584,14 +591,13 @@ impl DelegateCallEnv {
         .map_err(|e| DelegateEnvError::StorageError(e.to_string()))?;
 
         // V2 delegate write chokepoint: this path bypasses the executor's
-        // `state_store.store` call site where the per-contract generation
-        // counter is bumped and the hosting-cache snapshot refreshed. The
-        // callback (when wired) closes the EvictContract re-host race for
-        // V2 delegate writes by mirroring those two steps. Failure here is
-        // best-effort — the write has already committed and we don't want
-        // to roll it back over a counter bump.
+        // `state_store.store` call site where the bump+refresh+report
+        // happen. The callback (when wired) mirrors those side effects
+        // via `Ring::commit_state_write`. Failure here is best-effort —
+        // the write has already committed and we don't want to roll it
+        // back over a counter bump.
         if let Some(cb) = &self.state_write_callback {
-            cb(&contract_key);
+            cb(&contract_key, state_size);
         }
 
         Ok(())
@@ -611,6 +617,9 @@ impl DelegateCallEnv {
         };
 
         let contract_key = self.resolve_contract_key(instance_id)?;
+        // Capture byte count BEFORE the move — same reason as
+        // put_contract_state_sync above.
+        let state_size = state.len();
 
         // Atomic check-and-write in a single ReDb write transaction.
         match db.update_state_sync(
@@ -619,11 +628,11 @@ impl DelegateCallEnv {
         ) {
             Ok(true) => {
                 // V2 delegate write chokepoint: mirror the executor's
-                // `state_store.update` bump+refresh so the EvictContract
-                // re-host race is also closed for V2 delegate UPDATEs.
-                // See `put_contract_state_sync` for the rationale.
+                // `state_store.update` bump+refresh+report side effects
+                // via `Ring::commit_state_write`. See
+                // `put_contract_state_sync` for the rationale.
                 if let Some(cb) = &self.state_write_callback {
-                    cb(&contract_key);
+                    cb(&contract_key, state_size);
                 }
                 Ok(())
             }

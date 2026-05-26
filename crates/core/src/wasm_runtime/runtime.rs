@@ -191,19 +191,21 @@ impl Default for RuntimeConfig {
 ///
 /// V2 delegate writes go through `db.store_state_sync` / `db.update_state_sync`
 /// directly and bypass the executor's `state_store.{store,update}` chokepoints
-/// where the four `bump_state_generation` + `refresh_cache_generation` sites
-/// live. Without this callback the per-contract generation counter never
-/// advances on a V2 delegate write, leaving the EvictContract re-host race
-/// open for that path. The wiring lives outside `wasm_runtime/` (Ring lives
-/// in `crates/core/src/ring.rs`) so the callback is plumbed via a trait
-/// object owned by `Runtime` to keep `wasm_runtime` independent of the ring.
+/// where the bump+refresh+report sites live. Without this callback those
+/// three side effects never fire on a V2 delegate write, leaving the
+/// EvictContract re-host race open AND undercounting StateBytesWritten in
+/// the topology meter for that path. The wiring lives outside `wasm_runtime/`
+/// (Ring lives in `crates/core/src/ring.rs`) so the callback is plumbed via
+/// a trait object owned by `Runtime` to keep `wasm_runtime` independent of
+/// the ring.
 ///
-/// The closure SHOULD bump the per-contract generation and refresh the
-/// hosting-cache snapshot for the given key — see
-/// `RuntimePool::contract_state_write_callback` for the production wiring
-/// and `HostingCache::refresh_entry_generation` for the rationale.
+/// The closure SHOULD delegate to `Ring::commit_state_write(key, state_size)`
+/// — see `RuntimePool::contract_state_write_callback` for the production
+/// wiring. The `state_size` argument is the on-disk byte count of the
+/// newly-written state and is fed into the StateBytesWritten meter axis
+/// for governance scoring.
 pub type StateWriteCallback =
-    Arc<dyn Fn(&freenet_stdlib::prelude::ContractKey) + Send + Sync + 'static>;
+    Arc<dyn Fn(&freenet_stdlib::prelude::ContractKey, usize) + Send + Sync + 'static>;
 
 pub struct Runtime {
     /// The WASM engine backend (wasmtime).

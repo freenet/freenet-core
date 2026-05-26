@@ -1749,15 +1749,34 @@ impl Ring {
         self.hosting_manager.contract_in_use(contract)
     }
 
-    /// Atomically bump the state-write generation for `contract`.
+    /// Single helper for every state-write chokepoint. Does the three
+    /// things a chokepoint MUST do, in order:
     ///
-    /// Called from the executor's state-write chokepoints
-    /// (`state_store.store` / `state_store.update`). Pairs with the
-    /// generation captured in `HostedContract.write_generation` at
-    /// eviction time to close the EvictContract re-host race — see
-    /// `HostingManager::state_generation` for full rationale.
-    pub(crate) fn bump_state_generation(&self, contract: &ContractKey) -> u64 {
-        self.hosting_manager.bump_state_generation(contract)
+    /// 1. Bump the per-contract write generation (closes the
+    ///    `EvictContract` re-host race — see
+    ///    `HostingManager::state_generation`).
+    /// 2. Refresh the hosting-cache snapshot of that generation so
+    ///    already-hosted contracts don't leak on eviction after this
+    ///    write — see `HostingCache::refresh_entry_generation`.
+    /// 3. Report `state_size` bytes against this contract on the
+    ///    `StateBytesWritten` axis of the topology meter, feeding the
+    ///    governance scoring layer (see `crate::governance`).
+    ///
+    /// Every state-write chokepoint in the executor MUST go through
+    /// this helper, NOT call the three primitives by hand. The
+    /// "manually-mirrored side effects after a task-per-tx migration"
+    /// pattern in `.claude/rules/bug-prevention-patterns.md` lists this
+    /// exact failure mode: one site drops the report and governance
+    /// silently undercounts that path for months before anyone notices.
+    pub(crate) fn commit_state_write(&self, contract: &ContractKey, state_size: usize) {
+        let new_gen = self.hosting_manager.bump_state_generation(contract);
+        self.hosting_manager
+            .refresh_cache_generation(contract, new_gen);
+        self.report_contract_resource_usage(
+            *contract.id(),
+            crate::topology::meter::ResourceType::StateBytesWritten,
+            state_size as f64,
+        );
     }
 
     /// Read the current state-write generation for `contract` (0 if never written).
@@ -1769,15 +1788,6 @@ impl Ring {
     /// successful disk reclamation. Keeps the generation map bounded.
     pub(crate) fn forget_state_generation(&self, contract: &ContractKey) {
         self.hosting_manager.forget_state_generation(contract)
-    }
-
-    /// Refresh the hosting-cache snapshot of `contract`'s state-write
-    /// generation to `new_gen`. Paired with `bump_state_generation` at
-    /// every state-write chokepoint — see
-    /// `HostingManager::refresh_cache_generation`.
-    pub(crate) fn refresh_cache_generation(&self, contract: &ContractKey, new_gen: u64) {
-        self.hosting_manager
-            .refresh_cache_generation(contract, new_gen)
     }
 
     /// Add `contract` to the pending-reclamation retry queue with the
