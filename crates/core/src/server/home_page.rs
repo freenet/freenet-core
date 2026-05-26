@@ -473,7 +473,7 @@ fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Str
         );
     }
 
-    let ring_svg = build_ring_svg(snap.own_location, &snap.peers);
+    let ring_svg = build_ring_svg(snap.own_location, &snap.peers, Some(&snap.governance));
 
     let mut rows = String::new();
     for p in &snap.peers {
@@ -526,66 +526,201 @@ fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Str
     )
 }
 
-/// Build an SVG ring visualization showing this node and connected peers.
-/// Locations are 0.0–1.0, mapped to angles around a circle.
-fn build_ring_svg(own_location: Option<f64>, peers: &[network_status::PeerSnapshot]) -> String {
-    // Only render if we have location data for at least one peer
+/// Build an SVG ring visualization. Two concentric rings:
+///
+/// - **Outer ring**: peers we're connected to, placed by their
+///   ring-location (Kleinberg topology position).
+/// - **Inner ring**: contracts the governance manager is tracking,
+///   placed by a deterministic hash of the instance id. Colored by
+///   governance state.
+///
+/// Lines (Bezier curves through the interior) go YOU → peer (outer)
+/// and YOU → contract (inner). All curves originate from or terminate
+/// at YOU — a node only sees its own traffic, so anything else would
+/// be fabricated.
+///
+/// Falls back to outer-ring-only rendering when no governance
+/// snapshot is supplied (e.g. tests that pre-date the upgrade).
+fn build_ring_svg(
+    own_location: Option<f64>,
+    peers: &[network_status::PeerSnapshot],
+    governance: Option<&network_status::GovernanceSnapshot>,
+) -> String {
+    // Render when there's *something* to show. The historical guard
+    // (at least one peer with a location) still applies.
     let has_any_location = own_location.is_some() || peers.iter().any(|p| p.location.is_some());
     if !has_any_location {
         return String::new();
     }
 
-    let cx: f64 = 120.0;
-    let cy: f64 = 120.0;
-    let r: f64 = 95.0;
-    let size = 240;
+    // Larger viewBox than the original 240×240 so the inner ring +
+    // labels have room. Use a viewBox-only sizing (no fixed width)
+    // so the SVG scales with the card.
+    let size: f64 = 480.0;
+    let cx: f64 = size / 2.0;
+    let cy: f64 = size / 2.0;
+    let r_outer: f64 = 195.0;
+    let r_inner: f64 = 120.0;
 
     let mut svg = format!(
-        "<div class=\"ring-wrap\"><svg viewBox=\"0 0 {size} {size}\" width=\"{size}\" height=\"{size}\" class=\"ring-svg\">"
+        "<div class=\"ring-wrap\"><svg viewBox=\"0 0 {size:.0} {size:.0}\" class=\"ring-svg\" preserveAspectRatio=\"xMidYMid meet\">"
     );
 
-    // Ring circle
+    // === Background rings ===
     write!(
         svg,
-        "<circle cx=\"{cx}\" cy=\"{cy}\" r=\"{r}\" fill=\"none\" stroke=\"#e0e0e0\" stroke-width=\"2\"/>"
+        "<circle cx=\"{cx}\" cy=\"{cy}\" r=\"{r_outer}\" fill=\"none\" stroke=\"#363c4a\" stroke-width=\"1\"/>"
+    )
+    .ok();
+    write!(
+        svg,
+        "<circle cx=\"{cx}\" cy=\"{cy}\" r=\"{r_inner}\" fill=\"none\" stroke=\"#363c4a\" stroke-width=\"1\"/>"
     )
     .ok();
 
-    // Helper: location (0.0-1.0) to (x, y) on the ring.
+    // Helper: location (0.0..1.0) → (x, y) on a ring of given radius.
     // 0.0 is at the top, increasing clockwise.
-    let loc_to_xy = |loc: f64| -> (f64, f64) {
+    let loc_to_xy = |loc: f64, r: f64| -> (f64, f64) {
         let angle = loc * std::f64::consts::TAU - std::f64::consts::FRAC_PI_2;
         (cx + r * angle.cos(), cy + r * angle.sin())
     };
 
-    // Draw connection lines from own location to each peer
-    if let Some(own_loc) = own_location {
-        let (ox, oy) = loc_to_xy(own_loc);
+    // Curved chord path generator. Quadratic Bezier from (x1,y1) to
+    // (x2,y2) with the control point pulled toward the SVG centre.
+    // `bend_base` is the maximum bend for antipodal points; chord
+    // length scales bend so short hops look flat and long hops arc
+    // through the interior. Matches the nova.locut.us:3133 ring
+    // routing visualization.
+    let curve_path = |x1: f64, y1: f64, x2: f64, y2: f64, bend_base: f64| -> String {
+        let dx = x2 - x1;
+        let dy = y2 - y1;
+        let chord = (dx * dx + dy * dy).sqrt();
+        let ratio = (chord / (2.0 * r_outer)).min(1.0);
+        let bend = bend_base * ratio;
+        let mx = (x1 + x2) / 2.0;
+        let my = (y1 + y2) / 2.0;
+        let pcx = cx + (mx - cx) * (1.0 - bend);
+        let pcy = cy + (my - cy) * (1.0 - bend);
+        format!("M {x1:.1},{y1:.1} Q {pcx:.1},{pcy:.1} {x2:.1},{y2:.1}")
+    };
+
+    // === Ring labels at top ===
+    write!(
+        svg,
+        "<text x=\"{cx}\" y=\"{y:.1}\" text-anchor=\"middle\" fill=\"#6b7280\" font-family=\"monospace\" font-size=\"9\" letter-spacing=\"0.18em\">PEERS</text>",
+        y = cy - r_outer - 8.0,
+    )
+    .ok();
+    write!(
+        svg,
+        "<text x=\"{cx}\" y=\"{y:.1}\" text-anchor=\"middle\" fill=\"#6b7280\" font-family=\"monospace\" font-size=\"9\" letter-spacing=\"0.18em\">CONTRACTS</text>",
+        y = cy - r_inner - 8.0,
+    )
+    .ok();
+
+    let own_xy = own_location.map(|loc| loc_to_xy(loc, r_outer));
+
+    // === Connection curves: YOU → peers ===
+    // Only drawn if we know our own location; otherwise we can't
+    // anchor them. Bezier through the interior so the path looks
+    // like a routing arc, not a chord.
+    if let Some((ox, oy)) = own_xy {
         for p in peers {
             if let Some(ploc) = p.location {
-                let (px, py) = loc_to_xy(ploc);
-                let stroke = if p.is_gateway { "#fbbf24" } else { "#007FFF" };
+                let (px, py) = loc_to_xy(ploc, r_outer);
+                let stroke = if p.is_gateway { "#ffb610" } else { "#66d9ff" };
+                let path = curve_path(ox, oy, px, py, 0.55);
                 write!(
                     svg,
-                    "<line x1=\"{ox:.1}\" y1=\"{oy:.1}\" x2=\"{px:.1}\" y2=\"{py:.1}\" stroke=\"{stroke}\" stroke-width=\"1\" opacity=\"0.4\"/>"
+                    "<path d=\"{path}\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"1\" stroke-opacity=\"0.35\"/>"
                 )
                 .ok();
             }
         }
     }
 
-    // Peer dots — each wrapped in an <a> link to its detail page so the
-    // SVG ring stays in sync with the table rows below it.
+    // === Contract dots (and YOU → flagged-contract curves) ===
+    if let Some(gov) = governance {
+        // Deterministic hash → ring location for placing contracts.
+        // The instance id is a 32-byte content hash; we fold the
+        // string form to a u64 and modulo onto [0, 1). Position is
+        // stable across refreshes (same id → same dot location).
+        let hash_to_loc = |s: &str| -> f64 {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            s.hash(&mut h);
+            (h.finish() % 10_000) as f64 / 10_000.0
+        };
+        for c in &gov.contracts {
+            let loc = hash_to_loc(&c.instance_id);
+            let (kx, ky) = loc_to_xy(loc, r_inner);
+            let (fill, glow) = match c.state {
+                network_status::GovernanceStateSnapshot::Normal => ("#43c178", false),
+                network_status::GovernanceStateSnapshot::Borderline => ("#ffb610", false),
+                network_status::GovernanceStateSnapshot::WouldEvict => ("#ff8a3d", true),
+                network_status::GovernanceStateSnapshot::Evicted => ("#ff667a", true),
+                network_status::GovernanceStateSnapshot::Banned => ("#d33682", true),
+            };
+            // Flagged contracts get a curve from YOU into the inner
+            // ring + a small label of the short instance id. Normal
+            // ones get a dot only — they'd otherwise overwhelm the
+            // visual with curves.
+            let is_flagged = !matches!(c.state, network_status::GovernanceStateSnapshot::Normal);
+            if is_flagged {
+                if let Some((ox, oy)) = own_xy {
+                    let path = curve_path(ox, oy, kx, ky, 0.6);
+                    write!(
+                        svg,
+                        "<path d=\"{path}\" fill=\"none\" stroke=\"{fill}\" stroke-width=\"1.4\" stroke-opacity=\"0.7\"/>"
+                    )
+                    .ok();
+                }
+            }
+            // Use a more distinctive shape for flagged (rect) than
+            // normal (smaller, dimmer dot) so glance-scanning the
+            // ring surfaces flagged contracts first.
+            let size_px = if is_flagged { 6.0 } else { 3.0 };
+            let opacity = if is_flagged { "1.0" } else { "0.55" };
+            let glow_attr = if glow {
+                "filter=\"drop-shadow(0 0 3px currentColor)\""
+            } else {
+                ""
+            };
+            write!(
+                svg,
+                "<rect x=\"{x:.1}\" y=\"{y:.1}\" width=\"{size_px:.1}\" height=\"{size_px:.1}\" fill=\"{fill}\" fill-opacity=\"{opacity}\" {glow_attr}><title>{title}</title></rect>",
+                x = kx - size_px / 2.0,
+                y = ky - size_px / 2.0,
+                title = html_escape(&format!("{} ({:?})", c.instance_id_short, c.state)),
+            )
+            .ok();
+            // Short label next to flagged contracts so the ring view
+            // matches the table without clicking.
+            if is_flagged {
+                let label_loc_r = r_inner - 12.0;
+                let (lx, ly) = loc_to_xy(loc, label_loc_r);
+                write!(
+                    svg,
+                    "<text x=\"{lx:.1}\" y=\"{ly:.1}\" text-anchor=\"middle\" dominant-baseline=\"middle\" fill=\"{fill}\" font-family=\"monospace\" font-size=\"9\" font-weight=\"500\">{label}</text>",
+                    label = html_escape(&c.instance_id_short),
+                )
+                .ok();
+            }
+        }
+    }
+
+    // === Peer dots on the outer ring ===
     for p in peers {
         if let Some(loc) = p.location {
-            let (px, py) = loc_to_xy(loc);
-            let fill = if p.is_gateway { "#fbbf24" } else { "#007FFF" };
+            let (px, py) = loc_to_xy(loc, r_outer);
+            let fill = if p.is_gateway { "#ffb610" } else { "#66d9ff" };
             let kind = if p.is_gateway { "Gateway" } else { "Peer" };
             let addr = p.address.to_string();
             let title = format!("{kind} {addr} (loc {loc:.4})");
             write!(
                 svg,
-                "<a href=\"/peer/{href}\" class=\"ring-peer-link\"><title>{title}</title><circle cx=\"{px:.1}\" cy=\"{py:.1}\" r=\"5\" fill=\"{fill}\"/></a>",
+                "<a href=\"/peer/{href}\" class=\"ring-peer-link\"><title>{title}</title><circle cx=\"{px:.1}\" cy=\"{py:.1}\" r=\"4\" fill=\"{fill}\"/></a>",
                 href = html_escape(&addr),
                 title = html_escape(&title),
             )
@@ -593,25 +728,28 @@ fn build_ring_svg(own_location: Option<f64>, peers: &[network_status::PeerSnapsh
         }
     }
 
-    // Own location (drawn last so it's on top). Not a link — there is no
-    // detail page for the local node.
+    // === YOU marker — drawn last so it sits above everything ===
     if let Some(own_loc) = own_location {
-        let (ox, oy) = loc_to_xy(own_loc);
+        let (ox, oy) = loc_to_xy(own_loc, r_outer);
         write!(
             svg,
-            "<g class=\"ring-self\"><title>You (loc {own_loc:.4})</title><circle cx=\"{ox:.1}\" cy=\"{oy:.1}\" r=\"7\" fill=\"#34d399\" stroke=\"#fff\" stroke-width=\"2\"/></g>"
+            "<g class=\"ring-self\"><title>You (loc {own_loc:.4})</title><circle cx=\"{ox:.1}\" cy=\"{oy:.1}\" r=\"6\" fill=\"#43c178\" stroke=\"#ebecf0\" stroke-width=\"1.5\"/><text x=\"{lx:.1}\" y=\"{ly:.1}\" text-anchor=\"middle\" fill=\"#43c178\" font-family=\"monospace\" font-size=\"9\" font-weight=\"500\" letter-spacing=\"0.05em\">YOU</text></g>",
+            lx = ox,
+            ly = oy + 18.0,
         )
         .ok();
     }
 
     svg.push_str("</svg>");
 
-    // Legend
+    // Legend below the ring.
     svg.push_str(concat!(
         "<div class=\"ring-legend\">",
         "<span class=\"ring-key\"><span class=\"ring-dot ring-dot-self\"></span> You</span>",
         "<span class=\"ring-key\"><span class=\"ring-dot ring-dot-peer\"></span> Peer</span>",
         "<span class=\"ring-key\"><span class=\"ring-dot ring-dot-gw\"></span> Gateway</span>",
+        "<span class=\"ring-key\"><span class=\"ring-dot ring-dot-contract-normal\"></span> Hosted</span>",
+        "<span class=\"ring-key\"><span class=\"ring-dot ring-dot-contract-flagged\"></span> Flagged</span>",
         "</div></div>",
     ));
 
@@ -1412,9 +1550,11 @@ p:last-child { margin-bottom: 0; }
     border-radius: 50%;
     display: inline-block;
 }
-.ring-dot-self { background: #34d399; }
-.ring-dot-peer { background: var(--accent-primary); }
-.ring-dot-gw { background: #fbbf24; }
+.ring-dot-self { background: #43c178; }
+.ring-dot-peer { background: #66d9ff; }
+.ring-dot-gw { background: #ffb610; }
+.ring-dot-contract-normal { background: #43c178; opacity: 0.55; }
+.ring-dot-contract-flagged { background: #ff667a; }
 .theme-btn {
     background: none;
     border: 1px solid var(--border-color);
@@ -3648,7 +3788,7 @@ mod tests {
     #[test]
     fn ring_svg_dots_link_to_peer_pages() {
         let peers = vec![sample_peer("127.0.0.1:31337", 0.25)];
-        let svg = build_ring_svg(Some(0.5), &peers);
+        let svg = build_ring_svg(Some(0.5), &peers, None);
         assert!(
             svg.contains("<a href=\"/peer/127.0.0.1:31337\""),
             "ring peer dot must be wrapped in a link to /peer/{{addr}}, got: {svg}"
@@ -3752,7 +3892,7 @@ mod tests {
         // The local node has no /peer/{addr} page, so the self circle
         // must NOT be wrapped in an <a>, but it should still expose a
         // <title> for parity with the peer dots.
-        let svg = build_ring_svg(Some(0.42), &[]);
+        let svg = build_ring_svg(Some(0.42), &[], None);
         assert!(svg.contains("<svg"), "ring SVG should still render");
         assert!(
             !svg.contains("<a "),
@@ -3784,7 +3924,7 @@ mod tests {
             bytes_received: 0,
         };
         let peer = sample_peer("10.0.0.2:31338", 0.90);
-        let svg = build_ring_svg(Some(0.5), &[gw, peer]);
+        let svg = build_ring_svg(Some(0.5), &[gw, peer], None);
         assert!(
             svg.contains("<title>Gateway 10.0.0.1:31337"),
             "gateway dot title must say 'Gateway', got: {svg}"
@@ -3813,8 +3953,8 @@ mod tests {
             bytes_sent: 0,
             bytes_received: 0,
         };
-        assert!(build_ring_svg(None, &[no_loc_peer]).is_empty());
-        assert!(build_ring_svg(None, &[]).is_empty());
+        assert!(build_ring_svg(None, &[no_loc_peer], None).is_empty());
+        assert!(build_ring_svg(None, &[], None).is_empty());
     }
 
     // ── Sort attribute coverage for both tables ─────────────────────────────
