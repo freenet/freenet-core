@@ -708,13 +708,24 @@ async fn run_relay_request_update(
     )
     .await
     {
-        tracing::warn!(
-            tx = %incoming_tx,
-            %key,
-            error = %err,
-            phase = "relay_update_request_error",
-            "UPDATE relay: RequestUpdate driver returned error"
-        );
+        if err.is_contract_queue_full() {
+            tracing::debug!(
+                tx = %incoming_tx,
+                %key,
+                error = %err,
+                phase = "relay_update_request_error",
+                event = "queue_full",
+                "UPDATE relay: RequestUpdate driver returned error"
+            );
+        } else {
+            tracing::warn!(
+                tx = %incoming_tx,
+                %key,
+                error = %err,
+                phase = "relay_update_request_error",
+                "UPDATE relay: RequestUpdate driver returned error"
+            );
+        }
     }
 }
 
@@ -739,13 +750,24 @@ async fn run_relay_broadcast_to(
     )
     .await
     {
-        tracing::warn!(
-            tx = %incoming_tx,
-            %key,
-            error = %err,
-            phase = "relay_update_broadcast_error",
-            "UPDATE relay: BroadcastTo driver returned error"
-        );
+        if err.is_contract_queue_full() {
+            tracing::debug!(
+                tx = %incoming_tx,
+                %key,
+                error = %err,
+                phase = "relay_update_broadcast_error",
+                event = "queue_full",
+                "UPDATE relay: BroadcastTo driver returned error"
+            );
+        } else {
+            tracing::warn!(
+                tx = %incoming_tx,
+                %key,
+                error = %err,
+                phase = "relay_update_broadcast_error",
+                "UPDATE relay: BroadcastTo driver returned error"
+            );
+        }
     }
 }
 
@@ -1390,13 +1412,24 @@ async fn run_relay_request_update_streaming(
     )
     .await
     {
-        tracing::warn!(
-            tx = %incoming_tx,
-            %key,
-            error = %err,
-            phase = "relay_update_streaming_request_error",
-            "UPDATE relay (driver streaming): RequestUpdateStreaming driver returned error"
-        );
+        if err.is_contract_queue_full() {
+            tracing::debug!(
+                tx = %incoming_tx,
+                %key,
+                error = %err,
+                phase = "relay_update_streaming_request_error",
+                event = "queue_full",
+                "UPDATE relay (driver streaming): RequestUpdateStreaming driver returned error"
+            );
+        } else {
+            tracing::warn!(
+                tx = %incoming_tx,
+                %key,
+                error = %err,
+                phase = "relay_update_streaming_request_error",
+                "UPDATE relay (driver streaming): RequestUpdateStreaming driver returned error"
+            );
+        }
     }
 }
 
@@ -1421,13 +1454,24 @@ async fn run_relay_broadcast_to_streaming(
     )
     .await
     {
-        tracing::warn!(
-            tx = %incoming_tx,
-            %key,
-            error = %err,
-            phase = "relay_update_streaming_broadcast_error",
-            "UPDATE relay (driver streaming): BroadcastToStreaming driver returned error"
-        );
+        if err.is_contract_queue_full() {
+            tracing::debug!(
+                tx = %incoming_tx,
+                %key,
+                error = %err,
+                phase = "relay_update_streaming_broadcast_error",
+                event = "queue_full",
+                "UPDATE relay (driver streaming): BroadcastToStreaming driver returned error"
+            );
+        } else {
+            tracing::warn!(
+                tx = %incoming_tx,
+                %key,
+                error = %err,
+                phase = "relay_update_streaming_broadcast_error",
+                "UPDATE relay (driver streaming): BroadcastToStreaming driver returned error"
+            );
+        }
     }
 }
 
@@ -2363,6 +2407,49 @@ mod tests {
             "drive_relay_broadcast_to should still contain the auto-fetch \
              branch (gated on !queue_full)"
         );
+    }
+
+    /// Issue #4251 follow-up: the four `run_relay_*` driver wrappers each
+    /// log at WARN when the inner driver returns an error. PR #4253 gated
+    /// the amplification side effects (auto-fetch, ResyncRequest) on
+    /// `is_contract_queue_full()` inside the drivers, but left the WARN at
+    /// the wrapper boundary unconditional. On a hot contract (production
+    /// `4PjqN55KUCidW8vJvw5fhy5fe5maxXKNrWSyK33QjjVq` saturating its
+    /// per-contract queue) the broadcast wrapper alone emitted
+    /// ~40 WARNs/sec — 148k lines in a single hour on `nova`. Each wrapper
+    /// MUST drop queue-full to DEBUG with `event = "queue_full"` and keep
+    /// other errors at WARN. Regressing any of these re-opens the spam.
+    #[test]
+    fn run_relay_wrappers_gate_queue_full_log_severity() {
+        let src = include_str!("op_ctx_task.rs");
+        for wrapper in [
+            "async fn run_relay_request_update(",
+            "async fn run_relay_broadcast_to(",
+            "async fn run_relay_request_update_streaming(",
+            "async fn run_relay_broadcast_to_streaming(",
+        ] {
+            let start = src
+                .find(wrapper)
+                .unwrap_or_else(|| panic!("{wrapper} not found"));
+            let after = &src[start + 1..];
+            let end = after
+                .find("\nasync fn ")
+                .or_else(|| after.find("\n#[cfg(test)]"))
+                .unwrap_or(after.len());
+            let body = &src[start..start + 1 + end];
+
+            assert!(
+                body.contains("is_contract_queue_full()"),
+                "{wrapper} must gate its WARN log on \
+                 err.is_contract_queue_full() — see issue #4251 and PR #4253"
+            );
+            assert!(
+                body.contains("event = \"queue_full\""),
+                "{wrapper} must tag the DEBUG branch with \
+                 event = \"queue_full\" so log filtering / telemetry can \
+                 distinguish queue-full backpressure from real failures"
+            );
+        }
     }
 
     /// Pin: `BroadcastToStreaming` driver must classify failures via

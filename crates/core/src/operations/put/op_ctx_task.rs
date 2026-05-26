@@ -735,12 +735,22 @@ async fn run_relay_put<CB>(
     .await;
 
     if let Err(err) = &drive_result {
-        tracing::warn!(
-            tx = %incoming_tx,
-            error = %err,
-            phase = "relay_put_error",
-            "PUT relay: driver returned error"
-        );
+        if err.is_contract_queue_full() {
+            tracing::debug!(
+                tx = %incoming_tx,
+                error = %err,
+                phase = "relay_put_error",
+                event = "queue_full",
+                "PUT relay: driver returned error"
+            );
+        } else {
+            tracing::warn!(
+                tx = %incoming_tx,
+                error = %err,
+                phase = "relay_put_error",
+                "PUT relay: driver returned error"
+            );
+        }
     }
 
     // Originator-loopback error path: when the relay driver runs
@@ -1614,12 +1624,22 @@ async fn run_relay_put_streaming<CB>(
     )
     .await
     {
-        tracing::warn!(
-            tx = %incoming_tx,
-            error = %err,
-            phase = "relay_put_streaming_error",
-            "PUT streaming relay: driver returned error"
-        );
+        if err.is_contract_queue_full() {
+            tracing::debug!(
+                tx = %incoming_tx,
+                error = %err,
+                phase = "relay_put_streaming_error",
+                event = "queue_full",
+                "PUT streaming relay: driver returned error"
+            );
+        } else {
+            tracing::warn!(
+                tx = %incoming_tx,
+                error = %err,
+                phase = "relay_put_streaming_error",
+                "PUT streaming relay: driver returned error"
+            );
+        }
     }
 
     // Release per-tx pending_op_results slot (same rationale as slice A).
