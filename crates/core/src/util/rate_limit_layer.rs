@@ -19,7 +19,7 @@
 //! use crate::util::rate_limit_layer::{PerCallsiteRateLimiter, RateLimiter};
 //!
 //! let global = RateLimiter::with_defaults();           // 1000 ev/sec total
-//! let per_site = PerCallsiteRateLimiter::with_defaults(); // 100 ev/sec per callsite
+//! let per_site = PerCallsiteRateLimiter::with_defaults(); // 30 ev/sec per callsite
 //!
 //! let filter = tracing_subscriber::filter::filter_fn(move |meta| {
 //!     per_site.should_allow(meta) && global.should_allow()
@@ -39,16 +39,20 @@ pub const DEFAULT_MAX_EVENTS_PER_SECOND: u64 = 1000;
 
 /// Default maximum events per second per callsite.
 ///
-/// 100 / sec / callsite caps any single misbehaving WARN macro at
-/// ~360k events/hr — far under the ~140 MB/hr disk-fill rate that
-/// triggered issue #4251 — while still leaving enough headroom for
-/// legitimate WARN bursts during incident response (e.g. a
-/// "connection refused from {peer}" macro firing once per
-/// disconnected peer during a mass reconnect storm). The global
-/// 1000 / sec aggregate cap remains the next line of defence.
-/// Override via `FREENET_LOG_RATE_LIMIT_PER_CALLSITE` if your
-/// deployment needs tighter or looser bounds.
-pub const DEFAULT_MAX_EVENTS_PER_CALLSITE_PER_SECOND: u64 = 100;
+/// 30 / sec / callsite is intentionally **below** the ~40 ev/sec spam
+/// rate observed on the issue #4251 incident. A higher default (e.g.
+/// 100/sec) would leave that exact failure mode unthrottled out of the
+/// box — exactly the disk-fill scenario this limiter is meant to
+/// prevent. (Codex review on PR #4273 flagged this trade-off.)
+///
+/// Trade-off: legitimate WARN bursts that exceed 30/sec from a single
+/// macro (e.g. a mass-disconnect storm emitting one WARN per peer in
+/// a single second) will be clipped, with the dropped count surfaced
+/// in the periodic summary line so operators still see the event
+/// happened. If your deployment routinely needs more headroom (a
+/// gateway with thousands of concurrent peers, say), raise via
+/// `FREENET_LOG_RATE_LIMIT_PER_CALLSITE`.
+pub const DEFAULT_MAX_EVENTS_PER_CALLSITE_PER_SECOND: u64 = 30;
 
 /// Cap on the number of distinct callsites tracked. Each callsite holds
 /// one [`CallsiteState`] (~64 B). Once the cap is hit, the per-callsite
