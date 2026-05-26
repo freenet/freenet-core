@@ -246,7 +246,6 @@ impl TopologyManager {
         }
     }
 
-    #[allow(dead_code)] // wired up incrementally by per-resource-type reporters
     pub(crate) fn report_resource_usage(
         &mut self,
         attribution: &AttributionSource,

@@ -2140,6 +2140,17 @@ where
         if let Some(op_manager) = &self.op_manager {
             let new_gen = op_manager.ring.bump_state_generation(key);
             op_manager.ring.refresh_cache_generation(key, new_gen);
+            // Attribute the on-disk state-write volume to the contract
+            // for governance scoring. See `docs/design/contract-hardening.md`
+            // — Phase 3 ("Per-contract resource attribution"). Lightweight
+            // RwLock write on the topology meter; no channels involved
+            // (the May 2026 commit-path deadlock — #4145 — was on
+            // notification channels, not the meter).
+            op_manager.ring.report_contract_resource_usage(
+                *key.id(),
+                crate::topology::meter::ResourceType::StateBytesWritten,
+                state_size as f64,
+            );
         }
 
         tracing::info!(

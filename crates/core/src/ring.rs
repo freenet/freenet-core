@@ -1893,6 +1893,35 @@ impl Ring {
         self.hosting_manager.record_contract_update(contract)
     }
 
+    /// Report a per-contract resource sample to the topology meter.
+    ///
+    /// Lightweight non-blocking write: takes the topology manager's
+    /// write lock briefly to insert into the running-average store.
+    /// Safe to call from executor commit paths — does NOT use channels
+    /// (cf. `.claude/rules/channel-safety.md`); the May 2026 deadlock
+    /// pattern (`#4145`) is not reachable through this surface.
+    ///
+    /// Used by `Executor::commit_state_update` to attribute state-write
+    /// bytes to a contract, and (in follow-up work) by the WASM call
+    /// wrappers for CPU/fuel and the broadcast dispatcher for fanout
+    /// cost. Per-contract attribution lets the shared governance
+    /// outlier-detection module (`crate::governance`) score contracts
+    /// against the network's observed cost-per-benefit distribution.
+    pub(crate) fn report_contract_resource_usage(
+        &self,
+        contract_id: freenet_stdlib::prelude::ContractInstanceId,
+        resource: crate::topology::meter::ResourceType,
+        amount: f64,
+    ) {
+        let mut topo = self.connection_manager.topology_manager.write();
+        topo.report_resource_usage(
+            &crate::topology::meter::AttributionSource::Contract(contract_id),
+            resource,
+            amount,
+            tokio::time::Instant::now(),
+        );
+    }
+
     // ==================== Subscription Retry Spam Prevention ====================
 
     /// Check if a subscription request can be made for a contract.

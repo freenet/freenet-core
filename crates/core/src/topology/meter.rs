@@ -172,7 +172,6 @@ impl Meter {
     /// Report the use of a resource. This should be done in the lowest-level
     /// functions that consume the resource, taking an AttributionMeter
     /// as a parameter.
-    #[allow(dead_code)] // wired up incrementally by per-resource-type reporters
     pub(crate) fn report(
         &mut self,
         attribution: &AttributionSource,
