@@ -1241,6 +1241,59 @@ pub(super) fn launchd_plist_needs_regen(content: &str) -> bool {
         || content.contains("Library/Logs/freenet/freenet.error.log")
 }
 
+/// Pure helper: decide whether the macOS launchd wrapper script needs
+/// regeneration by comparing the on-disk content to what
+/// `generate_wrapper_script` would produce *now*. Returns `true` for any
+/// difference — template drift, binary path move, manual edit, etc.
+///
+/// This replaces the older marker-substring check (issue #3967), which
+/// looked for `EXIT_CODE=$?` + `freenet update` + absence of the legacy
+/// log path. That check passed for the Jan 2026 wrapper, which had the
+/// auto-update hook but lacked the later-added orphan-killing
+/// `pkill -f -u "$(id -u)" "freenet network"` block on startup. Hosts
+/// installed before the pkill block was added kept hitting exit-43
+/// loops on every launchd restart because the staleness check believed
+/// they were already current. Comparing to the current template
+/// content is robust against any template change without needing
+/// pattern-specific markers.
+///
+/// User-modification protection (so this doesn't silently overwrite a
+/// hand-edited wrapper) is layered on at the caller via a sidecar
+/// `freenet-service-wrapper.sh.hash` file; see
+/// `ensure_service_file_updated`.
+///
+/// Cross-platform-compiled (no `#[cfg(target_os = "macos")]`) so
+/// non-macOS CI runners can exercise the predicate per code-style.md /
+/// deployment.md preference for pure decision helpers. The
+/// `#[allow(dead_code)]` suppresses the dead-code lint on non-macOS
+/// builds where the only non-test caller (`ensure_service_file_updated`)
+/// is cfg'd out.
+#[allow(dead_code)]
+pub(super) fn wrapper_needs_regen(current_template: &str, on_disk: &str) -> bool {
+    current_template != on_disk
+}
+
+/// Pure helper: SHA-256 hex digest of arbitrary bytes. Used to fingerprint
+/// the wrapper template we last wrote so a later `freenet update` can
+/// distinguish "Freenet's previous wrapper" from "a user-edited wrapper".
+///
+/// Cross-platform-compiled (string ops only) so non-macOS CI runners can
+/// exercise the helper.
+#[allow(dead_code)]
+pub(super) fn wrapper_content_hash(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write;
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            write!(s, "{b:02x}").expect("writing to String is infallible");
+            s
+        })
+}
+
 #[cfg(target_os = "macos")]
 fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
     let home_dir = match dirs::home_dir() {
@@ -1256,20 +1309,51 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
     }
 
     let wrapper_path = home_dir.join(".local/bin/freenet-service-wrapper.sh");
+    let wrapper_hash_path = wrapper_path.with_extension("sh.hash");
 
-    // Check if wrapper script exists and has the update logic
-    let wrapper_needs_update = if wrapper_path.exists() {
-        let content = fs::read_to_string(&wrapper_path).context("Failed to read wrapper script")?;
-        // Check for key auto-update markers
-        !content.contains("EXIT_CODE=$?")
-            || !content.contains("freenet update")
-            // Force regeneration if the wrapper still writes lifecycle messages
-            // to a fixed unrotated freenet.log (issue #4251). Newer wrappers
-            // route those messages through `logger -t freenet`.
-            || content.contains("$HOME/Library/Logs/freenet/freenet.log")
+    // Generate what the wrapper SHOULD be now. We compare the on-disk
+    // wrapper to this byte-for-byte instead of grepping for individual
+    // markers — the marker approach (issue #3967) silently failed for
+    // hosts running the Jan 2026 wrapper, which carried the
+    // auto-update markers but lacked the later-added pkill-on-startup
+    // orphan kill. Equality covers any template change without
+    // requiring per-feature marker plumbing.
+    let new_wrapper_content = generate_wrapper_script(binary_path);
+
+    // Tri-state decision so we can warn (and skip) when the user has
+    // hand-edited their wrapper — overwriting it would lose their
+    // changes silently.
+    enum WrapperPlan {
+        UpToDate,
+        WriteOurs,
+        UserModified(String), // hex hash of the on-disk file
+    }
+
+    let plan = if wrapper_path.exists() {
+        let on_disk = fs::read_to_string(&wrapper_path).context("Failed to read wrapper script")?;
+        if !wrapper_needs_regen(&new_wrapper_content, &on_disk) {
+            WrapperPlan::UpToDate
+        } else {
+            let on_disk_hash = wrapper_content_hash(&on_disk);
+            // If the sidecar hash file records the hash we wrote last
+            // time, we know the wrapper is ours and is safe to
+            // overwrite. If it records a different hash, the user (or
+            // some other tool) modified the wrapper since we wrote it
+            // — back off. If the sidecar is missing entirely, treat
+            // the wrapper as ours (this is the migration case for
+            // pre-#3967 installs that never recorded a hash).
+            match fs::read_to_string(&wrapper_hash_path) {
+                Ok(stored) if stored.trim() != on_disk_hash => {
+                    WrapperPlan::UserModified(on_disk_hash)
+                }
+                _ => WrapperPlan::WriteOurs,
+            }
+        }
     } else {
-        true
+        WrapperPlan::WriteOurs
     };
+
+    let wrapper_needs_update = matches!(plan, WrapperPlan::WriteOurs);
 
     // Also force regeneration of the plist if it still points
     // StandardOutPath/StandardErrorPath at the unrotated freenet.log
@@ -1297,6 +1381,21 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
     // executable before we point launchd at it. If wrapper regen fails,
     // we exit BEFORE rewriting the plist so the system stays in its
     // previous-working state.
+    if let WrapperPlan::UserModified(on_disk_hash) = &plan {
+        if !quiet {
+            eprintln!(
+                "Warning: wrapper script at {} differs from the current Freenet \
+                 template AND from the hash recorded in {}, suggesting it has \
+                 been hand-edited. Leaving it alone. To accept the bundled \
+                 wrapper, delete the .sh.hash sidecar or reinstall via \
+                 `freenet service install`. (on-disk hash: {})",
+                wrapper_path.display(),
+                wrapper_hash_path.display(),
+                on_disk_hash,
+            );
+        }
+    }
+
     if wrapper_needs_update {
         if !quiet {
             println!("Updating service wrapper to add auto-update support...");
@@ -1323,9 +1422,27 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
             }
         }
 
-        // Generate and write new wrapper script
-        let wrapper_content = generate_wrapper_script(binary_path);
-        fs::write(&wrapper_path, &wrapper_content).context("Failed to write wrapper script")?;
+        // Write the new wrapper script (already generated above for the
+        // staleness check; reuse it).
+        fs::write(&wrapper_path, &new_wrapper_content).context("Failed to write wrapper script")?;
+
+        // Record the hash of what we just wrote so a later auto-update
+        // can distinguish "Freenet's previous wrapper" from "a
+        // user-edited wrapper". A failure to write the sidecar only
+        // weakens future user-modification protection — it does NOT
+        // invalidate the wrapper we just wrote, so warn but continue.
+        let new_hash = wrapper_content_hash(&new_wrapper_content);
+        if let Err(e) = fs::write(&wrapper_hash_path, format!("{new_hash}\n")) {
+            if !quiet {
+                eprintln!(
+                    "Warning: failed to write wrapper hash sidecar at {}: {}. \
+                     User-modification detection on the next `freenet update` \
+                     will fall back to treating the wrapper as ours.",
+                    wrapper_hash_path.display(),
+                    e
+                );
+            }
+        }
 
         // Make executable
         #[cfg(unix)]
@@ -1893,6 +2010,273 @@ StandardError=journal
         assert!(
             !launchd_plist_needs_regen(current),
             "current /dev/null plist must NOT be flagged for regen"
+        );
+    }
+
+    // ---- Issue #3967: wrapper-content-equality staleness detection. ----
+    //
+    // The Jan 2026 macOS wrapper carried the auto-update markers
+    // (`EXIT_CODE=$?` + `freenet update`) but lacked the later-added
+    // orphan-killing `pkill -f -u "$(id -u)" "freenet network"` block
+    // on startup. Hosts installed with that wrapper kept hitting
+    // exit-43 loops on every launchd restart because the old
+    // marker-substring staleness check believed they were already
+    // current. These tests pin the new comparison: ANY drift between
+    // the on-disk wrapper and what `generate_wrapper_script` produces
+    // now triggers a regen, regardless of which markers are present.
+    //
+    // The pure helpers (wrapper_needs_regen, wrapper_content_hash)
+    // are cross-platform-compiled, so these tests run on every CI
+    // platform per deployment.md's preference.
+
+    #[test]
+    fn wrapper_with_auto_update_hook_but_no_pkill_block_needs_regen_3967() {
+        // Synthetic Jan 2026 wrapper: has the auto-update markers
+        // (EXIT_CODE=$?, `freenet update`) but no pkill-on-startup
+        // orphan-kill block. The old marker check returned false
+        // here, leaving hosts stuck.
+        let jan_2026_wrapper = r#"#!/bin/bash
+BACKOFF=10
+while true; do
+    /usr/local/bin/freenet network
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -eq 42 ]; then
+        /usr/local/bin/freenet update --quiet
+        continue
+    fi
+    sleep $BACKOFF
+done
+"#;
+        // Stand in for the current template — different content,
+        // notably the pkill-on-startup block. We don't need to
+        // call the macOS-only generator here; any non-equal string
+        // exercises the same code path.
+        let current_template = r#"#!/bin/bash
+pkill -f -u "$(id -u)" "freenet network" 2>/dev/null || true
+BACKOFF=10
+while true; do
+    /usr/local/bin/freenet network
+    EXIT_CODE=$?
+    if [ $EXIT_CODE -eq 42 ]; then
+        /usr/local/bin/freenet update --quiet
+        continue
+    fi
+    sleep $BACKOFF
+done
+"#;
+        assert!(
+            wrapper_needs_regen(current_template, jan_2026_wrapper),
+            "Jan 2026 wrapper missing the pkill-on-startup block must \
+             be detected as needing regen (#3967). The old \
+             marker-substring check returned false here, leaving \
+             hosts stuck in exit-43 loops for weeks."
+        );
+    }
+
+    #[test]
+    fn wrapper_identical_to_template_does_not_need_regen() {
+        let template = "#!/bin/bash\necho hi\n";
+        assert!(
+            !wrapper_needs_regen(template, template),
+            "byte-identical wrapper must NOT be flagged for regen — \
+             otherwise every `freenet update` would loop rewriting it"
+        );
+    }
+
+    #[test]
+    fn wrapper_needs_regen_detects_single_char_drift() {
+        // Round-trip an arbitrary template change: even a one-byte
+        // difference (e.g. a new flag, an added comment, a bumped
+        // backoff constant) must trigger regen, since the whole
+        // point of equality-based detection is to be robust to ALL
+        // template edits, not just the ones we anticipated.
+        let template_a = "BACKOFF=10\n";
+        let template_b = "BACKOFF=11\n";
+        assert!(
+            wrapper_needs_regen(template_a, template_b),
+            "any drift between template and on-disk wrapper must \
+             trigger regen (#3967)"
+        );
+    }
+
+    /// Calls the real macOS wrapper generator with synthetic inputs
+    /// so a future edit to `generate_wrapper_script` that introduces
+    /// nondeterminism (timestamps, random IDs, environment-dependent
+    /// strings) is caught at test time — otherwise every auto-update
+    /// would loop rewriting an "always-stale" wrapper.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn freshly_generated_wrapper_does_not_trigger_regen_loop() {
+        use std::path::PathBuf;
+        let binary = PathBuf::from("/Users/test/.local/bin/freenet");
+        let a = super::super::service::generate_wrapper_script(&binary);
+        let b = super::super::service::generate_wrapper_script(&binary);
+        assert!(
+            !wrapper_needs_regen(&a, &b),
+            "two calls to generate_wrapper_script with the same \
+             binary path must produce identical output — \
+             otherwise every auto-update would loop rewriting the \
+             wrapper"
+        );
+    }
+
+    #[test]
+    fn wrapper_content_hash_is_stable_and_distinct() {
+        let a = wrapper_content_hash("hello");
+        let b = wrapper_content_hash("hello");
+        let c = wrapper_content_hash("hello\n"); // trailing newline differs
+        assert_eq!(a, b, "hash must be deterministic for the same input");
+        assert_ne!(
+            a, c,
+            "hash must distinguish inputs differing by a single byte — \
+             otherwise the user-modification sidecar can't tell a \
+             hand-edited wrapper from Freenet's"
+        );
+        assert_eq!(
+            a.len(),
+            64,
+            "SHA-256 hex digest must be exactly 64 chars; the wrapper \
+             sidecar's trim() comparison relies on a stable encoding"
+        );
+    }
+
+    /// Shared mutex for tests that mutate `HOME`. Cargo runs unit
+    /// tests in parallel, so HOME-touching tests must serialize on
+    /// this lock or they'd see each other's tempdirs and the assertions
+    /// would become flaky.
+    #[cfg(target_os = "macos")]
+    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII guard that restores the prior `HOME` on drop. Tests use it
+    /// to point `ensure_service_file_updated` at a tempdir without
+    /// leaking that override to sibling tests.
+    #[cfg(target_os = "macos")]
+    struct ScopedHome {
+        prior: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+    #[cfg(target_os = "macos")]
+    impl ScopedHome {
+        fn new(path: &std::path::Path) -> Self {
+            let lock = HOME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            let prior = std::env::var_os("HOME");
+            std::env::set_var("HOME", path);
+            Self { prior, _lock: lock }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    impl Drop for ScopedHome {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// End-to-end regression for issue #3967: a host with a stale
+    /// pre-pkill wrapper but no hash sidecar (the migration shape for
+    /// every existing install before this PR landed) must have its
+    /// wrapper rewritten by `ensure_service_file_updated`, and a hash
+    /// sidecar must be left behind so the NEXT update has
+    /// user-modification protection.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn ensure_service_file_updated_rewrites_pre_pkill_wrapper_and_records_hash() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("create tempdir");
+        let fake_home = tmp.path();
+        let _home = ScopedHome::new(fake_home);
+
+        // The macOS branch only acts when the user has actually
+        // installed the service (plist exists). Lay down a stub
+        // plist so the branch proceeds.
+        let launch_agents = fake_home.join("Library/LaunchAgents");
+        fs::create_dir_all(&launch_agents).unwrap();
+        let plist = launch_agents.join("org.freenet.node.plist");
+        fs::write(&plist, "<plist/>").unwrap();
+
+        // Stale Jan-2026-shape wrapper: carries the auto-update
+        // markers the old check looked for, but no pkill-on-startup
+        // block. No hash sidecar exists (the file landed here before
+        // #3967).
+        let wrapper_dir = fake_home.join(".local/bin");
+        fs::create_dir_all(&wrapper_dir).unwrap();
+        let wrapper = wrapper_dir.join("freenet-service-wrapper.sh");
+        let stale = "#!/bin/bash\n# EXIT_CODE=$?\n# freenet update\n# (no pkill block!)\n";
+        fs::write(&wrapper, stale).unwrap();
+        let hash_sidecar = wrapper.with_extension("sh.hash");
+        assert!(!hash_sidecar.exists(), "test precondition: no sidecar yet");
+
+        let binary = wrapper_dir.join("freenet");
+        ensure_service_file_updated(&binary, /* quiet */ true)
+            .expect("ensure_service_file_updated should succeed");
+
+        // Wrapper must have been rewritten (no longer matches the
+        // stale stub).
+        let new_content = fs::read_to_string(&wrapper).unwrap();
+        assert_ne!(
+            new_content, stale,
+            "stale Jan-2026 wrapper must be replaced by ensure_service_file_updated (#3967)"
+        );
+        // The rewritten wrapper must match what generate_wrapper_script
+        // produces now — the whole point of equality-based detection.
+        let expected = super::super::service::generate_wrapper_script(&binary);
+        assert_eq!(
+            new_content, expected,
+            "rewritten wrapper must equal the current template byte-for-byte"
+        );
+        // Hash sidecar must be present and match the new wrapper, so
+        // a future hand-edit is correctly flagged as user-modified.
+        let recorded = fs::read_to_string(&hash_sidecar)
+            .expect("hash sidecar must be written after a successful regen");
+        assert_eq!(
+            recorded.trim(),
+            wrapper_content_hash(&new_content),
+            "recorded sidecar hash must match the wrapper we just wrote"
+        );
+    }
+
+    /// User-modification protection: when the on-disk wrapper differs
+    /// from the current template AND the recorded sidecar hash
+    /// doesn't match the on-disk content, `ensure_service_file_updated`
+    /// must leave the wrapper alone (preserving the user's edits).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn ensure_service_file_updated_preserves_user_modified_wrapper() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().expect("create tempdir");
+        let fake_home = tmp.path();
+        let _home = ScopedHome::new(fake_home);
+
+        let launch_agents = fake_home.join("Library/LaunchAgents");
+        fs::create_dir_all(&launch_agents).unwrap();
+        fs::write(launch_agents.join("org.freenet.node.plist"), "<plist/>").unwrap();
+
+        let wrapper_dir = fake_home.join(".local/bin");
+        fs::create_dir_all(&wrapper_dir).unwrap();
+        let wrapper = wrapper_dir.join("freenet-service-wrapper.sh");
+        let user_edited = "#!/bin/bash\n# I have customized this myself\necho user\n";
+        fs::write(&wrapper, user_edited).unwrap();
+        // Record a sidecar with some OTHER hash — i.e. as if Freenet
+        // wrote a wrapper earlier and the user then edited it.
+        let stale_hash = wrapper_content_hash("something-different");
+        fs::write(wrapper.with_extension("sh.hash"), format!("{stale_hash}\n")).unwrap();
+
+        let binary = wrapper_dir.join("freenet");
+        ensure_service_file_updated(&binary, /* quiet */ true)
+            .expect("ensure_service_file_updated should succeed even when skipping");
+
+        let still_on_disk = fs::read_to_string(&wrapper).unwrap();
+        assert_eq!(
+            still_on_disk, user_edited,
+            "user-modified wrapper must be preserved (sidecar hash mismatch)"
         );
     }
 

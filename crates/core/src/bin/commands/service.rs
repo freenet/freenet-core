@@ -2814,9 +2814,27 @@ fn install_macos_service() -> Result<()> {
     fs::create_dir_all(&wrapper_dir).context("Failed to create wrapper directory")?;
     let wrapper_path = wrapper_dir.join("freenet-service-wrapper.sh");
     let wrapper_content = generate_wrapper_script(&exe_path);
-    fs::write(&wrapper_path, wrapper_content).context("Failed to write wrapper script")?;
+    fs::write(&wrapper_path, &wrapper_content).context("Failed to write wrapper script")?;
     fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))
         .context("Failed to make wrapper script executable")?;
+
+    // Record the SHA-256 hash of the wrapper we just wrote so a later
+    // `freenet update` can distinguish "Freenet's wrapper" from "a
+    // hand-edited wrapper" before overwriting it (issue #3967). A
+    // failed sidecar write only weakens user-modification protection
+    // on the next update — it does not invalidate the wrapper we just
+    // wrote — so we warn and continue.
+    let wrapper_hash_path = wrapper_path.with_extension("sh.hash");
+    let wrapper_hash = super::update::wrapper_content_hash(&wrapper_content);
+    if let Err(e) = fs::write(&wrapper_hash_path, format!("{wrapper_hash}\n")) {
+        eprintln!(
+            "Warning: failed to write wrapper hash sidecar at {}: {}. \
+             User-modification detection on the next `freenet update` \
+             will fall back to treating the wrapper as ours.",
+            wrapper_hash_path.display(),
+            e
+        );
+    }
 
     let plist_content = generate_plist(&wrapper_path, &log_dir);
     let plist_path = launch_agents_dir.join("org.freenet.node.plist");
