@@ -246,7 +246,6 @@ impl TopologyManager {
         }
     }
 
-    #[allow(dead_code)] // fixme: use this
     pub(crate) fn report_resource_usage(
         &mut self,
         attribution: &AttributionSource,
@@ -288,6 +287,16 @@ impl TopologyManager {
         debug!("Collecting data from source_creation_times");
         let mut usage_data = Vec::new();
         for (source, creation_time) in self.source_creation_times.iter() {
+            // Skip sources that cannot contribute to this resource type —
+            // e.g. Contract sources never produce bandwidth samples. Without
+            // this filter, the ramping-up branch below synthesizes a
+            // non-zero rate via the network-wide P50 estimator even for
+            // a source that has produced zero samples of the requested
+            // resource, inflating total_usage and driving spurious
+            // connection-removal decisions. See `AttributionSource::contributes_to`.
+            if !source.contributes_to(resource_type) {
+                continue;
+            }
             let ramping_up = now.duration_since(*creation_time) <= SOURCE_RAMP_UP_DURATION;
             debug!(
                 "Source: {:?}, Creation time: {:?}, Ramping up: {}",
@@ -1118,6 +1127,66 @@ mod tests {
                 .unwrap()
                 .per_second(),
             100.0
+        );
+    }
+
+    /// Regression test for the contract-hardening review (PR #4260):
+    /// reporting `AttributionSource::Contract` MUST NOT inflate the
+    /// topology's perceived bandwidth usage. Pre-fix, `extrapolated_usage`
+    /// iterated every entry in `source_creation_times` (now including
+    /// Contract sources) and synthesized a non-zero rate via the
+    /// network-wide P50 estimator for any source within the 5-min
+    /// ramp-up window, regardless of whether that source had ever
+    /// produced a bandwidth sample. The skeptical-reviewer flagged
+    /// this as a production-risk regression: every state UPDATE on a
+    /// popular contract would have looked like a fresh bandwidth-emitting
+    /// source, driving `adjust_topology` into bandwidth-overload mode
+    /// and removing connections unnecessarily.
+    #[test_log::test]
+    fn contract_source_does_not_pollute_bandwidth_extrapolation() {
+        use freenet_stdlib::prelude::ContractInstanceId;
+        let limits = Limits {
+            max_upstream_bandwidth: Rate::new_per_second(1000.0),
+            max_downstream_bandwidth: Rate::new_per_second(1000.0),
+            max_connections: 200,
+            min_connections: 5,
+        };
+        let mut topo = TopologyManager::new(limits);
+        let now = Instant::now();
+
+        // Baseline: with no sources reported, extrapolated bandwidth is zero.
+        let baseline = topo.extrapolated_usage(&ResourceType::InboundBandwidthBytes, now);
+        assert_eq!(baseline.total.per_second(), 0.0);
+
+        // Report a contract source that has produced zero bandwidth.
+        let contract_id = ContractInstanceId::new([7u8; 32]);
+        topo.report_resource_usage(
+            &AttributionSource::Contract(contract_id),
+            ResourceType::StateBytesWritten,
+            42.0,
+            now,
+        );
+
+        // The contract source is now in source_creation_times within the
+        // ramp-up window. Pre-fix, the next bandwidth extrapolation would
+        // have invented a P50 bandwidth rate for it. Post-fix, the
+        // contributes_to filter skips Contract sources for bandwidth.
+        let polluted = topo.extrapolated_usage(&ResourceType::InboundBandwidthBytes, now);
+        assert_eq!(
+            polluted.total.per_second(),
+            0.0,
+            "Contract source must NOT contribute to bandwidth extrapolation. \
+             total_usage = {:?}",
+            polluted.total
+        );
+
+        // Sanity: the contract source DOES show up in its own resource type.
+        let contract_resource = topo.extrapolated_usage(&ResourceType::StateBytesWritten, now);
+        assert!(
+            contract_resource
+                .per_source
+                .contains_key(&AttributionSource::Contract(contract_id)),
+            "Contract source must still contribute to its own resource types"
         );
     }
 
@@ -2327,6 +2396,26 @@ impl Limits {
         match resource_type {
             ResourceType::OutboundBandwidthBytes => self.max_upstream_bandwidth,
             ResourceType::InboundBandwidthBytes => self.max_downstream_bandwidth,
+            // Non-bandwidth resource types (CPU / fuel / state / fanout
+            // — added for contract governance) have no `Limits` ceiling.
+            // They are tracked by the meter but not gated here. This
+            // arm exists so the match stays exhaustive; in practice
+            // these variants never reach this function because
+            // `ResourceType::all()` (the iterator that drives capacity
+            // decisions) returns only the bandwidth variants. Reaching
+            // here would indicate a future code change forgot to update
+            // `Limits`; surface that via panic rather than a silent
+            // INFINITY sentinel.
+            ResourceType::ExecCpuMicros
+            | ResourceType::ExecFuelUnits
+            | ResourceType::StateBytesWritten
+            | ResourceType::BroadcastFanoutCost => {
+                unreachable!(
+                    "Limits::get called for non-bandwidth resource {:?} — \
+                     these are tracked but not bandwidth-rate-limited",
+                    resource_type
+                )
+            }
         }
     }
 }

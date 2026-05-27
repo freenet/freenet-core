@@ -10,6 +10,17 @@ const MAX_RELATED_CONTRACTS_PER_REQUEST: usize = 10;
 
 /// Timeout for fetching all related contracts during validation.
 const RELATED_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Probability that a given state-changing merge is checked for
+/// `update_state` idempotency. One re-invocation of WASM per sample, so
+/// the per-merge cost is ~`p * average_update_state_us`. At 1/32 ≈ 3%
+/// the overhead is negligible on healthy contracts and detection is
+/// effectively certain within a few seconds on a contract that's
+/// firing dozens of merges/sec.
+///
+/// Sample selection uses `GlobalRng` (deterministic under a fixed seed
+/// for simulation tests). See `Executor::maybe_probe_idempotency`.
+const IDEMPOTENCY_PROBE_PROBABILITY: f64 = 1.0 / 32.0;
 use crate::node::OpManager;
 use crate::wasm_runtime::{
     BackendEngine, DEFAULT_MODULE_CACHE_CAPACITY, MAX_STATE_SIZE, RuntimeConfig, SharedModuleCache,
@@ -1259,25 +1270,19 @@ where
                                 "Contract is new, storing initial state"
                             );
                             let state_to_store = incoming_state.clone();
+                            let written_bytes = state_to_store.as_ref().len();
                             self.state_store
                                 .store(key, state_to_store, params.clone())
                                 .await
                                 .map_err(ExecutorError::other)?;
-                            // State-write chokepoint: bump the per-contract
-                            // generation counter so a racing `EvictContract`
-                            // captured before this store sees a stale
-                            // generation at deletion time and skips
-                            // reclamation. Then refresh the hosting-cache
-                            // snapshot so subsequent evictions of this
-                            // already-hosted contract carry the new
-                            // generation rather than the stale snapshot
-                            // captured at first `record_access` — without
-                            // the refresh, every UPDATE leaks on eviction.
-                            // See `RuntimePool::remove_contract` and
-                            // `HostingCache::refresh_entry_generation`.
+                            // State-write chokepoint: delegate the three
+                            // mandatory side effects (bump generation,
+                            // refresh hosting-cache snapshot, report
+                            // StateBytesWritten) to `Ring::commit_state_write`.
+                            // See its rustdoc and `RuntimePool::remove_contract`
+                            // for the EvictContract re-host race this closes.
                             if let Some(op_manager) = &self.op_manager {
-                                let new_gen = op_manager.ring.bump_state_generation(&key);
-                                op_manager.ring.refresh_cache_generation(&key, new_gen);
+                                op_manager.ring.commit_state_write(&key, written_bytes);
                             }
 
                             let completion_now = now_nanos();
@@ -1781,6 +1786,39 @@ where
         if updated_state.as_ref() == current_state.as_ref() {
             Ok(UpsertResult::NoChange)
         } else {
+            // CRDT-invariant idempotency probe. With low probability, re-run
+            // `update_state` with `updated_state` as the current state and
+            // the same `updates`. A correct CRDT must satisfy
+            // `update_state(update_state(S, U), U) == update_state(S, U)` —
+            // a violation indicates a contract bug (timestamp/RNG/position-
+            // dependent signing/etc.) that produces an infinite broadcast
+            // storm in the network. See `crate::ring::broken_invariants`.
+            //
+            // `RelatedState` inputs are skipped: re-applying a cross-
+            // contract state hint isn't required to be a no-op by the
+            // contract ABI, so probing it can produce false positives.
+            self.maybe_probe_idempotency(&key, &params, &updated_state, &updates)
+                .await;
+
+            if self
+                .op_manager
+                .as_ref()
+                .map(|m| m.ring.is_contract_broken(&key))
+                .unwrap_or(false)
+            {
+                // Probe just flagged this contract (or it was already
+                // flagged). Skip the commit so we don't extend the
+                // problematic state, and surface the suppression to
+                // callers via NoChange — there is no state change the
+                // network should observe.
+                tracing::debug!(
+                    contract = %key,
+                    event = "merge_suppressed_broken_contract",
+                    "Skipping commit_state_update for contract flagged as broken"
+                );
+                return Ok(UpsertResult::NoChange);
+            }
+
             self.commit_state_update(&key, &params, &updated_state)
                 .await?;
             Ok(UpsertResult::Updated(updated_state))
@@ -2096,6 +2134,125 @@ where
         Ok(Either::Left(new_state))
     }
 
+    /// Probe-sampled idempotency check. Re-runs `update_state` with the just-
+    /// produced state as the current state and the same updates; flags the
+    /// contract as broken if the result differs.
+    ///
+    /// Costs one extra WASM invocation per sampled merge. With the
+    /// configured probability [`IDEMPOTENCY_PROBE_PROBABILITY`] (currently
+    /// 1/32) this is a few percent overhead on active contracts and
+    /// effectively zero on quiet ones. Sample selection uses `GlobalRng`
+    /// so simulation builds remain deterministic under a fixed seed.
+    ///
+    /// Only probes update batches whose every entry is
+    /// `UpdateData::State(_)`. `Delta`/`StateAndDelta` are exempted
+    /// because operation-based CRDTs (counters, append-logs) legitimately
+    /// violate the byte-equality property on re-apply; `RelatedState` is
+    /// exempted because it's a cross-contract hint, not a CRDT op over
+    /// this contract's state. Probe traps (timeout, OOG, panic) are
+    /// logged but not treated as positive signals — distinguishing
+    /// "buggy on re-apply" from "buggy in some other way" requires a
+    /// separate detector. See `crate::ring::broken_invariants`.
+    async fn maybe_probe_idempotency(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters<'_>,
+        post_merge_state: &WrappedState,
+        updates: &[UpdateData<'_>],
+    ) {
+        // Cheap precheck: if already flagged, no value in probing again.
+        if let Some(op_manager) = &self.op_manager {
+            if op_manager.ring.is_contract_broken(key) {
+                return;
+            }
+        }
+
+        // Probe ONLY when every input is `UpdateData::State(...)`. Three
+        // reasons for this conservative gating:
+        //
+        // 1. `Delta` inputs are NOT contractually required to be
+        //    idempotent. An "increment by 1" delta produces S+1 then S+2
+        //    on re-apply — that's a CmRDT-shaped contract, perfectly
+        //    valid, but `update_state(update_state(S, U), U) != update_state(S, U)`
+        //    in the exact byte sense the probe checks. Probing Delta
+        //    inputs would mass-flag legitimate counter / append-log
+        //    contracts. Skip them entirely.
+        //
+        // 2. `StateAndDelta` carries a delta too, with the same risk.
+        //
+        // 3. `RelatedState` is a cross-contract hint, not a CRDT op
+        //    over this contract's state — re-applying isn't required
+        //    to be a no-op even for a correct contract.
+        //
+        // State-only batches are the unambiguous case: receiving the
+        // same full state twice MUST produce the same merged result by
+        // CvRDT lattice-join semantics. That's the invariant the probe
+        // tests.
+        let all_state =
+            !updates.is_empty() && updates.iter().all(|u| matches!(u, UpdateData::State(_)));
+        if !all_state {
+            return;
+        }
+
+        // Sampling. `GlobalRng` honors a fixed seed in simulation tests
+        // (see `crate::config::GlobalRng`), so determinism is preserved
+        // under the existing test harness — but the call ordering would
+        // shift if existing tests don't expect a new RNG consumer on the
+        // merge path. The probe runs only on pure-State batches (above),
+        // which the simulation harness drives explicitly and rarely, so
+        // the RNG stream perturbation is bounded.
+        if !crate::config::GlobalRng::random_bool(IDEMPOTENCY_PROBE_PROBABILITY) {
+            return;
+        }
+
+        let probe_result = self
+            .runtime
+            .update_state(key, parameters, post_merge_state, updates);
+        let probe_outcome = match probe_result {
+            Ok(modification) => modification,
+            Err(err) => {
+                // The probe failing (timeout, trap, etc.) is not a positive
+                // signal — the contract is exercising some other failure
+                // mode that doesn't necessarily imply non-idempotency.
+                // Log at DEBUG and bail without flagging.
+                tracing::debug!(
+                    contract = %key,
+                    error = %err,
+                    event = "idempotency_probe_error",
+                    "Idempotency probe failed to execute; skipping detection"
+                );
+                return;
+            }
+        };
+        let UpdateModification {
+            new_state: probe_state,
+            ..
+        } = probe_outcome;
+        let Some(probe_state) = probe_state else {
+            // No state output from probe (e.g. contract returned only
+            // `requires(...)`). Inconclusive — bail.
+            return;
+        };
+        let probe_state = WrappedState::new(probe_state.into_bytes());
+
+        if probe_state.as_ref() != post_merge_state.as_ref() {
+            if let Some(op_manager) = &self.op_manager {
+                tracing::warn!(
+                    contract = %key,
+                    post_merge_size = post_merge_state.size(),
+                    probe_size = probe_state.size(),
+                    event = "non_idempotent_merge_detected",
+                    "Contract violates update_state idempotency \
+                     (update_state(update_state(S, U), U) != update_state(S, U)). \
+                     Flagging contract; outbound BroadcastStateChange will be suppressed."
+                );
+                op_manager
+                    .ring
+                    .record_broken_invariant(*key, crate::ring::BrokenInvariant::NonIdempotent);
+            }
+        }
+    }
+
     /// Persist an updated contract state via `state_store.update`.
     ///
     /// This is the canonical chokepoint for UPDATE-shaped writes: every
@@ -2109,6 +2266,27 @@ where
         parameters: &Parameters<'_>,
         new_state: &WrappedState,
     ) -> Result<(), ExecutorError> {
+        // Blanket gate: a contract flagged as violating a CRDT invariant
+        // (e.g. non-idempotent merge) must not have its state extended
+        // OR broadcast from this node. The merge in
+        // `bridged_upsert_contract_state` already short-circuits before
+        // reaching here on the probe-positive path, but
+        // `commit_state_update` has other call sites (related-contract
+        // retry, validation re-attempt) that don't run the probe first.
+        // Gating here covers all of them with one check. See
+        // `crate::ring::broken_invariants` for the tracker and #4279
+        // for the storm shape this defends against.
+        if let Some(op_manager) = &self.op_manager {
+            if op_manager.ring.is_contract_broken(key) {
+                tracing::debug!(
+                    contract = %key,
+                    event = "commit_suppressed_broken_contract",
+                    "Skipping commit_state_update for contract flagged as broken"
+                );
+                return Ok(());
+            }
+        }
+
         let state_size = new_state.as_ref().len();
         if state_size > MAX_STATE_SIZE {
             tracing::warn!(
@@ -2130,16 +2308,13 @@ where
             .update(key, new_state.clone())
             .await
             .map_err(ExecutorError::other)?;
-        // State-write chokepoint (UPDATE): see `commit_state_update` docs
-        // and `RuntimePool::remove_contract` for the race this bump closes.
-        // Refresh the hosting-cache snapshot in lock-step so an UPDATE to
-        // an already-hosted contract doesn't leave the cached generation
-        // stuck at its first-`record_access` value — that mismatch would
-        // make later evictions silently skip reclamation. See
-        // `HostingCache::refresh_entry_generation`.
+        // State-write chokepoint (UPDATE): delegate the bump + refresh +
+        // report side effects to `Ring::commit_state_write`. See its
+        // rustdoc and `RuntimePool::remove_contract` for the EvictContract
+        // re-host race this closes; the report leg feeds the governance
+        // scoring layer (`docs/design/contract-hardening.md` — Phase 3).
         if let Some(op_manager) = &self.op_manager {
-            let new_gen = op_manager.ring.bump_state_generation(key);
-            op_manager.ring.refresh_cache_generation(key, new_gen);
+            op_manager.ring.commit_state_write(key, state_size);
         }
 
         tracing::debug!(
@@ -2172,17 +2347,32 @@ where
         self.send_delegate_contract_notifications(key, new_state);
 
         if let Some(op_manager) = &self.op_manager {
-            // Non-blocking emit: a 30-second `notify_node_event(...).await`
-            // on this commit path was the primary back-pressure source
-            // that wedged both gateways on 2026-05-24 (#4145). Missed
-            // broadcasts heal via the next UPDATE or via summary-mismatch
-            // SyncStateToPeer rounds — the executor must not stall here.
-            if let Err(err) =
+            // Skip the broadcast entirely if this contract has been flagged
+            // as violating a CRDT invariant (e.g. non-idempotent
+            // `update_state`). The idempotency probe in
+            // `bridged_upsert_contract_state` sets this flag when it
+            // catches `update_state(update_state(S, U), U) != update_state(S, U)`.
+            // Once flagged, propagating this contract's state changes
+            // re-engages the broadcast storm we are trying to suppress.
+            // See `crate::ring::broken_invariants`.
+            if op_manager.ring.is_contract_broken(key) {
+                tracing::debug!(
+                    contract = %key,
+                    event = "broadcast_suppressed_broken_contract",
+                    "Skipping BroadcastStateChange for contract flagged as broken"
+                );
+            } else if let Err(err) =
                 op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
                     key: *key,
                     new_state: new_state.clone(),
                 })
             {
+                // Non-blocking emit: a 30-second `notify_node_event(...).await`
+                // on this commit path was the primary back-pressure source
+                // that wedged both gateways on 2026-05-24 (#4145). Missed
+                // broadcasts heal via the next UPDATE or via summary-mismatch
+                // SyncStateToPeer rounds — the executor must not stall here.
+                //
                 // Best-effort by design (see comment block above and
                 // #4145): a missed broadcast heals via the next UPDATE
                 // or summary-mismatch SyncStateToPeer round. Per-
@@ -2521,6 +2711,17 @@ where
 
     async fn broadcast_state_change(&self, key: ContractKey, new_state: WrappedState) {
         if let Some(op_manager) = &self.op_manager {
+            // Mirror the broken-invariant gate in `commit_state_update`
+            // above. Same rationale: a contract flagged as non-idempotent
+            // must not be propagated.
+            if op_manager.ring.is_contract_broken(&key) {
+                tracing::debug!(
+                    contract = %key,
+                    event = "broadcast_suppressed_broken_contract",
+                    "Skipping BroadcastStateChange for contract flagged as broken"
+                );
+                return;
+            }
             // Non-blocking emit — see comment in the update path above
             // and #4145 for the wedge this prevents.
             if let Err(err) =
@@ -2861,14 +3062,15 @@ impl Executor<Runtime> {
         // Enable V2 delegate contract access by providing the state store DB
         rt.set_state_store_db(state_store.storage());
         // V2 delegate state writes bypass the executor's
-        // `state_store.{store,update}` chokepoints, so install a callback that
-        // mirrors the bump+refresh those chokepoints perform. Without this,
-        // V2 delegate PUT/UPDATE leaves the EvictContract re-host race open.
+        // `state_store.{store,update}` chokepoints, so install a callback
+        // that mirrors the bump+refresh+report side effects via
+        // `Ring::commit_state_write`. Without this, V2 delegate PUT/UPDATE
+        // would leave the EvictContract re-host race open AND undercount
+        // StateBytesWritten in the governance meter.
         if let Some(op_manager_ref) = &op_manager {
             let op_manager_clone = op_manager_ref.clone();
-            rt.set_state_write_callback(Arc::new(move |key: &ContractKey| {
-                let new_gen = op_manager_clone.ring.bump_state_generation(key);
-                op_manager_clone.ring.refresh_cache_generation(key, new_gen);
+            rt.set_state_write_callback(Arc::new(move |key: &ContractKey, state_size: usize| {
+                op_manager_clone.ring.commit_state_write(key, state_size);
             }));
         }
         Executor::new(
@@ -2928,14 +3130,13 @@ impl Executor<Runtime> {
         .unwrap();
         rt.set_state_store_db(db);
         // V2 delegate state writes bypass the executor chokepoints — install
-        // the bump+refresh callback so the EvictContract re-host race is
-        // closed for that path too. See `from_config` and
+        // the commit_state_write callback so the bump+refresh+report side
+        // effects are still applied. See `from_config` and
         // `Runtime::set_state_write_callback`.
         if let Some(op_manager_ref) = &op_manager {
             let op_manager_clone = op_manager_ref.clone();
-            rt.set_state_write_callback(Arc::new(move |key: &ContractKey| {
-                let new_gen = op_manager_clone.ring.bump_state_generation(key);
-                op_manager_clone.ring.refresh_cache_generation(key, new_gen);
+            rt.set_state_write_callback(Arc::new(move |key: &ContractKey, state_size: usize| {
+                op_manager_clone.ring.commit_state_write(key, state_size);
             }));
         }
         Executor::new(
@@ -3327,18 +3528,17 @@ impl Executor<Runtime> {
             }
 
             // Commit locally
+            let written_bytes = new_state.as_ref().len();
             self.state_store
                 .update(&key, new_state.clone())
                 .await
                 .map_err(ExecutorError::other)?;
-            // State-write chokepoint: see `commit_state_update` doc comment
-            // and `RuntimePool::remove_contract` for the race this bump closes.
-            // Refresh the hosting-cache snapshot so already-hosted contracts
-            // don't leak on eviction after this re-PUT — see
-            // `HostingCache::refresh_entry_generation`.
+            // State-write chokepoint (re-PUT): delegate to
+            // `Ring::commit_state_write` for bump + refresh + report. See
+            // its rustdoc and `RuntimePool::remove_contract` for the
+            // EvictContract re-host race this closes.
             if let Some(op_manager) = &self.op_manager {
-                let new_gen = op_manager.ring.bump_state_generation(&key);
-                op_manager.ring.refresh_cache_generation(&key, new_gen);
+                op_manager.ring.commit_state_write(&key, written_bytes);
             }
 
             self.send_update_notification(&key, &params, &new_state)
@@ -3631,6 +3831,7 @@ impl Executor<Runtime> {
             state_size = state.as_ref().len(),
             "storing contract state"
         );
+        let written_bytes = state.as_ref().len();
         self.state_store
             .store(key, state, params)
             .await
@@ -3642,15 +3843,12 @@ impl Executor<Runtime> {
                 );
                 ExecutorError::other(e)
             })?;
-        // State-write chokepoint (verify_and_store PUT): see
-        // `commit_state_update` doc comment and
-        // `RuntimePool::remove_contract` for the race this bump closes.
-        // Refresh the hosting-cache snapshot so already-hosted contracts
-        // don't leak on eviction after this re-PUT — see
-        // `HostingCache::refresh_entry_generation`.
+        // State-write chokepoint (verify_and_store PUT): delegate to
+        // `Ring::commit_state_write` for bump + refresh + report. See
+        // its rustdoc and `RuntimePool::remove_contract` for the
+        // EvictContract re-host race this closes.
         if let Some(op_manager) = &self.op_manager {
-            let new_gen = op_manager.ring.bump_state_generation(&key);
-            op_manager.ring.refresh_cache_generation(&key, new_gen);
+            op_manager.ring.commit_state_write(&key, written_bytes);
         }
 
         Ok(())
@@ -4631,6 +4829,157 @@ mod remove_contract_tests {
             ReclaimOutcome::Full,
             "state-only present + code-already-gone counts as Full because \
              both halves are absent at end"
+        );
+    }
+}
+
+#[cfg(test)]
+mod state_write_attribution_pin_tests {
+    //! Source-grep pin tests for the StateBytesWritten reporter. The
+    //! `Ring::commit_state_write` helper bundles three side effects
+    //! (bump generation, refresh hosting-cache snapshot, report bytes
+    //! to the governance meter). The "Manually-mirrored telemetry
+    //! counters" row in `.claude/rules/bug-prevention-patterns.md`
+    //! says: a future refactor that hand-inlines one of those three
+    //! steps WITHOUT the report leg silently undercounts every state
+    //! write on that path. To make that failure mode trip CI instead
+    //! of going unnoticed for months, this module asserts at the
+    //! source level that:
+    //!
+    //!   1. There is exactly ONE place that calls `bump_state_generation`
+    //!      directly: the `commit_state_write` helper itself in ring.rs.
+    //!      Every other state-write site goes through the helper.
+    //!   2. The number of `commit_state_write` call sites in runtime.rs
+    //!      matches the number of state-write chokepoints we currently
+    //!      have (6 — see the comment at the top of the helper). If
+    //!      a new chokepoint is added without wiring it, this test
+    //!      will fail loudly until either the chokepoint is wired or
+    //!      this expected count is updated *with* a comment explaining
+    //!      why.
+    //!
+    //! These tests read their own source code (a common Rust idiom for
+    //! enforcing structural invariants — see `cargo` and `rustc`'s own
+    //! test suites for similar patterns).
+
+    const RUNTIME_SRC: &str = include_str!("runtime.rs");
+    const RING_SRC: &str = include_str!("../../ring.rs");
+    const NATIVE_API_SRC: &str = include_str!("../../wasm_runtime/native_api.rs");
+
+    /// Count lines containing the needle that are NOT comments, docstrings,
+    /// or string literals. A line counts only when the needle appears as
+    /// real code — the heuristic is: the line is not a comment AND the
+    /// needle does not appear inside a double-quoted string on that line.
+    fn count_call_sites(src: &str, needle: &str) -> usize {
+        src.lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    return false;
+                }
+                // Strip everything between matched double quotes so we
+                // don't count needle occurrences inside string literals
+                // (the test's own assertion messages contain the needles).
+                let stripped = strip_string_literals(line);
+                stripped.contains(needle)
+            })
+            .count()
+    }
+
+    /// Replace the contents of every `"..."` on the line with empty
+    /// quotes so substring searches on the result skip string literals.
+    /// Handles escaped quotes pragmatically (rare in this codebase).
+    fn strip_string_literals(line: &str) -> String {
+        let mut out = String::with_capacity(line.len());
+        let mut in_string = false;
+        let mut prev_was_backslash = false;
+        for c in line.chars() {
+            if in_string {
+                if c == '"' && !prev_was_backslash {
+                    in_string = false;
+                    out.push('"');
+                }
+                // drop characters inside the string
+            } else if c == '"' {
+                in_string = true;
+                out.push('"');
+            } else {
+                out.push(c);
+            }
+            prev_was_backslash = c == '\\' && !prev_was_backslash;
+        }
+        out
+    }
+
+    #[test]
+    fn bump_state_generation_has_exactly_one_caller_outside_hosting_manager() {
+        // The only NON-comment call to `.bump_state_generation(` in ring.rs
+        // should be the one inside `commit_state_write`. Every other
+        // state-write site goes through `commit_state_write` rather than
+        // calling the primitive directly.
+        let count = count_call_sites(RING_SRC, ".bump_state_generation(");
+        assert_eq!(
+            count, 1,
+            "expected exactly 1 .bump_state_generation( call in ring.rs \
+             (inside commit_state_write); found {count}. New direct \
+             callers should go through Ring::commit_state_write instead, \
+             or this assertion needs updating with a comment explaining \
+             why the new direct caller is correct."
+        );
+
+        // And runtime.rs MUST NOT call .bump_state_generation directly —
+        // every state-write site should go through commit_state_write.
+        let runtime_calls = count_call_sites(RUNTIME_SRC, ".bump_state_generation(");
+        assert_eq!(
+            runtime_calls, 0,
+            "runtime.rs must not call .bump_state_generation directly; \
+             use Ring::commit_state_write instead (which bundles the \
+             bump + refresh + report side effects). See \
+             `.claude/rules/bug-prevention-patterns.md` row \
+             'Manually-mirrored telemetry counters'."
+        );
+    }
+
+    #[test]
+    fn every_runtime_state_write_chokepoint_goes_through_commit_state_write() {
+        // 4 executor-internal chokepoints (PUT-new, UPDATE, re-PUT,
+        // verify_and_store PUT) + 2 V2 delegate callback installers
+        // = 6 total commit_state_write call sites in runtime.rs.
+        const EXPECTED: usize = 6;
+        let count = count_call_sites(RUNTIME_SRC, ".commit_state_write(");
+        assert_eq!(
+            count, EXPECTED,
+            "expected exactly {EXPECTED} .commit_state_write( call sites \
+             in runtime.rs; found {count}. If you added a new state-write \
+             chokepoint, wire it through `Ring::commit_state_write` and \
+             bump this expectation. If you removed one, ensure the \
+             chokepoint is genuinely gone (not just relocated) before \
+             lowering this expectation."
+        );
+    }
+
+    #[test]
+    fn v2_delegate_state_write_paths_invoke_callback_with_state_size() {
+        // The V2 delegate PUT and UPDATE paths in native_api.rs MUST
+        // capture state.len() BEFORE the move into store_state_sync /
+        // update_state_sync, and pass it to the callback. Otherwise the
+        // governance scoring undercounts every V2 delegate write by the
+        // full state size of that write.
+        let calls = count_call_sites(NATIVE_API_SRC, "cb(&contract_key,");
+        assert_eq!(
+            calls, 2,
+            "expected exactly 2 callback invocations passing state_size \
+             in native_api.rs (one for PUT, one for UPDATE); found {calls}"
+        );
+        // And state.len() MUST be captured before the move.
+        let captures = count_call_sites(NATIVE_API_SRC, "let state_size = state.len();");
+        assert_eq!(
+            captures, 2,
+            "expected exactly 2 `let state_size = state.len();` captures \
+             in native_api.rs (one before each state-store move); found \
+             {captures}. The order matters — capturing AFTER the move \
+             into store_state_sync would not compile, but a refactor \
+             that moves state into an intermediate first could regress \
+             this silently."
         );
     }
 }

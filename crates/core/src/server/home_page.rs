@@ -32,6 +32,7 @@ fn homepage_html() -> String {
 
     let status_card = build_status_card(&snap);
     let peers_card = build_peers_card(&snap);
+    let governance_card = build_governance_card(&snap);
     let contracts_card = build_contracts_card(&snap);
     let ops_card = build_ops_card(&snap);
     let transfer_card = build_transfer_card(&snap);
@@ -68,6 +69,7 @@ fn homepage_html() -> String {
         {status_card}
         {peers_card}
         {transfer_card}
+        {governance_card}
         {contracts_card}
         {ops_card}
 
@@ -107,6 +109,7 @@ fn homepage_html() -> String {
         status_card = status_card,
         peers_card = peers_card,
         transfer_card = transfer_card,
+        governance_card = governance_card,
         contracts_card = contracts_card,
         ops_card = ops_card,
     )
@@ -470,7 +473,7 @@ fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Str
         );
     }
 
-    let ring_svg = build_ring_svg(snap.own_location, &snap.peers);
+    let ring_svg = build_ring_svg(snap.own_location, &snap.peers, Some(&snap.governance));
 
     let mut rows = String::new();
     for p in &snap.peers {
@@ -523,66 +526,201 @@ fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Str
     )
 }
 
-/// Build an SVG ring visualization showing this node and connected peers.
-/// Locations are 0.0–1.0, mapped to angles around a circle.
-fn build_ring_svg(own_location: Option<f64>, peers: &[network_status::PeerSnapshot]) -> String {
-    // Only render if we have location data for at least one peer
+/// Build an SVG ring visualization. Two concentric rings:
+///
+/// - **Outer ring**: peers we're connected to, placed by their
+///   ring-location (Kleinberg topology position).
+/// - **Inner ring**: contracts the governance manager is tracking,
+///   placed by a deterministic hash of the instance id. Colored by
+///   governance state.
+///
+/// Lines (Bezier curves through the interior) go YOU → peer (outer)
+/// and YOU → contract (inner). All curves originate from or terminate
+/// at YOU — a node only sees its own traffic, so anything else would
+/// be fabricated.
+///
+/// Falls back to outer-ring-only rendering when no governance
+/// snapshot is supplied (e.g. tests that pre-date the upgrade).
+fn build_ring_svg(
+    own_location: Option<f64>,
+    peers: &[network_status::PeerSnapshot],
+    governance: Option<&network_status::GovernanceSnapshot>,
+) -> String {
+    // Render when there's *something* to show. The historical guard
+    // (at least one peer with a location) still applies.
     let has_any_location = own_location.is_some() || peers.iter().any(|p| p.location.is_some());
     if !has_any_location {
         return String::new();
     }
 
-    let cx: f64 = 120.0;
-    let cy: f64 = 120.0;
-    let r: f64 = 95.0;
-    let size = 240;
+    // Larger viewBox than the original 240×240 so the inner ring +
+    // labels have room. Use a viewBox-only sizing (no fixed width)
+    // so the SVG scales with the card.
+    let size: f64 = 480.0;
+    let cx: f64 = size / 2.0;
+    let cy: f64 = size / 2.0;
+    let r_outer: f64 = 195.0;
+    let r_inner: f64 = 120.0;
 
     let mut svg = format!(
-        "<div class=\"ring-wrap\"><svg viewBox=\"0 0 {size} {size}\" width=\"{size}\" height=\"{size}\" class=\"ring-svg\">"
+        "<div class=\"ring-wrap\"><svg viewBox=\"0 0 {size:.0} {size:.0}\" class=\"ring-svg\" preserveAspectRatio=\"xMidYMid meet\">"
     );
 
-    // Ring circle
+    // === Background rings ===
     write!(
         svg,
-        "<circle cx=\"{cx}\" cy=\"{cy}\" r=\"{r}\" fill=\"none\" stroke=\"#e0e0e0\" stroke-width=\"2\"/>"
+        "<circle cx=\"{cx}\" cy=\"{cy}\" r=\"{r_outer}\" fill=\"none\" stroke=\"#363c4a\" stroke-width=\"1\"/>"
+    )
+    .ok();
+    write!(
+        svg,
+        "<circle cx=\"{cx}\" cy=\"{cy}\" r=\"{r_inner}\" fill=\"none\" stroke=\"#363c4a\" stroke-width=\"1\"/>"
     )
     .ok();
 
-    // Helper: location (0.0-1.0) to (x, y) on the ring.
+    // Helper: location (0.0..1.0) → (x, y) on a ring of given radius.
     // 0.0 is at the top, increasing clockwise.
-    let loc_to_xy = |loc: f64| -> (f64, f64) {
+    let loc_to_xy = |loc: f64, r: f64| -> (f64, f64) {
         let angle = loc * std::f64::consts::TAU - std::f64::consts::FRAC_PI_2;
         (cx + r * angle.cos(), cy + r * angle.sin())
     };
 
-    // Draw connection lines from own location to each peer
-    if let Some(own_loc) = own_location {
-        let (ox, oy) = loc_to_xy(own_loc);
+    // Curved chord path generator. Quadratic Bezier from (x1,y1) to
+    // (x2,y2) with the control point pulled toward the SVG centre.
+    // `bend_base` is the maximum bend for antipodal points; chord
+    // length scales bend so short hops look flat and long hops arc
+    // through the interior. Matches the nova.locut.us:3133 ring
+    // routing visualization.
+    let curve_path = |x1: f64, y1: f64, x2: f64, y2: f64, bend_base: f64| -> String {
+        let dx = x2 - x1;
+        let dy = y2 - y1;
+        let chord = (dx * dx + dy * dy).sqrt();
+        let ratio = (chord / (2.0 * r_outer)).min(1.0);
+        let bend = bend_base * ratio;
+        let mx = (x1 + x2) / 2.0;
+        let my = (y1 + y2) / 2.0;
+        let pcx = cx + (mx - cx) * (1.0 - bend);
+        let pcy = cy + (my - cy) * (1.0 - bend);
+        format!("M {x1:.1},{y1:.1} Q {pcx:.1},{pcy:.1} {x2:.1},{y2:.1}")
+    };
+
+    // === Ring labels at top ===
+    write!(
+        svg,
+        "<text x=\"{cx}\" y=\"{y:.1}\" text-anchor=\"middle\" fill=\"#6b7280\" font-family=\"monospace\" font-size=\"9\" letter-spacing=\"0.18em\">PEERS</text>",
+        y = cy - r_outer - 8.0,
+    )
+    .ok();
+    write!(
+        svg,
+        "<text x=\"{cx}\" y=\"{y:.1}\" text-anchor=\"middle\" fill=\"#6b7280\" font-family=\"monospace\" font-size=\"9\" letter-spacing=\"0.18em\">CONTRACTS</text>",
+        y = cy - r_inner - 8.0,
+    )
+    .ok();
+
+    let own_xy = own_location.map(|loc| loc_to_xy(loc, r_outer));
+
+    // === Connection curves: YOU → peers ===
+    // Only drawn if we know our own location; otherwise we can't
+    // anchor them. Bezier through the interior so the path looks
+    // like a routing arc, not a chord.
+    if let Some((ox, oy)) = own_xy {
         for p in peers {
             if let Some(ploc) = p.location {
-                let (px, py) = loc_to_xy(ploc);
-                let stroke = if p.is_gateway { "#fbbf24" } else { "#007FFF" };
+                let (px, py) = loc_to_xy(ploc, r_outer);
+                let stroke = if p.is_gateway { "#ffb610" } else { "#66d9ff" };
+                let path = curve_path(ox, oy, px, py, 0.55);
                 write!(
                     svg,
-                    "<line x1=\"{ox:.1}\" y1=\"{oy:.1}\" x2=\"{px:.1}\" y2=\"{py:.1}\" stroke=\"{stroke}\" stroke-width=\"1\" opacity=\"0.4\"/>"
+                    "<path d=\"{path}\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"1\" stroke-opacity=\"0.35\"/>"
                 )
                 .ok();
             }
         }
     }
 
-    // Peer dots — each wrapped in an <a> link to its detail page so the
-    // SVG ring stays in sync with the table rows below it.
+    // === Contract dots (and YOU → flagged-contract curves) ===
+    if let Some(gov) = governance {
+        // Deterministic hash → ring location for placing contracts.
+        // The instance id is a 32-byte content hash; we fold the
+        // string form to a u64 and modulo onto [0, 1). Position is
+        // stable across refreshes (same id → same dot location).
+        let hash_to_loc = |s: &str| -> f64 {
+            use std::collections::hash_map::DefaultHasher;
+            use std::hash::{Hash, Hasher};
+            let mut h = DefaultHasher::new();
+            s.hash(&mut h);
+            (h.finish() % 10_000) as f64 / 10_000.0
+        };
+        for c in &gov.contracts {
+            let loc = hash_to_loc(&c.instance_id);
+            let (kx, ky) = loc_to_xy(loc, r_inner);
+            let (fill, glow) = match c.state {
+                network_status::GovernanceStateSnapshot::Normal => ("#43c178", false),
+                network_status::GovernanceStateSnapshot::Borderline => ("#ffb610", false),
+                network_status::GovernanceStateSnapshot::WouldEvict => ("#ff8a3d", true),
+                network_status::GovernanceStateSnapshot::Evicted => ("#ff667a", true),
+                network_status::GovernanceStateSnapshot::Banned => ("#d33682", true),
+            };
+            // Flagged contracts get a curve from YOU into the inner
+            // ring + a small label of the short instance id. Normal
+            // ones get a dot only — they'd otherwise overwhelm the
+            // visual with curves.
+            let is_flagged = !matches!(c.state, network_status::GovernanceStateSnapshot::Normal);
+            if is_flagged {
+                if let Some((ox, oy)) = own_xy {
+                    let path = curve_path(ox, oy, kx, ky, 0.6);
+                    write!(
+                        svg,
+                        "<path d=\"{path}\" fill=\"none\" stroke=\"{fill}\" stroke-width=\"1.4\" stroke-opacity=\"0.7\"/>"
+                    )
+                    .ok();
+                }
+            }
+            // Use a more distinctive shape for flagged (rect) than
+            // normal (smaller, dimmer dot) so glance-scanning the
+            // ring surfaces flagged contracts first.
+            let size_px = if is_flagged { 6.0 } else { 3.0 };
+            let opacity = if is_flagged { "1.0" } else { "0.55" };
+            let glow_attr = if glow {
+                "filter=\"drop-shadow(0 0 3px currentColor)\""
+            } else {
+                ""
+            };
+            write!(
+                svg,
+                "<rect x=\"{x:.1}\" y=\"{y:.1}\" width=\"{size_px:.1}\" height=\"{size_px:.1}\" fill=\"{fill}\" fill-opacity=\"{opacity}\" {glow_attr}><title>{title}</title></rect>",
+                x = kx - size_px / 2.0,
+                y = ky - size_px / 2.0,
+                title = html_escape(&format!("{} ({:?})", c.instance_id_short, c.state)),
+            )
+            .ok();
+            // Short label next to flagged contracts so the ring view
+            // matches the table without clicking.
+            if is_flagged {
+                let label_loc_r = r_inner - 12.0;
+                let (lx, ly) = loc_to_xy(loc, label_loc_r);
+                write!(
+                    svg,
+                    "<text x=\"{lx:.1}\" y=\"{ly:.1}\" text-anchor=\"middle\" dominant-baseline=\"middle\" fill=\"{fill}\" font-family=\"monospace\" font-size=\"9\" font-weight=\"500\">{label}</text>",
+                    label = html_escape(&c.instance_id_short),
+                )
+                .ok();
+            }
+        }
+    }
+
+    // === Peer dots on the outer ring ===
     for p in peers {
         if let Some(loc) = p.location {
-            let (px, py) = loc_to_xy(loc);
-            let fill = if p.is_gateway { "#fbbf24" } else { "#007FFF" };
+            let (px, py) = loc_to_xy(loc, r_outer);
+            let fill = if p.is_gateway { "#ffb610" } else { "#66d9ff" };
             let kind = if p.is_gateway { "Gateway" } else { "Peer" };
             let addr = p.address.to_string();
             let title = format!("{kind} {addr} (loc {loc:.4})");
             write!(
                 svg,
-                "<a href=\"/peer/{href}\" class=\"ring-peer-link\"><title>{title}</title><circle cx=\"{px:.1}\" cy=\"{py:.1}\" r=\"5\" fill=\"{fill}\"/></a>",
+                "<a href=\"/peer/{href}\" class=\"ring-peer-link\"><title>{title}</title><circle cx=\"{px:.1}\" cy=\"{py:.1}\" r=\"4\" fill=\"{fill}\"/></a>",
                 href = html_escape(&addr),
                 title = html_escape(&title),
             )
@@ -590,29 +728,242 @@ fn build_ring_svg(own_location: Option<f64>, peers: &[network_status::PeerSnapsh
         }
     }
 
-    // Own location (drawn last so it's on top). Not a link — there is no
-    // detail page for the local node.
+    // === YOU marker — drawn last so it sits above everything ===
     if let Some(own_loc) = own_location {
-        let (ox, oy) = loc_to_xy(own_loc);
+        let (ox, oy) = loc_to_xy(own_loc, r_outer);
         write!(
             svg,
-            "<g class=\"ring-self\"><title>You (loc {own_loc:.4})</title><circle cx=\"{ox:.1}\" cy=\"{oy:.1}\" r=\"7\" fill=\"#34d399\" stroke=\"#fff\" stroke-width=\"2\"/></g>"
+            "<g class=\"ring-self\"><title>You (loc {own_loc:.4})</title><circle cx=\"{ox:.1}\" cy=\"{oy:.1}\" r=\"6\" fill=\"#43c178\" stroke=\"#ebecf0\" stroke-width=\"1.5\"/><text x=\"{lx:.1}\" y=\"{ly:.1}\" text-anchor=\"middle\" fill=\"#43c178\" font-family=\"monospace\" font-size=\"9\" font-weight=\"500\" letter-spacing=\"0.05em\">YOU</text></g>",
+            lx = ox,
+            ly = oy + 18.0,
         )
         .ok();
     }
 
     svg.push_str("</svg>");
 
-    // Legend
+    // Legend below the ring.
     svg.push_str(concat!(
         "<div class=\"ring-legend\">",
         "<span class=\"ring-key\"><span class=\"ring-dot ring-dot-self\"></span> You</span>",
         "<span class=\"ring-key\"><span class=\"ring-dot ring-dot-peer\"></span> Peer</span>",
         "<span class=\"ring-key\"><span class=\"ring-dot ring-dot-gw\"></span> Gateway</span>",
+        "<span class=\"ring-key\"><span class=\"ring-dot ring-dot-contract-normal\"></span> Hosted</span>",
+        "<span class=\"ring-key\"><span class=\"ring-dot ring-dot-contract-flagged\"></span> Flagged</span>",
         "</div></div>",
     ));
 
     svg
+}
+
+/// Build the governance card. Reads `snap.governance` (sourced from
+/// `Ring::dashboard_governance_snapshot` → `GovernanceManager`). Every
+/// field rendered here came from the back-end's computation —
+/// nothing is invented at render time.
+///
+/// Layout follows the prototype: verdict block on the left (big
+/// number + headline), mini-strip with network-norms on the right,
+/// then the per-contract table below. The histogram and ring inner-
+/// ring renderings are deliberately separate commits — this commit
+/// proves the data path end-to-end with the simplest visualisations.
+fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {
+    let Some(snap) = snap else {
+        return String::new();
+    };
+    let g = &snap.governance;
+
+    // Empty state: no contracts tracked yet (cold start, or this
+    // build doesn't have the governance manager enabled). Per the
+    // design principle — show nothing rather than show fabricated
+    // data. The "history strip" pattern from the prototype lives
+    // here as a single compact line so the absence reads as
+    // working-correctly rather than missing-panel.
+    if g.contracts.is_empty() {
+        return r#"<div class="card">
+            <h2>Contract Governance</h2>
+            <p class="empty">Not enough contracts observed yet. Governance scoring activates once this node has seen at least 30 contracts and they have had time to accumulate cost/benefit signals.</p>
+        </div>"#.to_string();
+    }
+
+    // Verdict counts. Mirror state-snapshot enum → string.
+    let mut counts = [0u32; 5];
+    for c in &g.contracts {
+        let idx = match c.state {
+            network_status::GovernanceStateSnapshot::Normal => 0,
+            network_status::GovernanceStateSnapshot::Borderline => 1,
+            network_status::GovernanceStateSnapshot::WouldEvict => 2,
+            network_status::GovernanceStateSnapshot::Evicted => 3,
+            network_status::GovernanceStateSnapshot::Banned => 4,
+        };
+        counts[idx] = counts[idx].saturating_add(1);
+    }
+    let borderline = counts[1];
+    let would_evict = counts[2];
+    let evicted = counts[3];
+    let banned = counts[4];
+    let flagged = borderline + would_evict + evicted + banned;
+    let total = g.contracts.len();
+
+    let verdict_class = if flagged == 0 {
+        "verdict-ok"
+    } else {
+        "verdict-alert"
+    };
+    let verdict_main = if flagged == 0 {
+        format!(
+            r#"<div class="verdict-num">✓</div>
+               <div class="verdict-headline">All {total} contracts within normal range</div>"#,
+        )
+    } else {
+        let mut detail_parts: Vec<String> = Vec::new();
+        if would_evict > 0 {
+            detail_parts.push(format!(
+                r#"<span class="sw sw-wouldevict"></span>{would_evict} would be evicted"#
+            ));
+        }
+        if borderline > 0 {
+            detail_parts.push(format!(
+                r#"<span class="sw sw-borderline"></span>{borderline} borderline"#
+            ));
+        }
+        if evicted > 0 {
+            detail_parts.push(format!(
+                r#"<span class="sw sw-evicted"></span>{evicted} evicted"#
+            ));
+        }
+        if banned > 0 {
+            detail_parts.push(format!(
+                r#"<span class="sw sw-banned"></span>{banned} banned"#
+            ));
+        }
+        format!(
+            r#"<div class="verdict-num">{flagged}</div>
+               <div class="verdict-headline">contracts flagged on this node</div>
+               <div class="verdict-detail">{detail}</div>"#,
+            detail = detail_parts.join(" &nbsp;·&nbsp; "),
+        )
+    };
+
+    // Network-norms mini-strip — sourced from the last reaper-tick
+    // result. Empty if no tick has run yet (cold start; sample size
+    // didn't reach min_samples; MAD collapsed).
+    let median_txt = g
+        .norms
+        .median_log_ratio
+        .map(|v| format!("{:.2}", v))
+        .unwrap_or_else(|| "—".to_string());
+    let mad_txt = g
+        .norms
+        .mad
+        .map(|v| format!("{:.2}", v))
+        .unwrap_or_else(|| "—".to_string());
+    let threshold_txt = g
+        .norms
+        .threshold
+        .map(|v| format!("{:.2}", v))
+        .unwrap_or_else(|| "—".to_string());
+    let sample_size_txt = g.norms.sample_size.to_string();
+    let mode_txt = match g.mode {
+        network_status::GovernanceModeSnapshot::Off => "off",
+        network_status::GovernanceModeSnapshot::DryRun => "dry-run",
+        network_status::GovernanceModeSnapshot::Enforce => "enforce",
+    };
+
+    // Per-contract table — flagged-only by default; an "all" link
+    // could come later. Honest principle: this table reflects the
+    // governance manager's `iter_scores()`, nothing else.
+    let mut rows = String::new();
+    let mut shown_count = 0;
+    // Sort: most-flagged first (Banned > Evicted > WouldEvict >
+    // Borderline > Normal), then by highest log-ratio descending so
+    // the worst offenders sit at the top.
+    let mut sorted: Vec<&network_status::ContractGovernanceEntry> = g.contracts.iter().collect();
+    sorted.sort_by(|a, b| {
+        let rank = |s: network_status::GovernanceStateSnapshot| match s {
+            network_status::GovernanceStateSnapshot::Banned => 0,
+            network_status::GovernanceStateSnapshot::Evicted => 1,
+            network_status::GovernanceStateSnapshot::WouldEvict => 2,
+            network_status::GovernanceStateSnapshot::Borderline => 3,
+            network_status::GovernanceStateSnapshot::Normal => 4,
+        };
+        rank(a.state).cmp(&rank(b.state)).then_with(|| {
+            b.log_ratio
+                .partial_cmp(&a.log_ratio)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+    for c in sorted.iter() {
+        // Default: only show flagged contracts. An "all" toggle could
+        // come later; for now keeping the table digestible.
+        if matches!(c.state, network_status::GovernanceStateSnapshot::Normal) {
+            continue;
+        }
+        shown_count += 1;
+        let state_label = match c.state {
+            network_status::GovernanceStateSnapshot::Normal => "normal",
+            network_status::GovernanceStateSnapshot::Borderline => "borderline",
+            network_status::GovernanceStateSnapshot::WouldEvict => "would evict",
+            network_status::GovernanceStateSnapshot::Evicted => "evicted",
+            network_status::GovernanceStateSnapshot::Banned => "banned",
+        };
+        let state_class = match c.state {
+            network_status::GovernanceStateSnapshot::Normal => "g-normal",
+            network_status::GovernanceStateSnapshot::Borderline => "g-borderline",
+            network_status::GovernanceStateSnapshot::WouldEvict => "g-wouldevict",
+            network_status::GovernanceStateSnapshot::Evicted => "g-evicted",
+            network_status::GovernanceStateSnapshot::Banned => "g-banned",
+        };
+        let log_ratio_txt = c
+            .log_ratio
+            .map(|v| format!("{:+.2}", v))
+            .unwrap_or_else(|| "—".to_string());
+        let age = format_ago(c.age_secs);
+        rows.push_str(&format!(
+            r#"<tr><td title="{full}"><code>{short}</code></td><td><span class="g-badge {state_class}">{state_label}</span></td><td class="right">{log_ratio}</td><td class="right">{cost:.2}</td><td class="right">{benefit:.2}</td><td class="right">{age}</td></tr>"#,
+            full = html_escape(&c.instance_id),
+            short = html_escape(&c.instance_id_short),
+            state_class = state_class,
+            state_label = state_label,
+            log_ratio = log_ratio_txt,
+            cost = c.cost_used,
+            benefit = c.benefit_score,
+            age = age,
+        ));
+    }
+    if shown_count == 0 {
+        rows = r#"<tr><td colspan="6" class="empty" style="padding: 0.5rem 0.9rem">All contracts within normal range.</td></tr>"#.to_string();
+    }
+
+    format!(
+        r##"<div class="card">
+            <div class="card-header"><h2>Contract Governance</h2><span class="g-mode g-mode-{mode}">{mode}</span></div>
+            <div class="g-verdict-row">
+                <div class="g-verdict {verdict_class}">{verdict_main}</div>
+                <div class="g-norms">
+                    <div class="g-norm"><div class="g-norm-label">Tracked</div><div class="g-norm-value">{total}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Sample size</div><div class="g-norm-value">{sample_size}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Median log-ratio</div><div class="g-norm-value">{median}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">MAD spread</div><div class="g-norm-value">{mad}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Eviction threshold</div><div class="g-norm-value">{threshold}</div></div>
+                </div>
+            </div>
+            <div class="table-wrap">
+                <table>
+                    <thead><tr><th>Contract</th><th>State</th><th class="right">log-ratio</th><th class="right">Cost</th><th class="right">Benefit</th><th class="right">Age</th></tr></thead>
+                    <tbody>{rows}</tbody>
+                </table>
+            </div>
+        </div>"##,
+        mode = mode_txt,
+        verdict_class = verdict_class,
+        verdict_main = verdict_main,
+        total = total,
+        sample_size = sample_size_txt,
+        median = median_txt,
+        mad = mad_txt,
+        threshold = threshold_txt,
+        rows = rows,
+    )
 }
 
 fn build_contracts_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {
@@ -1199,9 +1550,11 @@ p:last-child { margin-bottom: 0; }
     border-radius: 50%;
     display: inline-block;
 }
-.ring-dot-self { background: #34d399; }
-.ring-dot-peer { background: var(--accent-primary); }
-.ring-dot-gw { background: #fbbf24; }
+.ring-dot-self { background: #43c178; }
+.ring-dot-peer { background: #66d9ff; }
+.ring-dot-gw { background: #ffb610; }
+.ring-dot-contract-normal { background: #43c178; opacity: 0.55; }
+.ring-dot-contract-flagged { background: #ff667a; }
 .theme-btn {
     background: none;
     border: 1px solid var(--border-color);
@@ -1312,6 +1665,128 @@ table.sortable thead th.sort-desc::after { content: "▼"; opacity: 1; color: va
     from { opacity: 0; transform: translateY(8px); }
     to   { opacity: 1; transform: translateY(0); }
 }
+
+/* ── Governance card (Phase 4.5) ───────────────────────────────────── */
+.g-mode {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    padding: 0.15rem 0.5rem;
+    border-radius: 3px;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    margin-left: auto;
+}
+.g-mode-dry-run {
+    background: rgba(255, 182, 16, 0.15);
+    color: #ffb610;
+    border: 1px solid rgba(255, 182, 16, 0.35);
+}
+.g-mode-enforce {
+    background: rgba(255, 102, 122, 0.15);
+    color: #ff667a;
+    border: 1px solid rgba(255, 102, 122, 0.35);
+}
+.g-mode-off {
+    background: rgba(148, 163, 184, 0.15);
+    color: var(--text-secondary);
+    border: 1px solid rgba(148, 163, 184, 0.35);
+}
+
+.g-verdict-row {
+    display: grid;
+    grid-template-columns: minmax(280px, 0.85fr) 2fr;
+    gap: 0.75rem;
+    margin: 0.5rem 0 0.75rem;
+}
+.g-verdict {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-left: 3px solid #ff8a3d;
+    border-radius: 6px;
+    padding: 0.85rem 1rem 0.85rem 1.1rem;
+    display: grid;
+    grid-template-columns: auto 1fr;
+    grid-template-rows: auto auto;
+    column-gap: 1rem;
+    align-items: center;
+}
+.verdict-ok { border-left-color: #43c178; }
+.verdict-alert { border-left-color: #ff8a3d; }
+.g-verdict .verdict-num {
+    grid-row: 1 / 3;
+    font-family: var(--font-mono);
+    font-size: 3.2rem;
+    font-weight: 500;
+    line-height: 0.95;
+    color: #ff8a3d;
+    letter-spacing: -0.04em;
+}
+.verdict-ok .verdict-num { color: #43c178; }
+.g-verdict .verdict-headline {
+    font-size: 0.95rem;
+    font-weight: 500;
+    color: var(--text-primary);
+}
+.g-verdict .verdict-detail {
+    font-family: var(--font-mono);
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+    margin-top: 0.15rem;
+}
+.g-verdict .sw {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    margin-right: 0.3rem;
+    vertical-align: 0.07rem;
+}
+.sw-borderline { background: #ffb610; }
+.sw-wouldevict { background: #ff8a3d; }
+.sw-evicted    { background: #ff667a; }
+.sw-banned     { background: #d33682; }
+
+.g-norms {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 0.5rem;
+}
+.g-norm {
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    border-radius: 5px;
+    padding: 0.55rem 0.75rem;
+}
+.g-norm-label {
+    font-family: var(--font-mono);
+    font-size: 0.66rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+}
+.g-norm-value {
+    font-family: var(--font-mono);
+    font-size: 1rem;
+    font-weight: 500;
+    margin-top: 0.1rem;
+    color: var(--text-primary);
+}
+
+.g-badge {
+    display: inline-block;
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    padding: 0.1rem 0.45rem;
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    font-weight: 500;
+}
+.g-normal     { background: rgba(67,193,120,0.16);  color: #43c178; }
+.g-borderline { background: rgba(255,182,16,0.16);  color: #ffb610; }
+.g-wouldevict { background: rgba(255,138,61,0.18);  color: #ff8a3d; }
+.g-evicted    { background: rgba(255,102,122,0.18); color: #ff667a; }
+.g-banned     { background: rgba(211,54,130,0.18);  color: #d33682; }
 "##;
 
 /// Inline JavaScript for the dark/light mode toggle.
@@ -2803,6 +3278,7 @@ mod tests {
             bytes_uploaded: 0,
             bytes_downloaded: 0,
             health: HealthLevel::Connecting,
+            governance: Default::default(),
         }
     }
 
@@ -3312,7 +3788,7 @@ mod tests {
     #[test]
     fn ring_svg_dots_link_to_peer_pages() {
         let peers = vec![sample_peer("127.0.0.1:31337", 0.25)];
-        let svg = build_ring_svg(Some(0.5), &peers);
+        let svg = build_ring_svg(Some(0.5), &peers, None);
         assert!(
             svg.contains("<a href=\"/peer/127.0.0.1:31337\""),
             "ring peer dot must be wrapped in a link to /peer/{{addr}}, got: {svg}"
@@ -3416,7 +3892,7 @@ mod tests {
         // The local node has no /peer/{addr} page, so the self circle
         // must NOT be wrapped in an <a>, but it should still expose a
         // <title> for parity with the peer dots.
-        let svg = build_ring_svg(Some(0.42), &[]);
+        let svg = build_ring_svg(Some(0.42), &[], None);
         assert!(svg.contains("<svg"), "ring SVG should still render");
         assert!(
             !svg.contains("<a "),
@@ -3448,7 +3924,7 @@ mod tests {
             bytes_received: 0,
         };
         let peer = sample_peer("10.0.0.2:31338", 0.90);
-        let svg = build_ring_svg(Some(0.5), &[gw, peer]);
+        let svg = build_ring_svg(Some(0.5), &[gw, peer], None);
         assert!(
             svg.contains("<title>Gateway 10.0.0.1:31337"),
             "gateway dot title must say 'Gateway', got: {svg}"
@@ -3477,8 +3953,8 @@ mod tests {
             bytes_sent: 0,
             bytes_received: 0,
         };
-        assert!(build_ring_svg(None, &[no_loc_peer]).is_empty());
-        assert!(build_ring_svg(None, &[]).is_empty());
+        assert!(build_ring_svg(None, &[no_loc_peer], None).is_empty());
+        assert!(build_ring_svg(None, &[], None).is_empty());
     }
 
     // ── Sort attribute coverage for both tables ─────────────────────────────
@@ -3670,5 +4146,116 @@ mod tests {
             JS.contains("localStorage") && JS.contains("freenet-update-check"),
             "JS must persist the update check in localStorage under the freenet-update-check key"
         );
+    }
+
+    // ─── Governance card (Phase 4.5) ───────────────────────────────
+
+    use crate::node::network_status::{
+        ContractGovernanceEntry, GovernanceModeSnapshot, GovernanceSnapshot,
+        GovernanceStateSnapshot, NetworkNorms,
+    };
+
+    fn mk_entry(state: GovernanceStateSnapshot, instance_id: &str) -> ContractGovernanceEntry {
+        ContractGovernanceEntry {
+            instance_id: instance_id.to_string(),
+            instance_id_short: instance_id.chars().take(12).collect::<String>(),
+            state,
+            cost_used: 12.5,
+            benefit_score: 1.0,
+            log_ratio: Some(1.1),
+            age_secs: 3600,
+            last_transition_secs_ago: 60,
+            history: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn governance_card_empty_state_when_no_contracts() {
+        let snap = base_snapshot();
+        let html = build_governance_card(&Some(snap));
+        assert!(
+            html.contains("Not enough contracts observed yet"),
+            "empty state should explain why governance has nothing to show — got:\n{html}"
+        );
+        assert!(
+            !html.contains("verdict-alert"),
+            "empty state must not render the alert verdict block"
+        );
+    }
+
+    #[test]
+    fn governance_card_verdict_ok_when_all_normal() {
+        let mut snap = base_snapshot();
+        snap.governance = GovernanceSnapshot {
+            mode: GovernanceModeSnapshot::DryRun,
+            contracts: (0..5)
+                .map(|i| mk_entry(GovernanceStateSnapshot::Normal, &format!("aaa{i}")))
+                .collect(),
+            norms: NetworkNorms::default(),
+        };
+        let html = build_governance_card(&Some(snap));
+        assert!(
+            html.contains("verdict-ok"),
+            "5 normal contracts should produce verdict-ok styling — got:\n{html}"
+        );
+        assert!(
+            html.contains("All 5 contracts within normal range"),
+            "verdict should name the total — got:\n{html}"
+        );
+    }
+
+    #[test]
+    fn governance_card_verdict_alert_with_breakdown_when_flagged() {
+        let mut snap = base_snapshot();
+        snap.governance = GovernanceSnapshot {
+            mode: GovernanceModeSnapshot::DryRun,
+            contracts: vec![
+                mk_entry(GovernanceStateSnapshot::WouldEvict, "abuser1"),
+                mk_entry(GovernanceStateSnapshot::Borderline, "warn1"),
+                mk_entry(GovernanceStateSnapshot::Borderline, "warn2"),
+                mk_entry(GovernanceStateSnapshot::Normal, "ok1"),
+            ],
+            norms: NetworkNorms::default(),
+        };
+        let html = build_governance_card(&Some(snap));
+        assert!(html.contains("verdict-alert"));
+        // Total flagged = 1 + 2 = 3
+        assert!(
+            html.contains(">3<"),
+            "verdict number should be the flagged count — got:\n{html}"
+        );
+        assert!(html.contains("1 would be evicted"));
+        assert!(html.contains("2 borderline"));
+        // Table renders the flagged ones, not the normal one.
+        assert!(html.contains("abuser1"));
+        assert!(html.contains("warn1"));
+        assert!(!html.contains(r#"<code>ok1</code>"#));
+    }
+
+    #[test]
+    fn governance_card_mode_pill_reflects_snapshot_mode() {
+        for (mode, label) in [
+            (GovernanceModeSnapshot::Off, "off"),
+            (GovernanceModeSnapshot::DryRun, "dry-run"),
+            (GovernanceModeSnapshot::Enforce, "enforce"),
+        ] {
+            let mut snap = base_snapshot();
+            snap.governance = GovernanceSnapshot {
+                mode,
+                contracts: vec![mk_entry(GovernanceStateSnapshot::Normal, "ok")],
+                norms: NetworkNorms::default(),
+            };
+            let html = build_governance_card(&Some(snap));
+            assert!(
+                html.contains(&format!(r#"g-mode g-mode-{label}">{label}<"#)),
+                "mode pill should reflect {label} — got:\n{html}"
+            );
+        }
+    }
+
+    #[test]
+    fn governance_card_omits_when_snap_is_none() {
+        let html = build_governance_card(&None);
+        assert!(html.is_empty());
     }
 }

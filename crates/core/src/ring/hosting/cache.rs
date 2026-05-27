@@ -93,6 +93,35 @@ pub struct HostedContract {
     /// re-checked at deletion time to close the re-host race. See
     /// `RecordAccessResult.evicted` and `RuntimePool::remove_contract`.
     pub write_generation: u64,
+    /// When this contract transitioned from "in use" to "no longer in use"
+    /// (last subscriber / client / downstream subscriber went away). `Some`
+    /// means the entry is now a recently-abandoned eviction candidate;
+    /// `None` means the entry has never been abandoned, or has been
+    /// re-accessed since its last abandonment.
+    ///
+    /// The abandonment hook moves the entry to the FRONT of the LRU order
+    /// so that under disk pressure it is evicted before older-but-still-
+    /// active entries. Once past TTL, `evict_over_budget` walks the LRU
+    /// front-first as before — abandoned entries simply sit at the front.
+    /// Refreshing the entry via `record_access` clears this field and
+    /// moves the entry back to the LRU tail.
+    ///
+    /// Idle contracts with no subscribers but recent demand are NOT
+    /// affected: they keep their natural LRU position. Only entries that
+    /// were actively in use and then lost all in-use signals get bumped
+    /// to the priority bucket, since their `last_accessed` would otherwise
+    /// keep them at the LRU tail despite no longer mattering.
+    ///
+    /// The timestamp itself is written but not read by eviction logic
+    /// (eviction priority comes purely from LRU position, which
+    /// `record_abandonment` adjusts as a side effect). It is retained
+    /// for the governance dashboard (PR #4270) so an operator can see
+    /// how long ago a flagged contract was last actively used. A future
+    /// refactor that removes the field can do so only after the
+    /// dashboard reader is also dropped — code-first reviewer of #4260
+    /// flagged this as a "currently write-only" foot-gun worth pinning
+    /// in the rustdoc.
+    pub abandoned_at: Option<Instant>,
 }
 
 /// Unified hosting cache that combines byte-budget LRU with TTL protection.
@@ -245,6 +274,11 @@ impl<T: TimeSource> HostingCache<T> {
             // "I'm hosting this state" assertion, so its captured generation
             // should track the current state-write generation.
             existing.write_generation = write_generation;
+            // A re-access clears the abandoned bucket: the contract is
+            // back in active use, so the priority-eviction marker no
+            // longer applies and the entry returns to the LRU tail
+            // below.
+            existing.abandoned_at = None;
 
             // Move to back of LRU (most recently used)
             self.lru_order.retain(|k| k != &key);
@@ -265,6 +299,7 @@ impl<T: TimeSource> HostingCache<T> {
                 local_client_access: false,
                 local_client_last_access: None,
                 write_generation,
+                abandoned_at: None,
             };
             self.contracts.insert(key, contract);
             self.lru_order.push_back(key);
@@ -319,9 +354,47 @@ impl<T: TimeSource> HostingCache<T> {
     pub fn touch(&mut self, key: &ContractKey) {
         if let Some(existing) = self.contracts.get_mut(key) {
             existing.last_accessed = self.time_source.now();
+            // A fresh touch is evidence of demand — clear any abandoned
+            // marker so the entry leaves the priority-eviction bucket.
+            existing.abandoned_at = None;
             // Move to back of LRU
             self.lru_order.retain(|k| k != key);
             self.lru_order.push_back(*key);
+        }
+    }
+
+    /// Mark `key` as recently abandoned and move it to the front of the
+    /// LRU order so it is the first candidate for eviction under disk
+    /// pressure.
+    ///
+    /// Called by `HostingManager` when a contract transitions from "in
+    /// use" (has subscribers / clients / downstream peers) to "no longer
+    /// in use" — the moment its `contract_in_use` predicate flips from
+    /// `true` to `false`. The TTL gate in `evict_over_budget` still
+    /// applies: an abandoned entry within `min_ttl` of its last access is
+    /// not yet eligible. Once past TTL, abandoned entries are evicted
+    /// before older-but-still-active entries because they now sit at the
+    /// LRU front.
+    ///
+    /// No-op when `key` is absent (already evicted). Idempotent: calling
+    /// it on an already-abandoned entry leaves the existing marker (and
+    /// its earlier timestamp) intact, which is the right behavior — the
+    /// first abandonment is what we want to time from.
+    ///
+    /// Network forgetfulness is explicitly preserved: this method does
+    /// **not** evict the contract or shorten its TTL. It only changes the
+    /// eviction *order* used when the cache is genuinely over budget. A
+    /// contract that's abandoned but no longer than other entries' TTL
+    /// stays cached just like before.
+    pub fn record_abandonment(&mut self, key: &ContractKey) {
+        if let Some(existing) = self.contracts.get_mut(key) {
+            if existing.abandoned_at.is_none() {
+                existing.abandoned_at = Some(self.time_source.now());
+                // Move to FRONT of LRU so the next over-budget walk
+                // evaluates this entry first.
+                self.lru_order.retain(|k| k != key);
+                self.lru_order.push_front(*key);
+            }
         }
     }
 
@@ -460,6 +533,10 @@ impl<T: TimeSource> HostingCache<T> {
             // after restart will cleanly close the race window against
             // any concurrent eviction.
             write_generation: 0,
+            // Persisted entries start un-abandoned; an abandonment
+            // transition would be re-observed by the running node if
+            // subscribers fail to re-attach after restart.
+            abandoned_at: None,
         };
 
         self.contracts.insert(key, contract);
@@ -1008,5 +1085,153 @@ mod tests {
             cache.has_recent_local_client_access(&key, lease),
             "Re-marking should refresh the age gate"
         );
+    }
+
+    // --- Recently-abandoned priority bucket (Phase 1) ---
+
+    #[test]
+    fn test_record_abandonment_moves_entry_to_lru_front() {
+        let (mut cache, _) = make_cache(1000, Duration::from_secs(60));
+        let key1 = make_key(1);
+        let key2 = make_key(2);
+        let key3 = make_key(3);
+
+        cache.record_access(key1, 100, AccessType::Get, 0, |_| false);
+        cache.record_access(key2, 100, AccessType::Get, 0, |_| false);
+        cache.record_access(key3, 100, AccessType::Get, 0, |_| false);
+
+        // Insertion order without abandonment: key1, key2, key3.
+        assert_eq!(cache.keys_lru_order(), vec![key1, key2, key3]);
+
+        // Abandon key3 — the most recently used — and it should jump to
+        // the FRONT so disk-pressure eviction sees it first.
+        cache.record_abandonment(&key3);
+        assert_eq!(cache.keys_lru_order(), vec![key3, key1, key2]);
+
+        let info = cache.get(&key3).unwrap();
+        assert!(
+            info.abandoned_at.is_some(),
+            "Abandonment must record a timestamp"
+        );
+    }
+
+    #[test]
+    fn test_record_abandonment_is_idempotent() {
+        let (mut cache, time) = make_cache(1000, Duration::from_secs(60));
+        let key = make_key(1);
+        cache.record_access(key, 100, AccessType::Get, 0, |_| false);
+
+        cache.record_abandonment(&key);
+        let first = cache.get(&key).unwrap().abandoned_at;
+        assert!(first.is_some());
+
+        time.advance_time(Duration::from_secs(5));
+        cache.record_abandonment(&key);
+        let second = cache.get(&key).unwrap().abandoned_at;
+
+        // First abandonment timestamp wins — we want to time-from the
+        // moment use ended, not from later re-marks.
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn test_record_abandonment_missing_key_is_noop() {
+        let (mut cache, _) = make_cache(1000, Duration::from_secs(60));
+        let key = make_key(42);
+        // Should not panic, should not insert anything.
+        cache.record_abandonment(&key);
+        assert!(!cache.contains(&key));
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn test_record_access_clears_abandoned_marker() {
+        let (mut cache, _) = make_cache(1000, Duration::from_secs(60));
+        let key = make_key(1);
+        cache.record_access(key, 100, AccessType::Get, 0, |_| false);
+        cache.record_abandonment(&key);
+        assert!(cache.get(&key).unwrap().abandoned_at.is_some());
+
+        // Fresh access — a re-subscribe or re-GET — clears the marker
+        // and returns the entry to the LRU tail.
+        cache.record_access(key, 100, AccessType::Get, 0, |_| false);
+        assert!(
+            cache.get(&key).unwrap().abandoned_at.is_none(),
+            "record_access must clear abandoned_at"
+        );
+    }
+
+    #[test]
+    fn test_touch_clears_abandoned_marker() {
+        let (mut cache, _) = make_cache(1000, Duration::from_secs(60));
+        let key = make_key(1);
+        cache.record_access(key, 100, AccessType::Get, 0, |_| false);
+        cache.record_abandonment(&key);
+
+        cache.touch(&key);
+        assert!(
+            cache.get(&key).unwrap().abandoned_at.is_none(),
+            "touch must clear abandoned_at"
+        );
+    }
+
+    #[test]
+    fn test_abandoned_entry_evicted_before_active_under_pressure() {
+        // Two entries, 100 bytes each, budget 200. Adding a third
+        // pushes the cache 100 bytes over budget. Both existing entries
+        // are past TTL. Without the abandonment bump key1 (oldest)
+        // evicts; with the bump key2 (abandoned-and-bumped) evicts
+        // even though key1 is older.
+        let (mut cache, time) = make_cache(200, Duration::from_secs(60));
+        let key1 = make_key(1);
+        let key2 = make_key(2);
+        let key3 = make_key(3);
+
+        cache.record_access(key1, 100, AccessType::Get, 0, |_| false);
+        cache.record_access(key2, 100, AccessType::Get, 0, |_| false);
+
+        // key2 is abandoned (latest in use, just lost its subscribers).
+        cache.record_abandonment(&key2);
+
+        // Both past TTL.
+        time.advance_time(Duration::from_secs(61));
+
+        // Insert key3: now over budget, must evict one. The abandoned
+        // bucket means key2 goes first, even though key1 is the older
+        // entry by `last_accessed`.
+        let result = cache.record_access(key3, 100, AccessType::Get, 0, |_| false);
+        assert!(result.is_new);
+        assert_eq!(
+            result.evicted,
+            vec![(key2, 0)],
+            "abandoned entry must evict first"
+        );
+        assert!(cache.contains(&key1));
+        assert!(!cache.contains(&key2));
+        assert!(cache.contains(&key3));
+    }
+
+    #[test]
+    fn test_idle_persistence_preserved_when_under_pressure() {
+        // Two entries, 100 bytes each, budget 1000. No pressure at all.
+        // Abandoning an entry MUST NOT evict it — the network's
+        // persistence-beyond-active-demand property only yields to
+        // disk pressure, never to abandonment alone.
+        let (mut cache, time) = make_cache(1000, Duration::from_secs(60));
+        let key1 = make_key(1);
+        let key2 = make_key(2);
+
+        cache.record_access(key1, 100, AccessType::Get, 0, |_| false);
+        cache.record_access(key2, 100, AccessType::Get, 0, |_| false);
+
+        cache.record_abandonment(&key2);
+        time.advance_time(Duration::from_secs(3600));
+
+        // No budget pressure → sweep_expired evicts nothing, abandoned
+        // or otherwise.
+        let evicted = cache.sweep_expired(|_| false);
+        assert!(evicted.is_empty(), "no pressure → no eviction");
+        assert!(cache.contains(&key1));
+        assert!(cache.contains(&key2));
     }
 }

@@ -93,6 +93,42 @@ const MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT: usize = 512;
 pub struct AddClientSubscriptionResult {
     /// Whether this was the first client for this contract.
     pub is_first_client: bool,
+    /// Whether this specific `(contract, client_id)` pair was newly
+    /// added (vs. an idempotent repeat call for an already-tracked
+    /// client). Used by the governance scoring layer to gate the
+    /// `ingest_demand` call — without this distinction a client that
+    /// re-subscribes repeatedly would pad the contract's
+    /// `benefit_score` indefinitely. See
+    /// `Ring::add_client_subscription` for the caller-side gating.
+    pub is_new_for_client: bool,
+}
+
+/// Outcome of an `add_downstream_subscriber` call. The variant
+/// distinguishes "the peer was newly added" from "the peer was already
+/// tracked and this call refreshed its lease timestamp" so the
+/// governance scoring layer can gate `ingest_demand` on new-add only.
+/// See `HostingManager::add_downstream_subscriber` for the rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddSubscriberOutcome {
+    /// Peer is now tracked for this contract; was not before.
+    /// Governance treats this as fresh demand evidence.
+    NewAdd,
+    /// Peer was already tracked; this call refreshed the lease
+    /// timestamp. Governance must NOT count this as fresh demand.
+    Renewal,
+    /// Per-contract subscriber cap reached; this is a new peer that
+    /// was rejected. Equivalent to the old `false` return.
+    Rejected,
+}
+
+impl AddSubscriberOutcome {
+    /// True when the peer is now tracked (either newly added or
+    /// renewed). Preserves the pre-Sybil-fix `bool` semantics for
+    /// callers that only care "was the registration accepted".
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn was_accepted(self) -> bool {
+        matches!(self, Self::NewAdd | Self::Renewal)
+    }
 }
 
 /// Result of removing all subscriptions for a disconnected client.
@@ -576,14 +612,23 @@ impl HostingManager {
     ) -> AddClientSubscriptionResult {
         let mut entry = self.client_subscriptions.entry(*instance_id).or_default();
         let is_first_client = entry.is_empty();
-        entry.insert(client_id);
+        // HashSet::insert returns true if the value was newly added.
+        // Capture this so the governance scoring layer can gate
+        // `ingest_demand` to new-adds only — otherwise a client that
+        // repeatedly re-subscribes for the same contract would pad
+        // demand by `LOCAL_DEMAND_WEIGHT × N` per N calls.
+        let is_new_for_client = entry.insert(client_id);
         debug!(
             contract = %instance_id,
             %client_id,
             is_first_client,
+            is_new_for_client,
             "add_client_subscription: registered"
         );
-        AddClientSubscriptionResult { is_first_client }
+        AddClientSubscriptionResult {
+            is_first_client,
+            is_new_for_client,
+        }
     }
 
     /// Remove a client subscription.
@@ -654,6 +699,10 @@ impl HostingManager {
                 .find(|entry| *entry.key().id() == instance_id)
                 .map(|entry| *entry.key());
             if let Some(contract) = contract {
+                // Client disconnect may have just transitioned the contract
+                // to no-longer-in-use. Record abandonment so over-budget
+                // eviction targets it first.
+                self.maybe_record_abandonment(&contract);
                 affected_contracts.push(contract);
             }
         }
@@ -672,20 +721,36 @@ impl HostingManager {
     // =========================================================================
 
     /// Record that a downstream peer is subscribed to a contract we host.
-    /// Returns false if the downstream subscriber limit for this contract has been reached
-    /// and the peer is not already tracked (existing peers can always renew).
-    pub fn add_downstream_subscriber(&self, contract: &ContractKey, peer: PeerKey) -> bool {
+    ///
+    /// Returns `AddSubscriberOutcome` so callers can distinguish a
+    /// genuine NewAdd (counts as fresh demand for governance scoring)
+    /// from a Renewal (lease-extension only — must NOT count as fresh
+    /// demand, otherwise a peer churning subscriptions every 2 minutes
+    /// would pad a contract's `benefit_score` by `0.1 × 30 = 3.0` per
+    /// hour, the Sybil-resistance equivalent of 30 distinct subscribers
+    /// for a single rotating peer). See `Ring::add_downstream_subscriber`
+    /// for the caller-side gating.
+    pub fn add_downstream_subscriber(
+        &self,
+        contract: &ContractKey,
+        peer: PeerKey,
+    ) -> AddSubscriberOutcome {
         let mut entry = self.downstream_subscribers.entry(*contract).or_default();
-        if !entry.contains_key(&peer) && entry.len() >= MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT {
+        let is_new = !entry.contains_key(&peer);
+        if is_new && entry.len() >= MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT {
             tracing::warn!(
                 contract = %contract,
                 limit = MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT,
                 "Downstream subscriber limit reached, rejecting peer"
             );
-            return false;
+            return AddSubscriberOutcome::Rejected;
         }
         entry.insert(peer, self.time_source.now());
-        true
+        if is_new {
+            AddSubscriberOutcome::NewAdd
+        } else {
+            AddSubscriberOutcome::Renewal
+        }
     }
 
     /// Renew a downstream peer's subscription lease.
@@ -713,6 +778,10 @@ impl HostingManager {
             // Remove the map entry if no peers remain
             self.downstream_subscribers
                 .remove_if(contract, |_, peers| peers.is_empty());
+            // If the contract has just transitioned to no-longer-in-use,
+            // mark it as recently abandoned so over-budget eviction
+            // targets it before older-but-still-active entries.
+            self.maybe_record_abandonment(contract);
         }
         removed
     }
@@ -750,6 +819,28 @@ impl HostingManager {
         self.has_client_subscriptions(contract.id()) || self.has_downstream_subscribers(contract)
     }
 
+    /// Hook called from every code path that removes an "in-use" signal
+    /// (client subscription, downstream subscriber, or stale-expiry of
+    /// either). If the contract has just transitioned to no-longer-in-use,
+    /// mark it as recently abandoned in the hosting cache so the next
+    /// over-budget sweep evicts it before older-but-still-active entries.
+    ///
+    /// Idle persistence is preserved: this changes eviction *order*, not
+    /// eviction *eligibility*. A contract with no budget pressure on it
+    /// stays cached regardless.
+    ///
+    /// Lock-order note: `contract_in_use` reads only the subscription
+    /// DashMaps and never touches `hosting_cache`, so calling it from
+    /// here is safe even though we then take the `hosting_cache` write
+    /// lock. Callers must invoke this AFTER any subscription-map guard
+    /// they hold has been dropped (the guard is needed to mutate state,
+    /// not to read `contract_in_use`).
+    fn maybe_record_abandonment(&self, contract: &ContractKey) {
+        if !self.contract_in_use(contract) {
+            self.hosting_cache.write().record_abandonment(contract);
+        }
+    }
+
     /// Remove downstream subscribers whose leases have expired.
     /// Returns each affected contract paired with the number of expired peers.
     pub fn expire_stale_downstream_subscribers(&self) -> Vec<(ContractKey, usize)> {
@@ -763,7 +854,7 @@ impl HostingManager {
             .collect();
 
         for key in keys {
-            if let Some(mut peers) = self.downstream_subscribers.get_mut(&key) {
+            let became_empty = if let Some(mut peers) = self.downstream_subscribers.get_mut(&key) {
                 let before = peers.len();
                 peers.retain(|_, last_renewed| {
                     now.duration_since(*last_renewed) < SUBSCRIPTION_LEASE_DURATION
@@ -772,11 +863,21 @@ impl HostingManager {
                 if expired > 0 {
                     expired_counts.push((key, expired));
                 }
-                if peers.is_empty() {
+                let empty = peers.is_empty();
+                if empty {
                     drop(peers);
                     self.downstream_subscribers
                         .remove_if(&key, |_, peers| peers.is_empty());
                 }
+                empty
+            } else {
+                false
+            };
+            if became_empty {
+                // Lease expiry may have just transitioned the contract to
+                // no-longer-in-use — record abandonment so the next
+                // over-budget sweep targets it first.
+                self.maybe_record_abandonment(&key);
             }
         }
 
@@ -2057,7 +2158,11 @@ mod tests {
         // contract, but we have not called `subscribe()` on our own behalf
         // (we're just forwarding Updates for someone else) and we have no
         // local client expressing interest.
-        assert!(manager.add_downstream_subscriber(&contract, downstream.clone()));
+        assert!(
+            manager
+                .add_downstream_subscriber(&contract, downstream.clone())
+                .was_accepted()
+        );
 
         // Invariant 1: we did not install a self-subscription lease.
         assert!(
@@ -3055,7 +3160,9 @@ mod tests {
                 bytes
             }));
             peers.push(peer.clone());
-            let result = manager.add_downstream_subscriber(&contract, peer);
+            let result = manager
+                .add_downstream_subscriber(&contract, peer)
+                .was_accepted();
             assert!(
                 result,
                 "Downstream subscriber {i} should succeed within limit (count before: {i})"
@@ -3083,10 +3190,50 @@ mod tests {
             .unwrap_or(false);
         assert!(is_new, "Extra peer should not already be in the set");
 
-        let rejected = !manager.add_downstream_subscriber(&contract, extra_peer);
+        let outcome = manager.add_downstream_subscriber(&contract, extra_peer);
+        assert_eq!(
+            outcome,
+            AddSubscriberOutcome::Rejected,
+            "Downstream subscriber beyond limit should return Rejected (count was {actual_count})"
+        );
         assert!(
-            rejected,
-            "Downstream subscriber beyond limit should be rejected (count was {actual_count})"
+            !outcome.was_accepted(),
+            "Rejected must NOT count as accepted"
+        );
+    }
+
+    /// Sybil-resistance pin: `add_downstream_subscriber` MUST distinguish
+    /// a genuine new add from a renewal so the governance scoring layer
+    /// can gate `ingest_demand` on new-add only. Without this distinction,
+    /// a peer renewing every 2 minutes would pad benefit_score by
+    /// `FORWARDED_DEMAND_WEIGHT × 30 = 3.0 per hour` — the equivalent of
+    /// 30 distinct subscribers from one rotating peer.
+    #[test]
+    fn add_downstream_subscriber_distinguishes_new_add_from_renewal() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(2);
+
+        // First call: NewAdd.
+        assert_eq!(
+            manager.add_downstream_subscriber(&contract, peer.clone()),
+            AddSubscriberOutcome::NewAdd,
+            "first registration of a peer must be NewAdd"
+        );
+
+        // Second call with the same peer: Renewal, not NewAdd.
+        assert_eq!(
+            manager.add_downstream_subscriber(&contract, peer.clone()),
+            AddSubscriberOutcome::Renewal,
+            "repeated registration of the same peer must be Renewal — \
+             otherwise the governance demand-ingest gate is bypassed and \
+             a churning peer pads benefit_score indefinitely"
+        );
+
+        // Third call also Renewal — no escalation back to NewAdd.
+        assert_eq!(
+            manager.add_downstream_subscriber(&contract, peer),
+            AddSubscriberOutcome::Renewal,
         );
     }
 
@@ -3109,11 +3256,16 @@ mod tests {
             manager.add_downstream_subscriber(&contract, peer);
         }
 
-        // Existing peer can still renew (re-insert updates the timestamp)
-        assert!(
-            manager.add_downstream_subscriber(&contract, first_peer),
-            "Existing peer should be able to renew at limit"
+        // Existing peer can still renew (re-insert updates the timestamp).
+        // Post-Sybil-fix: this returns Renewal, not NewAdd — pin both
+        // facts so a regression flips the demand-ingest gate the wrong way.
+        let outcome = manager.add_downstream_subscriber(&contract, first_peer);
+        assert_eq!(
+            outcome,
+            AddSubscriberOutcome::Renewal,
+            "Existing peer at limit should return Renewal (not NewAdd or Rejected)"
         );
+        assert!(outcome.was_accepted(), "Renewal must count as accepted");
     }
 
     // =========================================================================
