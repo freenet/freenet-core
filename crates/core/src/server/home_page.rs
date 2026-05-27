@@ -4172,6 +4172,106 @@ mod tests {
         assert!(build_ring_svg(None, &[], None, &[]).is_empty());
     }
 
+    /// Pin: build_ring_svg renders hosted contracts as faint dim
+    /// teal dots on the inner ring (non-flagged ones). Without this
+    /// the inner ring was visually empty in healthy state and made
+    /// the renderer look unfinished.
+    ///
+    /// Rule-review of #4298 caught that the new `hosted_contracts`
+    /// rendering loop was untested — every test site passed `&[]`.
+    /// This test exercises the happy path (at least one dot
+    /// rendered) and the skip-flagged path (a contract present in
+    /// BOTH hosted and flagged sets gets the flagged marker only,
+    /// not a duplicate hosted dot).
+    #[test]
+    fn ring_svg_renders_hosted_contracts_on_inner_ring() {
+        use crate::node::network_status::{
+            ContractGovernanceEntry, ContractSnapshot, GovernanceSnapshot, GovernanceStateSnapshot,
+            NetworkNorms,
+        };
+
+        let hosted = vec![
+            ContractSnapshot {
+                key_short: "HOST1...".to_string(),
+                key_full: "HOST1_with_params".to_string(),
+                instance_id: "HOST1".to_string(),
+                subscribed_secs: 60,
+                last_updated_secs: Some(5),
+            },
+            ContractSnapshot {
+                key_short: "HOST2...".to_string(),
+                key_full: "HOST2_with_params".to_string(),
+                instance_id: "HOST2".to_string(),
+                subscribed_secs: 60,
+                last_updated_secs: Some(5),
+            },
+            // This one is ALSO flagged — should be skipped in the
+            // hosted dim-dot loop to avoid a duplicate marker.
+            ContractSnapshot {
+                key_short: "FLAG1...".to_string(),
+                key_full: "FLAG1_with_params".to_string(),
+                instance_id: "FLAG1".to_string(),
+                subscribed_secs: 60,
+                last_updated_secs: Some(5),
+            },
+        ];
+
+        let governance = GovernanceSnapshot {
+            mode: crate::node::network_status::GovernanceModeSnapshot::DryRun,
+            contracts: vec![ContractGovernanceEntry {
+                instance_id: "FLAG1".to_string(),
+                instance_id_short: "FLAG1".to_string(),
+                state: GovernanceStateSnapshot::WouldEvict,
+                cost_used: 1.0,
+                benefit_score: 1.0,
+                log_ratio: Some(0.0),
+                age_secs: 100,
+                last_transition_secs_ago: 1,
+                history: Vec::new(),
+            }],
+            observed_count: 3,
+            min_samples: 30,
+            norms: NetworkNorms::default(),
+            last_tick_at: None,
+            state_by_id: std::collections::HashMap::new(),
+        };
+
+        let svg = build_ring_svg(Some(0.5), &[], Some(&governance), &hosted);
+
+        // The faint hosted-contract dot uses the brand teal at 0.45
+        // opacity. Pin both attributes so a future refactor that
+        // changes the style triggers the test, AND count the dots so
+        // we know flagged-skipping worked.
+        let hosted_dot_count = svg
+            .matches("fill=\"#43c178\" fill-opacity=\"0.45\"")
+            .count();
+        assert_eq!(
+            hosted_dot_count, 2,
+            "expected exactly 2 hosted-contract dim dots (HOST1, HOST2). \
+             FLAG1 should be skipped because it's already in the flagged set. \
+             Got {hosted_dot_count} hosted dots in SVG:\n{svg}"
+        );
+
+        // FLAG1 must still appear, just via the brighter flagged-
+        // dot rendering (the WouldEvict color, with glow).
+        assert!(
+            svg.contains("#ff8a3d"),
+            "FLAG1 should render with its WouldEvict color regardless of being in hosted set"
+        );
+    }
+
+    /// Pin: when the hosted-contracts slice is empty, the inner ring
+    /// emits no hosted-dot circles. Sanity check that the
+    /// `&[] → no rendering` path still works as before.
+    #[test]
+    fn ring_svg_no_hosted_contracts_means_no_dim_dots() {
+        let svg = build_ring_svg(Some(0.5), &[], None, &[]);
+        assert!(
+            !svg.contains("fill-opacity=\"0.45\""),
+            "empty hosted slice must produce no dim-dot fill-opacity attribute, got:\n{svg}"
+        );
+    }
+
     // ── Sort attribute coverage for both tables ─────────────────────────────
 
     #[test]
