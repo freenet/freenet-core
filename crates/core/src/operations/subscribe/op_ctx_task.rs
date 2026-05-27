@@ -110,19 +110,17 @@ pub(crate) async fn start_client_subscribe(
     // `send_and_await` attempt both inserts (via `handle_op_execution`)
     // and removes (via `release_pending_op_slot`) a `pending_op_results`
     // slot, a stuck task would show up as a widening insert/remove gap.
-    // Admission gate (closes the drain race window): refuse new
-    // SUBSCRIBEs as soon as `ShutdownHandle::shutdown` has begun.
-    if op_manager.is_shutting_down() {
-        return Err(OpError::NodeShuttingDown);
-    }
-    // `inflight_guard` is held for the lifetime of the spawned driver
-    // so `ShutdownHandle::shutdown` can wait for the client-initiated
-    // SUBSCRIBE to finish before tearing down peer connections. See
-    // `ClientOpGuard` rustdoc. (`run_client_subscribe` is also called
-    // inline from PUT's blocking_subscribe path; that caller is
-    // already counted under PUT's guard, so we attach the guard only
-    // at the spawned entry, not inside `run_client_subscribe`.)
-    let inflight_guard = op_manager.client_op_guard();
+    // Atomic admission gate + counter bump (closes the drain race
+    // window). See `OpManager::admit_client_op` for the race
+    // analysis. The guard is held for the lifetime of the spawned
+    // driver. (`run_client_subscribe` is also called inline from
+    // PUT's blocking_subscribe path; that caller is already counted
+    // under PUT's guard, so we attach the guard only at the spawned
+    // entry, not inside `run_client_subscribe`.)
+    let inflight_guard = match op_manager.admit_client_op() {
+        Some(g) => g,
+        None => return Err(OpError::NodeShuttingDown),
+    };
     GlobalExecutor::spawn(async move {
         let _inflight_guard = inflight_guard;
         run_client_subscribe(op_manager, instance_id, client_tx).await;
@@ -1719,9 +1717,15 @@ mod tests {
             .expect("start_client_subscribe must spawn a driver task");
         let before_spawn = &src[entry..entry + after_spawn];
         assert!(
-            before_spawn.contains("op_manager.client_op_guard()"),
-            "start_client_subscribe must call op_manager.client_op_guard() \
-             before GlobalExecutor::spawn (shutdown drain dependency)."
+            before_spawn.contains("op_manager.admit_client_op()"),
+            "start_client_subscribe must call op_manager.admit_client_op() \
+             before GlobalExecutor::spawn (atomic admission gate + \
+             counter bump; closes the Codex r2 TOCTOU)."
+        );
+        assert!(
+            before_spawn.contains("OpError::NodeShuttingDown"),
+            "start_client_subscribe must early-return OpError::NodeShuttingDown \
+             on a refused admission."
         );
         let spawned = &src[entry + after_spawn..];
         let block_end = spawned

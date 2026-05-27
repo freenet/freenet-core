@@ -138,14 +138,15 @@ pub(crate) async fn start_client_get(
     // `BackgroundTaskMonitor`: per-transaction task that terminates via
     // happy path, exhaustion, timeout, or infra error.
     //
-    // Admission gate (closes the drain race window): refuse new
-    // GETs as soon as `ShutdownHandle::shutdown` has begun.
-    if op_manager.is_shutting_down() {
-        return Err(OpError::NodeShuttingDown);
-    }
-    // `inflight_guard` is held for the lifetime of the spawned driver;
-    // see `ClientOpGuard` rustdoc for the shutdown-drain contract.
-    let inflight_guard = op_manager.client_op_guard();
+    // Atomic admission gate + counter bump (closes the drain race
+    // window). See `OpManager::admit_client_op` for the race
+    // analysis. The guard is held for the lifetime of the spawned
+    // driver; see `ClientOpGuard` rustdoc for the broader
+    // shutdown-drain contract.
+    let inflight_guard = match op_manager.admit_client_op() {
+        Some(g) => g,
+        None => return Err(OpError::NodeShuttingDown),
+    };
     GlobalExecutor::spawn(async move {
         let _inflight_guard = inflight_guard;
         run_client_get(
@@ -1096,10 +1097,14 @@ async fn lookup_stored_key(
 
 // --- Peer advance ---
 
-/// Maximum routing rounds before giving up. Matches PUT 3a's
-/// `MAX_RETRIES = 3` and SUBSCRIBE's driver. With typical ring
-/// fan-out of 3–5 peers per k_closest call, 3 rounds covers
-/// 9–15 distinct peers.
+/// Maximum routing rounds before giving up. Matches PUT's
+/// `MAX_PEER_ADVANCEMENTS_NON_STREAMING = 3` and SUBSCRIBE's driver.
+/// With typical ring fan-out of 3–5 peers per k_closest call, 3
+/// rounds covers 9–15 distinct peers. GET kept the legacy
+/// `MAX_RETRIES` name because (a) GETs are never streaming today
+/// (no large-payload class on the wire), so the streaming/non-
+/// streaming split PUT needed doesn't apply, and (b) renaming would
+/// touch unrelated code paths.
 const MAX_RETRIES: usize = 3;
 
 fn advance_to_next_peer(
@@ -2492,9 +2497,15 @@ mod tests {
             .expect("start_client_get must spawn a driver task");
         let before_spawn = &src[entry..entry + after_spawn];
         assert!(
-            before_spawn.contains("op_manager.client_op_guard()"),
-            "start_client_get must call op_manager.client_op_guard() \
-             before GlobalExecutor::spawn (shutdown drain dependency)."
+            before_spawn.contains("op_manager.admit_client_op()"),
+            "start_client_get must call op_manager.admit_client_op() \
+             before GlobalExecutor::spawn (atomic admission gate + \
+             counter bump; closes the Codex r2 TOCTOU)."
+        );
+        assert!(
+            before_spawn.contains("OpError::NodeShuttingDown"),
+            "start_client_get must early-return OpError::NodeShuttingDown \
+             on a refused admission."
         );
         let spawned = &src[entry + after_spawn..];
         let block_end = spawned

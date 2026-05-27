@@ -80,18 +80,21 @@ pub(crate) async fn start_client_put(
     // one task per client PUT request. Client request rate is bounded by
     // the WS connection handler's backpressure.
     // Admission gate (closes the drain race window): refuse new
-    // PUTs as soon as `ShutdownHandle::shutdown` has begun, so a
-    // client request arriving between drain-complete and
-    // Disconnect-send doesn't slip through and get cut off.
-    if op_manager.is_shutting_down() {
-        return Err(OpError::NodeShuttingDown);
-    }
-    // Bump the shutdown-drain counter for the lifetime of the spawned
-    // driver. The guard is held inside the spawned future so that
-    // `ShutdownHandle::shutdown` can wait for client-initiated PUTs to
-    // finish before tearing down peer connections (e.g. release-driven
-    // auto-update interrupting an in-flight `freenet-git` mirror push).
-    let inflight_guard = op_manager.client_op_guard();
+    // PUTs as soon as `ShutdownHandle::shutdown` has begun. Uses
+    // `admit_client_op` for atomic check-AND-bump — the prior
+    // shape (check, then bump) had a TOCTOU window the drain's
+    // `initial == 0` fast-path could skip past. See
+    // `OpManager::admit_client_op` rustdoc for the race analysis.
+    //
+    // The guard returned here is held inside the spawned future so
+    // that `ShutdownHandle::shutdown`'s drain can wait for
+    // client-initiated PUTs to finish before tearing down peer
+    // connections (e.g. release-driven auto-update interrupting an
+    // in-flight `freenet-git` mirror push).
+    let inflight_guard = match op_manager.admit_client_op() {
+        Some(g) => g,
+        None => return Err(OpError::NodeShuttingDown),
+    };
     GlobalExecutor::spawn(async move {
         let _inflight_guard = inflight_guard;
         run_client_put(
@@ -2375,11 +2378,19 @@ mod tests {
             .expect("start_client_put must spawn a driver task");
         let before_spawn = &src[entry..entry + after_spawn];
         assert!(
-            before_spawn.contains("op_manager.client_op_guard()"),
-            "start_client_put must call op_manager.client_op_guard() \
-             before GlobalExecutor::spawn so the shutdown drain knows \
-             this PUT is in flight. Removing the guard re-opens the \
-             release-restart-kills-mirror failure."
+            before_spawn.contains("op_manager.admit_client_op()"),
+            "start_client_put must call op_manager.admit_client_op() \
+             before GlobalExecutor::spawn so (a) the shutdown drain \
+             knows this PUT is in flight and (b) the gate check + \
+             counter bump are atomic. Reverting to a separate \
+             is_shutting_down() check + client_op_guard() bump \
+             re-opens the TOCTOU window (Codex r2 finding)."
+        );
+        assert!(
+            before_spawn.contains("OpError::NodeShuttingDown"),
+            "start_client_put must early-return OpError::NodeShuttingDown \
+             when admit_client_op() refuses. Dropping the early-return \
+             would silently spawn a driver that the Disconnect cuts off."
         );
         let spawned = &src[entry + after_spawn..];
         let block_end = spawned

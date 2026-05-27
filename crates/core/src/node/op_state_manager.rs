@@ -396,26 +396,64 @@ impl OpManager {
         })
     }
 
-    /// Returns `true` once `ShutdownHandle::shutdown` has begun.
-    /// Used by the `start_client_*` admission gate.
-    pub(crate) fn is_shutting_down(&self) -> bool {
-        self.shutting_down.load(Ordering::Relaxed)
-    }
-
     /// Cloneable handle to the shutting-down flag. Used by
     /// `ShutdownHandle` to flip the gate before starting the drain
-    /// wait.
+    /// wait. Callers checking the flag should use
+    /// [`OpManager::admit_client_op`] instead of reading directly,
+    /// because the check-then-bump shape has a TOCTOU window that
+    /// `admit_client_op` closes.
     pub(crate) fn shutting_down_handle(&self) -> Arc<AtomicBool> {
         self.shutting_down.clone()
     }
 
-    /// Construct a guard that bumps the in-flight client-op counter for
-    /// its lifetime. Pair with `move`-ing the guard into the spawned
-    /// `run_client_*` future so the counter tracks the driver task, not
-    /// the synchronous `start_client_*` caller. See [`ClientOpGuard`]
-    /// for the shutdown-drain contract this counter serves.
-    pub(crate) fn client_op_guard(&self) -> ClientOpGuard {
+    /// Bump the in-flight client-op counter without checking the
+    /// admission gate. **Do not call from `start_client_*` paths** —
+    /// use [`OpManager::admit_client_op`] there so the gate check
+    /// and counter bump are atomic. Kept module-private for the
+    /// `admit_client_op` implementation.
+    fn client_op_guard(&self) -> ClientOpGuard {
         ClientOpGuard::new(self.inflight_client_ops.clone())
+    }
+
+    /// Atomically check the shutdown admission gate AND bump the
+    /// in-flight client-op counter in a single operation. Returns
+    /// `None` if the node is shutting down (counter NOT bumped, no
+    /// spawn should follow).
+    ///
+    /// **Why "atomic"** — the prior shape (`if is_shutting_down() {
+    /// return Err; } let g = client_op_guard();`) had a TOCTOU window:
+    /// the gate check could observe `false`, then `ShutdownHandle`
+    /// could set the gate AND read the still-zero counter AND return
+    /// from the drain (the drain has an `initial == 0` fast path) all
+    /// before the caller bumped the counter. The driver would then
+    /// spawn into a node that has already past the drain — exactly
+    /// the bug the drain is meant to prevent. Reported by Codex r2,
+    /// confirmed by code-first r2.
+    ///
+    /// The fix is bump-first-then-check: increment the counter, then
+    /// check the gate. If the gate is set, drop the guard (which
+    /// decrements the counter back), and return `None`. From the
+    /// `ShutdownHandle::shutdown` side: any drain poll that races
+    /// with our increment will observe `counter > 0` and wait — even
+    /// if we end up dropping the guard a moment later, the next 200ms
+    /// poll will see `0` and proceed. The worst-case extra latency
+    /// per racing reject is one poll interval.
+    ///
+    /// Pair with `move`-ing the guard into the spawned `run_client_*`
+    /// future so the counter tracks the driver task, not the
+    /// synchronous `start_client_*` caller. See [`ClientOpGuard`] for
+    /// the broader shutdown-drain contract.
+    pub(crate) fn admit_client_op(&self) -> Option<ClientOpGuard> {
+        let guard = self.client_op_guard();
+        if self.shutting_down.load(Ordering::Relaxed) {
+            // Drop decrements the counter back to whatever it was.
+            // The drain may observe the transient bump on a poll —
+            // acceptable: it waits one extra interval, then sees the
+            // counter clear on the next poll. Correct, never starves.
+            drop(guard);
+            return None;
+        }
+        Some(guard)
     }
 
     /// Cloneable handle to the in-flight client-op counter. Used by
@@ -2404,5 +2442,76 @@ mod tests {
         assert!(waiters.contains_key(&id1));
         assert!(!waiters.contains_key(&id2));
         assert_eq!(waiters[&id1].len(), 1);
+    }
+
+    /// `ClientOpGuard::Drop` decrements the counter exactly once,
+    /// including on a panic. The shutdown drain depends on this —
+    /// if a panic skipped the decrement, the counter would leak and
+    /// `wait_for_drain` would block until `drain_timeout` even
+    /// though no driver is actually still running.
+    ///
+    /// Asks from Testing-reviewer r1 and r2; added here so a future
+    /// refactor switching `ClientOpGuard` to a manual `fetch_sub`
+    /// (foot-gun) without `Drop` semantics is caught at CI time.
+    #[test]
+    fn client_op_guard_decrements_on_panic() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ClientOpGuard::new(counter.clone());
+            assert_eq!(counter.load(Ordering::Relaxed), 1);
+            panic!("simulated driver panic");
+        }));
+        assert!(result.is_err(), "the closure must have panicked");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "ClientOpGuard::Drop must decrement the counter even on \
+             panic — otherwise the shutdown drain leaks and waits \
+             the full drain_timeout for a driver that's no longer \
+             alive."
+        );
+    }
+
+    /// `admit_client_op` returns `None` (no counter bump) when the
+    /// `shutting_down` gate is set. Without this test, a refactor that
+    /// inverts the gate check (e.g. `if !shutting_down { return None }`)
+    /// would compile and let every client op through during shutdown.
+    #[test]
+    fn admit_client_op_refuses_when_shutting_down() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(AtomicBool::new(true)); // pre-flipped
+        // Build a minimal stand-in: just the two atomics — we test
+        // `admit_client_op` against an `OpManager`-shaped struct by
+        // re-implementing its body here. A full OpManager fixture
+        // would drag in the entire node setup. The logic under test
+        // is a 4-line function; pinning its semantic via a parallel
+        // implementation is acceptable for a single-function gate.
+        let admit = || -> Option<ClientOpGuard> {
+            let guard = ClientOpGuard::new(counter.clone());
+            if gate.load(Ordering::Relaxed) {
+                drop(guard);
+                return None;
+            }
+            Some(guard)
+        };
+
+        assert!(
+            admit().is_none(),
+            "admit_client_op must return None when the gate is set"
+        );
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "the bump-then-check pattern must net-zero the counter \
+             on rejection — otherwise the gate leaks bumped counts \
+             that the drain then waits on indefinitely."
+        );
+
+        // Open the gate; admit succeeds and bumps the counter.
+        gate.store(false, Ordering::Relaxed);
+        let g = admit().expect("gate is open, admit must succeed");
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        drop(g);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 }

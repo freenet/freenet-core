@@ -115,16 +115,15 @@ pub(crate) async fn start_client_update(
     // Amplification ceiling: the client_events.rs UPDATE handler allocates
     // one task per client UPDATE request. Client request rate is bounded by
     // the WS connection handler's backpressure.
-    // Admission gate (closes the drain race window): refuse new
-    // UPDATEs as soon as `ShutdownHandle::shutdown` has begun.
-    if op_manager.is_shutting_down() {
-        return Err(OpError::NodeShuttingDown);
-    }
-    // Held by the driver task for its lifetime; bumps the shutdown
-    // drain counter so `ShutdownHandle::shutdown` waits for in-flight
-    // client UPDATEs before tearing down peer connections. See
-    // `ClientOpGuard` rustdoc.
-    let inflight_guard = op_manager.client_op_guard();
+    // Atomic admission gate + counter bump (closes the drain race
+    // window). See `OpManager::admit_client_op` for the race
+    // analysis. The guard is held by the driver task for its
+    // lifetime so `ShutdownHandle::shutdown` waits for in-flight
+    // client UPDATEs before tearing down peer connections.
+    let inflight_guard = match op_manager.admit_client_op() {
+        Some(g) => g,
+        None => return Err(OpError::NodeShuttingDown),
+    };
     GlobalExecutor::spawn(async move {
         let _inflight_guard = inflight_guard;
         run_client_update(op_manager, client_tx, key, update_data, related_contracts).await;
@@ -1880,9 +1879,15 @@ mod tests {
             .expect("start_client_update must spawn a driver task");
         let before_spawn = &src[entry..entry + after_spawn];
         assert!(
-            before_spawn.contains("op_manager.client_op_guard()"),
-            "start_client_update must call op_manager.client_op_guard() \
-             before GlobalExecutor::spawn (shutdown drain dependency)."
+            before_spawn.contains("op_manager.admit_client_op()"),
+            "start_client_update must call op_manager.admit_client_op() \
+             before GlobalExecutor::spawn (atomic admission gate + \
+             counter bump; closes the Codex r2 TOCTOU)."
+        );
+        assert!(
+            before_spawn.contains("OpError::NodeShuttingDown"),
+            "start_client_update must early-return OpError::NodeShuttingDown \
+             on a refused admission."
         );
         let spawned = &src[entry + after_spawn..];
         let block_end = spawned
