@@ -749,6 +749,22 @@ impl ReDb {
         txn.commit().map_err(Into::into)
     }
 
+    /// Remove a persisted broken-invariant flag. Paired with
+    /// `BrokenInvariantsTracker::clear` — without on-disk removal, an
+    /// operator's unflag would be undone on the next restart's
+    /// `set_storage` rehydration.
+    pub fn remove_broken_invariant(
+        &self,
+        instance_id: &ContractInstanceId,
+    ) -> Result<(), redb::Error> {
+        let txn = self.0.begin_write()?;
+        {
+            let mut tbl = txn.open_table(BROKEN_INVARIANTS_TABLE)?;
+            tbl.remove(instance_id.as_ref())?;
+        }
+        txn.commit().map_err(Into::into)
+    }
+
     /// Load all persisted broken-invariant flags. Malformed rows (wrong
     /// key length, wrong value length) are skipped with a warning rather
     /// than failing the entire load — a corrupted entry should not block
@@ -1100,6 +1116,31 @@ mod tests {
         assert_eq!(
             loaded, expected,
             "broken-invariants table must survive close-and-reopen exactly"
+        );
+    }
+
+    /// `remove_broken_invariant` deletes the on-disk row, so a clear()
+    /// in `BrokenInvariantsTracker` followed by a process restart
+    /// genuinely keeps the contract unflagged. Without this, `set_storage`
+    /// would re-hydrate from the stale row and the unflag would be undone.
+    #[tokio::test]
+    async fn broken_invariants_remove_makes_load_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let id = fake_instance_id(0x42);
+
+        {
+            let db = ReDb::new(temp_dir.path()).await.unwrap();
+            db.store_broken_invariant(&id, 0).unwrap();
+            assert_eq!(db.load_all_broken_invariants().unwrap().len(), 1);
+            db.remove_broken_invariant(&id).unwrap();
+            assert!(db.load_all_broken_invariants().unwrap().is_empty());
+        }
+
+        // Round-trip across a close/reopen — the removal must persist.
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+        assert!(
+            db.load_all_broken_invariants().unwrap().is_empty(),
+            "removal must survive a close/reopen"
         );
     }
 

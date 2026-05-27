@@ -129,6 +129,20 @@ impl BrokenInvariantsTracker {
     pub fn clear(&self, id: &ContractInstanceId) -> Option<BrokenInvariant> {
         let previous = self.flags.remove(id).map(|(_, v)| v);
         if previous.is_some() {
+            #[cfg(feature = "redb")]
+            if let Some(storage) = self.storage.get() {
+                if let Err(e) = storage.remove_broken_invariant(id) {
+                    // Best-effort: in-memory is cleared regardless, but
+                    // warn loudly because a stale on-disk row will
+                    // re-flag on next restart.
+                    tracing::warn!(
+                        contract = %id,
+                        error = %e,
+                        "Cleared in-memory broken-invariant flag, but persistence remove failed — \
+                         flag will be re-loaded on next restart"
+                    );
+                }
+            }
             tracing::warn!(
                 contract = %id,
                 event = "broken_invariant_cleared",
@@ -211,6 +225,28 @@ mod tests {
         t.record(broken, BrokenInvariant::NonIdempotent);
         assert!(t.is_broken(&broken));
         assert!(!t.is_broken(&healthy));
+    }
+
+    #[test]
+    fn clear_returns_previous_and_unsets() {
+        let t = BrokenInvariantsTracker::new();
+        let id = fake_id(5);
+
+        // Clearing an absent entry returns None and is a no-op.
+        assert_eq!(t.clear(&id), None);
+
+        t.record(id, BrokenInvariant::NonIdempotent);
+        assert!(t.is_broken(&id));
+
+        let prev = t.clear(&id);
+        assert_eq!(prev, Some(BrokenInvariant::NonIdempotent));
+        assert!(
+            !t.is_broken(&id),
+            "after clear the contract is no longer broken"
+        );
+
+        // Second clear is also a no-op, returns None.
+        assert_eq!(t.clear(&id), None);
     }
 
     #[test]
