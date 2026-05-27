@@ -97,6 +97,12 @@ impl BrokenInvariantsTracker {
                 event = "broken_invariant_detected",
                 "Marking contract as broken — gating outbound broadcast and merge propagation"
             );
+            // Persistence is currently only wired for the redb backend;
+            // sqlite-only builds keep the in-memory flag but skip the
+            // on-disk hydration. This is the same trade-off
+            // `HostingManager` makes — see #4279 deferred follow-up to
+            // add sqlite parity.
+            #[cfg(feature = "redb")]
             if let Some(storage) = self.storage.get() {
                 if let Err(e) = storage.store_broken_invariant(&id, kind.to_byte()) {
                     tracing::warn!(
@@ -109,6 +115,29 @@ impl BrokenInvariantsTracker {
         }
     }
 
+    /// Remove the broken-invariant flag for `id`. Use with extreme care:
+    /// this is the operator escape hatch for the rare case where the
+    /// probe was a false positive (most plausibly a probe trap that
+    /// shouldn't have been observed at all — see
+    /// `Executor::maybe_probe_idempotency`). Re-enables outbound
+    /// broadcast and commit for the contract. Does not unflag remotely.
+    ///
+    /// Not currently exposed to a CLI / WS API by this PR — added so the
+    /// debug-CLI follow-up has a stable surface to call into. Returns
+    /// the previous flag if any.
+    #[allow(dead_code)] // wired in follow-up PR
+    pub fn clear(&self, id: &ContractInstanceId) -> Option<BrokenInvariant> {
+        let previous = self.flags.remove(id).map(|(_, v)| v);
+        if previous.is_some() {
+            tracing::warn!(
+                contract = %id,
+                event = "broken_invariant_cleared",
+                "Operator cleared broken-invariant flag — outbound broadcast re-enabled"
+            );
+        }
+        previous
+    }
+
     /// Wire persistent storage. Called once at startup; idempotent on the
     /// `OnceLock` so callers cannot accidentally re-init with a different
     /// database. Hydrates the in-memory map from previously-persisted
@@ -118,6 +147,7 @@ impl BrokenInvariantsTracker {
             tracing::warn!("BrokenInvariantsTracker storage already set; ignoring re-init");
             return;
         }
+        #[cfg(feature = "redb")]
         match storage.load_all_broken_invariants() {
             Ok(entries) => {
                 for (id, byte) in entries {
