@@ -1,8 +1,9 @@
-//! Tests for the per-contract non-idempotency detector and the broken-
-//! invariants gate. See `crate::ring::broken_invariants` and
-//! `Executor::maybe_probe_idempotency` in `contract/executor/runtime.rs`.
+//! Tests for the per-contract non-idempotency *fixture*. See
+//! `crate::ring::broken_invariants` (tracker-level unit tests) and
+//! `Executor::maybe_probe_idempotency` in `contract/executor/runtime.rs`
+//! for the detector + gate code itself.
 //!
-//! These exercise two layers without spinning up a full network:
+//! ## What these tests cover
 //!
 //! 1. **Fixture self-check** — the `UpdateOverride::NonIdempotent` mock
 //!    actually models the smoking-gun behavior the detector is built to
@@ -10,10 +11,22 @@
 //!    A regression that flattens the fixture into a no-op would silently
 //!    pass the production detector while testing nothing.
 //!
-//! 2. **Gate behavior** — once a contract has been marked broken via
-//!    `Ring::record_broken_invariant`, `Ring::is_contract_broken` returns
-//!    true; the production gate code in `commit_state_update` /
-//!    `broadcast_state_change` reads this exact predicate.
+//! 2. **Healthy baseline** — the default mock IS idempotent on re-apply,
+//!    so the property the probe checks doesn't false-positive on
+//!    well-behaved contracts.
+//!
+//! ## What these tests do NOT cover (deferred)
+//!
+//! End-to-end "probe fires inside the executor, sets the flag via
+//! `Ring::record_broken_invariant`, and the next merge / broadcast is
+//! suppressed by the `is_contract_broken` gate in `commit_state_update`
+//! and `broadcast_state_change`" is **NOT** exercised here — the mock
+//! executor path (`Executor::new_mock_wasm`) doesn't wire a real
+//! `OpManager`, so `op_manager.ring.is_contract_broken(...)` from inside
+//! the executor is a no-op against an absent ring. The tracker layer
+//! (record → is_broken) is covered in `ring::broken_invariants::tests`.
+//! Full integration coverage requires a `SimNetwork`-shaped harness and
+//! is filed as a follow-up to #4279.
 
 use freenet_stdlib::prelude::*;
 
@@ -83,6 +96,42 @@ fn fixture_non_idempotent_override_produces_distinct_states() {
         s2.as_ref().len(),
         "Both outputs should stay the same size (fixed-shape state, \
          matching the 464-byte production observation)."
+    );
+}
+
+/// Source-grep pin: the three production gate sites in `runtime.rs`
+/// (`commit_state_update` top-gate, `broadcast_state_change` gate, and
+/// `bridged_upsert_contract_state` merge-suppression after probe) all
+/// MUST consult `op_manager.ring.is_contract_broken(...)`. A regression
+/// that removes or inverts any of these checks silently re-enables the
+/// broadcast storm — this test would fail compile-time-style on string
+/// match in CI before the gap reaches production.
+#[test]
+fn production_gate_sites_consult_is_contract_broken() {
+    // Read the full source file at compile time. `include_str!` is
+    // resolved relative to the file containing this macro — these tests
+    // live at `crates/core/src/contract/executor/pool_tests/` so we
+    // climb one level to reach the production file.
+    const RUNTIME_SRC: &str = include_str!("../runtime.rs");
+
+    // Truncate before the test module so we only grep production code.
+    // The runtime file currently has no `#[cfg(test)]` mod, so this is
+    // a no-op today, but future-proofs against a sibling test asserting
+    // the same substring.
+    let production = RUNTIME_SRC
+        .split_once("#[cfg(test)]")
+        .map(|(prod, _)| prod)
+        .unwrap_or(RUNTIME_SRC);
+
+    let occurrences = production.matches("is_contract_broken").count();
+    assert!(
+        occurrences >= 3,
+        "expected at least 3 `is_contract_broken` checks in production \
+         runtime.rs (commit_state_update top-gate, broadcast_state_change \
+         gate, and bridged_upsert_contract_state post-probe merge \
+         suppression); found {occurrences}. A regression that removed or \
+         inverted any of these silently re-enables the storm we're \
+         defending against — see PR #4279."
     );
 }
 
