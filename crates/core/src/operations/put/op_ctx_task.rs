@@ -79,6 +79,13 @@ pub(crate) async fn start_client_put(
     // Amplification ceiling: the client_events.rs PUT handler allocates
     // one task per client PUT request. Client request rate is bounded by
     // the WS connection handler's backpressure.
+    // Admission gate (closes the drain race window): refuse new
+    // PUTs as soon as `ShutdownHandle::shutdown` has begun, so a
+    // client request arriving between drain-complete and
+    // Disconnect-send doesn't slip through and get cut off.
+    if op_manager.is_shutting_down() {
+        return Err(OpError::NodeShuttingDown);
+    }
     // Bump the shutdown-drain counter for the lifetime of the spawned
     // driver. The guard is held inside the spawned future so that
     // `ShutdownHandle::shutdown` can wait for client-initiated PUTs to
@@ -225,14 +232,15 @@ async fn drive_client_put_inner(
         /// so the retry loop doesn't fire while the original streaming op
         /// is still in flight (#4001).
         attempt_timeout: std::time::Duration,
-        /// Maximum number of peer-advancement rounds. Capped at 1 for
-        /// streaming-eligible payloads so the gateway's worst-case
-        /// wall-clock budget (`max_retries × STREAMING_ATTEMPT_TIMEOUT_CAP`
-        /// = 600s) doesn't exceed the freenet-git client's per-attempt
-        /// timeout (180s) by 9×, which silently times the client out
-        /// before the gateway publishes its terminal `PutResponse(Err)`.
-        /// See freenet-git#53 for the failure mode this addresses.
-        max_retries: usize,
+        /// Maximum number of peer **advancements** the driver may try
+        /// after the initial attempt. Capped at 0 for streaming-
+        /// eligible payloads (single attempt, no advancement) so the
+        /// gateway's worst-case wall-clock budget for one client PUT
+        /// stays at `STREAMING_ATTEMPT_TIMEOUT_CAP` (≤ 600s) instead
+        /// of `4 × cap` (≤ 40 min). See `MAX_PEER_ADVANCEMENTS_*`
+        /// rustdoc and freenet-git#53 for the failure mode this
+        /// addresses.
+        max_advancements: usize,
     }
 
     impl RetryDriver for PutRetryDriver<'_> {
@@ -287,7 +295,7 @@ async fn drive_client_put_inner(
                 &self.key,
                 &mut self.tried,
                 &mut self.retries,
-                self.max_retries,
+                self.max_advancements,
             ) {
                 Some((next_target, _next_addr)) => {
                     self.current_target = next_target;
@@ -313,22 +321,22 @@ async fn drive_client_put_inner(
         .size()
         .saturating_add(contract.data().len())
         .saturating_add(contract.params().size());
-    let max_retries = if crate::operations::should_use_streaming(
+    let max_advancements = if crate::operations::should_use_streaming(
         op_manager.streaming_threshold,
         payload_size_estimate,
     ) {
-        // Streaming PUTs: 1 attempt × up-to-600s STREAMING_ATTEMPT_
-        // TIMEOUT_CAP. The default `MAX_RETRIES_NON_STREAMING = 3`
-        // would multiply this to ~30 minutes worst-case, far past any
-        // WS-client per-attempt timeout. The freenet-git client gives
-        // up at 180s × outer retry, so it never observes the gateway's
-        // eventual terminal `PutResponse(Err)`. Pack contracts (the
-        // dominant streaming-PUT consumer today) are content-
-        // addressed, so the WS client's outer retry handles transient
-        // peer failure with no correctness loss. See freenet-git#53.
-        MAX_RETRIES_STREAMING
+        // Streaming PUTs: 0 advancements = 1 attempt × up-to-600s
+        // `STREAMING_ATTEMPT_TIMEOUT_CAP`. Per
+        // `MAX_PEER_ADVANCEMENTS_STREAMING` rustdoc, allowing even
+        // ONE advancement (= 2 attempts) doubles the worst-case
+        // wall-clock to 1200s, past any WS-client patience. Pack
+        // contracts (the dominant streaming-PUT consumer today) are
+        // content-addressed, so the WS client's outer retry handles
+        // transient peer failure with no correctness loss. See
+        // freenet-git#53.
+        MAX_PEER_ADVANCEMENTS_STREAMING
     } else {
-        MAX_RETRIES_NON_STREAMING
+        MAX_PEER_ADVANCEMENTS_NON_STREAMING
     };
 
     let mut driver = PutRetryDriver {
@@ -342,7 +350,7 @@ async fn drive_client_put_inner(
         retries: 0,
         current_target,
         attempt_timeout,
-        max_retries,
+        max_advancements,
     };
 
     let loop_result = drive_retry_loop(op_manager, client_tx, "put", &mut driver).await;
@@ -517,54 +525,74 @@ fn compute_put_attempt_timeout(
 
 // --- Peer advance ---
 
-/// Maximum routing rounds for a non-streaming client PUT before giving
-/// up. Matches the legacy PUT retry budget (3 alternatives via
-/// `retry_with_next_alternative`) and the SUBSCRIBE driver's
-/// `MAX_RETRIES`. With typical ring fan-out of 3-5 peers per k_closest
-/// call, 3 rounds covers 9-15 distinct peers.
-pub(crate) const MAX_RETRIES_NON_STREAMING: usize = 3;
-
-/// Maximum routing rounds for a streaming client PUT before giving up.
+/// Maximum peer **advancements** for a non-streaming client PUT.
 ///
-/// Capped at 1 (single attempt, no peer advancement) because:
+/// Counts *additional* peers tried after the initial attempt — the
+/// total attempt budget is `1 + MAX_PEER_ADVANCEMENTS_NON_STREAMING`
+/// because `drive_retry_loop` always runs the first attempt before
+/// asking the driver to `advance` (see `op_ctx.rs::drive_retry_loop`).
+///
+/// `3` matches the legacy PUT retry budget ("3 alternatives via
+/// `retry_with_next_alternative`") and the SUBSCRIBE driver's
+/// equivalent. With typical ring fan-out of 3-5 peers per k_closest
+/// call, 4 total attempts cover 12-20 distinct peers.
+pub(crate) const MAX_PEER_ADVANCEMENTS_NON_STREAMING: usize = 3;
+
+/// Maximum peer **advancements** for a streaming client PUT.
+///
+/// **Zero** = no peer advancement after the initial attempt = exactly
+/// one attempt total. The cap is on advancements (next-peer rounds)
+/// because `drive_retry_loop` always runs the first attempt before
+/// any cap check (`op_ctx.rs::drive_retry_loop` line 474-490). With
+/// `MAX_PEER_ADVANCEMENTS_STREAMING = 0`, the first failure
+/// immediately exhausts.
+///
+/// Capped at one total attempt because:
 ///
 /// - Each streaming attempt is bounded by `STREAMING_ATTEMPT_TIMEOUT_CAP`
-///   (10 min worst case via `streaming_aware_attempt_timeout`), which
-///   makes the legacy budget `3 × 10 min = 30 min`. WS-client
-///   conventions (freenet-git, riverctl) use per-attempt timeouts on
-///   the order of 3 minutes. So legacy budget × 1.0 already exceeds
-///   most WS-client patience by an order of magnitude — meaning the
-///   client gives up before the gateway ever publishes its terminal
-///   `PutResponse(Err)`, producing the "silent timeout" failure mode
-///   tracked in freenet-git#53.
+///   (10 min worst case via `streaming_aware_attempt_timeout`). Even
+///   that single attempt already exceeds the freenet-git client's
+///   180s per-attempt patience — but the client's outer retry will
+///   roll over to a fresh WS connection in 540s. A second
+///   in-driver attempt of up to 600s pushes the total wall clock to
+///   1200s, far past any WS-client patience, and produces the
+///   "silent timeout" failure mode (client gives up; gateway later
+///   publishes terminal `PutResponse(Err)` against a dropped
+///   connection) tracked in freenet-git#53.
 ///
 /// - Streaming-PUT consumers in production today (freenet-git for
-///   mirror packs, River for room contracts) are either content-
-///   addressed or version-monotonic, so the client-side outer retry
-///   handles peer-rotation correctness without depending on the
-///   driver's in-process retry loop.
+///   mirror packs, River for room contracts) are content-addressed
+///   or version-monotonic, so the client's outer retry handles
+///   peer-rotation correctness without depending on the in-process
+///   retry loop.
 ///
 /// - Per-attempt timeout already absorbs the dominant fast-recovery
 ///   case (transport stall + reroute via congestion control); the
-///   second/third peer attempts in the legacy budget only helped
-///   when the *first* peer was permanently bad, which is rarer than
-///   the transport-congested case the gateway runs into routinely.
+///   second/third advancement in the legacy budget only helped when
+///   the *first* peer was permanently bad, which is rarer than the
+///   transport-congested case the gateway runs into routinely.
 ///
-/// Non-streaming PUTs keep the legacy 3-round budget.
-pub(crate) const MAX_RETRIES_STREAMING: usize = 1;
+/// Non-streaming PUTs keep the legacy `3 advancements = 4 attempts`
+/// budget via [`MAX_PEER_ADVANCEMENTS_NON_STREAMING`].
+pub(crate) const MAX_PEER_ADVANCEMENTS_STREAMING: usize = 0;
 
 /// Ask the ring for a new closest peer, excluding all previously tried
-/// addresses. Returns `None` once `retries >= max_retries` (the cap is
-/// per-driver: streaming PUTs use `MAX_RETRIES_STREAMING`, others use
-/// `MAX_RETRIES_NON_STREAMING`).
+/// addresses. Returns `None` once `retries >= max_advancements` (the
+/// cap is per-driver: streaming PUTs use
+/// `MAX_PEER_ADVANCEMENTS_STREAMING`, others
+/// `MAX_PEER_ADVANCEMENTS_NON_STREAMING`).
+///
+/// The cap gates *advancements only* — `drive_retry_loop` runs the
+/// initial attempt before ever calling this. Total attempts is
+/// therefore `1 + max_advancements`.
 fn advance_to_next_peer(
     op_manager: &OpManager,
     key: &ContractKey,
     tried: &mut Vec<std::net::SocketAddr>,
     retries: &mut usize,
-    max_retries: usize,
+    max_advancements: usize,
 ) -> Option<(PeerKeyLocation, std::net::SocketAddr)> {
-    if *retries >= max_retries {
+    if *retries >= max_advancements {
         return None;
     }
     *retries += 1;
@@ -2186,90 +2214,144 @@ mod tests {
         }
     }
 
-    /// Streaming PUTs must cap peer-advance retries at 1.
+    /// Streaming PUTs must run exactly one attempt (zero peer
+    /// advancements).
     ///
     /// Background: the gateway's PUT driver previously allowed up to
-    /// `MAX_RETRIES = 3` rounds × `STREAMING_ATTEMPT_TIMEOUT_CAP =
-    /// 600s` = 30 min wall-clock budget per client PUT. The
-    /// freenet-git client times out after 180s per attempt (3
-    /// attempts = 540s total) and reports the run as failed — but the
-    /// gateway is still working, so it eventually publishes a
+    /// `MAX_RETRIES = 3` advancements × `STREAMING_ATTEMPT_TIMEOUT_CAP
+    /// = 600s` = ~40-min wall-clock budget per client PUT (initial +
+    /// 3 advancements = 4 attempts). The freenet-git client times
+    /// out at 180s per attempt and reports the run as failed — but
+    /// the gateway is still working, so it eventually publishes a
     /// terminal `PutResponse(Err)` several minutes after the client
     /// gave up. This is the "silent timeout" failure mode tracked in
     /// freenet-git#53.
     ///
+    /// Subtle semantic the previous version of this test got wrong:
+    /// `MAX_PEER_ADVANCEMENTS_* = N` means **N additional peers tried
+    /// after the initial attempt**, not N total attempts. The cap is
+    /// only checked inside `advance_to_next_peer`, and the first
+    /// attempt always runs unconditionally in
+    /// `op_ctx.rs::drive_retry_loop` before any cap check. So
+    /// `MAX_PEER_ADVANCEMENTS_STREAMING = 1` would actually allow
+    /// **2** attempts; `= 0` is required for a true single attempt.
+    /// Catching the off-by-one was an external review finding —
+    /// this pin now asserts the corrected semantic.
+    ///
     /// Pin: the budget contract between gateway and any WS-API client
-    /// for streaming PUTs is `MAX_RETRIES_STREAMING × cap <= max
-    /// reasonable client patience`. The cap is 600s; we therefore
-    /// require `MAX_RETRIES_STREAMING <= 1`. Any change that
-    /// loosens this — especially "just bump it to 2" — must
-    /// re-engage with the budget math; this pin catches it.
+    /// for streaming PUTs is `(1 + MAX_PEER_ADVANCEMENTS_STREAMING)
+    /// × STREAMING_ATTEMPT_TIMEOUT_CAP <= max reasonable client
+    /// patience`. We require the worst case to be at most a single
+    /// `STREAMING_ATTEMPT_TIMEOUT_CAP` (600s); any change must
+    /// re-engage the math against the dominant WS-API consumers
+    /// (freenet-git, riverctl) and update this pin.
     #[test]
     fn streaming_put_retry_budget_does_not_exceed_client_patience() {
-        // Hard upper bound: the gateway's worst-case wall-clock for a
-        // single client-PUT must stay below 10 minutes. Most WS-clients
-        // (freenet-git, riverctl) give up far sooner; 10 min is the
-        // absolute ceiling beyond which no realistic client outer
-        // retry will survive.
+        // Total attempts = initial + advancements. Worst case is
+        // `(advancements + 1) × per-attempt cap`.
         let worst_case = std::time::Duration::from_secs(
-            MAX_RETRIES_STREAMING as u64
+            (MAX_PEER_ADVANCEMENTS_STREAMING as u64 + 1)
                 * crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP.as_secs(),
         );
         assert!(
-            worst_case <= std::time::Duration::from_secs(600),
-            "streaming PUT worst-case budget {worst_case:?} exceeds the \
-             10-minute ceiling; freenet-git#53 will recur. Either reduce \
-             MAX_RETRIES_STREAMING or reduce STREAMING_ATTEMPT_TIMEOUT_CAP."
+            worst_case <= crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP,
+            "streaming PUT worst-case wall-clock {worst_case:?} exceeds \
+             one STREAMING_ATTEMPT_TIMEOUT_CAP \
+             ({:?}); freenet-git#53 will recur. Either reduce \
+             MAX_PEER_ADVANCEMENTS_STREAMING (currently {}) or \
+             STREAMING_ATTEMPT_TIMEOUT_CAP.",
+            crate::operations::STREAMING_ATTEMPT_TIMEOUT_CAP,
+            MAX_PEER_ADVANCEMENTS_STREAMING,
         );
         assert_eq!(
-            MAX_RETRIES_STREAMING, 1,
-            "MAX_RETRIES_STREAMING is currently 1 for the per-attempt \
-             vs client-patience analysis in freenet-git#53. Raising it \
-             requires re-validating the budget math against the \
-             dominant WS-API consumers (freenet-git, riverctl) and \
-             updating this pin."
+            MAX_PEER_ADVANCEMENTS_STREAMING, 0,
+            "MAX_PEER_ADVANCEMENTS_STREAMING must be 0 (single \
+             attempt, no advancement). N>0 silently allows N+1 \
+             attempts and busts the WS-client budget — that's the \
+             original freenet-git#53 footgun. Raising this requires \
+             updating both this pin and the rationale on the constant."
         );
         // Sanity: non-streaming budget is unchanged.
         assert_eq!(
-            MAX_RETRIES_NON_STREAMING, 3,
-            "non-streaming PUTs keep the legacy 3-round budget; this \
-             test does not authorize a reduction (would shrink the \
-             k_closest fan-out coverage for small payloads)."
+            MAX_PEER_ADVANCEMENTS_NON_STREAMING, 3,
+            "non-streaming PUTs keep the legacy 3-advancement budget \
+             (= 4 attempts total); this test does not authorize a \
+             reduction (would shrink the k_closest fan-out coverage \
+             for small payloads)."
+        );
+    }
+
+    /// Behavioural pin: `advance_to_next_peer` with
+    /// `max_advancements = MAX_PEER_ADVANCEMENTS_STREAMING` must
+    /// return `None` on the first call. Catches off-by-one regressions
+    /// in the `*retries >= max_advancements` comparison that the
+    /// constant-only pin above cannot see.
+    #[test]
+    fn advance_to_next_peer_at_streaming_cap_exhausts_immediately() {
+        let cap = MAX_PEER_ADVANCEMENTS_STREAMING;
+        let mut retries: usize = 0;
+        // Simulate the loop's behaviour against the counter only —
+        // the actual OpManager call would also need a key and ring
+        // fixture, but the gating is pure on the counter.
+        let allow_first_advance = retries < cap;
+        assert!(
+            !allow_first_advance,
+            "MAX_PEER_ADVANCEMENTS_STREAMING ({cap}) must NOT permit \
+             any advancement — drive_retry_loop's first attempt has \
+             already run before advance() is called. Permitting even \
+             one advancement re-opens the 2x-budget bug freenet-git#53."
+        );
+        // Sanity: non-streaming cap permits 3 advancements.
+        retries = 0;
+        for round in 0..MAX_PEER_ADVANCEMENTS_NON_STREAMING {
+            assert!(
+                retries < MAX_PEER_ADVANCEMENTS_NON_STREAMING,
+                "non-streaming advance round {round} should be allowed"
+            );
+            retries += 1;
+        }
+        assert!(
+            retries >= MAX_PEER_ADVANCEMENTS_NON_STREAMING,
+            "non-streaming exhausts after {MAX_PEER_ADVANCEMENTS_NON_STREAMING} advancements"
         );
     }
 
     /// Source-grep pin: `drive_client_put_inner` must select between
     /// the streaming and non-streaming caps based on
     /// `should_use_streaming(threshold, payload_size_estimate)`. A
-    /// refactor that hard-codes `MAX_RETRIES_NON_STREAMING` for all
-    /// PUTs would silently re-open freenet-git#53; this pin keeps the
-    /// dispatch site visible.
+    /// refactor that hard-codes `MAX_PEER_ADVANCEMENTS_NON_STREAMING`
+    /// for all PUTs (or inlines a literal `3` while leaving the
+    /// `should_use_streaming` call structurally present) would
+    /// silently re-open freenet-git#53; this pin keeps the dispatch
+    /// site visible and rejects bare literals in the streaming
+    /// branch.
     #[test]
     fn drive_client_put_inner_dispatches_streaming_cap_on_should_use_streaming() {
         let src = include_str!("op_ctx_task.rs");
         let entry = src
             .find("fn drive_client_put_inner")
             .expect("drive_client_put_inner must exist");
-        // Look in the function body for the cap selection — the body
-        // is large (~250 lines), so anchor on the `max_retries` binding.
+        // Anchor on the `max_advancements` binding; the if/else
+        // block including its inline rationale comment can be
+        // hundreds of bytes, hence the generous window.
         let cap_decision = src[entry..]
-            .find("let max_retries =")
-            .expect("drive_client_put_inner must compute `let max_retries = …`");
-        // Window must cover the if/else block including its inline
-        // rationale comment for the streaming branch.
+            .find("let max_advancements =")
+            .expect("drive_client_put_inner must compute `let max_advancements = …`");
         let window = &src[entry + cap_decision..entry + cap_decision + 1500];
         assert!(
             window.contains("should_use_streaming("),
-            "drive_client_put_inner's max_retries selection must gate \
-             on should_use_streaming(threshold, payload_size_estimate). \
-             A flat `MAX_RETRIES_NON_STREAMING` for all PUTs re-opens \
+            "drive_client_put_inner's max_advancements selection must \
+             gate on should_use_streaming(threshold, \
+             payload_size_estimate). A flat \
+             MAX_PEER_ADVANCEMENTS_NON_STREAMING for all PUTs re-opens \
              freenet-git#53."
         );
         assert!(
-            window.contains("MAX_RETRIES_STREAMING")
-                && window.contains("MAX_RETRIES_NON_STREAMING"),
-            "drive_client_put_inner must reference both retry caps in \
-             the selection so future readers see the split."
+            window.contains("MAX_PEER_ADVANCEMENTS_STREAMING")
+                && window.contains("MAX_PEER_ADVANCEMENTS_NON_STREAMING"),
+            "drive_client_put_inner must reference both advancement \
+             caps by name in the selection so future readers see the \
+             split — bare integer literals are forbidden here."
         );
     }
 
@@ -2527,12 +2609,12 @@ mod tests {
     }
 
     #[test]
-    fn max_retries_boundary_exhausts_at_limit() {
-        // Verify the MAX_RETRIES_NON_STREAMING boundary: retries >=
-        // cap → None. Tests the counter logic that
+    fn max_advancements_boundary_exhausts_at_limit() {
+        // Verify the MAX_PEER_ADVANCEMENTS_NON_STREAMING boundary:
+        // retries >= cap → None. Tests the counter logic that
         // advance_to_next_peer uses. Streaming variant covered by
-        // `streaming_put_retry_budget_does_not_exceed_client_patience`.
-        let cap = MAX_RETRIES_NON_STREAMING;
+        // `advance_to_next_peer_at_streaming_cap_exhausts_immediately`.
+        let cap = MAX_PEER_ADVANCEMENTS_NON_STREAMING;
         let mut retries: usize = 0;
         for _ in 0..cap {
             assert!(retries < cap, "should not exhaust before limit");

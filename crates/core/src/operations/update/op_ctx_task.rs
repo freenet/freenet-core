@@ -115,6 +115,11 @@ pub(crate) async fn start_client_update(
     // Amplification ceiling: the client_events.rs UPDATE handler allocates
     // one task per client UPDATE request. Client request rate is bounded by
     // the WS connection handler's backpressure.
+    // Admission gate (closes the drain race window): refuse new
+    // UPDATEs as soon as `ShutdownHandle::shutdown` has begun.
+    if op_manager.is_shutting_down() {
+        return Err(OpError::NodeShuttingDown);
+    }
     // Held by the driver task for its lifetime; bumps the shutdown
     // drain counter so `ShutdownHandle::shutdown` waits for in-flight
     // client UPDATEs before tearing down peer connections. See

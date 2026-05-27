@@ -110,6 +110,11 @@ pub(crate) async fn start_client_subscribe(
     // `send_and_await` attempt both inserts (via `handle_op_execution`)
     // and removes (via `release_pending_op_slot`) a `pending_op_results`
     // slot, a stuck task would show up as a widening insert/remove gap.
+    // Admission gate (closes the drain race window): refuse new
+    // SUBSCRIBEs as soon as `ShutdownHandle::shutdown` has begun.
+    if op_manager.is_shutting_down() {
+        return Err(OpError::NodeShuttingDown);
+    }
     // `inflight_guard` is held for the lifetime of the spawned driver
     // so `ShutdownHandle::shutdown` can wait for the client-initiated
     // SUBSCRIBE to finish before tearing down peer connections. See

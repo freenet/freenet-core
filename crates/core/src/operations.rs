@@ -101,6 +101,15 @@ pub(crate) enum OpError {
     StreamCancelled,
     #[error("failed to claim orphan stream")]
     OrphanStreamClaimFailed,
+
+    /// Admission-gate rejection: a `start_client_*` was called after
+    /// `ShutdownHandle::shutdown` flipped the `OpManager::shutting_down`
+    /// flag. The driver task is NOT spawned and the counter is NOT
+    /// bumped — the client should retry once the node is back up.
+    /// Closes the drain race window between `counter == 0` and
+    /// `NodeEvent::Disconnect`.
+    #[error("node is shutting down; client operation rejected")]
+    NodeShuttingDown,
 }
 
 impl OpError {

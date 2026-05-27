@@ -85,6 +85,12 @@ pub struct ShutdownHandle {
     /// `shutdown` to wait for those tasks to finish before triggering
     /// the Disconnect.
     inflight_client_ops: Arc<std::sync::atomic::AtomicUsize>,
+    /// Admission gate flipped by `shutdown` *before* the drain begins,
+    /// so `start_client_*` can fail fast with `OpError::NodeShuttingDown`
+    /// instead of slipping a new op into the post-drain race window.
+    /// Same `Arc` is held by `OpManager::shutting_down` so the gate is
+    /// visible to the spawn sites without a separate channel.
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
     /// Maximum time to wait for `inflight_client_ops` to reach zero
     /// before forcing the disconnect anyway. `Duration::ZERO` disables
     /// the drain (legacy immediate-disconnect behaviour).
@@ -94,17 +100,42 @@ pub struct ShutdownHandle {
 impl ShutdownHandle {
     /// Trigger a graceful shutdown of the node.
     ///
-    /// 1. Wait up to `drain_timeout` for in-flight client-originated
-    ///    PUT/GET/UPDATE/SUBSCRIBE drivers to finish. Without this
-    ///    wait, a SIGTERM that arrives mid-PUT (e.g. release-driven
-    ///    auto-update on the nova gateway) drops the client's
-    ///    WebSocket mid-operation. See the rationale on
+    /// Three-phase shutdown — order matters:
+    ///
+    /// 1. **Close admission**: flip `OpManager::shutting_down` so
+    ///    `start_client_{put,get,update,subscribe}` immediately
+    ///    refuse new work with `OpError::NodeShuttingDown`. Without
+    ///    this, a new client op could spawn between the drain
+    ///    observing `counter == 0` and Disconnect being sent — that
+    ///    op would bump the counter (now unobserved) and then get
+    ///    cut off by the Disconnect. (Codex reviewer call-out
+    ///    2026-05.)
+    /// 2. **Drain**: wait up to `drain_timeout` for the in-flight
+    ///    client-op counter to reach zero. Without this wait, a
+    ///    SIGTERM arriving mid-PUT (e.g. release-driven auto-update
+    ///    on the nova gateway) drops the client's WebSocket
+    ///    mid-operation. See the rationale on
     ///    `Config::shutdown_drain_secs`.
-    /// 2. Send `NodeEvent::Disconnect`, which closes peer connections
-    ///    and exits the event loop.
+    /// 3. **Disconnect**: send `NodeEvent::Disconnect`, which closes
+    ///    peer connections and exits the event loop.
+    ///
+    /// Scope limitation: the drain covers **client-originated**
+    /// drivers only. In-flight *relay* operations (peer-to-peer
+    /// PUT/GET this node is forwarding) are NOT drained — those are
+    /// short-lived per-message work and the peer can re-attempt. The
+    /// targeted failure mode is user-facing WS client requests (the
+    /// `freenet-git` mirror), not relay traffic.
     pub async fn shutdown(&self) {
+        use std::sync::atomic::Ordering;
+
+        // Phase 1: close admission BEFORE the drain. Subsequent
+        // start_client_* calls fail fast.
+        self.shutting_down.store(true, Ordering::Relaxed);
+
+        // Phase 2: drain.
         self.wait_for_drain().await;
 
+        // Phase 3: trigger event-loop teardown.
         if let Err(err) = self
             .tx
             .send(NodeEvent::Disconnect {
@@ -526,6 +557,7 @@ impl NodeConfig {
         let shutdown_handle = ShutdownHandle {
             tx: shutdown_tx,
             inflight_client_ops: node_inner.op_manager.inflight_client_ops_handle(),
+            shutting_down: node_inner.op_manager.shutting_down_handle(),
             drain_timeout,
         };
         Ok((
@@ -3616,31 +3648,35 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
-        /// Construct a ShutdownHandle wired to a fresh channel and
-        /// counter, mirroring the production wire-up in
-        /// `NodeBuilder::build`. The receiver is returned so tests
-        /// can assert what (if anything) was sent.
+        /// Construct a ShutdownHandle wired to a fresh channel,
+        /// counter, and admission gate, mirroring the production
+        /// wire-up in `NodeBuilder::build`. The receiver is returned
+        /// so tests can assert what (if anything) was sent; the gate
+        /// is returned so tests can observe Phase 1 flipping it.
         fn make_handle(
             initial_count: usize,
             drain_timeout: Duration,
         ) -> (
             ShutdownHandle,
             Arc<AtomicUsize>,
+            Arc<std::sync::atomic::AtomicBool>,
             tokio::sync::mpsc::Receiver<NodeEvent>,
         ) {
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             let counter = Arc::new(AtomicUsize::new(initial_count));
+            let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let handle = ShutdownHandle {
                 tx,
                 inflight_client_ops: counter.clone(),
+                shutting_down: gate.clone(),
                 drain_timeout,
             };
-            (handle, counter, rx)
+            (handle, counter, gate, rx)
         }
 
         #[tokio::test]
         async fn shutdown_with_zero_ops_returns_immediately() {
-            let (handle, _counter, mut rx) = make_handle(0, Duration::from_secs(60));
+            let (handle, _counter, _gate, mut rx) = make_handle(0, Duration::from_secs(60));
             let start = std::time::Instant::now();
             handle.shutdown().await;
             assert!(
@@ -3657,7 +3693,7 @@ mod tests {
         #[tokio::test]
         async fn shutdown_waits_then_proceeds_on_timeout() {
             // 1 op in flight that never decrements; drain capped at 200ms.
-            let (handle, _counter, mut rx) = make_handle(1, Duration::from_millis(200));
+            let (handle, _counter, _gate, mut rx) = make_handle(1, Duration::from_millis(200));
             let start = std::time::Instant::now();
             handle.shutdown().await;
             let elapsed = start.elapsed();
@@ -3678,7 +3714,7 @@ mod tests {
         #[tokio::test]
         async fn shutdown_proceeds_as_soon_as_counter_clears() {
             // 1 op in flight; another task decrements after 100ms.
-            let (handle, counter, mut rx) = make_handle(1, Duration::from_secs(5));
+            let (handle, counter, _gate, mut rx) = make_handle(1, Duration::from_secs(5));
             let counter_clone = counter.clone();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3704,12 +3740,58 @@ mod tests {
             // SimNetwork teardown doesn't block on the 30s production
             // default. Verify the zero-timeout path bypasses the wait
             // entirely even when ops are "in flight".
-            let (handle, _counter, mut rx) = make_handle(5, Duration::ZERO);
+            let (handle, _counter, _gate, mut rx) = make_handle(5, Duration::ZERO);
             let start = std::time::Instant::now();
             handle.shutdown().await;
             assert!(
                 start.elapsed() < Duration::from_millis(50),
                 "drain_timeout=0 must skip the wait"
+            );
+            assert!(matches!(
+                rx.recv().await.expect("Disconnect must be sent"),
+                NodeEvent::Disconnect { .. }
+            ));
+        }
+
+        /// Phase 1 of the three-phase shutdown: admission gate MUST be
+        /// flipped before the drain begins, so `start_client_*` calls
+        /// arriving during the drain wait fail fast and don't slip
+        /// through the post-drain race window. Codex reviewer call-out
+        /// 2026-05 — re-opening this race re-opens the
+        /// gateway-restart-kills-mirror-PUT failure for any op spawned
+        /// in the window between drain-complete and Disconnect-send.
+        #[tokio::test]
+        async fn shutdown_closes_admission_gate_before_drain() {
+            // 1 op in flight; drain caps at 500ms so we have time to
+            // observe the gate during the wait.
+            let (handle, counter, gate, mut rx) = make_handle(1, Duration::from_millis(500));
+            assert!(
+                !gate.load(Ordering::Relaxed),
+                "admission gate must start closed"
+            );
+
+            let counter_clone = counter.clone();
+            let gate_clone = gate.clone();
+            let observed_during_drain = tokio::spawn(async move {
+                // Wait briefly so shutdown's Phase 1 fires first.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let g = gate_clone.load(Ordering::Relaxed);
+                // Release the op so drain can complete.
+                counter_clone.fetch_sub(1, Ordering::Relaxed);
+                g
+            });
+
+            handle.shutdown().await;
+
+            let gate_was_set_during_drain = observed_during_drain
+                .await
+                .expect("observer task must not panic");
+            assert!(
+                gate_was_set_during_drain,
+                "shutdown() must flip the admission gate BEFORE the \
+                 drain wait, not after. Otherwise a new client op \
+                 spawned during the drain bypasses the gate, bumps \
+                 the counter (now unobserved), and gets cut off."
             );
             assert!(matches!(
                 rx.recv().await.expect("Disconnect must be sent"),

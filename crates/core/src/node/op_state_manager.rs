@@ -180,6 +180,21 @@ pub(crate) struct OpManager {
     /// `freenet-git` mirror) to finish before tearing down peer
     /// connections. The drain is bounded by `config.shutdown_drain_secs`.
     pub(crate) inflight_client_ops: Arc<AtomicUsize>,
+    /// Set to `true` by `ShutdownHandle::shutdown` *before* the drain
+    /// begins, so `start_client_{put,get,update,subscribe}` can fail
+    /// fast with `OpError::NodeShuttingDown` instead of bumping the
+    /// counter for an op that will be aborted moments later.
+    ///
+    /// Without this gate, the shutdown sequence has a race window
+    /// between the drain loop observing `counter == 0` and the
+    /// `NodeEvent::Disconnect` being sent: a new client op spawned
+    /// in that window would bump the counter (now unobserved),
+    /// start running, and get cut off when the event loop tears
+    /// down peer connections. The admission gate eliminates the
+    /// race by causing `start_client_*` to refuse new work as soon
+    /// as shutdown begins — any in-flight op already past the
+    /// check at that moment is still covered by the drain wait.
+    pub(crate) shutting_down: Arc<AtomicBool>,
 }
 
 impl Clone for OpManager {
@@ -212,6 +227,7 @@ impl Clone for OpManager {
             active_relay_subscribe_txs: self.active_relay_subscribe_txs.clone(),
             active_relay_connect_txs: self.active_relay_connect_txs.clone(),
             inflight_client_ops: self.inflight_client_ops.clone(),
+            shutting_down: self.shutting_down.clone(),
         }
     }
 }
@@ -376,7 +392,21 @@ impl OpManager {
             active_relay_subscribe_txs,
             active_relay_connect_txs,
             inflight_client_ops: Arc::new(AtomicUsize::new(0)),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Returns `true` once `ShutdownHandle::shutdown` has begun.
+    /// Used by the `start_client_*` admission gate.
+    pub(crate) fn is_shutting_down(&self) -> bool {
+        self.shutting_down.load(Ordering::Relaxed)
+    }
+
+    /// Cloneable handle to the shutting-down flag. Used by
+    /// `ShutdownHandle` to flip the gate before starting the drain
+    /// wait.
+    pub(crate) fn shutting_down_handle(&self) -> Arc<AtomicBool> {
+        self.shutting_down.clone()
     }
 
     /// Construct a guard that bumps the in-flight client-op counter for

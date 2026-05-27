@@ -870,9 +870,11 @@ pub struct Config {
     /// Set to `0` to disable the drain entirely (legacy behaviour:
     /// disconnect immediately on SIGTERM). Default is 30s, which
     /// covers a typical `freenet-git` mirror push (~3 MiB pack split
-    /// into 4 chunks) plus headroom. Reasonable upper bound is
-    /// ~60s; longer than that and systemd's `TimeoutStopSec=90`
-    /// will kill the process before drain completes.
+    /// into 4 chunks) plus headroom. systemd's `TimeoutStopSec` is
+    /// set to 45s in this PR (30s drain + 15s peer-teardown
+    /// headroom) — raise both in lockstep if you raise this value;
+    /// `TimeoutStopSec` is the hard ceiling at which systemd
+    /// SIGKILLs the process.
     ///
     /// Motivation: release-driven auto-update was killing in-flight
     /// `freenet-git` mirror PUTs on the nova gateway, producing

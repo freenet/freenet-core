@@ -138,6 +138,11 @@ pub(crate) async fn start_client_get(
     // `BackgroundTaskMonitor`: per-transaction task that terminates via
     // happy path, exhaustion, timeout, or infra error.
     //
+    // Admission gate (closes the drain race window): refuse new
+    // GETs as soon as `ShutdownHandle::shutdown` has begun.
+    if op_manager.is_shutting_down() {
+        return Err(OpError::NodeShuttingDown);
+    }
     // `inflight_guard` is held for the lifetime of the spawned driver;
     // see `ClientOpGuard` rustdoc for the shutdown-drain contract.
     let inflight_guard = op_manager.client_op_guard();

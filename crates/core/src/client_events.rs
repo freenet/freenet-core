@@ -329,6 +329,13 @@ async fn report_op_init_error(
     let error_kind = match err {
         OpError::RingError(crate::ring::RingError::EmptyRing) => ErrorKind::EmptyRing,
         OpError::RingError(crate::ring::RingError::PeerNotJoined) => ErrorKind::PeerNotJoined,
+        // Admission-gate rejection during graceful shutdown — surface
+        // as the existing `Shutdown` kind so clients see the same
+        // typed reason as a mid-flight cancellation. Without an
+        // explicit arm here the match is non-exhaustive (CI fails),
+        // so this also serves as the source-of-truth for the
+        // user-visible shape of `OpError::NodeShuttingDown`.
+        OpError::NodeShuttingDown => ErrorKind::Shutdown,
         OpError::RingError(crate::ring::RingError::ConnError(_))
         | OpError::RingError(crate::ring::RingError::NoHostingPeers(_))
         | OpError::ConnError(_)
