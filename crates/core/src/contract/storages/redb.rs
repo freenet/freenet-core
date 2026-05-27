@@ -30,6 +30,16 @@ pub(crate) const CONTRACT_INDEX_TABLE: TableDefinition<&[u8], &[u8]> =
 pub(crate) const DELEGATE_INDEX_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("delegate_index");
 
+/// Per-contract record of detected CRDT-invariant violations (e.g. a
+/// non-idempotent `update_state`). One row per offending contract; presence
+/// alone is the gate signal. See `ring::broken_invariants` for the in-memory
+/// tracker that hydrates from this table at startup.
+///
+/// Key: ContractInstanceId (32 bytes)
+/// Value: single byte encoding [`BrokenInvariant`] (currently 0 = NonIdempotent)
+pub(crate) const BROKEN_INVARIANTS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("broken_invariants");
+
 /// Index table mapping DelegateKey to secret key hashes.
 /// This replaces the legacy KEY_DATA file in the secrets directory.
 /// Key: DelegateKey (64 bytes)
@@ -212,6 +222,18 @@ impl ReDb {
                     table = "SECRETS_INDEX_TABLE",
                     phase = "table_init_failed",
                     "Failed to open SECRETS_INDEX_TABLE"
+                );
+                e
+            })?;
+
+            // Created on first open of upgraded databases too — redb creates
+            // missing tables inside the same write txn that opens them.
+            txn.open_table(BROKEN_INVARIANTS_TABLE).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    table = "BROKEN_INVARIANTS_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open BROKEN_INVARIANTS_TABLE"
                 );
                 e
             })?;
@@ -701,6 +723,62 @@ impl ReDb {
             let delegate_key =
                 DelegateKey::new(delegate_key_bytes, CodeHash::from(&code_hash_bytes));
             result.push((delegate_key, secret_keys));
+        }
+        Ok(result)
+    }
+
+    // ==================== Broken Invariants Methods ====================
+    // Per-contract record of detected CRDT-invariant violations. See
+    // `ring::broken_invariants` for the in-memory tracker.
+
+    /// Persist a broken-invariant flag for the given contract instance.
+    /// `kind_byte` is the single-byte encoding produced by
+    /// `BrokenInvariant::to_byte`. Repeated calls overwrite — the tracker's
+    /// in-memory layer suppresses redundant writes for already-flagged
+    /// contracts, but we don't depend on that here.
+    pub fn store_broken_invariant(
+        &self,
+        instance_id: &ContractInstanceId,
+        kind_byte: u8,
+    ) -> Result<(), redb::Error> {
+        let txn = self.0.begin_write()?;
+        {
+            let mut tbl = txn.open_table(BROKEN_INVARIANTS_TABLE)?;
+            tbl.insert(instance_id.as_ref(), &[kind_byte][..])?;
+        }
+        txn.commit().map_err(Into::into)
+    }
+
+    /// Load all persisted broken-invariant flags. Malformed rows (wrong
+    /// key length, wrong value length) are skipped with a warning rather
+    /// than failing the entire load — a corrupted entry should not block
+    /// startup, and the worst case is we lose a flag and re-detect it.
+    pub fn load_all_broken_invariants(&self) -> Result<Vec<(ContractInstanceId, u8)>, redb::Error> {
+        let txn = self.0.begin_read()?;
+        let tbl = txn.open_table(BROKEN_INVARIANTS_TABLE)?;
+
+        let mut result = Vec::new();
+        for entry in tbl.iter()? {
+            let (key, value) = entry?;
+            let key_bytes: [u8; 32] = match key.value().try_into() {
+                Ok(b) => b,
+                Err(_) => {
+                    tracing::warn!(
+                        len = key.value().len(),
+                        "Skipping malformed broken-invariants row (key length)"
+                    );
+                    continue;
+                }
+            };
+            let v = value.value();
+            if v.len() != 1 {
+                tracing::warn!(
+                    len = v.len(),
+                    "Skipping malformed broken-invariants row (value length)"
+                );
+                continue;
+            }
+            result.push((ContractInstanceId::new(key_bytes), v[0]));
         }
         Ok(result)
     }

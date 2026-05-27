@@ -39,6 +39,17 @@ pub(crate) enum UpdateOverride {
     /// paths (issue #4151): the returned error must be classified as
     /// `is_invalid_update_rejection()` and logged at DEBUG, not INFO.
     RejectInvalidUpdate { reason: String },
+    /// Models a non-idempotent contract: every call to `update_state`
+    /// returns a state that is byte-different from the previous one even
+    /// when the input update is the same. The mock prepends an internal
+    /// monotonically-increasing counter to the state bytes, mimicking the
+    /// shape of a real contract that embeds a timestamp / position-
+    /// dependent signature / re-signed payload — the smoking-gun shape
+    /// the in-peer detector is built to catch (see #4251 and the
+    /// `bdtchyck…wasm` analysis in `~/.claude/jobs/.../wasm-analysis.md`).
+    /// Used by tests to verify the idempotency probe fires on a real-
+    /// world-shaped failure mode.
+    NonIdempotent(std::sync::Arc<std::sync::atomic::AtomicU64>),
 }
 
 /// A lightweight mock runtime at the `ContractRuntimeInterface` level that lets
@@ -143,6 +154,38 @@ impl ContractRuntimeInterface for MockWasmRuntime {
                     return Err(crate::wasm_runtime::ContractError::from(
                         ContractExecError::ContractError(inner_err),
                     ));
+                }
+                UpdateOverride::NonIdempotent(counter) => {
+                    // Pick the "logical" input state — same precedence as
+                    // the default branch — then prepend a monotonically-
+                    // increasing 8-byte counter. Re-running with the
+                    // produced state as input still bumps the counter,
+                    // so the result is byte-different every call.
+                    let logical = update_data
+                        .iter()
+                        .find_map(|u| match u {
+                            UpdateData::State(s) => Some(s.as_ref().to_vec()),
+                            UpdateData::Delta(d) => Some(d.as_ref().to_vec()),
+                            UpdateData::StateAndDelta { state, .. } => {
+                                Some(state.as_ref().to_vec())
+                            }
+                            UpdateData::RelatedState { .. }
+                            | UpdateData::RelatedDelta { .. }
+                            | UpdateData::RelatedStateAndDelta { .. } => None,
+                            // `UpdateData` is `#[non_exhaustive]`; allow future
+                            // variants to fall through to the `_state` fallback.
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| _state.as_ref().to_vec());
+                    let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let mut out = Vec::with_capacity(8 + logical.len().saturating_sub(8));
+                    out.extend_from_slice(&n.to_le_bytes());
+                    // Strip any prior counter prefix so the state stays a
+                    // fixed size — matching the 464-byte shape we saw in
+                    // production rather than growing unboundedly.
+                    let tail_start = logical.len().min(8);
+                    out.extend_from_slice(&logical[tail_start..]);
+                    return Ok(UpdateModification::valid(out.into()));
                 }
             }
         }

@@ -123,6 +123,12 @@ impl ContractHandler for NetworkContractHandler {
         // This must be done before loading the cache so evictions work correctly
         let storage = executor.state_store().inner().clone();
         op_manager.ring.set_hosting_storage(storage.clone());
+        // Hydrate broken-invariants flags from the same backing store so a
+        // node that previously detected a non-idempotent contract doesn't
+        // re-engage its broadcast storm after restart.
+        op_manager
+            .ring
+            .set_broken_invariants_storage(storage.clone());
 
         // Load hosting cache from persisted storage
         // This restores contracts that were hosted before restart, and also
