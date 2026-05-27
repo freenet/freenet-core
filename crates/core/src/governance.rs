@@ -488,8 +488,9 @@ mod tests {
         // Boundary: n=2 with distinct values. Median is the mean of the
         // two; MAD is the median of two equal deviations = that
         // deviation. Verify the math runs and doesn't flag either
-        // sample (both sit exactly at ±MAD from the median, which is
-        // below the k×MAD threshold).
+        // sample (both sit exactly at ±MAD from the median, while the
+        // threshold is `median + k × 1.4826 × MAD` = 0 + 5 × 1.4826 ×
+        // 0.1 ≈ 0.7413, well above either sample's value).
         let m = map_from(&[("low", -0.1), ("high", 0.1)]);
         let cfg = OutlierConfig {
             k: 5.0,

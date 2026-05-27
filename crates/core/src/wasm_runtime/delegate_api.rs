@@ -744,6 +744,12 @@ mod tests {
             &contract_id,
             "callback must receive the written contract key"
         );
+        assert_eq!(
+            calls[0].1, 3,
+            "callback must receive the on-disk state byte count (vec![4, 5, 6] = 3 bytes) — \
+             this pins the StateBytesWritten attribution to the actual write size and would \
+             catch a refactor that hardcodes the size or passes a stale length"
+        );
     }
 
     /// V2 delegate UPDATE must also fire `state_write_callback` after a
@@ -777,6 +783,10 @@ mod tests {
             calls[0].0.id(),
             &contract_id,
             "callback must receive the updated contract key"
+        );
+        assert_eq!(
+            calls[0].1, 3,
+            "callback must receive the on-disk state byte count (vec![40, 50, 60] = 3 bytes)"
         );
     }
 

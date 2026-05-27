@@ -229,22 +229,39 @@ impl AttributionSource {
     pub(crate) fn contributes_to(&self, resource: &ResourceType) -> bool {
         use AttributionSource::*;
         use ResourceType::*;
+        // Enumerate every (source, resource) pair explicitly so a future
+        // ResourceType variant fails the match exhaustiveness check
+        // instead of silently falling into a default. Codex re-reviewer
+        // of PR #4260 flagged the `_ => false` wildcard as a foot-gun:
+        // a new resource added without revisiting this predicate would
+        // silently treat every source as non-contributing to it.
         match (self, resource) {
             // Peer sources produce the bandwidth samples that drive
             // topology load-shedding.
-            (Peer(_), InboundBandwidthBytes | OutboundBandwidthBytes) => true,
+            (Peer(_), InboundBandwidthBytes) => true,
+            (Peer(_), OutboundBandwidthBytes) => true,
+            (Peer(_), ExecCpuMicros) => false,
+            (Peer(_), ExecFuelUnits) => false,
+            (Peer(_), StateBytesWritten) => false,
+            (Peer(_), BroadcastFanoutCost) => false,
             // Delegate sources predate this PR; their existing usage
             // pattern is bandwidth-relevant for accounting purposes.
-            (Delegate(_), InboundBandwidthBytes | OutboundBandwidthBytes) => true,
+            (Delegate(_), InboundBandwidthBytes) => true,
+            (Delegate(_), OutboundBandwidthBytes) => true,
+            (Delegate(_), ExecCpuMicros) => false,
+            (Delegate(_), ExecFuelUnits) => false,
+            (Delegate(_), StateBytesWritten) => false,
+            (Delegate(_), BroadcastFanoutCost) => false,
             // Contract sources contribute the four contract-governance
             // resource types (CPU, fuel, state-bytes, fan-out cost) and
             // NEVER bandwidth — those are peer-attributed even when the
             // contract is the originator.
-            (
-                Contract(_),
-                ExecCpuMicros | ExecFuelUnits | StateBytesWritten | BroadcastFanoutCost,
-            ) => true,
-            _ => false,
+            (Contract(_), InboundBandwidthBytes) => false,
+            (Contract(_), OutboundBandwidthBytes) => false,
+            (Contract(_), ExecCpuMicros) => true,
+            (Contract(_), ExecFuelUnits) => true,
+            (Contract(_), StateBytesWritten) => true,
+            (Contract(_), BroadcastFanoutCost) => true,
         }
     }
 }
