@@ -461,7 +461,10 @@ fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> 
     let Some(snap) = snap else {
         return String::new();
     };
-    if snap.bytes_uploaded == 0 && snap.bytes_downloaded == 0 && snap.open_connections == 0 {
+    // Always show the card once the node has been up for more than a few
+    // seconds — initial connection flapping shouldn't make the panel
+    // appear/disappear rhythmically during auto-refresh.
+    if snap.bytes_uploaded == 0 && snap.bytes_downloaded == 0 && snap.elapsed_secs < 10 {
         return String::new();
     }
 
@@ -482,9 +485,9 @@ fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> 
                 <span class="transfer-label">RTT (avg/min/max)</span>
                 <span class="transfer-value">{avg}ms / {min}ms / {max}ms</span>
             </div>"#,
-            avg = format!("{:.1}", ts.avg_rtt_us as f64 / 1000.0),
-            min = format!("{:.1}", ts.min_rtt_us as f64 / 1000.0),
-            max = format!("{:.1}", ts.max_rtt_us as f64 / 1000.0),
+            avg = format_args!("{:.1}", ts.avg_rtt_us as f64 / 1000.0),
+            min = format_args!("{:.1}", ts.min_rtt_us as f64 / 1000.0),
+            max = format_args!("{:.1}", ts.max_rtt_us as f64 / 1000.0),
         )
     } else {
         String::new()
@@ -524,7 +527,7 @@ fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> 
             </div>"#,
             ok = ts.transfers_completed,
             fail = ts.transfers_failed,
-            avg = format!("{:.3}", ts.avg_transfer_time_ms as f64 / 1000.0),
+            avg = format_args!("{:.3}", ts.avg_transfer_time_ms as f64 / 1000.0),
         )
     } else {
         String::new()
@@ -3550,7 +3553,9 @@ mod tests {
     use super::*;
     use crate::node::network_status::{
         FailureSnapshot, HealthLevel, NatStatsSnapshot, NetworkStatusSnapshot, OpStatsSnapshot,
+        RingStatsSnapshot,
     };
+    use crate::transport::metrics::TransportSnapshot;
     use std::net::SocketAddr;
 
     fn base_snapshot() -> NetworkStatusSnapshot {
@@ -3571,6 +3576,8 @@ mod tests {
             bytes_uploaded: 0,
             bytes_downloaded: 0,
             health: HealthLevel::Connecting,
+            ring_stats: RingStatsSnapshot::default(),
+            transport_snapshot: TransportSnapshot::default(),
             governance: Default::default(),
         }
     }
@@ -3587,7 +3594,7 @@ mod tests {
         let mut snap = base_snapshot();
         snap.open_connections = 3;
         let uri = build_favicon_data_uri(&Some(snap));
-        assert!(uri.contains("%23007FFF"), "expected blue color");
+        assert!(uri.contains("%230abab5"), "expected teal color");
     }
 
     #[test]
@@ -3618,7 +3625,7 @@ mod tests {
     }
 
     #[test]
-    fn favicon_blue_takes_priority_over_failures() {
+    fn favicon_connected_overrides_failures() {
         let mut snap = base_snapshot();
         snap.open_connections = 1;
         snap.nat_stats.attempts = 5;
@@ -3629,7 +3636,7 @@ mod tests {
         });
         let uri = build_favicon_data_uri(&Some(snap));
         assert!(
-            uri.contains("%23007FFF"),
+            uri.contains("%230abab5"),
             "connected should override failure colors"
         );
     }
@@ -3757,12 +3764,23 @@ mod tests {
     }
 
     #[test]
-    fn transfer_card_hidden_when_no_data() {
-        let snap = base_snapshot();
+    fn transfer_card_hidden_when_fresh_start() {
+        let mut snap = base_snapshot();
+        snap.elapsed_secs = 3; // first few seconds, no traffic yet
         let html = build_transfer_card(&Some(snap));
         assert!(
             html.is_empty(),
-            "transfer card should be hidden with no data"
+            "transfer card should be hidden in first 10s with no data"
+        );
+    }
+
+    #[test]
+    fn transfer_card_shown_after_grace_period() {
+        let snap = base_snapshot(); // elapsed_secs=10, no traffic → still show
+        let html = build_transfer_card(&Some(snap));
+        assert!(
+            !html.is_empty(),
+            "transfer card should render after grace period even without data"
         );
     }
 

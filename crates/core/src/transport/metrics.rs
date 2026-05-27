@@ -569,7 +569,7 @@ impl TransportMetrics {
 /// - `min_cwnd_bytes`: 0 indicates no cwnd samples were recorded
 /// - `min_rtt_us`: 0 indicates no RTT samples were recorded
 /// - Other fields: 0 is a valid value indicating no activity for that metric
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub struct TransportSnapshot {
     /// Number of stream transfers completed successfully.
