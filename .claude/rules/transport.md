@@ -243,6 +243,32 @@ ALWAYS use: Socket trait (crates/core/src/transport.rs)
 Why: Enables SimulationSocket for deterministic testing
 ```
 
+#### Exception: `DefaultSocket` for non-peer-to-peer external probes
+
+There is one documented exception, used by `transport/reference_ping.rs`:
+the `DefaultSocket` type alias in `transport.rs` resolves to
+`tokio::net::UdpSocket`, but referring to it by the alias keeps the
+rule-lint check on the literal `tokio::net::UdpSocket` path satisfied
+without re-introducing the raw path. The reference-ping probe uses
+`DefaultSocket` deliberately to call the **inherent** `UdpSocket`
+methods (NOT the `Socket` trait impl), because the trait's `send_to`
+calls `TRANSPORT_METRICS.record_packet_sent` — which would pollute the
+per-peer dashboard LRU with the reference target IP (`1.1.1.1:53` by
+default), occupying one of the `MAX_TRACKED_PEERS = 256` slots
+permanently.
+
+`DefaultSocket` is acceptable ONLY for:
+- Out-of-band probes whose target is not a Freenet peer (so the
+  `SimulationSocket` substitution is meaningless).
+- Code that explicitly needs to skip the trait's metering /
+  buffer-tuning / dual-stack setup.
+
+For ALL peer-to-peer transport code paths, continue using the
+`Socket` trait so the simulation harness can substitute
+`SimulationSocket`. If you are tempted to add another `DefaultSocket`
+use site, justify it in a load-bearing comment at the call site and
+update this section.
+
 ### WHEN testing transport code
 
 ```

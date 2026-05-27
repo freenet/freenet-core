@@ -35,8 +35,7 @@
 //! get no samples — the loop silently retries and emits an aggregate
 //! with `samples == 0`.
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -90,8 +89,8 @@ pub(crate) fn spawn_reference_ping(
 ) {
     let handle = tokio::spawn(async move {
         let bind_addr: SocketAddr = match target {
-            SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
-            SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+            SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
         };
         // `DefaultSocket` is a type alias for `tokio::net::UdpSocket`;
         // calling `bind`/`send_to`/`recv_from` on the concrete type
@@ -125,7 +124,7 @@ pub(crate) fn spawn_reference_ping(
 }
 
 async fn run_probe_loop(local_peer_id: String, target: SocketAddr, socket: DefaultSocket) {
-    let stats = Arc::new(RollingRttStats::new(RealTime::new()));
+    let stats = RollingRttStats::new(RealTime::new());
     let mut ticker = tokio::time::interval(PROBE_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Skip the immediate first tick so emission and probe phases

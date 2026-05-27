@@ -381,10 +381,17 @@ impl NodeP2P {
         // The local peer id is tagged onto every emitted event so the
         // collector can disaggregate samples by reporting node. We
         // construct it as `PeerId::new(pub_key, addr).to_string()` to
-        // match the format used by other OTLP events (set elsewhere
-        // from `KnownPeerKeyLocation::Display`), so the collector can
-        // cross-correlate shadow telemetry with the rest of the event
-        // stream by peer_id alone.
+        // match the *format* used by other OTLP events (set elsewhere
+        // from `KnownPeerKeyLocation::Display`).
+        //
+        // Caveat: for non-gateway nodes the external `own_addr` is
+        // not known at build time, so we fall back to the listener
+        // address (typically `0.0.0.0:<port>`). Other OTLP events
+        // emitted later read the up-to-date `Ring::own_location()`,
+        // so cross-correlation with the rest of the event stream by
+        // peer_id alone works for gateways but is best-effort for
+        // leaf nodes until they learn their external address. Phase
+        // 1.5 accepts this; a refresh path is tracked in #4294.
         //
         // Gate on telemetry being enabled: when telemetry is opt-out
         // (`telemetry-enabled = false`) or in test environments
