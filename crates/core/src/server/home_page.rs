@@ -37,13 +37,18 @@ fn homepage_html() -> String {
     let ops_card = build_ops_card(&snap);
     let transfer_card = build_transfer_card(&snap);
 
+    let pub_key = snap
+        .as_ref()
+        .map(|s| s.ring_stats.own_pub_key.as_str())
+        .unwrap_or("?");
+
     format!(
         r##"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Freenet — Local Peer</title>
+    <title>FN Peer</title>
     <link rel="icon" type="image/svg+xml" href="{favicon}">
     <style>{CSS}</style>
     <script>{JS}</script>
@@ -56,6 +61,7 @@ fn homepage_html() -> String {
             <span class="header-scope">Local Peer</span>
             <span class="badge" id="version-badge" data-version="{version}">v{version}</span>
             <a class="update-badge" id="update-badge" href="https://github.com/freenet/freenet-core/releases/latest" target="_blank" rel="noopener noreferrer" hidden>Update available</a>
+            <span class="pub-key" title="Node public key">{pub_key}</span>
         </div>
         <div class="header-right">
             <span class="uptime">Up {uptime}</span>
@@ -106,6 +112,7 @@ fn homepage_html() -> String {
         favicon = favicon,
         version = html_escape(version),
         uptime = uptime,
+        pub_key = html_escape(pub_key),
         status_card = status_card,
         peers_card = peers_card,
         transfer_card = transfer_card,
@@ -279,6 +286,27 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
         String::new()
     };
 
+    // Ring stats row: connection count, hosted contracts, connection attempts
+    let ring_stats_html = format!(
+        r#"<div class="metrics-row">
+            <div class="metric-tile">
+                <span class="metric-value">{conns}</span>
+                <span class="metric-label">Ring peers</span>
+            </div>
+            <div class="metric-tile">
+                <span class="metric-value">{hosted}</span>
+                <span class="metric-label">Hosted contracts</span>
+            </div>
+            <div class="metric-tile">
+                <span class="metric-value">{attempts}</span>
+                <span class="metric-label">Conn attempts</span>
+            </div>
+        </div>"#,
+        conns = snap.ring_stats.connection_count,
+        hosted = snap.ring_stats.hosted_contracts,
+        attempts = snap.connection_attempts,
+    );
+
     let spinner = if snap.open_connections == 0 {
         r#"<div class="spinner"></div>"#
     } else {
@@ -393,6 +421,7 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
         r#"<div class="card">
             <h2>Connection Status</h2>
             {health_banner}
+            {ring_stats_html}
             {external_addr_html}
             {spinner}
             {gateway_warning}
@@ -400,6 +429,7 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
             {failures_html}
         </div>"#,
         health_banner = health_banner,
+        ring_stats_html = ring_stats_html,
         external_addr_html = external_addr_html,
         spinner = spinner,
         gateway_warning = gateway_warning,
@@ -433,20 +463,94 @@ fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> 
         return String::new();
     }
 
+    let ts = &snap.transport_snapshot;
+
+    let peak_tput = if ts.peak_throughput_bps > 0 {
+        format!(
+            " <span class=\"transfer-detail\">(peak {}/s)</span>",
+            format_bytes(ts.peak_throughput_bps)
+        )
+    } else {
+        String::new()
+    };
+
+    let rtt_str = if ts.avg_rtt_us > 0 {
+        format!(
+            r#"<div class="transfer-stat">
+                <span class="transfer-label">RTT (avg/min/max)</span>
+                <span class="transfer-value">{avg}ms / {min}ms / {max}ms</span>
+            </div>"#,
+            avg = format!("{:.1}", ts.avg_rtt_us as f64 / 1000.0),
+            min = format!("{:.1}", ts.min_rtt_us as f64 / 1000.0),
+            max = format!("{:.1}", ts.max_rtt_us as f64 / 1000.0),
+        )
+    } else {
+        String::new()
+    };
+
+    let cwnd_str = if ts.avg_cwnd_bytes > 0 {
+        format!(
+            r#"<div class="transfer-stat">
+                <span class="transfer-label">BBR cwnd (avg/peak/min)</span>
+                <span class="transfer-value">{avg} / {peak} / {min}</span>
+            </div>"#,
+            avg = format_bytes(ts.avg_cwnd_bytes as u64),
+            peak = format_bytes(ts.peak_cwnd_bytes as u64),
+            min = format_bytes(ts.min_cwnd_bytes as u64),
+        )
+    } else {
+        String::new()
+    };
+
+    let slowdown_str = if ts.slowdowns_triggered > 0 {
+        format!(
+            r#"<div class="transfer-stat">
+                <span class="transfer-label">LEDBAT slowdowns</span>
+                <span class="transfer-value">{s}</span>
+            </div>"#,
+            s = ts.slowdowns_triggered,
+        )
+    } else {
+        String::new()
+    };
+
+    let xfer_str = if ts.transfers_completed > 0 || ts.transfers_failed > 0 {
+        format!(
+            r#"<div class="transfer-stat">
+                <span class="transfer-label">Transfers (avg time)</span>
+                <span class="transfer-value">{ok} ok / {fail} fail <span class="transfer-detail">({avg}s avg)</span></span>
+            </div>"#,
+            ok = ts.transfers_completed,
+            fail = ts.transfers_failed,
+            avg = format!("{:.3}", ts.avg_transfer_time_ms as f64 / 1000.0),
+        )
+    } else {
+        String::new()
+    };
+
     format!(
         r#"<div class="card">
             <h2>Data Transfer</h2>
             <div class="transfer-stat">
                 <span class="transfer-label">Uploaded</span>
-                <span class="transfer-value">{uploaded}</span>
+                <span class="transfer-value">{uploaded}{peak_tput}</span>
             </div>
             <div class="transfer-stat">
                 <span class="transfer-label">Downloaded</span>
                 <span class="transfer-value">{downloaded}</span>
             </div>
+            {xfer_str}
+            {rtt_str}
+            {cwnd_str}
+            {slowdown_str}
         </div>"#,
         uploaded = format_bytes(snap.bytes_uploaded),
+        peak_tput = peak_tput,
         downloaded = format_bytes(snap.bytes_downloaded),
+        xfer_str = xfer_str,
+        rtt_str = rtt_str,
+        cwnd_str = cwnd_str,
+        slowdown_str = slowdown_str,
     )
 }
 
@@ -1202,6 +1306,19 @@ header {
     text-transform: uppercase;
     letter-spacing: 0.05em;
 }
+.pub-key {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    background: rgba(139, 148, 158, 0.08);
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+    border: 1px solid var(--border-color);
+    max-width: 14ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
 .badge {
     background: rgba(0, 127, 255, 0.15);
     color: var(--accent-light);
@@ -1497,6 +1614,36 @@ code {
 }
 .diagnostics-muted li { margin-bottom: 0.25rem; }
 .muted-hint { opacity: 0.6; font-style: italic; }
+/* ── Ring stats metric row ── */
+.metrics-row {
+    display: flex;
+    gap: 0.5rem;
+    margin: 0.75rem 0;
+}
+.metric-tile {
+    flex: 1;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 0.5rem;
+    text-align: center;
+}
+.metric-value {
+    display: block;
+    font-size: 1.3rem;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    color: var(--accent-light);
+}
+[data-theme="light"] .metric-value { color: var(--accent-primary); }
+.metric-label {
+    display: block;
+    font-size: 0.65rem;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    font-family: var(--font-mono);
+    margin-top: 0.2rem;
+}
 /* ── Transfer stats ── */
 .transfer-stat {
     display: flex;
@@ -1519,6 +1666,12 @@ code {
     font-weight: 600;
     font-family: var(--font-mono);
     color: var(--text-primary);
+}
+.transfer-detail {
+    font-size: 0.75rem;
+    font-weight: 400;
+    color: var(--text-secondary);
+    margin-left: 0.4rem;
 }
 .note a { color: var(--accent-light); }
 [data-theme="light"] .note a { color: var(--accent-primary); }

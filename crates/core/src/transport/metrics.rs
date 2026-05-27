@@ -402,6 +402,64 @@ impl TransportMetrics {
         self.per_peer_stats.remove(&addr);
     }
 
+    /// Read-only snapshot for the local dashboard. Does NOT reset counters
+    /// (unlike `take_snapshot` which is consumed by the telemetry worker).
+    pub fn read_snapshot(&self) -> TransportSnapshot {
+        let transfers_completed = self.transfers_completed.load(Ordering::Relaxed);
+        let transfers_failed = self.transfers_failed.load(Ordering::Relaxed);
+        let total_transfer_time_ms = self.total_transfer_time_ms.load(Ordering::Relaxed);
+        let peak_throughput_bps = self.peak_throughput_bps.load(Ordering::Relaxed);
+        let peak_cwnd_bytes = self.peak_cwnd_bytes.load(Ordering::Relaxed);
+        let min_cwnd_bytes = self.min_cwnd_bytes.load(Ordering::Relaxed);
+        let cwnd_sum = self.cwnd_sum.load(Ordering::Relaxed);
+        let cwnd_samples = self.cwnd_samples.load(Ordering::Relaxed);
+        let slowdowns_triggered = self.slowdowns_triggered.load(Ordering::Relaxed);
+        let min_rtt_us = self.min_rtt_us.load(Ordering::Relaxed);
+        let max_rtt_us = self.max_rtt_us.load(Ordering::Relaxed);
+        let rtt_sum_us = self.rtt_sum_us.load(Ordering::Relaxed);
+        let rtt_samples = self.rtt_samples.load(Ordering::Relaxed);
+
+        let avg_cwnd_bytes = if cwnd_samples > 0 {
+            (cwnd_sum / cwnd_samples as u64) as u32
+        } else {
+            0
+        };
+        let avg_transfer_time_ms = if transfers_completed > 0 {
+            total_transfer_time_ms / transfers_completed as u64
+        } else {
+            0
+        };
+        let avg_rtt_us = if rtt_samples > 0 {
+            rtt_sum_us / rtt_samples as u64
+        } else {
+            0
+        };
+
+        TransportSnapshot {
+            transfers_completed,
+            transfers_failed,
+            bytes_sent: 0,
+            bytes_received: 0,
+            avg_transfer_time_ms,
+            peak_throughput_bps,
+            avg_cwnd_bytes,
+            peak_cwnd_bytes,
+            min_cwnd_bytes: if min_cwnd_bytes == u32::MAX {
+                0
+            } else {
+                min_cwnd_bytes
+            },
+            slowdowns_triggered,
+            avg_rtt_us,
+            min_rtt_us: if min_rtt_us == u64::MAX {
+                0
+            } else {
+                min_rtt_us
+            },
+            max_rtt_us,
+        }
+    }
+
     /// Snapshot per-peer transfer stats: `(addr, bytes_sent, bytes_received)`.
     pub fn per_peer_snapshot(&self) -> Vec<(SocketAddr, u64, u64)> {
         self.per_peer_stats

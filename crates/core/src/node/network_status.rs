@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use crate::ring::{PeerKeyLocation, SubscribedContractSnapshot};
 use crate::router::Router;
-use crate::transport::metrics::TRANSPORT_METRICS;
+use crate::transport::metrics::{TRANSPORT_METRICS, TransportSnapshot};
 
 static NETWORK_STATUS: OnceLock<Arc<RwLock<NetworkStatus>>> = OnceLock::new();
 static ROUTER: OnceLock<Arc<parking_lot::RwLock<Router>>> = OnceLock::new();
@@ -35,6 +35,19 @@ pub type SubscriptionProvider =
 /// reporters.
 pub type GovernanceProvider = Arc<dyn Fn() -> GovernanceSnapshot + Send + Sync + 'static>;
 
+/// Provider for live ring-level stats (connection count, hosted contracts).
+/// Same provider pattern as `SubscriptionProvider`/`GovernanceProvider`.
+pub type RingStatsProvider = Arc<dyn Fn() -> RingStatsSnapshot + Send + Sync + 'static>;
+
+/// Snapshot of ring-level statistics exposed to the dashboard.
+#[derive(Debug, Clone, Default)]
+pub struct RingStatsSnapshot {
+    pub connection_count: u32,
+    pub hosted_contracts: u32,
+    /// Base58-encoded public key of this node.
+    pub own_pub_key: String,
+}
+
 static GOVERNANCE_PROVIDER: parking_lot::RwLock<Option<GovernanceProvider>> =
     parking_lot::RwLock::new(None);
 
@@ -42,6 +55,19 @@ static GOVERNANCE_PROVIDER: parking_lot::RwLock<Option<GovernanceProvider>> =
 /// previously-registered provider.
 pub fn set_governance_provider(provider: GovernanceProvider) {
     *GOVERNANCE_PROVIDER.write() = Some(provider);
+}
+
+static RING_STATS_PROVIDER: parking_lot::RwLock<Option<RingStatsProvider>> =
+    parking_lot::RwLock::new(None);
+
+/// Register the dashboard's ring-stats data source.
+pub fn set_ring_stats_provider(provider: RingStatsProvider) {
+    *RING_STATS_PROVIDER.write() = Some(provider);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_ring_stats_provider() {
+    *RING_STATS_PROVIDER.write() = None;
 }
 
 /// Clear the governance provider. Used by tests once they're added
@@ -445,6 +471,10 @@ pub struct NetworkStatusSnapshot {
     pub bytes_downloaded: u64,
     /// Overall node health level for the "everything looks good" indicator.
     pub health: HealthLevel,
+    /// Live ring-level statistics: connection count, hosted contracts.
+    pub ring_stats: RingStatsSnapshot,
+    /// Period transport metrics (current values, not reset on read).
+    pub transport_snapshot: TransportSnapshot,
     /// Per-contract governance state (Phase 4). The dashboard's
     /// verdict block, contracts table, ring inner-ring, and
     /// distribution histogram all read from this. Empty when the
@@ -759,6 +789,14 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
     let bytes_uploaded = TRANSPORT_METRICS.cumulative_bytes_sent();
     let bytes_downloaded = TRANSPORT_METRICS.cumulative_bytes_received();
 
+    let ring_stats = RING_STATS_PROVIDER
+        .read()
+        .as_ref()
+        .map(|provider| provider())
+        .unwrap_or_default();
+
+    let transport_snapshot = TRANSPORT_METRICS.read_snapshot();
+
     Some(NetworkStatusSnapshot {
         failures,
         connection_attempts: s.connection_attempts,
@@ -787,6 +825,8 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
         bytes_uploaded,
         bytes_downloaded,
         health,
+        ring_stats,
+        transport_snapshot,
         governance: GOVERNANCE_PROVIDER
             .read()
             .as_ref()
