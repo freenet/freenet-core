@@ -171,8 +171,11 @@ pub(crate) struct ContractScore {
     /// check to know "did we evict this contract within the window?"
     pub last_transition: Instant,
     /// State history, capped at `MAX_TRANSITIONS_PER_CONTRACT`. Always
-    /// preserves the `FirstSeen` entry as the head; older transitions
-    /// in the middle are dropped if the cap is exceeded.
+    /// preserves the `FirstSeen` entry as the head[0]; once the cap is
+    /// reached, each new entry drops the OLDEST non-FirstSeen entry
+    /// (i.e. `history[1]`) — a sliding window of the most recent
+    /// `MAX_TRANSITIONS_PER_CONTRACT - 1` transitions plus the
+    /// permanent FirstSeen anchor.
     pub history: Vec<StateTransition>,
 }
 
@@ -310,8 +313,20 @@ pub(crate) struct GovernanceConfig {
     /// half-life = sample-history sticks around longer = state more
     /// stable but slower to recover.
     pub decay_half_life: Duration,
-    /// Window within which a re-eviction transitions to Banned (Phase 7).
+    /// Window measured from a contract's original `Evicted` transition
+    /// during which a SECOND eviction escalates to `Banned`. Must be
+    /// strictly greater than [`evicted_ttl`] so there is a window
+    /// between recovery and `ban_window` expiry where a re-eviction
+    /// can fire (otherwise the contract recovers to Normal and the
+    /// `recently_evicted` check immediately falls outside the window).
     pub ban_window: Duration,
+    /// How long an `Evicted` contract stays Evicted before the TTL
+    /// sweep transitions it back to `Normal` (via
+    /// [`TransitionReason::Recovered`]). Should be shorter than
+    /// [`ban_window`] so a contract that gets re-flagged shortly after
+    /// recovery has its first eviction still within the ban window —
+    /// that is the "repeat offender" path that triggers `Banned`.
+    pub evicted_ttl: Duration,
     /// How long Banned status persists before transitioning back to
     /// Normal automatically.
     pub ban_ttl: Duration,
@@ -332,8 +347,11 @@ impl Default for GovernanceConfig {
             outlier: OutlierConfig::default(),
             ramp_up: Duration::from_secs(15 * 60), // 15 minutes
             decay_half_life: Duration::from_secs(60 * 60), // 1 hour
+            // ban_window > evicted_ttl is required for the
+            // repeat-offender path to fire. See field docs.
             ban_window: Duration::from_secs(60 * 60), // 1 hour
-            ban_ttl: Duration::from_secs(60 * 60), // 1 hour
+            evicted_ttl: Duration::from_secs(15 * 60), // 15 minutes
+            ban_ttl: Duration::from_secs(60 * 60),    // 1 hour
             borderline_mad_units: 3.0,
             capacity_ceiling_log: 4.0, // log10 ceiling = 10000× typical
         }
@@ -451,9 +469,28 @@ impl GovernanceManager {
 
     /// Iterate per-contract scores. Yields cloned snapshots so the
     /// caller doesn't need to hold the DashMap shard guards.
+    ///
+    /// Note: at 10k+ contracts this clones the entire state set per
+    /// call. Use [`iter_flagged_scores`] from the dashboard hot path
+    /// when only flagged contracts are needed.
     pub(crate) fn iter_scores(&self) -> Vec<(ContractInstanceId, ContractScore)> {
         self.scores
             .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect()
+    }
+
+    /// Iterate per-contract scores, returning ONLY flagged entries
+    /// (Borderline / WouldEvict / Evicted / Banned). The dashboard
+    /// Contract Governance card hides Normal contracts at render
+    /// time; using this filter avoids cloning thousands of entries
+    /// per refresh on a busy node with mostly-healthy contracts.
+    /// Code-first reviewer of #4270 raised the clone-the-world cost
+    /// as a major concern at 10k+ contracts.
+    pub(crate) fn iter_flagged_scores(&self) -> Vec<(ContractInstanceId, ContractScore)> {
+        self.scores
+            .iter()
+            .filter(|e| e.value().state.is_flagged())
             .map(|e| (*e.key(), e.value().clone()))
             .collect()
     }
@@ -553,7 +590,7 @@ impl GovernanceManager {
                 }
                 GovernanceState::Evicted => {
                     let elapsed = now.saturating_duration_since(entry.last_transition);
-                    if elapsed >= self.config.ban_window {
+                    if elapsed >= self.config.evicted_ttl {
                         evicted_lifted.push(*entry.key());
                     }
                 }
@@ -575,10 +612,29 @@ impl GovernanceManager {
                 if age < self.config.ramp_up {
                     return None;
                 }
-                // Banned contracts are excluded from the distribution
-                // computation — we don't want a banned contract's
-                // extreme ratio dragging the threshold.
-                if entry.state == GovernanceState::Banned {
+                // Banned AND Evicted contracts are excluded from the
+                // distribution computation:
+                // - Banned: their extreme ratio would drag the threshold.
+                // - Evicted: same retained score keeps getting reprocessed
+                //   tick-after-tick; without this filter the second tick
+                //   sees `flagged.contains(key)` AND `recently_evicted ==
+                //   true`, escalating Evicted → Banned just because the
+                //   meter still carries the pre-eviction cost. That is
+                //   not "repeat offender", it is double-counting the
+                //   same eviction event. Codex reviewer of #4270 caught
+                //   this blocker. With Evicted excluded, the existing
+                //   stickiness rule in the main loop suffices: Evicted
+                //   stays Evicted until either:
+                //   (a) the `evicted_lifted` TTL sweep recovers it after
+                //       `ban_window`, OR
+                //   (b) a NEW eviction event fires after the contract
+                //       has recovered to Normal AND been re-evicted —
+                //       which is the real "repeat offender" path that
+                //       should trigger Banned.
+                if matches!(
+                    entry.state,
+                    GovernanceState::Banned | GovernanceState::Evicted
+                ) {
                     return None;
                 }
                 entry.log_ratio().map(|r| (*entry.key(), r))
@@ -608,10 +664,21 @@ impl GovernanceManager {
         // distinguish "elevated" from "normal"; falling back to
         // median-only would flag every contract slightly above
         // median, which is wrong.
+        // Scale MAD by `MAD_GAUSSIAN_CONSISTENCY` (≈1.4826) so
+        // `borderline_mad_units` is interpretable as standard
+        // deviations under a normal honest population — matching the
+        // semantics of the eviction threshold computed by
+        // `detect_outliers`, which uses scaled MAD too. Without this
+        // scaling, `borderline_mad_units = 3.0` would correspond to
+        // ~2.0σ, not the "+3 standard deviations" the
+        // `GovernanceState::Borderline` docstring claims. Codex
+        // reviewer of #4270 caught this inconsistency.
         let borderline_cutoff = match (outlier_result.median_log_ratio, outlier_result.mad) {
-            (Some(m), Some(mad)) if mad > f64::EPSILON => {
-                Some(m + self.config.borderline_mad_units * mad)
-            }
+            (Some(m), Some(mad)) if mad > f64::EPSILON => Some(
+                m + self.config.borderline_mad_units
+                    * crate::governance::MAD_GAUSSIAN_CONSISTENCY
+                    * mad,
+            ),
             _ => None,
         };
 
@@ -682,17 +749,34 @@ impl GovernanceManager {
                 (_, GovernanceState::Normal) => TransitionReason::Recovered,
             };
             entry.record_transition(now, next, reason);
+            // `actionable` means "the executor wiring should emit an
+            // `EvictContract` event for this decision" — true only for
+            // transitions INTO an actively-enforced state (Evicted or
+            // Banned). Borderline/WouldEvict/Normal transitions are
+            // observation-only regardless of mode. Codex reviewer of
+            // #4270 caught that the previous `actionable = mode.evicts()`
+            // marked every transition in Enforce mode (including
+            // Recovered and BorderlineEntered) as actionable, which
+            // violates the field's documented contract.
+            let actionable_decision =
+                actionable && matches!(next, GovernanceState::Evicted | GovernanceState::Banned);
             decisions.push(ReaperDecision {
                 key: *key,
                 from,
                 to: next,
                 reason,
                 at: now,
-                actionable,
+                actionable: actionable_decision,
             });
         }
 
         // 5. Process ban TTLs that expired during the decay walk.
+        //
+        // `actionable` mirrors the per-mode semantics: a ban lifted in
+        // DryRun was never actionable to begin with, so its lift
+        // isn't either. Skeptical-reviewer caught the earlier
+        // hardcoded `true` here would let a future actor act on a
+        // DryRun-lifted "ban" that never enforced.
         for key in ban_lifted {
             if let Some(mut entry) = self.scores.get_mut(&key) {
                 if entry.state == GovernanceState::Banned {
@@ -708,19 +792,36 @@ impl GovernanceManager {
                         to: GovernanceState::Normal,
                         reason: TransitionReason::BanLifted,
                         at: now,
-                        actionable: true,
+                        actionable,
                     });
                 }
             }
         }
 
         // 5b. Process evicted-window expiries the same way. A contract
-        // that has been Evicted for at least `ban_window` without a
-        // re-eviction is allowed to return to Normal. The
-        // `TransitionReason::Recovered` reason is reused — the dashboard
-        // can distinguish "actively-recovered (decay-driven)" from
-        // "recovered after eviction-window" via the `from` field.
+        // that has been Evicted for at least `evicted_ttl` AND is not
+        // currently being re-flagged is allowed to return to Normal.
+        //
+        // The currently-flagged filter is critical: without it, a
+        // contract whose `evicted_ttl` just elapsed AND is still
+        // actively abusive (still produces flagging samples) would get
+        // a free Recovered transition this tick — short-circuiting
+        // through `next == from` in the main loop, then unconditionally
+        // recovered here. Net effect: an abuser cycles "Evicted →
+        // Recovered → Normal → Evicted" indefinitely without ever
+        // triggering Banned. Skeptical-reviewer caught this as a
+        // high-severity bug. Filter against `flagged` so recovery
+        // only fires for contracts whose behavior has actually
+        // calmed down.
         for key in evicted_lifted {
+            if flagged.contains(&key) {
+                // Still actively flagged — let the main transition
+                // loop's `recently_evicted` check escalate on the
+                // next tick (or, if `ban_window` has also elapsed
+                // and the abuser keeps flagging, the next tick after
+                // recovery will start the Evicted clock fresh).
+                continue;
+            }
             if let Some(mut entry) = self.scores.get_mut(&key) {
                 if entry.state == GovernanceState::Evicted {
                     let from = entry.state;
@@ -735,7 +836,7 @@ impl GovernanceManager {
                         to: GovernanceState::Normal,
                         reason: TransitionReason::Recovered,
                         at: now,
-                        actionable: true,
+                        actionable,
                     });
                 }
             }
@@ -1132,12 +1233,20 @@ mod tests {
 
     #[test]
     fn second_eviction_within_ban_window_triggers_ban() {
+        // Real repeat-offender path post-#4270 review:
+        //   1. Contract gets Evicted at T=0.
+        //   2. evicted_ttl elapses (default 15min); the contract is
+        //      not currently flagged → TTL sweep recovers to Normal.
+        //   3. Fresh cost arrives → contract is flagged again.
+        //   4. Main loop's recently_evicted check finds the original
+        //      Evicted within ban_window (default 1h) → Banned.
+        //
+        // The earlier version of this test re-fed the SAME tick after
+        // eviction. Codex reviewer caught that this double-counted the
+        // same eviction event; the fix excludes Evicted contracts from
+        // the distribution so the next-tick re-feed path is unreachable.
         let (mgr, ts) = mk_mgr_shared(GovernanceMode::Enforce);
-        // Healthy population.
         for i in 0..30 {
-            // Tiny jitter so MAD doesn't collapse to zero; keeps the
-            // population recognisably honest but gives the detector
-            // a real distribution to work with.
             let jitter = (i as f64 - 15.0) * 0.01;
             mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
             mgr.ingest_demand(mk_key(i), 1.0 + jitter);
@@ -1146,34 +1255,53 @@ mod tests {
         mgr.ingest_cost(abuser, 100.0);
         mgr.ingest_demand(abuser, 1.0);
         ts.advance(Duration::from_secs(2));
-        // First eviction.
-        let result1 = mgr.tick(Duration::from_millis(100));
+
+        // Tick 1: first eviction.
+        let r1 = mgr.tick(Duration::from_millis(100));
         assert_eq!(
-            result1
-                .decisions
-                .iter()
-                .find(|d| d.key == abuser)
-                .unwrap()
-                .to,
+            r1.decisions.iter().find(|d| d.key == abuser).unwrap().to,
             GovernanceState::Evicted
         );
-        // Re-feed abuser's cost (simulating re-PUT + UPDATE storm).
+
+        // Advance past evicted_ttl (15min default). Re-establish the
+        // honest distribution so MAD stays well-defined during recovery.
+        ts.advance(Duration::from_secs(15 * 60 + 1));
+        for i in 0..30 {
+            let jitter = (i as f64 - 15.0) * 0.01;
+            mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
+            mgr.ingest_demand(mk_key(i), 1.0 + jitter);
+        }
+        let recovery = mgr.tick(Duration::from_millis(100));
+        let recovered = recovery
+            .decisions
+            .iter()
+            .find(|d| d.key == abuser)
+            .expect("evicted_lifted sweep must recover the abuser");
+        assert_eq!(recovered.from, GovernanceState::Evicted);
+        assert_eq!(recovered.to, GovernanceState::Normal);
+        assert!(matches!(recovered.reason, TransitionReason::Recovered));
+
+        // Re-feed abuser. The original Evicted transition is still
+        // within ban_window (we advanced 15min+1s, well under 1h).
         mgr.ingest_cost(abuser, 100.0);
+        mgr.ingest_cost(abuser, 100.0);
+        mgr.ingest_demand(abuser, 1.0);
         ts.advance(Duration::from_secs(1));
-        // Second eviction within the ban_window — should escalate to Banned.
-        let result2 = mgr.tick(Duration::from_millis(100));
-        let second = result2.decisions.iter().find(|d| d.key == abuser).unwrap();
+
+        // Tick 3: recently_evicted check fires → Banned, not Evicted.
+        let r2 = mgr.tick(Duration::from_millis(100));
+        let second = r2.decisions.iter().find(|d| d.key == abuser).unwrap();
         assert_eq!(second.to, GovernanceState::Banned);
         assert!(matches!(second.reason, TransitionReason::BanTriggered));
     }
 
     #[test]
     fn ban_ttl_expires_back_to_normal() {
+        // After the Banned state's ban_ttl elapses, BanLifted fires.
+        // Setup mirrors `second_eviction_within_ban_window_triggers_ban`:
+        // evict → recover → re-feed → Banned, then advance past ban_ttl.
         let (mgr, ts) = mk_mgr_shared(GovernanceMode::Enforce);
         for i in 0..30 {
-            // Tiny jitter so MAD doesn't collapse to zero; keeps the
-            // population recognisably honest but gives the detector
-            // a real distribution to work with.
             let jitter = (i as f64 - 15.0) * 0.01;
             mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
             mgr.ingest_demand(mk_key(i), 1.0 + jitter);
@@ -1182,13 +1310,27 @@ mod tests {
         mgr.ingest_cost(abuser, 100.0);
         mgr.ingest_demand(abuser, 1.0);
         ts.advance(Duration::from_secs(2));
-        // First eviction.
+
+        // Tick 1: Evicted.
         mgr.tick(Duration::from_millis(100));
-        // Re-feed + second tick → Banned.
+
+        // Advance past evicted_ttl + re-establish honest distribution.
+        ts.advance(Duration::from_secs(15 * 60 + 1));
+        for i in 0..30 {
+            let jitter = (i as f64 - 15.0) * 0.01;
+            mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
+            mgr.ingest_demand(mk_key(i), 1.0 + jitter);
+        }
+        mgr.tick(Duration::from_millis(100)); // → Normal via Recovered.
+
+        // Re-feed → Banned (recently_evicted in window).
         mgr.ingest_cost(abuser, 100.0);
+        mgr.ingest_cost(abuser, 100.0);
+        mgr.ingest_demand(abuser, 1.0);
         ts.advance(Duration::from_secs(1));
         mgr.tick(Duration::from_millis(100));
-        // Now advance past ban_ttl.
+
+        // Now advance past ban_ttl (1h default).
         ts.advance(Duration::from_secs(60 * 60 + 1));
         let result = mgr.tick(Duration::from_millis(100));
         let lifted = result.decisions.iter().find(|d| d.key == abuser).unwrap();
@@ -1198,43 +1340,58 @@ mod tests {
     }
 
     #[test]
-    fn borderline_state_for_three_mad_outside_threshold() {
-        // Build a tight distribution where one contract sits between
-        // +3·MAD and +5·MAD — the borderline zone.
+    fn borderline_state_for_contract_above_borderline_below_threshold() {
+        // Construct a distribution where the test contract MUST land
+        // in Borderline — specifically, between `+borderline_mad_units
+        // × 1.4826 × MAD` (the borderline cutoff) and `k × 1.4826 ×
+        // MAD` (the eviction threshold). With default config
+        // (borderline_mad_units=3, k=5), that's roughly 4.4σ–7.4σ.
+        //
+        // Codex reviewer of #4270 flagged that the previous version of
+        // this test (a) over-permitted WouldEvict, and (b) silently
+        // passed when no decision was logged. Both fixed here:
+        //   - The assertion is unconditional (no `if let Some`).
+        //   - It pins `Borderline` specifically, not the union.
         let (mgr, ts) = mk_mgr_shared(GovernanceMode::DryRun);
-        // Tighten the trim so all 30 honest contracts dominate the MAD.
-        // Set 30 contracts at exactly cost=0.1, benefit=1.0
-        // (log-ratio = -1, MAD then comes from the inserted outlier).
-        // Use slight jitter so MAD isn't zero.
+        // 30 honest contracts with enough spread to give MAD a
+        // meaningful magnitude. cost=0.1 ± slight jitter → log-ratio ≈ -1.
         for i in 0..30 {
-            let jitter = (i as f64 - 15.0) * 0.001;
-            mgr.ingest_cost(mk_key(i), 0.1 + jitter);
+            let jitter = (i as f64 - 15.0) * 0.02;
+            mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
             mgr.ingest_demand(mk_key(i), 1.0);
         }
-        // A "borderline" contract: cost ratio = 1.0 (log = 0), which
-        // is +1 above the median of -1. With small MAD this is multiple
-        // MAD-units away — should land in Borderline, not WouldEvict.
+        // Borderline test contract: cost ratio designed to land at
+        // ~5σ above median, which is between the borderline cutoff
+        // (≈4.4σ) and the eviction threshold (≈7.4σ). Calibrated
+        // empirically against the test fixture's MAD.
         let borderline = mk_key(99);
-        mgr.ingest_cost(borderline, 1.0);
+        mgr.ingest_cost(borderline, 0.15);
         mgr.ingest_demand(borderline, 1.0);
         ts.advance(Duration::from_secs(2));
         let result = mgr.tick(Duration::from_millis(100));
-        let decision = result.decisions.iter().find(|d| d.key == borderline);
-        if let Some(d) = decision {
-            // Either WouldEvict (if it crossed threshold due to tight MAD)
-            // or Borderline (between +3·MAD and threshold). Both are
-            // valid outcomes of this synthesized distribution; the
-            // critical invariant is that something flagged this
-            // contract.
-            assert!(
-                matches!(
-                    d.to,
-                    GovernanceState::WouldEvict | GovernanceState::Borderline
-                ),
-                "expected borderline/wouldevict, got {:?}",
-                d.to
-            );
-        }
+        let decision = result
+            .decisions
+            .iter()
+            .find(|d| d.key == borderline)
+            .unwrap_or_else(|| {
+                panic!(
+                    "borderline contract MUST produce a decision, got: {:?}",
+                    result.decisions
+                )
+            });
+        assert_eq!(
+            decision.to,
+            GovernanceState::Borderline,
+            "expected Borderline (not WouldEvict / Normal); got {:?}. \
+             If this drifts to WouldEvict, the test fixture's MAD has \
+             tightened beyond the test's design and the cost value \
+             needs recalibration.",
+            decision.to
+        );
+        assert!(matches!(
+            decision.reason,
+            TransitionReason::BorderlineEntered
+        ));
     }
 
     #[test]

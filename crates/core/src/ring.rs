@@ -2089,9 +2089,12 @@ impl Ring {
             gov::TransitionReason::BanLifted => ns::GovernanceTransitionReasonSnapshot::BanLifted,
         };
 
+        // Only iterate flagged contracts for the dashboard mirror —
+        // the renderer hides Normal anyway. Avoids cloning thousands of
+        // entries per refresh on a busy node. See `iter_flagged_scores`.
         let contracts: Vec<ns::ContractGovernanceEntry> = self
             .governance
-            .iter_scores()
+            .iter_flagged_scores()
             .into_iter()
             .map(|(id, score)| {
                 let instance_id = id.to_string();
@@ -2238,23 +2241,13 @@ impl Ring {
         self.governance.ingest_cost(contract_id, amount * weight);
     }
 
-    /// Record a demand event for a contract. Called from
-    /// subscription-registration sites in `HostingManager` so the
-    /// governance manager's `benefit_score` for the contract reflects
-    /// who's actually asking for it.
-    ///
-    /// `weight` is the caller's chance to differentiate local-client
-    /// subscriptions from forwarded-peer ones (Sybil resistance). A
-    /// reasonable default per the design doc: 1.0 for local,
-    /// 0.1 for forwarded.
-    #[allow(dead_code)] // wired by HostingManager-side reporters in subsequent commit
-    pub(crate) fn ingest_contract_demand(
-        &self,
-        contract_id: freenet_stdlib::prelude::ContractInstanceId,
-        weight: f64,
-    ) {
-        self.governance.ingest_demand(contract_id, weight);
-    }
+    // Note: there is intentionally no standalone `ingest_contract_demand`
+    // method here. Demand is ingested through `add_client_subscription` /
+    // `add_downstream_subscriber` (the two production registration sites)
+    // and gated on `is_new_for_client` / `AddSubscriberOutcome::NewAdd`
+    // there. Adding a bare entry point would let a future caller bypass
+    // the Sybil-resistance gate — that exact concern was flagged by
+    // skeptical-reviewer of #4270 as a latent foot-gun.
 
     /// Run one governance reaper tick. Caller (the periodic
     /// `governance_reaper_loop` task) is expected to feed
