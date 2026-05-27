@@ -202,7 +202,7 @@ fn build_favicon_data_uri(snap: &Option<network_status::NetworkStatusSnapshot>) 
     // Color is pre-encoded for data URI (# → %23) to avoid scanning the entire SVG.
     let color = match snap {
         None => "%239e9e9e",                              // grey — starting up
-        Some(s) if s.open_connections > 0 => "%23007FFF", // blue — connected
+        Some(s) if s.open_connections > 0 => "%230abab5", // teal — connected
         Some(s) if s.nat_stats.attempts > 0 && s.nat_stats.successes == 0 => "%238b0000", // dark red — NAT problems
         Some(s) if !s.failures.is_empty() => "%23f44336", // red — connection issues
         Some(_) => "%23fbbf24",                           // amber — connecting
@@ -727,18 +727,32 @@ fn build_ring_svg(
     let own_xy = own_location.map(|loc| loc_to_xy(loc, r_outer));
 
     // === Connection curves: YOU → peers ===
-    // Only drawn if we know our own location; otherwise we can't
-    // anchor them. Bezier through the interior so the path looks
-    // like a routing arc, not a chord.
+    // Stroke width scales with total bytes transferred to this peer,
+    // giving a visual "data flow" indication.  Floor at 0.6 so even
+    // idle peers are visible; ceiling at 3.0 for the busiest peer.
+    // Gateways get a warm amber arc, regular peers a teal one.
     if let Some((ox, oy)) = own_xy {
+        // Find max transfer for relative scaling
+        let max_xfer = peers
+            .iter()
+            .map(|p| p.bytes_sent.saturating_add(p.bytes_received))
+            .max()
+            .unwrap_or(1)
+            .max(1);
         for p in peers {
             if let Some(ploc) = p.location {
                 let (px, py) = loc_to_xy(ploc, r_outer);
-                let stroke = if p.is_gateway { "#ffb610" } else { "#66d9ff" };
+                let total = p.bytes_sent.saturating_add(p.bytes_received);
+                let sw = 0.6 + 2.4 * (total as f64 / max_xfer as f64);
+                let (stroke, opacity) = if p.is_gateway {
+                    ("#f0a030", 0.55)
+                } else {
+                    ("#0abab5", 0.45)
+                };
                 let path = curve_path(ox, oy, px, py, 0.55);
                 write!(
                     svg,
-                    "<path d=\"{path}\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"1\" stroke-opacity=\"0.35\"/>"
+                    "<path d=\"{path}\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"{sw:.1}\" stroke-opacity=\"{opacity}\" stroke-linecap=\"round\"/>"
                 )
                 .ok();
             }
@@ -1210,32 +1224,32 @@ fn build_ops_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Strin
 }
 
 const CSS: &str = r##"
-/* ── CSS Variables (dark mode default, matching global telemetry dashboard) ── */
+/* ── CSS Variables (dark mode default) ── */
 :root {
-    --bg-primary: #06080c;
-    --bg-secondary: #0d1117;
-    --bg-tertiary: #161b22;
-    --bg-panel: rgba(13, 17, 23, 0.8);
-    --border-color: rgba(48, 54, 61, 0.6);
-    --text-primary: #e6edf3;
-    --text-secondary: #8b949e;
-    --text-muted: #484f58;
-    --accent-primary: #007FFF;
-    --accent-light: #7ecfef;
-    --accent-dark: #0052cc;
-    --font-mono: 'SF Mono', Monaco, 'Cascadia Code', monospace;
-    --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    --bg-primary: #0c0d0f;
+    --bg-secondary: #141518;
+    --bg-tertiary: #1a1c20;
+    --bg-panel: rgba(20, 21, 24, 0.85);
+    --border-color: rgba(64, 66, 72, 0.35);
+    --text-primary: #edeeef;
+    --text-secondary: #94969a;
+    --text-muted: #585a5e;
+    --accent-primary: #0abab5;
+    --accent-light: #5eead4;
+    --accent-dark: #0d9488;
+    --font-mono: 'Iosevka', 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'SF Mono', monospace;
+    --font-sans: 'Space Grotesk', 'DM Sans', system-ui, -apple-system, sans-serif;
 }
 /* Light mode overrides */
 [data-theme="light"] {
-    --bg-primary: #f0f4f8;
-    --bg-secondary: #e2e8f0;
-    --bg-tertiary: #cbd5e1;
-    --bg-panel: rgba(255, 255, 255, 0.85);
-    --border-color: rgba(148, 163, 184, 0.5);
-    --text-primary: #0f172a;
-    --text-secondary: #475569;
-    --text-muted: #94a3b8;
+    --bg-primary: #f7f5f2;
+    --bg-secondary: #eeebe6;
+    --bg-tertiary: #e5e0d9;
+    --bg-panel: rgba(255, 255, 255, 0.88);
+    --border-color: rgba(180, 175, 168, 0.4);
+    --text-primary: #1a1816;
+    --text-secondary: #5c5955;
+    --text-muted: #8c8985;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -1244,23 +1258,35 @@ body {
     color: var(--text-primary);
     line-height: 1.5;
 }
-/* Atmospheric background (matching telemetry dashboard) */
+/* Subtle warm background with dot-grid texture */
 body::before {
     content: '';
     position: fixed;
     top: 0; left: 0; right: 0; bottom: 0;
     background:
-        radial-gradient(ellipse at 50% 0%, rgba(0, 127, 255, 0.08) 0%, transparent 50%),
-        radial-gradient(ellipse at 80% 50%, rgba(126, 207, 239, 0.05) 0%, transparent 40%),
-        radial-gradient(ellipse at 20% 80%, rgba(0, 82, 204, 0.05) 0%, transparent 40%);
+        radial-gradient(ellipse at 30% 20%, rgba(224, 220, 210, 0.03) 0%, transparent 55%),
+        radial-gradient(ellipse at 70% 60%, rgba(10, 186, 181, 0.04) 0%, transparent 50%);
     pointer-events: none;
     z-index: 0;
 }
+body::after {
+    content: '';
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background-image: radial-gradient(rgba(255,255,255,0.015) 1px, transparent 1px);
+    background-size: 24px 24px;
+    pointer-events: none;
+    z-index: 0;
+    opacity: 0.6;
+}
 [data-theme="light"] body::before {
     background:
-        radial-gradient(ellipse at 50% 0%, rgba(0, 127, 255, 0.06) 0%, transparent 50%),
-        radial-gradient(ellipse at 80% 50%, rgba(126, 207, 239, 0.04) 0%, transparent 40%),
-        radial-gradient(ellipse at 20% 80%, rgba(0, 82, 204, 0.04) 0%, transparent 40%);
+        radial-gradient(ellipse at 30% 20%, rgba(180, 175, 165, 0.06) 0%, transparent 55%),
+        radial-gradient(ellipse at 70% 60%, rgba(10, 186, 181, 0.04) 0%, transparent 50%);
+}
+[data-theme="light"] body::after {
+    background-image: radial-gradient(rgba(0,0,0,0.025) 1px, transparent 1px);
+    opacity: 0.5;
 }
 header {
     display: flex;
@@ -1366,9 +1392,10 @@ main {
 .card {
     background: var(--bg-panel);
     border: 1px solid var(--border-color);
-    border-radius: 10px;
+    border-radius: 12px;
     padding: 1rem 1.25rem;
     backdrop-filter: blur(10px);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.12);
 }
 .card-muted { background: var(--bg-secondary); }
 .card h2 {
