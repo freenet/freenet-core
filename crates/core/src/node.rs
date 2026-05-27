@@ -2010,6 +2010,15 @@ pub async fn run_local_node(
         )
     }
 
+    // Seed the dashboard so it renders immediately (not "Starting up…"
+    // forever). Local mode never joins the ring, so there are no peers,
+    // no contracts, and no transport stats.
+    crate::node::network_status::init(
+        socket.port,
+        std::collections::HashSet::new(),
+        crate::config::PCK_VERSION.to_string(),
+    );
+
     let (mut gw, mut ws_proxy) = crate::server::serve_client_api_in(socket).await?;
 
     // TODO: use combinator instead

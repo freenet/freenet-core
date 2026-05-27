@@ -61,7 +61,9 @@ fn homepage_html() -> String {
             <span class="header-scope">Local Peer</span>
             <span class="badge" id="version-badge" data-version="{version}">v{version}</span>
             <a class="update-badge" id="update-badge" href="https://github.com/freenet/freenet-core/releases/latest" target="_blank" rel="noopener noreferrer" hidden>Update available</a>
-            <span class="pub-key" title="Node public key">{pub_key}</span>
+            <span class="pub-key-label">Public key</span>
+            <code class="pub-key" id="pub-key" title="Click to copy">{pub_key}</code>
+            <button class="copy-btn" onclick="copyToClipboard(document.getElementById('pub-key').textContent).then(function(){{showToast('Public key copied')}})" title="Copy public key">&#x2398;</button>
         </div>
         <div class="header-right">
             <span class="uptime">Up {uptime}</span>
@@ -1306,19 +1308,41 @@ header {
     text-transform: uppercase;
     letter-spacing: 0.05em;
 }
+.pub-key-label {
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    font-family: var(--font-mono);
+    margin-right: 0.3rem;
+}
 .pub-key {
     font-family: var(--font-mono);
     font-size: 0.7rem;
     color: var(--text-secondary);
     background: rgba(139, 148, 158, 0.08);
     padding: 0.15rem 0.5rem;
-    border-radius: 4px;
+    border-radius: 4px 0 0 4px;
     border: 1px solid var(--border-color);
     max-width: 14ch;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    cursor: pointer;
 }
+.pub-key:hover { color: var(--accent-light); }
+.copy-btn {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    background: rgba(139, 148, 158, 0.08);
+    border: 1px solid var(--border-color);
+    border-left: none;
+    border-radius: 0 4px 4px 0;
+    padding: 0.15rem 0.4rem;
+    cursor: pointer;
+    line-height: 1;
+}
+.copy-btn:hover { color: var(--accent-light); background: rgba(126, 207, 239, 0.1); }
 .badge {
     background: rgba(0, 127, 255, 0.15);
     color: var(--accent-light);
