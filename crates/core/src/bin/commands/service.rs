@@ -2818,12 +2818,10 @@ fn install_macos_service() -> Result<()> {
     fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))
         .context("Failed to make wrapper script executable")?;
 
-    // Record the SHA-256 hash of the wrapper we just wrote so a later
-    // `freenet update` can distinguish "Freenet's wrapper" from "a
-    // hand-edited wrapper" before overwriting it (issue #3967). A
-    // failed sidecar write only weakens user-modification protection
-    // on the next update — it does not invalidate the wrapper we just
-    // wrote — so we warn and continue.
+    // Sidecar records the wrapper's SHA-256 so a later `freenet update`
+    // can distinguish "Freenet's wrapper" from a hand-edited one
+    // before overwriting (#3967). A failed sidecar write only weakens
+    // future user-modification protection — warn and continue.
     let wrapper_hash_path = wrapper_path.with_extension("sh.hash");
     let wrapper_hash = super::update::wrapper_content_hash(&wrapper_content);
     if let Err(e) = fs::write(&wrapper_hash_path, format!("{wrapper_hash}\n")) {
