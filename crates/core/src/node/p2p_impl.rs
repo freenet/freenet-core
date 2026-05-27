@@ -375,8 +375,23 @@ impl NodeP2P {
         let background_task_monitor = BackgroundTaskMonitor::new();
         // Phase 1 of the outer-loop rate-controller RFC (#4074):
         // start the cross-connection RTT shadow aggregator. Pure
-        // observation; never read by the production data path.
-        crate::transport::rolling_rtt_stats::spawn_aggregator(&background_task_monitor);
+        // observation; never read by the production data path. The
+        // local peer id is tagged onto every emitted event so the
+        // collector can disaggregate samples by reporting node.
+        let local_peer_id = config.key_pair.public().to_string();
+        crate::transport::rolling_rtt_stats::spawn_aggregator(
+            local_peer_id.clone(),
+            &background_task_monitor,
+        );
+        // Phase 1.5 (#4074): periodic out-of-band reference-path
+        // probe so the collector can separate "overlay queueing
+        // baseline" from "local uplink contention" — the open
+        // question Phase 1 telemetry cannot answer on its own.
+        crate::transport::reference_ping::spawn_reference_ping(
+            local_peer_id,
+            crate::transport::reference_ping::DEFAULT_REFERENCE_TARGET,
+            &background_task_monitor,
+        );
         let connection_manager = ConnectionManager::new(&config);
         let op_manager = Arc::new(OpManager::new(
             notification_tx,

@@ -93,18 +93,34 @@ populated by `RollingRttStatsHandle` in every `RemoteConnection`. A
 `shadow_rtt_aggregate` event both as `tracing::debug!` (file-log
 mirror; visible via `RUST_LOG=…=debug` in debug builds, compiled
 out entirely in release builds via the `release_max_level_info`
-feature in `crates/core/Cargo.toml`) and via `send_standalone_event`
-so it reaches the OTLP collector regardless of log level — the
-dashboard's 1 Hz feed is independent of the local tracing subscriber.
+feature in `crates/core/Cargo.toml`) and via
+`send_standalone_event_with_peer_id` so it reaches the OTLP
+collector regardless of log level, tagged with the local node id
+so the collector can disaggregate samples per reporting node.
+
+`transport/reference_ping.rs` runs an analogous 1Hz loop
+(`reference_ping` background task) that probes a fixed external
+target (default `1.1.1.1:53`) over UDP with a synthetic DNS query
+and feeds the RTT into a parallel `RollingRttStats`. It emits
+`shadow_reference_ping` events with the same shape and the same
+local-peer-id tag. The point is to separate "overlay multi-hop
+queueing baseline" (visible only in the per-peer signal) from
+"local uplink contention" (visible in both signals simultaneously),
+which the Phase 1 analysis posted on #4074 showed Phase 1 alone
+cannot answer.
 
 ```
-NEVER read SHADOW_RTT_REGISTRY or cross_connection_median_inflation
-from the production data path (rate limiter, retry, congestion
-control). It exists only for the staged rollout in #4074:
-  Phase 1 → observation only (current)
-  Phase 2 → shadow controller, still no behaviour change
-  Phase 3 → opt-in flag
-  Phase 4 → default switch only after Phase 3 shows improvement
+NEVER read SHADOW_RTT_REGISTRY, cross_connection_median_inflation,
+or the reference_ping stats from the production data path (rate
+limiter, retry, congestion control). They exist only for the
+staged rollout in #4074:
+  Phase 1   → observation only — per-peer overlay RTT (current)
+  Phase 1.5 → observation only — adds reference-path RTT + peer_id
+              tagging so signals can be disaggregated per node and
+              the overlay-vs-uplink confound can be tested
+  Phase 2   → shadow controller, still no behaviour change
+  Phase 3   → opt-in flag
+  Phase 4   → default switch only after Phase 3 shows improvement
 ```
 
 ## Connection Lifecycle Rules

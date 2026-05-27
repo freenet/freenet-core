@@ -292,14 +292,22 @@ const AGGREGATOR_INTERVAL: Duration = Duration::from_secs(1);
 /// node's `BackgroundTaskMonitor`. Call once during node startup,
 /// before any `RollingRttStatsHandle` is constructed.
 ///
+/// `local_peer_id` is the local node's identity (typically the
+/// transport public key as a string). It is tagged onto every
+/// `shadow_rtt_aggregate` event so the collector can disaggregate
+/// samples by reporting node — without this, every node's samples
+/// land in the same anonymous bucket and per-node patterns
+/// (gateway vs leaf, contended vs idle) cannot be separated.
+///
 /// Per `.claude/rules/bug-prevention-patterns.md`: lifetime-of-node
 /// tasks must be tracked so the supervisor notices if they exit. The
 /// aggregator silently dying would freeze the shadow telemetry stream
 /// without any user-visible failure.
 pub(crate) fn spawn_aggregator(
+    local_peer_id: String,
     monitor: &crate::node::background_task_monitor::BackgroundTaskMonitor,
 ) {
-    let handle = tokio::spawn(async {
+    let handle = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(AGGREGATOR_INTERVAL);
         // The first tick fires immediately; skip it so the first
         // emission is one period in, when there is at least one
@@ -308,7 +316,7 @@ pub(crate) fn spawn_aggregator(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            emit_aggregate_snapshot();
+            emit_aggregate_snapshot(&local_peer_id);
         }
     });
     monitor.register("shadow_rtt_aggregator", handle);
@@ -332,7 +340,7 @@ pub(crate) fn spawn_aggregator(
 /// path that `TelemetryReporter` consumes). Without that, the
 /// aggregate would land only in per-node file logs and the 2-4 week
 /// observation the RFC calls for would require manual log scraping.
-fn emit_aggregate_snapshot() {
+fn emit_aggregate_snapshot(local_peer_id: &str) {
     let snap = registry_snapshot();
     let active_peers = snap.len();
     if active_peers == 0 {
@@ -364,13 +372,15 @@ fn emit_aggregate_snapshot() {
         median_inflation_us,
         "shadow_rtt_aggregate"
     );
-    // Mirror the aggregate to the central OTLP collector. The
-    // tracing event above lands only in per-node file logs; this
+    // Mirror the aggregate to the central OTLP collector tagged with
+    // the local peer id so the collector can disaggregate per node.
+    // The tracing event above lands only in per-node file logs; this
     // call surfaces the same numbers in the freenet telemetry
     // dashboard so the 2-4 week observation horizon is queryable
     // without manual log scraping.
-    crate::tracing::telemetry::send_standalone_event(
+    crate::tracing::telemetry::send_standalone_event_with_peer_id(
         "shadow_rtt_aggregate",
+        local_peer_id,
         serde_json::json!({
             "active_peers": active_peers,
             "peers_with_recent": peers_with_recent,
@@ -735,7 +745,7 @@ mod tests {
         use crate::node::background_task_monitor::BackgroundTaskMonitor;
 
         let monitor = BackgroundTaskMonitor::new();
-        spawn_aggregator(&monitor);
+        spawn_aggregator("test-peer".to_string(), &monitor);
 
         // Register a peer so emit_aggregate_snapshot has something to
         // report (active_peers == 0 short-circuits).
