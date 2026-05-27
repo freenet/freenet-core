@@ -55,7 +55,7 @@ use std::hash::Hash;
 /// `k × 0.6745 × σ`, so k=5 would correspond to ~3.37σ (≈ 1-in-1500),
 /// not the 1-in-a-million the design doc claims. See
 /// <https://en.wikipedia.org/wiki/Median_absolute_deviation#Relation_to_standard_deviation>.
-const MAD_GAUSSIAN_CONSISTENCY: f64 = 1.4826;
+pub(crate) const MAD_GAUSSIAN_CONSISTENCY: f64 = 1.4826;
 
 /// Configuration for the outlier detector. Defaults match the
 /// design-doc values: k=5 (1-in-a-million false-positive rate under

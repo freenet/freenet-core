@@ -24,6 +24,34 @@ static ROUTER: OnceLock<Arc<parking_lot::RwLock<Router>>> = OnceLock::new();
 pub type SubscriptionProvider =
     Arc<dyn Fn() -> Vec<SubscribedContractSnapshot> + Send + Sync + 'static>;
 
+/// Provider for the per-contract governance snapshot. Same pattern as
+/// `SubscriptionProvider`: registered at node startup, replaceable for
+/// multi-node test harnesses, used by `get_snapshot` to build the
+/// dashboard payload from real back-end data.
+///
+/// In production this closure captures `Arc<Ring>` and reads from
+/// `ring.governance` — the GovernanceManager populated by the
+/// meter-driven cost reporters and the HostingManager-driven demand
+/// reporters.
+pub type GovernanceProvider = Arc<dyn Fn() -> GovernanceSnapshot + Send + Sync + 'static>;
+
+static GOVERNANCE_PROVIDER: parking_lot::RwLock<Option<GovernanceProvider>> =
+    parking_lot::RwLock::new(None);
+
+/// Register the dashboard's governance data source. Replaces any
+/// previously-registered provider.
+pub fn set_governance_provider(provider: GovernanceProvider) {
+    *GOVERNANCE_PROVIDER.write() = Some(provider);
+}
+
+/// Clear the governance provider. Used by tests once they're added
+/// for the dashboard renderer (Phase 4.5).
+#[cfg(test)]
+#[allow(dead_code)] // consumed by Phase 4.5 dashboard tests
+pub(crate) fn clear_governance_provider() {
+    *GOVERNANCE_PROVIDER.write() = None;
+}
+
 /// Replaceable storage for the subscription provider. Wrapped in a
 /// `RwLock<Option<…>>` rather than `OnceLock` so multi-node in-process
 /// harnesses can re-wire the dashboard to the live node — and so a
@@ -417,6 +445,119 @@ pub struct NetworkStatusSnapshot {
     pub bytes_downloaded: u64,
     /// Overall node health level for the "everything looks good" indicator.
     pub health: HealthLevel,
+    /// Per-contract governance state (Phase 4). The dashboard's
+    /// verdict block, contracts table, ring inner-ring, and
+    /// distribution histogram all read from this. Empty when the
+    /// governance manager has no contracts yet (cold start).
+    ///
+    /// `#[allow(dead_code)]` is on the inner types — see
+    /// `GovernanceSnapshot` — and that flows through; CI lint
+    /// strictness on `-D warnings` flags the outer field anyway, so
+    /// we silence it here too with the same justification.
+    #[allow(dead_code)] // consumed by the dashboard renderer (Phase 4.5)
+    pub governance: GovernanceSnapshot,
+}
+
+/// Snapshot of the governance system's state, mirrored from
+/// `crate::contract::governance::GovernanceManager`. Public-facing
+/// mirror so the manager's `pub(crate)` types stay internal.
+///
+/// Fields are consumed by the dashboard renderer in `home_page.rs`
+/// (Phase 4.5, landing in a subsequent commit). The `#[allow]` lives
+/// here so the snapshot can be built and tested independently of the
+/// renderer landing.
+#[allow(dead_code)] // consumed by the dashboard renderer (Phase 4.5)
+#[derive(Default)]
+pub struct GovernanceSnapshot {
+    /// Off / DryRun / Enforce — visible on the dashboard as the
+    /// "mode" pill.
+    pub mode: GovernanceModeSnapshot,
+    /// One entry per contract the manager is currently tracking.
+    pub contracts: Vec<ContractGovernanceEntry>,
+    /// Network-level statistics from the last reaper tick. Drives
+    /// the median / MAD / threshold / sample-size mini-tiles.
+    pub norms: NetworkNorms,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GovernanceModeSnapshot {
+    Off,
+    #[default]
+    DryRun,
+    Enforce,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GovernanceStateSnapshot {
+    Normal,
+    Borderline,
+    WouldEvict,
+    Evicted,
+    Banned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GovernanceTransitionReasonSnapshot {
+    FirstSeen,
+    BorderlineEntered,
+    ThresholdCrossed,
+    Evicted,
+    BanTriggered,
+    Recovered,
+    BanLifted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GovernanceSkipReasonSnapshot {
+    InsufficientSamples,
+    MadCollapsed,
+    NoExtractableRatios,
+}
+
+#[allow(dead_code)] // consumed by the dashboard renderer (Phase 4.5)
+#[derive(Debug, Clone)]
+pub struct ContractGovernanceEntry {
+    /// `key.id().to_string()` — same string the dashboard's
+    /// contracts-table renders.
+    pub instance_id: String,
+    /// Short-form key (first ~10 chars) for the dashboard's compact
+    /// labels on the ring.
+    pub instance_id_short: String,
+    pub state: GovernanceStateSnapshot,
+    pub cost_used: f64,
+    pub benefit_score: f64,
+    /// log10(cost/benefit). None when benefit_score is too small to
+    /// produce a stable ratio.
+    pub log_ratio: Option<f64>,
+    /// Age in seconds since first observation.
+    pub age_secs: u64,
+    /// Seconds since the last state transition.
+    pub last_transition_secs_ago: u64,
+    /// State history (bounded). Newest last.
+    pub history: Vec<GovernanceTransitionEntry>,
+}
+
+#[allow(dead_code)] // consumed by the dashboard renderer (Phase 4.5)
+#[derive(Debug, Clone)]
+pub struct GovernanceTransitionEntry {
+    /// Seconds ago this transition happened.
+    pub secs_ago: u64,
+    pub from: GovernanceStateSnapshot,
+    pub to: GovernanceStateSnapshot,
+    pub reason: GovernanceTransitionReasonSnapshot,
+}
+
+#[allow(dead_code)] // consumed by the dashboard renderer (Phase 4.5)
+#[derive(Default, Debug, Clone)]
+pub struct NetworkNorms {
+    pub median_log_ratio: Option<f64>,
+    pub mad: Option<f64>,
+    pub threshold: Option<f64>,
+    pub sample_size: usize,
+    /// True if the threshold was clamped at the capacity ceiling
+    /// instead of being driven by the MAD-derived value.
+    pub capacity_ceiling_binding: bool,
+    pub skip_reason: Option<GovernanceSkipReasonSnapshot>,
 }
 
 /// Overall health verdict for the node, synthesized from multiple signals.
@@ -646,6 +787,11 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
         bytes_uploaded,
         bytes_downloaded,
         health,
+        governance: GOVERNANCE_PROVIDER
+            .read()
+            .as_ref()
+            .map(|provider| provider())
+            .unwrap_or_default(),
     })
 }
 

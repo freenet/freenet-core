@@ -139,8 +139,15 @@ impl NodeP2P {
         // ring state so the panel doesn't drift the way the legacy
         // `record_subscription` mirror did.
         let ring = self.op_manager.ring.clone();
-        super::network_status::set_subscription_provider(std::sync::Arc::new(move || {
-            ring.dashboard_subscription_snapshot()
+        super::network_status::set_subscription_provider(std::sync::Arc::new({
+            let ring = ring.clone();
+            move || ring.dashboard_subscription_snapshot()
+        }));
+        // Same pattern for the per-contract governance snapshot —
+        // dashboard reads live state from the GovernanceManager
+        // populated by the meter and HostingManager wiring.
+        super::network_status::set_governance_provider(std::sync::Arc::new(move || {
+            ring.dashboard_governance_snapshot()
         }));
 
         // Emit peer startup event

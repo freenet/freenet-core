@@ -9,6 +9,7 @@ use freenet_stdlib::prelude::*;
 
 mod executor;
 mod fair_queue;
+pub(crate) mod governance;
 mod handler;
 pub mod storages;
 pub(crate) mod user_input;
