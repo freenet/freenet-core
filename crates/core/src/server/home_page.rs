@@ -457,6 +457,25 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Generate a deterministic HSL colour from an address string.
+/// Returns a CSS colour string, e.g. `"hsl(210, 55%, 45%)"`.
+fn identicon_color(seed: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    seed.hash(&mut h);
+    let v = h.finish();
+    let hue = (v % 360) as u16;
+    format!("hsl({hue}, 55%, 48%)")
+}
+
+/// Build an HTML identicon span: a coloured circle whose background is
+/// deterministically derived from `seed`.
+fn identicon_html(seed: &str, class: &str) -> String {
+    let color = identicon_color(seed);
+    format!("<span class=\"{class}\" style=\"background:{color};\" aria-hidden=\"true\"></span>")
+}
+
 fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {
     let Some(snap) = snap else {
         return String::new();
@@ -599,8 +618,10 @@ fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Str
         } else {
             "—".to_string()
         };
+        let icon = identicon_html(&p.address.to_string(), "peer-identicon");
         rows.push_str(&format!(
-            r#"<tr class="peer-row" onclick="window.location='/peer/{addr_enc}'"><td data-sort="{addr_enc}"><code>{addr}</code></td><td data-sort="{loc_sort}">{loc}</td><td data-sort="{ptype}">{ptype}</td><td data-sort="{bytes_sent}">{sent}</td><td data-sort="{bytes_recv}">{recv}</td><td data-sort="{conn_secs}">{connected}</td></tr>"#,
+            r#"<tr class="peer-row" onclick="window.location='/peer/{addr_enc}'"><td data-sort="{addr_enc}">{icon}<code>{addr}</code></td><td data-sort="{loc_sort}">{loc}</td><td data-sort="{ptype}">{ptype}</td><td data-sort="{bytes_sent}">{sent}</td><td data-sort="{bytes_recv}">{recv}</td><td data-sort="{conn_secs}">{connected}</td></tr>"#,
+            icon = icon,
             addr_enc = html_escape(&p.address.to_string()),
             addr = p.address,
             loc_sort = loc_sort,
@@ -752,7 +773,7 @@ fn build_ring_svg(
                 let path = curve_path(ox, oy, px, py, 0.55);
                 write!(
                     svg,
-                    "<path d=\"{path}\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"{sw:.1}\" stroke-opacity=\"{opacity}\" stroke-linecap=\"round\"/>"
+                    "<path d=\"{path}\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"{sw:.1}\" stroke-opacity=\"{opacity}\" stroke-linecap=\"round\" class=\"arc-flow\"/>"
                 )
                 .ok();
             }
@@ -853,7 +874,7 @@ fn build_ring_svg(
         let (ox, oy) = loc_to_xy(own_loc, r_outer);
         write!(
             svg,
-            "<g class=\"ring-self\"><title>You (loc {own_loc:.4})</title><circle cx=\"{ox:.1}\" cy=\"{oy:.1}\" r=\"6\" fill=\"#43c178\" stroke=\"#ebecf0\" stroke-width=\"1.5\"/><text x=\"{lx:.1}\" y=\"{ly:.1}\" text-anchor=\"middle\" fill=\"#43c178\" font-family=\"monospace\" font-size=\"9\" font-weight=\"500\" letter-spacing=\"0.05em\">YOU</text></g>",
+            "<g class=\"ring-self\"><title>You (loc {own_loc:.4})</title><circle cx=\"{ox:.1}\" cy=\"{oy:.1}\" r=\"6\" fill=\"#43c178\" stroke=\"#ebecf0\" stroke-width=\"1.5\" class=\"you-dot\"/><text x=\"{lx:.1}\" y=\"{ly:.1}\" text-anchor=\"middle\" fill=\"#43c178\" font-family=\"monospace\" font-size=\"9\" font-weight=\"500\" letter-spacing=\"0.05em\">YOU</text></g>",
             lx = ox,
             ly = oy + 18.0,
         )
@@ -1446,6 +1467,17 @@ main {
     margin: 0.5rem 0;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+@keyframes arc-flow {
+    to { stroke-dashoffset: -24; }
+}
+@keyframes peer-fade-in {
+    from { opacity: 0; transform: translateY(-6px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes you-pulse {
+    0%, 100% { r: 6; }
+    50%      { r: 8.5; }
+}
 .warning {
     background: rgba(251, 191, 36, 0.1);
     border: 1px solid rgba(251, 191, 36, 0.3);
@@ -1771,11 +1803,54 @@ p:last-child { margin-bottom: 0; }
     transition: border-color 0.15s;
 }
 .theme-btn:hover { border-color: var(--text-secondary); }
-@media (max-width: 600px) {
-    .op-grid { grid-template-columns: repeat(2, 1fr); }
-    header { padding: 0.5rem 1rem; }
-    main { margin: 1rem auto; }
-    .ring-svg { width: 180px; height: 180px; }
+
+/* ── Mobile responsive ── */
+@media (max-width: 768px) {
+    main { margin: 0.75rem auto; padding: 0 0.5rem; }
+    header {
+        flex-wrap: wrap; gap: 0.4rem; padding: 0.5rem 0.75rem;
+    }
+    .header-left { flex-wrap: wrap; gap: 0.3rem; }
+    .header-right { margin-left: auto; }
+    .pub-key-label { display: none; }
+    .pub-key { max-width: 10ch; font-size: 0.65rem; }
+    .copy-btn { font-size: 0.65rem; padding: 0.15rem 0.3rem; }
+    .uptime { font-size: 0.7rem; }
+    .badge, .update-badge { font-size: 0.65rem; }
+
+    .card { padding: 0.75rem 1rem; border-radius: 8px; }
+
+    .metrics-row { flex-wrap: wrap; gap: 0.35rem; }
+    .metric-tile { flex: 1 1 30%; min-width: 5rem; padding: 0.4rem; }
+    .metric-value { font-size: 1.1rem; }
+    .metric-label { font-size: 0.6rem; }
+
+    .peer-table { font-size: 0.72rem; }
+    .peer-table th, .peer-table td { padding: 0.3rem 0.4rem; }
+    .peer-table th:nth-child(4), .peer-table td:nth-child(4),
+    .peer-table th:nth-child(5), .peer-table td:nth-child(5) { display: none; }
+
+    .transfer-stat { flex-direction: column; align-items: flex-start; gap: 0.2rem; }
+    .transfer-value { font-size: 0.95rem; }
+
+    .op-grid { grid-template-columns: repeat(2, 1fr); gap: 0.35rem; }
+    .op-card { padding: 0.5rem; }
+    .op-label { font-size: 0.6rem; }
+    .op-value { font-size: 0.9rem; }
+
+    .ring-wrap { margin-bottom: 0.5rem; }
+    .ring-svg { width: 160px; height: 160px; }
+
+    .governance-grid { grid-template-columns: 1fr; }
+    .app-list li { padding: 0.4rem 0; }
+}
+@media (max-width: 400px) {
+    .header-title { font-size: 0.9rem; }
+    .header-scope { font-size: 0.65rem; padding: 0.1rem 0.35rem; }
+    .metric-tile { flex: 1 1 45%; }
+    .peer-table { font-size: 0.68rem; }
+    .op-grid { grid-template-columns: 1fr 1fr; }
+    .metrics-row { gap: 0.25rem; }
 }
 /* ── Ring SVG peer links ── */
 .ring-svg a.ring-peer-link { cursor: pointer; }
@@ -1789,6 +1864,53 @@ p:last-child { margin-bottom: 0; }
     stroke-width: 1.5;
 }
 .ring-svg a.ring-peer-link:focus { outline: none; }
+
+/* Data-flow arcs: animated dash pattern showing traffic direction */
+.ring-svg .arc-flow {
+    stroke-dasharray: 4 8;
+    animation: arc-flow 1.2s linear infinite;
+}
+/* "You" marker: subtle pulse */
+.ring-svg .you-dot {
+    animation: you-pulse 3s ease-in-out infinite;
+    transform-origin: center;
+}
+
+/* Peer table: fade-in rows */
+.peer-table tbody tr {
+    animation: peer-fade-in 0.35s ease-out both;
+}
+.peer-table tbody tr:nth-child(1) { animation-delay: 0.02s; }
+.peer-table tbody tr:nth-child(2) { animation-delay: 0.06s; }
+.peer-table tbody tr:nth-child(3) { animation-delay: 0.10s; }
+.peer-table tbody tr:nth-child(4) { animation-delay: 0.14s; }
+.peer-table tbody tr:nth-child(5) { animation-delay: 0.18s; }
+.peer-table tbody tr:nth-child(n+6) { animation-delay: 0.22s; }
+
+/* Peer identicon: coloured circle from address hash */
+.peer-identicon {
+    display: inline-block;
+    width: 20px; height: 20px; border-radius: 50%;
+    margin-right: 0.4rem; vertical-align: middle;
+    flex-shrink: 0;
+}
+.peer-identicon-lg {
+    width: 36px; height: 36px; border-radius: 50%;
+    margin-right: 0.6rem; flex-shrink: 0;
+}
+.copy-btn-inline {
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    background: none;
+    border: 1px solid var(--border-color);
+    border-radius: 3px;
+    padding: 0 0.35rem;
+    cursor: pointer;
+    margin-left: 0.4rem;
+    vertical-align: middle;
+}
+.copy-btn-inline:hover { color: var(--accent-light); border-color: var(--accent-light); }
 /* ── Sortable tables ── */
 table.sortable thead th {
     cursor: pointer;
@@ -2341,21 +2463,24 @@ fn peer_detail_html(address_str: &str) -> String {
     };
 
     // Build info card
+    let icon_lg = identicon_html(&peer.address.to_string(), "peer-identicon-lg");
+    let addr_enc = html_escape(&peer.address.to_string());
     let info_card = format!(
         r#"<div class="card">
             <h2>Peer Info</h2>
+            <div class="peer-header-row">{icon_lg}<div><strong>{ptype}</strong> <code>{addr}</code><button type="button" class="copy-btn-inline" onclick="copyToClipboard('{addr_enc}').then(function(){{showToast('Address copied')}})" title="Copy address">⎘</button></div></div>
             <div class="info-grid">
-                <div class="info-label">Address</div><div class="info-value"><code>{addr}</code></div>
                 <div class="info-label">Location</div><div class="info-value">{loc}</div>
-                <div class="info-label">Type</div><div class="info-value">{ptype}</div>
                 <div class="info-label">Connected</div><div class="info-value">{connected}</div>
                 <div class="info-label">Sent</div><div class="info-value">{sent}</div>
                 <div class="info-label">Received</div><div class="info-value">{recv}</div>
             </div>
         </div>"#,
-        addr = html_escape(&peer.address.to_string()),
-        loc = loc_str,
+        icon_lg = icon_lg,
         ptype = peer_type,
+        addr = addr_enc,
+        addr_enc = addr_enc,
+        loc = loc_str,
         connected = format_duration(peer.connected_secs),
         sent = format_bytes(peer.bytes_sent),
         recv = format_bytes(peer.bytes_received),
@@ -3333,6 +3458,16 @@ a.header-title {
     background: var(--bg-tertiary);
     padding: 0.1rem 0.45rem;
     border-radius: 4px;
+}
+.peer-header-row {
+    display: flex; align-items: center; gap: 0.5rem;
+    margin-bottom: 0.75rem;
+}
+.peer-header-row strong { color: var(--text-primary); margin-right: 0.3rem; }
+.peer-header-row code {
+    font-family: var(--font-mono); font-size: 0.85rem;
+    color: var(--text-secondary); background: var(--bg-tertiary);
+    padding: 0.1rem 0.5rem; border-radius: 4px;
 }
 .info-grid {
     display: grid;
