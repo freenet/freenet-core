@@ -576,6 +576,39 @@ pub(crate) async fn start_relay_request_update(
         return Ok(());
     }
 
+    // Phase 2 front-line rate limit. Catches sustained UPDATE floods
+    // from a single peer for a single contract at the receive
+    // boundary, in milliseconds — before the spawn cost, before
+    // contract handling, and well before the MAD-based governance
+    // reaper (which reacts in minutes). See
+    // `crate::ring::update_rate_limit` for design.
+    //
+    // Dedup-set membership is removed below so a real retry isn't
+    // permanently blocked by a single rejection.
+    let rate_decision = op_manager
+        .ring
+        .update_rate_limiter
+        .check_and_record(sender_addr, *key.id());
+    if !rate_decision.is_allowed() {
+        op_manager.active_relay_update_txs.remove(&incoming_tx);
+        if let crate::ring::update_rate_limit::RateLimitDecision::Rejected {
+            elapsed,
+            min_interval,
+        } = rate_decision
+        {
+            tracing::debug!(
+                tx = %incoming_tx,
+                %key,
+                %sender_addr,
+                elapsed_ms = elapsed.as_millis() as u64,
+                min_interval_ms = min_interval.as_millis() as u64,
+                phase = "relay_update_rate_limited",
+                "UPDATE relay: rejected by per-(sender, contract) rate limit"
+            );
+        }
+        return Ok(());
+    }
+
     tracing::debug!(
         tx = %incoming_tx,
         %key,

@@ -61,6 +61,7 @@ pub(crate) mod peer_cache;
 mod peer_connection_backoff;
 mod peer_key_location;
 pub mod topology_registry;
+pub(crate) mod update_rate_limit;
 
 /// Whether to auto-subscribe to contracts on GET.
 /// When true, GET operations will automatically subscribe to the contract
@@ -128,6 +129,12 @@ pub(crate) struct Ring {
     /// already records. Mode defaults to `DryRun` per the staged-
     /// rollout plan.
     pub(crate) governance: Arc<crate::contract::governance::GovernanceManager>,
+    /// Front-line per-(sender, contract) UPDATE rate limit. Catches
+    /// flood patterns at the receive boundary in milliseconds, before
+    /// the slower MAD-based governance reaper can react. See
+    /// `crate::ring::update_rate_limit` and `docs/design/contract-hardening.md`
+    /// Phase 2.
+    pub(crate) update_rate_limiter: Arc<update_rate_limit::UpdateRateLimiter>,
     event_register: Box<dyn NetEventRegister>,
     op_manager: RwLock<Option<Weak<OpManager>>>,
     /// Whether this peer is a gateway or not. This will affect behavior of the node when acquiring
@@ -267,6 +274,9 @@ impl Ring {
             hosting_manager: hosting::HostingManager::new(config.config.max_hosting_storage),
             broken_invariants: BrokenInvariantsTracker::new(),
             governance,
+            update_rate_limiter: Arc::new(update_rate_limit::UpdateRateLimiter::new(
+                time_source.clone(),
+            )),
             live_tx_tracker: live_tx_tracker.clone(),
             event_register: Box::new(event_register),
             op_manager: RwLock::new(None),
@@ -693,6 +703,12 @@ impl Ring {
             last_tick = now;
 
             let result = ring.governance_tick(elapsed);
+
+            // Cycle the UPDATE rate limiter's idle-entry cleanup on
+            // the same cadence. Keeps the `(sender, contract)` map
+            // bounded; CLEANUP_AGE is 5 minutes so this drops entries
+            // for pairs that haven't tried an UPDATE since then.
+            ring.update_rate_limiter.cleanup();
 
             // Network-norms summary at DEBUG — useful when debugging
             // calibration but too noisy for INFO on a healthy node.
