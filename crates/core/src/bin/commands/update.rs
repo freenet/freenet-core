@@ -1259,6 +1259,20 @@ pub(super) fn wrapper_needs_regen(current_template: &str, on_disk: &str) -> bool
     current_template != on_disk
 }
 
+/// Pure helper: validate a wrapper-sidecar hash string. SHA-256 hex is
+/// exactly 64 lowercase ASCII hex chars; anything else means the sidecar
+/// is truncated, corrupted, or was never a hash. Treating malformed
+/// as "no sidecar" (rather than as permanent UserModified) lets the
+/// host recover from a partial prior write — without this, a single
+/// interrupted update could lock the auto-update path forever.
+/// Code-first-reviewer flagged on PR #4286.
+#[allow(dead_code)]
+pub(super) fn is_valid_wrapper_hash(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Pure helper: SHA-256 hex digest of `content`. Used to fingerprint the
 /// wrapper we last wrote so a later `freenet update` can distinguish
 /// "Freenet's previous wrapper" from "a user-edited wrapper" (#3967).
@@ -1275,6 +1289,95 @@ pub(super) fn wrapper_content_hash(content: &str) -> String {
             write!(s, "{b:02x}").expect("writing to String is infallible");
             s
         })
+}
+
+/// The decision the auto-update path takes for the wrapper script,
+/// derived purely from the current template, the on-disk wrapper, and
+/// the on-disk sidecar — no I/O. Extracting this lets non-macOS CI
+/// runners exercise the full decision matrix (skeptical-reviewer
+/// flagged on PR #4286 that the macOS-only end-to-end tests don't run
+/// in CI today).
+#[derive(Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(super) enum WrapperAction {
+    /// On-disk wrapper matches the current template byte-for-byte.
+    /// No rewrite needed. If `backfill_sidecar` is `Some`, the caller
+    /// should write that hash to the sidecar — covers the case where
+    /// the wrapper is up-to-date but the sidecar is missing or
+    /// malformed (self-heal so user-modification protection is in
+    /// force on the next update).
+    UpToDate { backfill_sidecar: Option<String> },
+    /// On-disk wrapper differs from the template and we have grounds
+    /// to overwrite it: no on-disk wrapper, or the sidecar shows the
+    /// wrapper is the one we wrote previously. The caller should
+    /// write `template` plus a sidecar containing `new_hash`.
+    WriteOurs { new_hash: String },
+    /// On-disk wrapper differs AND the sidecar records a different
+    /// hash, indicating the user (or another tool) edited it. The
+    /// caller should leave the wrapper alone and warn.
+    /// `on_disk_hash` is the hash of the current on-disk content,
+    /// provided so the warning message can include it.
+    UserModified { on_disk_hash: String },
+}
+
+/// Pure helper: decide what to do with the macOS launchd wrapper given
+/// the inputs the caller has gathered from disk. Cross-platform-compiled
+/// so every CI runner exercises this decision matrix — closes the gap
+/// the skeptical reviewer flagged on PR #4286 about the macOS-only E2E
+/// tests not running in CI.
+///
+/// - `current_template`: what `generate_wrapper_script(binary)` would
+///   produce now.
+/// - `on_disk_wrapper`: `Some(content)` if the wrapper exists and was
+///   read successfully (`None` if missing or unreadable).
+/// - `sidecar_raw`: `Some(raw)` if the sidecar exists and was read
+///   successfully (`None` if missing or unreadable). The raw bytes
+///   are trimmed and validated as a 64-char hex string by this
+///   helper, so the caller doesn't need to pre-process.
+#[allow(dead_code)]
+pub(super) fn decide_wrapper_action(
+    current_template: &str,
+    on_disk_wrapper: Option<&str>,
+    sidecar_raw: Option<&str>,
+) -> WrapperAction {
+    let stored_hash = sidecar_raw
+        .map(|s| s.trim())
+        .filter(|s| is_valid_wrapper_hash(s));
+    let template_hash = wrapper_content_hash(current_template);
+
+    let Some(on_disk) = on_disk_wrapper else {
+        return WrapperAction::WriteOurs {
+            new_hash: template_hash,
+        };
+    };
+    if !wrapper_needs_regen(current_template, on_disk) {
+        // Wrapper byte-matches template. Backfill the sidecar if it's
+        // missing or malformed, so a future hand-edit triggers the
+        // user-modification path instead of silently being clobbered.
+        let backfill_sidecar = match stored_hash {
+            Some(s) if s == template_hash => None,
+            _ => Some(template_hash),
+        };
+        return WrapperAction::UpToDate { backfill_sidecar };
+    }
+    let on_disk_hash = wrapper_content_hash(on_disk);
+    match stored_hash {
+        Some(s) if s != on_disk_hash => WrapperAction::UserModified { on_disk_hash },
+        _ => WrapperAction::WriteOurs {
+            new_hash: template_hash,
+        },
+    }
+}
+
+/// Write the wrapper hash sidecar in the canonical on-disk format
+/// (single line of 64 lowercase hex chars + trailing newline). Single
+/// source of truth so `install_macos_service` and
+/// `ensure_service_file_updated` cannot drift apart on the format
+/// — a divergence would loop-rewrite the wrapper on every update.
+/// Testing-reviewer flagged on PR #4286.
+#[allow(dead_code)]
+pub(super) fn write_wrapper_hash_sidecar(path: &Path, hash: &str) -> std::io::Result<()> {
+    fs::write(path, format!("{hash}\n"))
 }
 
 #[cfg(target_os = "macos")]
@@ -1294,40 +1397,21 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
     let wrapper_path = home_dir.join(".local/bin/freenet-service-wrapper.sh");
     let wrapper_hash_path = wrapper_path.with_extension("sh.hash");
 
-    // Equality-check against the current template (see
-    // `wrapper_needs_regen` docs re: issue #3967).
     let new_wrapper_content = generate_wrapper_script(binary_path);
 
-    // Tri-state so we can warn (and skip) when the user has
-    // hand-edited their wrapper rather than silently overwriting it.
-    enum WrapperPlan {
-        UpToDate,
-        WriteOurs,
-        UserModified(String), // hex hash of the on-disk file
-    }
-
-    let plan = if wrapper_path.exists() {
-        let on_disk = fs::read_to_string(&wrapper_path).context("Failed to read wrapper script")?;
-        if !wrapper_needs_regen(&new_wrapper_content, &on_disk) {
-            WrapperPlan::UpToDate
-        } else {
-            let on_disk_hash = wrapper_content_hash(&on_disk);
-            // Sidecar absent: pre-#3967 migration case, treat as ours.
-            // Sidecar matches on-disk hash: ours, safe to overwrite.
-            // Sidecar mismatches: user (or some tool) edited the
-            // wrapper since we wrote it — back off.
-            match fs::read_to_string(&wrapper_hash_path) {
-                Ok(stored) if stored.trim() != on_disk_hash => {
-                    WrapperPlan::UserModified(on_disk_hash)
-                }
-                _ => WrapperPlan::WriteOurs,
-            }
-        }
-    } else {
-        WrapperPlan::WriteOurs
-    };
-
-    let wrapper_needs_update = matches!(plan, WrapperPlan::WriteOurs);
+    // A non-UTF-8 wrapper on disk (very unusual for a shell script,
+    // but possible if corruption snuck in) is treated the same as a
+    // missing wrapper: we'll overwrite. Otherwise the whole update
+    // path would abort with a misleading "Failed to read wrapper
+    // script" error on an obviously-recoverable state.
+    // Skeptical-reviewer flagged on PR #4286.
+    let on_disk_wrapper = fs::read_to_string(&wrapper_path).ok();
+    let sidecar_raw = fs::read_to_string(&wrapper_hash_path).ok();
+    let action = decide_wrapper_action(
+        &new_wrapper_content,
+        on_disk_wrapper.as_deref(),
+        sidecar_raw.as_deref(),
+    );
 
     // Also force regeneration of the plist if it still points
     // StandardOutPath/StandardErrorPath at the unrotated freenet.log
@@ -1350,83 +1434,94 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
         }
     };
 
-    // Step 1: regenerate the wrapper FIRST. The plist's ProgramArguments
+    // Step 1: act on the wrapper FIRST. The plist's ProgramArguments
     // points at this wrapper path, so the wrapper must exist and be
-    // executable before we point launchd at it. If wrapper regen fails,
-    // we exit BEFORE rewriting the plist so the system stays in its
-    // previous-working state.
-    if let WrapperPlan::UserModified(on_disk_hash) = &plan {
-        if !quiet {
-            eprintln!(
-                "Warning: wrapper script at {} differs from the current Freenet \
-                 template AND from the hash recorded in {}, suggesting it has \
-                 been hand-edited. Leaving it alone. To accept the bundled \
-                 wrapper, delete the .sh.hash sidecar or reinstall via \
-                 `freenet service install`. (on-disk hash: {})",
-                wrapper_path.display(),
-                wrapper_hash_path.display(),
-                on_disk_hash,
-            );
-        }
-    }
-
-    if wrapper_needs_update {
-        if !quiet {
-            println!("Updating service wrapper to add auto-update support...");
-        }
-
-        // Ensure wrapper directory exists
-        let wrapper_dir = wrapper_path
-            .parent()
-            .context("Wrapper path has no parent directory")?;
-        fs::create_dir_all(wrapper_dir).context("Failed to create wrapper directory")?;
-
-        // Create backup of existing wrapper script if it exists
-        if wrapper_path.exists() {
-            let backup_path = wrapper_path.with_extension("sh.bak");
-            if let Err(e) = fs::copy(&wrapper_path, &backup_path) {
-                if !quiet {
-                    eprintln!(
-                        "Warning: Failed to backup wrapper script: {}. Continuing anyway.",
-                        e
-                    );
-                }
-            } else if !quiet {
-                println!("Backed up existing wrapper script to {:?}", backup_path);
-            }
-        }
-
-        fs::write(&wrapper_path, &new_wrapper_content).context("Failed to write wrapper script")?;
-
-        // Sidecar records the hash of what we just wrote so a later
-        // auto-update can detect a user-edited wrapper (#3967). A
-        // failed sidecar write only weakens future protection — it
-        // does NOT invalidate the wrapper we just wrote, so warn but
-        // continue.
-        let new_hash = wrapper_content_hash(&new_wrapper_content);
-        if let Err(e) = fs::write(&wrapper_hash_path, format!("{new_hash}\n")) {
+    // executable before we point launchd at it. If wrapper regen
+    // fails we exit BEFORE rewriting the plist so the system stays
+    // in its previous-working state.
+    match &action {
+        WrapperAction::UserModified { on_disk_hash } => {
             if !quiet {
                 eprintln!(
-                    "Warning: failed to write wrapper hash sidecar at {}: {}. \
-                     User-modification detection on the next `freenet update` \
-                     will fall back to treating the wrapper as ours.",
+                    "Warning: wrapper script at {} differs from the current Freenet \
+                     template AND from the hash recorded in {}, suggesting it has \
+                     been hand-edited. Leaving it alone. To accept the bundled \
+                     wrapper, delete the .sh.hash sidecar or reinstall via \
+                     `freenet service install`. (on-disk hash: {})",
+                    wrapper_path.display(),
                     wrapper_hash_path.display(),
-                    e
+                    on_disk_hash,
                 );
             }
         }
-
-        // Make executable
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(&wrapper_path)?.permissions();
-            perms.set_mode(0o755);
-            fs::set_permissions(&wrapper_path, perms)?;
+        WrapperAction::UpToDate {
+            backfill_sidecar: Some(h),
+        } => {
+            if let Err(e) = write_wrapper_hash_sidecar(&wrapper_hash_path, h) {
+                if !quiet {
+                    eprintln!(
+                        "Warning: failed to backfill wrapper hash sidecar at {}: {}.",
+                        wrapper_hash_path.display(),
+                        e
+                    );
+                }
+            }
         }
+        WrapperAction::UpToDate {
+            backfill_sidecar: None,
+        } => {}
+        WrapperAction::WriteOurs { new_hash } => {
+            if !quiet {
+                println!("Updating service wrapper to add auto-update support...");
+            }
+            let wrapper_dir = wrapper_path
+                .parent()
+                .context("Wrapper path has no parent directory")?;
+            fs::create_dir_all(wrapper_dir).context("Failed to create wrapper directory")?;
 
-        if !quiet {
-            println!("Service wrapper updated with auto-update hook.");
+            if wrapper_path.exists() {
+                let backup_path = wrapper_path.with_extension("sh.bak");
+                if let Err(e) = fs::copy(&wrapper_path, &backup_path) {
+                    if !quiet {
+                        eprintln!(
+                            "Warning: Failed to backup wrapper script: {}. Continuing anyway.",
+                            e
+                        );
+                    }
+                } else if !quiet {
+                    println!("Backed up existing wrapper script to {:?}", backup_path);
+                }
+            }
+
+            fs::write(&wrapper_path, &new_wrapper_content)
+                .context("Failed to write wrapper script")?;
+
+            // Failed sidecar write only weakens future user-mod
+            // protection; it does not invalidate the wrapper we
+            // just wrote, so warn but continue.
+            if let Err(e) = write_wrapper_hash_sidecar(&wrapper_hash_path, new_hash) {
+                if !quiet {
+                    eprintln!(
+                        "Warning: failed to write wrapper hash sidecar at {}: {}. \
+                         User-modification detection on the next `freenet update` \
+                         will fall back to treating the wrapper as ours.",
+                        wrapper_hash_path.display(),
+                        e
+                    );
+                }
+            }
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = fs::metadata(&wrapper_path)?.permissions();
+                perms.set_mode(0o755);
+                fs::set_permissions(&wrapper_path, perms)?;
+            }
+
+            if !quiet {
+                println!("Service wrapper updated with auto-update hook.");
+            }
         }
     }
 
@@ -2068,6 +2163,191 @@ done
     }
 
     #[test]
+    fn is_valid_wrapper_hash_accepts_real_sha256_hex_only() {
+        // 64 lowercase hex chars: the actual SHA-256 shape.
+        let good = wrapper_content_hash("anything");
+        assert!(is_valid_wrapper_hash(&good));
+        assert!(is_valid_wrapper_hash(&"a".repeat(64)));
+        assert!(is_valid_wrapper_hash(&"0123456789abcdef".repeat(4)));
+
+        // Reject everything else — these are all "malformed sidecar"
+        // shapes that, before the carve-out, would have locked the
+        // host into permanent UserModified.
+        assert!(!is_valid_wrapper_hash(""), "empty");
+        assert!(!is_valid_wrapper_hash("not a hash"), "free text");
+        assert!(!is_valid_wrapper_hash(&"a".repeat(63)), "truncated");
+        assert!(!is_valid_wrapper_hash(&"a".repeat(65)), "too long");
+        assert!(
+            !is_valid_wrapper_hash(&"A".repeat(64)),
+            "uppercase rejected — wrapper_content_hash always emits lowercase"
+        );
+        assert!(
+            !is_valid_wrapper_hash(&"g".repeat(64)),
+            "non-hex char rejected"
+        );
+    }
+
+    // ---- decide_wrapper_action: pure decision matrix. ----
+    //
+    // Skeptical-reviewer flagged that the macOS-only end-to-end tests
+    // for `ensure_service_file_updated` don't run in CI (`ci.yml` has
+    // no macOS `cargo test` job). Extracting the decision logic into
+    // this pure helper closes that gap: every CI runner exercises the
+    // matrix below regardless of target OS, so a future regression on
+    // any branch is caught at PR time.
+
+    /// Build the "current" template + its hash for use in the
+    /// decision-matrix tests below. The exact content is irrelevant;
+    /// what matters is that on-disk wrappers we feed in differ from
+    /// it for the regen cases and match it for the up-to-date cases.
+    fn fixture_template() -> (String, String) {
+        let t = "#!/bin/bash\necho fixture\n".to_string();
+        let h = wrapper_content_hash(&t);
+        (t, h)
+    }
+
+    #[test]
+    fn decide_wrapper_action_no_wrapper_writes_ours() {
+        let (template, hash) = fixture_template();
+        assert_eq!(
+            decide_wrapper_action(&template, None, None),
+            WrapperAction::WriteOurs { new_hash: hash }
+        );
+    }
+
+    #[test]
+    fn decide_wrapper_action_stale_wrapper_no_sidecar_writes_ours_3967() {
+        // The migration shape for every pre-#3967 install: wrapper
+        // differs from current template (e.g. missing the pkill
+        // block) and no sidecar exists. Treat as ours so the host
+        // can recover.
+        let (template, hash) = fixture_template();
+        let stale = "#!/bin/bash\n# stale Jan 2026 wrapper\n";
+        assert_eq!(
+            decide_wrapper_action(&template, Some(stale), None),
+            WrapperAction::WriteOurs { new_hash: hash }
+        );
+    }
+
+    #[test]
+    fn decide_wrapper_action_stale_wrapper_matching_sidecar_writes_ours() {
+        // Sidecar present and matches the on-disk hash: it's ours,
+        // safe to overwrite (e.g. template drifted between releases).
+        let (template, template_hash) = fixture_template();
+        let stale = "#!/bin/bash\n# previous Freenet wrapper\n";
+        let stale_hash = wrapper_content_hash(stale);
+        assert_eq!(
+            decide_wrapper_action(&template, Some(stale), Some(&stale_hash)),
+            WrapperAction::WriteOurs {
+                new_hash: template_hash
+            }
+        );
+    }
+
+    #[test]
+    fn decide_wrapper_action_stale_wrapper_with_trailing_newline_sidecar() {
+        // Sidecar with `\n` (the canonical on-disk form) must trim
+        // and validate as ours. Pins the wire-format contract between
+        // `write_wrapper_hash_sidecar` and `decide_wrapper_action` —
+        // testing-reviewer flagged on PR #4286 that a future
+        // refactor dropping the trim would silently break.
+        let (template, template_hash) = fixture_template();
+        let stale = "#!/bin/bash\n# previous Freenet wrapper\n";
+        let sidecar_with_newline = format!("{}\n", wrapper_content_hash(stale));
+        assert_eq!(
+            decide_wrapper_action(&template, Some(stale), Some(&sidecar_with_newline)),
+            WrapperAction::WriteOurs {
+                new_hash: template_hash
+            },
+            "matching sidecar with trailing newline must validate the same as one without",
+        );
+    }
+
+    #[test]
+    fn decide_wrapper_action_user_modified_wrapper_is_preserved() {
+        let (template, _) = fixture_template();
+        let edited = "#!/bin/bash\n# user customized this\n";
+        let edited_hash = wrapper_content_hash(edited);
+        // Sidecar records what Freenet wrote previously (different
+        // from what's currently on disk → user edited it).
+        let prior_freenet_hash = wrapper_content_hash("#!/bin/bash\n# prior Freenet\n");
+        assert_eq!(
+            decide_wrapper_action(&template, Some(edited), Some(&prior_freenet_hash)),
+            WrapperAction::UserModified {
+                on_disk_hash: edited_hash
+            }
+        );
+    }
+
+    #[test]
+    fn decide_wrapper_action_malformed_sidecar_treated_as_missing_3967() {
+        // Truncated / corrupted sidecar must NOT lock the host into
+        // permanent UserModified — fall through to WriteOurs so the
+        // auto-update path can recover from a partial prior write.
+        let (template, hash) = fixture_template();
+        let stale = "#!/bin/bash\n# stale\n";
+        // Truncated hex (length 6 — not 64).
+        assert_eq!(
+            decide_wrapper_action(&template, Some(stale), Some("deadbe")),
+            WrapperAction::WriteOurs {
+                new_hash: hash.clone()
+            }
+        );
+        // Free text.
+        assert_eq!(
+            decide_wrapper_action(&template, Some(stale), Some("not a hash at all")),
+            WrapperAction::WriteOurs {
+                new_hash: hash.clone()
+            }
+        );
+        // Empty file.
+        assert_eq!(
+            decide_wrapper_action(&template, Some(stale), Some("")),
+            WrapperAction::WriteOurs { new_hash: hash }
+        );
+    }
+
+    #[test]
+    fn decide_wrapper_action_up_to_date_with_matching_sidecar_is_noop() {
+        let (template, template_hash) = fixture_template();
+        assert_eq!(
+            decide_wrapper_action(&template, Some(&template), Some(&template_hash)),
+            WrapperAction::UpToDate {
+                backfill_sidecar: None
+            }
+        );
+    }
+
+    #[test]
+    fn decide_wrapper_action_up_to_date_with_missing_sidecar_backfills() {
+        // Pre-#3967 install with a wrapper that happens to be
+        // byte-identical to today's template (rare but possible)
+        // — backfill the sidecar so future user-mod protection
+        // works. Code-first-reviewer flagged on PR #4286.
+        let (template, template_hash) = fixture_template();
+        assert_eq!(
+            decide_wrapper_action(&template, Some(&template), None),
+            WrapperAction::UpToDate {
+                backfill_sidecar: Some(template_hash)
+            }
+        );
+    }
+
+    #[test]
+    fn decide_wrapper_action_up_to_date_with_malformed_sidecar_backfills() {
+        // Same self-heal as the missing-sidecar case: a corrupted
+        // sidecar (truncated, free text, etc.) gets overwritten with
+        // a valid one when the wrapper is already up to date.
+        let (template, template_hash) = fixture_template();
+        assert_eq!(
+            decide_wrapper_action(&template, Some(&template), Some("garbage")),
+            WrapperAction::UpToDate {
+                backfill_sidecar: Some(template_hash)
+            }
+        );
+    }
+
+    #[test]
     fn wrapper_content_hash_is_stable_and_distinct() {
         let a = wrapper_content_hash("hello");
         let b = wrapper_content_hash("hello");
@@ -2109,16 +2389,35 @@ done
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
             let prior = std::env::var_os("HOME");
-            std::env::set_var("HOME", path);
+            // SAFETY: Rust 2024 marks `set_var`/`remove_var` unsafe
+            // because other threads could be reading the environment
+            // concurrently. The static `HOME_ENV_LOCK` mutex
+            // serializes ALL test code in this module that touches
+            // `HOME`, and nothing else in this crate's test binary
+            // reads `HOME` while a `ScopedHome` is alive. The
+            // serialization is local to the cargo-test process, which
+            // is what matters: cargo runs each binary in its own
+            // process, so HOME-touching tests in other binaries (the
+            // lib tests, integration tests, etc.) don't share state
+            // with this one.
+            unsafe {
+                std::env::set_var("HOME", path);
+            }
             Self { prior, _lock: lock }
         }
     }
     #[cfg(target_os = "macos")]
     impl Drop for ScopedHome {
         fn drop(&mut self) {
-            match self.prior.take() {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
+            // SAFETY: same lock-guarded reasoning as `ScopedHome::new`
+            // above; the `_lock` field keeps the mutex held until
+            // after this drop runs, so no sibling test sees a
+            // mid-restore HOME value.
+            unsafe {
+                match self.prior.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
             }
         }
     }
@@ -2169,6 +2468,162 @@ done
             recorded.trim(),
             wrapper_content_hash(&new_content),
             "recorded sidecar hash must match the wrapper we just wrote"
+        );
+    }
+
+    /// Pin the install -> update no-op contract: when the wrapper is
+    /// byte-identical to the current template AND a matching sidecar
+    /// exists (the post-#3967 fresh-install shape), the next
+    /// `freenet update` must be a no-op. If either writer (`install`
+    /// in service.rs, the regen path here) ever changes the sidecar
+    /// format without the other matching, this test fails by
+    /// detecting the resulting regen loop. Testing reviewer flagged
+    /// this gap on PR #4286.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn ensure_service_file_updated_is_noop_after_fresh_install() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let fake_home = tmp.path();
+        let _home = ScopedHome::new(fake_home);
+
+        let launch_agents = fake_home.join("Library/LaunchAgents");
+        fs::create_dir_all(&launch_agents).unwrap();
+        fs::write(launch_agents.join("org.freenet.node.plist"), "<plist/>").unwrap();
+
+        let wrapper_dir = fake_home.join(".local/bin");
+        fs::create_dir_all(&wrapper_dir).unwrap();
+        let binary = wrapper_dir.join("freenet");
+
+        // Simulate what `install_macos_service` writes: wrapper text
+        // equal to what `generate_wrapper_script` produces now, plus
+        // a sidecar containing its SHA-256.
+        let wrapper = wrapper_dir.join("freenet-service-wrapper.sh");
+        let template = super::super::service::generate_wrapper_script(&binary);
+        fs::write(&wrapper, &template).unwrap();
+        let sidecar = wrapper.with_extension("sh.hash");
+        fs::write(&sidecar, format!("{}\n", wrapper_content_hash(&template))).unwrap();
+
+        // Snapshot mtimes so we can prove neither file was rewritten.
+        let wrapper_before = fs::metadata(&wrapper).unwrap().modified().unwrap();
+        let sidecar_before = fs::metadata(&sidecar).unwrap().modified().unwrap();
+
+        ensure_service_file_updated(&binary, /* quiet */ true).unwrap();
+
+        // Both files must still hold the same content AND have
+        // unchanged mtimes (no needless rewrite).
+        assert_eq!(fs::read_to_string(&wrapper).unwrap(), template);
+        assert_eq!(
+            fs::read_to_string(&sidecar).unwrap().trim(),
+            wrapper_content_hash(&template),
+        );
+        assert_eq!(
+            fs::metadata(&wrapper).unwrap().modified().unwrap(),
+            wrapper_before,
+            "wrapper must not be rewritten when already up to date \
+             — otherwise every `freenet update` loops on it"
+        );
+        assert_eq!(
+            fs::metadata(&sidecar).unwrap().modified().unwrap(),
+            sidecar_before,
+            "sidecar must not be rewritten when wrapper is already up to date"
+        );
+    }
+
+    /// Self-heal: if the wrapper is up-to-date but the sidecar is
+    /// missing (a prior wrapper write succeeded but the sidecar write
+    /// failed, or a pre-#3967 install that happened to land on the
+    /// current template), the next `freenet update` must backfill
+    /// the sidecar so the NEXT user-modification protection works.
+    /// Without this, the host stays in the "no sidecar = treat as
+    /// ours" migration state forever and a later hand-edit would be
+    /// silently clobbered on the next template change.
+    /// Code-first-reviewer flagged this on PR #4286.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn ensure_service_file_updated_backfills_missing_sidecar() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let fake_home = tmp.path();
+        let _home = ScopedHome::new(fake_home);
+
+        let launch_agents = fake_home.join("Library/LaunchAgents");
+        fs::create_dir_all(&launch_agents).unwrap();
+        fs::write(launch_agents.join("org.freenet.node.plist"), "<plist/>").unwrap();
+
+        let wrapper_dir = fake_home.join(".local/bin");
+        fs::create_dir_all(&wrapper_dir).unwrap();
+        let binary = wrapper_dir.join("freenet");
+
+        // Wrapper is up-to-date but no sidecar exists (the gap the
+        // self-heal closes).
+        let wrapper = wrapper_dir.join("freenet-service-wrapper.sh");
+        let template = super::super::service::generate_wrapper_script(&binary);
+        fs::write(&wrapper, &template).unwrap();
+        let sidecar = wrapper.with_extension("sh.hash");
+        assert!(!sidecar.exists(), "precondition: no sidecar");
+
+        ensure_service_file_updated(&binary, /* quiet */ true).unwrap();
+
+        // Wrapper unchanged.
+        assert_eq!(fs::read_to_string(&wrapper).unwrap(), template);
+        // Sidecar now present with the right hash.
+        assert_eq!(
+            fs::read_to_string(&sidecar).unwrap().trim(),
+            wrapper_content_hash(&template),
+            "sidecar must be backfilled when wrapper is up-to-date \
+             but sidecar was missing"
+        );
+    }
+
+    /// Malformed (truncated / corrupted) sidecar must NOT lock the
+    /// host into permanent `UserModified`: treating a non-64-hex
+    /// sidecar as "no sidecar" lets the auto-update path recover
+    /// after an interrupted prior write. The wrapper here is stale,
+    /// so the malformed sidecar should fall through to WriteOurs
+    /// rather than UserModified. Code-first-reviewer flagged this
+    /// on PR #4286.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn ensure_service_file_updated_treats_malformed_sidecar_as_missing() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let fake_home = tmp.path();
+        let _home = ScopedHome::new(fake_home);
+
+        let launch_agents = fake_home.join("Library/LaunchAgents");
+        fs::create_dir_all(&launch_agents).unwrap();
+        fs::write(launch_agents.join("org.freenet.node.plist"), "<plist/>").unwrap();
+
+        let wrapper_dir = fake_home.join(".local/bin");
+        fs::create_dir_all(&wrapper_dir).unwrap();
+        let wrapper = wrapper_dir.join("freenet-service-wrapper.sh");
+        let stale = "#!/bin/bash\n# stale Jan 2026 wrapper, no pkill block\n";
+        fs::write(&wrapper, stale).unwrap();
+        // Corrupted / truncated sidecar — what a partial prior write
+        // could leave behind.
+        fs::write(wrapper.with_extension("sh.hash"), "deadbe").unwrap();
+
+        let binary = wrapper_dir.join("freenet");
+        ensure_service_file_updated(&binary, /* quiet */ true).unwrap();
+
+        // Wrapper must have been rewritten — the malformed sidecar
+        // didn't latch the host into UserModified.
+        let new_content = fs::read_to_string(&wrapper).unwrap();
+        assert_ne!(new_content, stale, "stale wrapper must be replaced");
+        let expected = super::super::service::generate_wrapper_script(&binary);
+        assert_eq!(new_content, expected);
+        // Sidecar replaced with a real hash.
+        let recorded = fs::read_to_string(wrapper.with_extension("sh.hash")).unwrap();
+        assert!(
+            is_valid_wrapper_hash(recorded.trim()),
+            "sidecar must now hold a valid SHA-256, got {recorded:?}"
         );
     }
 
