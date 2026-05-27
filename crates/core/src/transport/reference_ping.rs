@@ -39,12 +39,12 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::net::UdpSocket;
 use tokio::time::Instant;
 
 use crate::config::GlobalRng;
 use crate::simulation::RealTime;
 use crate::transport::rolling_rtt_stats::RollingRttStats;
+use crate::transport::{DefaultSocket, Socket};
 
 /// Default reference target (Cloudflare public DNS over UDP).
 ///
@@ -89,7 +89,7 @@ pub(crate) fn spawn_reference_ping(
 ) {
     let handle = tokio::spawn(async move {
         let stats = Arc::new(RollingRttStats::new(RealTime::new()));
-        if let Err(e) = run_probe_loop(local_peer_id, target, stats).await {
+        if let Err(e) = run_probe_loop::<DefaultSocket>(local_peer_id, target, stats).await {
             // Reaching here means the loop itself failed to start
             // (e.g. could not bind the ephemeral socket). Per-tick
             // failures are absorbed inside the loop and never escape.
@@ -103,23 +103,20 @@ pub(crate) fn spawn_reference_ping(
     monitor.register("reference_ping", handle);
 }
 
-async fn run_probe_loop(
+async fn run_probe_loop<S: Socket>(
     local_peer_id: String,
     target: SocketAddr,
     stats: Arc<RollingRttStats<RealTime>>,
 ) -> std::io::Result<()> {
-    // Bind an ephemeral source socket. We use `tokio::net::UdpSocket`
-    // here intentionally: the abstract `Socket` trait exists to let
-    // peer-to-peer transport be exercised by `SimulationSocket`, but
-    // reference-ping talks to an external, real-world DNS resolver
-    // by design. There is no simulation surface for this code path
-    // and adding one would defeat the purpose of an out-of-band
-    // reference signal.
+    // Bind an ephemeral source socket via the `Socket` trait. The
+    // production caller substitutes `DefaultSocket` (a real UDP
+    // socket); the trait keeps reference-ping testable with a mock
+    // and matches the rest of the transport layer's abstraction.
     let bind_addr: SocketAddr = match target {
         SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
         SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
     };
-    let socket = UdpSocket::bind(bind_addr).await?;
+    let socket = S::bind(bind_addr).await?;
 
     let mut ticker = tokio::time::interval(PROBE_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -149,7 +146,7 @@ enum ProbeOutcome {
     SendError,
 }
 
-async fn probe_once(socket: &UdpSocket, target: SocketAddr) -> ProbeOutcome {
+async fn probe_once<S: Socket>(socket: &S, target: SocketAddr) -> ProbeOutcome {
     // tx_id only needs uniqueness within the in-flight probe window
     // (1s timeout, so essentially "the next response"). GlobalRng is
     // used for consistency with the rest of the crate; the value is
@@ -353,10 +350,14 @@ mod tests {
         // synthetic DNS response. This pins the full send → recv →
         // validate → record path against a regression that breaks any
         // step in isolation.
-        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = DefaultSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
         let server_addr = server.local_addr().unwrap();
 
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = DefaultSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
 
         // Echo a single matching response.
         let echo = tokio::spawn(async move {
@@ -394,10 +395,14 @@ mod tests {
         // must return NoResponse within ~RESPONSE_TIMEOUT and never
         // produce a sample. Pins the "do not poison baseline on
         // timeout" invariant from the module rustdoc.
-        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let silent = DefaultSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
         let silent_addr = silent.local_addr().unwrap();
 
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client = DefaultSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
 
         let start = Instant::now();
         let outcome = probe_once(&client, silent_addr).await;
@@ -419,11 +424,17 @@ mod tests {
         // unrelated process spraying replies on our ephemeral port)
         // must not satisfy the probe. Pins the `from == target` check
         // in `probe_once`.
-        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target = DefaultSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
         let target_addr = target.local_addr().unwrap();
 
-        let interloper = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let interloper = DefaultSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
+        let client = DefaultSocket::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+            .await
+            .unwrap();
         let client_addr = client.local_addr().unwrap();
 
         // Interloper sends a syntactically-valid DNS response (random
