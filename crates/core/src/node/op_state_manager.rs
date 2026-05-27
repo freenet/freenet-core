@@ -10,7 +10,10 @@ use std::{
     cmp::Reverse,
     collections::{BTreeSet, HashSet},
     net::SocketAddr,
-    sync::{Arc, OnceLock, atomic::AtomicBool},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -169,6 +172,14 @@ pub(crate) struct OpManager {
     /// downstream propagation stay on legacy `process_message`, gated
     /// by the dedup set's absence on those branches.
     pub(crate) active_relay_connect_txs: Arc<DashSet<Transaction>>,
+    /// Count of client-originated operation drivers currently running.
+    /// Bumped by `ClientOpGuard::new` (held inside each `run_client_*`
+    /// task) and decremented when the guard is dropped. Read by the
+    /// shutdown drain in `ShutdownHandle::shutdown` to wait for
+    /// client-initiated work (most importantly PUTs from the
+    /// `freenet-git` mirror) to finish before tearing down peer
+    /// connections. The drain is bounded by `config.shutdown_drain_secs`.
+    pub(crate) inflight_client_ops: Arc<AtomicUsize>,
 }
 
 impl Clone for OpManager {
@@ -200,7 +211,36 @@ impl Clone for OpManager {
             active_relay_put_txs: self.active_relay_put_txs.clone(),
             active_relay_subscribe_txs: self.active_relay_subscribe_txs.clone(),
             active_relay_connect_txs: self.active_relay_connect_txs.clone(),
+            inflight_client_ops: self.inflight_client_ops.clone(),
         }
+    }
+}
+
+/// RAII guard counting client-originated drivers in flight.
+///
+/// Construct via [`OpManager::client_op_guard`] at the start of each
+/// `run_client_*` task and let it drop when the task exits — every
+/// terminal path (happy path, infrastructure error, panic propagated
+/// through the spawn) decrements the counter exactly once, so missing
+/// a branch can't leak count.
+///
+/// The shutdown drain in `ShutdownHandle::shutdown` reads the counter
+/// via [`OpManager::inflight_client_op_count`] and waits for it to
+/// reach zero before letting the node tear down.
+pub(crate) struct ClientOpGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl ClientOpGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self { counter }
+    }
+}
+
+impl Drop for ClientOpGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -335,7 +375,24 @@ impl OpManager {
             active_relay_put_txs,
             active_relay_subscribe_txs,
             active_relay_connect_txs,
+            inflight_client_ops: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// Construct a guard that bumps the in-flight client-op counter for
+    /// its lifetime. Pair with `move`-ing the guard into the spawned
+    /// `run_client_*` future so the counter tracks the driver task, not
+    /// the synchronous `start_client_*` caller. See [`ClientOpGuard`]
+    /// for the shutdown-drain contract this counter serves.
+    pub(crate) fn client_op_guard(&self) -> ClientOpGuard {
+        ClientOpGuard::new(self.inflight_client_ops.clone())
+    }
+
+    /// Cloneable handle to the in-flight client-op counter. Used by
+    /// `ShutdownHandle` to read the counter from a separate task
+    /// without holding an `Arc<OpManager>` across the drain wait.
+    pub(crate) fn inflight_client_ops_handle(&self) -> Arc<AtomicUsize> {
+        self.inflight_client_ops.clone()
     }
 
     /// Set the request router for cleaning up stale entries when operations complete.

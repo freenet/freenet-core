@@ -137,14 +137,22 @@ pub(crate) async fn start_client_get(
     // via this function's return value. Not registered with
     // `BackgroundTaskMonitor`: per-transaction task that terminates via
     // happy path, exhaustion, timeout, or infra error.
-    GlobalExecutor::spawn(run_client_get(
-        op_manager,
-        client_tx,
-        instance_id,
-        return_contract_code,
-        subscribe,
-        blocking_subscribe,
-    ));
+    //
+    // `inflight_guard` is held for the lifetime of the spawned driver;
+    // see `ClientOpGuard` rustdoc for the shutdown-drain contract.
+    let inflight_guard = op_manager.client_op_guard();
+    GlobalExecutor::spawn(async move {
+        let _inflight_guard = inflight_guard;
+        run_client_get(
+            op_manager,
+            client_tx,
+            instance_id,
+            return_contract_code,
+            subscribe,
+            blocking_subscribe,
+        )
+        .await;
+    });
 
     Ok(client_tx)
 }
@@ -2462,6 +2470,37 @@ mod tests {
 
     fn dummy_tx() -> Transaction {
         Transaction::new::<GetMsg>()
+    }
+
+    /// `start_client_get` must acquire a `ClientOpGuard` before the
+    /// `GlobalExecutor::spawn` and move it into the spawned future.
+    /// See the sibling pin in `put/op_ctx_task.rs` for the full
+    /// rationale (shutdown drain depends on the per-driver counter).
+    #[test]
+    fn start_client_get_acquires_inflight_guard_before_spawn() {
+        let src = include_str!("op_ctx_task.rs");
+        let entry = src
+            .find("pub(crate) async fn start_client_get(")
+            .expect("start_client_get must exist");
+        let after_spawn = src[entry..]
+            .find("GlobalExecutor::spawn(")
+            .expect("start_client_get must spawn a driver task");
+        let before_spawn = &src[entry..entry + after_spawn];
+        assert!(
+            before_spawn.contains("op_manager.client_op_guard()"),
+            "start_client_get must call op_manager.client_op_guard() \
+             before GlobalExecutor::spawn (shutdown drain dependency)."
+        );
+        let spawned = &src[entry + after_spawn..];
+        let block_end = spawned
+            .find("\n    Ok(client_tx)")
+            .expect("start_client_get must return Ok(client_tx)");
+        let spawn_block = &spawned[..block_end];
+        assert!(
+            spawn_block.contains("let _inflight_guard = inflight_guard;"),
+            "the ClientOpGuard must be moved into the spawned future \
+             via `let _inflight_guard = inflight_guard;`."
+        );
     }
 
     #[test]

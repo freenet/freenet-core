@@ -89,7 +89,13 @@ impl NetworkPeer {
             identifier,
         )
         .await?;
-        let shutdown_handle = ShutdownHandle { tx: shutdown_tx };
+        // Tests don't need a drain window — disable it so tearing down
+        // a SimNetwork peer doesn't block on the 30s production default.
+        let shutdown_handle = ShutdownHandle {
+            tx: shutdown_tx,
+            inflight_client_ops: node_inner.op_manager.inflight_client_ops_handle(),
+            drain_timeout: std::time::Duration::ZERO,
+        };
         Ok(Node {
             inner: node_inner,
             shutdown_handle,

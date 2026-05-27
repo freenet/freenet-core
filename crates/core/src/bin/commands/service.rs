@@ -2559,9 +2559,13 @@ RestartSec=10
 # SuccessExitStatus=42 ensures auto-update exits don't count as failures.
 StartLimitBurst=5
 StartLimitIntervalSec=120
-# Allow 15 seconds for graceful shutdown before SIGKILL
-# The node handles SIGTERM to properly close peer connections
-TimeoutStopSec=15
+# Allow 45 seconds for graceful shutdown before SIGKILL.
+# The node handles SIGTERM by (1) waiting up to `shutdown-drain-secs`
+# (default 30s) for in-flight client PUT/GET/UPDATE/SUBSCRIBE drivers
+# to finish, then (2) closing peer connections. The 15s headroom over
+# the default drain covers peer-connection teardown + spawn-task
+# cleanup. If you raise `shutdown-drain-secs`, raise this in lockstep.
+TimeoutStopSec=45
 
 # Auto-update: if peer exits with code 42 (version mismatch with gateway),
 # run update before systemd restarts the service. The '-' prefix means
@@ -2633,9 +2637,13 @@ RestartSec=10
 # SuccessExitStatus=42 ensures auto-update exits don't count as failures.
 StartLimitBurst=5
 StartLimitIntervalSec=120
-# Allow 15 seconds for graceful shutdown before SIGKILL
-# The node handles SIGTERM to properly close peer connections
-TimeoutStopSec=15
+# Allow 45 seconds for graceful shutdown before SIGKILL.
+# The node handles SIGTERM by (1) waiting up to `shutdown-drain-secs`
+# (default 30s) for in-flight client PUT/GET/UPDATE/SUBSCRIBE drivers
+# to finish, then (2) closing peer connections. The 15s headroom over
+# the default drain covers peer-connection teardown + spawn-task
+# cleanup. If you raise `shutdown-drain-secs`, raise this in lockstep.
+TimeoutStopSec=45
 
 # Auto-update: if peer exits with code 42 (version mismatch with gateway),
 # run update before systemd restarts the service. The '-' prefix means
@@ -4129,8 +4137,9 @@ mod tests {
         // Verify exit code 43 prevents restart (another instance already running)
         assert!(service_content.contains("RestartPreventExitStatus=43"));
 
-        // Verify graceful shutdown timeout is set
-        assert!(service_content.contains("TimeoutStopSec=15"));
+        // Verify graceful shutdown timeout is set. 45s = 30s drain
+        // (default `shutdown-drain-secs`) + 15s peer-teardown headroom.
+        assert!(service_content.contains("TimeoutStopSec=45"));
 
         // Verify user service targets default.target
         assert!(service_content.contains("WantedBy=default.target"));

@@ -79,16 +79,26 @@ pub(crate) async fn start_client_put(
     // Amplification ceiling: the client_events.rs PUT handler allocates
     // one task per client PUT request. Client request rate is bounded by
     // the WS connection handler's backpressure.
-    GlobalExecutor::spawn(run_client_put(
-        op_manager,
-        client_tx,
-        contract,
-        related,
-        value,
-        htl,
-        subscribe,
-        blocking_subscribe,
-    ));
+    // Bump the shutdown-drain counter for the lifetime of the spawned
+    // driver. The guard is held inside the spawned future so that
+    // `ShutdownHandle::shutdown` can wait for client-initiated PUTs to
+    // finish before tearing down peer connections (e.g. release-driven
+    // auto-update interrupting an in-flight `freenet-git` mirror push).
+    let inflight_guard = op_manager.client_op_guard();
+    GlobalExecutor::spawn(async move {
+        let _inflight_guard = inflight_guard;
+        run_client_put(
+            op_manager,
+            client_tx,
+            contract,
+            related,
+            value,
+            htl,
+            subscribe,
+            blocking_subscribe,
+        )
+        .await;
+    });
 
     Ok(client_tx)
 }
@@ -2105,6 +2115,47 @@ mod tests {
                  warn would re-open the spam"
             );
         }
+    }
+
+    /// `start_client_put` must construct a `client_op_guard()` before
+    /// the `GlobalExecutor::spawn`, and that guard MUST be moved into
+    /// the spawned future (held for the lifetime of the spawned
+    /// `run_client_put`). Without the guard, the shutdown drain in
+    /// `ShutdownHandle::shutdown` has no signal that this PUT is in
+    /// flight — release-driven auto-update reverts to dropping the
+    /// mirror push mid-stream. Sibling pins live in the analogous test
+    /// modules of `get/op_ctx_task.rs`, `update/op_ctx_task.rs`, and
+    /// `subscribe/op_ctx_task.rs`.
+    #[test]
+    fn start_client_put_acquires_inflight_guard_before_spawn() {
+        let src = include_str!("op_ctx_task.rs");
+        let entry = src
+            .find("pub(crate) async fn start_client_put(")
+            .expect("start_client_put must exist");
+        let after_spawn = src[entry..]
+            .find("GlobalExecutor::spawn(")
+            .expect("start_client_put must spawn a driver task");
+        let before_spawn = &src[entry..entry + after_spawn];
+        assert!(
+            before_spawn.contains("op_manager.client_op_guard()"),
+            "start_client_put must call op_manager.client_op_guard() \
+             before GlobalExecutor::spawn so the shutdown drain knows \
+             this PUT is in flight. Removing the guard re-opens the \
+             release-restart-kills-mirror failure."
+        );
+        let spawned = &src[entry + after_spawn..];
+        let block_end = spawned
+            .find("\n    Ok(client_tx)")
+            .expect("start_client_put must return Ok(client_tx)");
+        let spawn_block = &spawned[..block_end];
+        assert!(
+            spawn_block.contains("let _inflight_guard = inflight_guard;"),
+            "the ClientOpGuard must be moved into the spawned future \
+             via `let _inflight_guard = inflight_guard;` so it is held \
+             for the full driver lifetime. A bare drop at the spawn \
+             site would clear the counter before run_client_put even \
+             starts."
+        );
     }
 
     #[test]

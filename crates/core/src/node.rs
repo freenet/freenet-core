@@ -80,16 +80,31 @@ pub use request_router::{DeduplicatedRequest, RequestRouter};
 #[derive(Clone)]
 pub struct ShutdownHandle {
     tx: tokio::sync::mpsc::Sender<NodeEvent>,
+    /// Counter of currently-running client-originated driver tasks
+    /// (`run_client_put` / `_get` / `_update` / `_subscribe`). Read by
+    /// `shutdown` to wait for those tasks to finish before triggering
+    /// the Disconnect.
+    inflight_client_ops: Arc<std::sync::atomic::AtomicUsize>,
+    /// Maximum time to wait for `inflight_client_ops` to reach zero
+    /// before forcing the disconnect anyway. `Duration::ZERO` disables
+    /// the drain (legacy immediate-disconnect behaviour).
+    drain_timeout: std::time::Duration,
 }
 
 impl ShutdownHandle {
     /// Trigger a graceful shutdown of the node.
     ///
-    /// This will:
-    /// 1. Close all peer connections gracefully
-    /// 2. Stop accepting new connections
-    /// 3. Exit the event loop
+    /// 1. Wait up to `drain_timeout` for in-flight client-originated
+    ///    PUT/GET/UPDATE/SUBSCRIBE drivers to finish. Without this
+    ///    wait, a SIGTERM that arrives mid-PUT (e.g. release-driven
+    ///    auto-update on the nova gateway) drops the client's
+    ///    WebSocket mid-operation. See the rationale on
+    ///    `Config::shutdown_drain_secs`.
+    /// 2. Send `NodeEvent::Disconnect`, which closes peer connections
+    ///    and exits the event loop.
     pub async fn shutdown(&self) {
+        self.wait_for_drain().await;
+
         if let Err(err) = self
             .tx
             .send(NodeEvent::Disconnect {
@@ -101,6 +116,57 @@ impl ShutdownHandle {
                 error = %err,
                 "failed to send graceful shutdown signal; shutdown channel may already be closed"
             );
+        }
+    }
+
+    /// Poll-loop the in-flight client-op counter until it hits zero or
+    /// `drain_timeout` expires. Cap each individual sleep at 200ms so
+    /// the drain can react promptly when the counter clears.
+    async fn wait_for_drain(&self) {
+        use std::sync::atomic::Ordering;
+
+        if self.drain_timeout.is_zero() {
+            return;
+        }
+        let initial = self.inflight_client_ops.load(Ordering::Relaxed);
+        if initial == 0 {
+            return;
+        }
+        tracing::info!(
+            initial,
+            drain_timeout_secs = self.drain_timeout.as_secs(),
+            "Shutdown drain: waiting for in-flight client ops to finish"
+        );
+
+        // `tokio::time` is appropriate here even under the
+        // `TimeSource`-or-bust rule for crates/core: shutdown drain is
+        // a process-exit code path that wall-clock blocks on real
+        // tokio sleeps, has no analogue in simulation tests, and is
+        // explicitly bounded by `drain_timeout`.
+        let drained = tokio::time::timeout(self.drain_timeout, async {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // First `tick` fires immediately; advance past it so the
+            // loop body actually sleeps between checks.
+            tick.tick().await;
+            loop {
+                if self.inflight_client_ops.load(Ordering::Relaxed) == 0 {
+                    return;
+                }
+                tick.tick().await;
+            }
+        })
+        .await;
+
+        let remaining = self.inflight_client_ops.load(Ordering::Relaxed);
+        match drained {
+            Ok(()) => tracing::info!(initial, "Shutdown drain complete (all client ops finished)"),
+            Err(_) => tracing::warn!(
+                initial,
+                remaining,
+                drain_timeout_secs = self.drain_timeout.as_secs(),
+                "Shutdown drain timed out; proceeding with disconnect"
+            ),
         }
     }
 }
@@ -449,6 +515,7 @@ impl NodeConfig {
             (DynamicRegister::new(registers), flush_handle)
         };
         let cfg = self.config.clone();
+        let drain_timeout = std::time::Duration::from_secs(cfg.shutdown_drain_secs);
         let (node_inner, shutdown_tx) = NodeP2P::build::<NetworkContractHandler, CLIENTS, _>(
             self,
             clients,
@@ -456,7 +523,11 @@ impl NodeConfig {
             cfg,
         )
         .await?;
-        let shutdown_handle = ShutdownHandle { tx: shutdown_tx };
+        let shutdown_handle = ShutdownHandle {
+            tx: shutdown_tx,
+            inflight_client_ops: node_inner.op_manager.inflight_client_ops_handle(),
+            drain_timeout,
+        };
         Ok((
             Node {
                 inner: node_inner,
@@ -3532,6 +3603,118 @@ mod tests {
                  duplicate Request retransmission could spawn a second \
                  driver before the first inserts into the dedup set."
             );
+        }
+    }
+
+    /// Tests for `ShutdownHandle::shutdown`'s drain behaviour. The
+    /// drain stops in-flight client PUT/GET/UPDATE/SUBSCRIBE drivers
+    /// from being torn down mid-operation when the gateway is stopped
+    /// for an auto-update (motivating incident: `freenet-git` mirror
+    /// failures on the nova gateway).
+    mod shutdown_drain {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        /// Construct a ShutdownHandle wired to a fresh channel and
+        /// counter, mirroring the production wire-up in
+        /// `NodeBuilder::build`. The receiver is returned so tests
+        /// can assert what (if anything) was sent.
+        fn make_handle(
+            initial_count: usize,
+            drain_timeout: Duration,
+        ) -> (
+            ShutdownHandle,
+            Arc<AtomicUsize>,
+            tokio::sync::mpsc::Receiver<NodeEvent>,
+        ) {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let counter = Arc::new(AtomicUsize::new(initial_count));
+            let handle = ShutdownHandle {
+                tx,
+                inflight_client_ops: counter.clone(),
+                drain_timeout,
+            };
+            (handle, counter, rx)
+        }
+
+        #[tokio::test]
+        async fn shutdown_with_zero_ops_returns_immediately() {
+            let (handle, _counter, mut rx) = make_handle(0, Duration::from_secs(60));
+            let start = std::time::Instant::now();
+            handle.shutdown().await;
+            assert!(
+                start.elapsed() < Duration::from_millis(100),
+                "shutdown with zero in-flight ops should not sleep"
+            );
+            // Disconnect must still be sent.
+            assert!(matches!(
+                rx.recv().await.expect("Disconnect must be sent"),
+                NodeEvent::Disconnect { .. }
+            ));
+        }
+
+        #[tokio::test]
+        async fn shutdown_waits_then_proceeds_on_timeout() {
+            // 1 op in flight that never decrements; drain capped at 200ms.
+            let (handle, _counter, mut rx) = make_handle(1, Duration::from_millis(200));
+            let start = std::time::Instant::now();
+            handle.shutdown().await;
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed >= Duration::from_millis(180),
+                "shutdown should wait the full drain timeout when ops \
+                 never finish (elapsed: {elapsed:?})"
+            );
+            // Disconnect must still be sent so the node can exit.
+            assert!(matches!(
+                rx.recv()
+                    .await
+                    .expect("Disconnect must be sent even on drain timeout"),
+                NodeEvent::Disconnect { .. }
+            ));
+        }
+
+        #[tokio::test]
+        async fn shutdown_proceeds_as_soon_as_counter_clears() {
+            // 1 op in flight; another task decrements after 100ms.
+            let (handle, counter, mut rx) = make_handle(1, Duration::from_secs(5));
+            let counter_clone = counter.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                counter_clone.fetch_sub(1, Ordering::Relaxed);
+            });
+            let start = std::time::Instant::now();
+            handle.shutdown().await;
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed >= Duration::from_millis(80) && elapsed < Duration::from_secs(2),
+                "shutdown should return shortly after the counter clears, \
+                 not wait the full drain timeout (elapsed: {elapsed:?})"
+            );
+            assert!(matches!(
+                rx.recv().await.expect("Disconnect must be sent"),
+                NodeEvent::Disconnect { .. }
+            ));
+        }
+
+        #[tokio::test]
+        async fn drain_disabled_skips_wait_even_with_ops_in_flight() {
+            // Tests opt out of the drain via Duration::ZERO so a
+            // SimNetwork teardown doesn't block on the 30s production
+            // default. Verify the zero-timeout path bypasses the wait
+            // entirely even when ops are "in flight".
+            let (handle, _counter, mut rx) = make_handle(5, Duration::ZERO);
+            let start = std::time::Instant::now();
+            handle.shutdown().await;
+            assert!(
+                start.elapsed() < Duration::from_millis(50),
+                "drain_timeout=0 must skip the wait"
+            );
+            assert!(matches!(
+                rx.recv().await.expect("Disconnect must be sent"),
+                NodeEvent::Disconnect { .. }
+            ));
         }
     }
 }
