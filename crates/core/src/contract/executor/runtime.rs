@@ -1259,25 +1259,19 @@ where
                                 "Contract is new, storing initial state"
                             );
                             let state_to_store = incoming_state.clone();
+                            let written_bytes = state_to_store.as_ref().len();
                             self.state_store
                                 .store(key, state_to_store, params.clone())
                                 .await
                                 .map_err(ExecutorError::other)?;
-                            // State-write chokepoint: bump the per-contract
-                            // generation counter so a racing `EvictContract`
-                            // captured before this store sees a stale
-                            // generation at deletion time and skips
-                            // reclamation. Then refresh the hosting-cache
-                            // snapshot so subsequent evictions of this
-                            // already-hosted contract carry the new
-                            // generation rather than the stale snapshot
-                            // captured at first `record_access` — without
-                            // the refresh, every UPDATE leaks on eviction.
-                            // See `RuntimePool::remove_contract` and
-                            // `HostingCache::refresh_entry_generation`.
+                            // State-write chokepoint: delegate the three
+                            // mandatory side effects (bump generation,
+                            // refresh hosting-cache snapshot, report
+                            // StateBytesWritten) to `Ring::commit_state_write`.
+                            // See its rustdoc and `RuntimePool::remove_contract`
+                            // for the EvictContract re-host race this closes.
                             if let Some(op_manager) = &self.op_manager {
-                                let new_gen = op_manager.ring.bump_state_generation(&key);
-                                op_manager.ring.refresh_cache_generation(&key, new_gen);
+                                op_manager.ring.commit_state_write(&key, written_bytes);
                             }
 
                             let completion_now = now_nanos();
@@ -2130,16 +2124,13 @@ where
             .update(key, new_state.clone())
             .await
             .map_err(ExecutorError::other)?;
-        // State-write chokepoint (UPDATE): see `commit_state_update` docs
-        // and `RuntimePool::remove_contract` for the race this bump closes.
-        // Refresh the hosting-cache snapshot in lock-step so an UPDATE to
-        // an already-hosted contract doesn't leave the cached generation
-        // stuck at its first-`record_access` value — that mismatch would
-        // make later evictions silently skip reclamation. See
-        // `HostingCache::refresh_entry_generation`.
+        // State-write chokepoint (UPDATE): delegate the bump + refresh +
+        // report side effects to `Ring::commit_state_write`. See its
+        // rustdoc and `RuntimePool::remove_contract` for the EvictContract
+        // re-host race this closes; the report leg feeds the governance
+        // scoring layer (`docs/design/contract-hardening.md` — Phase 3).
         if let Some(op_manager) = &self.op_manager {
-            let new_gen = op_manager.ring.bump_state_generation(key);
-            op_manager.ring.refresh_cache_generation(key, new_gen);
+            op_manager.ring.commit_state_write(key, state_size);
         }
 
         tracing::debug!(
@@ -2861,14 +2852,15 @@ impl Executor<Runtime> {
         // Enable V2 delegate contract access by providing the state store DB
         rt.set_state_store_db(state_store.storage());
         // V2 delegate state writes bypass the executor's
-        // `state_store.{store,update}` chokepoints, so install a callback that
-        // mirrors the bump+refresh those chokepoints perform. Without this,
-        // V2 delegate PUT/UPDATE leaves the EvictContract re-host race open.
+        // `state_store.{store,update}` chokepoints, so install a callback
+        // that mirrors the bump+refresh+report side effects via
+        // `Ring::commit_state_write`. Without this, V2 delegate PUT/UPDATE
+        // would leave the EvictContract re-host race open AND undercount
+        // StateBytesWritten in the governance meter.
         if let Some(op_manager_ref) = &op_manager {
             let op_manager_clone = op_manager_ref.clone();
-            rt.set_state_write_callback(Arc::new(move |key: &ContractKey| {
-                let new_gen = op_manager_clone.ring.bump_state_generation(key);
-                op_manager_clone.ring.refresh_cache_generation(key, new_gen);
+            rt.set_state_write_callback(Arc::new(move |key: &ContractKey, state_size: usize| {
+                op_manager_clone.ring.commit_state_write(key, state_size);
             }));
         }
         Executor::new(
@@ -2928,14 +2920,13 @@ impl Executor<Runtime> {
         .unwrap();
         rt.set_state_store_db(db);
         // V2 delegate state writes bypass the executor chokepoints — install
-        // the bump+refresh callback so the EvictContract re-host race is
-        // closed for that path too. See `from_config` and
+        // the commit_state_write callback so the bump+refresh+report side
+        // effects are still applied. See `from_config` and
         // `Runtime::set_state_write_callback`.
         if let Some(op_manager_ref) = &op_manager {
             let op_manager_clone = op_manager_ref.clone();
-            rt.set_state_write_callback(Arc::new(move |key: &ContractKey| {
-                let new_gen = op_manager_clone.ring.bump_state_generation(key);
-                op_manager_clone.ring.refresh_cache_generation(key, new_gen);
+            rt.set_state_write_callback(Arc::new(move |key: &ContractKey, state_size: usize| {
+                op_manager_clone.ring.commit_state_write(key, state_size);
             }));
         }
         Executor::new(
@@ -3327,18 +3318,17 @@ impl Executor<Runtime> {
             }
 
             // Commit locally
+            let written_bytes = new_state.as_ref().len();
             self.state_store
                 .update(&key, new_state.clone())
                 .await
                 .map_err(ExecutorError::other)?;
-            // State-write chokepoint: see `commit_state_update` doc comment
-            // and `RuntimePool::remove_contract` for the race this bump closes.
-            // Refresh the hosting-cache snapshot so already-hosted contracts
-            // don't leak on eviction after this re-PUT — see
-            // `HostingCache::refresh_entry_generation`.
+            // State-write chokepoint (re-PUT): delegate to
+            // `Ring::commit_state_write` for bump + refresh + report. See
+            // its rustdoc and `RuntimePool::remove_contract` for the
+            // EvictContract re-host race this closes.
             if let Some(op_manager) = &self.op_manager {
-                let new_gen = op_manager.ring.bump_state_generation(&key);
-                op_manager.ring.refresh_cache_generation(&key, new_gen);
+                op_manager.ring.commit_state_write(&key, written_bytes);
             }
 
             self.send_update_notification(&key, &params, &new_state)
@@ -3631,6 +3621,7 @@ impl Executor<Runtime> {
             state_size = state.as_ref().len(),
             "storing contract state"
         );
+        let written_bytes = state.as_ref().len();
         self.state_store
             .store(key, state, params)
             .await
@@ -3642,15 +3633,12 @@ impl Executor<Runtime> {
                 );
                 ExecutorError::other(e)
             })?;
-        // State-write chokepoint (verify_and_store PUT): see
-        // `commit_state_update` doc comment and
-        // `RuntimePool::remove_contract` for the race this bump closes.
-        // Refresh the hosting-cache snapshot so already-hosted contracts
-        // don't leak on eviction after this re-PUT — see
-        // `HostingCache::refresh_entry_generation`.
+        // State-write chokepoint (verify_and_store PUT): delegate to
+        // `Ring::commit_state_write` for bump + refresh + report. See
+        // its rustdoc and `RuntimePool::remove_contract` for the
+        // EvictContract re-host race this closes.
         if let Some(op_manager) = &self.op_manager {
-            let new_gen = op_manager.ring.bump_state_generation(&key);
-            op_manager.ring.refresh_cache_generation(&key, new_gen);
+            op_manager.ring.commit_state_write(&key, written_bytes);
         }
 
         Ok(())
@@ -4631,6 +4619,157 @@ mod remove_contract_tests {
             ReclaimOutcome::Full,
             "state-only present + code-already-gone counts as Full because \
              both halves are absent at end"
+        );
+    }
+}
+
+#[cfg(test)]
+mod state_write_attribution_pin_tests {
+    //! Source-grep pin tests for the StateBytesWritten reporter. The
+    //! `Ring::commit_state_write` helper bundles three side effects
+    //! (bump generation, refresh hosting-cache snapshot, report bytes
+    //! to the governance meter). The "Manually-mirrored telemetry
+    //! counters" row in `.claude/rules/bug-prevention-patterns.md`
+    //! says: a future refactor that hand-inlines one of those three
+    //! steps WITHOUT the report leg silently undercounts every state
+    //! write on that path. To make that failure mode trip CI instead
+    //! of going unnoticed for months, this module asserts at the
+    //! source level that:
+    //!
+    //!   1. There is exactly ONE place that calls `bump_state_generation`
+    //!      directly: the `commit_state_write` helper itself in ring.rs.
+    //!      Every other state-write site goes through the helper.
+    //!   2. The number of `commit_state_write` call sites in runtime.rs
+    //!      matches the number of state-write chokepoints we currently
+    //!      have (6 — see the comment at the top of the helper). If
+    //!      a new chokepoint is added without wiring it, this test
+    //!      will fail loudly until either the chokepoint is wired or
+    //!      this expected count is updated *with* a comment explaining
+    //!      why.
+    //!
+    //! These tests read their own source code (a common Rust idiom for
+    //! enforcing structural invariants — see `cargo` and `rustc`'s own
+    //! test suites for similar patterns).
+
+    const RUNTIME_SRC: &str = include_str!("runtime.rs");
+    const RING_SRC: &str = include_str!("../../ring.rs");
+    const NATIVE_API_SRC: &str = include_str!("../../wasm_runtime/native_api.rs");
+
+    /// Count lines containing the needle that are NOT comments, docstrings,
+    /// or string literals. A line counts only when the needle appears as
+    /// real code — the heuristic is: the line is not a comment AND the
+    /// needle does not appear inside a double-quoted string on that line.
+    fn count_call_sites(src: &str, needle: &str) -> usize {
+        src.lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    return false;
+                }
+                // Strip everything between matched double quotes so we
+                // don't count needle occurrences inside string literals
+                // (the test's own assertion messages contain the needles).
+                let stripped = strip_string_literals(line);
+                stripped.contains(needle)
+            })
+            .count()
+    }
+
+    /// Replace the contents of every `"..."` on the line with empty
+    /// quotes so substring searches on the result skip string literals.
+    /// Handles escaped quotes pragmatically (rare in this codebase).
+    fn strip_string_literals(line: &str) -> String {
+        let mut out = String::with_capacity(line.len());
+        let mut in_string = false;
+        let mut prev_was_backslash = false;
+        for c in line.chars() {
+            if in_string {
+                if c == '"' && !prev_was_backslash {
+                    in_string = false;
+                    out.push('"');
+                }
+                // drop characters inside the string
+            } else if c == '"' {
+                in_string = true;
+                out.push('"');
+            } else {
+                out.push(c);
+            }
+            prev_was_backslash = c == '\\' && !prev_was_backslash;
+        }
+        out
+    }
+
+    #[test]
+    fn bump_state_generation_has_exactly_one_caller_outside_hosting_manager() {
+        // The only NON-comment call to `.bump_state_generation(` in ring.rs
+        // should be the one inside `commit_state_write`. Every other
+        // state-write site goes through `commit_state_write` rather than
+        // calling the primitive directly.
+        let count = count_call_sites(RING_SRC, ".bump_state_generation(");
+        assert_eq!(
+            count, 1,
+            "expected exactly 1 .bump_state_generation( call in ring.rs \
+             (inside commit_state_write); found {count}. New direct \
+             callers should go through Ring::commit_state_write instead, \
+             or this assertion needs updating with a comment explaining \
+             why the new direct caller is correct."
+        );
+
+        // And runtime.rs MUST NOT call .bump_state_generation directly —
+        // every state-write site should go through commit_state_write.
+        let runtime_calls = count_call_sites(RUNTIME_SRC, ".bump_state_generation(");
+        assert_eq!(
+            runtime_calls, 0,
+            "runtime.rs must not call .bump_state_generation directly; \
+             use Ring::commit_state_write instead (which bundles the \
+             bump + refresh + report side effects). See \
+             `.claude/rules/bug-prevention-patterns.md` row \
+             'Manually-mirrored telemetry counters'."
+        );
+    }
+
+    #[test]
+    fn every_runtime_state_write_chokepoint_goes_through_commit_state_write() {
+        // 4 executor-internal chokepoints (PUT-new, UPDATE, re-PUT,
+        // verify_and_store PUT) + 2 V2 delegate callback installers
+        // = 6 total commit_state_write call sites in runtime.rs.
+        const EXPECTED: usize = 6;
+        let count = count_call_sites(RUNTIME_SRC, ".commit_state_write(");
+        assert_eq!(
+            count, EXPECTED,
+            "expected exactly {EXPECTED} .commit_state_write( call sites \
+             in runtime.rs; found {count}. If you added a new state-write \
+             chokepoint, wire it through `Ring::commit_state_write` and \
+             bump this expectation. If you removed one, ensure the \
+             chokepoint is genuinely gone (not just relocated) before \
+             lowering this expectation."
+        );
+    }
+
+    #[test]
+    fn v2_delegate_state_write_paths_invoke_callback_with_state_size() {
+        // The V2 delegate PUT and UPDATE paths in native_api.rs MUST
+        // capture state.len() BEFORE the move into store_state_sync /
+        // update_state_sync, and pass it to the callback. Otherwise the
+        // governance scoring undercounts every V2 delegate write by the
+        // full state size of that write.
+        let calls = count_call_sites(NATIVE_API_SRC, "cb(&contract_key,");
+        assert_eq!(
+            calls, 2,
+            "expected exactly 2 callback invocations passing state_size \
+             in native_api.rs (one for PUT, one for UPDATE); found {calls}"
+        );
+        // And state.len() MUST be captured before the move.
+        let captures = count_call_sites(NATIVE_API_SRC, "let state_size = state.len();");
+        assert_eq!(
+            captures, 2,
+            "expected exactly 2 `let state_size = state.len();` captures \
+             in native_api.rs (one before each state-store move); found \
+             {captures}. The order matters — capturing AFTER the move \
+             into store_state_sync would not compile, but a refactor \
+             that moves state into an intermediate first could regress \
+             this silently."
         );
     }
 }

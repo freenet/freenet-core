@@ -720,11 +720,12 @@ mod tests {
         let mut env_holder = TestEnv::new().await;
         let contract_id = env_holder.store_contract(120, &[1, 2, 3]).await;
 
-        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<ContractKey>::new()));
+        let observed =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, usize)>::new()));
         let observed_for_cb = observed.clone();
         let cb: super::super::runtime::StateWriteCallback =
-            std::sync::Arc::new(move |k: &ContractKey| {
-                observed_for_cb.lock().unwrap().push(*k);
+            std::sync::Arc::new(move |k: &ContractKey, state_size: usize| {
+                observed_for_cb.lock().unwrap().push((*k, state_size));
             });
 
         // SAFETY: `env_holder` is alive for the duration of this test.
@@ -739,9 +740,15 @@ mod tests {
             "callback must fire exactly once per successful V2 PUT"
         );
         assert_eq!(
-            calls[0].id(),
+            calls[0].0.id(),
             &contract_id,
             "callback must receive the written contract key"
+        );
+        assert_eq!(
+            calls[0].1, 3,
+            "callback must receive the on-disk state byte count (vec![4, 5, 6] = 3 bytes) — \
+             this pins the StateBytesWritten attribution to the actual write size and would \
+             catch a refactor that hardcodes the size or passes a stale length"
         );
     }
 
@@ -753,11 +760,12 @@ mod tests {
         let mut env_holder = TestEnv::new().await;
         let contract_id = env_holder.store_contract(121, &[10, 20, 30]).await;
 
-        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<ContractKey>::new()));
+        let observed =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, usize)>::new()));
         let observed_for_cb = observed.clone();
         let cb: super::super::runtime::StateWriteCallback =
-            std::sync::Arc::new(move |k: &ContractKey| {
-                observed_for_cb.lock().unwrap().push(*k);
+            std::sync::Arc::new(move |k: &ContractKey, state_size: usize| {
+                observed_for_cb.lock().unwrap().push((*k, state_size));
             });
 
         // SAFETY: `env_holder` is alive for the duration of this test.
@@ -772,9 +780,13 @@ mod tests {
             "callback must fire exactly once per successful V2 UPDATE"
         );
         assert_eq!(
-            calls[0].id(),
+            calls[0].0.id(),
             &contract_id,
             "callback must receive the updated contract key"
+        );
+        assert_eq!(
+            calls[0].1, 3,
+            "callback must receive the on-disk state byte count (vec![40, 50, 60] = 3 bytes)"
         );
     }
 
@@ -790,11 +802,12 @@ mod tests {
         let contract_id = *key.id();
         env_holder.contract_store.ensure_key_indexed(&key).unwrap();
 
-        let observed = std::sync::Arc::new(std::sync::Mutex::new(Vec::<ContractKey>::new()));
+        let observed =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, usize)>::new()));
         let observed_for_cb = observed.clone();
         let cb: super::super::runtime::StateWriteCallback =
-            std::sync::Arc::new(move |k: &ContractKey| {
-                observed_for_cb.lock().unwrap().push(*k);
+            std::sync::Arc::new(move |k: &ContractKey, state_size: usize| {
+                observed_for_cb.lock().unwrap().push((*k, state_size));
             });
 
         // SAFETY: `env_holder` is alive for the duration of this test.

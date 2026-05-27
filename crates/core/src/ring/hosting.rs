@@ -654,6 +654,10 @@ impl HostingManager {
                 .find(|entry| *entry.key().id() == instance_id)
                 .map(|entry| *entry.key());
             if let Some(contract) = contract {
+                // Client disconnect may have just transitioned the contract
+                // to no-longer-in-use. Record abandonment so over-budget
+                // eviction targets it first.
+                self.maybe_record_abandonment(&contract);
                 affected_contracts.push(contract);
             }
         }
@@ -713,6 +717,10 @@ impl HostingManager {
             // Remove the map entry if no peers remain
             self.downstream_subscribers
                 .remove_if(contract, |_, peers| peers.is_empty());
+            // If the contract has just transitioned to no-longer-in-use,
+            // mark it as recently abandoned so over-budget eviction
+            // targets it before older-but-still-active entries.
+            self.maybe_record_abandonment(contract);
         }
         removed
     }
@@ -750,6 +758,28 @@ impl HostingManager {
         self.has_client_subscriptions(contract.id()) || self.has_downstream_subscribers(contract)
     }
 
+    /// Hook called from every code path that removes an "in-use" signal
+    /// (client subscription, downstream subscriber, or stale-expiry of
+    /// either). If the contract has just transitioned to no-longer-in-use,
+    /// mark it as recently abandoned in the hosting cache so the next
+    /// over-budget sweep evicts it before older-but-still-active entries.
+    ///
+    /// Idle persistence is preserved: this changes eviction *order*, not
+    /// eviction *eligibility*. A contract with no budget pressure on it
+    /// stays cached regardless.
+    ///
+    /// Lock-order note: `contract_in_use` reads only the subscription
+    /// DashMaps and never touches `hosting_cache`, so calling it from
+    /// here is safe even though we then take the `hosting_cache` write
+    /// lock. Callers must invoke this AFTER any subscription-map guard
+    /// they hold has been dropped (the guard is needed to mutate state,
+    /// not to read `contract_in_use`).
+    fn maybe_record_abandonment(&self, contract: &ContractKey) {
+        if !self.contract_in_use(contract) {
+            self.hosting_cache.write().record_abandonment(contract);
+        }
+    }
+
     /// Remove downstream subscribers whose leases have expired.
     /// Returns each affected contract paired with the number of expired peers.
     pub fn expire_stale_downstream_subscribers(&self) -> Vec<(ContractKey, usize)> {
@@ -763,7 +793,7 @@ impl HostingManager {
             .collect();
 
         for key in keys {
-            if let Some(mut peers) = self.downstream_subscribers.get_mut(&key) {
+            let became_empty = if let Some(mut peers) = self.downstream_subscribers.get_mut(&key) {
                 let before = peers.len();
                 peers.retain(|_, last_renewed| {
                     now.duration_since(*last_renewed) < SUBSCRIPTION_LEASE_DURATION
@@ -772,11 +802,21 @@ impl HostingManager {
                 if expired > 0 {
                     expired_counts.push((key, expired));
                 }
-                if peers.is_empty() {
+                let empty = peers.is_empty();
+                if empty {
                     drop(peers);
                     self.downstream_subscribers
                         .remove_if(&key, |_, peers| peers.is_empty());
                 }
+                empty
+            } else {
+                false
+            };
+            if became_empty {
+                // Lease expiry may have just transitioned the contract to
+                // no-longer-in-use — record abandonment so the next
+                // over-budget sweep targets it first.
+                self.maybe_record_abandonment(&key);
             }
         }
 
