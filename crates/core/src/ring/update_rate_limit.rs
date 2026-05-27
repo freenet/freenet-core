@@ -88,7 +88,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -163,6 +163,21 @@ impl RateLimitDecision {
 /// so per-entry memory is tiny.
 pub(crate) struct UpdateRateLimiter {
     last_accepted: DashMap<(SocketAddr, ContractInstanceId), Instant>,
+    /// Authoritative size counter for capacity enforcement. Held
+    /// in sync with `last_accepted.len()` at every stable point
+    /// (incremented by successful new-pair inserts in
+    /// `check_and_record`; decremented by the count of dropped
+    /// entries in `cleanup`).
+    ///
+    /// Why not just use `last_accepted.len()`? Because `len()` walks
+    /// every shard, so it can't be called while holding any shard
+    /// guard (the previous probe-then-insert iteration deadlocked on
+    /// this). With this counter, the cap check is a single atomic
+    /// `fetch_add`, which strictly serializes — no overshoot from
+    /// concurrent inserts. Codex re-review of #4285 caught that the
+    /// `len()` precheck overshoots by `num_concurrent_callers`,
+    /// which can be hundreds.
+    size: AtomicUsize,
     min_interval: Duration,
     max_tracked_pairs: usize,
     time_source: Arc<dyn TimeSource + Send + Sync>,
@@ -190,6 +205,7 @@ impl UpdateRateLimiter {
     ) -> Self {
         Self {
             last_accepted: DashMap::new(),
+            size: AtomicUsize::new(0),
             min_interval,
             max_tracked_pairs,
             time_source,
@@ -202,17 +218,26 @@ impl UpdateRateLimiter {
     /// Check whether an UPDATE from `sender` for `contract` is allowed
     /// right now, and atomically stamp the accepted timestamp if so.
     ///
-    /// Implementation note: uses [`DashMap::entry`] so the per-shard
-    /// guard is held across the time-comparison + stamp. A previous
-    /// probe-then-insert version was non-atomic — Codex review of
-    /// PR #4285 caught that concurrent UPDATEs for the same pair
-    /// could all read the same old timestamp and all be admitted.
-    /// With the guard held, exactly one admitting caller wins per
-    /// `min_interval` window.
+    /// Two-property atomicity:
     ///
-    /// If rejected, no state change is made (so a barrage of rejected
-    /// attempts doesn't itself extend the rate-limit window — the
-    /// existing `last_accepted` timestamp stays put).
+    /// 1. **Same-pair compare-and-stamp** is atomic via
+    ///    [`DashMap::entry`] holding the per-shard guard across
+    ///    timestamp comparison and update. Exactly one caller per
+    ///    pair wins per `min_interval` window.
+    ///
+    /// 2. **Capacity enforcement** is strict via the [`Self::size`]
+    ///    atomic counter. New-pair insertion reserves a slot with
+    ///    `fetch_add` BEFORE inserting; if the post-increment value
+    ///    exceeds the cap, the reservation is returned via
+    ///    `fetch_sub` and the call returns `CapacityExceeded`.
+    ///    Concurrent distinct-key inserts strictly serialize through
+    ///    the counter — no overshoot.
+    ///
+    /// If rejected (either rate or capacity), no map mutation is
+    /// made. A barrage of rejected attempts doesn't extend the rate
+    /// window (the existing `last_accepted` timestamp is unchanged)
+    /// and doesn't grow memory (the reservation is rolled back on
+    /// CapacityExceeded).
     pub fn check_and_record(
         &self,
         sender: SocketAddr,
@@ -221,91 +246,66 @@ impl UpdateRateLimiter {
         let now = self.time_source.now();
         let key = (sender, contract);
 
-        // Two-phase check:
-        //   1. If the entry already exists, hold its shard guard
-        //      across the time-comparison + stamp (atomic per pair).
-        //   2. For new pairs we need to enforce MAX_TRACKED_PAIRS by
-        //      reading `DashMap::len()` — but `len()` walks every
-        //      shard, so we MUST NOT hold any shard guard when we
-        //      call it (otherwise it deadlocks on the shard we hold).
-        //      Check existence with a `contains_key` probe first; if
-        //      it's a new pair, check `len()` against the cap and
-        //      then call `insert`. `insert` is itself atomic per
-        //      shard, so the worst-case race is a transient ±N
-        //      overshoot of the cap (N = number of shards) — bounded
-        //      and harmless.
         use dashmap::mapref::entry::Entry;
-        if self.last_accepted.contains_key(&key) {
-            // Existing pair: hold the shard guard for the
-            // time-comparison + stamp.
-            match self.last_accepted.entry(key) {
-                Entry::Occupied(mut entry) => {
-                    let last = *entry.get();
-                    let elapsed = now.saturating_duration_since(last);
-                    if elapsed < self.min_interval {
-                        self.rejected_total.fetch_add(1, Ordering::Relaxed);
-                        return RateLimitDecision::Rejected {
-                            elapsed,
-                            min_interval: self.min_interval,
-                        };
-                    }
-                    *entry.get_mut() = now;
-                    self.accepted_total.fetch_add(1, Ordering::Relaxed);
-                    RateLimitDecision::Allowed
+        match self.last_accepted.entry(key) {
+            Entry::Occupied(mut entry) => {
+                // Existing pair: atomic compare-and-stamp under
+                // shard guard.
+                let last = *entry.get();
+                let elapsed = now.saturating_duration_since(last);
+                if elapsed < self.min_interval {
+                    self.rejected_total.fetch_add(1, Ordering::Relaxed);
+                    return RateLimitDecision::Rejected {
+                        elapsed,
+                        min_interval: self.min_interval,
+                    };
                 }
-                // Race: the entry was concurrently removed between
-                // the contains_key probe and the entry() call. Treat
-                // as a new pair, fall through.
-                Entry::Vacant(entry) => self.insert_new_pair(entry, now),
+                *entry.get_mut() = now;
+                self.accepted_total.fetch_add(1, Ordering::Relaxed);
+                RateLimitDecision::Allowed
             }
-        } else {
-            // New pair: check cap WITHOUT holding any shard guard.
-            if self.last_accepted.len() >= self.max_tracked_pairs {
-                self.capacity_rejected_total.fetch_add(1, Ordering::Relaxed);
-                return RateLimitDecision::CapacityExceeded;
-            }
-            // Insert under the shard guard. If a concurrent insert
-            // beat us to the same key, treat as a normal admission
-            // (the other admit wins; we just bump our counter).
-            match self.last_accepted.entry(key) {
-                Entry::Vacant(entry) => self.insert_new_pair(entry, now),
-                Entry::Occupied(mut entry) => {
-                    let last = *entry.get();
-                    let elapsed = now.saturating_duration_since(last);
-                    if elapsed < self.min_interval {
-                        self.rejected_total.fetch_add(1, Ordering::Relaxed);
-                        return RateLimitDecision::Rejected {
-                            elapsed,
-                            min_interval: self.min_interval,
-                        };
-                    }
-                    *entry.get_mut() = now;
-                    self.accepted_total.fetch_add(1, Ordering::Relaxed);
-                    RateLimitDecision::Allowed
+            Entry::Vacant(entry) => {
+                // New pair: reserve a slot via the authoritative
+                // counter BEFORE inserting. `fetch_add` is the
+                // serialization point — concurrent new-key inserts
+                // strictly serialize, no overshoot beyond the cap.
+                let prev = self.size.fetch_add(1, Ordering::Relaxed);
+                if prev >= self.max_tracked_pairs {
+                    // Cap exceeded. Roll back the reservation.
+                    self.size.fetch_sub(1, Ordering::Relaxed);
+                    self.capacity_rejected_total.fetch_add(1, Ordering::Relaxed);
+                    return RateLimitDecision::CapacityExceeded;
                 }
+                entry.insert(now);
+                self.accepted_total.fetch_add(1, Ordering::Relaxed);
+                RateLimitDecision::Allowed
             }
         }
     }
 
-    fn insert_new_pair(
-        &self,
-        entry: dashmap::mapref::entry::VacantEntry<'_, (SocketAddr, ContractInstanceId), Instant>,
-        now: Instant,
-    ) -> RateLimitDecision {
-        entry.insert(now);
-        self.accepted_total.fetch_add(1, Ordering::Relaxed);
-        RateLimitDecision::Allowed
-    }
-
     /// Drop entries whose timestamp is older than [`CLEANUP_AGE`].
     /// Call periodically from a reaper loop to bound memory.
+    ///
+    /// Decrements the [`Self::size`] counter by the number of
+    /// removed entries so the strict capacity enforcement remains
+    /// accurate as idle pairs roll off.
     pub fn cleanup(&self) {
         let now = self.time_source.now();
         let cutoff = match now.checked_sub(CLEANUP_AGE) {
             Some(t) => t,
             None => return, // clock not advanced enough to bother
         };
-        self.last_accepted.retain(|_, &mut last| last >= cutoff);
+        let mut removed = 0usize;
+        self.last_accepted.retain(|_, last| {
+            let keep = *last >= cutoff;
+            if !keep {
+                removed += 1;
+            }
+            keep
+        });
+        if removed > 0 {
+            self.size.fetch_sub(removed, Ordering::Relaxed);
+        }
     }
 
     /// Total accepted UPDATEs since creation. Used by the dashboard
@@ -679,10 +679,17 @@ mod tests {
             .find("NetMessageV1::Update(ref op) =>")
             .expect("could not locate UPDATE dispatch block in node.rs");
 
-        // Bound the search to a generous slice — the UPDATE block is
-        // well under 4KB.
-        let block_end = (block_start + 8192).min(NODE_SRC.len());
-        let block = &NODE_SRC[block_start..block_end];
+        // Bound the search to the END of the UPDATE arm — find the
+        // next `NetMessageV1::` arm that starts at the same match
+        // level. The UPDATE block must not "spill" into the next
+        // handler for our assertions (Codex re-review nit on #4285
+        // — the previous 8KB slice could include the next handler).
+        let tail = &NODE_SRC[block_start + 1..];
+        let block_len = tail
+            .find("\n        NetMessageV1::")
+            .or_else(|| tail.find("\n    NetMessageV1::"))
+            .unwrap_or(tail.len());
+        let block = &NODE_SRC[block_start..block_start + 1 + block_len];
 
         // (a) the gate is invoked.
         let rate_limit_pos = block
@@ -701,7 +708,8 @@ mod tests {
              messages don't pay the spawn cost"
         );
 
-        // (c) all four wire variants are matched in the dispatch.
+        // (c) all four wire variants are matched in the dispatch, and
+        //     each spawn site is also present.
         for variant in [
             "UpdateMsg::RequestUpdate {",
             "UpdateMsg::BroadcastTo {",
@@ -714,6 +722,126 @@ mod tests {
                  If a new UPDATE wire variant was added, gate it through \
                  the rate limiter and update this list. If a variant was \
                  removed, update this list."
+            );
+        }
+        // Spawn-site cross-check — the dispatch must invoke all four
+        // relay drivers. This pins the variants to actual driver
+        // calls (not just match arms), making the test less brittle
+        // to comment-only mentions of a variant name.
+        for spawn in [
+            "start_relay_request_update(",
+            "start_relay_broadcast_to(",
+            "start_relay_request_update_streaming(",
+            "start_relay_broadcast_to_streaming(",
+        ] {
+            let count = block.matches(spawn).count();
+            assert!(
+                count >= 1,
+                "UPDATE dispatch block does not invoke `{spawn}` — the \
+                 corresponding wire variant is not actually gated."
+            );
+        }
+    }
+
+    /// Strict-cap pin: under concurrent insertion of distinct keys
+    /// (no shared key), the total accepted count must NOT exceed the
+    /// cap regardless of how many threads race. Codex re-review of
+    /// PR #4285 caught that the previous `len()`-precheck pattern
+    /// could overshoot by up to `num_concurrent_callers` because
+    /// every racing caller saw `len < cap` at probe time. The fix
+    /// uses an `AtomicUsize::fetch_add` reservation, which strictly
+    /// serializes.
+    #[test]
+    fn concurrent_distinct_keys_do_not_overshoot_cap() {
+        use std::sync::{Arc as StdArc, Barrier};
+        use std::thread;
+
+        const CAP: usize = 8;
+        const THREADS: usize = 64; // 8× the cap to stress the race
+
+        let ts = SharedMockTimeSource::new();
+        let limiter = StdArc::new(UpdateRateLimiter::with_config(
+            Arc::new(ts.clone()),
+            MIN_UPDATE_INTERVAL,
+            CAP,
+        ));
+        let barrier = StdArc::new(Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+
+        for i in 0..THREADS {
+            let l = limiter.clone();
+            let b = barrier.clone();
+            handles.push(thread::spawn(move || {
+                b.wait();
+                // Each thread tries a DISTINCT key, so they all
+                // exercise the new-pair (Vacant) path concurrently.
+                l.check_and_record(mk_sender((i + 1) as u8), mk_contract((i + 1) as u8))
+            }));
+        }
+
+        let mut allowed = 0;
+        let mut cap_rejected = 0;
+        let mut rate_rejected = 0;
+        for h in handles {
+            match h.join().unwrap() {
+                RateLimitDecision::Allowed => allowed += 1,
+                RateLimitDecision::CapacityExceeded => cap_rejected += 1,
+                RateLimitDecision::Rejected { .. } => rate_rejected += 1,
+            }
+        }
+        // Critical invariant: the map size is EXACTLY the cap, not
+        // cap + overshoot.
+        assert_eq!(
+            limiter.len(),
+            CAP,
+            "strict cap: map size must equal CAP after a 64-thread \
+             concurrent flood of distinct keys, got {}",
+            limiter.len()
+        );
+        assert_eq!(
+            allowed, CAP,
+            "exactly CAP admissions allowed under flood, got {allowed}"
+        );
+        assert_eq!(cap_rejected, THREADS - CAP);
+        assert_eq!(rate_rejected, 0);
+        assert_eq!(limiter.capacity_rejected_total(), (THREADS - CAP) as u64);
+    }
+
+    /// Pin: cleanup decrements the `size` counter by the number of
+    /// dropped entries. After all entries roll off, the cap should
+    /// be fully available again — strict-cap accounting tracks the
+    /// map. Caught a related issue while refactoring the cap
+    /// implementation.
+    #[test]
+    fn cleanup_decrements_size_counter() {
+        let ts = SharedMockTimeSource::new();
+        let limiter = UpdateRateLimiter::with_config(
+            Arc::new(ts.clone()),
+            MIN_UPDATE_INTERVAL,
+            4, // small cap
+        );
+        // Fill to cap.
+        for i in 0..4 {
+            assert_eq!(
+                limiter.check_and_record(mk_sender(i + 1), mk_contract(i + 1)),
+                RateLimitDecision::Allowed
+            );
+        }
+        // 5th is CapacityExceeded.
+        assert_eq!(
+            limiter.check_and_record(mk_sender(5), mk_contract(5)),
+            RateLimitDecision::CapacityExceeded
+        );
+        // Age out all entries.
+        ts.advance(CLEANUP_AGE + Duration::from_secs(1));
+        limiter.cleanup();
+        assert_eq!(limiter.len(), 0);
+        // Now we should be able to add 4 more without hitting the cap.
+        for i in 10..14 {
+            assert_eq!(
+                limiter.check_and_record(mk_sender(i), mk_contract(i)),
+                RateLimitDecision::Allowed,
+                "after cleanup, new pair (sender={i}) should be admitted"
             );
         }
     }
