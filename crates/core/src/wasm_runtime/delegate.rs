@@ -373,8 +373,7 @@ impl Runtime {
                 }
 
                 OutboundDelegateMsg::ContextUpdated(new_context) => {
-                    // Port #4242: reuse backing allocation instead of
-                    // unconditionally allocating a new Vec<u8>.
+                    // Port #4242: re-use buffer to avoid alloc churn.
                     context.clear();
                     context.extend_from_slice(new_context.as_ref());
                 }
@@ -555,12 +554,7 @@ impl DelegateRuntimeInterface for Runtime {
                         processed,
                         ..
                     }) => {
-                        // Port #4242: context attached to ApplicationMessage
-                        // is read by delegates that need message-level context
-                        // (e.g. test-delegate-integration).  The clone here is
-                        // kept because the message must own its own copy; the
-                        // second copy (for exec_inbound_with_env) uses
-                        // `std::mem::take` to avoid a second allocation.
+                        // Port #4242: clone kept — delegates read message context (e.g. test-delegate-integration).
                         let app_msg = InboundDelegateMsg::ApplicationMessage(
                             ApplicationMessage::new(payload)
                                 .processed(processed)
