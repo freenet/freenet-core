@@ -373,7 +373,7 @@ impl Runtime {
                 }
 
                 OutboundDelegateMsg::ContextUpdated(new_context) => {
-                    // Port #4242: re-use buffer to avoid alloc churn.
+                    // avoid alloc churn — buffer reuse instead of to_vec
                     context.clear();
                     context.extend_from_slice(new_context.as_ref());
                 }
@@ -554,7 +554,7 @@ impl DelegateRuntimeInterface for Runtime {
                         processed,
                         ..
                     }) => {
-                        // Port #4242: clone kept — delegates read message context (e.g. test-delegate-integration).
+                        // clone kept — delegates read message-level context
                         let app_msg = InboundDelegateMsg::ApplicationMessage(
                             ApplicationMessage::new(payload)
                                 .processed(processed)
