@@ -663,10 +663,23 @@ impl Ring {
     /// reaper writes governance state; readers consume it
     /// asynchronously.
     async fn governance_reaper_loop(ring: Arc<Self>) {
-        // Random initial delay so a fleet-wide restart doesn't have
-        // every node ticking in lockstep. 30-90 second offset; the
-        // tick itself runs every minute below.
-        let initial_delay = Duration::from_secs(GlobalRng::random_range(30u64..=90u64));
+        // Initial delay so a fleet-wide restart doesn't have every node
+        // ticking in lockstep. Derived from the node's own ring location
+        // (already random + node-distinct) rather than from `GlobalRng`,
+        // because consuming from `GlobalRng` at startup shifts the
+        // deterministic seed state and breaks simulation tests whose
+        // routing/topology decisions are RNG-driven (the
+        // `test_get_routing_coverage_low_htl` regression was caught by
+        // CI on PR #4270). 30-90 second offset; the tick itself runs
+        // every minute below.
+        let own_loc = ring
+            .connection_manager
+            .own_location()
+            .location()
+            .map(|l| l.as_f64())
+            .unwrap_or(0.5);
+        let initial_delay_secs = 30 + ((own_loc * 60.0) as u64);
+        let initial_delay = Duration::from_secs(initial_delay_secs);
         tokio::time::sleep(initial_delay).await;
 
         let mut interval = tokio::time::interval(GOVERNANCE_TICK_INTERVAL);
