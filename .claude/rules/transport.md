@@ -83,7 +83,7 @@ BEFORE changing LEDBAT++ parameters:
   4. Document reasoning in commit message
 ```
 
-### Shadow per-peer RTT registry (issue #4074, Phase 1)
+### Shadow per-peer RTT registry (issue #4074, Phases 1 + 1.5)
 
 `transport/rolling_rtt_stats.rs` maintains a process-wide
 `SHADOW_RTT_REGISTRY` (`DashMap<SocketAddr, Arc<dyn RttSnapshotProvider>>`)

@@ -331,15 +331,19 @@ pub(crate) fn spawn_aggregator(
 /// mirror at INFO was the third-largest contributor to the
 /// #4251 / #4272 log-volume regression at ~3,600 lines/hour per
 /// node. Production telemetry reaches the OTLP collector via the
-/// `send_standalone_event` call below, which is independent of the
-/// tracing level, so the dashboard's 1 Hz feed survives.
+/// `send_standalone_event_with_peer_id` call below, which is
+/// independent of the tracing level, so the dashboard's 1 Hz feed
+/// survives.
 ///
-/// `send_standalone_event` pushes a structured event through the
-/// global telemetry sender (`crate::tracing::telemetry::send_standalone_event`)
+/// `send_standalone_event_with_peer_id` pushes a structured event
+/// through the global telemetry sender
+/// (`crate::tracing::telemetry::send_standalone_event_with_peer_id`)
 /// so it reaches the central OTLP collector (per the `NetEventLog`
 /// path that `TelemetryReporter` consumes). Without that, the
 /// aggregate would land only in per-node file logs and the 2-4 week
 /// observation the RFC calls for would require manual log scraping.
+/// The `local_peer_id` argument is attached as an OTLP attribute so
+/// the collector can disaggregate per reporting node.
 fn emit_aggregate_snapshot(local_peer_id: &str) {
     let snap = registry_snapshot();
     let active_peers = snap.len();

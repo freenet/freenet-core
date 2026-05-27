@@ -1,4 +1,4 @@
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
 
 use futures::{FutureExt, future::BoxFuture};
 use tokio::task::JoinHandle;
@@ -373,25 +373,47 @@ impl NodeP2P {
         tracing::info!("Actor-based client management infrastructure installed with result router");
 
         let background_task_monitor = BackgroundTaskMonitor::new();
-        // Phase 1 of the outer-loop rate-controller RFC (#4074):
-        // start the cross-connection RTT shadow aggregator. Pure
-        // observation; never read by the production data path. The
-        // local peer id is tagged onto every emitted event so the
-        // collector can disaggregate samples by reporting node.
-        let local_peer_id = config.key_pair.public().to_string();
+        // Phase 1 / Phase 1.5 of the outer-loop rate-controller RFC
+        // (#4074): start the cross-connection RTT shadow aggregator
+        // and the out-of-band reference-path probe. Both are pure
+        // observation — never read by the production data path.
+        //
+        // The local peer id is tagged onto every emitted event so the
+        // collector can disaggregate samples by reporting node. We
+        // construct it as `PeerId::new(pub_key, addr).to_string()` to
+        // match the format used by other OTLP events (set elsewhere
+        // from `KnownPeerKeyLocation::Display`), so the collector can
+        // cross-correlate shadow telemetry with the rest of the event
+        // stream by peer_id alone.
+        //
+        // Gate on telemetry being enabled: when telemetry is opt-out
+        // (`telemetry-enabled = false`) or in test environments
+        // (detected by `--id` flag), `TelemetryReporter::new` returns
+        // `None` and `send_standalone_event_with_peer_id` silently
+        // drops events. The shadow aggregator is cheap to leave
+        // running (no I/O), but reference-ping issues a real UDP DNS
+        // query at 1Hz, so we must not fire that traffic when
+        // telemetry is disabled — that would surprise opt-out
+        // operators AND flood Cloudflare with redundant queries from
+        // every CI simulation node.
+        let telemetry_enabled =
+            config.config.telemetry.enabled && !config.config.telemetry.is_test_environment;
+        let listen_addr = config.own_addr.unwrap_or_else(|| {
+            SocketAddr::new(config.network_listener_ip, config.network_listener_port)
+        });
+        let local_peer_id =
+            crate::node::PeerId::new(config.key_pair.public().clone(), listen_addr).to_string();
         crate::transport::rolling_rtt_stats::spawn_aggregator(
             local_peer_id.clone(),
             &background_task_monitor,
         );
-        // Phase 1.5 (#4074): periodic out-of-band reference-path
-        // probe so the collector can separate "overlay queueing
-        // baseline" from "local uplink contention" — the open
-        // question Phase 1 telemetry cannot answer on its own.
-        crate::transport::reference_ping::spawn_reference_ping(
-            local_peer_id,
-            crate::transport::reference_ping::DEFAULT_REFERENCE_TARGET,
-            &background_task_monitor,
-        );
+        if telemetry_enabled {
+            crate::transport::reference_ping::spawn_reference_ping(
+                local_peer_id,
+                crate::transport::reference_ping::DEFAULT_REFERENCE_TARGET,
+                &background_task_monitor,
+            );
+        }
         let connection_manager = ConnectionManager::new(&config);
         let op_manager = Arc::new(OpManager::new(
             notification_tx,
