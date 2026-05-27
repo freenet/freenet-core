@@ -1923,12 +1923,20 @@ impl Ring {
         resource: crate::topology::meter::ResourceType,
         amount: f64,
     ) {
+        // Use the injectable `TimeSource` (rather than `Instant::now()`
+        // directly) so deterministic simulation tests can drive this
+        // path. Per `.claude/rules/code-style.md` "Need current time?
+        // → USE: TimeSource trait" — the executor commit path will reach
+        // here from inside simulated nodes once the governance scoring
+        // integration tests land, and reading wall-clock there would
+        // break determinism.
+        let now = self.time_source.now();
         let mut topo = self.connection_manager.topology_manager.write();
         topo.report_resource_usage(
             &crate::topology::meter::AttributionSource::Contract(contract_id),
             resource,
             amount,
-            tokio::time::Instant::now(),
+            now,
         );
     }
 

@@ -111,6 +111,16 @@ pub struct HostedContract {
     /// were actively in use and then lost all in-use signals get bumped
     /// to the priority bucket, since their `last_accessed` would otherwise
     /// keep them at the LRU tail despite no longer mattering.
+    ///
+    /// The timestamp itself is written but not read by eviction logic
+    /// (eviction priority comes purely from LRU position, which
+    /// `record_abandonment` adjusts as a side effect). It is retained
+    /// for the governance dashboard (PR #4270) so an operator can see
+    /// how long ago a flagged contract was last actively used. A future
+    /// refactor that removes the field can do so only after the
+    /// dashboard reader is also dropped — code-first reviewer of #4260
+    /// flagged this as a "currently write-only" foot-gun worth pinning
+    /// in the rustdoc.
     pub abandoned_at: Option<Instant>,
 }
 
