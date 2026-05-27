@@ -251,17 +251,23 @@ where
                 state_size = state.size(),
                 "MockRuntime: Emitting BroadcastStateChange"
             );
-            if let Err(err) = op_manager
-                .notify_node_event(NodeEvent::BroadcastStateChange {
-                    key,
-                    new_state: state.clone(),
-                })
-                .await
-            {
-                tracing::warn!(
+            // Mirror the production runtime: non-blocking emit avoids
+            // stalling the executor when the event-loop notification
+            // channel is full (#4145). The mock would otherwise diverge
+            // from production semantics and silently absorb a regression
+            // in simulation tests.
+            if let Err(err) = op_manager.try_notify_node_event(NodeEvent::BroadcastStateChange {
+                key,
+                new_state: state.clone(),
+            }) {
+                // Best-effort by design (mirrors the production
+                // executor; see runtime.rs for the #4145 / #4238
+                // rationale). Per-occurrence WARN here would re-
+                // introduce the spam at the caller layer.
+                tracing::debug!(
                     contract = %key,
                     error = %err,
-                    "MockRuntime: Failed to broadcast state change"
+                    "MockRuntime: Failed to broadcast state change (best-effort)"
                 );
             }
         }

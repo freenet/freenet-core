@@ -390,9 +390,36 @@ mod tests {
                     &mut self.secret_store,
                     &self.contract_store,
                     Some(self.db.clone()),
+                    None,
                     delegate_key,
                     &mut self.delegate_store,
                     depth,
+                    vec![],
+                )
+            }
+        }
+
+        /// Create a DelegateCallEnv wired to an arbitrary state-write callback.
+        ///
+        /// # Safety
+        /// Caller must ensure the returned env does not outlive `self`.
+        unsafe fn make_env_with_callback(
+            &mut self,
+            cb: super::super::runtime::StateWriteCallback,
+        ) -> DelegateCallEnv {
+            let delegate_key = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
+            // SAFETY: The caller guarantees the returned env does not outlive `self`,
+            // which keeps the borrowed `secret_store` and `contract_store` alive.
+            unsafe {
+                DelegateCallEnv::new(
+                    vec![],
+                    &mut self.secret_store,
+                    &self.contract_store,
+                    Some(self.db.clone()),
+                    Some(cb),
+                    delegate_key,
+                    &mut self.delegate_store,
+                    0,
                     vec![],
                 )
             }
@@ -415,6 +442,7 @@ mod tests {
                     &mut self.secret_store,
                     &self.contract_store,
                     Some(self.db.clone()),
+                    None,
                     delegate_key,
                     &mut self.delegate_store,
                     0,
@@ -507,6 +535,7 @@ mod tests {
                 &mut env_holder.secret_store,
                 &env_holder.contract_store,
                 None, // No state store
+                None,
                 delegate_key,
                 &mut env_holder.delegate_store,
                 0,
@@ -587,6 +616,7 @@ mod tests {
                 &mut env_holder.secret_store,
                 &env_holder.contract_store,
                 None,
+                None,
                 delegate_key,
                 &mut env_holder.delegate_store,
                 0,
@@ -612,6 +642,7 @@ mod tests {
                 vec![],
                 &mut env_holder.secret_store,
                 &env_holder.contract_store,
+                None,
                 None,
                 delegate_key,
                 &mut env_holder.delegate_store,
@@ -674,6 +705,121 @@ mod tests {
 
         let state = env.get_contract_state_sync(&contract_id).unwrap();
         assert_eq!(state, Some(vec![40, 50, 60]));
+    }
+
+    /// V2 delegate PUT must fire the `state_write_callback` (which the
+    /// executor wires to `bump_state_generation` + `refresh_cache_generation`)
+    /// AFTER a successful write. Without this hook the V2 delegate write
+    /// path bypasses the executor's `state_store.store` chokepoint and the
+    /// per-contract generation counter never advances on V2 delegate writes,
+    /// leaving the EvictContract re-host race open.
+    ///
+    /// Regression test for PR #4212 review round D (skeptical r3 #1).
+    #[tokio::test]
+    async fn test_env_put_contract_state_fires_write_callback() {
+        let mut env_holder = TestEnv::new().await;
+        let contract_id = env_holder.store_contract(120, &[1, 2, 3]).await;
+
+        let observed =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, usize)>::new()));
+        let observed_for_cb = observed.clone();
+        let cb: super::super::runtime::StateWriteCallback =
+            std::sync::Arc::new(move |k: &ContractKey, state_size: usize| {
+                observed_for_cb.lock().unwrap().push((*k, state_size));
+            });
+
+        // SAFETY: `env_holder` is alive for the duration of this test.
+        let env = unsafe { env_holder.make_env_with_callback(cb) };
+        env.put_contract_state_sync(&contract_id, vec![4, 5, 6])
+            .expect("V2 PUT should succeed");
+
+        let calls = observed.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "callback must fire exactly once per successful V2 PUT"
+        );
+        assert_eq!(
+            calls[0].0.id(),
+            &contract_id,
+            "callback must receive the written contract key"
+        );
+        assert_eq!(
+            calls[0].1, 3,
+            "callback must receive the on-disk state byte count (vec![4, 5, 6] = 3 bytes) — \
+             this pins the StateBytesWritten attribution to the actual write size and would \
+             catch a refactor that hardcodes the size or passes a stale length"
+        );
+    }
+
+    /// V2 delegate UPDATE must also fire `state_write_callback` after a
+    /// successful update. Mirrors `test_env_put_contract_state_fires_write_callback`
+    /// for the UPDATE path — same race rationale.
+    #[tokio::test]
+    async fn test_env_update_contract_state_fires_write_callback() {
+        let mut env_holder = TestEnv::new().await;
+        let contract_id = env_holder.store_contract(121, &[10, 20, 30]).await;
+
+        let observed =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, usize)>::new()));
+        let observed_for_cb = observed.clone();
+        let cb: super::super::runtime::StateWriteCallback =
+            std::sync::Arc::new(move |k: &ContractKey, state_size: usize| {
+                observed_for_cb.lock().unwrap().push((*k, state_size));
+            });
+
+        // SAFETY: `env_holder` is alive for the duration of this test.
+        let env = unsafe { env_holder.make_env_with_callback(cb) };
+        env.update_contract_state_sync(&contract_id, vec![40, 50, 60])
+            .expect("V2 UPDATE should succeed");
+
+        let calls = observed.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "callback must fire exactly once per successful V2 UPDATE"
+        );
+        assert_eq!(
+            calls[0].0.id(),
+            &contract_id,
+            "callback must receive the updated contract key"
+        );
+        assert_eq!(
+            calls[0].1, 3,
+            "callback must receive the on-disk state byte count (vec![40, 50, 60] = 3 bytes)"
+        );
+    }
+
+    /// A failed V2 delegate UPDATE (no existing state) must NOT fire the
+    /// callback — the write didn't happen, so no generation bump is owed.
+    #[tokio::test]
+    async fn test_env_update_contract_state_failure_does_not_fire_callback() {
+        let mut env_holder = TestEnv::new().await;
+        // Register contract code but do NOT store any state — UPDATE will fail.
+        let code = ContractCode::from(vec![122, 123, 124]);
+        let params = Parameters::from(vec![132, 133]);
+        let key = ContractKey::from_params_and_code(&params, &code);
+        let contract_id = *key.id();
+        env_holder.contract_store.ensure_key_indexed(&key).unwrap();
+
+        let observed =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<(ContractKey, usize)>::new()));
+        let observed_for_cb = observed.clone();
+        let cb: super::super::runtime::StateWriteCallback =
+            std::sync::Arc::new(move |k: &ContractKey, state_size: usize| {
+                observed_for_cb.lock().unwrap().push((*k, state_size));
+            });
+
+        // SAFETY: `env_holder` is alive for the duration of this test.
+        let env = unsafe { env_holder.make_env_with_callback(cb) };
+        let result = env.update_contract_state_sync(&contract_id, vec![1, 2, 3]);
+        assert!(matches!(result, Err(DelegateEnvError::NoExistingState)));
+
+        let calls = observed.lock().unwrap();
+        assert!(
+            calls.is_empty(),
+            "callback must NOT fire when the V2 UPDATE returns NoExistingState"
+        );
     }
 
     /// V2 delegate UPDATE fails when there's no existing state.

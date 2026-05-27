@@ -1100,6 +1100,10 @@ fn run_wrapper(version: &str) -> Result<()> {
     //   - network child in `run_wrapper_loop`      (this file, ~line 1452)
     //   - `spawn_new_wrapper`                      (this file)
     //   - `open_log_file` notepad/open/xdg-open    (tray.rs)
+    //   - `taskkill_pid` (nulls all three) and `list_freenet_processes`
+    //     (`.output()` — fresh pipes, no stdin inherit), reached directly via
+    //     `kill_stale_freenet_processes` (called below) and via
+    //     `kill_freenet_service_processes` (the `update.rs` restart path)
     // Add any new child spawn in this module with null stdio by default.
     // See #3933 / #3934 and `.claude/rules/bug-prevention-patterns.md`
     // at the repo root for the rule + audit grep.
@@ -2012,44 +2016,21 @@ fn kill_stale_freenet_processes(log_dir: &Path) {
 
     #[cfg(target_os = "windows")]
     {
-        // Use WMIC to find freenet.exe processes with "network" in the command line,
-        // then kill them by PID. This avoids killing the wrapper itself or other
-        // freenet subcommands (update, service, etc.).
-        let output = std::process::Command::new("wmic")
-            .args([
-                "process",
-                "where",
-                "name='freenet.exe' and commandline like '%network%'",
-                "get",
-                "processid",
-                "/format:list",
-            ])
-            .output();
-        if let Ok(output) = output {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let mut killed = false;
-            for line in stdout.lines() {
-                if let Some(pid_str) = line.strip_prefix("ProcessId=") {
-                    let pid = pid_str.trim();
-                    if !pid.is_empty() {
-                        drop(
-                            std::process::Command::new("taskkill")
-                                .args(["/F", "/PID", pid])
-                                .stdout(std::process::Stdio::null())
-                                .stderr(std::process::Stdio::null())
-                                .status(),
-                        );
-                        killed = true;
-                    }
-                }
-            }
-            if killed {
-                log_wrapper_event(
-                    log_dir,
-                    "Killed stale freenet network process(es) on startup",
-                );
-                std::thread::sleep(std::time::Duration::from_secs(2));
-            }
+        // Reap orphaned `network` node children left by a previous wrapper
+        // instance. Only nodes are targeted — never a wrapper or another
+        // `freenet` subcommand. A single pass suffices here (unlike the loop
+        // in `kill_freenet_service_processes`): this runs at wrapper startup
+        // and on the port-conflict retry, when the only live wrapper is this
+        // process, so no other wrapper exists to respawn a reaped node.
+        // Shares the PowerShell-based enumeration used by
+        // `kill_freenet_service_processes`; `wmic` (used here previously) is
+        // deprecated and absent by default on recent Windows releases.
+        if kill_freenet_processes_matching(FreenetServiceProcess::Node) > 0 {
+            log_wrapper_event(
+                log_dir,
+                "Killed stale freenet network process(es) on startup",
+            );
+            std::thread::sleep(std::time::Duration::from_secs(2));
         }
     }
 }
@@ -2594,10 +2575,19 @@ SuccessExitStatus=42 43
 # Do NOT restart — the existing instance is healthy.
 RestartPreventExitStatus=43
 
-# Logging - write to files for systems without active user journald
-# (headless servers, systems without lingering enabled, etc.)
-StandardOutput=append:{log_dir}/freenet.log
-StandardError=append:{log_dir}/freenet.error.log
+# Logging
+# - The node's tracing layer writes its own size-capped, hourly-rotated
+#   logs to {log_dir}/freenet.YYYY-MM-DD-HH.log (LOG_RETENTION_HOURS +
+#   LOG_DIR_MAX_BYTES; see crates/core/src/tracing.rs).
+# - systemd's StandardOutput/StandardError previously appended to a fixed
+#   freenet.log / freenet.error.log that the time-based cleanup never
+#   pruned (mtime stayed fresh while the file was being written), so they
+#   grew without bound on long-running nodes (issue #4251).
+# - Routing both to the journal lets journald handle rotation, and panics
+#   or pre-tracing-init output remain queryable via
+#   `journalctl --user-unit freenet`.
+StandardOutput=journal
+StandardError=journal
 SyslogIdentifier=freenet
 
 # Resource limits to prevent runaway resource consumption
@@ -2659,9 +2649,19 @@ SuccessExitStatus=42 43
 # Do NOT restart — the existing instance is healthy.
 RestartPreventExitStatus=43
 
-# Logging - write to files for systems without active user journald
-StandardOutput=append:{log_dir}/freenet.log
-StandardError=append:{log_dir}/freenet.error.log
+# Logging
+# - The node's tracing layer writes its own size-capped, hourly-rotated
+#   logs to {log_dir}/freenet.YYYY-MM-DD-HH.log (LOG_RETENTION_HOURS +
+#   LOG_DIR_MAX_BYTES; see crates/core/src/tracing.rs).
+# - systemd's StandardOutput/StandardError previously appended to a fixed
+#   freenet.log / freenet.error.log that the time-based cleanup never
+#   pruned (mtime stayed fresh while the file was being written), so they
+#   grew without bound on long-running nodes (issue #4251).
+# - Routing both to the journal lets journald handle rotation, and panics
+#   or pre-tracing-init output remain queryable via
+#   `journalctl -u freenet`.
+StandardOutput=journal
+StandardError=journal
 SyslogIdentifier=freenet
 
 # Resource limits to prevent runaway resource consumption
@@ -2849,14 +2849,24 @@ CONSECUTIVE_FAILURES=0
 PORT_CONFLICT_KILLS=0
 MAX_PORT_CONFLICT_KILLS=3  # Give up after this many kill attempts
 
-LOG="$HOME/Library/Logs/freenet/freenet.log"
+# Lifecycle messages route through `logger`, which writes to macOS unified
+# logging (auto-rotated, queryable via `log show --predicate 'process ==
+# "logger"' --info`). Previously these were appended to a fixed
+# ~/Library/Logs/freenet/freenet.log that the cleanup pass never touched
+# (its mtime stayed fresh while being written), so the file grew without
+# bound on long-running nodes (issue #4251). The transient
+# freenet.error.log.last scratch file below is overwritten on every launch
+# and so does not accumulate.
+log_event() {{
+    logger -t freenet "$1"
+}}
 
 # Kill any stale freenet network processes before starting.
 # This handles the case where a previous launch daemon restart left a child
 # process still holding the port (e.g. port 7509).
 # Scoped to the current user to avoid killing processes owned by other users.
 if pkill -f -u "$(id -u)" "freenet network" 2>/dev/null; then
-    echo "$(date): Killed stale freenet network process(es) on startup" >> "$LOG"
+    log_event "Killed stale freenet network process(es) on startup"
     sleep 2
 fi
 
@@ -2865,44 +2875,44 @@ while true; do
     EXIT_CODE=$?
 
     if [ $EXIT_CODE -eq 42 ]; then
-        echo "$(date): Update needed, running freenet update..." >> "$LOG"
+        log_event "Update needed, running freenet update..."
         if "{binary}" update --quiet; then
-            echo "$(date): Update successful, restarting..." >> "$LOG"
+            log_event "Update successful, restarting..."
             CONSECUTIVE_FAILURES=0
             PORT_CONFLICT_KILLS=0
             BACKOFF=10
             sleep 2
         else
             CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
-            echo "$(date): Update failed (attempt $CONSECUTIVE_FAILURES), backing off $BACKOFF seconds..." >> "$LOG"
+            log_event "Update failed (attempt $CONSECUTIVE_FAILURES), backing off $BACKOFF seconds..."
             sleep $BACKOFF
             BACKOFF=$((BACKOFF * 2))
             [ $BACKOFF -gt $MAX_BACKOFF ] && BACKOFF=$MAX_BACKOFF
         fi
         continue
     elif [ $EXIT_CODE -eq 43 ]; then
-        echo "$(date): Another instance is already running, exiting cleanly" >> "$LOG"
+        log_event "Another instance is already running, exiting cleanly"
         exit 0
     elif [ $EXIT_CODE -eq 0 ]; then
-        echo "$(date): Normal shutdown" >> "$LOG"
+        log_event "Normal shutdown"
         exit 0
     else
         # Check if this looks like a port-already-in-use failure.
         if grep -q "already in use" "$HOME/Library/Logs/freenet/freenet.error.log.last" 2>/dev/null; then
             PORT_CONFLICT_KILLS=$((PORT_CONFLICT_KILLS + 1))
             if [ $PORT_CONFLICT_KILLS -le $MAX_PORT_CONFLICT_KILLS ]; then
-                echo "$(date): Port conflict detected (attempt $PORT_CONFLICT_KILLS/$MAX_PORT_CONFLICT_KILLS) — killing stale freenet process and retrying..." >> "$LOG"
+                log_event "Port conflict detected (attempt $PORT_CONFLICT_KILLS/$MAX_PORT_CONFLICT_KILLS) — killing stale freenet process and retrying..."
                 pkill -f -u "$(id -u)" "freenet network" 2>/dev/null || true
                 sleep 2
                 BACKOFF=10
                 continue
             else
-                echo "$(date): Port conflict persists after $MAX_PORT_CONFLICT_KILLS kill attempts. Manual intervention may be required ('pkill freenet'). Backing off..." >> "$LOG"
+                log_event "Port conflict persists after $MAX_PORT_CONFLICT_KILLS kill attempts. Manual intervention may be required ('pkill freenet'). Backing off..."
             fi
         fi
         CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
         PORT_CONFLICT_KILLS=0
-        echo "$(date): Exited with code $EXIT_CODE, restarting after backoff..." >> "$LOG"
+        log_event "Exited with code $EXIT_CODE, restarting after backoff..."
         sleep $BACKOFF
         BACKOFF=$((BACKOFF * 2))
         [ $BACKOFF -gt $MAX_BACKOFF ] && BACKOFF=$MAX_BACKOFF
@@ -2914,7 +2924,7 @@ done
 }
 
 #[cfg(target_os = "macos")]
-fn generate_plist(wrapper_path: &Path, log_dir: &Path) -> String {
+pub(super) fn generate_plist(wrapper_path: &Path, log_dir: &Path) -> String {
     // Note: wrapper_path is the auto-update wrapper script, not the freenet binary directly.
     // The wrapper handles the loop: run freenet, check exit code, update if needed.
     format!(
@@ -2935,10 +2945,23 @@ fn generate_plist(wrapper_path: &Path, log_dir: &Path) -> String {
         <key>SuccessfulExit</key>
         <false/>
     </dict>
+    <!--
+        Logging
+        - The node's tracing layer writes its own size-capped, hourly-
+          rotated logs to {log_dir}/freenet.YYYY-MM-DD-HH.log
+          (LOG_RETENTION_HOURS + LOG_DIR_MAX_BYTES; see
+          crates/core/src/tracing.rs).
+        - launchd previously appended to fixed freenet.log / freenet.error.log
+          that the time-based cleanup never pruned, so they grew without
+          bound (issue #4251). macOS does not offer a journal target for
+          launchd, so the cleanest option is /dev/null — diagnostics
+          remain available via `freenet service report`, which collects
+          the rotated tracing logs.
+    -->
     <key>StandardOutPath</key>
-    <string>{log_dir}/freenet.log</string>
+    <string>/dev/null</string>
     <key>StandardErrorPath</key>
-    <string>{log_dir}/freenet.error.log</string>
+    <string>/dev/null</string>
     <key>SoftResourceLimits</key>
     <dict>
         <key>NumberOfFiles</key>
@@ -3196,21 +3219,11 @@ pub fn stop_and_remove_service(_system: bool) -> Result<bool> {
 
     let had_registry = run_key.delete_value("Freenet").is_ok();
 
-    // Kill any running freenet processes (wrapper + child), excluding ourselves
-    let our_pid = std::process::id().to_string();
-    drop(
-        std::process::Command::new("taskkill")
-            .args([
-                "/f",
-                "/im",
-                "freenet.exe",
-                "/fi",
-                &format!("PID ne {}", our_pid),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status(),
-    );
+    // Kill the running Freenet service processes (wrapper + node child).
+    // Targets only the service's own processes by command line so an
+    // unrelated freenet.exe — e.g. the GUI installer — is never killed
+    // (issue #4205).
+    kill_freenet_service_processes();
 
     // Also clean up any legacy scheduled task from older installs
     let had_task = std::process::Command::new("schtasks")
@@ -3311,32 +3324,201 @@ fn start_service(system: bool) -> Result<()> {
     Ok(())
 }
 
+/// Strip the leading executable path from a Windows process command line,
+/// returning just the argument portion (everything after the program name).
+///
+/// The program path is normally quoted — both Rust's `Command` and the
+/// registry `Run` key quote it — in which case it can be stripped exactly.
+/// For an unquoted path we fall back to splitting on the first whitespace;
+/// that is only ambiguous for unquoted paths containing spaces, which
+/// Windows avoids for the processes Freenet itself spawns.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn command_line_args(cmdline: &str) -> &str {
+    let trimmed = cmdline.trim_start();
+    if let Some(after_open_quote) = trimmed.strip_prefix('"') {
+        after_open_quote
+            .find('"')
+            .map_or("", |close| after_open_quote[close + 1..].trim_start())
+    } else {
+        trimmed
+            .find(char::is_whitespace)
+            .map_or("", |space| trimmed[space..].trim_start())
+    }
+}
+
+/// Which Freenet service process a `freenet.exe` command line represents.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreenetServiceProcess {
+    /// The `service run-wrapper` supervisor (also the Windows tray process).
+    Wrapper,
+    /// The `network` node child the wrapper supervises.
+    Node,
+}
+
+/// Classify a `freenet.exe` process from its full command line.
+///
+/// Matching is by the **subcommand prefix** — the first argument token after
+/// the executable path — not by scanning every token. A blanket token scan
+/// would misfire on a command line where `network` or `run-wrapper` appears
+/// as an option value or path component rather than the subcommand, e.g.
+/// `freenet local --config-dir network`.
+///
+/// Returns `None` for every other `freenet.exe` invocation, which must never
+/// be killed: the GUI installer (launched with no subcommand — issue #4205),
+/// `service stop`, `update`, or any directly-run `freenet` CLI command. Note
+/// that a node started manually via the top-level `freenet network`
+/// subcommand IS classified as `Node` — `service stop` is meant to stop a
+/// running node regardless of how it was launched.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn classify_freenet_process(cmdline: &str) -> Option<FreenetServiceProcess> {
+    let mut args = command_line_args(cmdline).split_whitespace();
+    match args.next()? {
+        "network" => Some(FreenetServiceProcess::Node),
+        "service" if args.next() == Some("run-wrapper") => Some(FreenetServiceProcess::Wrapper),
+        _ => None,
+    }
+}
+
+/// Parse the `<pid>\t<command line>` lines produced by the PowerShell process
+/// listing in `list_freenet_processes` into `(pid, command_line)` pairs.
+/// Lines that do not begin with a numeric PID are ignored.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn parse_freenet_process_listing(stdout: &str) -> Vec<(u32, String)> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_end_matches('\r');
+            let (pid, cmdline) = line.split_once('\t').unwrap_or((line, ""));
+            Some((pid.trim().parse::<u32>().ok()?, cmdline.to_string()))
+        })
+        .collect()
+}
+
+/// Enumerate `freenet.exe` processes and their command lines via PowerShell.
+///
+/// Uses `Get-CimInstance` rather than `wmic`, which is deprecated and no
+/// longer installed by default on recent Windows releases. Returns `None` if
+/// the process listing could not be obtained.
+///
+/// A process whose `CommandLine` cannot be read (owned by another user) is
+/// listed with an empty command line and so is never classified as a service
+/// process. The wrapper, node, and installer all run as the same user, so
+/// this never hides one of our own processes.
+///
+/// `.output()` captures stdout/stderr through fresh pipes and does not inherit
+/// stdin, so this spawn is safe even after `FreeConsole()` (see the spawn-site
+/// audit note on `run_wrapper`).
+#[cfg(target_os = "windows")]
+fn list_freenet_processes() -> Option<Vec<(u32, String)>> {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Get-CimInstance Win32_Process -Filter \"Name='freenet.exe'\" | \
+             ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_freenet_process_listing(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// Force-terminate a process by PID via `taskkill`. Returns whether `taskkill`
+/// reported success.
+///
+/// All three standard handles are nulled so the spawn succeeds even when the
+/// caller has detached from its console via `FreeConsole()` — the auto-update
+/// restart path reaches here from the wrapper. See
+/// `.claude/rules/bug-prevention-patterns.md`.
+#[cfg(target_os = "windows")]
+fn taskkill_pid(pid: u32) -> bool {
+    std::process::Command::new("taskkill")
+        .args(["/f", "/pid", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Enumerate `freenet.exe` processes and `taskkill` every one classified as
+/// `kind`, excluding the current process. Returns the number terminated.
+#[cfg(target_os = "windows")]
+fn kill_freenet_processes_matching(kind: FreenetServiceProcess) -> usize {
+    let our_pid = std::process::id();
+    let Some(processes) = list_freenet_processes() else {
+        return 0;
+    };
+    let mut killed = 0;
+    for (pid, cmdline) in processes {
+        if pid != our_pid && classify_freenet_process(&cmdline) == Some(kind) && taskkill_pid(pid) {
+            killed += 1;
+        }
+    }
+    killed
+}
+
+/// Stop the running Freenet service — the `service run-wrapper` supervisor and
+/// the `network` node child it manages.
+///
+/// Unlike a blanket `taskkill /im freenet.exe`, this targets only the
+/// service's own processes (classified by command line), so it never kills an
+/// unrelated `freenet.exe` that merely shares the image name: the GUI
+/// installer (issue #4205), a concurrent `freenet` CLI command, or the caller
+/// itself.
+///
+/// Wrappers are killed first, then nodes in a short re-enumerating loop. Only
+/// a live wrapper spawns `network` children, and `taskkill /f` merely
+/// *requests* termination (`TerminateProcess` is asynchronous), so a wrapper
+/// can briefly outlive the wrapper pass — long enough to spawn a node the
+/// first node enumeration missed. Each loop pass re-enumerates; once no
+/// wrapper this sweep terminated is still alive, the node set is stable. The
+/// loop stops as soon as a pass kills nothing — everything is gone, or the
+/// remainder is unkillable and retrying will not help — and is bounded to 3
+/// passes (200ms apart, comfortably over normal `TerminateProcess` latency)
+/// so an unkillable process cannot hang the caller.
+///
+/// Known limitation: a wrapper mid-self-update can `spawn_new_wrapper` inside
+/// its own async-termination window; that successor is not re-enumerated and
+/// may survive. This matches the previous blanket `taskkill`'s exposure and
+/// requires a self-update to coincide with a stop to the millisecond.
+///
+/// Returns the count of successful `taskkill` requests — which counts a node
+/// re-killed across passes more than once, so callers only test `> 0`. A `0`
+/// result means nothing was running, the process listing was unavailable, or
+/// every `taskkill` failed; callers treat all three as "nothing was stopped".
+#[cfg(target_os = "windows")]
+pub(crate) fn kill_freenet_service_processes() -> usize {
+    let mut killed = kill_freenet_processes_matching(FreenetServiceProcess::Wrapper);
+    for _ in 0..3 {
+        let nodes = kill_freenet_processes_matching(FreenetServiceProcess::Node);
+        killed += nodes;
+        if nodes == 0 {
+            break;
+        }
+        // Give a still-dying wrapper time to finish so a node it respawns is
+        // visible to the next enumeration.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    killed
+}
+
 #[cfg(target_os = "windows")]
 fn stop_service(system: bool) -> Result<()> {
     check_no_system_flag_windows(system)?;
 
-    // Kill freenet processes, excluding the current one (which IS freenet.exe)
-    let our_pid = std::process::id().to_string();
-    let status = std::process::Command::new("taskkill")
-        .args([
-            "/f",
-            "/im",
-            "freenet.exe",
-            "/fi",
-            &format!("PID ne {}", our_pid),
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .context("Failed to stop Freenet")?;
-
-    if status.success() {
+    if kill_freenet_service_processes() > 0 {
         println!("Freenet stopped.");
+        Ok(())
     } else {
-        anyhow::bail!("Failed to stop Freenet. It may not be running.");
+        anyhow::bail!("Failed to stop Freenet. It may not be running.")
     }
-
-    Ok(())
 }
 
 #[cfg(target_os = "windows")]
@@ -3491,6 +3673,132 @@ fn service_logs(_error_only: bool) -> Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn command_line_args_strips_quoted_executable_path() {
+        assert_eq!(
+            command_line_args("\"C:\\Program Files\\Freenet\\freenet.exe\" service run-wrapper"),
+            "service run-wrapper"
+        );
+        // Quoted path, no arguments — the GUI installer launched by Explorer.
+        assert_eq!(
+            command_line_args("\"C:\\Users\\me\\Downloads\\freenet.exe\""),
+            ""
+        );
+    }
+
+    #[test]
+    fn command_line_args_strips_unquoted_executable_path() {
+        assert_eq!(command_line_args("C:\\bin\\freenet.exe network"), "network");
+        assert_eq!(command_line_args("freenet.exe"), "");
+    }
+
+    #[test]
+    fn command_line_args_handles_degenerate_input() {
+        // Empty and whitespace-only input.
+        assert_eq!(command_line_args(""), "");
+        assert_eq!(command_line_args("   "), "");
+        // A leading quote with no closing quote — must not panic, yields "".
+        assert_eq!(command_line_args("\"C:\\bin\\freenet.exe network"), "");
+    }
+
+    #[test]
+    fn classify_freenet_process_identifies_wrapper_and_node() {
+        assert_eq!(
+            classify_freenet_process(
+                "\"C:\\Users\\me\\AppData\\Local\\Freenet\\bin\\freenet.exe\" service run-wrapper"
+            ),
+            Some(FreenetServiceProcess::Wrapper)
+        );
+        assert_eq!(
+            classify_freenet_process(
+                "\"C:\\Users\\me\\AppData\\Local\\Freenet\\bin\\freenet.exe\" network"
+            ),
+            Some(FreenetServiceProcess::Node)
+        );
+    }
+
+    /// Regression test for issue #4205: the Windows GUI installer is launched
+    /// with no subcommand, so it must never be classified as a service
+    /// process — otherwise the install-time `service stop` step kills the
+    /// installer itself before anything is installed.
+    #[test]
+    fn classify_freenet_process_spares_installer_and_other_commands() {
+        // GUI installer: double-clicked freenet.exe, no arguments.
+        assert_eq!(
+            classify_freenet_process("\"C:\\Users\\me\\Downloads\\freenet.exe\""),
+            None
+        );
+        // The `service stop` child process that triggers the kill.
+        assert_eq!(
+            classify_freenet_process("\"C:\\Users\\me\\Downloads\\freenet.exe\" service stop"),
+            None
+        );
+        // A concurrent self-update must not be killed.
+        assert_eq!(
+            classify_freenet_process("\"C:\\Program Files\\Freenet\\freenet.exe\" update"),
+            None
+        );
+        // An install path that merely contains the word "network" — the
+        // quoted exe path is stripped, so this must not match.
+        assert_eq!(
+            classify_freenet_process("\"C:\\Users\\me\\My Network Tools\\freenet.exe\""),
+            None
+        );
+    }
+
+    /// `network` / `run-wrapper` must only match as the subcommand (the first
+    /// argument token), never as an option value or later argument —
+    /// otherwise an unrelated `freenet` CLI invocation would be killed.
+    #[test]
+    fn classify_freenet_process_matches_subcommand_prefix_only() {
+        // `network` appearing as an option value, not the subcommand.
+        assert_eq!(
+            classify_freenet_process("\"C:\\bin\\freenet.exe\" local --config-dir network"),
+            None
+        );
+        // `run-wrapper` only counts immediately after the `service` subcommand.
+        assert_eq!(
+            classify_freenet_process("\"C:\\bin\\freenet.exe\" service stop run-wrapper"),
+            None
+        );
+        // The real node spawn has `network` as the first token.
+        assert_eq!(
+            classify_freenet_process("\"C:\\bin\\freenet.exe\" network"),
+            Some(FreenetServiceProcess::Node)
+        );
+    }
+
+    #[test]
+    fn parse_freenet_process_listing_extracts_pid_and_command_line() {
+        let stdout = "1234\t\"C:\\bin\\freenet.exe\" service run-wrapper\r\n\
+                      5678\t\"C:\\bin\\freenet.exe\" network\r\n\
+                      9012\t\"C:\\Users\\me\\Downloads\\freenet.exe\"\r\n";
+        assert_eq!(
+            parse_freenet_process_listing(stdout),
+            vec![
+                (
+                    1234u32,
+                    "\"C:\\bin\\freenet.exe\" service run-wrapper".to_string()
+                ),
+                (5678u32, "\"C:\\bin\\freenet.exe\" network".to_string()),
+                (
+                    9012u32,
+                    "\"C:\\Users\\me\\Downloads\\freenet.exe\"".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_freenet_process_listing_skips_blank_and_malformed_lines() {
+        // A process whose CommandLine could not be read prints just its PID;
+        // blank lines and non-numeric lines must be ignored.
+        assert_eq!(
+            parse_freenet_process_listing("4242\t\r\n\r\nnot-a-pid\tsomething\r\n"),
+            vec![(4242u32, String::new())]
+        );
+    }
 
     /// Flock-level regression test for the dup-tray bug observed in
     /// phase-1 smoke test 2026-04-22. Uses a dedicated path inside a
@@ -3788,9 +4096,16 @@ mod tests {
         // Verify it references the correct binary
         assert!(service_content.contains("/usr/local/bin/freenet network"));
 
-        // Verify log paths are set correctly (file-based logging for headless systems)
-        assert!(service_content.contains("/home/test/.local/state/freenet/freenet.log"));
-        assert!(service_content.contains("/home/test/.local/state/freenet/freenet.error.log"));
+        // Logging routes to journal so journald handles rotation. The tracing
+        // layer writes its own size-capped rolling files; routing systemd
+        // stdout/stderr to a fixed freenet.log / freenet.error.log caused
+        // unbounded growth (issue #4251 / log-spam fix).
+        assert!(service_content.contains("StandardOutput=journal"));
+        assert!(service_content.contains("StandardError=journal"));
+        assert!(
+            !service_content.contains("append:"),
+            "regression: must not append systemd output to fixed unrotated file (#4251)"
+        );
 
         // Verify resource limits are set
         assert!(service_content.contains("LimitNOFILE=65536"));
@@ -3859,6 +4174,14 @@ mod tests {
 
         // Verify exit code 43 prevents restart (another instance already running)
         assert!(service_content.contains("RestartPreventExitStatus=43"));
+
+        // Logging routes to journal (same reasoning as the user-unit test).
+        assert!(service_content.contains("StandardOutput=journal"));
+        assert!(service_content.contains("StandardError=journal"));
+        assert!(
+            !service_content.contains("append:"),
+            "regression: must not append systemd output to fixed unrotated file (#4251)"
+        );
     }
 
     #[test]
@@ -3866,6 +4189,23 @@ mod tests {
     fn test_macos_wrapper_script_generation() {
         let binary_path = PathBuf::from("/usr/local/bin/freenet");
         let script = generate_wrapper_script(&binary_path);
+
+        // Regression for issue #4251: lifecycle messages MUST go through
+        // `logger -t freenet` (auto-rotated by macOS unified logging),
+        // not appended to a fixed ~/Library/Logs/freenet/freenet.log file
+        // that grows without bound.
+        assert!(
+            script.contains("logger -t freenet"),
+            "wrapper must route lifecycle messages through logger(1)"
+        );
+        assert!(
+            !script.contains("Library/Logs/freenet/freenet.log\""),
+            "regression: wrapper must NOT append to fixed unrotated freenet.log (#4251)"
+        );
+        assert!(
+            !script.contains(">> \"$LOG\""),
+            "regression: wrapper must not use the legacy LOG file variable (#4251)"
+        );
 
         // Regression for #3301: startup stale-process cleanup, scoped to current user
         assert!(
@@ -3934,9 +4274,19 @@ mod tests {
         // Verify it references the correct binary
         assert!(plist_content.contains("/usr/local/bin/freenet"));
 
-        // Verify log paths are set correctly
-        assert!(plist_content.contains("/Users/test/Library/Logs/freenet/freenet.log"));
-        assert!(plist_content.contains("/Users/test/Library/Logs/freenet/freenet.error.log"));
+        // Stdout/stderr are discarded; the tracing layer writes its own
+        // size-capped rolling logs and `freenet service report` collects
+        // them. Writing launchd output to a fixed freenet.log /
+        // freenet.error.log caused unbounded growth (issue #4251).
+        assert!(plist_content.contains("<string>/dev/null</string>"));
+        assert!(
+            !plist_content.contains("/Users/test/Library/Logs/freenet/freenet.log"),
+            "regression: launchd must not write stdout to a fixed unrotated log file (#4251)"
+        );
+        assert!(
+            !plist_content.contains("/Users/test/Library/Logs/freenet/freenet.error.log"),
+            "regression: launchd must not write stderr to a fixed unrotated log file (#4251)"
+        );
 
         // Verify resource limits are set
         assert!(plist_content.contains("<key>NumberOfFiles</key>"));
@@ -4677,6 +5027,42 @@ mod tests {
                  autostart fires a silent spawn failure with os error 6 \
                  (#3933 / #3934). The fix pattern matches the network-child \
                  spawn in run_wrapper_loop.",
+                pattern
+            );
+        }
+    }
+
+    /// Source-level regression pin for the `FreeConsole()` rule, mirroring
+    /// `spawn_update_command_must_null_all_three_standard_handles`.
+    ///
+    /// `taskkill_pid` spawns a child via `Command::status()`, which inherits
+    /// the parent's standard handles unless they are explicitly nulled. It is
+    /// reachable from `kill_stale_freenet_processes` (run by the wrapper right
+    /// after `FreeConsole()`) and from the auto-update restart path. If a
+    /// future refactor drops the `.stdin/.stdout/.stderr(Stdio::null())`
+    /// lines, this fails loudly instead of shipping a silent os-error-6 spawn
+    /// failure to Windows.
+    #[test]
+    fn taskkill_pid_must_null_all_three_standard_handles() {
+        let src = include_str!("service.rs");
+        let (_, after_fn_start) = src
+            .split_once("fn taskkill_pid(")
+            .expect("taskkill_pid definition not found");
+        let (body, _) = after_fn_start
+            .split_once("\nfn ")
+            .expect("could not locate end of taskkill_pid");
+        let code_only: String = body
+            .lines()
+            .map(|line| line.split_once("//").map(|(c, _)| c).unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for handle in ["stdin", "stdout", "stderr"] {
+            let pattern = format!(".{handle}(std::process::Stdio::null())");
+            assert!(
+                code_only.contains(&pattern),
+                "taskkill_pid must call `{}` — without it, the `taskkill` \
+                 spawn fails with os error 6 after the wrapper's \
+                 FreeConsole() (#3933 / #3934).",
                 pattern
             );
         }

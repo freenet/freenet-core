@@ -88,9 +88,13 @@ use serde::Deserialize;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
+use crate::client_events::websocket::{
+    host_header_ip_in_cidrs, is_allowed_host, is_localhost_origin,
+};
 use crate::contract::user_input::{
     CallerIdentity, PendingPrompts, PromptEvent, PromptSnapshot, emit_prompt_event, prompt_events,
 };
+use crate::server::{AllowedHosts, AllowedSourceCidrs};
 
 /// Register permission prompt routes.
 pub(super) fn routes() -> Router {
@@ -204,49 +208,54 @@ fn caller_to_json(caller: &CallerIdentity) -> serde_json::Value {
 /// in-page overlays (see issue #3836). Each entry includes the sanitized
 /// message, button labels, and delegate/caller context.
 ///
-/// Because the response carries full delegate-controlled text, it must
-/// not be readable by a cross-origin page or DNS-rebinding attacker.
-/// Earlier versions enforced that by replying `403 Forbidden` to any
-/// untrusted `Origin`, but the `403` carried no `Access-Control-Allow-*`
-/// headers, which caused the browser to surface a "CORS header missing"
-/// error in the devtools console for every non-same-origin caller
-/// (e.g. a sandboxed iframe whose origin is `null`) — user-visible
-/// noise that looked like a real bug.
+/// Trust gating + CORS:
 ///
-/// Instead, always reply `200 OK` with `Access-Control-Allow-Origin: *`
-/// so the response body can be delivered, but withhold the real prompt
-/// list unless the `Origin` header is a trusted loopback origin.
-/// Untrusted / null / missing-but-rewritten origins get an empty `[]`,
-/// a valid-shape response the shell's polling loop silently ignores.
+/// * **Untrusted callers** (cross-origin, `Origin: null`, public Origin):
+///   reply `200 OK` with `[]` and `Access-Control-Allow-Origin: *`. The
+///   wildcard exists only so the browser delivers the empty body instead
+///   of logging a "CORS header missing" error in devtools for legitimate
+///   cross-origin probes (e.g. a sandboxed iframe whose origin is
+///   `null`). The body itself reveals nothing.
+/// * **Trusted callers** (loopback / LAN-with-same-IP-Origin /
+///   `allowed-host`-with-matching-Origin / no Origin same-origin GET):
+///   reply `200 OK` with the real prompt list and **no**
+///   `Access-Control-Allow-Origin` header. The legitimate consumer (the
+///   gateway shell page) is same-origin, so it doesn't need CORS to
+///   read the body. Withholding the wildcard ensures that even if a
+///   future change widens the trust gate, the trusted body cannot be
+///   read by an arbitrary cross-origin `fetch()`.
 ///
-/// Security posture is unchanged: a cross-origin attacker still cannot
-/// read the contents of live prompts, and the state-changing
-/// `/permission/{nonce}/respond` endpoint retains its strict Origin
-/// check independently. `*` is safe on this endpoint because no
-/// credentials (cookies, auth tokens) are associated with the poll.
+/// The state-changing `/permission/{nonce}/respond` endpoint retains
+/// its strict Origin check independently of this read endpoint.
 async fn pending_prompts(
     headers: HeaderMap,
+    allowed_hosts: Option<Extension<AllowedHosts>>,
+    allowed_source_cidrs: Option<Extension<AllowedSourceCidrs>>,
     Extension(pending): Extension<PendingPrompts>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    let allowed_hosts = allowed_hosts.as_ref().map(|Extension(v)| v);
+    let allowed_source_cidrs = allowed_source_cidrs.as_ref().map(|Extension(v)| v);
+
     // Missing Origin (e.g. same-origin top-level fetch from some
-    // browsers) is treated as trusted: the gateway only listens on
-    // loopback, and the poll payload is not a capability.
+    // browsers) is treated as trusted: the source-IP filter in
+    // `server.rs::private_network_filter` and the operator-configured
+    // `allowed-source-cidrs` policy already gate which networks can
+    // reach this endpoint, and the poll payload is not a capability.
     let trusted = match headers.get("origin") {
-        Some(value) => value.to_str().map(is_trusted_origin).unwrap_or(false),
+        Some(value) => value
+            .to_str()
+            .map(|s| is_origin_trusted(&headers, s, allowed_hosts, allowed_source_cidrs))
+            .unwrap_or(false),
         None => true,
     };
 
-    // Attach a permissive CORS header on every response so the browser
-    // delivers the body (real list or empty) instead of logging a
-    // "CORS header missing" error.
-    let cors_headers = [("access-control-allow-origin", "*")];
-
     if !trusted {
-        return (
-            axum::http::StatusCode::OK,
-            cors_headers,
-            Json(serde_json::json!([])),
+        let mut resp = Json(serde_json::json!([])).into_response();
+        resp.headers_mut().insert(
+            axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            axum::http::HeaderValue::from_static("*"),
         );
+        return resp;
     }
 
     let prompts: Vec<serde_json::Value> = pending
@@ -269,11 +278,7 @@ async fn pending_prompts(
             })
         })
         .collect();
-    (
-        axum::http::StatusCode::OK,
-        cors_headers,
-        Json(serde_json::json!(prompts)),
-    )
+    Json(serde_json::json!(prompts)).into_response()
 }
 
 /// Format the caller identity for the standalone HTML page's details
@@ -477,23 +482,29 @@ struct PermissionResponse {
 async fn permission_respond(
     Path(nonce): Path<String>,
     headers: HeaderMap,
+    allowed_hosts: Option<Extension<AllowedHosts>>,
+    allowed_source_cidrs: Option<Extension<AllowedSourceCidrs>>,
     Extension(pending): Extension<PendingPrompts>,
     Json(body): Json<PermissionResponse>,
 ) -> impl IntoResponse {
-    // Validate Origin header to prevent CSRF
-    if let Some(origin) = headers.get("origin") {
-        let origin = origin.to_str().unwrap_or("");
-        if !is_trusted_origin(origin) {
-            return (
-                axum::http::StatusCode::FORBIDDEN,
-                Json(serde_json::json!({"error": "forbidden"})),
-            );
-        }
-    } else {
-        // Reject requests with no Origin header
+    let allowed_hosts = allowed_hosts.as_ref().map(|Extension(v)| v);
+    let allowed_source_cidrs = allowed_source_cidrs.as_ref().map(|Extension(v)| v);
+
+    // CSRF guard: state-changing POST requires Origin and the Origin must be
+    // authorized. Authorized means loopback, in `allowed-source-cidrs`, or a
+    // matched `allowed-host` entry whose Origin authority matches the Host
+    // header (so a cross-site page reaching the gateway via DNS rebinding
+    // cannot forge `Origin: https://evil.com` with a victim Host).
+    let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) else {
         return (
             axum::http::StatusCode::FORBIDDEN,
             Json(serde_json::json!({"error": "missing origin"})),
+        );
+    };
+    if !is_origin_trusted(&headers, origin, allowed_hosts, allowed_source_cidrs) {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "forbidden"})),
         );
     }
 
@@ -554,13 +565,17 @@ async fn permission_respond(
 /// missing `Origin` because it returns no useful body to attackers; this
 /// endpoint is stricter because the connection slot itself is a resource
 /// (cap = 64).
-fn is_caller_trusted(headers: &HeaderMap) -> bool {
+fn is_caller_trusted(
+    headers: &HeaderMap,
+    allowed_hosts: Option<&AllowedHosts>,
+    allowed_source_cidrs: Option<&AllowedSourceCidrs>,
+) -> bool {
     if let Some(value) = headers.get("origin") {
         let s = match value.to_str() {
             Ok(s) => s,
             Err(_) => return false,
         };
-        if !is_trusted_origin(s) {
+        if !is_origin_trusted(headers, s, allowed_hosts, allowed_source_cidrs) {
             return false;
         }
     }
@@ -577,29 +592,131 @@ fn is_caller_trusted(headers: &HeaderMap) -> bool {
     true
 }
 
-/// Check if an Origin header is from a trusted localhost source.
-/// Accepts any port on localhost/loopback to handle non-default configurations.
-fn is_trusted_origin(origin: &str) -> bool {
-    let Some(host_port) = origin.strip_prefix("http://") else {
+/// Returns true if `origin` is authorized to read or modify permission-prompt
+/// state for this request.
+///
+/// Closely mirrors the WebSocket upgrade policy in
+/// `client_events::websocket::connection_info`, with two deliberate
+/// tightenings called out below.
+///
+/// Pre-check (always): `Origin: null` is rejected for every branch. The
+/// WS gate accepts `null` under the operator-CIDR branch to support the
+/// dApp sandbox iframe upgrading a WebSocket; permission prompts are a
+/// stricter target (the response POST authorises a delegate action on
+/// the user's behalf) so the same sandboxed-iframe Origin is refused.
+///
+/// Accept branches:
+///
+/// 1. **Loopback** — `http://localhost`/`127.0.0.1`/`[::1]` (any port,
+///    plus `https://` variants). Default-on for the localhost-only
+///    install. Note: this is broader than the pre-fix gate, which
+///    rejected `https://` loopback; the new check matches the WS layer
+///    and removes a needless restriction.
+/// 2. **LAN / operator-configured CIDR** — Host header IP is private
+///    (RFC1918 / loopback / link-local / IPv6 ULA) **or** matches
+///    `allowed-source-cidrs`, **and** the Origin is a same-IP literal.
+///    The default-LAN sub-branch is on for every caller (including when
+///    the `AllowedSourceCidrs` extension is missing, e.g. `run_local_node`
+///    or older tests); the operator CIDR set only widens which non-private
+///    ranges (e.g. Tailnet CGNAT) qualify. See [`host_header_ip_in_cidrs`]
+///    for the CSWSH/DNS-rebind rationale.
+/// 3. **Explicit `allowed-host` hostname** — Host header is in
+///    `allowed_hosts` **and** the Origin's authority matches the Host
+///    header. The Origin-vs-Host check is stricter than the WebSocket
+///    layer's `is_allowed_host` branch and closes a CSWSH path where
+///    `evil.com` opens a fetch to `http://victim-hostname:7509` (the
+///    operator's allow-listed hostname) — browsers send `Host:
+///    victim-hostname:7509`, `Origin: https://evil.com`, which would
+///    otherwise pass an Origin-less allowed-host check. When the
+///    `AllowedHosts` extension is missing, branch 3 is inactive.
+fn is_origin_trusted(
+    headers: &HeaderMap,
+    origin: &str,
+    allowed_hosts: Option<&AllowedHosts>,
+    allowed_source_cidrs: Option<&AllowedSourceCidrs>,
+) -> bool {
+    // Reject `Origin: null` for permission endpoints regardless of branch.
+    // The WS layer's CIDR branch deliberately accepts `null` to support
+    // the dApp sandbox iframe upgrading a WebSocket, but the permission
+    // endpoints are a different threat model: `/respond` clicks a
+    // delegate-permission button on the user's behalf (CSRF target), and
+    // `/pending` exposes delegate-controlled prompt text. A sandboxed
+    // iframe on any site can present `Origin: null`, so accepting it here
+    // — even under operator CIDR opt-in — would let a malicious page open
+    // a `<iframe sandbox>` to the gateway and silently confirm prompts
+    // the user never saw. Always require a non-null Origin.
+    if origin.eq_ignore_ascii_case("null") {
+        return false;
+    }
+    if is_localhost_origin(origin) {
+        return true;
+    }
+    // Always call `host_header_ip_in_cidrs` — even when no CIDR is
+    // configured, the helper's default-LAN sub-branch still accepts
+    // private RFC1918 / link-local / IPv6 ULA Host with a same-IP
+    // literal Origin.
+    let empty_cidrs = AllowedSourceCidrs::default();
+    let cidrs = allowed_source_cidrs.unwrap_or(&empty_cidrs);
+    if host_header_ip_in_cidrs(headers, origin, cidrs) {
+        return true;
+    }
+    if let Some(hosts) = allowed_hosts
+        && origin_matches_allowed_host(origin, headers, hosts)
+    {
+        return true;
+    }
+    false
+}
+
+/// True iff `headers["host"]` is in `allowed_hosts` AND the Origin's
+/// authority matches the Host header.
+///
+/// The Origin/Host equality is what prevents `evil.com` from successfully
+/// posting `Origin: https://evil.com` with `Host: <victim-allow-listed-host>`
+/// to a state-changing endpoint.
+fn origin_matches_allowed_host(
+    origin: &str,
+    headers: &HeaderMap,
+    allowed_hosts: &AllowedHosts,
+) -> bool {
+    if !is_allowed_host(headers, allowed_hosts) {
+        return false;
+    }
+    let Some(host_header) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|h| h.to_str().ok())
+    else {
         return false;
     };
-    // Handle bracketed IPv6 addresses: [::1]:port or [::1]
-    if host_port.starts_with('[') {
-        let host = if let Some((h, _port)) = host_port.split_once(']') {
-            // h is "[::1" without closing bracket, add it back
-            format!("{h}]")
-        } else {
-            return false;
-        };
-        return host == "[::1]";
-    }
-    // For non-IPv6: extract hostname before the port
-    let host = if let Some((h, _port)) = host_port.rsplit_once(':') {
-        h
-    } else {
-        host_port
+    let Some(origin_authority) = origin_authority(origin) else {
+        return false;
     };
-    matches!(host, "127.0.0.1" | "localhost")
+    origin_authority.eq_ignore_ascii_case(host_header)
+}
+
+/// Returns the scheme-stripped authority of an Origin header value with
+/// any `user@` userinfo prefix stripped (e.g.
+/// `https://mynode.example.com:7509/foo` → `mynode.example.com:7509`).
+/// Returns `None` for malformed Origins or `Origin: null`.
+///
+/// Differs intentionally from [`crate::client_events::websocket::parse_origin_host`]:
+/// that helper returns the *host* component only (no port), which is
+/// what the WS Host-IP CIDR check needs. This one returns the full
+/// authority (host plus port) so it can be byte-compared against the
+/// HTTP `Host` header. Both strip userinfo to defend against
+/// `Origin: http://victim@evil.com:7509` style spoof attempts.
+fn origin_authority(origin: &str) -> Option<&str> {
+    let (_, after_scheme) = origin.split_once("://")?;
+    let authority = after_scheme
+        .split_once('/')
+        .map(|(a, _)| a)
+        .unwrap_or(after_scheme);
+    Some(
+        authority
+            .rsplit_once('@')
+            .map(|(_, host_and_port)| host_and_port)
+            .unwrap_or(authority),
+    )
 }
 
 /// HTML for when a permission request has expired or already been answered.
@@ -680,14 +797,19 @@ fn snapshot_to_json(snapshot: &PromptSnapshot) -> serde_json::Value {
 /// idempotent.
 async fn permission_events(
     headers: HeaderMap,
+    allowed_hosts: Option<Extension<AllowedHosts>>,
+    allowed_source_cidrs: Option<Extension<AllowedSourceCidrs>>,
     Extension(pending): Extension<PendingPrompts>,
 ) -> axum::response::Response {
+    let allowed_hosts = allowed_hosts.as_ref().map(|Extension(v)| v);
+    let allowed_source_cidrs = allowed_source_cidrs.as_ref().map(|Extension(v)| v);
+
     // Reject untrusted callers BEFORE consuming a connection slot. Browsers
     // send `Sec-Fetch-Site: cross-site` for cross-origin EventSource and
     // `Origin` for any cross-origin request: either signal is enough to
     // reject, and rejecting up front blocks the cross-origin DoS where an
     // evil page opens 64 EventSources to consume every slot.
-    if !is_caller_trusted(&headers) {
+    if !is_caller_trusted(&headers, allowed_hosts, allowed_source_cidrs) {
         tracing::debug!("Rejecting /permission/events request from untrusted origin");
         let stream = stream::once(async {
             Ok::<_, Infallible>(Event::default().comment("untrusted-origin"))
@@ -812,51 +934,10 @@ where
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_trusted_origin_localhost_default_port() {
-        assert!(is_trusted_origin("http://localhost:7509"));
-    }
-
-    #[test]
-    fn test_trusted_origin_localhost_custom_port() {
-        assert!(is_trusted_origin("http://localhost:8080"));
-    }
-
-    #[test]
-    fn test_trusted_origin_ipv4_loopback() {
-        assert!(is_trusted_origin("http://127.0.0.1:7509"));
-    }
-
-    #[test]
-    fn test_trusted_origin_ipv6_loopback() {
-        assert!(is_trusted_origin("http://[::1]:7509"));
-    }
-
-    #[test]
-    fn test_trusted_origin_ipv6_no_port() {
-        assert!(is_trusted_origin("http://[::1]"));
-    }
-
-    #[test]
-    fn test_untrusted_origin_external() {
-        assert!(!is_trusted_origin("http://evil.com"));
-        assert!(!is_trusted_origin("http://evil.com:7509"));
-    }
-
-    #[test]
-    fn test_untrusted_origin_https() {
-        assert!(!is_trusted_origin("https://localhost:7509"));
-    }
-
-    #[test]
-    fn test_untrusted_origin_null() {
-        assert!(!is_trusted_origin("null"));
-    }
-
-    #[test]
-    fn test_untrusted_origin_empty() {
-        assert!(!is_trusted_origin(""));
-    }
+    // Loopback-origin behaviour is now provided by
+    // `crate::client_events::websocket::is_localhost_origin`, which has its
+    // own tests in that module. The localhost-only behaviour at this layer
+    // is re-verified end-to-end through the `is_origin_trusted` tests below.
 
     #[test]
     fn test_html_escape_script_tag() {
@@ -971,11 +1052,25 @@ mod tests {
         headers: HeaderMap,
         pending: PendingPrompts,
     ) -> (axum::http::StatusCode, HeaderMap, serde_json::Value) {
+        call_pending_full_with_policy(headers, pending, None, None).await
+    }
+
+    async fn call_pending_full_with_policy(
+        headers: HeaderMap,
+        pending: PendingPrompts,
+        allowed_hosts: Option<AllowedHosts>,
+        allowed_source_cidrs: Option<AllowedSourceCidrs>,
+    ) -> (axum::http::StatusCode, HeaderMap, serde_json::Value) {
         use axum::body::to_bytes;
         use axum::response::IntoResponse;
-        let resp = pending_prompts(headers, Extension(pending))
-            .await
-            .into_response();
+        let resp = pending_prompts(
+            headers,
+            allowed_hosts.map(Extension),
+            allowed_source_cidrs.map(Extension),
+            Extension(pending),
+        )
+        .await
+        .into_response();
         let status = resp.status();
         let resp_headers = resp.headers().clone();
         let body = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
@@ -1181,11 +1276,14 @@ mod tests {
         );
     }
 
-    // Trusted (loopback) origins still see the full prompt list and
-    // still receive the CORS header (harmless on same-origin replies,
-    // required on any non-same-origin path the browser may take).
+    // Trusted (loopback) origins see the full prompt list and the
+    // response carries NO Access-Control-Allow-Origin header. The
+    // legitimate consumer is the same-origin shell page, which doesn't
+    // need CORS to read the body; withholding the wildcard makes sure a
+    // future widening of the trust gate can't accidentally hand the
+    // trusted body to an arbitrary cross-origin `fetch()`.
     #[tokio::test]
-    async fn test_pending_prompts_trusted_origin_returns_list_with_cors() {
+    async fn test_pending_prompts_trusted_origin_returns_list_without_cors_wildcard() {
         let pending = empty_pending();
         let _rx = insert_prompt(&pending, "n", "msg", vec!["OK"], "d", webapp_caller("c"));
         let (status, resp_headers, value) = call_pending_full(trusted_header(), pending).await;
@@ -1193,11 +1291,10 @@ mod tests {
         let arr = value.as_array().expect("array");
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["message"], "msg");
-        assert_eq!(
-            resp_headers
-                .get("access-control-allow-origin")
-                .map(|v| v.to_str().unwrap()),
-            Some("*"),
+        assert!(
+            resp_headers.get("access-control-allow-origin").is_none(),
+            "trusted response must NOT carry the `*` wildcard, so a future \
+             trust-gate widening can't expose the body cross-origin"
         );
     }
 
@@ -1253,6 +1350,8 @@ mod tests {
             let resp = permission_respond(
                 Path("a".to_string()),
                 trusted_header(),
+                None,
+                None,
                 Extension(pending.clone()),
                 Json(PermissionResponse { index: 0 }),
             )
@@ -1281,6 +1380,8 @@ mod tests {
         let resp = permission_respond(
             Path("a".to_string()),
             trusted_header(),
+            None,
+            None,
             Extension(pending),
             Json(PermissionResponse { index: 0 }),
         )
@@ -1464,7 +1565,7 @@ mod tests {
         if let Some(s) = sec_fetch_site {
             headers.insert("sec-fetch-site", s.parse().unwrap());
         }
-        let resp = permission_events(headers, Extension(pending))
+        let resp = permission_events(headers, None, None, Extension(pending))
             .await
             .into_response();
         let stream = resp
@@ -1559,6 +1660,7 @@ mod tests {
     /// The bug this PR closes: a `prompt_added` lifecycle event must be
     /// pushed to a subscribed SSE client without polling.
     #[tokio::test]
+    #[serial_test::serial(sse_global_counter)]
     async fn test_sse_emits_added_when_prompt_inserted() {
         let initial_subs = prompt_events().receiver_count();
         let mut body = open_sse_with_origin(Some("http://localhost:7509")).await;
@@ -1587,6 +1689,7 @@ mod tests {
     /// `prompt_removed` must arrive over SSE so every tab dismisses its
     /// overlay simultaneously when one tab clicks a button.
     #[tokio::test]
+    #[serial_test::serial(sse_global_counter)]
     async fn test_sse_emits_removed_when_prompt_responded() {
         let initial_subs = prompt_events().receiver_count();
         let mut body = open_sse_with_origin(Some("http://localhost:7509")).await;
@@ -1653,6 +1756,7 @@ mod tests {
     /// handler emits `prompt_added` for it) instead of the live broadcast,
     /// to keep the test deterministic under parallel execution.
     #[tokio::test]
+    #[serial_test::serial(sse_global_counter)]
     async fn test_sse_allows_same_origin_and_none_sec_fetch() {
         let pending = crate::contract::user_input::pending_prompts();
         for site in ["same-origin", "same-site", "none"] {
@@ -1685,6 +1789,7 @@ mod tests {
     /// new live events arrive. Avoids the race where a prompt added between
     /// the page load and the SSE subscribe would be invisible.
     #[tokio::test]
+    #[serial_test::serial(sse_global_counter)]
     async fn test_sse_replays_existing_pending_on_subscribe() {
         // Insert into the global registry before subscribing.
         let pending = crate::contract::user_input::pending_prompts();
@@ -1726,6 +1831,7 @@ mod tests {
     /// chain order, a refreshed tab could dedup-skip a re-broadcast Added
     /// for an entry that hadn't been delivered yet.
     #[tokio::test]
+    #[serial_test::serial(sse_global_counter)]
     async fn test_sse_bootstrap_replay_arrives_before_live() {
         let pending = crate::contract::user_input::pending_prompts();
         let pre_nonce = "ssetest_order_pre".to_string();
@@ -1816,11 +1922,16 @@ mod tests {
     /// the GuardedStream's drop semantics (no permanent leak after a
     /// client disconnects mid-flight).
     ///
-    /// Uses a serialising mutex so concurrent tests don't perturb the
-    /// shared SSE_CONNECTIONS counter. Without it, a sibling test
-    /// touching the counter mid-assertion would flake this test.
+    /// Uses `#[serial_test::serial(sse_global_counter)]` so any other
+    /// test that opens an SSE stream can't perturb the shared
+    /// `SSE_CONNECTIONS` counter mid-assertion. Tests that only construct
+    /// the rejected path (no slot consumed) don't need the lock.
     #[tokio::test]
+    #[serial_test::serial(sse_global_counter)]
     async fn test_sse_connection_cap_and_release_on_drop() {
+        // Local-mutex pattern retained as a defence-in-depth against a
+        // future test that opens an SSE stream without the serial
+        // attribute. Acquiring an already-uncontended mutex is a no-op.
         use std::sync::OnceLock;
         static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
         let _serial = SERIAL
@@ -1913,6 +2024,8 @@ mod tests {
         let resp = permission_respond(
             Path(nonce.clone()),
             trusted_header(),
+            None,
+            None,
             Extension(pending.clone()),
             Json(PermissionResponse { index: 0 }),
         )
@@ -1935,5 +2048,588 @@ mod tests {
             }
         }
         assert!(saw, "permission_respond did not emit Removed for {nonce}");
+    }
+
+    // ====================================================================
+    // Regression tests for issue #4261: a non-localhost browser must be
+    // able to respond to delegate permission prompts when the operator has
+    // opted into LAN access (the gateway is bound to a LAN/private IP or
+    // an `allowed-source-cidrs` range is configured). Before the fix, the
+    // Origin gate only accepted `http://localhost`, so any LAN/Tailnet user
+    // got a 403 on the response POST even though the Host-header policy
+    // already considered them trusted.
+    // ====================================================================
+
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    fn allowed_hosts_with(values: &[&str], port: u16) -> AllowedHosts {
+        let mut set = HashSet::new();
+        for v in values {
+            let lower = v.to_lowercase();
+            set.insert(lower.clone());
+            set.insert(format!("{lower}:{port}"));
+        }
+        Arc::new(set)
+    }
+
+    fn allowed_cidrs_with(list: &[&str]) -> AllowedSourceCidrs {
+        AllowedSourceCidrs(Arc::new(list.iter().map(|s| s.parse().unwrap()).collect()))
+    }
+
+    fn lan_browser_headers(host_ip: &str, port: u16) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("host", format!("{host_ip}:{port}").parse().unwrap());
+        h.insert(
+            "origin",
+            format!("http://{host_ip}:{port}").parse().unwrap(),
+        );
+        h
+    }
+
+    /// Default LAN: gateway bound to `192.168.1.42`, browser on the same
+    /// LAN. Before the fix this returned `403`; now it must succeed.
+    #[tokio::test]
+    async fn test_respond_accepts_lan_same_ip_origin() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", webapp_caller("c"));
+
+        let resp = permission_respond(
+            Path("n".to_string()),
+            lan_browser_headers("192.168.1.42", 7509),
+            None,
+            None,
+            Extension(pending),
+            Json(PermissionResponse { index: 0 }),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::OK,
+            "LAN browser POSTing same-IP Origin must succeed (regression for #4261)"
+        );
+    }
+
+    /// CGNAT / Tailnet: gateway has `allowed-source-cidrs = 100.64.0.0/10`
+    /// and the browser arrives via a Tailscale IP. The Tailnet IP is not
+    /// in the default private-LAN set, so this branch requires the
+    /// operator-opt-in CIDR plus a same-IP Origin.
+    #[tokio::test]
+    async fn test_respond_accepts_cidr_same_ip_origin() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", webapp_caller("c"));
+
+        let cidrs = allowed_cidrs_with(&["100.64.0.0/10"]);
+        let resp = permission_respond(
+            Path("n".to_string()),
+            lan_browser_headers("100.64.0.1", 7509),
+            None,
+            Some(Extension(cidrs)),
+            Extension(pending),
+            Json(PermissionResponse { index: 0 }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    /// CSWSH/CSRF guard: a same-LAN Host is reachable, but the Origin is a
+    /// public attacker (`evil.com`). Must reject — this is the attack the
+    /// new policy explicitly defends against by requiring Origin to match
+    /// Host when leaving the loopback path.
+    #[tokio::test]
+    async fn test_respond_rejects_cross_origin_with_lan_host() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", webapp_caller("c"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "192.168.1.42:7509".parse().unwrap());
+        headers.insert("origin", "https://evil.com".parse().unwrap());
+        let resp = permission_respond(
+            Path("n".to_string()),
+            headers,
+            None,
+            None,
+            Extension(pending),
+            Json(PermissionResponse { index: 0 }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    /// A public-IP Host (not in any policy) must still reject even with
+    /// matching Origin: `is_default_lan_host_ip` rejects 8.8.8.8 and no
+    /// CIDR was configured.
+    #[tokio::test]
+    async fn test_respond_rejects_public_host_outside_cidrs() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", webapp_caller("c"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "8.8.8.8:7509".parse().unwrap());
+        headers.insert("origin", "http://8.8.8.8:7509".parse().unwrap());
+        let resp = permission_respond(
+            Path("n".to_string()),
+            headers,
+            None,
+            None,
+            Extension(pending),
+            Json(PermissionResponse { index: 0 }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    /// `allowed-host` hostname entry: operator added `mynode.example.com`.
+    /// The browser navigates to it; Origin authority must match Host.
+    #[tokio::test]
+    async fn test_respond_accepts_allowed_host_with_matching_origin() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", webapp_caller("c"));
+
+        let hosts = allowed_hosts_with(&["mynode.example.com"], 7509);
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "mynode.example.com:7509".parse().unwrap());
+        headers.insert("origin", "http://mynode.example.com:7509".parse().unwrap());
+        let resp = permission_respond(
+            Path("n".to_string()),
+            headers,
+            Some(Extension(hosts)),
+            None,
+            Extension(pending),
+            Json(PermissionResponse { index: 0 }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    /// Closes the CSWSH gap that the WS layer's `is_allowed_host` branch
+    /// has: even when the Host header is in `allowed_hosts`, the Origin
+    /// must independently match the Host authority. Without this check,
+    /// `evil.com` could open a fetch to the allow-listed hostname and the
+    /// browser would send `Host: mynode.example.com:7509`, `Origin:
+    /// https://evil.com` — the request would otherwise pass.
+    #[tokio::test]
+    async fn test_respond_rejects_allowed_host_with_cross_origin() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", webapp_caller("c"));
+
+        let hosts = allowed_hosts_with(&["mynode.example.com"], 7509);
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "mynode.example.com:7509".parse().unwrap());
+        headers.insert("origin", "https://evil.com".parse().unwrap());
+        let resp = permission_respond(
+            Path("n".to_string()),
+            headers,
+            Some(Extension(hosts)),
+            None,
+            Extension(pending),
+            Json(PermissionResponse { index: 0 }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    /// Missing Origin must still 403 on /respond — POST that's missing
+    /// Origin is either a non-browser caller or a browser bug; either way,
+    /// the conservative response is to reject.
+    #[tokio::test]
+    async fn test_respond_rejects_missing_origin_even_with_lan_host() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", webapp_caller("c"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "192.168.1.42:7509".parse().unwrap());
+        let resp = permission_respond(
+            Path("n".to_string()),
+            headers,
+            None,
+            None,
+            Extension(pending),
+            Json(PermissionResponse { index: 0 }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    /// /pending: a LAN browser must see the full prompt list, not the
+    /// empty-list cross-origin response. Without this branch the shell
+    /// overlay JS would never render a prompt for the user even though
+    /// the gateway accepts the LAN connection.
+    #[tokio::test]
+    async fn test_pending_prompts_lan_same_ip_origin_returns_list() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", webapp_caller("c"));
+
+        let (status, _, value) = call_pending_full_with_policy(
+            lan_browser_headers("192.168.1.42", 7509),
+            pending,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(value.as_array().unwrap().len(), 1);
+    }
+
+    /// /pending: a cross-origin caller with a LAN Host must still get an
+    /// empty list. Mirrors the existing `evil.com` regression but with the
+    /// LAN-policy now in scope.
+    #[tokio::test]
+    async fn test_pending_prompts_lan_host_cross_origin_returns_empty() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", webapp_caller("c"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "192.168.1.42:7509".parse().unwrap());
+        headers.insert("origin", "https://evil.com".parse().unwrap());
+        let (status, _, value) = call_pending_full_with_policy(headers, pending, None, None).await;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert_eq!(value, serde_json::json!([]));
+    }
+
+    /// Unit-level coverage of the new helper for the IPv6 LAN case:
+    /// fe80:: link-local Host with same-Origin must be accepted, even
+    /// without operator CIDR opt-in.
+    #[test]
+    fn test_is_origin_trusted_accepts_ipv6_link_local_same_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "[fe80::1]:7509".parse().unwrap());
+        assert!(is_origin_trusted(
+            &headers,
+            "http://[fe80::1]:7509",
+            None,
+            None,
+        ));
+    }
+
+    /// Without operator policy, only loopback Origin is accepted. This
+    /// preserves the pre-fix behaviour for `run_local_node` and other
+    /// callers that don't inject the AllowedHosts/AllowedSourceCidrs
+    /// extensions.
+    #[test]
+    fn test_is_origin_trusted_loopback_only_with_no_policy() {
+        let headers = HeaderMap::new();
+        assert!(is_origin_trusted(
+            &headers,
+            "http://localhost:7509",
+            None,
+            None,
+        ));
+        assert!(is_origin_trusted(
+            &headers,
+            "http://127.0.0.1:7509",
+            None,
+            None,
+        ));
+        assert!(!is_origin_trusted(&headers, "http://evil.com", None, None));
+        assert!(!is_origin_trusted(
+            &headers,
+            "http://192.168.1.42:7509",
+            None,
+            None,
+        ));
+    }
+
+    /// HTTPS loopback is also accepted (the localhost-only path no longer
+    /// requires `http://` — the previous narrower check was a relic).
+    #[test]
+    fn test_is_origin_trusted_accepts_https_localhost() {
+        let headers = HeaderMap::new();
+        assert!(is_origin_trusted(
+            &headers,
+            "https://localhost:7509",
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn test_origin_authority_strips_scheme_and_path() {
+        assert_eq!(
+            origin_authority("http://mynode.example.com:7509"),
+            Some("mynode.example.com:7509")
+        );
+        assert_eq!(
+            origin_authority("https://[::1]:7509/extra"),
+            Some("[::1]:7509")
+        );
+        assert_eq!(origin_authority("null"), None);
+        assert_eq!(origin_authority(""), None);
+    }
+
+    /// `parse_origin_host` (websocket.rs) strips `user@` from Origin to
+    /// defeat scheme-spoof attempts; this layer's `origin_authority` does
+    /// the same so a `Origin: http://victim@evil.com:7509` value can't be
+    /// crafted to compare equal to any operator-allowed Host.
+    #[test]
+    fn test_origin_authority_strips_userinfo() {
+        assert_eq!(
+            origin_authority("http://victim@mynode.example.com:7509"),
+            Some("mynode.example.com:7509")
+        );
+        assert_eq!(
+            origin_authority("https://attacker@[::1]:7509/path"),
+            Some("[::1]:7509")
+        );
+    }
+
+    // ====================================================================
+    // Stricter-than-WS regression guard: `Origin: null` must NEVER be
+    // accepted on the permission endpoints, even when the operator has
+    // opted into `allowed-source-cidrs`. The WebSocket upgrade gate
+    // intentionally accepts `null` Origin under the CIDR branch (to
+    // support the dApp sandbox iframe), but the permission endpoints are
+    // a stricter target: `/respond` authorises a delegate action and
+    // `/pending` exposes prompt-content. Any sandboxed iframe on any
+    // site can produce `Origin: null`, so accepting it here would let a
+    // malicious page silently confirm permission prompts the user never
+    // saw. (Reported by Codex review of #4262.)
+    // ====================================================================
+
+    #[test]
+    fn test_is_origin_trusted_rejects_null_origin_even_with_cidr() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "100.64.1.5:7509".parse().unwrap());
+        let cidrs = allowed_cidrs_with(&["100.64.0.0/10"]);
+        assert!(
+            !is_origin_trusted(&headers, "null", None, Some(&cidrs)),
+            "null Origin must be rejected even when host IP is inside the \
+             operator-configured CIDR — the permission endpoints are \
+             stricter than the WS-upgrade gate"
+        );
+    }
+
+    #[test]
+    fn test_is_origin_trusted_rejects_null_origin_default_lan() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "192.168.1.42:7509".parse().unwrap());
+        assert!(!is_origin_trusted(&headers, "null", None, None));
+    }
+
+    #[tokio::test]
+    async fn test_respond_rejects_null_origin_under_cidr() {
+        let pending = empty_pending();
+        let _rx = insert_prompt(&pending, "n", "m", vec!["OK"], "d", webapp_caller("c"));
+
+        let cidrs = allowed_cidrs_with(&["100.64.0.0/10"]);
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "100.64.1.5:7509".parse().unwrap());
+        headers.insert("origin", "null".parse().unwrap());
+        let resp = permission_respond(
+            Path("n".to_string()),
+            headers,
+            None,
+            Some(Extension(cidrs)),
+            Extension(pending),
+            Json(PermissionResponse { index: 0 }),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "sandboxed-iframe null Origin must not be allowed to confirm \
+             permission prompts even under operator-configured CIDR"
+        );
+    }
+
+    /// IPv4-mapped IPv6 (`::ffff:192.168.1.42`) is what dual-stack Linux
+    /// gateways present to handlers when an IPv4 client connects. Both
+    /// Host header parsing (rejects unbracketed bare IPv6, requires
+    /// bracketed form for IPv6) and the CIDR-match normalization in
+    /// `host_header_ip_in_cidrs` should cooperate so a LAN browser
+    /// reaching the gateway via the mapped form still works end-to-end.
+    /// This test exercises the realistic header shape: bracketed mapped
+    /// v6 on both Host and Origin.
+    #[test]
+    fn test_is_origin_trusted_accepts_ipv4_mapped_ipv6_default_lan() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "[::ffff:192.168.1.42]:7509".parse().unwrap());
+        assert!(is_origin_trusted(
+            &headers,
+            "http://[::ffff:192.168.1.42]:7509",
+            None,
+            None,
+        ));
+    }
+
+    // ====================================================================
+    // /permission/events under the new LAN/CIDR policy. The handler glue
+    // (`is_caller_trusted(headers, allowed_hosts, allowed_source_cidrs)`)
+    // was untested under non-None extensions until now — without these,
+    // a refactor that drops the new args could regress silently.
+    // ====================================================================
+
+    async fn open_sse_with_policy(
+        headers: HeaderMap,
+        allowed_hosts: Option<AllowedHosts>,
+        allowed_source_cidrs: Option<AllowedSourceCidrs>,
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = bytes::Bytes> + Send>> {
+        use axum::response::IntoResponse;
+        let pending = crate::contract::user_input::pending_prompts();
+        let resp = permission_events(
+            headers,
+            allowed_hosts.map(Extension),
+            allowed_source_cidrs.map(Extension),
+            Extension(pending),
+        )
+        .await
+        .into_response();
+        let stream = resp
+            .into_body()
+            .into_data_stream()
+            .filter_map(|r| async move { r.ok() });
+        Box::pin(stream)
+    }
+
+    /// LAN browser (same-IP Host + Origin) must be able to open the SSE
+    /// stream. Asserts the stream is NOT immediately closed with the
+    /// `:untrusted-origin` comment.
+    #[tokio::test]
+    #[serial_test::serial(sse_global_counter)]
+    async fn test_sse_accepts_lan_same_ip_origin() {
+        let pending = crate::contract::user_input::pending_prompts();
+        let nonce = "ssetest_lan_accept";
+        let _rx = insert_prompt(&pending, nonce, "m", vec!["OK"], "d", webapp_caller("c"));
+        let _cleanup = cleanup_on_drop(pending.clone(), nonce.to_string());
+
+        let mut body =
+            open_sse_with_policy(lan_browser_headers("192.168.1.42", 7509), None, None).await;
+        // The stream must emit our bootstrap prompt as a data event, not
+        // close with an `:untrusted-origin` comment.
+        let frame = next_event_frame(&mut body, 1_000).await;
+        assert!(
+            frame.is_some_and(|f| f.contains(nonce)),
+            "LAN browser SSE must deliver bootstrap prompt event"
+        );
+    }
+
+    /// Cross-origin Origin with LAN Host must reject the SSE stream
+    /// regardless of policy.
+    #[tokio::test]
+    async fn test_sse_rejects_cross_origin_with_lan_host() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "192.168.1.42:7509".parse().unwrap());
+        headers.insert("origin", "https://evil.com".parse().unwrap());
+        let mut body = open_sse_with_policy(headers, None, None).await;
+        let frame = next_event_frame(&mut body, 200).await;
+        assert!(
+            frame.is_none(),
+            "cross-origin SSE must not receive any data events"
+        );
+    }
+
+    /// `allowed-host` hostname with matching Origin must accept SSE.
+    #[tokio::test]
+    #[serial_test::serial(sse_global_counter)]
+    async fn test_sse_accepts_allowed_host_with_matching_origin() {
+        let pending = crate::contract::user_input::pending_prompts();
+        let nonce = "ssetest_allowed_host_accept";
+        let _rx = insert_prompt(&pending, nonce, "m", vec!["OK"], "d", webapp_caller("c"));
+        let _cleanup = cleanup_on_drop(pending.clone(), nonce.to_string());
+
+        let hosts = allowed_hosts_with(&["mynode.example.com"], 7509);
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "mynode.example.com:7509".parse().unwrap());
+        headers.insert("origin", "http://mynode.example.com:7509".parse().unwrap());
+        let mut body = open_sse_with_policy(headers, Some(hosts), None).await;
+        let frame = next_event_frame(&mut body, 1_000).await;
+        assert!(
+            frame.is_some_and(|f| f.contains(nonce)),
+            "allowed-host browser SSE must deliver bootstrap prompt event"
+        );
+    }
+
+    /// Cross-site Sec-Fetch-Site is rejected under the new policy too —
+    /// the LAN/CIDR Origin-acceptance path doesn't bypass the existing
+    /// independent Sec-Fetch-Site reject branch in `is_caller_trusted`.
+    #[tokio::test]
+    async fn test_sse_rejects_cross_site_sec_fetch_under_lan_policy() {
+        let mut headers = lan_browser_headers("192.168.1.42", 7509);
+        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
+        let mut body = open_sse_with_policy(headers, None, None).await;
+        let frame = next_event_frame(&mut body, 200).await;
+        assert!(
+            frame.is_none(),
+            "Sec-Fetch-Site: cross-site must reject even when Host/Origin \
+             would otherwise satisfy the LAN policy"
+        );
+    }
+
+    // ====================================================================
+    // Router-level Extension-chain test. Without this, an extractor-order
+    // regression in `server.rs::serve_client_api_in_impl` (the exact
+    // failure class of #4261 itself) would not be caught by the unit
+    // tests because they construct Extensions directly.
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_router_propagates_extensions_to_respond_handler() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let pending = empty_pending();
+        let _rx = insert_prompt(&pending, "rt", "m", vec!["OK"], "d", webapp_caller("c"));
+
+        let hosts = allowed_hosts_with(&["192.168.1.42"], 7509);
+        let cidrs = AllowedSourceCidrs::default();
+        let app = super::routes()
+            .layer(Extension(pending))
+            .layer(Extension(hosts))
+            .layer(Extension(cidrs));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/permission/rt/respond")
+            .header("host", "192.168.1.42:7509")
+            .header("origin", "http://192.168.1.42:7509")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"index":0}"#))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "router must propagate AllowedHosts + AllowedSourceCidrs to /respond \
+             — a missing Extension layer would 500 here (the failure class of #4261)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_router_rejects_cross_origin_respond() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        let pending = empty_pending();
+        let _rx = insert_prompt(&pending, "rt2", "m", vec!["OK"], "d", webapp_caller("c"));
+
+        let hosts: AllowedHosts = Arc::new(HashSet::new());
+        let cidrs = AllowedSourceCidrs::default();
+        let app = super::routes()
+            .layer(Extension(pending))
+            .layer(Extension(hosts))
+            .layer(Extension(cidrs));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/permission/rt2/respond")
+            .header("host", "192.168.1.42:7509")
+            .header("origin", "https://evil.com")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"index":0}"#))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 }

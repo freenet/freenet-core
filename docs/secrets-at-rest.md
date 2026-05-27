@@ -135,6 +135,39 @@ Modes are set in the same syscall as `O_CREAT` (via
 `OpenOptions::mode`), so there is no race window where a file is
 readable under the process umask.
 
+### Defense-in-depth: startup umask (PR follow-up to #4196)
+
+In addition to the per-call-site `OpenOptions::mode(0o600)`, the
+`freenet` binary calls `umask(0o077)` at process startup, before the
+tokio runtime spawns any worker thread. This is the belt-and-suspenders
+companion: if a future contributor adds a plain `File::create` in the
+secrets subsystem and forgets to route it through the
+`create_owner_only` helper, the file still lands at `0o600` (and any
+created directory at `0o700`) because the umask itself masks off all
+group and other bits.
+
+Operators who configured a custom `umask` for the freenet service
+(e.g. `UMask=0027` in the systemd unit, or a shell `umask` in a wrapper
+script) **will see their setting overridden** — the node always
+tightens to `0o077`. The override is logged at INFO on startup with
+both the prior and new mask so operators can confirm what happened
+without inspecting on-disk file modes. There is currently no knob to
+relax this; if you have a concrete need for a different policy (e.g.
+`0o007` so a privileged backup group can read the secrets tree), open
+an issue under the secrets-at-rest umbrella (#4137).
+
+The tightening MUST happen before any thread is spawned: `umask(2)` is
+per-thread on macOS (BSD-derived semantics) and worker threads inherit
+their creator's umask at `pthread_create` time, so a runtime built
+before the umask call would leave its workers at the operator's
+default. The Linux umask is per-process so the constraint is weaker
+there, but the same call site is correct for both platforms.
+
+The regression test `umask_persists_into_tokio_worker_thread` in
+`crates/core/src/bin/freenet.rs` pins this behavior: a plain
+`File::create` issued from a `tokio::spawn`'d task is asserted to land
+at `0o600` after `set_secure_umask` runs.
+
 ### Migration from pre-#4195 nodes
 
 Nodes upgraded across this PR may have inherited the process umask

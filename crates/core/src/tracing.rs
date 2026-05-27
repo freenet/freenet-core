@@ -1115,7 +1115,7 @@ impl<'a> NetEventLog<'a> {
                     initiated_by: Some(peer_id.clone()), // We (the joiner) initiated
                 })
             }
-            NetMessage::V1(NetMessageV1::Put(PutMsg::Response { id, key })) => {
+            NetMessage::V1(NetMessageV1::Put(PutMsg::Response { id, key, .. })) => {
                 // Track outbound Put response for message routing visibility
                 let to = target_addr
                     .and_then(|addr| ring.connection_manager.get_peer_by_addr(addr))
@@ -1265,18 +1265,20 @@ impl<'a> NetEventLog<'a> {
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
-            NetMessageV1::Put(PutMsg::Response { id, key }) => {
+            NetMessageV1::Put(PutMsg::Response { id, key, hop_count }) => {
                 let this_peer = &op_manager.ring.connection_manager.own_location();
-                // Calculate hop_count from operation state: max_htl - current_htl
-                let hop_count = op_manager.get_current_hop(id).map(|current_htl| {
-                    op_manager.ring.max_hops_to_live.saturating_sub(current_htl)
-                });
+                // hop_count is carried on the wire Response: set by the storer
+                // (max_htl - htl_at_storer) and preserved by relays bubbling up.
+                // Clamp to ring.max_hops_to_live so a malicious or buggy peer
+                // sending hop_count = usize::MAX can't pollute telemetry.
+                // Mirrors the GET extraction logic (PR #4245).
+                let max_htl = op_manager.ring.max_hops_to_live;
                 EventKind::Put(PutEvent::PutSuccess {
                     id: *id,
                     requester: this_peer.clone(),
                     target: this_peer.clone(),
                     key: *key,
-                    hop_count,
+                    hop_count: Some((*hop_count).min(max_htl)),
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                     state_hash: None, // Hash not available from message
@@ -1302,19 +1304,21 @@ impl<'a> NetEventLog<'a> {
             NetMessageV1::Get(GetMsg::Response {
                 id,
                 result: GetMsgResult::Found { key, value },
+                hop_count,
                 ..
             }) if value.state.is_some() => {
                 let this_peer = op_manager.ring.connection_manager.own_location();
-                // Calculate hop_count from operation state: max_htl - current_hop
-                let hop_count = op_manager.get_current_hop(id).map(|current_hop| {
-                    op_manager.ring.max_hops_to_live.saturating_sub(current_hop)
-                });
+                // hop_count is carried on the wire Response: set by the storer
+                // (max_htl - htl_at_storer) and preserved by relays bubbling up.
+                // Clamp to ring.max_hops_to_live so a malicious or buggy peer
+                // sending hop_count = usize::MAX can't pollute telemetry.
+                let max_htl = op_manager.ring.max_hops_to_live;
                 EventKind::Get(GetEvent::GetSuccess {
                     id: *id,
                     requester: this_peer.clone(),
                     target: this_peer,
                     key: *key,
-                    hop_count,
+                    hop_count: Some((*hop_count).min(max_htl)),
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                     state_hash: None, // Hash not available from message
@@ -1324,18 +1328,29 @@ impl<'a> NetEventLog<'a> {
                 id,
                 instance_id,
                 result: GetMsgResult::NotFound,
+                hop_count,
             }) => {
                 let this_peer = op_manager.ring.connection_manager.own_location();
-                // Calculate hop_count from operation state: max_htl - current_hop
-                let hop_count = op_manager.get_current_hop(id).map(|current_hop| {
-                    op_manager.ring.max_hops_to_live.saturating_sub(current_hop)
-                });
+                // hop_count is carried on the wire Response (same semantics
+                // as GetSuccess: forward-path depth from originator to the
+                // node that produced the NotFound).
+                //
+                // Caveat for NotFound interpretation: the value is the
+                // forward depth of *the relay that produced the NotFound*,
+                // which is the deepest peer the request reached before
+                // exhaustion / store-miss.  For analytics, treat NotFound
+                // hop_count as "exhaustion depth", not "path depth to the
+                // contract location" — there is no storer.
+                //
+                // Same clamp as GetSuccess: bound by max_hops_to_live to
+                // guard against malicious or buggy peer values.
+                let max_htl = op_manager.ring.max_hops_to_live;
                 EventKind::Get(GetEvent::GetNotFound {
                     id: *id,
                     requester: this_peer.clone(),
                     instance_id: *instance_id,
                     target: this_peer,
-                    hop_count,
+                    hop_count: Some((*hop_count).min(max_htl)),
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
@@ -1359,14 +1374,21 @@ impl<'a> NetEventLog<'a> {
             NetMessageV1::Subscribe(SubscribeMsg::Response {
                 id,
                 result: SubscribeMsgResult::Subscribed { key },
+                hop_count,
                 ..
             }) => {
                 let this_peer = op_manager.ring.connection_manager.own_location();
+                // hop_count is carried on the wire Response: set by the
+                // hosting peer (max_htl - htl_at_storer) and preserved by
+                // relays bubbling up.  Clamp to ring.max_hops_to_live so
+                // a malicious or buggy peer sending hop_count = usize::MAX
+                // can't pollute telemetry.  Mirrors GET (PR #4245).
+                let max_htl = op_manager.ring.max_hops_to_live;
                 EventKind::Subscribe(SubscribeEvent::SubscribeSuccess {
                     id: *id,
                     key: *key,
                     at: this_peer.clone(),
-                    hop_count: None, // TODO: Track hop count from operation state
+                    hop_count: Some((*hop_count).min(max_htl)),
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                     requester: this_peer,
@@ -1376,14 +1398,28 @@ impl<'a> NetEventLog<'a> {
                 id,
                 instance_id,
                 result: SubscribeMsgResult::NotFound,
+                hop_count,
             }) => {
                 let this_peer = op_manager.ring.connection_manager.own_location();
+                // hop_count is carried on the wire Response (same semantics
+                // as SubscribeSuccess: forward-path depth from originator
+                // to the node that produced the response).
+                //
+                // Caveat for NotFound interpretation: the value is the
+                // forward depth of *the relay that produced the NotFound*
+                // (HTL exhaustion, no candidates, or downstream forward
+                // failure).  For analytics, treat NotFound hop_count as
+                // "exhaustion depth", not "depth to the hosting peer".
+                //
+                // Same clamp as SubscribeSuccess: bound by max_hops_to_live
+                // to guard against malicious or buggy peer values.
+                let max_htl = op_manager.ring.max_hops_to_live;
                 EventKind::Subscribe(SubscribeEvent::SubscribeNotFound {
                     id: *id,
                     requester: this_peer.clone(),
                     instance_id: *instance_id,
                     target: this_peer,
-                    hop_count: None, // TODO: Track hop count from operation state
+                    hop_count: Some((*hop_count).min(max_htl)),
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
@@ -2929,6 +2965,30 @@ impl EventKind {
         }
     }
 
+    /// Returns the `hop_count` recorded in this event, if any.
+    ///
+    /// Populated for terminal GET events (`GetSuccess`, `GetNotFound`,
+    /// `GetFailure`) since PR #4245, and for terminal PUT/SUBSCRIBE
+    /// events (`PutSuccess`, `SubscribeSuccess`, `SubscribeNotFound`)
+    /// since PR #4248.  The value is the number of forward hops the
+    /// originating request traversed before reaching its terminal state.
+    /// Returns `None` for non-terminal events (e.g. `Request`) and for
+    /// events that don't carry a hop_count field.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub fn hop_count(&self) -> Option<usize> {
+        match self {
+            EventKind::Get(GetEvent::GetSuccess { hop_count, .. })
+            | EventKind::Get(GetEvent::GetNotFound { hop_count, .. })
+            | EventKind::Get(GetEvent::GetFailure { hop_count, .. })
+            | EventKind::Put(PutEvent::PutSuccess { hop_count, .. })
+            | EventKind::Subscribe(SubscribeEvent::SubscribeSuccess { hop_count, .. })
+            | EventKind::Subscribe(SubscribeEvent::SubscribeNotFound { hop_count, .. }) => {
+                *hop_count
+            }
+            _ => None,
+        }
+    }
+
     /// Returns the variant name of this event kind.
     pub fn variant_name(&self) -> &'static str {
         match self {
@@ -3967,6 +4027,54 @@ pub mod tracer {
     /// At typical gateway log rates (~500KB/hour), 72 hours ≈ 36MB.
     const LOG_RETENTION_HOURS: usize = 72;
 
+    /// Startup-only backstop on the total bytes the freenet log directory
+    /// may occupy. When log volume spikes above the steady-state assumption
+    /// baked into `LOG_RETENTION_HOURS` (e.g., the executor-queue overflow
+    /// in issue #4251 producing thousands of events per second), the
+    /// time-based retention alone cannot bound disk usage within a single
+    /// session. This cap deletes oldest-first after the time pass to bring
+    /// the directory back under the limit on every restart.
+    ///
+    /// Caveat: enforcement runs only when the tracer initializes (i.e.,
+    /// node start). A long-uptime node under sustained runaway logging can
+    /// still exceed this cap until its next restart. Periodic enforcement
+    /// is a candidate follow-up.
+    const LOG_DIR_MAX_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+
+    /// Match the rolling-appender naming convention used by
+    /// `RollingFileAppender::Rotation::HOURLY` for the `freenet` /
+    /// `freenet.error` prefixes:
+    ///
+    ///   freenet.YYYY-MM-DD-HH.log
+    ///   freenet.error.YYYY-MM-DD-HH.log
+    ///
+    /// Intentionally does NOT match:
+    /// - `freenet.log` / `freenet.error.log` — legacy systemd /launchd
+    ///   StandardOutput targets that the OS holds open; deleting them
+    ///   leaks an unlinked-but-open inode (Linux) or errors (Windows)
+    ///   and does not free disk space until restart.
+    /// - `freenet.error.log.last` — transient per-launch scratch file the
+    ///   macOS wrapper overwrites each iteration.
+    fn is_rotating_freenet_log(name: &str) -> bool {
+        // freenet.error.YYYY-MM-DD-HH.log → after stripping the prefix and
+        // suffix, the remainder must be the date-hour stem. We don't parse
+        // the stem strictly; cheap shape check: at least one '-' and all
+        // remaining characters in [0-9-].
+        let stem = if let Some(rest) = name.strip_prefix("freenet.error.") {
+            rest
+        } else if let Some(rest) = name.strip_prefix("freenet.") {
+            rest
+        } else {
+            return false;
+        };
+        let Some(date_part) = stem.strip_suffix(".log") else {
+            return false;
+        };
+        !date_part.is_empty()
+            && date_part.contains('-')
+            && date_part.chars().all(|c| c.is_ascii_digit() || c == '-')
+    }
+
     /// Guards for non-blocking file appenders - must be kept alive for the lifetime of the program
     static LOG_GUARDS: OnceLock<Vec<WorkerGuard>> = OnceLock::new();
 
@@ -3995,7 +4103,12 @@ pub mod tracer {
     }
 
     /// Clean up old log files on startup.
-    /// Removes any log files older than LOG_RETENTION_HOURS, including legacy daily log files.
+    ///
+    /// First pass: remove files older than `LOG_RETENTION_HOURS`.
+    /// Second pass: if the total size of remaining `freenet*.log` files
+    /// still exceeds `LOG_DIR_MAX_BYTES`, delete oldest-first until under
+    /// the limit. The size cap is a backstop for runaway log rates that
+    /// the time-based retention alone can't bound.
     fn cleanup_old_logs(log_dir: &std::path::Path) {
         use std::time::{Duration, SystemTime};
 
@@ -4006,25 +4119,78 @@ pub mod tracer {
             return;
         };
 
+        // First pass: time-based deletion, collect survivors for the
+        // size-cap pass.
+        let mut survivors: Vec<(std::path::PathBuf, SystemTime, u64)> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
 
-            // Only process log files
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if !name.starts_with("freenet") || !name.ends_with(".log") {
+            if !is_rotating_freenet_log(name) {
                 continue;
             }
 
-            // Check file modification time
-            if let Ok(metadata) = path.metadata() {
-                if let Ok(modified) = metadata.modified() {
-                    if modified < cutoff {
-                        if let Err(e) = std::fs::remove_file(&path) {
-                            eprintln!("Failed to remove old log file {}: {}", path.display(), e);
-                        }
-                    }
+            let Ok(metadata) = path.metadata() else {
+                continue;
+            };
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            if modified < cutoff {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    eprintln!("Failed to remove old log file {}: {}", path.display(), e);
+                }
+                continue;
+            }
+            survivors.push((path, modified, metadata.len()));
+        }
+
+        enforce_log_dir_size_cap(survivors, LOG_DIR_MAX_BYTES);
+    }
+
+    /// Delete oldest log files until the total size of the supplied list is
+    /// at or below `max_bytes`. Mutates the filesystem; the input vector
+    /// is consumed. Parameterized for test isolation.
+    ///
+    /// The most-recently-modified file is preserved unconditionally even
+    /// when it alone exceeds `max_bytes`: it is the file currently being
+    /// written by `RollingFileAppender`. On Linux, removing it would leave
+    /// the appender writing to an unlinked inode (disk space not reclaimed
+    /// until the next rotation); on Windows, `remove_file` would simply
+    /// fail. Either way the live file should not be a cleanup target.
+    fn enforce_log_dir_size_cap(
+        mut files: Vec<(std::path::PathBuf, std::time::SystemTime, u64)>,
+        max_bytes: u64,
+    ) {
+        let total: u64 = files.iter().map(|(_, _, size)| *size).sum();
+        if total <= max_bytes {
+            return;
+        }
+
+        // Oldest first; remove from this end and stop before the newest.
+        files.sort_by_key(|(_, modified, _)| *modified);
+        let live = files.pop(); // newest mtime — never deleted
+        let live_size = live.as_ref().map(|(_, _, size)| *size).unwrap_or(0);
+        let mut non_live_remaining: u64 = files.iter().map(|(_, _, size)| *size).sum();
+
+        for (path, _, size) in files {
+            // Final on-disk size after additional deletions =
+            //   live_size + non_live_remaining (decreasing each loop).
+            if live_size.saturating_add(non_live_remaining) <= max_bytes {
+                break;
+            }
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    non_live_remaining = non_live_remaining.saturating_sub(size);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Failed to enforce log dir size cap on {}: {}",
+                        path.display(),
+                        e
+                    );
                 }
             }
         }
@@ -4096,13 +4262,29 @@ pub mod tracer {
             .and_then(|v| v.parse().ok())
             .unwrap_or(crate::util::rate_limit_layer::DEFAULT_MAX_EVENTS_PER_SECOND);
 
+        // Per-callsite cap (issue #4251 follow-up). Stops a single misbehaving
+        // tracing macro from dominating the log even when its rate stays
+        // below the global aggregate cap. Configurable via
+        // FREENET_LOG_RATE_LIMIT_PER_CALLSITE.
+        let per_callsite_limit: u64 = std::env::var("FREENET_LOG_RATE_LIMIT_PER_CALLSITE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(crate::util::rate_limit_layer::DEFAULT_MAX_EVENTS_PER_CALLSITE_PER_SECOND);
+
         // Rate limiting is disabled in tests and debug builds to avoid masking issues
         let rate_limit_enabled = !cfg!(any(test, debug_assertions))
             && std::env::var("FREENET_DISABLE_LOG_RATE_LIMIT").is_err();
 
-        // Create rate limiter (shared across all layers)
+        // Create rate limiters (shared across all layers)
         let rate_limiter = if rate_limit_enabled {
             Some(crate::util::rate_limit_layer::RateLimiter::new(rate_limit))
+        } else {
+            None
+        };
+        let per_callsite_limiter = if rate_limit_enabled {
+            Some(crate::util::rate_limit_layer::PerCallsiteRateLimiter::new(
+                per_callsite_limit,
+            ))
         } else {
             None
         };
@@ -4119,6 +4301,7 @@ pub mod tracer {
                         use_json,
                         filter_layer,
                         rate_limiter,
+                        per_callsite_limiter,
                     );
                 }
 
@@ -4153,11 +4336,28 @@ pub mod tracer {
                     ));
                 }
 
-                // Apply rate limiting as a global filter if enabled
-                // Layers must be created after the rate filter to ensure type compatibility
+                // Apply rate limiting as a global filter if enabled.
+                //
+                // We MUST use `DynFilterFn` here, NOT `filter_fn`. The latter
+                // assumes the closure is callsite-cacheable (no Context arg)
+                // and so calls `callsite_enabled` ONCE per callsite, caching
+                // the first result as `Interest::always`/`never`. That makes
+                // every stateful rate-limit filter a no-op for the second and
+                // subsequent events from the same macro — exactly the bug
+                // that let issue #4251 spam slip past the pre-existing global
+                // `RateLimiter`. `DynFilterFn` defaults to `Interest::sometimes`,
+                // so `enabled` is invoked per event. (Caught by codex review on
+                // PR #4273 — see the PR thread.)
                 if let Some(rate_limiter) = rate_limiter.clone() {
+                    let per_callsite = per_callsite_limiter.clone();
                     let rate_filter =
-                        tracing_subscriber::filter::filter_fn(move |_| rate_limiter.should_allow());
+                        tracing_subscriber::filter::DynFilterFn::new(move |meta, _cx| {
+                            per_callsite
+                                .as_ref()
+                                .map(|pc| pc.should_allow(meta))
+                                .unwrap_or(true)
+                                && rate_limiter.should_allow()
+                        });
                     let base = Registry::default().with(rate_filter);
 
                     // Create layers for main and error logs (typed against rate-filtered registry)
@@ -4244,6 +4444,7 @@ pub mod tracer {
             use_json,
             filter_layer,
             rate_limiter,
+            per_callsite_limiter,
         )
     }
 
@@ -4253,6 +4454,7 @@ pub mod tracer {
         use_json: bool,
         filter_layer: tracing_subscriber::EnvFilter,
         rate_limiter: Option<crate::util::rate_limit_layer::RateLimiter>,
+        per_callsite_limiter: Option<crate::util::rate_limit_layer::PerCallsiteRateLimiter>,
     ) -> anyhow::Result<()> {
         use tracing_subscriber::layer::SubscriberExt;
 
@@ -4298,11 +4500,18 @@ pub mod tracer {
             }
         }
 
-        // Apply rate limiting as a global filter if enabled
-        // Layers must be created after the rate filter to ensure type compatibility
+        // Apply rate limiting as a global filter if enabled.
+        // See the equivalent block in `init_tracer` above for why this MUST
+        // use `DynFilterFn` rather than `filter_fn`.
         if let Some(rate_limiter) = rate_limiter {
-            let rate_filter =
-                tracing_subscriber::filter::filter_fn(move |_| rate_limiter.should_allow());
+            let per_callsite = per_callsite_limiter.clone();
+            let rate_filter = tracing_subscriber::filter::DynFilterFn::new(move |meta, _cx| {
+                per_callsite
+                    .as_ref()
+                    .map(|pc| pc.should_allow(meta))
+                    .unwrap_or(true)
+                    && rate_limiter.should_allow()
+            });
             let base = Registry::default().with(rate_filter);
             let layer = make_layer(to_stderr, use_json);
             let subscriber = base.with(layer.with_filter(filter_layer));
@@ -4313,6 +4522,187 @@ pub mod tracer {
             tracing::subscriber::set_global_default(subscriber).expect("Error setting subscriber");
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod cleanup_tests {
+        use super::{cleanup_old_logs, enforce_log_dir_size_cap};
+        use std::fs;
+        use std::time::{Duration, SystemTime};
+
+        /// Writes `path` with `size` bytes and sets its mtime to `mtime`.
+        fn write_with_mtime(path: &std::path::Path, size: usize, mtime: SystemTime) {
+            fs::write(path, vec![b'.'; size]).unwrap();
+            let times = std::fs::FileTimes::new().set_modified(mtime);
+            let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            f.set_times(times).unwrap();
+        }
+
+        /// Regression for issue #4251: when log volume blows past the
+        /// time-based retention's implicit assumption (~500 KB/h), the
+        /// size cap must delete oldest-first until the directory is
+        /// under the supplied limit.
+        #[test]
+        fn size_cap_deletes_oldest_first_until_under_limit() {
+            let dir = tempfile::tempdir().unwrap();
+            let now = SystemTime::now();
+
+            let oldest = dir.path().join("freenet.2026-05-25-12.log");
+            let middle = dir.path().join("freenet.2026-05-25-13.log");
+            let newest = dir.path().join("freenet.2026-05-25-14.log");
+
+            // 4 KiB each; total 12 KiB. Cap at 8 KiB → oldest must go.
+            write_with_mtime(&oldest, 4096, now - Duration::from_secs(3600));
+            write_with_mtime(&middle, 4096, now - Duration::from_secs(60));
+            write_with_mtime(&newest, 4096, now - Duration::from_secs(30));
+
+            let files = vec![
+                (oldest.clone(), now - Duration::from_secs(3600), 4096),
+                (middle.clone(), now - Duration::from_secs(60), 4096),
+                (newest.clone(), now - Duration::from_secs(30), 4096),
+            ];
+            enforce_log_dir_size_cap(files, 8192);
+
+            assert!(
+                !oldest.exists(),
+                "oldest file should be deleted by size cap"
+            );
+            assert!(middle.exists(), "middle file should survive");
+            assert!(newest.exists(), "newest file should survive");
+        }
+
+        /// Under-cap directories must not lose any files.
+        #[test]
+        fn size_cap_is_noop_when_under_limit() {
+            let dir = tempfile::tempdir().unwrap();
+            let now = SystemTime::now();
+            let small = dir.path().join("freenet.2026-05-25-15.log");
+            write_with_mtime(&small, 1024, now);
+
+            let files = vec![(small.clone(), now, 1024)];
+            enforce_log_dir_size_cap(files, 1024 * 1024 * 1024);
+
+            assert!(small.exists(), "file under cap must survive");
+        }
+
+        /// The time-based pass in `cleanup_old_logs` still removes files
+        /// older than the retention window, even when total size is under
+        /// the cap.
+        #[test]
+        fn time_pass_removes_files_older_than_retention() {
+            let dir = tempfile::tempdir().unwrap();
+            // 100 days old, 1 KiB — well under size cap but past time cap.
+            let ancient = dir.path().join("freenet.2026-02-14-00.log");
+            write_with_mtime(
+                &ancient,
+                1024,
+                SystemTime::now() - Duration::from_secs(100 * 24 * 3600),
+            );
+
+            cleanup_old_logs(dir.path());
+
+            assert!(
+                !ancient.exists(),
+                "ancient file must be removed by time pass"
+            );
+        }
+
+        /// Non-`freenet*` files in the same directory must be ignored.
+        #[test]
+        fn cleanup_ignores_non_freenet_files() {
+            let dir = tempfile::tempdir().unwrap();
+            let other = dir.path().join("other.log");
+            fs::write(&other, b"unrelated").unwrap();
+
+            cleanup_old_logs(dir.path());
+
+            assert!(other.exists(), "non-freenet files must not be touched");
+        }
+
+        /// The size cap must NEVER delete the most-recently-modified file
+        /// (the live file the rolling appender is currently writing to).
+        /// Removing it would leave the appender writing to an unlinked inode
+        /// on Linux, or fail on Windows. Regression for review findings on
+        /// issue #4251.
+        #[test]
+        fn size_cap_preserves_most_recently_modified_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let now = SystemTime::now();
+
+            // Single oversized file — also the newest. Must NOT be deleted.
+            let live = dir.path().join("freenet.2026-05-25-18.log");
+            write_with_mtime(&live, 16 * 1024, now);
+
+            let files = vec![(live.clone(), now, 16 * 1024)];
+            enforce_log_dir_size_cap(files, 1024); // cap below file size
+
+            assert!(
+                live.exists(),
+                "live file must survive even when alone it exceeds the cap"
+            );
+        }
+
+        /// Even with the live file preserved, older files must be deleted
+        /// to bring the total down. Regression for the live-file fix
+        /// composing correctly with the eviction loop.
+        #[test]
+        fn size_cap_deletes_oldest_but_keeps_live() {
+            let dir = tempfile::tempdir().unwrap();
+            let now = SystemTime::now();
+
+            // Two oversized files: cap at 5 KiB, live=4 KiB, old=4 KiB,
+            // total 8 KiB → old gets deleted, live survives, final = 4 KiB.
+            let old = dir.path().join("freenet.2026-05-25-12.log");
+            let live = dir.path().join("freenet.2026-05-25-18.log");
+            write_with_mtime(&old, 4096, now - Duration::from_secs(3600));
+            write_with_mtime(&live, 4096, now);
+
+            let files = vec![
+                (old.clone(), now - Duration::from_secs(3600), 4096),
+                (live.clone(), now, 4096),
+            ];
+            enforce_log_dir_size_cap(files, 5120);
+
+            assert!(!old.exists(), "older file must be deleted");
+            assert!(live.exists(), "live file must survive");
+        }
+
+        /// `cleanup_old_logs` must NOT touch the legacy bare
+        /// `freenet.log` / `freenet.error.log` paths — systemd/launchd
+        /// hold them open and deletion leaks the inode (Linux) or fails
+        /// (Windows). Only the rolling-appender date-suffixed files are
+        /// eligible. Regression for review findings on issue #4251.
+        #[test]
+        fn cleanup_skips_legacy_bare_freenet_log_names() {
+            let dir = tempfile::tempdir().unwrap();
+            // Make these old so they'd be deleted by the time pass if it
+            // applied to them.
+            let bare = dir.path().join("freenet.log");
+            let bare_err = dir.path().join("freenet.error.log");
+            let scratch = dir.path().join("freenet.error.log.last");
+            for p in [&bare, &bare_err, &scratch] {
+                write_with_mtime(
+                    p,
+                    1024,
+                    SystemTime::now() - Duration::from_secs(30 * 24 * 3600),
+                );
+            }
+
+            cleanup_old_logs(dir.path());
+
+            assert!(
+                bare.exists(),
+                "legacy freenet.log must not be deleted (systemd-owned)"
+            );
+            assert!(
+                bare_err.exists(),
+                "legacy freenet.error.log must not be deleted (systemd-owned)"
+            );
+            assert!(
+                scratch.exists(),
+                "transient freenet.error.log.last must not be deleted (wrapper-owned)"
+            );
+        }
     }
 }
 

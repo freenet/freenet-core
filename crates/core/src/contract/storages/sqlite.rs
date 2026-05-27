@@ -313,6 +313,76 @@ impl StateStorage for Pool {
             Err(_) => Err(SqlDbError::ContractNotFound),
         }
     }
+
+    async fn remove(&self, key: &ContractKey) -> Result<(), Self::Error> {
+        // State and params share the `states` row; `hosting_metadata` is a
+        // separate table. A `DELETE` of an absent row is a no-op, so this is
+        // idempotent.
+        sqlx::query("DELETE FROM states WHERE contract = ?")
+            .bind(key.as_bytes())
+            .execute(&self.0)
+            .await?;
+        sqlx::query("DELETE FROM hosting_metadata WHERE contract = ?")
+            .bind(key.as_bytes())
+            .execute(&self.0)
+            .await?;
+        Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod tests {
+    //! Tests for the SQLite `StateStorage::remove` implementation — mirrors
+    //! redb's `test_remove_deletes_state_and_params` so eviction-driven disk
+    //! reclamation is covered on both storage backends.
+
+    use super::*;
+
+    fn make_test_key() -> ContractKey {
+        let code = ContractCode::from(vec![1, 2, 3, 4]);
+        let params = Parameters::from(vec![5, 6, 7, 8]);
+        ContractKey::from_params_and_code(&params, &code)
+    }
+
+    /// `remove` deletes both the state and the params for a contract.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_remove_deletes_state_and_params() {
+        // `Pool::new(None)` uses an in-memory database; `block_in_place` inside
+        // it requires the multi-thread runtime flavor.
+        let pool = Pool::new(None).await.expect("create in-memory sqlite pool");
+
+        let key = make_test_key();
+        let state = WrappedState::new(vec![1, 2, 3]);
+        let params = Parameters::from(vec![10, 20, 30]);
+
+        // Store state + params and confirm they are present.
+        pool.store(key, state.clone()).await.unwrap();
+        pool.store_params(key, params.clone()).await.unwrap();
+        assert_eq!(pool.get(&key).await.unwrap(), Some(state));
+        assert_eq!(pool.get_params(&key).await.unwrap(), Some(params));
+
+        // Remove and confirm both are gone.
+        pool.remove(&key).await.unwrap();
+        assert_eq!(pool.get(&key).await.unwrap(), None);
+        assert_eq!(pool.get_params(&key).await.unwrap(), None);
+    }
+
+    /// `remove` on a contract that was never stored is a no-op (idempotent):
+    /// a `DELETE` of an absent row affects zero rows and must not error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_remove_never_stored_is_idempotent() {
+        let pool = Pool::new(None).await.expect("create in-memory sqlite pool");
+
+        let key = make_test_key();
+        pool.remove(&key)
+            .await
+            .expect("removing a never-stored contract should be Ok");
+
+        // A second remove is equally harmless.
+        pool.remove(&key)
+            .await
+            .expect("double remove should remain Ok");
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

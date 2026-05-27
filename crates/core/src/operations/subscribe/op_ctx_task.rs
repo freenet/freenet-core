@@ -747,35 +747,22 @@ async fn drive_client_subscribe_inner(
                         .await;
                 }
                 op_manager.ring.routing_finished(route_event);
-                // Mirror the legacy Response-handler side effects from
-                // `subscribe.rs`'s `SubscribeMsg::Response` arm. The
-                // driver reply forwarding bypass in `node.rs` skips
-                // `handle_op_request` for terminal Responses, so without
-                // these calls the local interest manager and ring would
-                // never learn about the subscription, breaking
-                // ChangeInterests-driven update propagation. Both calls are
-                // idempotent for repeat subscribes.
-                //
-                // Register the responding peer as our upstream. Without
-                // this, `send_unsubscribe_upstream` cannot locate the peer
-                // on client disconnect and no Unsubscribe is emitted (#3874).
-                if let Some(pkl) = op_manager
-                    .ring
-                    .connection_manager
-                    .get_peer_by_addr(current_target_addr)
-                {
-                    let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key);
-                    op_manager
-                        .interest_manager
-                        .register_peer_interest(&key, peer_key, None, true);
-                }
-                op_manager.ring.subscribe(key);
-                op_manager.ring.complete_subscription_request(&key, true);
-                let became_interested = op_manager.interest_manager.add_local_client(&key);
-                if became_interested {
-                    crate::operations::broadcast_change_interests(op_manager, vec![key], vec![])
-                        .await;
-                }
+                // Run originator-side finalization. This is the single
+                // place that owns the post-Subscribed side effects:
+                // upstream-peer registration (#3874), lease install,
+                // backoff clear, contract-body fetch (#4223), neighbor
+                // announce, and local-interest bookkeeping. Keeping all
+                // of it inside `finalize_originator_subscribe` lets the
+                // executor-subscribe entry (`run_executor_subscribe`)
+                // and any future driver entry inherit the same shape
+                // by calling the same helper.
+                super::finalize_originator_subscribe(
+                    op_manager,
+                    key,
+                    current_target_addr,
+                    is_renewal,
+                )
+                .await;
                 return Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
                     ContractResponse::SubscribeResponse {
                         key,
@@ -1145,10 +1132,17 @@ pub(crate) async fn start_relay_subscribe(
         // does not touch the winning driver's `pending_op_results`
         // slot (that slot is keyed on the attempt_tx the WINNER
         // forwarded downstream, not on `incoming_tx` at this node).
+        // Forward depth at this dedup-rejecting node = max_htl - htl.
+        // The winning in-flight driver will report its own (possibly
+        // deeper) hop_count to upstream — but for this rejected duplicate
+        // path the upstream sees this node's depth, which is correct from
+        // the duplicate's perspective.
+        let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
         let response = NetMessage::from(SubscribeMsg::Response {
             id: incoming_tx,
             instance_id,
             result: SubscribeMsgResult::NotFound,
+            hop_count,
         });
         let mut ctx = op_manager.op_ctx(incoming_tx);
         if let Err(err) = ctx.send_fire_and_forget(upstream_addr, response).await {
@@ -1335,12 +1329,16 @@ async fn drive_relay_subscribe(
             phase = "relay_subscribe_local_hit",
             "SUBSCRIBE relay: fulfilled locally, sending Response"
         );
+        // Local-hit storer arm: this node hosts the contract.
+        // hop_count = max_htl - htl_we_received.
+        let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
         return relay_subscribe_send_response(
             op_manager,
             incoming_tx,
             instance_id,
             SubscribeMsgResult::Subscribed { key },
             upstream_addr,
+            hop_count,
         )
         .await;
     }
@@ -1354,11 +1352,14 @@ async fn drive_relay_subscribe(
             phase = "relay_subscribe_not_found",
             "SUBSCRIBE relay: HTL exhausted"
         );
+        // HTL=0 path: the request traversed the full max_htl forward hops
+        // to reach us. hop_count = max_htl - 0 = max_htl.
+        let hop_count = op_manager.ring.max_hops_to_live;
         if let Some(event) = crate::tracing::NetEventLog::subscribe_not_found(
             &incoming_tx,
             &op_manager.ring,
             instance_id,
-            Some(op_manager.ring.max_hops_to_live),
+            Some(hop_count),
         ) {
             op_manager
                 .ring
@@ -1371,6 +1372,7 @@ async fn drive_relay_subscribe(
             instance_id,
             SubscribeMsgResult::NotFound,
             upstream_addr,
+            hop_count,
         )
         .await;
     }
@@ -1394,11 +1396,15 @@ async fn drive_relay_subscribe(
             phase = "relay_subscribe_not_found",
             "SUBSCRIBE relay: no closer peers to forward"
         );
+        // No-candidates exhaustion: this relay is reporting its own
+        // exhaustion of downstream candidates. hop_count = max_htl - htl
+        // (the forward depth of THIS relay).
+        let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
         if let Some(event) = crate::tracing::NetEventLog::subscribe_not_found(
             &incoming_tx,
             &op_manager.ring,
             instance_id,
-            None,
+            Some(hop_count),
         ) {
             op_manager
                 .ring
@@ -1411,6 +1417,7 @@ async fn drive_relay_subscribe(
             instance_id,
             SubscribeMsgResult::NotFound,
             upstream_addr,
+            hop_count,
         )
         .await;
     }
@@ -1425,12 +1432,15 @@ async fn drive_relay_subscribe(
                 target_pub_key = %next_hop.pub_key(),
                 "SUBSCRIBE relay: next hop has no socket address"
             );
+            // Forward-failure at THIS relay; same depth as no-candidates.
+            let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
             return relay_subscribe_send_response(
                 op_manager,
                 incoming_tx,
                 instance_id,
                 SubscribeMsgResult::NotFound,
                 upstream_addr,
+                hop_count,
             )
             .await;
         }
@@ -1496,12 +1506,15 @@ async fn drive_relay_subscribe(
                 crate::router::RouteOutcome::Failure,
                 crate::node::network_status::OpType::Subscribe,
             );
+            // Forward failure at THIS relay: report our own depth.
+            let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
             return relay_subscribe_send_response(
                 op_manager,
                 incoming_tx,
                 instance_id,
                 SubscribeMsgResult::NotFound,
                 upstream_addr,
+                hop_count,
             )
             .await;
         }
@@ -1520,12 +1533,15 @@ async fn drive_relay_subscribe(
                 crate::router::RouteOutcome::Failure,
                 crate::node::network_status::OpType::Subscribe,
             );
+            // Same as send-failure arm.
+            let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
             return relay_subscribe_send_response(
                 op_manager,
                 incoming_tx,
                 instance_id,
                 SubscribeMsgResult::NotFound,
                 upstream_addr,
+                hop_count,
             )
             .await;
         }
@@ -1536,9 +1552,16 @@ async fn drive_relay_subscribe(
     // Feed the relay's downstream-peer choice into the local Router so
     // future routing decisions are informed by relay-observed outcomes
     // (see operations.rs::record_relay_route_event).
-    let result = match reply {
+    //
+    // `bubble_hop_count` is the wire `hop_count` to forward upstream:
+    // - downstream Subscribed/NotFound: preserve the downstream's value
+    //   (relays do NOT increment on the return path);
+    // - unexpected variant: fall back to this relay's own depth
+    //   (`max_htl - htl`) — we know nothing about what produced `other`.
+    let (result, bubble_hop_count) = match reply {
         NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
             result: SubscribeMsgResult::Subscribed { key },
+            hop_count: downstream_hop_count,
             ..
         })) => {
             // Relay-side Subscribed registration — mirror legacy
@@ -1571,10 +1594,11 @@ async fn drive_relay_subscribe(
                 crate::router::RouteOutcome::SuccessUntimed,
                 crate::node::network_status::OpType::Subscribe,
             );
-            SubscribeMsgResult::Subscribed { key }
+            (SubscribeMsgResult::Subscribed { key }, downstream_hop_count)
         }
         NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
             result: SubscribeMsgResult::NotFound,
+            hop_count: downstream_hop_count,
             ..
         })) => {
             // Downstream peer correctly answered NotFound. The peer
@@ -1594,7 +1618,7 @@ async fn drive_relay_subscribe(
                 crate::router::RouteOutcome::SuccessUntimed,
                 crate::node::network_status::OpType::Subscribe,
             );
-            SubscribeMsgResult::NotFound
+            (SubscribeMsgResult::NotFound, downstream_hop_count)
         }
         other => {
             // Unexpected reply variant: unclear whether it's a local
@@ -1606,26 +1630,45 @@ async fn drive_relay_subscribe(
                 reply_variant = ?std::mem::discriminant(&other),
                 "SUBSCRIBE relay: unexpected reply variant; treating as NotFound"
             );
-            SubscribeMsgResult::NotFound
+            let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+            (SubscribeMsgResult::NotFound, hop_count)
         }
     };
 
-    relay_subscribe_send_response(op_manager, incoming_tx, instance_id, result, upstream_addr).await
+    relay_subscribe_send_response(
+        op_manager,
+        incoming_tx,
+        instance_id,
+        result,
+        upstream_addr,
+        bubble_hop_count,
+    )
+    .await
 }
 
 /// Send `SubscribeMsg::Response` upstream (fire-and-forget: upstream
 /// relay awaits via its own `send_to_and_await`, no reply expected).
+///
+/// `hop_count` is the forward-path depth to embed in the Response. For a
+/// relay that fulfilled locally (this node hosts the contract), pass
+/// `max_htl - incoming_htl`. For an HTL-exhaustion / no-candidates /
+/// forward-failure relay, pass that same `max_htl - incoming_htl` (it's
+/// the depth at which this relay reported the failure). For a relay
+/// bubbling a downstream Response upstream, pass the downstream's
+/// `hop_count` verbatim — relays do NOT increment on the return path.
 async fn relay_subscribe_send_response(
     op_manager: &OpManager,
     incoming_tx: Transaction,
     instance_id: ContractInstanceId,
     result: SubscribeMsgResult,
     upstream_addr: std::net::SocketAddr,
+    hop_count: usize,
 ) -> Result<(), OpError> {
     let response = NetMessage::from(SubscribeMsg::Response {
         id: incoming_tx,
         instance_id,
         result,
+        hop_count,
     });
     let mut ctx = op_manager.op_ctx(incoming_tx);
     ctx.send_fire_and_forget(upstream_addr, response).await
@@ -1653,6 +1696,7 @@ mod tests {
             id: tx,
             instance_id: *key.id(),
             result: SubscribeMsgResult::Subscribed { key },
+            hop_count: 0,
         }));
         match classify_reply(&msg) {
             ReplyClass::Subscribed { key: got } => assert_eq!(got, key),
@@ -1670,8 +1714,72 @@ mod tests {
             id: tx,
             instance_id,
             result: SubscribeMsgResult::NotFound,
+            hop_count: 0,
         }));
         assert!(matches!(classify_reply(&msg), ReplyClass::NotFound));
+    }
+
+    /// Regression pin: the SUBSCRIBE bubble-up path MUST preserve the
+    /// wire-carried `hop_count` from the downstream Response unchanged.
+    /// A regression that synthesised 0 here (or dropped the field) would
+    /// silently collapse the storer's forward-path depth at every relay,
+    /// defeating the whole PR.  The bincode-roundtrip test in
+    /// `subscribe/tests.rs` catches the wire format only; this pin tests
+    /// that destructuring the message keeps the field intact and that the
+    /// classifier doesn't conditionally reject based on `hop_count`.
+    #[test]
+    fn classify_reply_preserves_hop_count_subscribed() {
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([3u8; 32]),
+            CodeHash::new([4u8; 32]),
+        );
+        for hc in [0_usize, 1, 4, 10, 64] {
+            let tx = fresh_tx();
+            let msg = NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
+                id: tx,
+                instance_id: *key.id(),
+                result: SubscribeMsgResult::Subscribed { key },
+                hop_count: hc,
+            }));
+            assert!(
+                matches!(classify_reply(&msg), ReplyClass::Subscribed { .. }),
+                "Subscribed with hop_count={hc} must still classify"
+            );
+            // Destructure the message to assert the field was preserved.
+            match msg {
+                NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
+                    hop_count: got,
+                    ..
+                })) => assert_eq!(got, hc, "Subscribed hop_count preserved ({hc})"),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn classify_reply_preserves_hop_count_not_found() {
+        let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([4u8; 32]);
+        for hc in [0_usize, 1, 4, 10, 64] {
+            let tx = fresh_tx();
+            let msg = NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
+                id: tx,
+                instance_id,
+                result: SubscribeMsgResult::NotFound,
+                hop_count: hc,
+            }));
+            assert!(
+                matches!(classify_reply(&msg), ReplyClass::NotFound),
+                "NotFound with hop_count={hc} must still classify"
+            );
+            match msg {
+                NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response {
+                    hop_count: got,
+                    ..
+                })) => assert_eq!(got, hc, "NotFound hop_count preserved ({hc})"),
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]

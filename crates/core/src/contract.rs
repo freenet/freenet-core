@@ -9,6 +9,7 @@ use freenet_stdlib::prelude::*;
 
 mod executor;
 mod fair_queue;
+pub(crate) mod governance;
 mod handler;
 pub mod storages;
 pub(crate) mod user_input;
@@ -31,7 +32,7 @@ pub(crate) use handler::{
     },
 };
 
-pub use executor::{Executor, ExecutorError, OperationMode};
+pub use executor::{ContractQueueFull, Executor, ExecutorError, OperationMode};
 pub use handler::reset_event_id_counter;
 
 use freenet_stdlib::client_api::DelegateRequest;
@@ -682,6 +683,7 @@ where
                         continue;
                     }
                     if let Err(rejected) = fair_queue.try_push(id, event) {
+                        track_pending_reclamation_if_evict(&mut contract_handler, &rejected);
                         send_queue_full_response(contract_handler.channel(), rejected).await;
                     }
                 }
@@ -714,6 +716,7 @@ where
             result = contract_handler.channel().recv_from_sender() => {
                 let (id, event) = result?;
                 if let Err(rejected) = fair_queue.try_push(id, event) {
+                    track_pending_reclamation_if_evict(&mut contract_handler, &rejected);
                     send_queue_full_response(contract_handler.channel(), rejected).await;
                 }
             }
@@ -724,19 +727,51 @@ where
     }
 }
 
+/// When the fair queue rejects an `EvictContract` event (queue-full),
+/// the hosting-cache entry is already gone — no later sweep would
+/// re-emit on its own. Record the key in the pending-reclamation retry
+/// queue so the periodic sweep retries via `reclaim_evicted_contract`.
+///
+/// This closes disk-leak edge case #1 in PR #4212 review round 7
+/// (other variants are no-ops here — they have their own error paths).
+fn track_pending_reclamation_if_evict<CH>(
+    contract_handler: &mut CH,
+    rejected: &fair_queue::RejectedEvent,
+) where
+    CH: ContractHandler + Send + 'static,
+{
+    if let ContractHandlerEvent::EvictContract {
+        key,
+        expected_generation,
+    } = &rejected.event
+    {
+        contract_handler
+            .executor()
+            .track_pending_reclamation(*key, *expected_generation);
+    }
+}
+
 /// Send an error response to the event sender when the per-contract queue is full.
 ///
-/// Logs a warning and sends the appropriate error response variant for the rejected event.
+/// Logs at DEBUG (per-event backpressure is not user-actionable; see #4251)
+/// and sends the appropriate error response variant for the rejected event.
 /// For fire-and-forget events (delegates, disconnects), no response is sent.
 async fn send_queue_full_response(
     channel: &mut handler::ContractHandlerChannel<handler::ContractHandlerHalve>,
     rejected: Box<fair_queue::RejectedEvent>,
 ) {
-    tracing::warn!(
+    // Per-event backpressure is normal under sustained load on a hot contract
+    // and is not user-actionable. Logging at WARN once per rejection drowns
+    // node logs (millions of lines/day on a saturated contract). Aggregate
+    // backpressure visibility belongs in metrics, not per-event logs.
+    // See issue #4251 for the underlying queue-saturation tracking.
+    tracing::debug!(
         event = %rejected.event,
         "Rejected event due to per-contract queue capacity limit"
     );
-    let make_err = || ExecutorError::other(anyhow::anyhow!("contract queue full, try again later"));
+    // Typed `ContractQueueFull` marker powers `is_contract_queue_full` at
+    // every caller; the UPDATE relay drivers gate amplification on it. #4251.
+    let make_err = || ExecutorError::other(ContractQueueFull);
     let response = match &rejected.event {
         ContractHandlerEvent::PutQuery { .. } => ContractHandlerEvent::PutResponse {
             new_value: Err(make_err()),
@@ -776,7 +811,8 @@ async fn send_queue_full_response(
         | ContractHandlerEvent::QuerySubscriptionsResponse
         | ContractHandlerEvent::GetSummaryResponse { .. }
         | ContractHandlerEvent::GetDeltaResponse { .. }
-        | ContractHandlerEvent::ClientDisconnect { .. } => {
+        | ContractHandlerEvent::ClientDisconnect { .. }
+        | ContractHandlerEvent::EvictContract { .. } => {
             channel.drop_waiting_response(rejected.id);
             return;
         }
@@ -1411,6 +1447,37 @@ where
             contract_handler.executor().remove_client(client_id);
             contract_handler.channel().drop_waiting_response(id);
         }
+        ContractHandlerEvent::EvictContract {
+            key,
+            expected_generation,
+        } => {
+            // Reclaim the contract's on-disk storage after it was evicted
+            // from the hosting cache. Routed here (not inline-fast-pathed in
+            // the drain loop) so it goes through the fair queue and is
+            // serialized per-contract with any other in-flight ops on the
+            // same key. Fire-and-forget: no response is sent.
+            //
+            // `expected_generation` is consulted by
+            // `RuntimePool::remove_contract` to skip deletion if the
+            // contract's state was rewritten since eviction (re-host race).
+            match contract_handler
+                .executor()
+                .remove_contract(&key, expected_generation)
+                .await
+            {
+                Ok(()) => {
+                    tracing::info!(contract = %key, "Reclaimed on-disk storage for evicted contract");
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        contract = %key,
+                        error = %error,
+                        "Failed to reclaim on-disk storage for evicted contract"
+                    );
+                }
+            }
+            contract_handler.channel().drop_waiting_response(id);
+        }
         ContractHandlerEvent::DelegateResponse(_)
         | ContractHandlerEvent::PutResponse { .. }
         | ContractHandlerEvent::GetResponse { .. }
@@ -1447,6 +1514,46 @@ mod tests {
     use super::*;
     use crate::config::GlobalExecutor;
     use std::time::Duration;
+
+    /// Pin the rejection log site to DEBUG.
+    ///
+    /// Demoting `Rejected event due to per-contract queue capacity limit`
+    /// from WARN to DEBUG was the user-visible point of the #4251 fix —
+    /// at WARN it produced millions of lines/day on saturated contracts.
+    /// A future refactor that re-promotes it would silently restore that
+    /// regression. This is a source-level pin (per
+    /// `.claude/rules/bug-prevention-patterns.md`'s precedent for
+    /// regression-guard pins) rather than a tracing-subscriber capture,
+    /// because the level is the *only* thing being asserted and a string
+    /// scan over our own source is more robust than runtime-subscriber
+    /// state-machine plumbing.
+    #[test]
+    fn send_queue_full_response_logs_at_debug_not_warn_pin_test() {
+        // file!() returns a workspace-rooted path but tests run from
+        // CARGO_MANIFEST_DIR. Anchor explicitly.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/contract.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("must read own source at {}: {e}", path.display()));
+        let needle = "Rejected event due to per-contract queue capacity limit";
+        let idx = source
+            .find(needle)
+            .expect("rejection log message must still exist in source");
+        // Window the 200 bytes preceding the message: the `tracing::*!`
+        // macro that emits it lives within that window.
+        let start = idx.saturating_sub(200);
+        let window = &source[start..idx];
+        assert!(
+            window.contains("tracing::debug!"),
+            "Rejected-event log site must be at DEBUG. \
+             Re-promotion to WARN/INFO restores the issue #4251 log-volume regression.\n\
+             Source window:\n{window}"
+        );
+        assert!(
+            !window.contains("tracing::warn!") && !window.contains("tracing::info!"),
+            "Rejected-event log site must NOT be at WARN or INFO. \
+             Source window:\n{window}"
+        );
+    }
 
     fn make_contract_key() -> ContractKey {
         let code = ContractCode::from(vec![42u8; 32]);
@@ -1739,6 +1846,54 @@ mod tests {
                 assert!(delta.is_err(), "should be an error response");
             }
             other => panic!("expected GetDeltaResponse, got {other}"),
+        }
+    }
+
+    /// Issue #4251: the queue-full response MUST carry the typed
+    /// `ContractQueueFull` marker, not just an opaque anyhow error, so
+    /// callers can suppress amplification side effects (auto-fetch,
+    /// ResyncRequest, ERROR logs) via
+    /// `ExecutorError::is_contract_queue_full`. A regression here would
+    /// silently bring back the storm-on-saturation behavior.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn send_queue_full_response_carries_typed_queue_full_marker() {
+        let (send_halve, mut rcv_halve, _) = handler::contract_handler_channel();
+        let key = make_contract_key();
+
+        let (rejected, handle) = setup_rejected_event(
+            send_halve,
+            &mut rcv_halve,
+            ContractHandlerEvent::UpdateQuery {
+                key,
+                data: UpdateData::Delta(StateDelta::from(vec![1])),
+                related_contracts: RelatedContracts::default(),
+            },
+        )
+        .await;
+
+        send_queue_full_response(&mut rcv_halve, rejected).await;
+
+        let response = tokio::time::timeout(Duration::from_millis(200), handle)
+            .await
+            .expect("timeout")
+            .expect("task should complete")
+            .expect("should get response");
+
+        match response {
+            ContractHandlerEvent::UpdateResponse { new_value, .. } => {
+                let err = new_value.expect_err("UpdateResponse should carry an error");
+                assert!(
+                    err.is_contract_queue_full(),
+                    "queue-full response MUST be classified by is_contract_queue_full; \
+                     got err = {err:?}. If you removed this classification, you have also \
+                     re-enabled the auto-fetch / ResyncRequest amplification storm — see \
+                     issue #4251."
+                );
+                // Disjointness from other predicates is covered by
+                // `test_contract_queue_full_disjoint_from_other_predicates`
+                // in executor.rs.
+            }
+            other => panic!("expected UpdateResponse, got {other}"),
         }
     }
 

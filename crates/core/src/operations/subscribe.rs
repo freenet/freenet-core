@@ -340,6 +340,161 @@ async fn complete_local_subscription(
     Ok(())
 }
 
+/// Fetch the contract body locally if we do not already have it.
+///
+/// Fire-and-forget GET sub-op + bounded wait for the contract to land in
+/// local storage. Used by the originator finalization helper so that a
+/// peer that successfully subscribed to a contract it had never seen can
+/// answer subsequent GETs from local state rather than returning
+/// `get_not_found`. See issue #4223 — the v0.2.51+ task-per-tx SUBSCRIBE
+/// migration dropped this call, leaving subscribers with the lease
+/// installed but no contract body, so 37% of GETs that routed through a
+/// subscriber were returning NotFound.
+///
+/// Returns `Ok(Some(key))` if the contract is locally available after the
+/// fetch attempt (including the case where it was already present),
+/// `Ok(None)` if it could not be obtained within `CONTRACT_WAIT_TIMEOUT_MS`
+/// (the originator's subscribe still completes — the contract may arrive
+/// later via UPDATE), and `Err` only for local infrastructure failures
+/// (channel closed, etc.).
+pub(super) async fn fetch_contract_if_missing(
+    op_manager: &OpManager,
+    instance_id: ContractInstanceId,
+) -> Result<Option<ContractKey>, OpError> {
+    if let Some(key) = super::has_contract(op_manager, instance_id).await? {
+        return Ok(Some(key));
+    }
+
+    // Spawn the sub-op GET. We drop the receiver — we don't care about
+    // the structured `SubOpGetOutcome`, only the side effect of caching
+    // the contract locally. `wait_for_contract_with_timeout` (storage
+    // poll + wait_for_contract channel + timeout) detects arrival.
+    let (_tx, _rx) = super::get::op_ctx_task::start_sub_op_get(op_manager, instance_id, true);
+
+    wait_for_contract_with_timeout(op_manager, instance_id, CONTRACT_WAIT_TIMEOUT_MS).await
+}
+
+/// Finalize an originator-side subscribe success.
+///
+/// Called from the task-per-tx SUBSCRIBE driver
+/// (`op_ctx_task::drive_client_subscribe_inner`) after a `Subscribed`
+/// reply arrives. Performs every side-effect the originator needs so the
+/// subscription is fully usable end-to-end:
+///
+/// 1. Register the responding peer as our upstream interest (so
+///    `send_unsubscribe_upstream` can find it on client disconnect — #3874).
+/// 2. Install the lease in `active_subscriptions`
+///    (`op_manager.ring.subscribe`).
+/// 3. Clear pending backoff state for this contract
+///    (`op_manager.ring.complete_subscription_request(..., true)`).
+/// 4. **Fetch the contract body locally if missing** (#4223). Without
+///    this, the peer registers as a subscriber but answers `NotFound`
+///    on GETs that route through it because the contract body never
+///    arrived.
+/// 5. **Announce that we host this contract to neighbors**, *only when
+///    the body is locally present after step 4*. Announcing without a
+///    body would tell neighbors to forward UPDATEs to a peer that
+///    cannot validate or store them. If the body lands later via the
+///    sub-op GET's own cache path, `get/op_ctx_task.rs` calls
+///    `announce_contract_hosted` there *on first-time cache* (gated
+///    on `is_new && put_persisted`). A niche case where the contract
+///    was previously hosted then evicted, the lease expires, and the
+///    re-subscribe fetch then times out, would not re-trigger the
+///    announce via that fallback — neighbors learn we host the
+///    contract again either through the next renewal cycle's
+///    finalization (if the body has arrived by then) or via UPDATE
+///    delivery + auto-fetch.
+/// 6. Register the contract in our local interest manager (so inbound
+///    `ChangeInterests` for this contract get processed) and broadcast
+///    a `ChangeInterests` so connected peers learn we became interested.
+///    Gated on `!is_renewal` — `add_local_client` is NOT idempotent
+///    (`ring::interest::Contract::add_client` increments
+///    `local_client_count` on every call); calling it on every renewal
+///    cycle (~2 minutes) would leak the gauge unboundedly.
+///
+/// Latency note: because this function is awaited before the driver
+/// publishes `SubscribeResponse` to the client, a first-time subscribe
+/// to a contract we don't host can take up to `CONTRACT_WAIT_TIMEOUT_MS`
+/// (2 s) longer than the prior task-per-tx path took. This implements
+/// issue #4223's proposed approach point 2 ("do not emit
+/// subscribe_success to the client until fetch_contract_if_missing
+/// completes"); the latency is the cost of the client knowing the
+/// subscriber can actually serve a follow-up GET.
+///
+/// See also: `crate::operations::complete_piggyback_subscription` —
+/// the GET-piggyback originator finalization path, which performs the
+/// same conceptual steps in a different order (it does NOT need the
+/// fetch step because the contract just arrived inside the GET
+/// response that carried the piggyback). Keep the two helpers in sync
+/// when adding new originator-side side effects.
+pub(super) async fn finalize_originator_subscribe(
+    op_manager: &OpManager,
+    key: ContractKey,
+    upstream_addr: std::net::SocketAddr,
+    is_renewal: bool,
+) {
+    if let Some(pkl) = op_manager
+        .ring
+        .connection_manager
+        .get_peer_by_addr(upstream_addr)
+    {
+        let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key);
+        op_manager
+            .interest_manager
+            .register_peer_interest(&key, peer_key, None, true);
+    }
+
+    op_manager.ring.subscribe(key);
+    op_manager.ring.complete_subscription_request(&key, true);
+
+    // Fetch the contract body if we don't have it locally. The result
+    // gates the announce step: we only advertise hosting to neighbors
+    // when the body actually lands. On timeout (Ok(None)) or
+    // infrastructure failure (Err), the subscription is still finalized
+    // (lease installed, peer registered) — the contract may arrive
+    // later via UPDATE propagation or the sub-op GET completing past
+    // the 2 s wait window, at which point the GET driver's own
+    // `announce_contract_hosted` call fires.
+    let have_body = match fetch_contract_if_missing(op_manager, *key.id()).await {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            tracing::debug!(
+                contract = %key,
+                timeout_ms = CONTRACT_WAIT_TIMEOUT_MS,
+                "subscribe: contract body did not arrive within timeout; \
+                 deferring announce_contract_hosted — the sub-op GET will \
+                 announce when it caches, or UPDATE delivery will fill the gap"
+            );
+            false
+        }
+        Err(err) => {
+            // Infrastructure failure (notification channel closed,
+            // contract handler down). `warn` rather than `debug`
+            // because this signals broken local plumbing, not a
+            // routine cache miss.
+            tracing::warn!(
+                contract = %key,
+                error = %err,
+                "subscribe: fetch_contract_if_missing returned infra error; \
+                 deferring announce_contract_hosted — operator should \
+                 investigate (contract handler / notification channel)"
+            );
+            false
+        }
+    };
+
+    if have_body {
+        super::announce_contract_hosted(op_manager, &key).await;
+    }
+
+    if !is_renewal {
+        let became_interested = op_manager.interest_manager.add_local_client(&key);
+        if became_interested {
+            super::broadcast_change_interests(op_manager, vec![key], vec![]).await;
+        }
+    }
+}
+
 /// Register a downstream subscriber for a contract.
 ///
 /// Resolves the requester's `PeerKey` from the pre-resolved public key (preferred,
@@ -547,6 +702,26 @@ mod messages {
             id: Transaction,
             instance_id: ContractInstanceId,
             result: SubscribeMsgResult,
+            /// Forward-path hop count: how many hops the originating Request
+            /// traversed before reaching the node that produced this Response
+            /// (the hosting peer for `Subscribed`, or the relay that reported
+            /// exhaustion / no-candidates / forward-failure for `NotFound`).
+            ///
+            /// Computed as `max_hops_to_live - htl_at_responder`. The relay
+            /// chain preserves this value as the Response bubbles back to the
+            /// originator — it does NOT increment on the return path. For
+            /// `NotFound`, treat this as the depth at which exhaustion
+            /// occurred, not depth-to-the-contract.
+            ///
+            /// `#[serde(default)]` is set for source-level clarity. Bincode
+            /// does not honour serde defaults (positional encoding), so wire
+            /// compat with peers that lack this field is handled at the
+            /// handshake layer via `MIN_COMPATIBLE_VERSION`.
+            ///
+            /// Mirror of `GetMsg::Response.hop_count` (PR #4245); see also
+            /// `PutMsg::Response.hop_count`.
+            #[serde(default)]
+            hop_count: usize,
         },
         /// Explicit unsubscribe notification sent upstream for fast cleanup.
         /// Fire-and-forget: does not require a response or existing operation state.

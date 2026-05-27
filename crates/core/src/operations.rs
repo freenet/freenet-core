@@ -141,6 +141,15 @@ impl OpError {
     pub fn is_invalid_update_rejection(&self) -> bool {
         matches!(self, Self::ExecutorError(e) if e.is_invalid_update_rejection())
     }
+
+    /// Returns true for the typed `ContractQueueFull` marker. Callers MUST
+    /// gate amplification side effects (auto-fetch, ResyncRequest, ERROR
+    /// logs) on this predicate so a saturated contract queue doesn't induce
+    /// network-wide storms. See `ExecutorError::is_contract_queue_full` and
+    /// issue #4251.
+    pub fn is_contract_queue_full(&self) -> bool {
+        matches!(self, Self::ExecutorError(e) if e.is_contract_queue_full())
+    }
 }
 
 impl<T> From<SendError<T>> for OpError {
@@ -157,6 +166,26 @@ pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &Contr
             %key,
             "NEIGHBOR_HOSTING: Announcing contract hosted to neighbors"
         );
+        // DELIBERATELY blocking — unlike the other Broadcast* emission
+        // sites in this PR, `announce_contract_hosted` carries a
+        // one-shot transition: `on_contract_hosted(key)` above just
+        // inserted `key` into `my_contracts`, and any subsequent call
+        // for the same key returns `None` (the `if let Some(...)`
+        // arm we are inside never re-fires). Dropping this emission
+        // on `Full` would silently lose the only hosting
+        // announcement we will ever send for this contract, leaving
+        // neighbors unaware that this node hosts it until a
+        // reconnect or unrelated state-exchange round.
+        //
+        // Acceptable trade-off because this path runs only on the
+        // *first* PUT/GET of a new contract — low frequency, so a
+        // 30s blocking await under wedge conditions is rare and the
+        // error is preferable to silent loss. If this becomes a
+        // wedge contributor in its own right, the right fix is to
+        // separate the `my_contracts` insertion from the
+        // announcement (so the transition isn't consumed until the
+        // broadcast is queued), not to switch back to try_notify.
+        // See review on PR #4231 (Codex P1) and #4145.
         if let Err(err) = op_manager
             .notify_node_event(crate::message::NodeEvent::BroadcastHostingUpdate {
                 message: announcement,
@@ -171,6 +200,54 @@ pub(crate) async fn announce_contract_hosted(op_manager: &OpManager, key: &Contr
             );
         }
     }
+}
+
+/// Reclaim the on-disk storage of a contract that was evicted from the
+/// hosting cache. Skips contracts that are still in use — an active client
+/// subscription or a downstream peer subscriber means something still
+/// depends on us hosting it, so its state/code must NOT be deleted. See
+/// `HostingManager::contract_in_use` for why an active upstream network
+/// subscription alone is NOT included in the gate.
+///
+/// `expected_generation` is the state-write generation captured atomically
+/// with the eviction decision (see `HostingCache::record_access` /
+/// `sweep_expired`). It is carried through `EvictContract` so the
+/// deletion-time guard in `RuntimePool::remove_contract` can detect a
+/// state write (PUT/UPDATE) that re-hosted the contract between eviction
+/// and this handler running — that case must skip disk reclamation
+/// because the freshly written state would otherwise be deleted.
+///
+/// Fire-and-forget: emits an `EvictContract` event to the contract handler,
+/// which routes it through the fair queue (serialized per-contract with other
+/// ops on the same key) and reclaims disk in `handle_contract_event`.
+pub(crate) fn reclaim_evicted_contract(
+    op_manager: &OpManager,
+    key: ContractKey,
+    expected_generation: u64,
+) {
+    if op_manager.ring.contract_in_use(&key) {
+        tracing::debug!(
+            contract = %key,
+            "Skipping disk reclamation for evicted contract — still in use \
+             (client subscription or downstream subscriber); queued for retry"
+        );
+        // Queue for retry by the periodic sweep: the hosting-cache entry is
+        // already gone (we are processing its `evicted` tuple), so when the
+        // subscriber later expires nothing else would emit another
+        // EvictContract for this key — without this, the disk state/code
+        // would leak permanently. Mirrors the symmetric in-use skip in
+        // RuntimePool::remove_contract.
+        op_manager
+            .ring
+            .pending_reclamation_add(key, expected_generation);
+        return;
+    }
+    op_manager.notify_contract_handler_fire_and_forget(
+        crate::contract::ContractHandlerEvent::EvictContract {
+            key,
+            expected_generation,
+        },
+    );
 }
 
 /// Complete subscription at the originator node via GET piggyback.
@@ -263,16 +340,20 @@ pub(crate) async fn broadcast_change_interests(
         "Broadcasting ChangeInterests to neighbors"
     );
 
-    if let Err(err) = op_manager
-        .notify_node_event(crate::message::NodeEvent::BroadcastChangeInterests {
+    // Non-blocking emit: interest changes are best-effort gossip;
+    // a missed one will be re-broadcast on the next change or
+    // converged via the periodic InterestSync exchange (#4145).
+    if let Err(err) =
+        op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastChangeInterests {
             added: added_hashes,
             removed: removed_hashes,
         })
-        .await
     {
-        tracing::warn!(
+        // Best-effort by design — log at debug to keep the caller
+        // layer in step with the helper-internal downgrade (#4238).
+        tracing::debug!(
             error = %err,
-            "Failed to broadcast ChangeInterests"
+            "Failed to broadcast ChangeInterests (best-effort)"
         );
     }
 }
@@ -349,7 +430,8 @@ pub(crate) async fn has_contract(
         | crate::contract::ContractHandlerEvent::GetSummaryResponse { .. }
         | crate::contract::ContractHandlerEvent::GetDeltaQuery { .. }
         | crate::contract::ContractHandlerEvent::GetDeltaResponse { .. }
-        | crate::contract::ContractHandlerEvent::ClientDisconnect { .. } => Ok(None),
+        | crate::contract::ContractHandlerEvent::ClientDisconnect { .. }
+        | crate::contract::ContractHandlerEvent::EvictContract { .. } => Ok(None),
     }
 }
 

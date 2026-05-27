@@ -334,14 +334,7 @@ impl NodeConfig {
             Address::HostAddress(addr) => return Ok(*addr),
         };
 
-        let (conf, opts) = hickory_resolver::system_conf::read_system_conf()?;
-        let resolver = hickory_resolver::TokioAsyncResolver::new(
-            conf,
-            opts,
-            hickory_resolver::name_server::GenericConnector::new(
-                hickory_resolver::name_server::TokioRuntimeProvider::new(),
-            ),
-        );
+        let resolver = hickory_resolver::TokioResolver::builder_tokio()?.build()?;
 
         // only issue one query with .
         let hostname = if hostname.ends_with('.') {
@@ -351,7 +344,7 @@ impl NodeConfig {
         };
 
         let ips = resolver.lookup_ip(hostname.as_ref()).await?;
-        match ips.into_iter().next() {
+        match ips.iter().next() {
             Some(ip) => Ok(SocketAddr::new(
                 ip,
                 port.unwrap_or_else(crate::config::default_network_api_port),
@@ -1302,18 +1295,26 @@ where
                         peer = %source_pub_key,
                         "Proximity cache overlap — syncing state to neighbor"
                     );
-                    if let Err(e) = op_manager
-                        .notify_node_event(NodeEvent::SyncStateToPeer {
-                            key,
-                            new_state: state,
-                            target: source,
-                        })
-                        .await
-                    {
-                        tracing::warn!(
+                    // Non-blocking emit: SyncStateToPeer is best-effort
+                    // gossip — if dropped, the next interest-sync round
+                    // or a subsequent summary mismatch will catch it. A
+                    // blocking 30 s `.await` here would itself stack on
+                    // the same notification channel that the executor's
+                    // try_notify path is trying to keep responsive
+                    // (#4145 / #4234).
+                    if let Err(e) = op_manager.try_notify_node_event(NodeEvent::SyncStateToPeer {
+                        key,
+                        new_state: state,
+                        target: source,
+                    }) {
+                        // Best-effort by design (see comment above);
+                        // log at debug to keep the caller layer in
+                        // step with the helper-internal downgrade
+                        // (#4238).
+                        tracing::debug!(
                             contract = %instance_id,
                             error = %e,
-                            "Failed to emit SyncStateToPeer for proximity sync"
+                            "Failed to emit SyncStateToPeer for proximity sync (best-effort)"
                         );
                     }
                 }
@@ -1549,23 +1550,31 @@ async fn handle_interest_sync_message(
                     );
                     continue;
                 };
-                tracing::info!(
+                // Fires per stale-peer detection during interest sync, which
+                // is dominant on hot contracts. Diagnostic-grade rather than
+                // user-actionable; keep accessible via RUST_LOG=…=debug.
+                tracing::debug!(
                     contract = %contract,
                     stale_peer = %source,
                     "Summary mismatch in interest sync — syncing state to stale peer"
                 );
-                if let Err(e) = op_manager
-                    .notify_node_event(NodeEvent::SyncStateToPeer {
-                        key: contract,
-                        new_state: state,
-                        target: source,
-                    })
-                    .await
-                {
-                    tracing::warn!(
+                // Non-blocking emit: SyncStateToPeer is best-effort
+                // gossip — if dropped, the next interest-sync round
+                // will retry. Blocking here would stack the heal
+                // path on the same notification channel the executor
+                // is trying to keep responsive (#4145 / #4234).
+                if let Err(e) = op_manager.try_notify_node_event(NodeEvent::SyncStateToPeer {
+                    key: contract,
+                    new_state: state,
+                    target: source,
+                }) {
+                    // Best-effort by design (see comment above); log
+                    // at debug to keep the caller layer in step with
+                    // the helper-internal downgrade (#4238).
+                    tracing::debug!(
                         contract = %contract,
                         error = %e,
-                        "Failed to emit SyncStateToPeer for stale peer correction"
+                        "Failed to emit SyncStateToPeer for stale peer correction (best-effort)"
                     );
                 }
             }
@@ -1784,11 +1793,18 @@ async fn handle_interest_sync_message(
                     );
                 }
                 Ok(other) => {
-                    tracing::warn!(
+                    // Display, not Debug, for `other` — `?other` Debug-prints
+                    // the full UpdateResponse, expands the inner
+                    // anyhow::Error, and emits a ~15-line backtrace per call
+                    // under queue saturation (issue #4251).
+                    // ContractHandlerEvent's hand-written Display
+                    // (`contract/handler.rs:706`) gives a single-line variant
+                    // summary without expanding nested anyhow chains.
+                    tracing::debug!(
                         from = %source,
                         contract = %key,
                         event = "resync_failed",
-                        response = ?other,
+                        response = %other,
                         "Unexpected response to resync update"
                     );
                 }
@@ -1884,7 +1900,11 @@ async fn get_contract_summary(
         Ok(ContractHandlerEvent::GetSummaryResponse {
             summary: Err(e), ..
         }) => {
-            tracing::warn!(
+            // Fires repeatedly when the executor queue is saturated for a hot
+            // contract (issue #4251). Demoted to debug because the actionable
+            // signal is the queue saturation itself, not the per-summary
+            // failure.
+            tracing::debug!(
                 contract = %key,
                 error = %e,
                 "Failed to get contract summary"
@@ -2138,6 +2158,75 @@ mod tests {
 
     use super::*;
     use rstest::rstest;
+
+    /// Source-level pins for the three log sites in this file that were
+    /// demoted / format-fixed in PR #4252 for issue #4251. Each pin
+    /// asserts the macro family of the call site by scanning a 400-byte
+    /// window before the anchor message. Same shape as the
+    /// `bug-prevention-patterns.md` FreeConsole pins in `service.rs`.
+    /// Window widened from 240 to 400 in re-review #3 to absorb future
+    /// added structured fields without false-breaking the pin.
+    fn assert_log_site_pin(needle: &str, must_contain: &[&str], must_not_contain: &[&str]) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/node.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("must read own source at {}: {e}", path.display()));
+        let idx = source
+            .find(needle)
+            .unwrap_or_else(|| panic!("log message `{needle}` must still exist in source"));
+        let start = idx.saturating_sub(400);
+        let window = &source[start..idx];
+        for needle in must_contain {
+            assert!(
+                window.contains(needle),
+                "site `{needle}` must appear in the 240-byte window before message:\n{window}",
+                needle = needle
+            );
+        }
+        for forbidden in must_not_contain {
+            assert!(
+                !window.contains(forbidden),
+                "site must NOT contain `{forbidden}` (would restore an issue #4251 regression):\n{window}",
+                forbidden = forbidden
+            );
+        }
+    }
+
+    #[test]
+    fn summary_mismatch_in_interest_sync_logs_at_debug_pin_test() {
+        // Demoted from INFO to DEBUG to stop dominating peer logs on
+        // hot contracts. Per #4251 review (testing reviewer #1).
+        assert_log_site_pin(
+            "Summary mismatch in interest sync \u{2014} syncing state to stale peer",
+            &["tracing::debug!"],
+            &["tracing::info!", "tracing::warn!"],
+        );
+    }
+
+    #[test]
+    fn unexpected_resync_response_uses_display_not_debug_pin_test() {
+        // Switched from `response = ?other` (Debug-expanded UpdateResponse
+        // → anyhow chain → ~15-line backtrace per call) to `response =
+        // %other` (single-line Display via ContractHandlerEvent's
+        // hand-written impl). Per #4251 review (code-first + Codex).
+        assert_log_site_pin(
+            "Unexpected response to resync update",
+            &["tracing::debug!", "response = %other"],
+            &["response = ?other", "tracing::warn!", "tracing::info!"],
+        );
+    }
+
+    #[test]
+    fn failed_to_get_contract_summary_logs_at_debug_pin_test() {
+        // Demoted from WARN to DEBUG: this site fires repeatedly when
+        // the executor queue is saturated for a hot contract (#4251).
+        // The actionable signal is the queue saturation itself, not
+        // the per-summary failure. Caught by rule-review on PR #4252.
+        assert_log_site_pin(
+            "Failed to get contract summary",
+            &["tracing::debug!"],
+            &["tracing::warn!", "tracing::info!"],
+        );
+    }
 
     // Hostname resolution tests
     #[tokio::test]
@@ -2552,6 +2641,7 @@ mod tests {
                 id: sub_tx,
                 instance_id,
                 result: SubscribeMsgResult::Subscribed { key },
+                hop_count: 0,
             };
 
             let taken = subscribe_branch_would_forward(&op, Some(&tx));
@@ -2628,6 +2718,7 @@ mod tests {
                 id: sub_tx,
                 instance_id,
                 result: SubscribeMsgResult::NotFound,
+                hop_count: 0,
             };
 
             let taken = subscribe_branch_would_forward(&op, None);
@@ -2727,7 +2818,11 @@ mod tests {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
             let put_tx = Transaction::new::<PutMsg>();
             let key = dummy_put_key(10, 11);
-            let op = PutMsg::Response { id: put_tx, key };
+            let op = PutMsg::Response {
+                id: put_tx,
+                key,
+                hop_count: 0,
+            };
 
             let taken = put_branch_would_forward(&op, Some(&tx));
             assert!(taken, "Response with callback → must be forwarded");
@@ -2745,6 +2840,7 @@ mod tests {
                 id: put_tx,
                 key,
                 continue_forwarding: false,
+                hop_count: 0,
             };
 
             let taken = put_branch_would_forward(&op, Some(&tx));
@@ -2804,7 +2900,11 @@ mod tests {
         async fn put_response_without_callback_falls_through() {
             let put_tx = Transaction::new::<PutMsg>();
             let key = dummy_put_key(16, 17);
-            let op = PutMsg::Response { id: put_tx, key };
+            let op = PutMsg::Response {
+                id: put_tx,
+                key,
+                hop_count: 0,
+            };
 
             let taken = put_branch_would_forward(&op, None);
             assert!(

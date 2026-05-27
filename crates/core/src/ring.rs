@@ -42,11 +42,17 @@ use crate::{
     router::Router,
 };
 
+mod broken_invariants;
 mod connection_backoff;
 mod connection_manager;
 pub(crate) use connection_manager::ConnectionManager;
 mod connection;
 mod hosting;
+pub(crate) use broken_invariants::{BrokenInvariant, BrokenInvariantsTracker};
+/// Single source of truth for the default hosted-contract-state budget.
+/// `config::default_max_hosting_storage()` resolves to this so the
+/// operator-facing default and the in-code fallback can never drift.
+pub(crate) use hosting::DEFAULT_HOSTING_BUDGET_BYTES;
 pub use hosting::{AccessType, RecordAccessResult};
 pub mod interest;
 mod live_tx;
@@ -60,6 +66,29 @@ pub mod topology_registry;
 /// When true, GET operations will automatically subscribe to the contract
 /// to receive updates. This is controlled by hosting cache eviction.
 pub const AUTO_SUBSCRIBE_ON_GET: bool = true;
+
+/// Governance demand weight for a local-client subscription. Strong
+/// signal: a real user on this node opted in. Hard to fake without
+/// running an actual freenet client locally.
+///
+/// Sourced from the design doc — see "Sybil weighting falls out
+/// naturally" in `docs/design/contract-hardening.md`.
+const LOCAL_DEMAND_WEIGHT: f64 = 1.0;
+
+/// Governance demand weight for a downstream peer's subscription.
+/// Weaker signal because peer identity is attacker-rotatable —
+/// without an identity layer, a single attacker can spin up many
+/// peers and each "subscribes." We weight forwarded demand at 0.1
+/// so an attacker would need 10 peers to fake the demand of one
+/// local user.
+const FORWARDED_DEMAND_WEIGHT: f64 = 0.1;
+
+/// Interval between governance reaper ticks. Each tick applies
+/// decay and runs MAD-based outlier detection across the population.
+/// One minute balances responsiveness (a sustained-cost contract is
+/// flagged within a minute or two of crossing the threshold) against
+/// CPU overhead (MAD over the entire contract set every tick).
+const GOVERNANCE_TICK_INTERVAL: Duration = Duration::from_secs(60);
 
 use connection_backoff::ConnectionBackoff;
 pub use connection_backoff::ConnectionFailureReason;
@@ -89,6 +118,16 @@ pub(crate) struct Ring {
     pub router: Arc<RwLock<Router>>,
     pub live_tx_tracker: LiveTransactionTracker,
     hosting_manager: hosting::HostingManager,
+    /// Per-contract record of detected CRDT-invariant violations (e.g. a
+    /// non-idempotent `update_state`). Used to gate outbound broadcast
+    /// so a broken contract's state changes don't leave the node.
+    broken_invariants: BrokenInvariantsTracker,
+    /// Per-contract governance scoring + reaper. Routes every
+    /// per-contract resource report through `ingest_cost` so the
+    /// governance state for a contract reflects what the meter
+    /// already records. Mode defaults to `DryRun` per the staged-
+    /// rollout plan.
+    pub(crate) governance: Arc<crate::contract::governance::GovernanceManager>,
     event_register: Box<dyn NetEventRegister>,
     op_manager: RwLock<Option<Weak<OpManager>>>,
     /// Whether this peer is a gateway or not. This will affect behavior of the node when acquiring
@@ -215,18 +254,26 @@ impl Ring {
         } else {
             Some(config.config.data_dir())
         };
+        let time_source: Arc<dyn crate::util::time_source::TimeSource + Send + Sync> =
+            Arc::new(InstantTimeSrc::new());
+        let governance = Arc::new(crate::contract::governance::GovernanceManager::new(
+            crate::contract::governance::GovernanceConfig::default(),
+            time_source.clone(),
+        ));
         let ring = Ring {
             max_hops_to_live,
             router,
             connection_manager,
-            hosting_manager: hosting::HostingManager::new(),
+            hosting_manager: hosting::HostingManager::new(config.config.max_hosting_storage),
+            broken_invariants: BrokenInvariantsTracker::new(),
+            governance,
             live_tx_tracker: live_tx_tracker.clone(),
             event_register: Box::new(event_register),
             op_manager: RwLock::new(None),
             is_gateway,
             connection_backoff: Arc::new(Mutex::new(ConnectionBackoff::new())),
             contract_connect_backoff: Mutex::new(HashMap::new()),
-            time_source: Arc::new(InstantTimeSrc::new()),
+            time_source,
             peer_cache_dir,
         };
 
@@ -329,6 +376,19 @@ impl Ring {
         task_monitor.register(
             "interest_heartbeat",
             GlobalExecutor::spawn(Self::interest_heartbeat(ring.clone())),
+        );
+
+        // Spawn periodic governance reaper tick.
+        // Computes per-contract state from accumulated cost/benefit
+        // samples and logs `ReaperDecision`s. Mode defaults to DryRun
+        // per the staged-rollout plan, so this task only ever logs —
+        // no eviction actions until the operator (or release default)
+        // flips to Enforce. The dashboard reads `governance.score_snapshot`
+        // independently of the tick; the tick is only the engine that
+        // updates state.
+        task_monitor.register(
+            "governance_reaper",
+            GlobalExecutor::spawn(Self::governance_reaper_loop(ring.clone())),
         );
 
         Ok(ring)
@@ -583,6 +643,85 @@ impl Ring {
     /// This prevents the death spiral where interest entries expire because no
     /// broadcasts are flowing, which in turn prevents broadcasts from ever
     /// flowing again. By periodically re-sending the full interest set, we
+    /// Periodic governance reaper loop. Ticks every
+    /// `GOVERNANCE_TICK_INTERVAL` and:
+    ///
+    ///   1. Calls `governance.tick(interval)` to apply decay and
+    ///      run the MAD detector over the per-contract distribution.
+    ///   2. Logs each `ReaperDecision` at INFO level with the from→to
+    ///      state and reason. In `DryRun` mode (the default) this is
+    ///      the only effect; in `Enforce` mode the caller would also
+    ///      emit `EvictContract` events here. Enforce-mode wiring
+    ///      lands in a subsequent commit.
+    ///   3. Logs the network-norms summary (median, MAD, threshold,
+    ///      sample size) at DEBUG so a busy node doesn't spam INFO.
+    ///
+    /// **Cancellation safety:** the loop's only `.await` points are
+    /// `tokio::time::sleep` / `interval.tick()`. No channel sends, no
+    /// long-running operations — the design-doc rule that "the
+    /// dashboard reflects the back-end" is respected here too: the
+    /// reaper writes governance state; readers consume it
+    /// asynchronously.
+    async fn governance_reaper_loop(ring: Arc<Self>) {
+        // Initial delay so a fleet-wide restart doesn't have every node
+        // ticking in lockstep. Derived from the node's own ring location
+        // (already random + node-distinct) rather than from `GlobalRng`,
+        // because consuming from `GlobalRng` at startup shifts the
+        // deterministic seed state and breaks simulation tests whose
+        // routing/topology decisions are RNG-driven (the
+        // `test_get_routing_coverage_low_htl` regression was caught by
+        // CI on PR #4270). 30-90 second offset; the tick itself runs
+        // every minute below.
+        let own_loc = ring
+            .connection_manager
+            .own_location()
+            .location()
+            .map(|l| l.as_f64())
+            .unwrap_or(0.5);
+        let initial_delay_secs = 30 + ((own_loc * 60.0) as u64);
+        let initial_delay = Duration::from_secs(initial_delay_secs);
+        tokio::time::sleep(initial_delay).await;
+
+        let mut interval = tokio::time::interval(GOVERNANCE_TICK_INTERVAL);
+        interval.tick().await; // Skip first immediate tick.
+        let mut last_tick = ring.time_source.now();
+
+        loop {
+            interval.tick().await;
+            let now = ring.time_source.now();
+            let elapsed = now.saturating_duration_since(last_tick);
+            last_tick = now;
+
+            let result = ring.governance_tick(elapsed);
+
+            // Network-norms summary at DEBUG — useful when debugging
+            // calibration but too noisy for INFO on a healthy node.
+            tracing::debug!(
+                median = ?result.median_log_ratio,
+                mad = ?result.mad,
+                threshold = ?result.threshold,
+                sample_size = result.sample_size,
+                capacity_ceiling_binding = result.capacity_ceiling_binding,
+                skip_reason = ?result.skip_reason,
+                "governance reaper tick",
+            );
+
+            // Decisions at INFO — these are the dashboard-relevant
+            // events. Empty in healthy state, surfaces every
+            // transition during incidents.
+            for decision in result.decisions {
+                tracing::info!(
+                    contract = %decision.key,
+                    from = ?decision.from,
+                    to = ?decision.to,
+                    reason = ?decision.reason,
+                    actionable = decision.actionable,
+                    "governance state transition",
+                );
+            }
+        }
+    }
+
     /// keep entries alive on the remote side.
     ///
     /// Sends are spread evenly across the interval to avoid bursts.
@@ -1169,24 +1308,84 @@ impl Ring {
             // Sweep expired entries from GET subscription cache
             let expired = ring.sweep_expired_get_subscriptions();
 
-            if expired.is_empty() {
-                continue;
+            // Do NOT early-continue when `expired` is empty: pending
+            // reclamation retries below must run every cycle, otherwise
+            // entries queued by the in-use / queue-full skip points stay
+            // leaked indefinitely whenever the cache is under budget
+            // (the common case). See Codex r10 P2.
+            if !expired.is_empty() {
+                tracing::debug!(
+                    expired_count = expired.len(),
+                    "GET subscription cache sweep found expired entries"
+                );
             }
 
-            tracing::debug!(
-                expired_count = expired.len(),
-                "GET subscription cache sweep found expired entries"
-            );
+            // Reclaim on-disk storage for the expired contracts so the hosting
+            // budget is a real disk bound. The sweep task only holds an
+            // `Arc<Ring>`; reach the `OpManager` the same way
+            // `recover_orphaned_subscriptions` does, via the weak back-reference.
+            // `reclaim_evicted_contract` re-checks the subscription gate per
+            // key before emitting the eviction event.
+            let op_manager = ring.upgrade_op_manager();
+            if op_manager.is_none() {
+                // The weak back-reference is dropped only during node shutdown;
+                // surface the skipped reclamation so an unexpected `None` (and
+                // the resulting on-disk leak for this cycle) is observable.
+                tracing::debug!(
+                    expired_count = expired.len(),
+                    "OpManager unavailable during GET subscription sweep — \
+                     on-disk reclamation skipped for the expired contracts this cycle"
+                );
+            }
 
             // Clean up local subscription state for each expired contract.
             // Note: contracts with client subscriptions are protected from eviction
             // by the should_retain predicate in sweep_expired_hosting().
-            for key in expired {
+            // The `expected_generation` snapshot is captured atomically with
+            // the eviction decision in `HostingCache::record_access` /
+            // `sweep_expired`; it is re-checked at deletion time by
+            // `RuntimePool::remove_contract` to close the re-host race.
+            for (key, expected_generation) in expired {
                 ring.unsubscribe(&key);
                 tracing::info!(
                     %key,
                     "Cleaned up expired hosting subscription from local state"
                 );
+                if let Some(op_manager) = &op_manager {
+                    crate::operations::reclaim_evicted_contract(
+                        op_manager,
+                        key,
+                        expected_generation,
+                    );
+                }
+            }
+
+            // Retry pending reclamations queued by the two skip points
+            // (fair-queue rejection of `EvictContract` and the
+            // `contract_in_use` skip in `RuntimePool::remove_contract`).
+            // The snapshot iterates without holding the DashMap shard
+            // guards. Each retry routes through
+            // `reclaim_evicted_contract`, which re-checks
+            // `contract_in_use` — entries that are still in use stay in
+            // the queue (no event emitted) and will be retried next
+            // cycle. Successful reclamations clear their pending entry
+            // in `RuntimePool::remove_contract`.
+            if let Some(op_manager) = &op_manager {
+                let pending = ring.pending_reclamation_snapshot();
+                if !pending.is_empty() {
+                    tracing::debug!(
+                        pending_count = pending.len(),
+                        "Retrying pending reclamations from previous skipped \
+                         `EvictContract` events"
+                    );
+                    for (key, expected_generation) in pending {
+                        crate::operations::reclaim_evicted_contract(
+                            op_manager,
+                            key,
+                            expected_generation,
+                        );
+                    }
+                }
             }
         }
     }
@@ -1470,6 +1669,7 @@ impl Ring {
         let mut candidates: Vec<PeerKeyLocation> = Vec::new();
         let mut not_ready_fallback: Vec<PeerKeyLocation> = Vec::new();
         let mut skipped_not_ready: usize = 0;
+        let mut skipped_transient: usize = 0;
 
         let connections = self.connection_manager.get_connections_by_location();
         // Sort keys for deterministic iteration order (HashMap iteration is non-deterministic)
@@ -1484,6 +1684,21 @@ impl Ring {
             for conn in sorted_conns {
                 if let Some(addr) = conn.location.socket_addr() {
                     if skip_list.has_element(addr) || !seen.insert(addr) {
+                        continue;
+                    }
+                    // Skip transient peers — these are short-TTL connections used for
+                    // CONNECT coordination, not stable routing targets. PUT/UPDATE
+                    // already exclude them via `ConnectionManager::routing_candidates`
+                    // (see connection_manager.rs:1578); previously GET/SUBSCRIBE
+                    // could route through them and waste hops on a forwarder that
+                    // was about to be dropped. Issue #4222 / #3570.
+                    if self.connection_manager.is_transient(addr) {
+                        tracing::debug!(
+                            %addr,
+                            target_location = %target_location.as_f64(),
+                            "k_closest: skipping transient peer"
+                        );
+                        skipped_transient += 1;
                         continue;
                     }
                     // Skip peers that haven't advertised readiness, but collect them
@@ -1518,6 +1733,22 @@ impl Ring {
             candidates = not_ready_fallback;
         }
 
+        // If the entire connection set was filtered out and transients carried
+        // weight in that filtering, warn the operator. There is no transient
+        // fallback by design — transient peers are short-TTL coordination slots
+        // and routing through them just wastes hops — but a sustained
+        // empty-candidate state means the local node has no viable routing
+        // options for this hop, which is operator-visible information that
+        // would otherwise only surface as an `EmptyRing` higher up.
+        if candidates.is_empty() && skipped_transient > 0 {
+            tracing::warn!(
+                skipped_transient,
+                target_location = %target_location.as_f64(),
+                "k_closest: no viable peers — all eligible connections were transient \
+                 (no fallback by design; routing will fail this hop)"
+            );
+        }
+
         // Sort candidates for deterministic input to select_k_best_peers
         candidates.sort();
 
@@ -1548,6 +1779,7 @@ impl Ring {
             target_location = %target_location.as_f64(),
             candidates_found = selected.len(),
             skipped_not_ready,
+            skipped_transient,
             "k_closest_potentially_hosting result"
         );
 
@@ -1621,8 +1853,27 @@ impl Ring {
     // ==================== Downstream Subscriber Tracking ====================
 
     pub fn add_downstream_subscriber(&self, contract: &ContractKey, peer: PeerKey) -> bool {
-        self.hosting_manager
-            .add_downstream_subscriber(contract, peer)
+        let outcome = self
+            .hosting_manager
+            .add_downstream_subscriber(contract, peer);
+        // Sybil resistance: count demand on NewAdd only. A peer that
+        // keeps renewing its subscription every few minutes would
+        // otherwise pad `benefit_score` by FORWARDED_DEMAND_WEIGHT
+        // per renewal — equivalent to N distinct subscribers from a
+        // single rotating peer over an hour. Renewals must NOT
+        // register as fresh demand. Forwarded weight (0.1, per the
+        // design doc) reflects that peer identities are
+        // attacker-rotatable. See `AddSubscriberOutcome`.
+        if matches!(outcome, crate::ring::hosting::AddSubscriberOutcome::NewAdd) {
+            self.governance
+                .ingest_demand(*contract.id(), FORWARDED_DEMAND_WEIGHT);
+        }
+        // Caller-facing bool preserved for backward compat: Rejected
+        // → false; NewAdd or Renewal → true (the peer is tracked).
+        !matches!(
+            outcome,
+            crate::ring::hosting::AddSubscriberOutcome::Rejected
+        )
     }
 
     #[allow(dead_code)] // Only used in tests
@@ -1638,6 +1889,84 @@ impl Ring {
 
     pub fn has_downstream_subscribers(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.has_downstream_subscribers(contract)
+    }
+
+    /// Whether something still depends on this node hosting `contract` — a
+    /// live local client subscription or a downstream peer subscriber.
+    ///
+    /// Used to gate hosting-cache eviction reclamation: a contract that is in
+    /// use must not have its on-disk state/code deleted. See
+    /// `HostingManager::contract_in_use` for why an active upstream network
+    /// subscription alone does NOT make the contract in-use (the renewal
+    /// machinery would refresh the lease unboundedly).
+    pub(crate) fn contract_in_use(&self, contract: &ContractKey) -> bool {
+        self.hosting_manager.contract_in_use(contract)
+    }
+
+    /// Single helper for every state-write chokepoint. Does the three
+    /// things a chokepoint MUST do, in order:
+    ///
+    /// 1. Bump the per-contract write generation (closes the
+    ///    `EvictContract` re-host race — see
+    ///    `HostingManager::state_generation`).
+    /// 2. Refresh the hosting-cache snapshot of that generation so
+    ///    already-hosted contracts don't leak on eviction after this
+    ///    write — see `HostingCache::refresh_entry_generation`.
+    /// 3. Report `state_size` bytes against this contract on the
+    ///    `StateBytesWritten` axis of the topology meter, feeding the
+    ///    governance scoring layer (see `crate::governance`).
+    ///
+    /// Every state-write chokepoint in the executor MUST go through
+    /// this helper, NOT call the three primitives by hand. The
+    /// "manually-mirrored side effects after a task-per-tx migration"
+    /// pattern in `.claude/rules/bug-prevention-patterns.md` lists this
+    /// exact failure mode: one site drops the report and governance
+    /// silently undercounts that path for months before anyone notices.
+    pub(crate) fn commit_state_write(&self, contract: &ContractKey, state_size: usize) {
+        let new_gen = self.hosting_manager.bump_state_generation(contract);
+        self.hosting_manager
+            .refresh_cache_generation(contract, new_gen);
+        self.report_contract_resource_usage(
+            *contract.id(),
+            crate::topology::meter::ResourceType::StateBytesWritten,
+            state_size as f64,
+        );
+    }
+
+    /// Read the current state-write generation for `contract` (0 if never written).
+    pub(crate) fn state_generation(&self, contract: &ContractKey) -> u64 {
+        self.hosting_manager.state_generation(contract)
+    }
+
+    /// Forget the state-write generation entry for `contract` after a
+    /// successful disk reclamation. Keeps the generation map bounded.
+    pub(crate) fn forget_state_generation(&self, contract: &ContractKey) {
+        self.hosting_manager.forget_state_generation(contract)
+    }
+
+    /// Add `contract` to the pending-reclamation retry queue with the
+    /// captured `expected_generation`. Called from the two skip points
+    /// that drop an `EvictContract` event before it can complete (fair
+    /// queue rejection, `contract_in_use` skip in `RuntimePool::remove_contract`).
+    /// See `HostingManager::pending_reclamation_add` for the queue's
+    /// invariants and how the periodic sweep retries entries.
+    pub(crate) fn pending_reclamation_add(&self, contract: ContractKey, expected_generation: u64) {
+        self.hosting_manager
+            .pending_reclamation_add(contract, expected_generation)
+    }
+
+    /// Remove `contract` from the pending-reclamation retry queue after
+    /// a successful disk reclamation. See
+    /// `HostingManager::pending_reclamation_remove`.
+    pub(crate) fn pending_reclamation_remove(&self, contract: &ContractKey) {
+        self.hosting_manager.pending_reclamation_remove(contract)
+    }
+
+    /// Snapshot the pending-reclamation queue for the periodic sweep
+    /// to iterate without holding any DashMap shard guard. See
+    /// `HostingManager::pending_reclamation_snapshot`.
+    pub(crate) fn pending_reclamation_snapshot(&self) -> Vec<(ContractKey, u64)> {
+        self.hosting_manager.pending_reclamation_snapshot()
     }
 
     pub fn expire_stale_downstream_subscribers(&self) -> Vec<(ContractKey, usize)> {
@@ -1677,8 +2006,20 @@ impl Ring {
         instance_id: &ContractInstanceId,
         client_id: crate::client_events::ClientId,
     ) -> AddClientSubscriptionResult {
-        self.hosting_manager
-            .add_client_subscription(instance_id, client_id)
+        let result = self
+            .hosting_manager
+            .add_client_subscription(instance_id, client_id);
+        // Local client subscription = strong demand signal. Full
+        // weight: this is our own user telling us they care about
+        // this contract, harder to fake than a peer-side signal.
+        // Gated on `is_new_for_client` so an idempotent re-subscribe
+        // call (same client + same contract) doesn't pad demand —
+        // see `AddClientSubscriptionResult::is_new_for_client`.
+        if result.is_new_for_client {
+            self.governance
+                .ingest_demand(*instance_id, LOCAL_DEMAND_WEIGHT);
+        }
+        result
     }
 
     /// Remove a client from all its subscriptions (used when client disconnects).
@@ -1722,12 +2063,233 @@ impl Ring {
         self.hosting_manager.dashboard_subscription_snapshot()
     }
 
+    /// Snapshot of per-contract governance state for the local-peer
+    /// dashboard. Reads directly from the canonical `GovernanceManager`
+    /// state — no mirror, no cache, no derived recomputation. If a
+    /// state appears here it's because the manager computed it from
+    /// real meter samples and real subscription events.
+    pub fn dashboard_governance_snapshot(&self) -> crate::node::network_status::GovernanceSnapshot {
+        use crate::contract::governance as gov;
+        use crate::node::network_status as ns;
+
+        let now = self.time_source.now();
+        let mode = match self.governance.mode() {
+            gov::GovernanceMode::Off => ns::GovernanceModeSnapshot::Off,
+            gov::GovernanceMode::DryRun => ns::GovernanceModeSnapshot::DryRun,
+            gov::GovernanceMode::Enforce => ns::GovernanceModeSnapshot::Enforce,
+        };
+
+        let map_state = |s: gov::GovernanceState| match s {
+            gov::GovernanceState::Normal => ns::GovernanceStateSnapshot::Normal,
+            gov::GovernanceState::Borderline => ns::GovernanceStateSnapshot::Borderline,
+            gov::GovernanceState::WouldEvict => ns::GovernanceStateSnapshot::WouldEvict,
+            gov::GovernanceState::Evicted => ns::GovernanceStateSnapshot::Evicted,
+            gov::GovernanceState::Banned => ns::GovernanceStateSnapshot::Banned,
+        };
+        let map_reason = |r: gov::TransitionReason| match r {
+            gov::TransitionReason::FirstSeen => ns::GovernanceTransitionReasonSnapshot::FirstSeen,
+            gov::TransitionReason::BorderlineEntered => {
+                ns::GovernanceTransitionReasonSnapshot::BorderlineEntered
+            }
+            gov::TransitionReason::ThresholdCrossed => {
+                ns::GovernanceTransitionReasonSnapshot::ThresholdCrossed
+            }
+            gov::TransitionReason::Evicted => ns::GovernanceTransitionReasonSnapshot::Evicted,
+            gov::TransitionReason::BanTriggered => {
+                ns::GovernanceTransitionReasonSnapshot::BanTriggered
+            }
+            gov::TransitionReason::Recovered => ns::GovernanceTransitionReasonSnapshot::Recovered,
+            gov::TransitionReason::BanLifted => ns::GovernanceTransitionReasonSnapshot::BanLifted,
+        };
+
+        // Only iterate flagged contracts for the dashboard mirror —
+        // the renderer hides Normal anyway. Avoids cloning thousands of
+        // entries per refresh on a busy node. See `iter_flagged_scores`.
+        let contracts: Vec<ns::ContractGovernanceEntry> = self
+            .governance
+            .iter_flagged_scores()
+            .into_iter()
+            .map(|(id, score)| {
+                let instance_id = id.to_string();
+                let instance_id_short = if instance_id.chars().count() > 12 {
+                    let trunc: String = instance_id.chars().take(12).collect();
+                    format!("{trunc}...")
+                } else {
+                    instance_id.clone()
+                };
+                let history = score
+                    .history
+                    .iter()
+                    .map(|t| ns::GovernanceTransitionEntry {
+                        secs_ago: now.saturating_duration_since(t.at).as_secs(),
+                        from: map_state(t.from),
+                        to: map_state(t.to),
+                        reason: map_reason(t.reason),
+                    })
+                    .collect();
+                ns::ContractGovernanceEntry {
+                    instance_id,
+                    instance_id_short,
+                    state: map_state(score.state),
+                    cost_used: score.cost_used,
+                    benefit_score: score.benefit_score,
+                    log_ratio: score.log_ratio(),
+                    age_secs: now.saturating_duration_since(score.first_seen).as_secs(),
+                    last_transition_secs_ago: now
+                        .saturating_duration_since(score.last_transition)
+                        .as_secs(),
+                    history,
+                }
+            })
+            .collect();
+
+        let norms = match self.governance.latest_norms() {
+            Some(n) => ns::NetworkNorms {
+                median_log_ratio: n.median_log_ratio,
+                mad: n.mad,
+                threshold: n.threshold,
+                sample_size: n.sample_size,
+                capacity_ceiling_binding: n.capacity_ceiling_binding,
+                skip_reason: n.skip_reason.map(|r| match r {
+                    crate::governance::SkipReason::InsufficientSamples => {
+                        ns::GovernanceSkipReasonSnapshot::InsufficientSamples
+                    }
+                    crate::governance::SkipReason::MadCollapsed => {
+                        ns::GovernanceSkipReasonSnapshot::MadCollapsed
+                    }
+                    crate::governance::SkipReason::NoExtractableRatios => {
+                        ns::GovernanceSkipReasonSnapshot::NoExtractableRatios
+                    }
+                }),
+            },
+            None => ns::NetworkNorms::default(),
+        };
+
+        ns::GovernanceSnapshot {
+            mode,
+            contracts,
+            norms,
+        }
+    }
+
     /// Record that a state update was observed for `contract`.
     /// No-op if the contract is not currently subscribed.
     pub fn record_contract_update(&self, contract: &ContractKey) {
         self.hosting_manager.record_contract_update(contract)
     }
 
+    /// True if `contract` has been flagged as violating a CRDT invariant
+    /// (e.g. non-idempotent `update_state`). Callers on the broadcast path
+    /// must skip emission when this returns true to prevent the broken
+    /// contract from generating a propagation storm.
+    pub fn is_contract_broken(&self, contract: &ContractKey) -> bool {
+        self.broken_invariants.is_broken(contract.id())
+    }
+
+    /// Mark `contract` as broken with `kind`. Idempotent. See
+    /// [`broken_invariants`] module docs.
+    pub(crate) fn record_broken_invariant(&self, contract: ContractKey, kind: BrokenInvariant) {
+        self.broken_invariants.record(*contract.id(), kind);
+    }
+
+    /// Wire persistent storage for the broken-invariants tracker. Called
+    /// once at executor wiring time.
+    pub(crate) fn set_broken_invariants_storage(
+        &self,
+        storage: crate::contract::storages::Storage,
+    ) {
+        self.broken_invariants.set_storage(storage);
+    }
+
+    /// Report a per-contract resource sample to the topology meter.
+    ///
+    /// Lightweight non-blocking write: takes the topology manager's
+    /// write lock briefly to insert into the running-average store.
+    /// Safe to call from executor commit paths — does NOT use channels
+    /// (cf. `.claude/rules/channel-safety.md`); the May 2026 deadlock
+    /// pattern (`#4145`) is not reachable through this surface.
+    ///
+    /// Used by `Executor::commit_state_update` to attribute state-write
+    /// bytes to a contract, and (in follow-up work) by the WASM call
+    /// wrappers for CPU/fuel and the broadcast dispatcher for fanout
+    /// cost. Per-contract attribution lets the shared governance
+    /// outlier-detection module (`crate::governance`) score contracts
+    /// against the network's observed cost-per-benefit distribution.
+    pub(crate) fn report_contract_resource_usage(
+        &self,
+        contract_id: freenet_stdlib::prelude::ContractInstanceId,
+        resource: crate::topology::meter::ResourceType,
+        amount: f64,
+    ) {
+        // Use the injectable `TimeSource` (rather than `Instant::now()`
+        // directly) so deterministic simulation tests can drive this
+        // path. Per `.claude/rules/code-style.md` "Need current time?
+        // → USE: TimeSource trait" — the executor commit path will reach
+        // here from inside simulated nodes once the governance scoring
+        // integration tests land, and reading wall-clock there would
+        // break determinism.
+        let now = self.time_source.now();
+        let mut topo = self.connection_manager.topology_manager.write();
+        topo.report_resource_usage(
+            &crate::topology::meter::AttributionSource::Contract(contract_id),
+            resource,
+            amount,
+            now,
+        );
+        drop(topo);
+        // Also feed the governance manager — the meter stores rates
+        // for telemetry/the dashboard's bandwidth view, while the
+        // governance manager aggregates these samples into the
+        // cost/benefit ratio that drives state. Both ingest in
+        // parallel from this one entry point so there's no risk of
+        // them diverging (governance reading from a stale meter
+        // snapshot, etc).
+        //
+        // Per-resource weight: identity (1.0) for now. Future tuning
+        // could weight CPU-µs and fanout-cost higher than
+        // state-bytes, but until we have live data to calibrate
+        // against, unit weights match what the design doc proposed
+        // as a starting point.
+        let weight = resource_weight(resource);
+        self.governance.ingest_cost(contract_id, amount * weight);
+    }
+
+    // Note: there is intentionally no standalone `ingest_contract_demand`
+    // method here. Demand is ingested through `add_client_subscription` /
+    // `add_downstream_subscriber` (the two production registration sites)
+    // and gated on `is_new_for_client` / `AddSubscriberOutcome::NewAdd`
+    // there. Adding a bare entry point would let a future caller bypass
+    // the Sybil-resistance gate — that exact concern was flagged by
+    // skeptical-reviewer of #4270 as a latent foot-gun.
+
+    /// Run one governance reaper tick. Caller (the periodic
+    /// `governance_reaper_loop` task) is expected to feed
+    /// `tick_interval` = wall-time since the previous tick for decay.
+    /// Returns the `ReaperTickResult` for the caller to act on (emit
+    /// `EvictContract` events for actionable decisions, log dry-run
+    /// decisions, surface stats on the dashboard).
+    pub(crate) fn governance_tick(
+        &self,
+        tick_interval: Duration,
+    ) -> crate::contract::governance::ReaperTickResult {
+        self.governance.tick(tick_interval)
+    }
+}
+
+/// Per-resource weight for cost aggregation. Defaults to 1.0 for all
+/// dimensions so total cost = simple sum of meter samples. Hooks here
+/// for future tuning if any one dimension proves to dominate the
+/// signal-to-noise ratio.
+fn resource_weight(resource: crate::topology::meter::ResourceType) -> f64 {
+    use crate::topology::meter::ResourceType::*;
+    match resource {
+        InboundBandwidthBytes | OutboundBandwidthBytes => 1.0,
+        ExecCpuMicros | ExecFuelUnits => 1.0,
+        StateBytesWritten | BroadcastFanoutCost => 1.0,
+    }
+}
+
+impl Ring {
     // ==================== Subscription Retry Spam Prevention ====================
 
     /// Check if a subscription request can be made for a contract.
@@ -1770,18 +2332,22 @@ impl Ring {
 
     /// Sweep for expired entries in the hosting cache.
     ///
-    /// Returns contracts evicted from this cache. Contracts with client
-    /// subscriptions are protected from eviction.
-    pub fn sweep_expired_hosting(&self) -> Vec<ContractKey> {
+    /// Returns `(ContractKey, write_generation)` pairs for contracts
+    /// evicted from this cache. Contracts with client subscriptions
+    /// (or downstream/network subscribers) are protected from eviction.
+    /// The generation snapshot is carried through `EvictContract` so the
+    /// deletion-time guard can detect a re-host race.
+    pub fn sweep_expired_hosting(&self) -> Vec<(ContractKey, u64)> {
         self.hosting_manager.sweep_expired_hosting()
     }
 
     // ==================== Legacy GET Auto-Subscription (delegating to hosting cache) ====================
     /// Sweep for expired entries (delegated to hosting cache).
     ///
-    /// Returns contracts evicted from the cache. Contracts with client
-    /// subscriptions are protected from eviction.
-    pub fn sweep_expired_get_subscriptions(&self) -> Vec<ContractKey> {
+    /// Returns `(ContractKey, write_generation)` pairs for contracts
+    /// evicted from the cache. Contracts with client subscriptions are
+    /// protected from eviction.
+    pub fn sweep_expired_get_subscriptions(&self) -> Vec<(ContractKey, u64)> {
         // Delegate to hosting cache
         self.sweep_expired_hosting()
     }
@@ -2904,6 +3470,97 @@ fn deferred_swap_drops_to_execute(
 #[inline]
 fn classify_suspend_jump(boot_elapsed: Duration, mono_elapsed: Duration) -> Duration {
     boot_elapsed.saturating_sub(mono_elapsed)
+}
+
+#[cfg(test)]
+mod k_closest_source_tests {
+    //! Source-scrape pin tests for `Ring::k_closest_potentially_hosting`.
+    //!
+    //! Constructing a real `Ring` for behavioral tests requires significant
+    //! scaffolding (NodeConfig, EventLoopNotificationsSender, NetEventRegister,
+    //! BackgroundTaskMonitor) that does not currently exist in the test suite.
+    //! These tests instead scrape the production source to ensure load-bearing
+    //! filter invariants stay wired in — a future refactor that silently drops
+    //! the transient filter (issue #4222) or the readiness fallback should fail
+    //! CI rather than silently regress production routing behavior.
+    //!
+    //! Behavioral coverage exists transitively via the simulation_integration
+    //! tests; a dedicated integration test for the transient filter is filed
+    //! as a follow-up to the Ring test-scaffolding work.
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("ring.rs");
+        // ring.rs has inline `#[cfg(test)]` annotations on individual const
+        // declarations inside `connection_maintenance` (lines ~1894–1940), so
+        // a plain `find("#[cfg(test)]")` would cut off the file mid-impl and
+        // miss the function we want to scrape. Anchor on the first *top-level*
+        // test module declaration instead.
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("ring.rs must have a top-level #[cfg(test)] mod section");
+        &FULL[..cutoff]
+    }
+
+    fn extract_fn_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
+        let start = source
+            .find(signature_prefix)
+            .unwrap_or_else(|| panic!("could not find {signature_prefix}"));
+        let brace = source[start..].find('{').expect("fn sig must have body");
+        let body_start = start + brace + 1;
+        let bytes = source.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unbalanced braces while extracting {signature_prefix}");
+    }
+
+    /// Issue #4222: `k_closest_potentially_hosting` must skip transient peers
+    /// so GET/SUBSCRIBE doesn't route through about-to-be-dropped connections.
+    /// The PUT/UPDATE path already filters them via `routing_candidates`; this
+    /// pin makes sure the GET path stays in sync.
+    #[test]
+    fn k_closest_potentially_hosting_filters_transient_peers() {
+        let src = production_source();
+        let body = extract_fn_body(src, "pub fn k_closest_potentially_hosting<K>(");
+        assert!(
+            body.contains("is_transient(addr)"),
+            "k_closest_potentially_hosting must call is_transient(addr) on each \
+             candidate connection. If the filter was deliberately removed, also \
+             update .claude/rules/ring.md (which documents the filter rule) and \
+             this test. Issue #4222 / #3570."
+        );
+        assert!(
+            body.contains("skipped_transient"),
+            "k_closest_potentially_hosting must surface a skipped_transient \
+             counter so operators can see when the filter is removing peers."
+        );
+    }
+
+    /// The existing readiness fallback must remain — without it, a node whose
+    /// peers haven't yet sent ReadyState would fail every GET with EmptyRing.
+    /// Pinning it here so a future refactor of the filter chain can't silently
+    /// drop the fallback.
+    #[test]
+    fn k_closest_potentially_hosting_preserves_not_ready_fallback() {
+        let src = production_source();
+        let body = extract_fn_body(src, "pub fn k_closest_potentially_hosting<K>(");
+        assert!(
+            body.contains("not_ready_fallback"),
+            "k_closest_potentially_hosting must keep the not-yet-ready peer \
+             fallback so cold-start nodes don't fail every GET with EmptyRing."
+        );
+    }
 }
 
 #[cfg(test)]

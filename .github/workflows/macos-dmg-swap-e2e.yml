@@ -1,7 +1,8 @@
 name: macOS DMG-swap E2E
 
-# End-to-end test for the macOS bundle-swap updater (scripts/macos-bundle-
-# updater.sh + surrounding logic in crates/core/src/bin/commands/update.rs).
+# End-to-end test for the macOS bundle-swap updater (crates/core/scripts/
+# macos-bundle-updater.sh + surrounding logic in
+# crates/core/src/bin/commands/update.rs).
 #
 # Why a separate workflow: the DMG-swap path is invisible to every other
 # CI job — the mechanics (process-wait + atomic mv + LaunchServices

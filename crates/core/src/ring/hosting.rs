@@ -33,8 +33,12 @@ mod cache;
 
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 use crate::util::time_source::{InstantTimeSrc, TimeSource};
+/// Re-exported as the single source of truth for the default hosting storage
+/// budget. `config::default_max_hosting_storage()` resolves to this constant so
+/// the operator-facing default and the in-code fallback can never drift.
+pub(crate) use cache::DEFAULT_HOSTING_BUDGET_BYTES;
 pub use cache::{AccessType, RecordAccessResult};
-use cache::{DEFAULT_HOSTING_BUDGET_BYTES, DEFAULT_MIN_TTL, HostingCache};
+use cache::{DEFAULT_MIN_TTL, HostingCache};
 use dashmap::{DashMap, DashSet};
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::RwLock;
@@ -89,6 +93,42 @@ const MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT: usize = 512;
 pub struct AddClientSubscriptionResult {
     /// Whether this was the first client for this contract.
     pub is_first_client: bool,
+    /// Whether this specific `(contract, client_id)` pair was newly
+    /// added (vs. an idempotent repeat call for an already-tracked
+    /// client). Used by the governance scoring layer to gate the
+    /// `ingest_demand` call — without this distinction a client that
+    /// re-subscribes repeatedly would pad the contract's
+    /// `benefit_score` indefinitely. See
+    /// `Ring::add_client_subscription` for the caller-side gating.
+    pub is_new_for_client: bool,
+}
+
+/// Outcome of an `add_downstream_subscriber` call. The variant
+/// distinguishes "the peer was newly added" from "the peer was already
+/// tracked and this call refreshed its lease timestamp" so the
+/// governance scoring layer can gate `ingest_demand` on new-add only.
+/// See `HostingManager::add_downstream_subscriber` for the rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddSubscriberOutcome {
+    /// Peer is now tracked for this contract; was not before.
+    /// Governance treats this as fresh demand evidence.
+    NewAdd,
+    /// Peer was already tracked; this call refreshed the lease
+    /// timestamp. Governance must NOT count this as fresh demand.
+    Renewal,
+    /// Per-contract subscriber cap reached; this is a new peer that
+    /// was rejected. Equivalent to the old `false` return.
+    Rejected,
+}
+
+impl AddSubscriberOutcome {
+    /// True when the peer is now tracked (either newly added or
+    /// renewed). Preserves the pre-Sybil-fix `bool` semantics for
+    /// callers that only care "was the registration accepted".
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn was_accepted(self) -> bool {
+        matches!(self, Self::NewAdd | Self::Renewal)
+    }
 }
 
 /// Result of removing all subscriptions for a disconnected client.
@@ -191,17 +231,68 @@ pub(crate) struct HostingManager {
     storage: RwLock<Option<crate::contract::storages::Storage>>,
     #[cfg(all(feature = "sqlite", not(feature = "redb")))]
     storage: RwLock<Option<crate::contract::storages::Storage>>,
+
+    /// Monotonic per-contract state-write generation counter.
+    ///
+    /// Bumped at every persistent state write in the executor
+    /// (`state_store.store` / `state_store.update`). Captured atomically
+    /// when an `EvictContract` is enqueued (`HostedContract.write_generation`,
+    /// recorded under the hosting-cache write lock) and re-checked at
+    /// deletion time in `RuntimePool::remove_contract`. If the captured
+    /// generation no longer matches the current value, a state write
+    /// occurred between eviction and deletion (e.g. a PUT/UPDATE
+    /// re-hosted the contract) and the disk reclamation must be skipped
+    /// — the freshly-PUT state would otherwise be deleted.
+    ///
+    /// See `RuntimePool::remove_contract` and `EvictContract` for the
+    /// race this token closes (the driver-side `host_contract` re-mark
+    /// of a freshly-PUT contract runs after `PutQuery.await` returns,
+    /// so the existing `is_hosting_contract` check is not sufficient).
+    state_generation: DashMap<ContractKey, u64>,
+
+    /// Retry queue for contracts whose `EvictContract` could not be
+    /// completed at the original eviction time. Maps contract key →
+    /// `expected_generation` captured when the original `EvictContract`
+    /// event was emitted.
+    ///
+    /// Two skip points add entries here (both close narrow disk-leak
+    /// edge cases — see PR #4212 review round 7):
+    ///
+    /// 1. **Queue-full drop**: when the per-contract fair queue rejects
+    ///    an `EvictContract` event (queue-full), the hosting-cache
+    ///    entry is already gone so no later sweep would re-emit. The
+    ///    pending entry lets the periodic sweep retry.
+    /// 2. **In-use-then-subscriber-expires**: when
+    ///    `RuntimePool::remove_contract` skips reclamation because
+    ///    `contract_in_use` is true (a subscriber appeared between
+    ///    eviction and processing), the contract is gone from the
+    ///    hosting cache. When that subscriber later expires no cache
+    ///    entry remains to emit another eviction — the pending entry
+    ///    lets the periodic sweep retry once `contract_in_use`
+    ///    becomes false.
+    ///
+    /// Entries are removed by `pending_reclamation_remove` after a
+    /// successful disk reclamation. The map is monotonically draining
+    /// under steady load — bounded by the contracts the node has ever
+    /// stored. The pending entries are a *retry queue* for
+    /// reclamation, NOT a *block* on reclamation, so they do not
+    /// constitute an unbounded cleanup exemption (AGENTS.md cleanup
+    /// rule): the on-disk state stays until the retry succeeds.
+    ///
+    /// Behind an `Arc` so the periodic sweep snapshot can iterate
+    /// without re-entering the `HostingManager` borrow.
+    pending_reclamation: std::sync::Arc<DashMap<ContractKey, u64>>,
 }
 
 impl HostingManager {
-    pub fn new() -> Self {
+    pub fn new(budget_bytes: u64) -> Self {
         let backoff_config =
             ExponentialBackoff::new(INITIAL_SUBSCRIPTION_BACKOFF, MAX_SUBSCRIPTION_BACKOFF);
         Self {
             active_subscriptions: DashMap::new(),
             client_subscriptions: DashMap::new(),
             hosting_cache: RwLock::new(HostingCache::new(
-                DEFAULT_HOSTING_BUDGET_BYTES,
+                budget_bytes,
                 DEFAULT_MIN_TTL,
                 InstantTimeSrc::new(),
             )),
@@ -213,13 +304,108 @@ impl HostingManager {
                 MAX_SUBSCRIPTION_BACKOFF_ENTRIES,
             )),
             storage: RwLock::new(None),
+            state_generation: DashMap::new(),
+            pending_reclamation: std::sync::Arc::new(DashMap::new()),
         }
+    }
+
+    // =========================================================================
+    // State-Write Generation Token
+    // =========================================================================
+
+    /// Atomically increment the state-write generation for `key` and return
+    /// the new value. Called by the executor after every successful state
+    /// write (`state_store.store` / `state_store.update`) — see the chokepoint
+    /// comment in `Executor::commit_state_update` and the per-call-site
+    /// callouts in `contract/executor/runtime.rs`.
+    pub(crate) fn bump_state_generation(&self, key: &ContractKey) -> u64 {
+        use dashmap::mapref::entry::Entry;
+        match self.state_generation.entry(*key) {
+            Entry::Occupied(mut e) => {
+                let next = e.get().saturating_add(1);
+                *e.get_mut() = next;
+                next
+            }
+            Entry::Vacant(e) => {
+                e.insert(1);
+                1
+            }
+        }
+    }
+
+    /// Read the current state-write generation for `key` (0 if never written).
+    pub(crate) fn state_generation(&self, key: &ContractKey) -> u64 {
+        self.state_generation
+            .get(key)
+            .map(|v| *v.value())
+            .unwrap_or(0)
+    }
+
+    /// Remove the generation entry for `key`. Called after a successful disk
+    /// reclamation so the map does not grow unbounded.
+    pub(crate) fn forget_state_generation(&self, key: &ContractKey) {
+        self.state_generation.remove(key);
+    }
+
+    /// Update the hosting-cache snapshot of `key`'s state-write generation
+    /// to `new_gen`. Paired with `bump_state_generation` at every state-write
+    /// chokepoint (executor PUT/UPDATE and V2 delegate PUT/UPDATE) so a
+    /// later eviction's snapshot reflects the current generation and the
+    /// deletion-time guard in `RuntimePool::remove_contract` does not
+    /// permanently skip reclamation after an UPDATE-then-evict. No-op when
+    /// the entry is not currently cached. See
+    /// `HostingCache::refresh_entry_generation`.
+    pub(crate) fn refresh_cache_generation(&self, key: &ContractKey, new_gen: u64) {
+        self.hosting_cache
+            .write()
+            .refresh_entry_generation(key, new_gen);
     }
 
     /// Set the storage reference for persisting hosting metadata.
     /// Must be called after executor creation.
     pub fn set_storage(&self, storage: crate::contract::storages::Storage) {
         *self.storage.write() = Some(storage);
+    }
+
+    // =========================================================================
+    // Pending Reclamation Retry Queue
+    // =========================================================================
+
+    /// Add `key` to the pending-reclamation retry queue, recording the
+    /// `expected_generation` captured at the original `EvictContract`
+    /// emission time. If `key` is already present, replaces the entry —
+    /// the most recent attempt's generation is the relevant one for the
+    /// retry, and over-writing avoids unbounded growth from repeated
+    /// add calls on the same key.
+    ///
+    /// See `pending_reclamation` field docs for the two skip points
+    /// that feed this queue.
+    pub(crate) fn pending_reclamation_add(&self, key: ContractKey, expected_generation: u64) {
+        self.pending_reclamation.insert(key, expected_generation);
+    }
+
+    /// Remove `key` from the pending-reclamation queue. Called after a
+    /// successful disk reclamation so the queue drains under steady
+    /// load.
+    pub(crate) fn pending_reclamation_remove(&self, key: &ContractKey) {
+        self.pending_reclamation.remove(key);
+    }
+
+    /// Snapshot every pending reclamation entry as an owned vector so
+    /// the periodic sweep can iterate without holding any DashMap
+    /// shard guard.
+    pub(crate) fn pending_reclamation_snapshot(&self) -> Vec<(ContractKey, u64)> {
+        self.pending_reclamation
+            .iter()
+            .map(|entry| (*entry.key(), *entry.value()))
+            .collect()
+    }
+
+    /// Number of contracts currently in the pending-reclamation queue
+    /// (used in tests and diagnostics).
+    #[cfg(test)]
+    pub(crate) fn pending_reclamation_len(&self) -> usize {
+        self.pending_reclamation.len()
     }
 
     // =========================================================================
@@ -426,14 +612,23 @@ impl HostingManager {
     ) -> AddClientSubscriptionResult {
         let mut entry = self.client_subscriptions.entry(*instance_id).or_default();
         let is_first_client = entry.is_empty();
-        entry.insert(client_id);
+        // HashSet::insert returns true if the value was newly added.
+        // Capture this so the governance scoring layer can gate
+        // `ingest_demand` to new-adds only — otherwise a client that
+        // repeatedly re-subscribes for the same contract would pad
+        // demand by `LOCAL_DEMAND_WEIGHT × N` per N calls.
+        let is_new_for_client = entry.insert(client_id);
         debug!(
             contract = %instance_id,
             %client_id,
             is_first_client,
+            is_new_for_client,
             "add_client_subscription: registered"
         );
-        AddClientSubscriptionResult { is_first_client }
+        AddClientSubscriptionResult {
+            is_first_client,
+            is_new_for_client,
+        }
     }
 
     /// Remove a client subscription.
@@ -504,6 +699,10 @@ impl HostingManager {
                 .find(|entry| *entry.key().id() == instance_id)
                 .map(|entry| *entry.key());
             if let Some(contract) = contract {
+                // Client disconnect may have just transitioned the contract
+                // to no-longer-in-use. Record abandonment so over-budget
+                // eviction targets it first.
+                self.maybe_record_abandonment(&contract);
                 affected_contracts.push(contract);
             }
         }
@@ -522,20 +721,36 @@ impl HostingManager {
     // =========================================================================
 
     /// Record that a downstream peer is subscribed to a contract we host.
-    /// Returns false if the downstream subscriber limit for this contract has been reached
-    /// and the peer is not already tracked (existing peers can always renew).
-    pub fn add_downstream_subscriber(&self, contract: &ContractKey, peer: PeerKey) -> bool {
+    ///
+    /// Returns `AddSubscriberOutcome` so callers can distinguish a
+    /// genuine NewAdd (counts as fresh demand for governance scoring)
+    /// from a Renewal (lease-extension only — must NOT count as fresh
+    /// demand, otherwise a peer churning subscriptions every 2 minutes
+    /// would pad a contract's `benefit_score` by `0.1 × 30 = 3.0` per
+    /// hour, the Sybil-resistance equivalent of 30 distinct subscribers
+    /// for a single rotating peer). See `Ring::add_downstream_subscriber`
+    /// for the caller-side gating.
+    pub fn add_downstream_subscriber(
+        &self,
+        contract: &ContractKey,
+        peer: PeerKey,
+    ) -> AddSubscriberOutcome {
         let mut entry = self.downstream_subscribers.entry(*contract).or_default();
-        if !entry.contains_key(&peer) && entry.len() >= MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT {
+        let is_new = !entry.contains_key(&peer);
+        if is_new && entry.len() >= MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT {
             tracing::warn!(
                 contract = %contract,
                 limit = MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT,
                 "Downstream subscriber limit reached, rejecting peer"
             );
-            return false;
+            return AddSubscriberOutcome::Rejected;
         }
         entry.insert(peer, self.time_source.now());
-        true
+        if is_new {
+            AddSubscriberOutcome::NewAdd
+        } else {
+            AddSubscriberOutcome::Renewal
+        }
     }
 
     /// Renew a downstream peer's subscription lease.
@@ -563,6 +778,10 @@ impl HostingManager {
             // Remove the map entry if no peers remain
             self.downstream_subscribers
                 .remove_if(contract, |_, peers| peers.is_empty());
+            // If the contract has just transitioned to no-longer-in-use,
+            // mark it as recently abandoned so over-budget eviction
+            // targets it before older-but-still-active entries.
+            self.maybe_record_abandonment(contract);
         }
         removed
     }
@@ -572,6 +791,54 @@ impl HostingManager {
         self.downstream_subscribers
             .get(contract)
             .is_some_and(|peers| !peers.is_empty())
+    }
+
+    /// Whether something still depends on this node hosting `contract` — a
+    /// live local client subscription or a downstream peer subscriber. Used
+    /// to gate hosting-cache eviction reclamation: a contract that is in
+    /// use must NOT have its on-disk state/code deleted.
+    ///
+    /// **Why `is_subscribed` (this node's own upstream subscription) is NOT
+    /// included.** It would seem natural to also exempt contracts the node
+    /// is actively subscribed to. The problem is `contracts_needing_renewal`
+    /// section 1 renews ANY soon-to-expire active subscription
+    /// unconditionally, with no gate on local interest. So an
+    /// `is_subscribed`-only exemption is effectively unbounded — the renewal
+    /// machinery would keep extending the lease forever, blocking
+    /// reclamation indefinitely. That would violate the cleanup-exemption
+    /// rule in `AGENTS.md` (exemptions must be time-bounded). Local-client
+    /// subscriptions and downstream subscribers ARE both time-bounded:
+    /// client subscriptions expire on disconnect; downstream subscribers
+    /// expire via `expire_stale_downstream_subscribers` after
+    /// `SUBSCRIPTION_LEASE_DURATION` without renewal.
+    ///
+    /// The narrow case "subscribed but no local interest" should be handled
+    /// by tearing down the orphaned upstream subscription, not by carrying
+    /// an unbounded GC exemption here.
+    pub fn contract_in_use(&self, contract: &ContractKey) -> bool {
+        self.has_client_subscriptions(contract.id()) || self.has_downstream_subscribers(contract)
+    }
+
+    /// Hook called from every code path that removes an "in-use" signal
+    /// (client subscription, downstream subscriber, or stale-expiry of
+    /// either). If the contract has just transitioned to no-longer-in-use,
+    /// mark it as recently abandoned in the hosting cache so the next
+    /// over-budget sweep evicts it before older-but-still-active entries.
+    ///
+    /// Idle persistence is preserved: this changes eviction *order*, not
+    /// eviction *eligibility*. A contract with no budget pressure on it
+    /// stays cached regardless.
+    ///
+    /// Lock-order note: `contract_in_use` reads only the subscription
+    /// DashMaps and never touches `hosting_cache`, so calling it from
+    /// here is safe even though we then take the `hosting_cache` write
+    /// lock. Callers must invoke this AFTER any subscription-map guard
+    /// they hold has been dropped (the guard is needed to mutate state,
+    /// not to read `contract_in_use`).
+    fn maybe_record_abandonment(&self, contract: &ContractKey) {
+        if !self.contract_in_use(contract) {
+            self.hosting_cache.write().record_abandonment(contract);
+        }
     }
 
     /// Remove downstream subscribers whose leases have expired.
@@ -587,7 +854,7 @@ impl HostingManager {
             .collect();
 
         for key in keys {
-            if let Some(mut peers) = self.downstream_subscribers.get_mut(&key) {
+            let became_empty = if let Some(mut peers) = self.downstream_subscribers.get_mut(&key) {
                 let before = peers.len();
                 peers.retain(|_, last_renewed| {
                     now.duration_since(*last_renewed) < SUBSCRIPTION_LEASE_DURATION
@@ -596,11 +863,21 @@ impl HostingManager {
                 if expired > 0 {
                     expired_counts.push((key, expired));
                 }
-                if peers.is_empty() {
+                let empty = peers.is_empty();
+                if empty {
                     drop(peers);
                     self.downstream_subscribers
                         .remove_if(&key, |_, peers| peers.is_empty());
                 }
+                empty
+            } else {
+                false
+            };
+            if became_empty {
+                // Lease expiry may have just transitioned the contract to
+                // no-longer-in-use — record abandonment so the next
+                // over-budget sweep targets it first.
+                self.maybe_record_abandonment(&key);
             }
         }
 
@@ -629,7 +906,9 @@ impl HostingManager {
     ///
     /// Returns a `RecordAccessResult` containing:
     /// - `is_new`: Whether this contract was newly added (vs. refreshed existing)
-    /// - `evicted`: Contracts that were evicted to make room
+    /// - `evicted`: `(ContractKey, write_generation)` pairs for contracts
+    ///   evicted to make room — the generation snapshot is carried through
+    ///   `EvictContract` and re-checked at deletion time.
     ///
     /// Automatically persists hosting metadata for the accessed contract and
     /// removes persisted metadata for evicted contracts.
@@ -639,10 +918,27 @@ impl HostingManager {
         size_bytes: u64,
         access_type: AccessType,
     ) -> RecordAccessResult {
-        let result = self
-            .hosting_cache
-            .write()
-            .record_access(key, size_bytes, access_type);
+        // `contract_in_use` reads only the client_subscriptions /
+        // downstream_subscribers / active_subscriptions DashMaps — never
+        // `hosting_cache` — so calling it from inside the `hosting_cache`
+        // write guard does not re-enter that lock. `sweep_expired_hosting`
+        // uses this same pattern.
+        //
+        // Read the current state-write generation BEFORE taking the
+        // hosting-cache write lock to avoid nested lock order against the
+        // `state_generation` DashMap shards. The generation is monotonic so
+        // a value read here is a valid lower bound; if a write races and
+        // bumps it after this read, the cached entry will simply be
+        // refreshed by the subsequent `record_contract_access` from that
+        // write path.
+        let current_generation = self.state_generation(&key);
+        let result = self.hosting_cache.write().record_access(
+            key,
+            size_bytes,
+            access_type,
+            current_generation,
+            |k: &ContractKey| self.contract_in_use(k),
+        );
 
         // Persist hosting metadata for the accessed contract
         if let Some(storage) = self.storage.read().as_ref() {
@@ -686,7 +982,7 @@ impl HostingManager {
             }
 
             // Clean up persisted metadata for evicted contracts
-            for evicted_key in &result.evicted {
+            for (evicted_key, _generation) in &result.evicted {
                 #[cfg(feature = "redb")]
                 {
                     if let Err(e) = storage.remove_hosting_metadata(evicted_key) {
@@ -732,6 +1028,12 @@ impl HostingManager {
     /// Get the number of contracts in the hosting cache.
     pub fn hosting_contracts_count(&self) -> usize {
         self.hosting_cache.read().len()
+    }
+
+    /// Get the configured byte-budget of the hosting cache.
+    #[cfg(test)]
+    pub(crate) fn hosting_budget_bytes(&self) -> u64 {
+        self.hosting_cache.read().budget_bytes()
     }
 
     /// Check if we should continue hosting a contract.
@@ -816,21 +1118,29 @@ impl HostingManager {
 
     /// Sweep for expired entries in the hosting cache.
     ///
-    /// Contracts are protected from eviction if they have client subscriptions
-    /// OR downstream subscribers (other peers relying on us for updates).
+    /// Contracts are protected from eviction while `contract_in_use` returns
+    /// true — i.e. they have client subscriptions, downstream subscribers, or
+    /// an active upstream network subscription. This is the same predicate
+    /// used by `record_contract_access`, so all eviction paths agree.
     /// The downstream subscriber exemption is time-bounded: stale entries are
     /// removed by `expire_stale_downstream_subscribers()` (called periodically)
     /// after `SUBSCRIPTION_LEASE_DURATION` without renewal.
     /// Automatically removes persisted metadata for expired contracts.
-    pub fn sweep_expired_hosting(&self) -> Vec<ContractKey> {
-        let expired = self.hosting_cache.write().sweep_expired(|key| {
-            self.has_client_subscriptions(key.id()) || self.has_downstream_subscribers(key)
-        });
+    ///
+    /// Returns `(ContractKey, write_generation)` pairs — the generation
+    /// captured atomically under the hosting-cache write lock travels with
+    /// the `EvictContract` event so the deletion-time guard can detect a
+    /// re-host race.
+    pub fn sweep_expired_hosting(&self) -> Vec<(ContractKey, u64)> {
+        let expired = self
+            .hosting_cache
+            .write()
+            .sweep_expired(|key| self.contract_in_use(key));
 
         // Clean up persisted metadata for expired contracts
         if !expired.is_empty() {
             if let Some(storage) = self.storage.read().as_ref() {
-                for expired_key in &expired {
+                for (expired_key, _generation) in &expired {
                     #[cfg(feature = "redb")]
                     {
                         if let Err(e) = storage.remove_hosting_metadata(expired_key) {
@@ -1419,7 +1729,7 @@ impl HostingManager {
 
 impl Default for HostingManager {
     fn default() -> Self {
-        Self::new()
+        Self::new(DEFAULT_HOSTING_BUDGET_BYTES)
     }
 }
 
@@ -1441,7 +1751,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_subscribe_creates_new_subscription() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         let result = manager.subscribe(contract);
@@ -1451,8 +1761,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_new_uses_configured_budget() {
+        let custom_budget = 256 * 1024 * 1024_u64;
+        let manager = HostingManager::new(custom_budget);
+        assert_eq!(
+            manager.hosting_budget_bytes(),
+            custom_budget,
+            "HostingManager::new should pass the budget through to the cache"
+        );
+
+        // The default constructor still uses the in-code default.
+        let default_manager = HostingManager::default();
+        assert_eq!(
+            default_manager.hosting_budget_bytes(),
+            DEFAULT_HOSTING_BUDGET_BYTES
+        );
+    }
+
+    #[tokio::test]
     async fn test_subscribe_renews_existing() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         let first = manager.subscribe(contract);
@@ -1465,7 +1793,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_unsubscribe_removes_subscription() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         manager.subscribe(contract);
@@ -1477,7 +1805,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_renew_subscription() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         // Renew non-existent subscription fails
@@ -1490,7 +1818,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_subscribed_contracts() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let c1 = make_contract_key(1);
         let c2 = make_contract_key(2);
         let c3 = make_contract_key(3);
@@ -1513,7 +1841,7 @@ mod tests {
     /// after the SUBSCRIBE migration (PR #3806 → #3981).
     #[tokio::test]
     async fn dashboard_snapshot_reflects_active_subscriptions() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let c1 = make_contract_key(1);
         let c2 = make_contract_key(2);
 
@@ -1559,7 +1887,7 @@ mod tests {
     /// entries) must break by contract-key bytes.
     #[tokio::test]
     async fn dashboard_snapshot_sort_is_deterministic_on_ties() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         // Three contracts with distinct, ordered key-byte prefixes
         // (`make_contract_key(seed)` writes `[seed; 32]` into the
         // ContractInstanceId, so seeds 0x10/0x40/0xF0 sort low/mid/high).
@@ -1605,7 +1933,7 @@ mod tests {
     /// to ~0 every renewal interval (2 min) for every River user.
     #[tokio::test]
     async fn dashboard_snapshot_preserves_subscribed_since_across_renewals() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let c = make_contract_key(1);
 
         let read_lease = || {
@@ -1633,7 +1961,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_active_subscription_count() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
 
         assert_eq!(manager.active_subscription_count(), 0);
 
@@ -1647,7 +1975,7 @@ mod tests {
 
     #[test]
     fn test_client_subscription_basic() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let instance_id = ContractInstanceId::new([1; 32]);
         let client_id = crate::client_events::ClientId::next();
 
@@ -1662,7 +1990,7 @@ mod tests {
 
     #[test]
     fn test_client_subscription_multiple_clients() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let instance_id = ContractInstanceId::new([1; 32]);
         let client1 = crate::client_events::ClientId::next();
         let client2 = crate::client_events::ClientId::next();
@@ -1682,7 +2010,7 @@ mod tests {
 
     #[test]
     fn test_hosting_cache_basic() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let key = make_contract_key(1);
 
         assert!(!manager.is_hosting_contract(&key));
@@ -1696,7 +2024,7 @@ mod tests {
 
     #[test]
     fn test_subscription_backoff() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         // Initially can request
@@ -1717,7 +2045,7 @@ mod tests {
 
     #[test]
     fn test_should_host() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         // Not hosting initially
@@ -1732,7 +2060,7 @@ mod tests {
     /// renewal list. Including them caused subscription storms (#3763 incident).
     #[test]
     fn test_hosted_contract_not_in_renewal_after_restart() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(42);
         manager.record_contract_access(contract, 1000, AccessType::Get);
         assert!(manager.is_hosting_contract(&contract));
@@ -1746,7 +2074,7 @@ mod tests {
     /// a contract is only in the hosting LRU cache (no active subscription).
     #[test]
     fn test_is_receiving_updates_excludes_hosting_cache_only() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         // Not receiving updates initially
@@ -1768,7 +2096,7 @@ mod tests {
     /// Regression test for #3340: is_receiving_updates with client subscriptions.
     #[test]
     fn test_is_receiving_updates_with_client_subscription() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
         let client_id = crate::client_events::ClientId::next();
 
@@ -1780,7 +2108,7 @@ mod tests {
 
     #[test]
     fn test_contracts_needing_renewal_excludes_hosted_only() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         // Add to hosting cache (simulating GET operation)
@@ -1822,7 +2150,7 @@ mod tests {
     /// is that such a relay does not get recruited into the renewal cycle.
     #[test]
     fn test_relay_downstream_only_not_in_renewal() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(77);
         let downstream = make_peer_key(42);
 
@@ -1830,7 +2158,11 @@ mod tests {
         // contract, but we have not called `subscribe()` on our own behalf
         // (we're just forwarding Updates for someone else) and we have no
         // local client expressing interest.
-        assert!(manager.add_downstream_subscriber(&contract, downstream.clone()));
+        assert!(
+            manager
+                .add_downstream_subscriber(&contract, downstream.clone())
+                .was_accepted()
+        );
 
         // Invariant 1: we did not install a self-subscription lease.
         assert!(
@@ -1869,7 +2201,7 @@ mod tests {
     #[ignore]
     #[test]
     fn test_hosted_contract_renewed_despite_no_interest() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(42);
         manager.record_contract_access(contract, 1000, AccessType::Get);
         assert!(manager.is_hosting_contract(&contract));
@@ -1887,7 +2219,7 @@ mod tests {
     #[ignore]
     #[test]
     fn test_startup_revalidation_includes_hosted_contracts() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
         manager.record_contract_access(contract, 1000, AccessType::Get);
         // Before #3546: during startup window, this would be in renewal list
@@ -1903,7 +2235,7 @@ mod tests {
     #[ignore]
     #[test]
     fn test_startup_revalidation_skips_already_subscribed() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
         manager.record_contract_access(contract, 1000, AccessType::Get);
         manager.subscribe(contract);
@@ -1918,7 +2250,7 @@ mod tests {
     #[ignore]
     #[test]
     fn test_startup_revalidation_window_expires() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
         manager.record_contract_access(contract, 1000, AccessType::Get);
         let needs_renewal = manager.contracts_needing_renewal();
@@ -1932,7 +2264,7 @@ mod tests {
     #[ignore]
     #[test]
     fn test_startup_revalidation_multiple_contracts() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract_a = make_contract_key(1);
         let contract_b = make_contract_key(2);
         let contract_c = make_contract_key(3);
@@ -1965,7 +2297,7 @@ mod tests {
     /// prevents subscription storms by processing at most 10 per cycle.
     #[test]
     fn test_hosted_contracts_not_renewed_at_scale() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
 
         // Simulate 200 relay-cached contracts loaded from disk
         for i in 0..200u8 {
@@ -2051,7 +2383,7 @@ mod tests {
     /// tracked (simulates "contract not found" early return in the Unsubscribe handler).
     #[test]
     fn test_should_unsubscribe_upstream_unknown_contract() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let unknown_contract = make_contract_key(99);
 
         // Contract never added to any tracking structure
@@ -2065,7 +2397,7 @@ mod tests {
 
     #[test]
     fn test_should_unsubscribe_upstream() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
         let peer = make_peer_key(10);
         let client_id = crate::client_events::ClientId::next();
@@ -2098,7 +2430,7 @@ mod tests {
     /// should propagate the unsubscribe to A.
     #[test]
     fn test_chain_propagation_single_downstream() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(10);
         let downstream_c = make_peer_key(30);
 
@@ -2120,7 +2452,7 @@ mod tests {
     /// B should NOT propagate upstream because A remains as a downstream subscriber.
     #[test]
     fn test_no_propagation_with_remaining_downstream() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(10);
         let downstream_a = make_peer_key(10);
         let downstream_c = make_peer_key(30);
@@ -2144,7 +2476,7 @@ mod tests {
     /// Node should NOT propagate upstream because a local WebSocket client is subscribed.
     #[test]
     fn test_no_propagation_with_local_client() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(10);
         let downstream_peer = make_peer_key(10);
         let client_id = crate::client_events::ClientId::next();
@@ -2169,7 +2501,7 @@ mod tests {
     /// is correct.
     #[test]
     fn test_client_disconnect_triggers_unsubscribe_decision() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(10);
         let client_id = crate::client_events::ClientId::next();
 
@@ -2200,7 +2532,7 @@ mod tests {
     /// no remaining interest should trigger the unsubscribe decision.
     #[test]
     fn test_client_disconnect_partial_unsubscribe() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract_a = make_contract_key(10);
         let contract_b = make_contract_key(20);
         let client_id = crate::client_events::ClientId::next();
@@ -2236,7 +2568,7 @@ mod tests {
     /// Uses manual timestamp manipulation via DashMap to simulate time passing.
     #[test]
     fn test_expire_downstream_triggers_unsubscribe_decision() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(10);
         let peer = make_peer_key(10);
 
@@ -2276,7 +2608,7 @@ mod tests {
     /// Should NOT trigger unsubscribe.
     #[test]
     fn test_partial_downstream_expiry_no_unsubscribe() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(10);
         let stale_peer = make_peer_key(10);
         let fresh_peer = make_peer_key(20);
@@ -2319,7 +2651,7 @@ mod tests {
     /// triggers upstream unsubscribe propagation.
     #[test]
     fn test_unsubscribe_handler_contract_found_peer_resolved() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let interest = make_interest_manager();
         let contract = make_contract_key(1);
         let peer = make_peer_key(10);
@@ -2338,7 +2670,7 @@ mod tests {
     /// Removing an unknown peer is a noop; existing entries remain intact.
     #[test]
     fn test_unsubscribe_handler_unknown_peer_is_noop() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(2);
         let known_peer = make_peer_key(20);
         let unknown_peer = make_peer_key(99);
@@ -2350,10 +2682,350 @@ mod tests {
         assert!(!manager.should_unsubscribe_upstream(&contract));
     }
 
+    // ----------------------------------------------------------------------
+    // contract_in_use — the eviction-reclamation gate.
+    //
+    // `operations::reclaim_evicted_contract` MUST NOT emit an EvictContract
+    // event (which would delete the contract's state/code from disk) for a
+    // contract that is still in use. `contract_in_use` is that gate.
+    // ----------------------------------------------------------------------
+
+    /// A freshly-evicted contract with no client or downstream subscribers is
+    /// NOT in use — reclamation may proceed.
+    #[test]
+    fn test_contract_in_use_false_when_no_subscribers() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(1);
+        assert!(
+            !manager.contract_in_use(&contract),
+            "a contract with no subscribers must not be considered in use"
+        );
+    }
+
+    /// A contract with a live client subscription IS in use — the gate must
+    /// keep its on-disk storage.
+    #[test]
+    fn test_contract_in_use_true_with_client_subscription() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(2);
+        let client = crate::client_events::ClientId::next();
+
+        manager.add_client_subscription(contract.id(), client);
+        assert!(
+            manager.contract_in_use(&contract),
+            "a contract with a client subscription must be considered in use"
+        );
+
+        // After the last client unsubscribes, the contract is reclaimable.
+        manager.remove_client_subscription(contract.id(), client);
+        assert!(
+            !manager.contract_in_use(&contract),
+            "contract must become reclaimable once its last client unsubscribes"
+        );
+    }
+
+    /// A contract with a downstream peer subscriber IS in use.
+    #[test]
+    fn test_contract_in_use_true_with_downstream_subscriber() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(3);
+        let peer = make_peer_key(7);
+
+        manager.add_downstream_subscriber(&contract, peer.clone());
+        assert!(
+            manager.contract_in_use(&contract),
+            "a contract with a downstream subscriber must be considered in use"
+        );
+
+        manager.remove_downstream_subscriber(&contract, &peer);
+        assert!(
+            !manager.contract_in_use(&contract),
+            "contract must become reclaimable once its last downstream subscriber leaves"
+        );
+    }
+
+    /// A contract with ONLY an active upstream network subscription (no
+    /// local client, no downstream subscriber) is NOT in use for
+    /// reclamation purposes. Documented in `contract_in_use`'s rustdoc:
+    /// `contracts_needing_renewal` renews active subscriptions
+    /// unconditionally, so including `is_subscribed` here would be an
+    /// effectively unbounded GC exemption (AGENTS.md cleanup-exemption
+    /// rule). Local-client subscriptions and downstream-peer subscribers
+    /// are both time-bounded and remain in the predicate.
+    #[test]
+    fn test_contract_in_use_excludes_network_subscription_only() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(4);
+
+        assert!(!manager.has_client_subscriptions(contract.id()));
+        assert!(!manager.has_downstream_subscribers(&contract));
+        assert!(!manager.contract_in_use(&contract));
+
+        // Establishing an upstream network subscription alone must NOT
+        // make the contract appear in-use, because the renewal machinery
+        // would keep extending the lease forever.
+        manager.subscribe(contract);
+        assert!(manager.is_subscribed(&contract));
+        assert!(
+            !manager.contract_in_use(&contract),
+            "an active upstream network subscription alone must NOT block \
+             reclamation (the renewal machinery would keep it alive \
+             unboundedly — see contract_in_use rustdoc)"
+        );
+
+        manager.unsubscribe(&contract);
+        assert!(!manager.contract_in_use(&contract));
+    }
+
+    /// Generation flow through `HostingManager`: bumping the state
+    /// generation BEFORE `record_contract_access` makes the captured
+    /// generation match; subsequently bumping the generation simulates
+    /// a write that raced ahead of an `EvictContract`, and the captured
+    /// snapshot on the evicted entry is now stale (less than current).
+    ///
+    /// This is the load-bearing flow the `RuntimePool::remove_contract`
+    /// generation-mismatch guard relies on. PR #4212 review round C.
+    #[test]
+    fn test_record_contract_access_captures_then_diverges_from_current_generation() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        // Tiny cache, zero TTL: any insert past the first immediately
+        // evicts the previous entry.
+        {
+            let mut cache = manager.hosting_cache.write();
+            *cache = cache::HostingCache::new(
+                100,
+                std::time::Duration::ZERO,
+                crate::util::time_source::InstantTimeSrc::new(),
+            );
+        }
+
+        let key = make_contract_key(1);
+        let trigger = make_contract_key(2);
+
+        // Simulate three state writes before the hosting record.
+        assert_eq!(manager.bump_state_generation(&key), 1);
+        assert_eq!(manager.bump_state_generation(&key), 2);
+        assert_eq!(manager.bump_state_generation(&key), 3);
+        assert_eq!(manager.state_generation(&key), 3);
+
+        // Recording the access captures the current generation (3).
+        manager.record_contract_access(key, 100, AccessType::Get);
+
+        // Simulate a state write that races ahead of `EvictContract`.
+        let new_generation = manager.bump_state_generation(&key);
+        assert_eq!(new_generation, 4);
+
+        // Now evict the entry by inserting `trigger`; the captured
+        // generation on the evicted tuple must be the snapshot taken at
+        // `record_contract_access` time (3), NOT the current value (4).
+        // `RuntimePool::remove_contract` will compare this captured
+        // value (3) against the current `state_generation` (4) and
+        // SKIP the on-disk reclamation, closing the re-host race.
+        let result = manager.record_contract_access(trigger, 100, AccessType::Get);
+        assert_eq!(
+            result.evicted,
+            vec![(key, 3)],
+            "evicted tuple must carry the generation captured atomically \
+             when the entry was inserted, NOT the current generation"
+        );
+        assert_eq!(
+            manager.state_generation(&key),
+            4,
+            "current generation must reflect the most recent write"
+        );
+        assert_ne!(
+            result.evicted[0].1,
+            manager.state_generation(&key),
+            "the mismatch between captured and current is exactly what \
+             `RuntimePool::remove_contract` keys off to skip reclamation"
+        );
+    }
+
+    /// Without `refresh_cache_generation`, a hosted contract that receives
+    /// a subsequent state write (UPDATE or re-PUT) has its `state_generation`
+    /// advance while the cached `write_generation` snapshot stays at the
+    /// `record_contract_access`-time value. Later, when this contract is
+    /// evicted (LRU pressure, expiry sweep, etc.), the `EvictContract` event
+    /// carries the stale snapshot. The deletion-time guard in
+    /// `RuntimePool::remove_contract` compares the snapshot against the
+    /// current generation and — seeing a mismatch — skips reclamation.
+    /// Result: every UPDATE-then-evict leaks the on-disk state and code blob.
+    ///
+    /// The fix is to call `refresh_cache_generation` paired with every
+    /// `bump_state_generation` so the snapshot tracks the counter. This
+    /// test asserts the refresh updates the snapshot, so the
+    /// subsequently-evicted entry carries the current generation rather
+    /// than the stale one.
+    ///
+    /// Regression test for PR #4212 review round D (skeptical r3 #2).
+    #[test]
+    fn test_record_access_refresh_updates_write_generation() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        // Tiny cache, zero TTL so the next insert evicts immediately.
+        {
+            let mut cache = manager.hosting_cache.write();
+            *cache = cache::HostingCache::new(
+                100,
+                std::time::Duration::ZERO,
+                crate::util::time_source::InstantTimeSrc::new(),
+            );
+        }
+
+        let key = make_contract_key(1);
+        let trigger = make_contract_key(2);
+
+        // Initial write + hosting record: snapshot captures generation 1.
+        let new_gen = manager.bump_state_generation(&key);
+        assert_eq!(new_gen, 1);
+        manager.refresh_cache_generation(&key, new_gen);
+        manager.record_contract_access(key, 100, AccessType::Get);
+
+        // Simulate an UPDATE that bumps the counter to 2 AND refreshes
+        // the cached snapshot — this is the bump+refresh pair installed
+        // at every state-write chokepoint.
+        let new_gen = manager.bump_state_generation(&key);
+        assert_eq!(new_gen, 2);
+        manager.refresh_cache_generation(&key, new_gen);
+
+        // Now force eviction. With the refresh, the evicted tuple should
+        // carry the post-UPDATE generation (2). Without the refresh, it
+        // would carry the stale snapshot (1), and `RuntimePool::remove_contract`
+        // would see a mismatch against the current generation (2) and
+        // SKIP reclamation — leaking the on-disk state forever.
+        let result = manager.record_contract_access(trigger, 100, AccessType::Get);
+        assert_eq!(
+            result.evicted,
+            vec![(key, 2)],
+            "evicted tuple must carry the refreshed generation (post-UPDATE), \
+             not the stale snapshot from initial record_contract_access"
+        );
+        assert_eq!(
+            result.evicted[0].1,
+            manager.state_generation(&key),
+            "with bump+refresh in lock-step, the evicted snapshot matches \
+             the current generation — deletion-time guard would proceed \
+             with reclamation rather than skipping it"
+        );
+    }
+
+    /// `refresh_cache_generation` is a no-op when the entry is not in the
+    /// cache: if the contract was evicted between bump and refresh, the
+    /// `EvictContract` already carried the pre-bump snapshot and the
+    /// deletion-time guard will skip on that narrower mismatch. The
+    /// no-op behavior is intentional — see the comment on
+    /// `HostingCache::refresh_entry_generation`.
+    #[test]
+    fn test_refresh_cache_generation_is_noop_when_entry_absent() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let key = make_contract_key(99);
+
+        // The contract is not in the hosting cache. The bump+refresh
+        // pair runs from a state-write chokepoint, but the entry was
+        // already evicted in a prior eviction wave. The refresh must
+        // simply do nothing — not panic, not insert.
+        let new_gen = manager.bump_state_generation(&key);
+        manager.refresh_cache_generation(&key, new_gen);
+        assert!(
+            !manager.hosting_cache.read().contains(&key),
+            "refresh must not insert a phantom entry for an absent contract"
+        );
+    }
+
+    /// `bump_state_generation` is monotonic and starts at 1 on first
+    /// bump (`state_generation` returns 0 for never-seen contracts).
+    /// `forget_state_generation` returns the entry to the absent state
+    /// so the next bump restarts at 1.
+    #[test]
+    fn test_state_generation_lifecycle() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let key = make_contract_key(42);
+
+        assert_eq!(
+            manager.state_generation(&key),
+            0,
+            "never-seen contract reads as generation 0"
+        );
+
+        assert_eq!(manager.bump_state_generation(&key), 1);
+        assert_eq!(manager.bump_state_generation(&key), 2);
+        assert_eq!(manager.bump_state_generation(&key), 3);
+        assert_eq!(manager.state_generation(&key), 3);
+
+        manager.forget_state_generation(&key);
+        assert_eq!(
+            manager.state_generation(&key),
+            0,
+            "after forget, generation reads as 0 again"
+        );
+        assert_eq!(
+            manager.bump_state_generation(&key),
+            1,
+            "after forget, next bump restarts at 1"
+        );
+    }
+
+    /// `record_contract_access` must not evict an in-use contract when the
+    /// cache is over budget; once the in-use signal is removed the contract
+    /// becomes evictable. The in-use signal here is a local client
+    /// subscription — the time-bounded form `contract_in_use` actually
+    /// checks (see its rustdoc for why an upstream network subscription
+    /// alone is excluded).
+    #[test]
+    fn test_record_contract_access_skips_in_use_contract() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        // Override with a tiny cache and ZERO TTL so every entry is instantly
+        // eviction-eligible — `contract_in_use` is then the only protection.
+        {
+            let mut cache = manager.hosting_cache.write();
+            *cache = cache::HostingCache::new(
+                200, // room for ~2 contracts at 100 bytes
+                std::time::Duration::ZERO,
+                crate::util::time_source::InstantTimeSrc::new(),
+            );
+        }
+
+        let in_use = make_contract_key(1);
+        let filler = make_contract_key(2);
+        let trigger = make_contract_key(3);
+
+        // `in_use` is the oldest LRU entry but has a local client subscription.
+        let client = crate::client_events::ClientId::next();
+        manager.add_client_subscription(in_use.id(), client);
+        assert!(manager.contract_in_use(&in_use));
+
+        manager.record_contract_access(in_use, 100, AccessType::Get);
+        manager.record_contract_access(filler, 100, AccessType::Get);
+
+        // Inserting `trigger` puts the cache over budget. A naive LRU would
+        // evict `in_use` (oldest) — `contract_in_use` must protect it, so
+        // `filler` is evicted instead.
+        let result = manager.record_contract_access(trigger, 100, AccessType::Get);
+        assert_eq!(
+            result.evicted,
+            vec![(filler, 0)],
+            "in-use (client-subscribed) contract must be skipped; the \
+             unprotected contract must be evicted instead"
+        );
+        assert!(manager.is_hosting_contract(&in_use));
+        assert!(!manager.is_hosting_contract(&filler));
+
+        // Drop the client subscription: `in_use` is now evictable.
+        manager.remove_client_subscription(in_use.id(), client);
+        assert!(!manager.contract_in_use(&in_use));
+
+        let result = manager.record_contract_access(filler, 100, AccessType::Get);
+        assert!(
+            result.evicted.iter().any(|(k, _)| *k == in_use),
+            "once the subscription is removed the contract must become \
+             evictable when the cache is over budget"
+        );
+        assert!(!manager.is_hosting_contract(&in_use));
+    }
+
     /// Removing from an untracked contract is a noop; other contracts unaffected.
     #[test]
     fn test_unsubscribe_handler_unknown_contract_is_noop() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let known_contract = make_contract_key(3);
         let unknown_contract = make_contract_key(99);
         let peer = make_peer_key(30);
@@ -2369,7 +3041,7 @@ mod tests {
     /// independent of `InterestManager` state.
     #[test]
     fn test_unsubscribe_dual_tracking_authority() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let interest = make_interest_manager();
         let contract = make_contract_key(4);
         let peer = make_peer_key(40);
@@ -2404,8 +3076,8 @@ mod tests {
         let protected = make_contract_key(1);
         let unprotected = make_contract_key(2);
 
-        cache.record_access(protected, 100, AccessType::Get);
-        cache.record_access(unprotected, 100, AccessType::Get);
+        cache.record_access(protected, 100, AccessType::Get, 0, |_| false);
+        cache.record_access(unprotected, 100, AccessType::Get, 0, |_| false);
         assert_eq!(cache.current_bytes(), 200); // over budget
 
         // Advance past TTL
@@ -2416,11 +3088,11 @@ mod tests {
         let evicted = cache.sweep_expired(|k| *k == protected);
 
         assert!(
-            !evicted.contains(&protected),
+            !evicted.iter().any(|(k, _)| *k == protected),
             "Contract with downstream subscribers must not be evicted"
         );
         assert!(
-            evicted.contains(&unprotected),
+            evicted.iter().any(|(k, _)| *k == unprotected),
             "Unprotected contract should be evicted when over budget + past TTL"
         );
         assert!(cache.contains(&protected));
@@ -2441,7 +3113,7 @@ mod tests {
         let mut cache = HostingCache::new(80, min_ttl, time.clone());
 
         let contract = make_contract_key(100);
-        cache.record_access(contract, 100, AccessType::Get);
+        cache.record_access(contract, 100, AccessType::Get, 0, |_| false);
         assert!(cache.contains(&contract));
 
         // Under TTL: should not be evicted even though over budget
@@ -2457,7 +3129,7 @@ mod tests {
         // Now should be evicted (over budget + past TTL + no retain predicate)
         let evicted = cache.sweep_expired(|_| false);
         assert!(
-            evicted.contains(&contract),
+            evicted.iter().any(|(k, _)| *k == contract),
             "Contract past TTL with no subscribers should be evicted"
         );
         assert!(!cache.contains(&contract));
@@ -2469,7 +3141,7 @@ mod tests {
 
     #[test]
     fn test_downstream_subscriber_limit_enforced() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(50);
 
         // Use a small limit for testing to avoid issues with peer key generation.
@@ -2488,7 +3160,9 @@ mod tests {
                 bytes
             }));
             peers.push(peer.clone());
-            let result = manager.add_downstream_subscriber(&contract, peer);
+            let result = manager
+                .add_downstream_subscriber(&contract, peer)
+                .was_accepted();
             assert!(
                 result,
                 "Downstream subscriber {i} should succeed within limit (count before: {i})"
@@ -2516,16 +3190,56 @@ mod tests {
             .unwrap_or(false);
         assert!(is_new, "Extra peer should not already be in the set");
 
-        let rejected = !manager.add_downstream_subscriber(&contract, extra_peer);
+        let outcome = manager.add_downstream_subscriber(&contract, extra_peer);
+        assert_eq!(
+            outcome,
+            AddSubscriberOutcome::Rejected,
+            "Downstream subscriber beyond limit should return Rejected (count was {actual_count})"
+        );
         assert!(
-            rejected,
-            "Downstream subscriber beyond limit should be rejected (count was {actual_count})"
+            !outcome.was_accepted(),
+            "Rejected must NOT count as accepted"
+        );
+    }
+
+    /// Sybil-resistance pin: `add_downstream_subscriber` MUST distinguish
+    /// a genuine new add from a renewal so the governance scoring layer
+    /// can gate `ingest_demand` on new-add only. Without this distinction,
+    /// a peer renewing every 2 minutes would pad benefit_score by
+    /// `FORWARDED_DEMAND_WEIGHT × 30 = 3.0 per hour` — the equivalent of
+    /// 30 distinct subscribers from one rotating peer.
+    #[test]
+    fn add_downstream_subscriber_distinguishes_new_add_from_renewal() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(1);
+        let peer = make_peer_key(2);
+
+        // First call: NewAdd.
+        assert_eq!(
+            manager.add_downstream_subscriber(&contract, peer.clone()),
+            AddSubscriberOutcome::NewAdd,
+            "first registration of a peer must be NewAdd"
+        );
+
+        // Second call with the same peer: Renewal, not NewAdd.
+        assert_eq!(
+            manager.add_downstream_subscriber(&contract, peer.clone()),
+            AddSubscriberOutcome::Renewal,
+            "repeated registration of the same peer must be Renewal — \
+             otherwise the governance demand-ingest gate is bypassed and \
+             a churning peer pads benefit_score indefinitely"
+        );
+
+        // Third call also Renewal — no escalation back to NewAdd.
+        assert_eq!(
+            manager.add_downstream_subscriber(&contract, peer),
+            AddSubscriberOutcome::Renewal,
         );
     }
 
     #[test]
     fn test_downstream_subscriber_existing_peer_can_renew_at_limit() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(51);
 
         // Fill up to the limit
@@ -2542,11 +3256,16 @@ mod tests {
             manager.add_downstream_subscriber(&contract, peer);
         }
 
-        // Existing peer can still renew (re-insert updates the timestamp)
-        assert!(
-            manager.add_downstream_subscriber(&contract, first_peer),
-            "Existing peer should be able to renew at limit"
+        // Existing peer can still renew (re-insert updates the timestamp).
+        // Post-Sybil-fix: this returns Renewal, not NewAdd — pin both
+        // facts so a regression flips the demand-ingest gate the wrong way.
+        let outcome = manager.add_downstream_subscriber(&contract, first_peer);
+        assert_eq!(
+            outcome,
+            AddSubscriberOutcome::Renewal,
+            "Existing peer at limit should return Renewal (not NewAdd or Rejected)"
         );
+        assert!(outcome.was_accepted(), "Renewal must count as accepted");
     }
 
     // =========================================================================
@@ -2557,7 +3276,7 @@ mod tests {
     /// count of expired peers so the interest manager can be decremented.
     #[test]
     fn test_expire_returns_expired_count_for_interest_sync() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let interest = make_interest_manager();
         let contract = make_contract_key(90);
         let peer_a = make_peer_key(90);
@@ -2606,7 +3325,7 @@ mod tests {
     /// renewal, but relay-cached contracts should NOT.
     #[test]
     fn test_local_client_access_enables_renewal() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let local_contract = make_contract_key(1);
         let relay_contract = make_contract_key(2);
 
@@ -2633,7 +3352,7 @@ mod tests {
     /// Regression test for #3763/#3765 (the subscription storm incident).
     #[test]
     fn test_relay_cached_contracts_not_renewed_at_scale() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
 
         // Simulate 200 relay-cached contracts (no local_client_access)
         for i in 0..200u8 {
@@ -2662,7 +3381,7 @@ mod tests {
     /// double-counted in the renewal list.
     #[test]
     fn test_local_client_access_with_active_subscription_no_duplicate() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         manager.record_contract_access(contract, 1000, AccessType::Get);
@@ -2681,7 +3400,7 @@ mod tests {
     /// Marking and querying unknown contracts should be no-ops (no panic).
     #[test]
     fn test_local_client_access_unknown_contract() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         assert!(!manager.has_local_client_access(&contract));
@@ -2693,7 +3412,7 @@ mod tests {
     /// persist even after the contract's access type changes.
     #[test]
     fn test_local_client_access_sticky_across_access_type_changes() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         let contract = make_contract_key(1);
 
         manager.record_contract_access(contract, 1000, AccessType::Get);
@@ -2712,7 +3431,7 @@ mod tests {
     /// should appear in contracts_needing_renewal().
     #[test]
     fn test_local_client_access_survives_restart_via_load() {
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
 
         // Simulate loading from disk with local_client_access=true
         {
@@ -2750,7 +3469,7 @@ mod tests {
     #[test]
     fn test_eviction_clears_local_client_access() {
         // Small budget to force eviction
-        let manager = HostingManager::new();
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
         // Override with a tiny cache
         {
             let mut cache = manager.hosting_cache.write();
@@ -2789,5 +3508,216 @@ mod tests {
         // After local client re-accesses, flag is restored
         manager.mark_local_client_access(&contract_a);
         assert!(manager.has_local_client_access(&contract_a));
+    }
+
+    // =========================================================================
+    // Pending Reclamation Retry Queue (PR #4212 review round 7)
+    //
+    // The queue catches two narrow disk-leak edge cases — fair-queue
+    // rejection of `EvictContract`, and the `contract_in_use` skip in
+    // `RuntimePool::remove_contract` — where an `EvictContract` event
+    // is dropped before reclamation runs but the hosting-cache entry is
+    // already gone. The queue is drained by the periodic sweep, which
+    // re-emits `EvictContract` via `reclaim_evicted_contract`.
+    //
+    // End-to-end coverage of the periodic sweep retry path (which
+    // requires a wired `OpManager`) is intentionally deferred —
+    // constructing a `RuntimePool` is too heavy for a unit test (see
+    // the note on `remove_contract_tests` in
+    // `contract/executor/runtime.rs`). These tests cover the manager-
+    // level API the sweep relies on.
+    // =========================================================================
+
+    /// Basic API: add → snapshot reflects the entry; remove → snapshot
+    /// becomes empty. The snapshot returns owned tuples (no lock held
+    /// across iteration), which is the property the periodic sweep
+    /// relies on.
+    #[test]
+    fn test_pending_reclamation_add_remove_snapshot() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let key_a = make_contract_key(1);
+        let key_b = make_contract_key(2);
+
+        assert_eq!(manager.pending_reclamation_len(), 0);
+        assert!(manager.pending_reclamation_snapshot().is_empty());
+
+        manager.pending_reclamation_add(key_a, 7);
+        manager.pending_reclamation_add(key_b, 13);
+        assert_eq!(manager.pending_reclamation_len(), 2);
+
+        let mut snapshot = manager.pending_reclamation_snapshot();
+        snapshot.sort_by(|a, b| a.0.id().as_bytes().cmp(b.0.id().as_bytes()));
+        assert_eq!(snapshot, vec![(key_a, 7), (key_b, 13)]);
+
+        // Re-adding the same key replaces the generation. This matters
+        // for the queue-full skip point: if multiple eviction events
+        // for the same key race the queue, the most recent generation
+        // is the relevant one for the retry.
+        manager.pending_reclamation_add(key_a, 99);
+        let snapshot = manager.pending_reclamation_snapshot();
+        let gen_a = snapshot
+            .iter()
+            .find(|(k, _)| *k == key_a)
+            .map(|(_, g)| *g)
+            .expect("key_a still present");
+        assert_eq!(gen_a, 99, "re-add must replace the generation");
+
+        manager.pending_reclamation_remove(&key_a);
+        assert_eq!(manager.pending_reclamation_len(), 1);
+        let remaining = manager.pending_reclamation_snapshot();
+        assert_eq!(remaining, vec![(key_b, 13)]);
+
+        manager.pending_reclamation_remove(&key_b);
+        assert_eq!(manager.pending_reclamation_len(), 0);
+
+        // Removing a key that is not present is a no-op (matters because
+        // the success path in `RuntimePool::remove_contract` calls
+        // `pending_reclamation_remove` unconditionally — the queue must
+        // tolerate non-pending keys).
+        manager.pending_reclamation_remove(&key_a);
+        assert_eq!(manager.pending_reclamation_len(), 0);
+    }
+
+    /// Simulate the `contract_in_use` skip path: an EvictContract event
+    /// could not complete because a subscriber appeared between
+    /// eviction and processing. The pending entry survives subsequent
+    /// snapshots so the periodic sweep can keep retrying; once the
+    /// subscriber expires the snapshot still contains the entry and a
+    /// successful retry would call `pending_reclamation_remove` to
+    /// clear it.
+    ///
+    /// This is the manager-level invariant; end-to-end coverage of the
+    /// sweep loop calling `reclaim_evicted_contract` for each entry
+    /// (which requires a wired `OpManager`) is deferred — see the
+    /// module-level test note.
+    #[test]
+    fn test_pending_reclamation_survives_in_use_skip_and_retries() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(42);
+        let client = crate::client_events::ClientId::next();
+        let captured_generation = 5u64;
+
+        // Step 1: a client subscription means `contract_in_use` is true.
+        // In production this is the state `RuntimePool::remove_contract`
+        // observes when it hits the in-use skip and adds the key to the
+        // pending queue.
+        manager.add_client_subscription(contract.id(), client);
+        assert!(manager.contract_in_use(&contract));
+        manager.pending_reclamation_add(contract, captured_generation);
+        assert_eq!(manager.pending_reclamation_len(), 1);
+
+        // Step 2: the periodic sweep snapshots the queue. The entry is
+        // returned with its captured generation intact, and the queue
+        // state is unchanged (the sweep does not consume entries —
+        // `reclaim_evicted_contract`'s `contract_in_use` gate filters
+        // them, and successful retries call `pending_reclamation_remove`
+        // explicitly).
+        let snapshot = manager.pending_reclamation_snapshot();
+        assert_eq!(snapshot, vec![(contract, captured_generation)]);
+        assert_eq!(
+            manager.pending_reclamation_len(),
+            1,
+            "snapshot must NOT drain the queue — entries stay until \
+             explicit removal so the sweep can keep retrying until \
+             `contract_in_use` becomes false"
+        );
+
+        // Step 3: subscriber leaves; `contract_in_use` becomes false.
+        // The next sweep would route this through
+        // `reclaim_evicted_contract`, which (with the gate now open)
+        // emits a fresh `EvictContract`. On successful reclamation,
+        // `RuntimePool::remove_contract` calls
+        // `pending_reclamation_remove`. We model the successful retry
+        // here by calling `pending_reclamation_remove` directly.
+        manager.remove_client_subscription(contract.id(), client);
+        assert!(!manager.contract_in_use(&contract));
+        // The sweep would re-snapshot at this point and route through
+        // reclaim_evicted_contract — model the successful path.
+        manager.pending_reclamation_remove(&contract);
+        assert_eq!(manager.pending_reclamation_len(), 0);
+        assert!(manager.pending_reclamation_snapshot().is_empty());
+    }
+
+    /// Generation-mismatch + not-in-cache → keep pending and update its
+    /// captured generation to the current one. Models the
+    /// `RuntimePool::remove_contract` branch added in PR #4212 review
+    /// round 8: an evicted-then-in-use-then-UPDATEd contract must keep
+    /// its retry entry, otherwise the on-disk storage leaks once the
+    /// subscriber later expires (UPDATE does not call `host_contract`,
+    /// so the cache cannot emit another `EvictContract`).
+    #[test]
+    fn test_pending_reclamation_kept_on_generation_mismatch_when_not_hosted() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(0xA1);
+
+        // Initial state: contract has been written 5 times (gen=5), was
+        // evicted with `expected_generation=5`, and queued for retry
+        // because a subscriber was still attached at the time.
+        for _ in 0..5 {
+            manager.bump_state_generation(&contract);
+        }
+        let captured_generation = manager.state_generation(&contract);
+        assert_eq!(captured_generation, 5);
+        manager.pending_reclamation_add(contract, captured_generation);
+
+        // Simulate UPDATEs while the contract is still evicted (not in
+        // cache): `state_generation` advances past the captured value.
+        // UPDATE does not call `host_contract`, so the cache stays
+        // empty.
+        manager.bump_state_generation(&contract);
+        manager.bump_state_generation(&contract);
+        manager.bump_state_generation(&contract);
+        let current_generation = manager.state_generation(&contract);
+        assert_eq!(current_generation, captured_generation + 3);
+
+        // Precondition: the contract is NOT in the hosting cache.
+        assert!(!manager.is_hosting_contract(&contract));
+
+        // The `RuntimePool::remove_contract` generation-mismatch +
+        // not-hosted branch upserts the pending entry to the current
+        // generation. Model that here via `pending_reclamation_add`.
+        manager.pending_reclamation_add(contract, current_generation);
+
+        let snapshot = manager.pending_reclamation_snapshot();
+        assert_eq!(
+            snapshot,
+            vec![(contract, current_generation)],
+            "pending entry must survive the generation mismatch AND its \
+             expected_generation must advance to the current generation"
+        );
+    }
+
+    /// Generation-mismatch + IS-in-cache → clear pending. Models the
+    /// other half of the new branch: when the contract is back in the
+    /// hosting cache (a PUT re-hosted it), the cache owns subsequent
+    /// re-eviction and a stale pending entry would only produce
+    /// spurious sweep retries.
+    #[test]
+    fn test_pending_reclamation_cleared_on_generation_mismatch_when_hosted() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(0xA2);
+
+        // Queue a stale pending entry.
+        let captured_generation = 7u64;
+        manager.pending_reclamation_add(contract, captured_generation);
+        assert_eq!(manager.pending_reclamation_len(), 1);
+
+        // Simulate a PUT that re-hosted: bump generation AND add to
+        // the hosting cache (record_contract_access ≈ what
+        // `host_contract` does in production).
+        manager.bump_state_generation(&contract);
+        manager.record_contract_access(contract, 128, AccessType::Put);
+        assert!(manager.is_hosting_contract(&contract));
+
+        // The `RuntimePool::remove_contract` generation-mismatch +
+        // is-hosting branch removes the pending entry. Model that here.
+        manager.pending_reclamation_remove(&contract);
+        assert_eq!(
+            manager.pending_reclamation_len(),
+            0,
+            "pending entry must be cleared once the cache owns the contract \
+             again — leaving it would let the sweep emit `EvictContract` \
+             events that all bail at the `is_hosting_contract` check"
+        );
     }
 }

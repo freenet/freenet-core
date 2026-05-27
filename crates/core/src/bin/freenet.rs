@@ -642,6 +642,9 @@ fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
             max_blocking_threads,
             "Tokio runtime configured with bounded blocking thread pool"
         );
+        // Surface the early-`main` umask override now that tracing is
+        // installed — operators with a custom `UMask=` see the change.
+        log_umask_override();
         run(config).await
     })?;
 
@@ -705,7 +708,71 @@ fn freenet_main() -> anyhow::Result<()> {
     }
 }
 
+/// Stores the operator's umask at the moment `set_secure_umask` ran,
+/// so a `tracing::info!` emitted later (after the logger is installed
+/// in `run_node`) can surface the override in operator logs. Only used
+/// for observability; the load-bearing behaviour is the `libc::umask`
+/// call itself.
+#[cfg(unix)]
+static PRIOR_UMASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// Defense-in-depth umask tightening for the secrets subsystem.
+///
+/// PR #4195 / issue #4141 added explicit `OpenOptions::mode(0o600)` at
+/// every known secret-writing call site. Setting the process umask to
+/// `0o077` here is the belt-and-suspenders companion: any future
+/// `File::create` added in the secrets subsystem that forgets to go
+/// through `create_owner_only` will still land at `0o600` (and any
+/// `fs::create_dir` at `0o700`) rather than silently inheriting the
+/// operator's umask (typically `0o022` → world-readable).
+///
+/// MUST run before any thread is spawned. `umask(2)` is per-thread on
+/// macOS — child threads inherit their creator's umask at thread-create
+/// time, so a worker thread spawned before this call would keep the
+/// (default, permissive) inherited umask. On Linux umask is per-process
+/// so the constraint is weaker, but the same call site is correct for
+/// both platforms.
+///
+/// See: issue #4196.
+#[cfg(unix)]
+fn set_secure_umask() {
+    // SAFETY: `umask(2)` is a thread-safe POSIX syscall that simply
+    // installs a new mask and returns the prior value.
+    let prior = unsafe { libc::umask(0o077) };
+    // `set` is a no-op if a prior call already populated the cell
+    // (e.g. when a test exercises `set_secure_umask` directly after
+    // `main` already ran in the same process). The first writer wins;
+    // that's fine — the value is purely informational.
+    #[allow(clippy::let_underscore_must_use)]
+    let _ = PRIOR_UMASK.set(prior as u32);
+}
+
+#[cfg(not(unix))]
+fn set_secure_umask() {}
+
+/// Log the umask override at INFO once the tracing subscriber is up.
+/// Operators who configured a non-default umask via systemd `UMask=`,
+/// a wrapper script, or a login shell see the override in normal logs
+/// instead of having to guess from on-disk file modes.
+#[cfg(unix)]
+fn log_umask_override() {
+    if let Some(prior) = PRIOR_UMASK.get() {
+        tracing::info!(
+            prior_umask = format_args!("{:#05o}", prior),
+            new_umask = format_args!("{:#05o}", 0o077),
+            "tightened process umask for secrets defense-in-depth (issue #4196)"
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn log_umask_override() {}
+
 fn main() {
+    // Defense-in-depth: tighten umask BEFORE the tokio runtime spawns
+    // any worker threads. See `set_secure_umask` and issue #4196.
+    set_secure_umask();
+
     use commands::auto_update::{EXIT_CODE_UPDATE_NEEDED, UpdateNeededError};
 
     match freenet_main() {
@@ -783,5 +850,106 @@ mod tests {
    0: 00000000:1D55 00000000:0000 0A";
 
         assert_eq!(parse_listening_inode(content, "1D55"), None);
+    }
+
+    /// Regression test for issue #4196: a plain `File::create` from
+    /// inside a `tokio::spawn`'d task on a tokio worker thread must
+    /// land at mode `0o600` after `set_secure_umask` runs, even though
+    /// the call site does NOT go through the `create_owner_only`
+    /// helper. This is the defense-in-depth guarantee the umask
+    /// provides for any future secret-writing call that forgets the
+    /// explicit `OpenOptions::mode(0o600)`.
+    #[cfg(unix)]
+    #[test]
+    fn umask_persists_into_tokio_worker_thread() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Force a permissive baseline umask so we are actually testing
+        // that `set_secure_umask` tightens it (not that the test
+        // harness already happened to start at 0o077). Capture the
+        // prior value so we can restore it before returning — leaking
+        // a tight umask into the rest of the test binary would mask
+        // bugs in other tests' file-permission assertions.
+        // SAFETY: `umask(2)` is a thread-safe POSIX syscall.
+        let prior = unsafe { libc::umask(0o022) };
+
+        // Sanity-check the baseline by creating a file BEFORE
+        // tightening: under `umask(0o022)` it should land at `0o644`.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let baseline_path = temp.path().join("baseline-default-umask");
+        std::fs::File::create(&baseline_path).expect("create baseline");
+        let baseline_mode = std::fs::metadata(&baseline_path)
+            .expect("stat baseline")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            baseline_mode, 0o644,
+            "baseline file under umask(0o022) should be 0o644, got {baseline_mode:o}; \
+             test setup is invalid"
+        );
+
+        // Function under test: tighten the umask, then build a fresh
+        // multi-thread runtime so that the worker threads inherit the
+        // new umask at pthread-create time (macOS-correct).
+        super::set_secure_umask();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+
+        let worker_file_path = temp.path().join("created-from-tokio-worker");
+        let worker_dir_path = temp.path().join("created-from-tokio-worker-dir");
+        let worker_file_for_task = worker_file_path.clone();
+        let worker_dir_for_task = worker_dir_path.clone();
+        rt.block_on(async move {
+            tokio::spawn(async move {
+                // Deliberately use plain `File::create` / `create_dir`
+                // — NOT `create_owner_only` / `ensure_owner_only_dir`
+                // — to exercise the umask path on both file and
+                // directory creates. `0o600` for files and `0o700`
+                // for dirs is the contract the docs commit to in
+                // `docs/secrets-at-rest.md`.
+                std::fs::File::create(&worker_file_for_task).expect("create file from worker");
+                std::fs::create_dir(&worker_dir_for_task).expect("create dir from worker");
+            })
+            .await
+            .expect("worker task");
+        });
+
+        let worker_file_mode = std::fs::metadata(&worker_file_path)
+            .expect("stat worker file")
+            .permissions()
+            .mode()
+            & 0o777;
+        let worker_dir_mode = std::fs::metadata(&worker_dir_path)
+            .expect("stat worker dir")
+            .permissions()
+            .mode()
+            & 0o777;
+
+        // Restore the prior umask on the test-runner thread BEFORE
+        // asserting so a failure does not leak a tightened mask into
+        // subsequent tests. We deliberately do NOT restore on the
+        // tokio worker threads: macOS umask is per-thread, but the
+        // runtime is dropped at the end of this block, so the worker
+        // threads exit before any other test can observe their state.
+        // SAFETY: `umask(2)` is a thread-safe POSIX syscall.
+        unsafe {
+            libc::umask(prior);
+        }
+
+        assert_eq!(
+            worker_file_mode, 0o600,
+            "file created from tokio worker after set_secure_umask() should be 0o600, \
+             got {worker_file_mode:o}"
+        );
+        assert_eq!(
+            worker_dir_mode, 0o700,
+            "directory created from tokio worker after set_secure_umask() should be 0o700, \
+             got {worker_dir_mode:o}"
+        );
     }
 }

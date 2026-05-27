@@ -103,6 +103,14 @@ pub struct ConfigArgs {
     #[arg(long, env = "MAX_BLOCKING_THREADS")]
     pub max_blocking_threads: Option<usize>,
 
+    /// Budget in bytes for hosted contract *state*. Once exceeded, contracts
+    /// are evicted (least-valuable-first) and their on-disk state reclaimed.
+    /// This bounds tracked contract state only — WASM code blobs and ReDb/
+    /// SQLite database overhead are additional and not counted against it.
+    /// Default: 1 GiB.
+    #[arg(long, env = "MAX_HOSTING_STORAGE")]
+    pub max_hosting_storage: Option<u64>,
+
     #[command(flatten)]
     pub telemetry: TelemetryArgs,
 }
@@ -150,6 +158,7 @@ impl Default for ConfigArgs {
             id: None,
             version: false,
             max_blocking_threads: None,
+            max_hosting_storage: None,
             telemetry: Default::default(),
         }
     }
@@ -354,6 +363,8 @@ impl ConfigArgs {
                 self.network_api.bbr_startup_rate = cfg.network_api.bbr_startup_rate;
             }
             self.log_level.get_or_insert(cfg.log_level);
+            self.max_hosting_storage
+                .get_or_insert(cfg.max_hosting_storage);
             self.config_paths.merge(cfg.config_paths.as_ref().clone());
             // Merge telemetry config - CLI args override file config
             // Note: enabled defaults to true via clap, so we only override
@@ -466,6 +477,29 @@ impl ConfigArgs {
                 // Inline gateways were provided via --gateways flag, use those
                 remotely_loaded_gateways
             }
+        } else if self.network_api.skip_load_from_network && has_cli_gateways {
+            // #3980: Strict additive --gateway semantics under
+            // skip_load_from_network. When the user explicitly passes
+            // --gateway, treat the CLI entries (plus any --gateways inline
+            // JSON entries resolved into `remotely_loaded_gateways` above)
+            // as the complete bootstrap set: do NOT merge in the on-disk
+            // gateways.toml cache (which on a default install lists public
+            // production peers like nova/vega). The explicit --gateway
+            // entries are merged below.
+            //
+            // When --gateway is NOT supplied under skip_load_from_network,
+            // the on-disk gateways.toml is still read (next branch). This
+            // preserves the contract used by isolated test harnesses
+            // (e.g. freenet-test-network's Docker NAT setup) that
+            // pre-populate gateways.toml in a custom --config-dir.
+            tracing::info!(
+                "skip_load_from_network with --gateway entries: \
+                 ignoring on-disk gateways.toml; using only CLI-supplied gateways"
+            );
+            // Returning `remotely_loaded_gateways` (empty or populated from
+            // --gateways JSON) preserves the precedence contract documented
+            // below at the --gateway merge step.
+            remotely_loaded_gateways
         } else {
             // Either skip_load_from_network is set (use local file only), or the
             // remote fetch failed and we need to fall back to the local cache.
@@ -695,6 +729,9 @@ impl ConfigArgs {
             max_blocking_threads: self
                 .max_blocking_threads
                 .unwrap_or_else(default_max_blocking_threads),
+            max_hosting_storage: self
+                .max_hosting_storage
+                .unwrap_or(crate::ring::DEFAULT_HOSTING_BUDGET_BYTES),
             telemetry: TelemetryConfig {
                 enabled: self.telemetry.enabled,
                 endpoint: self
@@ -801,6 +838,15 @@ pub struct Config {
     /// Maximum number of threads for blocking operations (WASM execution, etc.).
     #[serde(default = "default_max_blocking_threads")]
     pub max_blocking_threads: usize,
+    /// Budget in bytes for hosted contract *state*. Once exceeded, contracts
+    /// are evicted (least-valuable-first) and their on-disk state reclaimed.
+    /// This bounds tracked contract state only — WASM code blobs and ReDb/
+    /// SQLite database overhead are additional and not counted against it.
+    #[serde(
+        default = "default_max_hosting_storage",
+        rename = "max-hosting-storage"
+    )]
+    pub max_hosting_storage: u64,
     /// Telemetry configuration
     #[serde(flatten)]
     pub telemetry: TelemetryConfig,
@@ -811,6 +857,16 @@ fn default_max_blocking_threads() -> usize {
     std::thread::available_parallelism()
         .map(|n| (n.get() * 2).clamp(4, 32))
         .unwrap_or(8)
+}
+
+/// Default operator-facing budget for hosted contract state (1 GiB).
+///
+/// Resolves to [`crate::ring::DEFAULT_HOSTING_BUDGET_BYTES`], which is
+/// the single source of truth for this value — the in-code fallback used by the
+/// hosting cache and its tests. This indirection keeps the operator-facing
+/// default and the in-code default from ever drifting apart.
+fn default_max_hosting_storage() -> u64 {
+    crate::ring::DEFAULT_HOSTING_BUDGET_BYTES
 }
 
 impl Config {
@@ -860,7 +916,16 @@ pub struct NetworkArgs {
     #[arg(long)]
     pub is_gateway: bool,
 
-    /// Skips loading gateway configurations from the network and merging it with existing one.
+    /// Skip fetching the remote gateway index. The on-disk gateways.toml
+    /// cache is also skipped in two cases: (1) the node is a gateway
+    /// (--is-gateway), which always runs isolated under this flag (any
+    /// --gateways JSON entries are still honored); (2) an explicit
+    /// --gateway CLI entry is supplied, in which case the CLI entries
+    /// (plus any --gateways JSON entries) REPLACE the on-disk cache.
+    /// Otherwise — non-gateway peer with no --gateway CLI entry — the
+    /// on-disk gateways.toml is still read (and merged with any
+    /// --gateways JSON), preserving the contract used by test harnesses
+    /// (e.g. freenet-test-network) that pre-populate it via --config-dir.
     #[arg(long)]
     pub skip_load_from_network: bool,
 
@@ -1218,8 +1283,13 @@ pub struct NetworkApiConfig {
     pub bbr_startup_rate: Option<u64>,
 
     /// When true, this node is part of a local/test network and does not load
-    /// gateways from the public index. Used to disable the relay-ready gate
-    /// and other production-only features.
+    /// gateways from the public remote index. Used to disable the relay-ready
+    /// gate and other production-only features. The on-disk gateways.toml is
+    /// also skipped in two cases: when `is_gateway` is true (isolated
+    /// gateway), and when an explicit `--gateway` CLI entry is supplied. With
+    /// neither, the on-disk gateways.toml is still read — the test-harness
+    /// contract preserved for callers like freenet-test-network's Docker NAT
+    /// path that pre-populate the file in a custom `--config-dir`.
     #[serde(default)]
     pub skip_load_from_network: bool,
 }
@@ -1335,7 +1405,10 @@ pub struct WebsocketApiArgs {
     )]
     pub token_cleanup_interval_seconds: Option<u64>,
 
-    /// Additional hostname(s) to accept in the Host header for WebSocket connections.
+    /// Additional hostname(s) to accept in the Host header for the local
+    /// HTTP/WebSocket API (including the delegate permission-prompt
+    /// endpoints `/permission/pending`, `/permission/events`, and
+    /// `/permission/{nonce}/respond`).
     /// Use when accessing the node via a custom domain (e.g., through a reverse proxy).
     /// Can be specified multiple times. If omitted, only the machine's hostname and
     /// bound IP are accepted.
@@ -2704,6 +2777,56 @@ mod tests {
         let _: Config = toml::from_str(&serialized).unwrap();
     }
 
+    #[tokio::test]
+    async fn max_hosting_storage_defaults_to_one_gib() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            ..Default::default()
+        };
+        let cfg = args.build().await.unwrap();
+        assert_eq!(
+            cfg.max_hosting_storage,
+            crate::ring::DEFAULT_HOSTING_BUDGET_BYTES,
+            "default max_hosting_storage should resolve to the hosting cache's \
+             single-source-of-truth default budget"
+        );
+        assert_eq!(
+            crate::ring::DEFAULT_HOSTING_BUDGET_BYTES,
+            1024 * 1024 * 1024,
+            "default hosting budget should be 1 GiB"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_hosting_storage_explicit_value_round_trips() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let custom = 256 * 1024 * 1024_u64;
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            max_hosting_storage: Some(custom),
+            ..Default::default()
+        };
+        let cfg = args.build().await.unwrap();
+        assert_eq!(cfg.max_hosting_storage, custom);
+
+        // Round-trips through TOML serialization.
+        let serialized = toml::to_string(&cfg).unwrap();
+        assert!(serialized.contains("max-hosting-storage"));
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.max_hosting_storage, custom);
+    }
+
     /// Build a minimal local-mode ConfigArgs with the given CIDR list and
     /// return the result of `build().await`. The allowed_source_cidrs path
     /// is the only interesting variation; everything else is defaulted.
@@ -3354,6 +3477,310 @@ mod tests {
             err.to_string()
                 .contains("Cannot initialize node without gateways"),
             "Expected 'Cannot initialize node without gateways', got: {err}"
+        );
+    }
+
+    /// Regression test for #3980: when `--skip-load-from-network` is combined
+    /// with an explicit `--gateway` entry, the on-disk `gateways.toml` must
+    /// NOT be merged into the result. Without this guarantee, a default-install
+    /// machine whose `gateways.toml` lists public peers (e.g. nova/vega) would
+    /// have those public peers dialed by an "isolated" test node — exactly
+    /// the leak #3980 reported.
+    ///
+    /// Note: when --gateway is NOT supplied under skip_load_from_network, the
+    /// on-disk gateways.toml IS still read — that path is the contract used
+    /// by isolated test harnesses (e.g. freenet-test-network's Docker NAT)
+    /// that pre-populate gateways.toml in a custom --config-dir.
+    #[tokio::test]
+    async fn test_skip_load_from_network_with_cli_gateway_ignores_on_disk_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path();
+        let gateways_file = config_dir.join("gateways.toml");
+
+        // Pre-populate gateways.toml with a "production" gateway entry that
+        // the test must NOT leak to the final config.
+        let public_gateway_addr: SocketAddr = "203.0.113.99:31337".parse().unwrap();
+        let preexisting = toml::to_string(&Gateways {
+            gateways: vec![GatewayConfig {
+                address: Address::HostAddress(public_gateway_addr),
+                public_key_path: PathBuf::from("public_gateway.pub"),
+                location: None,
+            }],
+        })
+        .unwrap();
+        fs::write(&gateways_file, preexisting).unwrap();
+
+        let isolated_keypair = TransportKeypair::new();
+        let isolated_key_hex = hex::encode(isolated_keypair.public().as_bytes());
+        let isolated_addr: SocketAddr = "127.0.0.1:31338".parse().unwrap();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir.to_path_buf()),
+                data_dir: Some(config_dir.to_path_buf()),
+                log_dir: Some(config_dir.to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                gateway: Some(vec![format!("{isolated_addr},{isolated_key_hex}")]),
+                skip_load_from_network: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let cfg = args.build().await.unwrap();
+
+        // The CLI-provided isolated gateway must be the ONLY entry. The public
+        // gateway from the on-disk file must NOT leak into the final list.
+        assert_eq!(cfg.gateways.len(), 1, "gateways={:?}", cfg.gateways);
+        assert_eq!(
+            cfg.gateways[0].address,
+            Address::HostAddress(isolated_addr),
+            "isolated gateway should be selected"
+        );
+        assert!(
+            !cfg.gateways
+                .iter()
+                .any(|gw| gw.address == Address::HostAddress(public_gateway_addr)),
+            "on-disk gateways.toml leaked into final config despite skip_load_from_network"
+        );
+    }
+
+    /// Companion to #3980: under `--skip-load-from-network` with NO `--gateway`
+    /// CLI entries, the on-disk `gateways.toml` MUST still be read. This is
+    /// the contract used by isolated test harnesses (notably
+    /// freenet-test-network's Docker NAT path) that pre-populate
+    /// `gateways.toml` in a custom `--config-dir`. Regressed once during
+    /// review of #4264 when the skip path was widened too aggressively;
+    /// keep this test to pin the contract.
+    #[tokio::test]
+    async fn test_skip_load_from_network_without_cli_gateways_reads_on_disk_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path();
+        let gateways_file = config_dir.join("gateways.toml");
+
+        let test_gateway_addr: SocketAddr = "10.20.30.40:31337".parse().unwrap();
+        let preexisting = toml::to_string(&Gateways {
+            gateways: vec![GatewayConfig {
+                address: Address::HostAddress(test_gateway_addr),
+                public_key_path: PathBuf::from("test_gateway.pub"),
+                location: None,
+            }],
+        })
+        .unwrap();
+        fs::write(&gateways_file, preexisting).unwrap();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir.to_path_buf()),
+                data_dir: Some(config_dir.to_path_buf()),
+                log_dir: Some(config_dir.to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                is_gateway: false,
+                // No --gateway / --gateways supplied; harness pre-populated
+                // gateways.toml is the only bootstrap source.
+                public_address: Some("198.51.100.1".parse().unwrap()),
+                public_port: Some(31338),
+                skip_load_from_network: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let cfg = args.build().await.unwrap();
+        assert_eq!(cfg.gateways.len(), 1, "gateways={:?}", cfg.gateways);
+        assert_eq!(
+            cfg.gateways[0].address,
+            Address::HostAddress(test_gateway_addr),
+            "on-disk gateways.toml must be honored when --gateway is not supplied"
+        );
+    }
+
+    /// Pin: under `--skip-load-from-network --is-gateway`, the on-disk
+    /// gateways.toml is NOT read regardless of whether `--gateway` is set.
+    /// An isolated gateway runs without any bootstrap peers (unless inline
+    /// `--gateways` JSON entries are supplied). This is the pre-existing
+    /// behavior of the `skip_load && is_gateway` branch and matches the
+    /// docstring contract.
+    #[tokio::test]
+    async fn test_skip_load_from_network_gateway_mode_ignores_on_disk_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path();
+        let gateways_file = config_dir.join("gateways.toml");
+
+        // Pre-populate gateways.toml — must NOT leak into an isolated gateway.
+        let leaked_addr: SocketAddr = "192.0.2.50:31337".parse().unwrap();
+        let preexisting = toml::to_string(&Gateways {
+            gateways: vec![GatewayConfig {
+                address: Address::HostAddress(leaked_addr),
+                public_key_path: PathBuf::from("leaked.pub"),
+                location: None,
+            }],
+        })
+        .unwrap();
+        fs::write(&gateways_file, preexisting).unwrap();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir.to_path_buf()),
+                data_dir: Some(config_dir.to_path_buf()),
+                log_dir: Some(config_dir.to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                is_gateway: true,
+                public_address: Some("198.51.100.1".parse().unwrap()),
+                public_port: Some(31337),
+                skip_load_from_network: true,
+                // No --gateway supplied.
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let cfg = args.build().await.unwrap();
+        assert!(cfg.is_gateway);
+        assert!(
+            cfg.gateways.is_empty(),
+            "isolated gateway must NOT read gateways.toml; got {:?}",
+            cfg.gateways
+        );
+    }
+
+    /// Pin: under `--skip-load-from-network --gateway X --gateways JSON_Y`,
+    /// both the CLI entry and the JSON entry reach the final config — the
+    /// new "strict additive --gateway" branch must preserve any inline
+    /// --gateways JSON entries rather than silently dropping them.
+    #[tokio::test]
+    async fn test_skip_load_from_network_preserves_inline_gateways_with_cli_gateway() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path();
+
+        // Pre-populate gateways.toml with an entry that MUST NOT leak.
+        let leaked_addr: SocketAddr = "192.0.2.99:31337".parse().unwrap();
+        let preexisting = toml::to_string(&Gateways {
+            gateways: vec![GatewayConfig {
+                address: Address::HostAddress(leaked_addr),
+                public_key_path: PathBuf::from("leaked.pub"),
+                location: None,
+            }],
+        })
+        .unwrap();
+        fs::write(config_dir.join("gateways.toml"), preexisting).unwrap();
+
+        // Inline --gateways JSON: a test gateway address.
+        let json_keypair = TransportKeypair::new();
+        let json_key_path = config_dir.join("json_gw.pub");
+        fs::write(
+            &json_key_path,
+            hex::encode(json_keypair.public().as_bytes()),
+        )
+        .unwrap();
+        let json_addr: SocketAddr = "10.10.10.10:31337".parse().unwrap();
+        let json_inline = serde_json::to_string(&InlineGwConfig {
+            address: json_addr,
+            public_key_path: json_key_path,
+            location: None,
+        })
+        .unwrap();
+
+        // CLI --gateway: another distinct test gateway address.
+        let cli_keypair = TransportKeypair::new();
+        let cli_key_hex = hex::encode(cli_keypair.public().as_bytes());
+        let cli_addr: SocketAddr = "10.20.20.20:31337".parse().unwrap();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir.to_path_buf()),
+                data_dir: Some(config_dir.to_path_buf()),
+                log_dir: Some(config_dir.to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                gateway: Some(vec![format!("{cli_addr},{cli_key_hex}")]),
+                gateways: Some(vec![json_inline]),
+                skip_load_from_network: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let cfg = args.build().await.unwrap();
+        let addrs: Vec<_> = cfg.gateways.iter().map(|gw| gw.address.clone()).collect();
+        assert!(
+            addrs.contains(&Address::HostAddress(cli_addr)),
+            "CLI --gateway must be in final list: {addrs:?}"
+        );
+        assert!(
+            addrs.contains(&Address::HostAddress(json_addr)),
+            "Inline --gateways JSON entry must be in final list: {addrs:?}"
+        );
+        assert!(
+            !addrs.contains(&Address::HostAddress(leaked_addr)),
+            "On-disk gateways.toml must NOT leak when --gateway is supplied: {addrs:?}"
+        );
+        assert_eq!(
+            addrs.len(),
+            2,
+            "expected exactly cli + json entries: {addrs:?}"
+        );
+    }
+
+    /// Pin: `skip_load_from_network + is_gateway + --gateway X` with a public
+    /// gateway in the on-disk gateways.toml. The pre-existing
+    /// `skip_load && is_gateway` branch fires first and ignores the file;
+    /// the post-block merge then prepends the CLI --gateway entry. Final
+    /// gateways list must be exactly [X] with no on-disk leak. Covers the
+    /// four-way combination flagged in re-review for #4264.
+    #[tokio::test]
+    async fn test_skip_load_from_network_isolated_gateway_with_cli_gateway_ignores_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path();
+
+        let leaked_addr: SocketAddr = "192.0.2.77:31337".parse().unwrap();
+        let preexisting = toml::to_string(&Gateways {
+            gateways: vec![GatewayConfig {
+                address: Address::HostAddress(leaked_addr),
+                public_key_path: PathBuf::from("leaked.pub"),
+                location: None,
+            }],
+        })
+        .unwrap();
+        fs::write(config_dir.join("gateways.toml"), preexisting).unwrap();
+
+        let cli_keypair = TransportKeypair::new();
+        let cli_key_hex = hex::encode(cli_keypair.public().as_bytes());
+        let cli_addr: SocketAddr = "10.30.30.30:31337".parse().unwrap();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir.to_path_buf()),
+                data_dir: Some(config_dir.to_path_buf()),
+                log_dir: Some(config_dir.to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                is_gateway: true,
+                public_address: Some("198.51.100.7".parse().unwrap()),
+                public_port: Some(31337),
+                gateway: Some(vec![format!("{cli_addr},{cli_key_hex}")]),
+                skip_load_from_network: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let cfg = args.build().await.unwrap();
+        let addrs: Vec<_> = cfg.gateways.iter().map(|gw| gw.address.clone()).collect();
+        assert!(cfg.is_gateway);
+        assert_eq!(addrs.len(), 1, "expected only the CLI gateway: {addrs:?}");
+        assert_eq!(addrs[0], Address::HostAddress(cli_addr));
+        assert!(
+            !addrs.contains(&Address::HostAddress(leaked_addr)),
+            "isolated gateway leaked file content: {addrs:?}"
         );
     }
 

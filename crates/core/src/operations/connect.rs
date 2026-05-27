@@ -845,8 +845,8 @@ impl RelayContext for RelayEnv<'_> {
             .self_location
             .location()
             .map(|loc| loc.distance(desired_location));
-        let mut scored: Vec<(f64, PeerKeyLocation)> = Vec::new();
-        let mut fallbacks: Vec<PeerKeyLocation> = Vec::new();
+        let mut scored: Vec<(f64, PeerKeyLocation)> = Vec::with_capacity(candidates.len());
+        let mut fallbacks: Vec<PeerKeyLocation> = Vec::with_capacity(candidates.len());
 
         let conn_mgr = &self.op_manager.ring.connection_manager;
 
@@ -982,23 +982,24 @@ impl RelayContext for RelayEnv<'_> {
         );
 
         // Score candidates by acceptor reliability, filtering out recency cooldown.
+        // Single pass: score candidates, track the best reliability,
+        // discard peers in recency cooldown.
+        let mut best_reliability = 0.0_f64;
         let scored: Vec<(f64, PeerKeyLocation)> = candidates
             .into_iter()
-            .filter(|cand| {
+            .filter_map(|cand| {
                 // Skip peers we recently forwarded to
-                if let Some(ts) = recency.get(cand) {
+                if let Some(ts) = recency.get(&cand) {
                     if now.duration_since(*ts) < RECENCY_COOLDOWN {
-                        return false;
+                        return None;
                     }
                 }
-                true
-            })
-            .map(|cand| {
                 let reliability = cand
                     .socket_addr()
                     .map(|addr| conn_mgr.peer_acceptor_reliability(addr, now))
                     .unwrap_or(0.5);
-                (reliability, cand)
+                best_reliability = best_reliability.max(reliability);
+                Some((reliability, cand))
             })
             .collect();
 
@@ -1010,25 +1011,19 @@ impl RelayContext for RelayEnv<'_> {
             return None;
         }
 
-        // Keep candidates whose reliability is within 0.1 of the best.
-        // This avoids discarding close-to-target peers over tiny reliability
-        // differences while still filtering out genuinely unreliable ones.
-        let best_reliability = scored.iter().map(|(r, _)| *r).fold(0.0_f64, f64::max);
-        let best_candidates: Vec<PeerKeyLocation> = scored
+        // Keep candidates whose reliability is within 0.1 of the best and
+        // immediately partition into "close uphill" (within 2× NEAR_TERMINUS_DISTANCE of target)
+        // and "far uphill". This avoids an intermediate Vec allocation.
+        let close_threshold = NEAR_TERMINUS_DISTANCE * 2.0;
+        let (close, far): (Vec<_>, Vec<_>) = scored
             .into_iter()
             .filter(|(r, _)| best_reliability - *r < UPHILL_RELIABILITY_TOLERANCE)
             .map(|(_, c)| c)
-            .collect();
-
-        // Partition into "close uphill" (within 2× NEAR_TERMINUS_DISTANCE of target)
-        // and "far uphill". Prefer close uphill peers as they're more likely to know
-        // peers near the target that we don't.
-        let close_threshold = NEAR_TERMINUS_DISTANCE * 2.0;
-        let (close, far): (Vec<_>, Vec<_>) = best_candidates.into_iter().partition(|cand| {
-            cand.location()
-                .map(|loc| loc.distance(desired_location).as_f64() < close_threshold)
-                .unwrap_or(false)
-        });
+            .partition(|cand: &PeerKeyLocation| {
+                cand.location()
+                    .map(|loc| loc.distance(desired_location).as_f64() < close_threshold)
+                    .unwrap_or(false)
+            });
 
         if !close.is_empty() {
             tracing::debug!(
@@ -1111,7 +1106,7 @@ impl ConnectOp {
     }
 
     pub(crate) fn expire_forward_attempts(&mut self, now: Instant) {
-        let mut expired = Vec::new();
+        let mut expired = Vec::with_capacity(self.forward_attempts.len());
         for (peer, attempt) in self.forward_attempts.iter() {
             if now.duration_since(attempt.sent_at) >= FORWARD_ATTEMPT_TIMEOUT {
                 expired.push((peer.clone(), attempt.desired));
@@ -2761,10 +2756,29 @@ mod tests {
         let joiner = make_peer(5200);
         let next_hop = make_peer(6200);
 
+        // Pin the invariant the fix relies on: `desired_location` must be
+        // far enough from `self_loc` that the near-terminus probabilistic
+        // accept branch (line ~624: `d < NEAR_TERMINUS_DISTANCE`) is
+        // statically unreachable. Using `next_hop`'s location makes this
+        // deterministic — but only because `make_peer` derives location
+        // from the loopback port. If port choices, `Location::from_address`,
+        // or `NEAR_TERMINUS_DISTANCE` ever change such that the gap shrinks,
+        // fail loudly here rather than silently re-flake. See #3944.
+        let target_loc = next_hop.location().expect("test peer has location");
+        let self_to_target = self_loc
+            .location()
+            .expect("test peer has location")
+            .distance(target_loc)
+            .as_f64();
+        assert!(
+            self_to_target > NEAR_TERMINUS_DISTANCE,
+            "test invariant: self_loc must be > NEAR_TERMINUS_DISTANCE ({NEAR_TERMINUS_DISTANCE}) from desired_location, got {self_to_target}"
+        );
+
         let mut state = RelayState {
             upstream_addr: joiner.socket_addr().expect("test peer must have address"),
             request: ConnectRequest {
-                desired_location: Location::random(),
+                desired_location: target_loc,
                 joiner: joiner.clone(),
                 ttl: 3,
                 visited: VisitedPeers::default(),
@@ -2832,6 +2846,69 @@ mod tests {
         assert!(
             actions2.forward.is_none(),
             "second call should not forward again"
+        );
+    }
+
+    /// Regression for #3944: directly exercises the "already forwarded → don't
+    /// accept" guard at the terminus-acceptance check without going through the
+    /// forwarding path first. The companion test
+    /// `relay_does_not_accept_after_forwarding_on_retry` was previously flaky
+    /// because its first call exercised near-terminus probabilistic acceptance
+    /// (driven by `GlobalRng`) before `forwarded_to` was set, sometimes
+    /// triggering acceptance regardless of the post-forward guard.
+    ///
+    /// This test sets `forwarded_to` and `forwarded_at` in the initial
+    /// `RelayState` so the only path under test is the terminus-acceptance
+    /// gate, which is fully deterministic. It would have failed before the
+    /// fix at `is_terminus && !self.accepted_locally && self.forwarded_to.is_none()`
+    /// was introduced, and is unaffected by RNG state.
+    #[test]
+    fn relay_with_forwarded_state_rejects_acceptance_at_terminus() {
+        let self_loc = make_peer(4250);
+        let joiner = make_peer(5250);
+        let prior_next_hop = make_peer(6250);
+
+        let mut state = RelayState {
+            upstream_addr: joiner.socket_addr().expect("test peer must have address"),
+            request: ConnectRequest {
+                desired_location: prior_next_hop.location().expect("test peer has location"),
+                joiner: joiner.clone(),
+                ttl: 3,
+                visited: VisitedPeers::default(),
+                uphill_budget: DEFAULT_UPHILL_BUDGET,
+            },
+            // Simulate a prior forward that completed: the operation has
+            // already committed to a path and must not also accept locally.
+            forwarded_to: Some(prior_next_hop),
+            forwarded_at: Some(Instant::now()),
+            observed_sent: false,
+            accepted_locally: false,
+            response_forwarded: false,
+        };
+
+        // Terminus (next_hop=None) with should_accept=true — every condition
+        // that would normally green-light acceptance is in place EXCEPT the
+        // forwarded_to guard.
+        let ctx = TestRelayContext::new(self_loc).accept(true).next_hop(None);
+        let recency = HashMap::new();
+        let mut forward_attempts = HashMap::new();
+        let estimator = ConnectForwardEstimator::new();
+
+        let actions = state.handle_request(
+            &ctx,
+            &recency,
+            &mut forward_attempts,
+            &estimator,
+            Instant::now(),
+        );
+
+        assert!(
+            actions.accept.is_none(),
+            "relay must not accept once forwarded_to is set, even at terminus"
+        );
+        assert!(
+            actions.forward.is_none(),
+            "relay must not forward again when forwarded_to is already set"
         );
     }
 

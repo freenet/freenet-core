@@ -277,6 +277,15 @@ pub(super) struct DelegateCallEnv {
     /// contract state synchronously via host functions. ReDb is Arc<Database>
     /// internally, so cloning is cheap.
     state_store_db: Option<Storage>,
+    /// Optional callback invoked AFTER a successful V2 delegate state write
+    /// (`put_contract_state_sync` / `update_contract_state_sync`). Closes the
+    /// EvictContract re-host race for the V2 delegate write path by bumping
+    /// the per-contract generation token and refreshing the hosting-cache
+    /// snapshot — the V2 path bypasses the executor `state_store.{store,update}`
+    /// chokepoints where the four executor-side bump+refresh sites live, so
+    /// without this hook the V2 path leaves the race open. See
+    /// `super::runtime::StateWriteCallback`.
+    state_write_callback: Option<super::runtime::StateWriteCallback>,
     /// Interior-mutable pointer to the runtime's DelegateStore. Valid only during
     /// synchronous `process()` call. Used for creating child delegates.
     delegate_store: std::cell::UnsafeCell<*mut DelegateStore>,
@@ -344,6 +353,7 @@ impl DelegateCallEnv {
         secret_store: &mut SecretsStore,
         contract_store: &ContractStore,
         state_store_db: Option<Storage>,
+        state_write_callback: Option<super::runtime::StateWriteCallback>,
         delegate_key: DelegateKey,
         delegate_store: &mut DelegateStore,
         creation_depth: u32,
@@ -355,6 +365,7 @@ impl DelegateCallEnv {
             delegate_key,
             contract_store: contract_store as *const ContractStore,
             state_store_db,
+            state_write_callback,
             delegate_store: std::cell::UnsafeCell::new(delegate_store as *mut DelegateStore),
             creation_depth,
             creations_this_call: std::cell::Cell::new(0),
@@ -565,12 +576,31 @@ impl DelegateCallEnv {
         };
 
         let contract_key = self.resolve_contract_key(instance_id)?;
+        // Capture the byte count BEFORE the move into store_state_sync —
+        // the callback needs it for governance attribution. The
+        // bug-prevention-patterns rule about "Manually-inlined originator
+        // side effects after a task-per-tx migration" applies here too:
+        // a future refactor that drops state_size from the callback path
+        // would silently undercount StateBytesWritten for V2 delegate PUT.
+        let state_size = state.len();
 
         db.store_state_sync(
             &contract_key,
             freenet_stdlib::prelude::WrappedState::new(state),
         )
-        .map_err(|e| DelegateEnvError::StorageError(e.to_string()))
+        .map_err(|e| DelegateEnvError::StorageError(e.to_string()))?;
+
+        // V2 delegate write chokepoint: this path bypasses the executor's
+        // `state_store.store` call site where the bump+refresh+report
+        // happen. The callback (when wired) mirrors those side effects
+        // via `Ring::commit_state_write`. Failure here is best-effort —
+        // the write has already committed and we don't want to roll it
+        // back over a counter bump.
+        if let Some(cb) = &self.state_write_callback {
+            cb(&contract_key, state_size);
+        }
+
+        Ok(())
     }
 
     /// Update contract state by instance ID.
@@ -587,13 +617,25 @@ impl DelegateCallEnv {
         };
 
         let contract_key = self.resolve_contract_key(instance_id)?;
+        // Capture byte count BEFORE the move — same reason as
+        // put_contract_state_sync above.
+        let state_size = state.len();
 
         // Atomic check-and-write in a single ReDb write transaction.
         match db.update_state_sync(
             &contract_key,
             freenet_stdlib::prelude::WrappedState::new(state),
         ) {
-            Ok(true) => Ok(()),
+            Ok(true) => {
+                // V2 delegate write chokepoint: mirror the executor's
+                // `state_store.update` bump+refresh+report side effects
+                // via `Ring::commit_state_write`. See
+                // `put_contract_state_sync` for the rationale.
+                if let Some(cb) = &self.state_write_callback {
+                    cb(&contract_key, state_size);
+                }
+                Ok(())
+            }
             Ok(false) => Err(DelegateEnvError::NoExistingState),
             Err(e) => Err(DelegateEnvError::StorageError(e.to_string())),
         }

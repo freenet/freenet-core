@@ -37,6 +37,10 @@ pub mod server;
 /// Local network topology management.
 mod topology;
 
+/// Outlier-detection primitive shared by per-contract governance and
+/// peer-side load-shedding. See `docs/design/contract-hardening.md`.
+mod governance;
+
 /// Tracing and loging infrastructure. Includes our custom event log register. Tracing collectors, etc.
 #[cfg_attr(test, allow(dead_code))]
 pub mod tracing;

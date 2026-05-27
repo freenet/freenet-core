@@ -13,7 +13,7 @@ paths:
 
 `.send().await` on a bounded channel inside an event loop or recv loop.
 When the receiver is slow or blocked on another channel, the sender blocks,
-stalling the entire event loop. This has caused 4+ production deadlocks:
+stalling the entire event loop. This has caused 5+ production deadlocks:
 
 - **StreamRegistry** (Mar 2026): `mpsc::channel(64)` whose receiver was never
   consumed. After 64 streams, `.send().await` blocked forever, deadlocking
@@ -36,6 +36,30 @@ stalling the entire event loop. This has caused 4+ production deadlocks:
   `.send().await`: the receiver there is the freenet-spawned
   `recv_stream` reassembly task, internal and same-runtime, so the
   cascading-backpressure pattern this rule prevents cannot form.
+- **Event-loop notification channel back-pressure deadlock** (#4145, #4231,
+  May 2026): both production gateways (nova, vega) wedged simultaneously
+  with `channel_pending=2048` on senders and `notification_channel_pending=0`
+  on the receiver — a self-feeding cycle. The executor's WASM commit
+  path called `notify_node_event(BroadcastStateChange{…}).await` (30 s
+  timeout) on every contract UPDATE. Under sustained UPDATE fan-out
+  (50–80 broadcast targets per popular River contract), the
+  `event_loop_notification` channel filled up faster than the event
+  loop could drain it, and the drainers themselves were blocked
+  downstream — every drained notification spawned per-peer dispatch
+  work that re-entered the same backpressure surface. Compounding:
+  `ConnEvent::StreamSend` / `PipeStream` in `p2p_protoc.rs` did
+  `peer_connection.sender.send(...).await` with no timeout, so a single
+  congested peer could stall the event loop indefinitely. Fix
+  (#4231): (a) added `OpManager::try_notify_node_event` and switched
+  the four best-effort Broadcast emission sites to it, breaking the
+  cycle at the executor side; (b) wrapped per-peer dispatch in
+  `tokio::time::timeout(500ms, peer_connection.sender.reserve())` so
+  ownership of `completion_tx` is retained on the timeout path,
+  releasing the broadcast queue's permit immediately instead of
+  waiting `STREAM_COMPLETION_TIMEOUT` (120 s). One emission site
+  (`announce_contract_hosted`) intentionally kept the blocking variant
+  because it carries a one-shot transition — see its inline
+  `DELIBERATELY blocking` comment for the rationale.
 
 ## Exception: same-runtime internal consumers
 

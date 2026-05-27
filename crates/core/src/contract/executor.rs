@@ -99,6 +99,24 @@ pub(crate) use init_tracker::{
 };
 pub(crate) use runtime::RuntimePool;
 
+/// Typed marker for queue-full errors so callers can downcast and
+/// distinguish transient per-contract queue saturation from real
+/// executor failures (OOG, traps, missing parameters, storage errors).
+///
+/// Constructed by `send_queue_full_response`; recognized by
+/// `ExecutorError::is_contract_queue_full` (see that predicate for the
+/// platform-resilience invariant it enforces). Issue #4251.
+#[derive(Debug, Clone, Copy)]
+pub struct ContractQueueFull;
+
+impl std::fmt::Display for ContractQueueFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("contract queue full, try again later")
+    }
+}
+
+impl std::error::Error for ContractQueueFull {}
+
 #[derive(Debug)]
 pub struct ExecutorError {
     inner: Either<Box<RequestError>, anyhow::Error>,
@@ -271,6 +289,29 @@ impl ExecutorError {
         }
     }
 
+    /// Returns true if this error is the typed `ContractQueueFull` marker.
+    ///
+    /// Produced by:
+    /// - `send_queue_full_response` (per-contract fair queue at capacity),
+    /// - the `InitCheckResult::QueueFull` arm in `executor/runtime.rs` (per-contract
+    ///   initialization queue at capacity).
+    ///
+    /// **Platform-resilience invariant**: queue-full is transient
+    /// backpressure, not a contract-level fault, missing-contract condition,
+    /// or WASM failure. Callers in paths that have amplification side effects
+    /// (today: UPDATE relay's `try_auto_fetch_contract` and `ResyncRequest`)
+    /// MUST gate those branches on this predicate so a saturated contract
+    /// doesn't induce a network-wide storm. Paths without amplification
+    /// (today: PUT, GET, SUBSCRIBE) only need to gate **ERROR-level logging**
+    /// off this predicate, since on a hot contract the volume otherwise drowns
+    /// real failures. See issue #4251.
+    pub fn is_contract_queue_full(&self) -> bool {
+        match &self.inner {
+            Either::Left(_) => false,
+            Either::Right(err) => err.downcast_ref::<ContractQueueFull>().is_some(),
+        }
+    }
+
     pub fn is_fatal(&self) -> bool {
         self.fatal
     }
@@ -433,6 +474,36 @@ pub(crate) trait ContractExecutor: Send + 'static {
     ///
     /// Default implementation is a no-op (for mock executors that don't track subscriptions).
     fn remove_client(&self, _client_id: ClientId) {}
+
+    /// Reclaim a contract's on-disk storage (persisted state + parameters and
+    /// the WASM code blob) after the contract was evicted from the hosting
+    /// cache. Best-effort and idempotent: a double eviction is a no-op.
+    ///
+    /// `expected_generation` is the state-write generation captured
+    /// atomically with the eviction decision. Implementations that wire
+    /// through to a real `Ring`/`HostingManager` re-read the current
+    /// generation and skip reclamation if it has advanced (closing the
+    /// EvictContract re-host race). Implementations without a `Ring` may
+    /// ignore the argument.
+    ///
+    /// Default implementation is a no-op (for mock executors that keep state
+    /// in memory and have no on-disk storage to reclaim).
+    fn remove_contract(
+        &mut self,
+        _key: &ContractKey,
+        _expected_generation: u64,
+    ) -> impl Future<Output = Result<(), ExecutorError>> + Send {
+        async { Ok(()) }
+    }
+
+    /// Record that an `EvictContract` event was dropped before it could
+    /// complete (queue-full rejection in `contract_handling`), so the
+    /// periodic sweep can retry it via `reclaim_evicted_contract`.
+    ///
+    /// Default implementation is a no-op (for mock executors with no
+    /// `Ring` to record into). The real implementation on `RuntimePool`
+    /// forwards to `op_manager.ring.pending_reclamation_add`.
+    fn track_pending_reclamation(&self, _key: ContractKey, _expected_generation: u64) {}
 
     /// Compute the state summary for a contract using the contract's summarize_state method.
     fn summarize_contract_state(
@@ -928,6 +999,73 @@ mod tests {
                 !err.is_fatal(),
                 "MaxComputeTimeExceeded must not be fatal - it would kill the entire contract handler"
             );
+        }
+
+        // ── ContractQueueFull predicate (issue #4251) ─────────────────────
+        //
+        // The marker must be cleanly distinguishable from every other error
+        // class so amplification suppression fires only on queue-full.
+
+        #[test]
+        fn test_contract_queue_full_true_for_marker_error() {
+            let err = ExecutorError::other(ContractQueueFull);
+            assert!(
+                err.is_contract_queue_full(),
+                "ContractQueueFull marker MUST be recognized by is_contract_queue_full"
+            );
+            // Display message preserved for human-readable surface (logs, etc.)
+            assert!(err.to_string().contains("contract queue full"));
+        }
+
+        #[test]
+        fn test_contract_queue_full_false_for_anyhow_string_lookalike() {
+            // Predicate is typed (downcast), not string-matched: a similarly-
+            // worded anyhow error must not inherit queue-full semantics.
+            let err = ExecutorError::other(anyhow::anyhow!("contract queue full, try again later"));
+            assert!(
+                !err.is_contract_queue_full(),
+                "Anyhow string with matching prose must NOT satisfy the typed predicate"
+            );
+        }
+
+        #[test]
+        fn test_contract_queue_full_false_for_invalid_update() {
+            let key = test_fixtures::make_contract_key();
+            let err = ExecutorError::request(StdContractError::update_exec_error(
+                key,
+                "invalid contract update, reason: stale",
+            ));
+            assert!(
+                !err.is_contract_queue_full(),
+                "Benign WASM invalid-update rejection is not queue-full"
+            );
+        }
+
+        #[test]
+        fn test_contract_queue_full_false_for_missing_parameters() {
+            let key = test_fixtures::make_contract_key();
+            let err = ExecutorError::request(StdContractError::Update {
+                key,
+                cause: "missing contract parameters".into(),
+            });
+            assert!(
+                !err.is_contract_queue_full(),
+                "Missing contract parameters is not queue-full"
+            );
+        }
+
+        #[test]
+        fn test_contract_queue_full_disjoint_from_other_predicates() {
+            // Load-bearing property used by the gating in op_ctx_task.rs:
+            // the queue-full marker must trip its own predicate and no other.
+            let err = ExecutorError::other(ContractQueueFull);
+            assert!(err.is_contract_queue_full());
+            assert!(!err.is_request());
+            assert!(!err.is_contract_exec_rejection());
+            assert!(!err.is_invalid_update_rejection());
+            assert!(!err.is_missing_contract_parameters());
+            assert!(!err.is_missing_delegate());
+            assert!(!err.is_fatal());
         }
     }
 

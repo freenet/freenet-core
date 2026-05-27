@@ -110,10 +110,11 @@ Pattern (logic in native_api.rs):
 USE: StateStore trait
 Backends: redb (default), sqlite
 
-Operations:
-  - get_state(key) → Option<State>
-  - put_state(key, state) → Result
-  - delete_state(key) → Result
+Operations (StateStore methods):
+  - get(key) → WrappedState
+  - store(key, state, params) → Result
+  - update(key, state) → Result
+  - delete(key) → Result
 
 MUST:
   - Handle missing state gracefully (new contract)
@@ -144,6 +145,17 @@ State merging rules:
   - Contract defines merge semantics
   - Merge MUST be commutative: merge(a, b) == merge(b, a)
   - Merge MUST be associative: merge(merge(a, b), c) == merge(a, merge(b, c))
+  - For `UpdateData::State` inputs, merge MUST be idempotent:
+      update_state(update_state(S, State(X)), State(X)) == update_state(S, State(X))
+    Enforced at runtime via the in-peer probe in
+    `Executor::maybe_probe_idempotency`. Violators get flagged in
+    `Ring::broken_invariants` and their outbound `BroadcastStateChange`
+    is suppressed locally; the flag is permanent for that contract
+    instance id and survives restart. See `ring::broken_invariants` and
+    issue #4251 / PR #4279.
+    Note: this invariant is NOT enforced for `UpdateData::Delta` inputs
+    (CmRDT-style "increment by X" deltas legitimately violate it) or
+    `UpdateData::RelatedState` (a cross-contract hint, not a CRDT op).
   - Invalid merges should return error, not panic
 ```
 
@@ -305,7 +317,7 @@ Handling:
 
 ```
 □ Test contract validation (valid and invalid states)
-□ Test state merging (commutativity, associativity)
+□ Test state merging (commutativity, associativity, idempotency on State inputs)
 □ Test execution timeout handling
 □ Test related contract fetching
 □ Test concurrent contract updates
