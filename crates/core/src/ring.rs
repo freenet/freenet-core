@@ -42,11 +42,13 @@ use crate::{
     router::Router,
 };
 
+mod broken_invariants;
 mod connection_backoff;
 mod connection_manager;
 pub(crate) use connection_manager::ConnectionManager;
 mod connection;
 mod hosting;
+pub(crate) use broken_invariants::{BrokenInvariant, BrokenInvariantsTracker};
 /// Single source of truth for the default hosted-contract-state budget.
 /// `config::default_max_hosting_storage()` resolves to this so the
 /// operator-facing default and the in-code fallback can never drift.
@@ -93,6 +95,10 @@ pub(crate) struct Ring {
     pub router: Arc<RwLock<Router>>,
     pub live_tx_tracker: LiveTransactionTracker,
     hosting_manager: hosting::HostingManager,
+    /// Per-contract record of detected CRDT-invariant violations (e.g. a
+    /// non-idempotent `update_state`). Used to gate outbound broadcast
+    /// so a broken contract's state changes don't leave the node.
+    broken_invariants: BrokenInvariantsTracker,
     event_register: Box<dyn NetEventRegister>,
     op_manager: RwLock<Option<Weak<OpManager>>>,
     /// Whether this peer is a gateway or not. This will affect behavior of the node when acquiring
@@ -224,6 +230,7 @@ impl Ring {
             router,
             connection_manager,
             hosting_manager: hosting::HostingManager::new(config.config.max_hosting_storage),
+            broken_invariants: BrokenInvariantsTracker::new(),
             live_tx_tracker: live_tx_tracker.clone(),
             event_register: Box::new(event_register),
             op_manager: RwLock::new(None),
@@ -1901,6 +1908,29 @@ impl Ring {
     /// No-op if the contract is not currently subscribed.
     pub fn record_contract_update(&self, contract: &ContractKey) {
         self.hosting_manager.record_contract_update(contract)
+    }
+
+    /// True if `contract` has been flagged as violating a CRDT invariant
+    /// (e.g. non-idempotent `update_state`). Callers on the broadcast path
+    /// must skip emission when this returns true to prevent the broken
+    /// contract from generating a propagation storm.
+    pub fn is_contract_broken(&self, contract: &ContractKey) -> bool {
+        self.broken_invariants.is_broken(contract.id())
+    }
+
+    /// Mark `contract` as broken with `kind`. Idempotent. See
+    /// [`broken_invariants`] module docs.
+    pub(crate) fn record_broken_invariant(&self, contract: ContractKey, kind: BrokenInvariant) {
+        self.broken_invariants.record(*contract.id(), kind);
+    }
+
+    /// Wire persistent storage for the broken-invariants tracker. Called
+    /// once at executor wiring time.
+    pub(crate) fn set_broken_invariants_storage(
+        &self,
+        storage: crate::contract::storages::Storage,
+    ) {
+        self.broken_invariants.set_storage(storage);
     }
 
     /// Report a per-contract resource sample to the topology meter.

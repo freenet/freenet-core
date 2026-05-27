@@ -10,6 +10,17 @@ const MAX_RELATED_CONTRACTS_PER_REQUEST: usize = 10;
 
 /// Timeout for fetching all related contracts during validation.
 const RELATED_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Probability that a given state-changing merge is checked for
+/// `update_state` idempotency. One re-invocation of WASM per sample, so
+/// the per-merge cost is ~`p * average_update_state_us`. At 1/32 ≈ 3%
+/// the overhead is negligible on healthy contracts and detection is
+/// effectively certain within a few seconds on a contract that's
+/// firing dozens of merges/sec.
+///
+/// Sample selection uses `GlobalRng` (deterministic under a fixed seed
+/// for simulation tests). See `Executor::maybe_probe_idempotency`.
+const IDEMPOTENCY_PROBE_PROBABILITY: f64 = 1.0 / 32.0;
 use crate::node::OpManager;
 use crate::wasm_runtime::{
     BackendEngine, DEFAULT_MODULE_CACHE_CAPACITY, MAX_STATE_SIZE, RuntimeConfig, SharedModuleCache,
@@ -1775,6 +1786,39 @@ where
         if updated_state.as_ref() == current_state.as_ref() {
             Ok(UpsertResult::NoChange)
         } else {
+            // CRDT-invariant idempotency probe. With low probability, re-run
+            // `update_state` with `updated_state` as the current state and
+            // the same `updates`. A correct CRDT must satisfy
+            // `update_state(update_state(S, U), U) == update_state(S, U)` —
+            // a violation indicates a contract bug (timestamp/RNG/position-
+            // dependent signing/etc.) that produces an infinite broadcast
+            // storm in the network. See `crate::ring::broken_invariants`.
+            //
+            // `RelatedState` inputs are skipped: re-applying a cross-
+            // contract state hint isn't required to be a no-op by the
+            // contract ABI, so probing it can produce false positives.
+            self.maybe_probe_idempotency(&key, &params, &updated_state, &updates)
+                .await;
+
+            if self
+                .op_manager
+                .as_ref()
+                .map(|m| m.ring.is_contract_broken(&key))
+                .unwrap_or(false)
+            {
+                // Probe just flagged this contract (or it was already
+                // flagged). Skip the commit so we don't extend the
+                // problematic state, and surface the suppression to
+                // callers via NoChange — there is no state change the
+                // network should observe.
+                tracing::debug!(
+                    contract = %key,
+                    event = "merge_suppressed_broken_contract",
+                    "Skipping commit_state_update for contract flagged as broken"
+                );
+                return Ok(UpsertResult::NoChange);
+            }
+
             self.commit_state_update(&key, &params, &updated_state)
                 .await?;
             Ok(UpsertResult::Updated(updated_state))
@@ -2090,6 +2134,125 @@ where
         Ok(Either::Left(new_state))
     }
 
+    /// Probe-sampled idempotency check. Re-runs `update_state` with the just-
+    /// produced state as the current state and the same updates; flags the
+    /// contract as broken if the result differs.
+    ///
+    /// Costs one extra WASM invocation per sampled merge. With the
+    /// configured probability [`IDEMPOTENCY_PROBE_PROBABILITY`] (currently
+    /// 1/32) this is a few percent overhead on active contracts and
+    /// effectively zero on quiet ones. Sample selection uses `GlobalRng`
+    /// so simulation builds remain deterministic under a fixed seed.
+    ///
+    /// Only probes update batches whose every entry is
+    /// `UpdateData::State(_)`. `Delta`/`StateAndDelta` are exempted
+    /// because operation-based CRDTs (counters, append-logs) legitimately
+    /// violate the byte-equality property on re-apply; `RelatedState` is
+    /// exempted because it's a cross-contract hint, not a CRDT op over
+    /// this contract's state. Probe traps (timeout, OOG, panic) are
+    /// logged but not treated as positive signals — distinguishing
+    /// "buggy on re-apply" from "buggy in some other way" requires a
+    /// separate detector. See `crate::ring::broken_invariants`.
+    async fn maybe_probe_idempotency(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters<'_>,
+        post_merge_state: &WrappedState,
+        updates: &[UpdateData<'_>],
+    ) {
+        // Cheap precheck: if already flagged, no value in probing again.
+        if let Some(op_manager) = &self.op_manager {
+            if op_manager.ring.is_contract_broken(key) {
+                return;
+            }
+        }
+
+        // Probe ONLY when every input is `UpdateData::State(...)`. Three
+        // reasons for this conservative gating:
+        //
+        // 1. `Delta` inputs are NOT contractually required to be
+        //    idempotent. An "increment by 1" delta produces S+1 then S+2
+        //    on re-apply — that's a CmRDT-shaped contract, perfectly
+        //    valid, but `update_state(update_state(S, U), U) != update_state(S, U)`
+        //    in the exact byte sense the probe checks. Probing Delta
+        //    inputs would mass-flag legitimate counter / append-log
+        //    contracts. Skip them entirely.
+        //
+        // 2. `StateAndDelta` carries a delta too, with the same risk.
+        //
+        // 3. `RelatedState` is a cross-contract hint, not a CRDT op
+        //    over this contract's state — re-applying isn't required
+        //    to be a no-op even for a correct contract.
+        //
+        // State-only batches are the unambiguous case: receiving the
+        // same full state twice MUST produce the same merged result by
+        // CvRDT lattice-join semantics. That's the invariant the probe
+        // tests.
+        let all_state =
+            !updates.is_empty() && updates.iter().all(|u| matches!(u, UpdateData::State(_)));
+        if !all_state {
+            return;
+        }
+
+        // Sampling. `GlobalRng` honors a fixed seed in simulation tests
+        // (see `crate::config::GlobalRng`), so determinism is preserved
+        // under the existing test harness — but the call ordering would
+        // shift if existing tests don't expect a new RNG consumer on the
+        // merge path. The probe runs only on pure-State batches (above),
+        // which the simulation harness drives explicitly and rarely, so
+        // the RNG stream perturbation is bounded.
+        if !crate::config::GlobalRng::random_bool(IDEMPOTENCY_PROBE_PROBABILITY) {
+            return;
+        }
+
+        let probe_result = self
+            .runtime
+            .update_state(key, parameters, post_merge_state, updates);
+        let probe_outcome = match probe_result {
+            Ok(modification) => modification,
+            Err(err) => {
+                // The probe failing (timeout, trap, etc.) is not a positive
+                // signal — the contract is exercising some other failure
+                // mode that doesn't necessarily imply non-idempotency.
+                // Log at DEBUG and bail without flagging.
+                tracing::debug!(
+                    contract = %key,
+                    error = %err,
+                    event = "idempotency_probe_error",
+                    "Idempotency probe failed to execute; skipping detection"
+                );
+                return;
+            }
+        };
+        let UpdateModification {
+            new_state: probe_state,
+            ..
+        } = probe_outcome;
+        let Some(probe_state) = probe_state else {
+            // No state output from probe (e.g. contract returned only
+            // `requires(...)`). Inconclusive — bail.
+            return;
+        };
+        let probe_state = WrappedState::new(probe_state.into_bytes());
+
+        if probe_state.as_ref() != post_merge_state.as_ref() {
+            if let Some(op_manager) = &self.op_manager {
+                tracing::warn!(
+                    contract = %key,
+                    post_merge_size = post_merge_state.size(),
+                    probe_size = probe_state.size(),
+                    event = "non_idempotent_merge_detected",
+                    "Contract violates update_state idempotency \
+                     (update_state(update_state(S, U), U) != update_state(S, U)). \
+                     Flagging contract; outbound BroadcastStateChange will be suppressed."
+                );
+                op_manager
+                    .ring
+                    .record_broken_invariant(*key, crate::ring::BrokenInvariant::NonIdempotent);
+            }
+        }
+    }
+
     /// Persist an updated contract state via `state_store.update`.
     ///
     /// This is the canonical chokepoint for UPDATE-shaped writes: every
@@ -2103,6 +2266,27 @@ where
         parameters: &Parameters<'_>,
         new_state: &WrappedState,
     ) -> Result<(), ExecutorError> {
+        // Blanket gate: a contract flagged as violating a CRDT invariant
+        // (e.g. non-idempotent merge) must not have its state extended
+        // OR broadcast from this node. The merge in
+        // `bridged_upsert_contract_state` already short-circuits before
+        // reaching here on the probe-positive path, but
+        // `commit_state_update` has other call sites (related-contract
+        // retry, validation re-attempt) that don't run the probe first.
+        // Gating here covers all of them with one check. See
+        // `crate::ring::broken_invariants` for the tracker and #4279
+        // for the storm shape this defends against.
+        if let Some(op_manager) = &self.op_manager {
+            if op_manager.ring.is_contract_broken(key) {
+                tracing::debug!(
+                    contract = %key,
+                    event = "commit_suppressed_broken_contract",
+                    "Skipping commit_state_update for contract flagged as broken"
+                );
+                return Ok(());
+            }
+        }
+
         let state_size = new_state.as_ref().len();
         if state_size > MAX_STATE_SIZE {
             tracing::warn!(
@@ -2163,17 +2347,32 @@ where
         self.send_delegate_contract_notifications(key, new_state);
 
         if let Some(op_manager) = &self.op_manager {
-            // Non-blocking emit: a 30-second `notify_node_event(...).await`
-            // on this commit path was the primary back-pressure source
-            // that wedged both gateways on 2026-05-24 (#4145). Missed
-            // broadcasts heal via the next UPDATE or via summary-mismatch
-            // SyncStateToPeer rounds — the executor must not stall here.
-            if let Err(err) =
+            // Skip the broadcast entirely if this contract has been flagged
+            // as violating a CRDT invariant (e.g. non-idempotent
+            // `update_state`). The idempotency probe in
+            // `bridged_upsert_contract_state` sets this flag when it
+            // catches `update_state(update_state(S, U), U) != update_state(S, U)`.
+            // Once flagged, propagating this contract's state changes
+            // re-engages the broadcast storm we are trying to suppress.
+            // See `crate::ring::broken_invariants`.
+            if op_manager.ring.is_contract_broken(key) {
+                tracing::debug!(
+                    contract = %key,
+                    event = "broadcast_suppressed_broken_contract",
+                    "Skipping BroadcastStateChange for contract flagged as broken"
+                );
+            } else if let Err(err) =
                 op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
                     key: *key,
                     new_state: new_state.clone(),
                 })
             {
+                // Non-blocking emit: a 30-second `notify_node_event(...).await`
+                // on this commit path was the primary back-pressure source
+                // that wedged both gateways on 2026-05-24 (#4145). Missed
+                // broadcasts heal via the next UPDATE or via summary-mismatch
+                // SyncStateToPeer rounds — the executor must not stall here.
+                //
                 // Best-effort by design (see comment block above and
                 // #4145): a missed broadcast heals via the next UPDATE
                 // or summary-mismatch SyncStateToPeer round. Per-
@@ -2512,6 +2711,17 @@ where
 
     async fn broadcast_state_change(&self, key: ContractKey, new_state: WrappedState) {
         if let Some(op_manager) = &self.op_manager {
+            // Mirror the broken-invariant gate in `commit_state_update`
+            // above. Same rationale: a contract flagged as non-idempotent
+            // must not be propagated.
+            if op_manager.ring.is_contract_broken(&key) {
+                tracing::debug!(
+                    contract = %key,
+                    event = "broadcast_suppressed_broken_contract",
+                    "Skipping BroadcastStateChange for contract flagged as broken"
+                );
+                return;
+            }
             // Non-blocking emit — see comment in the update path above
             // and #4145 for the wedge this prevents.
             if let Err(err) =

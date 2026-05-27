@@ -30,6 +30,16 @@ pub(crate) const CONTRACT_INDEX_TABLE: TableDefinition<&[u8], &[u8]> =
 pub(crate) const DELEGATE_INDEX_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("delegate_index");
 
+/// Per-contract record of detected CRDT-invariant violations (e.g. a
+/// non-idempotent `update_state`). One row per offending contract; presence
+/// alone is the gate signal. See `ring::broken_invariants` for the in-memory
+/// tracker that hydrates from this table at startup.
+///
+/// Key: ContractInstanceId (32 bytes)
+/// Value: single byte encoding [`BrokenInvariant`] (currently 0 = NonIdempotent)
+pub(crate) const BROKEN_INVARIANTS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("broken_invariants");
+
 /// Index table mapping DelegateKey to secret key hashes.
 /// This replaces the legacy KEY_DATA file in the secrets directory.
 /// Key: DelegateKey (64 bytes)
@@ -212,6 +222,18 @@ impl ReDb {
                     table = "SECRETS_INDEX_TABLE",
                     phase = "table_init_failed",
                     "Failed to open SECRETS_INDEX_TABLE"
+                );
+                e
+            })?;
+
+            // Created on first open of upgraded databases too — redb creates
+            // missing tables inside the same write txn that opens them.
+            txn.open_table(BROKEN_INVARIANTS_TABLE).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    table = "BROKEN_INVARIANTS_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open BROKEN_INVARIANTS_TABLE"
                 );
                 e
             })?;
@@ -704,6 +726,78 @@ impl ReDb {
         }
         Ok(result)
     }
+
+    // ==================== Broken Invariants Methods ====================
+    // Per-contract record of detected CRDT-invariant violations. See
+    // `ring::broken_invariants` for the in-memory tracker.
+
+    /// Persist a broken-invariant flag for the given contract instance.
+    /// `kind_byte` is the single-byte encoding produced by
+    /// `BrokenInvariant::to_byte`. Repeated calls overwrite — the tracker's
+    /// in-memory layer suppresses redundant writes for already-flagged
+    /// contracts, but we don't depend on that here.
+    pub fn store_broken_invariant(
+        &self,
+        instance_id: &ContractInstanceId,
+        kind_byte: u8,
+    ) -> Result<(), redb::Error> {
+        let txn = self.0.begin_write()?;
+        {
+            let mut tbl = txn.open_table(BROKEN_INVARIANTS_TABLE)?;
+            tbl.insert(instance_id.as_ref(), &[kind_byte][..])?;
+        }
+        txn.commit().map_err(Into::into)
+    }
+
+    /// Remove a persisted broken-invariant flag. Paired with
+    /// `BrokenInvariantsTracker::clear` — without on-disk removal, an
+    /// operator's unflag would be undone on the next restart's
+    /// `set_storage` rehydration.
+    pub fn remove_broken_invariant(
+        &self,
+        instance_id: &ContractInstanceId,
+    ) -> Result<(), redb::Error> {
+        let txn = self.0.begin_write()?;
+        {
+            let mut tbl = txn.open_table(BROKEN_INVARIANTS_TABLE)?;
+            tbl.remove(instance_id.as_ref())?;
+        }
+        txn.commit().map_err(Into::into)
+    }
+
+    /// Load all persisted broken-invariant flags. Malformed rows (wrong
+    /// key length, wrong value length) are skipped with a warning rather
+    /// than failing the entire load — a corrupted entry should not block
+    /// startup, and the worst case is we lose a flag and re-detect it.
+    pub fn load_all_broken_invariants(&self) -> Result<Vec<(ContractInstanceId, u8)>, redb::Error> {
+        let txn = self.0.begin_read()?;
+        let tbl = txn.open_table(BROKEN_INVARIANTS_TABLE)?;
+
+        let mut result = Vec::new();
+        for entry in tbl.iter()? {
+            let (key, value) = entry?;
+            let key_bytes: [u8; 32] = match key.value().try_into() {
+                Ok(b) => b,
+                Err(_) => {
+                    tracing::warn!(
+                        len = key.value().len(),
+                        "Skipping malformed broken-invariants row (key length)"
+                    );
+                    continue;
+                }
+            };
+            let v = value.value();
+            if v.len() != 1 {
+                tracing::warn!(
+                    len = v.len(),
+                    "Skipping malformed broken-invariants row (value length)"
+                );
+                continue;
+            }
+            result.push((ContractInstanceId::new(key_bytes), v[0]));
+        }
+        Ok(result)
+    }
 }
 
 impl StateStorage for ReDb {
@@ -979,5 +1073,128 @@ mod tests {
         db.remove(&key)
             .await
             .expect("removing a never-stored contract should be Ok");
+    }
+
+    // ==================== Broken Invariants Persistence ====================
+
+    fn fake_instance_id(seed: u8) -> ContractInstanceId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        ContractInstanceId::new(bytes)
+    }
+
+    /// Full store → reopen → load round trip for the broken-invariants
+    /// table. This is the load-bearing guarantee for the
+    /// "node that detected the bug stays gated after restart" claim in
+    /// PR #4279. A regression that swapped key/value order, dropped the
+    /// commit, or wrote to the wrong table would ship green without this.
+    #[tokio::test]
+    async fn broken_invariants_persistence_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let id_a = fake_instance_id(0xA1);
+        let id_b = fake_instance_id(0xB2);
+
+        // Initial open + write.
+        {
+            let db = ReDb::new(temp_dir.path()).await.unwrap();
+            db.store_broken_invariant(&id_a, 0).expect("store id_a");
+            db.store_broken_invariant(&id_b, 0).expect("store id_b");
+        }
+
+        // Reopen. The exact instance must come back through
+        // `load_all_broken_invariants` — this is what
+        // `BrokenInvariantsTracker::set_storage` calls at executor wire-up
+        // to hydrate the in-memory flag map.
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+        let mut loaded = db.load_all_broken_invariants().expect("load");
+        loaded.sort_by_key(|(id, _)| id.as_bytes().to_vec());
+
+        let mut expected = vec![(id_a, 0u8), (id_b, 0u8)];
+        expected.sort_by_key(|(id, _)| id.as_bytes().to_vec());
+
+        assert_eq!(
+            loaded, expected,
+            "broken-invariants table must survive close-and-reopen exactly"
+        );
+    }
+
+    /// `remove_broken_invariant` deletes the on-disk row, so a clear()
+    /// in `BrokenInvariantsTracker` followed by a process restart
+    /// genuinely keeps the contract unflagged. Without this, `set_storage`
+    /// would re-hydrate from the stale row and the unflag would be undone.
+    #[tokio::test]
+    async fn broken_invariants_remove_makes_load_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let id = fake_instance_id(0x42);
+
+        {
+            let db = ReDb::new(temp_dir.path()).await.unwrap();
+            db.store_broken_invariant(&id, 0).unwrap();
+            assert_eq!(db.load_all_broken_invariants().unwrap().len(), 1);
+            db.remove_broken_invariant(&id).unwrap();
+            assert!(db.load_all_broken_invariants().unwrap().is_empty());
+        }
+
+        // Round-trip across a close/reopen — the removal must persist.
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+        assert!(
+            db.load_all_broken_invariants().unwrap().is_empty(),
+            "removal must survive a close/reopen"
+        );
+    }
+
+    /// `store_broken_invariant` is treated as upsert (single in-memory
+    /// flag → single on-disk row). Repeated stores with the same key
+    /// must collapse to one row, not produce duplicates.
+    #[tokio::test]
+    async fn broken_invariants_store_is_upsert_not_append() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+        let id = fake_instance_id(0x77);
+
+        db.store_broken_invariant(&id, 0).unwrap();
+        db.store_broken_invariant(&id, 0).unwrap();
+        db.store_broken_invariant(&id, 0).unwrap();
+
+        let rows = db.load_all_broken_invariants().unwrap();
+        assert_eq!(rows.len(), 1, "repeated stores must collapse to one row");
+        assert_eq!(rows[0].0, id);
+    }
+
+    /// Malformed value-length rows must be skipped (not panic, not abort
+    /// load). The current write path always writes 1 byte; this pins the
+    /// forward-compat behavior so future format extensions can roll out
+    /// without bricking startup for older nodes' on-disk state.
+    #[tokio::test]
+    async fn broken_invariants_load_skips_malformed_value() {
+        use redb::Database;
+        let temp_dir = TempDir::new().unwrap();
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+        // Write a deliberately-too-long value bypassing the helper.
+        let db_path = temp_dir.path().join("db");
+        // Drop the wrapper so the raw redb file lock is released before
+        // we open it directly to inject the malformed row.
+        drop(db);
+        let raw = Database::open(&db_path).unwrap();
+        {
+            let txn = raw.begin_write().unwrap();
+            {
+                let mut tbl = txn.open_table(BROKEN_INVARIANTS_TABLE).unwrap();
+                let id = fake_instance_id(0xCC);
+                let bogus: [u8; 4] = [1, 2, 3, 4];
+                tbl.insert(id.as_ref(), &bogus[..]).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        drop(raw);
+
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+        let rows = db.load_all_broken_invariants().unwrap();
+        assert!(
+            rows.is_empty(),
+            "malformed row must be silently skipped; got: {:?}",
+            rows
+        );
     }
 }
