@@ -2358,14 +2358,16 @@ mod tests {
         );
     }
 
-    /// `start_client_put` must construct a `client_op_guard()` before
-    /// the `GlobalExecutor::spawn`, and that guard MUST be moved into
-    /// the spawned future (held for the lifetime of the spawned
+    /// `start_client_put` must call `admit_client_op()` before the
+    /// `GlobalExecutor::spawn`, and the returned guard MUST be moved
+    /// into the spawned future (held for the lifetime of the spawned
     /// `run_client_put`). Without the guard, the shutdown drain in
     /// `ShutdownHandle::shutdown` has no signal that this PUT is in
     /// flight — release-driven auto-update reverts to dropping the
-    /// mirror push mid-stream. Sibling pins live in the analogous test
-    /// modules of `get/op_ctx_task.rs`, `update/op_ctx_task.rs`, and
+    /// mirror push mid-stream. Using the atomic `admit_client_op()`
+    /// (instead of the prior separate check + bump) closes the Codex
+    /// r2 TOCTOU. Sibling pins live in the analogous test modules of
+    /// `get/op_ctx_task.rs`, `update/op_ctx_task.rs`, and
     /// `subscribe/op_ctx_task.rs`.
     #[test]
     fn start_client_put_acquires_inflight_guard_before_spawn() {

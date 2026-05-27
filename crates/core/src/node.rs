@@ -129,8 +129,11 @@ impl ShutdownHandle {
         use std::sync::atomic::Ordering;
 
         // Phase 1: close admission BEFORE the drain. Subsequent
-        // start_client_* calls fail fast.
-        self.shutting_down.store(true, Ordering::Relaxed);
+        // start_client_* calls fail fast. SeqCst is required for the
+        // Dekker-style handshake with `admit_client_op` — see
+        // `OpManager::admit_client_op` rustdoc for the full memory-
+        // ordering analysis (Codex r3 + skeptical r3).
+        self.shutting_down.store(true, Ordering::SeqCst);
 
         // Phase 2: drain.
         self.wait_for_drain().await;
@@ -153,13 +156,19 @@ impl ShutdownHandle {
     /// Poll-loop the in-flight client-op counter until it hits zero or
     /// `drain_timeout` expires. Cap each individual sleep at 200ms so
     /// the drain can react promptly when the counter clears.
+    ///
+    /// Counter loads use `SeqCst` so they synchronize with
+    /// `ClientOpGuard::new`'s `fetch_add(SeqCst)` — without this, the
+    /// Dekker-style handshake described in
+    /// `OpManager::admit_client_op` would let a racing client bump
+    /// go unobserved (Codex r3 + skeptical r3 finding).
     async fn wait_for_drain(&self) {
         use std::sync::atomic::Ordering;
 
         if self.drain_timeout.is_zero() {
             return;
         }
-        let initial = self.inflight_client_ops.load(Ordering::Relaxed);
+        let initial = self.inflight_client_ops.load(Ordering::SeqCst);
         if initial == 0 {
             return;
         }
@@ -181,7 +190,11 @@ impl ShutdownHandle {
             // loop body actually sleeps between checks.
             tick.tick().await;
             loop {
-                if self.inflight_client_ops.load(Ordering::Relaxed) == 0 {
+                // SeqCst: participates in the admission handshake
+                // (see admit_client_op rustdoc). Relaxed here could
+                // let the poll see a stale 0 even after a racing
+                // bump, missing a late-arrived op.
+                if self.inflight_client_ops.load(Ordering::SeqCst) == 0 {
                     return;
                 }
                 tick.tick().await;
@@ -189,6 +202,8 @@ impl ShutdownHandle {
         })
         .await;
 
+        // Final log-only read after the drain decision — Relaxed is
+        // fine, this doesn't gate any further action.
         let remaining = self.inflight_client_ops.load(Ordering::Relaxed);
         match drained {
             Ok(()) => tracing::info!(initial, "Shutdown drain complete (all client ops finished)"),
