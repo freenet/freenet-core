@@ -526,18 +526,40 @@ impl GovernanceManager {
 
         let now = self.time_source.now();
 
-        // 1. Apply decay to every score AND check for ban-TTL expiry.
+        // 1. Apply decay to every score AND check for ban-TTL expiry
+        //    + evicted-window expiry.
+        //
         // Banned → Normal transition is unconditional after `ban_ttl`
         // passes since the BanTriggered transition (recorded in
         // `last_transition`).
+        //
+        // Evicted → Normal works on the same shape but with the
+        // `ban_window` TTL — once that window has elapsed without
+        // re-eviction, the contract is allowed to recover (skeptical
+        // reviewer flagged that without an explicit TTL sweep, Evicted
+        // could either flap back to Normal via decay-driven score
+        // recovery — see the stickiness rule in the transition loop —
+        // OR stay Evicted forever, neither of which we want).
         let mut ban_lifted: Vec<ContractInstanceId> = Vec::new();
+        let mut evicted_lifted: Vec<ContractInstanceId> = Vec::new();
         for mut entry in self.scores.iter_mut() {
             entry.decay(tick_interval, self.config.decay_half_life);
-            if entry.state == GovernanceState::Banned {
-                let elapsed = now.saturating_duration_since(entry.last_transition);
-                if elapsed >= self.config.ban_ttl {
-                    ban_lifted.push(*entry.key());
+            match entry.state {
+                GovernanceState::Banned => {
+                    let elapsed = now.saturating_duration_since(entry.last_transition);
+                    if elapsed >= self.config.ban_ttl {
+                        ban_lifted.push(*entry.key());
+                    }
                 }
+                GovernanceState::Evicted => {
+                    let elapsed = now.saturating_duration_since(entry.last_transition);
+                    if elapsed >= self.config.ban_window {
+                        evicted_lifted.push(*entry.key());
+                    }
+                }
+                GovernanceState::Normal
+                | GovernanceState::Borderline
+                | GovernanceState::WouldEvict => {}
             }
         }
 
@@ -593,6 +615,26 @@ impl GovernanceManager {
             _ => None,
         };
 
+        // Stickiness + MAD-collapse rules (skeptical-reviewer
+        // findings on #4270):
+        //
+        // - Once a contract is Evicted (Enforce mode), it stays
+        //   Evicted for the duration of the ban_window. Decay-driven
+        //   score recovery is NOT enough to undo an eviction — the
+        //   on-disk state is gone, and shrinking `cost_used` only
+        //   tells us "the cost signal faded", not "the contract is
+        //   fine now". Recovery happens via the explicit TTL sweep
+        //   in `evicted_lifted` below the main loop, the same shape
+        //   already used for Banned → Normal.
+        //
+        // - When MAD collapses (the population is too homogeneous
+        //   to compute `borderline_cutoff`), a previously-Borderline
+        //   contract MUST NOT auto-recover to Normal. Doing so logs
+        //   a spurious `Recovered` transition each time MAD
+        //   collapses and a fresh `BorderlineEntered` each time it
+        //   recomputes — pure flap. Skip the transition for that
+        //   tick and let the next tick re-evaluate.
+        let mad_collapsed = borderline_cutoff.is_none();
         for (key, log_ratio) in actionable_samples.iter() {
             let Some(mut entry) = self.scores.get_mut(key) else {
                 continue;
@@ -617,6 +659,12 @@ impl GovernanceManager {
                 } else {
                     GovernanceState::WouldEvict
                 }
+            } else if from == GovernanceState::Evicted {
+                // Evicted is sticky — see comment above the loop.
+                continue;
+            } else if mad_collapsed {
+                // No reliable signal — see comment above the loop.
+                continue;
             } else if borderline_cutoff.is_some_and(|c| *log_ratio >= c) {
                 GovernanceState::Borderline
             } else {
@@ -659,6 +707,33 @@ impl GovernanceManager {
                         from,
                         to: GovernanceState::Normal,
                         reason: TransitionReason::BanLifted,
+                        at: now,
+                        actionable: true,
+                    });
+                }
+            }
+        }
+
+        // 5b. Process evicted-window expiries the same way. A contract
+        // that has been Evicted for at least `ban_window` without a
+        // re-eviction is allowed to return to Normal. The
+        // `TransitionReason::Recovered` reason is reused — the dashboard
+        // can distinguish "actively-recovered (decay-driven)" from
+        // "recovered after eviction-window" via the `from` field.
+        for key in evicted_lifted {
+            if let Some(mut entry) = self.scores.get_mut(&key) {
+                if entry.state == GovernanceState::Evicted {
+                    let from = entry.state;
+                    entry.record_transition(
+                        now,
+                        GovernanceState::Normal,
+                        TransitionReason::Recovered,
+                    );
+                    decisions.push(ReaperDecision {
+                        key,
+                        from,
+                        to: GovernanceState::Normal,
+                        reason: TransitionReason::Recovered,
                         at: now,
                         actionable: true,
                     });
@@ -1180,5 +1255,190 @@ mod tests {
     fn missing_key_returns_none() {
         let (mgr, _ts) = mk_mgr_shared(GovernanceMode::DryRun);
         assert!(mgr.score_snapshot(&mk_key(42)).is_none());
+    }
+
+    /// Stickiness pin: once Evicted, a contract MUST NOT transition
+    /// back to Normal via decay-driven score recovery in the main loop.
+    /// It can only recover via the explicit ban_window TTL sweep.
+    ///
+    /// Skeptical reviewer of PR #4270 flagged this as the
+    /// Normal → Evicted → Normal flapping bug: an evicted contract is
+    /// still in `scores` and still receives demand events, so decay
+    /// shrinks `cost_used` faster than `benefit_score` builds, and the
+    /// ratio falls below threshold → "Recovered" transition is logged
+    /// while the on-disk state is already gone. Confusing at best,
+    /// state-machine vs data-plane divergence at worst.
+    #[test]
+    fn evicted_is_sticky_to_decay_driven_recovery() {
+        let (mgr, ts) = mk_mgr_shared(GovernanceMode::Enforce);
+        // Build an honest distribution + one abuser.
+        for i in 0..30 {
+            let jitter = (i as f64 - 15.0) * 0.01;
+            mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
+            mgr.ingest_demand(mk_key(i), 1.0 + jitter);
+        }
+        let abuser = mk_key(99);
+        mgr.ingest_cost(abuser, 100.0);
+        mgr.ingest_demand(abuser, 1.0);
+        ts.advance(Duration::from_secs(2));
+
+        // First tick → abuser Evicted.
+        let r1 = mgr.tick(Duration::from_millis(100));
+        let evicted_decision = r1.decisions.iter().find(|d| d.key == abuser).unwrap();
+        assert_eq!(evicted_decision.to, GovernanceState::Evicted);
+
+        // Now flip the abuser's signal to "low cost, high benefit" —
+        // dragging its log-ratio FAR below threshold and below
+        // borderline_cutoff too. Without the stickiness rule, the next
+        // tick would log a `Recovered` transition (Evicted → Normal)
+        // even though the on-disk state is already gone.
+        for _ in 0..20 {
+            mgr.ingest_demand(abuser, 1.0);
+        }
+        // Re-feed honest contracts so the distribution still has a
+        // sensible MAD.
+        for i in 0..30 {
+            let jitter = (i as f64 - 15.0) * 0.01;
+            mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
+            mgr.ingest_demand(mk_key(i), 1.0);
+        }
+        ts.advance(Duration::from_secs(60));
+        let r2 = mgr.tick(Duration::from_millis(100));
+
+        // Critical assertion: NO `Recovered` (or any `Normal`) transition
+        // logged for the abuser. It's allowed to escalate to Banned
+        // (repeat-eviction inside ban_window — also a valid transition
+        // out of Evicted) but never recover via decay.
+        assert!(
+            !r2.decisions
+                .iter()
+                .any(|d| d.key == abuser && d.to == GovernanceState::Normal),
+            "Evicted contract must NOT auto-recover to Normal via decay — \
+             found decision: {:?}",
+            r2.decisions
+                .iter()
+                .filter(|d| d.key == abuser)
+                .collect::<Vec<_>>(),
+        );
+
+        // Snapshot confirms the abuser is still Evicted or escalated to
+        // Banned — anything BUT Normal.
+        let snap_state = mgr.score_snapshot(&abuser).unwrap().state;
+        assert!(
+            matches!(
+                snap_state,
+                GovernanceState::Evicted | GovernanceState::Banned
+            ),
+            "abuser snapshot must still report Evicted/Banned, got {:?}",
+            snap_state
+        );
+    }
+
+    /// After the ban_window has elapsed, an Evicted contract IS allowed
+    /// to return to Normal via the explicit TTL sweep (the same shape
+    /// already used for Banned → Normal). This pins that the TTL recovery
+    /// path actually fires.
+    #[test]
+    fn evicted_lifts_back_to_normal_after_ban_window() {
+        let (mgr, ts) = mk_mgr_shared(GovernanceMode::Enforce);
+        for i in 0..30 {
+            let jitter = (i as f64 - 15.0) * 0.01;
+            mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
+            mgr.ingest_demand(mk_key(i), 1.0 + jitter);
+        }
+        let abuser = mk_key(99);
+        mgr.ingest_cost(abuser, 100.0);
+        mgr.ingest_demand(abuser, 1.0);
+        ts.advance(Duration::from_secs(2));
+
+        // First tick → Evicted.
+        let r1 = mgr.tick(Duration::from_millis(100));
+        assert!(
+            r1.decisions
+                .iter()
+                .any(|d| d.key == abuser && d.to == GovernanceState::Evicted)
+        );
+
+        // Advance past ban_window without re-eviction.
+        ts.advance(Duration::from_secs(60 * 60 + 1));
+        let r = mgr.tick(Duration::from_millis(100));
+        let lift = r.decisions.iter().find(|d| d.key == abuser).unwrap();
+        assert_eq!(lift.from, GovernanceState::Evicted);
+        assert_eq!(lift.to, GovernanceState::Normal);
+        assert!(matches!(lift.reason, TransitionReason::Recovered));
+    }
+
+    /// MAD-collapse pin: when MAD collapses (the population is too
+    /// homogeneous to compute a borderline cutoff), a previously-
+    /// Borderline contract MUST NOT auto-recover to Normal. Doing so
+    /// would log a spurious `Recovered` transition each time MAD
+    /// collapses and a fresh `BorderlineEntered` each time it recomputes.
+    ///
+    /// Skeptical reviewer of PR #4270 flagged this as a dashboard
+    /// flapping risk: a homogeneous tick spuriously "recovers" every
+    /// Borderline contract, then the next tick with two outliers
+    /// flips them back to Borderline.
+    #[test]
+    fn mad_collapse_does_not_recover_borderline_to_normal() {
+        let (mgr, ts) = mk_mgr_shared(GovernanceMode::DryRun);
+        // Step 1: build a distribution with one Borderline contract.
+        for i in 0..30 {
+            let jitter = (i as f64 - 15.0) * 0.001;
+            mgr.ingest_cost(mk_key(i), 0.1 + jitter);
+            mgr.ingest_demand(mk_key(i), 1.0);
+        }
+        let borderline = mk_key(99);
+        mgr.ingest_cost(borderline, 1.0);
+        mgr.ingest_demand(borderline, 1.0);
+        ts.advance(Duration::from_secs(2));
+        let _r1 = mgr.tick(Duration::from_millis(100));
+        // The borderline contract may have ended Borderline or
+        // WouldEvict — both flagged states. Confirm via the snapshot.
+        let after_first_tick = mgr.score_snapshot(&borderline).unwrap().state;
+        // Borderline or flagged is what we want — anything but Normal.
+        assert_ne!(
+            after_first_tick,
+            GovernanceState::Normal,
+            "test fixture must flag the contract on first tick; got {:?}",
+            after_first_tick
+        );
+
+        // Step 2: replace the honest population with identical values
+        // (MAD collapse). Re-feeding identical cost/benefit doesn't
+        // immediately replace the running averages but moves them
+        // toward homogeneity. Skip this — instead, simulate MAD
+        // collapse by NOT advancing time and feeding everyone the
+        // same value to drag the average to zero spread.
+        for i in 0..30 {
+            // Heavy injection to dominate the running average.
+            for _ in 0..100 {
+                mgr.ingest_cost(mk_key(i), 0.1);
+                mgr.ingest_demand(mk_key(i), 1.0);
+            }
+        }
+        ts.advance(Duration::from_secs(60));
+        let r2 = mgr.tick(Duration::from_millis(100));
+
+        // The critical assertion: even if MAD collapsed and the
+        // borderline contract's score sample is no longer extracted
+        // (or extracts but can't be classified), there is NO
+        // `Recovered` transition logged. The state stays whatever it
+        // was after r1.
+        assert!(
+            !r2.decisions
+                .iter()
+                .any(|d| d.key == borderline && d.to == GovernanceState::Normal),
+            "MAD-collapse must NOT recover Borderline to Normal — found: {:?}",
+            r2.decisions
+                .iter()
+                .filter(|d| d.key == borderline)
+                .collect::<Vec<_>>()
+        );
+        // Snapshot confirms state unchanged.
+        assert_eq!(
+            mgr.score_snapshot(&borderline).unwrap().state,
+            after_first_tick,
+            "borderline contract state must persist through MAD-collapse tick"
+        );
     }
 }
