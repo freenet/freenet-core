@@ -620,6 +620,15 @@ pub struct PeerSnapshot {
 pub struct ContractSnapshot {
     pub key_short: String,
     pub key_full: String,
+    /// `ContractKey.id().to_string()` — the 32-byte content hash
+    /// portion of the key. Distinct from `key_full` which carries
+    /// the full ContractKey encoding (instance id + parameters /
+    /// code-hash bookkeeping). Surfaced so the dashboard can
+    /// cross-reference this contract against
+    /// `GovernanceSnapshot.state_by_id`, which is keyed by
+    /// `ContractInstanceId::to_string()`. Codex review of
+    /// dashboard-polish PR caught the id/key string mismatch.
+    pub instance_id: String,
     pub subscribed_secs: u64,
     pub last_updated_secs: Option<u64>,
 }
@@ -743,6 +752,7 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
                 .into_iter()
                 .map(|c| {
                     let key_full = c.key.to_string();
+                    let instance_id = c.key.id().to_string();
                     // Use char boundary for safe truncation (contract keys
                     // are base58/ASCII, but be defensive against future
                     // encoding changes).
@@ -755,6 +765,7 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
                     ContractSnapshot {
                         key_short,
                         key_full,
+                        instance_id,
                         subscribed_secs: c.subscribed_secs,
                         last_updated_secs: c.last_updated_secs,
                     }

@@ -676,10 +676,14 @@ fn build_ring_svg(
         // Skip contracts that are flagged — they get a more visible
         // marker in the flagged-rendering loop below. Drawing them
         // here would just be overlapped.
-        if governance_ids.contains(c.key_full.as_str()) {
+        if governance_ids.contains(c.instance_id.as_str()) {
             continue;
         }
-        let loc = hash_to_loc(&c.key_full);
+        // Hash on the instance_id so the hosted-dot position matches
+        // the same contract's flagged-dot position (which also hashes
+        // on instance_id) — Codex review caught the previous
+        // key_full vs instance_id mismatch.
+        let loc = hash_to_loc(&c.instance_id);
         let (kx, ky) = loc_to_xy(loc, r_inner);
         // Dim teal dot — same brand color as YOU but smaller and
         // translucent so flagged dots stand out by contrast.
@@ -842,26 +846,37 @@ fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
     if g.contracts.is_empty() {
         let observed = g.observed_count;
         let needed = g.min_samples;
+        // Tiny pluralization helper so the user-facing messages
+        // don't read "1 contracts" — Codex review nit.
+        let plural = |n: usize| if n == 1 { "contract" } else { "contracts" };
         let progress_msg = if needed == 0 {
             "Governance manager is not yet wired.".to_string()
         } else if observed == 0 {
             format!(
-                "No contracts observed yet. Scoring activates after {needed} contracts \
-                 have accumulated cost/benefit signals."
+                "No contracts observed yet. Scoring activates after {needed} {n_word} \
+                 have accumulated cost/benefit signals.",
+                n_word = plural(needed),
             )
         } else if observed < needed {
+            let remaining = needed - observed;
+            let verb = if remaining == 1 {
+                "accumulates"
+            } else {
+                "accumulate"
+            };
             format!(
-                "Observed {observed} / {needed} contracts needed for statistical scoring. \
-                 Scoring activates once {needed_remaining} more contracts accumulate \
-                 cost/benefit signals.",
-                needed_remaining = needed - observed,
+                "Observed {observed} / {needed} {n_word} needed for statistical scoring. \
+                 Scoring activates once {remaining} more {r_word} {verb} cost/benefit signals.",
+                n_word = plural(needed),
+                r_word = plural(remaining),
             )
         } else {
             // Enough samples observed but none flagged — that's the
             // healthy steady state.
             format!(
-                "All {observed} tracked contracts within normal range. \
-                 (Scored against the network's own observed distribution.)"
+                "All {observed} tracked {n_word} within normal range. \
+                 (Scored against the network's own observed distribution.)",
+                n_word = plural(observed),
             )
         };
         let verdict_main = if observed >= needed {
@@ -1142,7 +1157,7 @@ fn build_contracts_card(snap: &Option<network_status::NetworkStatusSnapshot>) ->
         // render it as "ok". Absence from the table specifically
         // means "not flagged"; we trust the back-end's `iter_flagged_
         // scores` filter.
-        let (gov_class, gov_label, gov_sort) = match state_by_id.get(&c.key_full) {
+        let (gov_class, gov_label, gov_sort) = match state_by_id.get(&c.instance_id) {
             None => ("gov-ok", "ok", 0u8),
             Some(network_status::GovernanceStateSnapshot::Normal) => ("gov-ok", "ok", 0),
             Some(network_status::GovernanceStateSnapshot::Borderline) => {
@@ -3719,12 +3734,14 @@ mod tests {
             ContractSnapshot {
                 key_short: "ABC1...".to_string(),
                 key_full: "ABC123".to_string(),
+                instance_id: "ABC123".to_string(),
                 subscribed_secs: 100,
                 last_updated_secs: Some(5),
             },
             ContractSnapshot {
                 key_short: "DEF4...".to_string(),
                 key_full: "DEF456".to_string(),
+                instance_id: "DEF456".to_string(),
                 subscribed_secs: 50,
                 last_updated_secs: None,
             },
@@ -4029,6 +4046,7 @@ mod tests {
         snap.contracts = vec![ContractSnapshot {
             key_short: "ABC1...".to_string(),
             key_full: "ABC123XYZ".to_string(),
+            instance_id: "ABC123XYZ".to_string(),
             subscribed_secs: 100,
             last_updated_secs: Some(5),
         }];
@@ -4194,6 +4212,7 @@ mod tests {
         snap.contracts = vec![ContractSnapshot {
             key_short: "DEAD...".to_string(),
             key_full: "DEADBEEF".to_string(),
+            instance_id: "DEADBEEF".to_string(),
             subscribed_secs: 60,
             last_updated_secs: Some(2),
         }];
@@ -4231,12 +4250,14 @@ mod tests {
             ContractSnapshot {
                 key_short: "FRESH..".to_string(),
                 key_full: "FRESH".to_string(),
+                instance_id: "FRESH".to_string(),
                 subscribed_secs: 1,
                 last_updated_secs: Some(1),
             },
             ContractSnapshot {
                 key_short: "NEVER..".to_string(),
                 key_full: "NEVER".to_string(),
+                instance_id: "NEVER".to_string(),
                 subscribed_secs: 1,
                 last_updated_secs: None,
             },
@@ -4395,8 +4416,9 @@ mod tests {
 
     #[test]
     fn governance_card_empty_state_shows_observed_progress() {
-        // Pin: the empty state surfaces "N / min_samples" so the
-        // operator can see progress toward statistical scoring.
+        // Pin: the empty state surfaces "N / min_samples" + the
+        // remaining count, using the exact phrases the user sees —
+        // not just digit substrings (Codex review nit).
         let mut snap = base_snapshot();
         snap.governance = GovernanceSnapshot {
             mode: GovernanceModeSnapshot::DryRun,
@@ -4409,12 +4431,33 @@ mod tests {
         };
         let html = build_governance_card(&Some(snap));
         assert!(
-            html.contains("12") && html.contains("30"),
-            "empty state should surface observed_count and min_samples — got:\n{html}"
+            html.contains("Observed 12 / 30 contracts needed"),
+            "empty state should pin the 'Observed X / Y contracts needed' phrase — got:\n{html}"
         );
         assert!(
-            html.contains("18"),
-            "empty state should mention the remaining count (30-12=18) — got:\n{html}"
+            html.contains("once 18 more contracts accumulate"),
+            "empty state should name the remaining count by name — got:\n{html}"
+        );
+    }
+
+    #[test]
+    fn governance_card_empty_state_pluralizes_singular_count() {
+        // Pin: when remaining == 1, the message uses "1 more contract"
+        // not "1 more contracts". Codex review nit on pluralization.
+        let mut snap = base_snapshot();
+        snap.governance = GovernanceSnapshot {
+            mode: GovernanceModeSnapshot::DryRun,
+            contracts: Vec::new(),
+            norms: NetworkNorms::default(),
+            observed_count: 29,
+            min_samples: 30,
+            last_tick_at: None,
+            state_by_id: std::collections::HashMap::new(),
+        };
+        let html = build_governance_card(&Some(snap));
+        assert!(
+            html.contains("once 1 more contract accumulates"),
+            "with remaining=1 message must use singular 'contract accumulates' — got:\n{html}"
         );
     }
 
