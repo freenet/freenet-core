@@ -457,25 +457,6 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Generate a deterministic HSL colour from an address string.
-/// Returns a CSS colour string, e.g. `"hsl(210, 55%, 45%)"`.
-fn identicon_color(seed: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut h = DefaultHasher::new();
-    seed.hash(&mut h);
-    let v = h.finish();
-    let hue = (v % 360) as u16;
-    format!("hsl({hue}, 55%, 48%)")
-}
-
-/// Build an HTML identicon span: a coloured circle whose background is
-/// deterministically derived from `seed`.
-fn identicon_html(seed: &str, class: &str) -> String {
-    let color = identicon_color(seed);
-    format!("<span class=\"{class}\" style=\"background:{color};\" aria-hidden=\"true\"></span>")
-}
-
 fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {
     let Some(snap) = snap else {
         return String::new();
@@ -618,10 +599,8 @@ fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Str
         } else {
             "—".to_string()
         };
-        let icon = identicon_html(&p.address.to_string(), "peer-identicon");
         rows.push_str(&format!(
-            r#"<tr class="peer-row" onclick="window.location='/peer/{addr_enc}'"><td data-sort="{addr_enc}">{icon}<code>{addr}</code></td><td data-sort="{loc_sort}">{loc}</td><td data-sort="{ptype}">{ptype}</td><td data-sort="{bytes_sent}">{sent}</td><td data-sort="{bytes_recv}">{recv}</td><td data-sort="{conn_secs}">{connected}</td></tr>"#,
-            icon = icon,
+            r#"<tr class="peer-row" onclick="window.location='/peer/{addr_enc}'"><td data-sort="{addr_enc}"><code>{addr}</code></td><td data-sort="{loc_sort}">{loc}</td><td data-sort="{ptype}">{ptype}</td><td data-sort="{bytes_sent}">{sent}</td><td data-sort="{bytes_recv}">{recv}</td><td data-sort="{conn_secs}">{connected}</td></tr>"#,
             addr_enc = html_escape(&p.address.to_string()),
             addr = p.address,
             loc_sort = loc_sort,
@@ -693,17 +672,21 @@ fn build_ring_svg(
         "<div class=\"ring-wrap\"><svg viewBox=\"0 0 {size:.0} {size:.0}\" class=\"ring-svg\" preserveAspectRatio=\"xMidYMid meet\">"
     );
 
+    let has_governance = governance.is_some_and(|g| !g.contracts.is_empty());
+
     // === Background rings ===
     write!(
         svg,
         "<circle cx=\"{cx}\" cy=\"{cy}\" r=\"{r_outer}\" fill=\"none\" stroke=\"#363c4a\" stroke-width=\"1\"/>"
     )
     .ok();
-    write!(
-        svg,
-        "<circle cx=\"{cx}\" cy=\"{cy}\" r=\"{r_inner}\" fill=\"none\" stroke=\"#363c4a\" stroke-width=\"1\"/>"
-    )
-    .ok();
+    if has_governance {
+        write!(
+            svg,
+            "<circle cx=\"{cx}\" cy=\"{cy}\" r=\"{r_inner}\" fill=\"none\" stroke=\"#363c4a\" stroke-width=\"1\"/>"
+        )
+        .ok();
+    }
 
     // Helper: location (0.0..1.0) → (x, y) on a ring of given radius.
     // 0.0 is at the top, increasing clockwise.
@@ -738,12 +721,14 @@ fn build_ring_svg(
         y = cy - r_outer - 8.0,
     )
     .ok();
-    write!(
-        svg,
-        "<text x=\"{cx}\" y=\"{y:.1}\" text-anchor=\"middle\" fill=\"#6b7280\" font-family=\"monospace\" font-size=\"9\" letter-spacing=\"0.18em\">CONTRACTS</text>",
-        y = cy - r_inner - 8.0,
-    )
-    .ok();
+    if has_governance {
+        write!(
+            svg,
+            "<text x=\"{cx}\" y=\"{y:.1}\" text-anchor=\"middle\" fill=\"#6b7280\" font-family=\"monospace\" font-size=\"9\" letter-spacing=\"0.18em\">CONTRACTS</text>",
+            y = cy - r_inner - 8.0,
+        )
+        .ok();
+    }
 
     let own_xy = own_location.map(|loc| loc_to_xy(loc, r_outer));
 
@@ -773,7 +758,7 @@ fn build_ring_svg(
                 let path = curve_path(ox, oy, px, py, 0.55);
                 write!(
                     svg,
-                    "<path d=\"{path}\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"{sw:.1}\" stroke-opacity=\"{opacity}\" stroke-linecap=\"round\" class=\"arc-flow\"/>"
+                    "<path d=\"{path}\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"{sw:.1}\" stroke-opacity=\"{opacity}\" stroke-linecap=\"round\"/>"
                 )
                 .ok();
             }
@@ -1467,9 +1452,6 @@ main {
     margin: 0.5rem 0;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
-@keyframes arc-flow {
-    to { stroke-dashoffset: -24; }
-}
 @keyframes peer-fade-in {
     from { opacity: 0; transform: translateY(-6px); }
     to   { opacity: 1; transform: translateY(0); }
@@ -1865,11 +1847,6 @@ p:last-child { margin-bottom: 0; }
 }
 .ring-svg a.ring-peer-link:focus { outline: none; }
 
-/* Data-flow arcs: animated dash pattern showing traffic direction */
-.ring-svg .arc-flow {
-    stroke-dasharray: 4 8;
-    animation: arc-flow 1.2s linear infinite;
-}
 /* "You" marker: subtle pulse */
 .ring-svg .you-dot {
     animation: you-pulse 3s ease-in-out infinite;
@@ -1887,17 +1864,6 @@ p:last-child { margin-bottom: 0; }
 .peer-table tbody tr:nth-child(5) { animation-delay: 0.18s; }
 .peer-table tbody tr:nth-child(n+6) { animation-delay: 0.22s; }
 
-/* Peer identicon: coloured circle from address hash */
-.peer-identicon {
-    display: inline-block;
-    width: 20px; height: 20px; border-radius: 50%;
-    margin-right: 0.4rem; vertical-align: middle;
-    flex-shrink: 0;
-}
-.peer-identicon-lg {
-    width: 36px; height: 36px; border-radius: 50%;
-    margin-right: 0.6rem; flex-shrink: 0;
-}
 .copy-btn-inline {
     font-family: var(--font-mono);
     font-size: 0.65rem;
@@ -2463,12 +2429,11 @@ fn peer_detail_html(address_str: &str) -> String {
     };
 
     // Build info card
-    let icon_lg = identicon_html(&peer.address.to_string(), "peer-identicon-lg");
     let addr_enc = html_escape(&peer.address.to_string());
     let info_card = format!(
         r#"<div class="card">
             <h2>Peer Info</h2>
-            <div class="peer-header-row">{icon_lg}<div><strong>{ptype}</strong> <code>{addr}</code><button type="button" class="copy-btn-inline" onclick="copyToClipboard('{addr_enc}').then(function(){{showToast('Address copied')}})" title="Copy address">⎘</button></div></div>
+            <div><strong>{ptype}</strong> <code>{addr}</code><button type="button" class="copy-btn-inline" onclick="copyToClipboard('{addr_enc}').then(function(){{showToast('Address copied')}})" title="Copy address">⎘</button></div>
             <div class="info-grid">
                 <div class="info-label">Location</div><div class="info-value">{loc}</div>
                 <div class="info-label">Connected</div><div class="info-value">{connected}</div>
@@ -2476,7 +2441,6 @@ fn peer_detail_html(address_str: &str) -> String {
                 <div class="info-label">Received</div><div class="info-value">{recv}</div>
             </div>
         </div>"#,
-        icon_lg = icon_lg,
         ptype = peer_type,
         addr = addr_enc,
         addr_enc = addr_enc,
@@ -3458,16 +3422,6 @@ a.header-title {
     background: var(--bg-tertiary);
     padding: 0.1rem 0.45rem;
     border-radius: 4px;
-}
-.peer-header-row {
-    display: flex; align-items: center; gap: 0.5rem;
-    margin-bottom: 0.75rem;
-}
-.peer-header-row strong { color: var(--text-primary); margin-right: 0.3rem; }
-.peer-header-row code {
-    font-family: var(--font-mono); font-size: 0.85rem;
-    color: var(--text-secondary); background: var(--bg-tertiary);
-    padding: 0.1rem 0.5rem; border-radius: 4px;
 }
 .info-grid {
     display: grid;
