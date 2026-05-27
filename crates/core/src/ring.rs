@@ -1840,18 +1840,27 @@ impl Ring {
     // ==================== Downstream Subscriber Tracking ====================
 
     pub fn add_downstream_subscriber(&self, contract: &ContractKey, peer: PeerKey) -> bool {
-        let added = self
+        let outcome = self
             .hosting_manager
             .add_downstream_subscriber(contract, peer);
-        if added {
-            // Downstream peer subscription = demand signal for this
-            // contract. Forwarded weight (per design doc Sybil
-            // resistance): 0.1, since peer identities are
-            // attacker-rotatable.
+        // Sybil resistance: count demand on NewAdd only. A peer that
+        // keeps renewing its subscription every few minutes would
+        // otherwise pad `benefit_score` by FORWARDED_DEMAND_WEIGHT
+        // per renewal — equivalent to N distinct subscribers from a
+        // single rotating peer over an hour. Renewals must NOT
+        // register as fresh demand. Forwarded weight (0.1, per the
+        // design doc) reflects that peer identities are
+        // attacker-rotatable. See `AddSubscriberOutcome`.
+        if matches!(outcome, crate::ring::hosting::AddSubscriberOutcome::NewAdd) {
             self.governance
                 .ingest_demand(*contract.id(), FORWARDED_DEMAND_WEIGHT);
         }
-        added
+        // Caller-facing bool preserved for backward compat: Rejected
+        // → false; NewAdd or Renewal → true (the peer is tracked).
+        !matches!(
+            outcome,
+            crate::ring::hosting::AddSubscriberOutcome::Rejected
+        )
     }
 
     #[allow(dead_code)] // Only used in tests
@@ -1990,8 +1999,13 @@ impl Ring {
         // Local client subscription = strong demand signal. Full
         // weight: this is our own user telling us they care about
         // this contract, harder to fake than a peer-side signal.
-        self.governance
-            .ingest_demand(*instance_id, LOCAL_DEMAND_WEIGHT);
+        // Gated on `is_new_for_client` so an idempotent re-subscribe
+        // call (same client + same contract) doesn't pad demand —
+        // see `AddClientSubscriptionResult::is_new_for_client`.
+        if result.is_new_for_client {
+            self.governance
+                .ingest_demand(*instance_id, LOCAL_DEMAND_WEIGHT);
+        }
         result
     }
 
