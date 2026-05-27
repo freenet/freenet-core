@@ -564,6 +564,12 @@ pub(crate) async fn start_relay_request_update(
     #[cfg(any(test, feature = "testing"))]
     RELAY_UPDATE_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+    // Note: the Phase 2 per-(sender, contract) rate limit is applied
+    // UPSTREAM at the wire dispatch site in `node.rs` so the same
+    // gate covers all four UPDATE wire variants (RequestUpdate,
+    // BroadcastTo, RequestUpdateStreaming, BroadcastToStreaming)
+    // uniformly. Rejected messages never reach this driver.
+
     if !op_manager.active_relay_update_txs.insert(incoming_tx) {
         RELAY_UPDATE_DEDUP_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::debug!(
@@ -573,39 +579,6 @@ pub(crate) async fn start_relay_request_update(
             phase = "relay_update_dedup_reject",
             "UPDATE relay: duplicate RequestUpdate for in-flight tx, dropping"
         );
-        return Ok(());
-    }
-
-    // Phase 2 front-line rate limit. Catches sustained UPDATE floods
-    // from a single peer for a single contract at the receive
-    // boundary, in milliseconds — before the spawn cost, before
-    // contract handling, and well before the MAD-based governance
-    // reaper (which reacts in minutes). See
-    // `crate::ring::update_rate_limit` for design.
-    //
-    // Dedup-set membership is removed below so a real retry isn't
-    // permanently blocked by a single rejection.
-    let rate_decision = op_manager
-        .ring
-        .update_rate_limiter
-        .check_and_record(sender_addr, *key.id());
-    if !rate_decision.is_allowed() {
-        op_manager.active_relay_update_txs.remove(&incoming_tx);
-        if let crate::ring::update_rate_limit::RateLimitDecision::Rejected {
-            elapsed,
-            min_interval,
-        } = rate_decision
-        {
-            tracing::debug!(
-                tx = %incoming_tx,
-                %key,
-                %sender_addr,
-                elapsed_ms = elapsed.as_millis() as u64,
-                min_interval_ms = min_interval.as_millis() as u64,
-                phase = "relay_update_rate_limited",
-                "UPDATE relay: rejected by per-(sender, contract) rate limit"
-            );
-        }
         return Ok(());
     }
 

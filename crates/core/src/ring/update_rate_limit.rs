@@ -32,10 +32,36 @@
 //!
 //! ## Bounded growth
 //!
-//! The `last_accepted` DashMap is bounded by a periodic cleanup task
-//! that drops entries whose timestamp is older than [`CLEANUP_AGE`].
-//! Caller is responsible for invoking [`UpdateRateLimiter::cleanup`]
-//! periodically (the Ring's existing reaper loop is a natural place).
+//! Two layers:
+//!
+//! 1. **Hard cap on entry count** ([`MAX_TRACKED_PAIRS`]). When the
+//!    cap is hit, new entries are rejected — an attacker churning
+//!    distinct `(sender, contract)` pairs cannot grow the map past
+//!    this size. Critical because the address space is attacker-
+//!    chosen (32-byte contract id × any source address).
+//! 2. **Periodic TTL sweep** ([`UpdateRateLimiter::cleanup`]) drops
+//!    entries idle for longer than [`CLEANUP_AGE`]. Hooked into the
+//!    Ring's existing reaper tick.
+//!
+//! The cap alone is sufficient to bound memory; the TTL sweep
+//! reclaims space from genuinely-idle pairs so the cap isn't
+//! prematurely reached under normal traffic.
+//!
+//! ## Semantic note: `sender_addr` is the immediate upstream hop
+//!
+//! The key uses the SocketAddr of the peer that *sent us* the
+//! message — not the originator of the UPDATE transaction. This is
+//! deliberate: the limiter is a **receiver-side resource guard**.
+//! "How much of my CPU/memory am I willing to spend processing
+//! UPDATEs from a single immediate peer for a single contract?" is
+//! the question this answers. If A floods through B to reach us, B
+//! is who hits our limiter — and that's correct, because B is who
+//! is consuming our resources.
+//!
+//! Originator-level protection is a different layer (Phase 7 ban
+//! enforcement, where a banned originator's traffic is rejected
+//! even if relayed). The two layers compose; neither subsumes the
+//! other.
 //!
 //! ## Design doc reference
 //!
@@ -43,12 +69,22 @@
 //! ContractInstanceId)>`. Apply at `SyncStateToPeer` emit + originator
 //! UPDATE entry. Reject with typed marker."*
 //!
-//! This MVP applies at INBOUND relay entry first (the highest-value
-//! protection point: blocks a flooding peer at the door). Originator
-//! and outbound-emit gates follow as separate PRs. The exponential
-//! repeat-offender backoff via `TrackedBackoff` is also a follow-up;
-//! the flat `MIN_UPDATE_INTERVAL` ceiling alone is sufficient for the
-//! May 21 incident pattern.
+//! Divergences from the design doc, with rationale:
+//!
+//! - **Flat ceiling instead of `TrackedBackoff` exponential.** A flat
+//!   100ms ceiling catches the May 21 pattern; exponential repeat-
+//!   offender cooldown can land as a follow-up if observation shows
+//!   it's needed.
+//! - **Inbound relay receive-boundary, not `SyncStateToPeer` emit.**
+//!   The doc's wording targets outbound emit. We instead gate at
+//!   inbound receive (4 wire-variant sites: `RequestUpdate`,
+//!   `BroadcastTo`, `RequestUpdateStreaming`, `BroadcastToStreaming`).
+//!   Receive-side guards a peer's own resources directly; emit-side
+//!   guards against being an amplifier. Receive is the higher-value
+//!   first cut; emit is a follow-up.
+//! - **No typed wire-level error.** Rejected UPDATEs are dropped
+//!   silently. The sender's own retry / governance scoring will
+//!   detect the flood pattern from its end.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -77,13 +113,26 @@ pub(crate) const MIN_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 /// preserving the rate-limit signal across short-term retries.
 pub(crate) const CLEANUP_AGE: Duration = Duration::from_secs(5 * 60);
 
-/// Outcome of an UPDATE rate-limit check. Callers must treat
-/// `Rejected` as "drop this message at the receive boundary, do not
-/// spawn a relay driver."
+/// Hard upper bound on the number of tracked `(sender, contract)`
+/// pairs. When the cap is reached, new pairs are rejected outright —
+/// this is the "no unbounded per-key collection for attacker-influenced
+/// keys" rule from `.claude/rules/code-style.md`. At 64 bytes/entry,
+/// 16 384 pairs ≈ 1 MB — tiny — but bounds the worst case where an
+/// attacker chooses fresh contract ids.
+///
+/// On reaching the cap: the per-shard guard's existing entries
+/// continue to track normally (so a legitimate peer who was already
+/// tracked keeps working); only NEW pairs hit the cap. Combined with
+/// the TTL sweep this gives smooth recovery as idle pairs roll off.
+pub(crate) const MAX_TRACKED_PAIRS: usize = 16_384;
+
+/// Outcome of an UPDATE rate-limit check. Callers must treat any
+/// non-`Allowed` variant as "drop this message at the receive
+/// boundary, do not spawn a relay driver."
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RateLimitDecision {
     /// Allowed — proceed with normal UPDATE handling. The accepted
-    /// timestamp has been stamped.
+    /// timestamp has been stamped atomically.
     Allowed,
     /// Rejected — too soon after the previous accepted UPDATE from this
     /// `(sender, contract)` pair. Carries the elapsed time vs the
@@ -92,6 +141,12 @@ pub(crate) enum RateLimitDecision {
         elapsed: Duration,
         min_interval: Duration,
     },
+    /// Rejected because the tracking map has hit
+    /// [`MAX_TRACKED_PAIRS`] and this is a new pair. Distinct from
+    /// `Rejected` so the dashboard can tell "throttling working as
+    /// intended" apart from "limiter overflowing" — the latter
+    /// suggests an attack pattern with churned identities.
+    CapacityExceeded,
 }
 
 impl RateLimitDecision {
@@ -109,39 +164,55 @@ impl RateLimitDecision {
 pub(crate) struct UpdateRateLimiter {
     last_accepted: DashMap<(SocketAddr, ContractInstanceId), Instant>,
     min_interval: Duration,
+    max_tracked_pairs: usize,
     time_source: Arc<dyn TimeSource + Send + Sync>,
     /// Total accepted UPDATEs since limiter creation. Surfaced on the
     /// dashboard so operators can see the limiter's signal-to-noise.
     accepted_total: AtomicU64,
-    /// Total rejected UPDATEs since limiter creation.
+    /// Total rejected UPDATEs since limiter creation (rate-limit hits).
     rejected_total: AtomicU64,
+    /// Total UPDATEs rejected because the tracking map was at capacity
+    /// when a new `(sender, contract)` pair tried to register. Surfaced
+    /// separately because a non-zero value suggests an attacker is
+    /// churning identities to exhaust the limiter's address space.
+    capacity_rejected_total: AtomicU64,
 }
 
 impl UpdateRateLimiter {
     pub fn new(time_source: Arc<dyn TimeSource + Send + Sync>) -> Self {
-        Self::with_min_interval(time_source, MIN_UPDATE_INTERVAL)
+        Self::with_config(time_source, MIN_UPDATE_INTERVAL, MAX_TRACKED_PAIRS)
     }
 
-    pub fn with_min_interval(
+    pub fn with_config(
         time_source: Arc<dyn TimeSource + Send + Sync>,
         min_interval: Duration,
+        max_tracked_pairs: usize,
     ) -> Self {
         Self {
             last_accepted: DashMap::new(),
             min_interval,
+            max_tracked_pairs,
             time_source,
             accepted_total: AtomicU64::new(0),
             rejected_total: AtomicU64::new(0),
+            capacity_rejected_total: AtomicU64::new(0),
         }
     }
 
     /// Check whether an UPDATE from `sender` for `contract` is allowed
-    /// right now. If allowed, the accepted timestamp is recorded
-    /// atomically; the caller can rely on this being the moment of
-    /// admission for downstream rate-tracking. If rejected, no state
-    /// change is made (so a barrage of rejected attempts doesn't itself
-    /// extend the rate-limit window — the existing `last_accepted`
-    /// timestamp stays put).
+    /// right now, and atomically stamp the accepted timestamp if so.
+    ///
+    /// Implementation note: uses [`DashMap::entry`] so the per-shard
+    /// guard is held across the time-comparison + stamp. A previous
+    /// probe-then-insert version was non-atomic — Codex review of
+    /// PR #4285 caught that concurrent UPDATEs for the same pair
+    /// could all read the same old timestamp and all be admitted.
+    /// With the guard held, exactly one admitting caller wins per
+    /// `min_interval` window.
+    ///
+    /// If rejected, no state change is made (so a barrage of rejected
+    /// attempts doesn't itself extend the rate-limit window — the
+    /// existing `last_accepted` timestamp stays put).
     pub fn check_and_record(
         &self,
         sender: SocketAddr,
@@ -150,28 +221,78 @@ impl UpdateRateLimiter {
         let now = self.time_source.now();
         let key = (sender, contract);
 
-        // Probe the existing timestamp without holding a guard across
-        // the conditional update — avoids holding the DashMap shard
-        // lock during the time-comparison + atomic-counter steps.
-        let existing = self.last_accepted.get(&key).map(|r| *r);
-
-        if let Some(last) = existing {
-            let elapsed = now.saturating_duration_since(last);
-            if elapsed < self.min_interval {
-                self.rejected_total.fetch_add(1, Ordering::Relaxed);
-                return RateLimitDecision::Rejected {
-                    elapsed,
-                    min_interval: self.min_interval,
-                };
+        // Two-phase check:
+        //   1. If the entry already exists, hold its shard guard
+        //      across the time-comparison + stamp (atomic per pair).
+        //   2. For new pairs we need to enforce MAX_TRACKED_PAIRS by
+        //      reading `DashMap::len()` — but `len()` walks every
+        //      shard, so we MUST NOT hold any shard guard when we
+        //      call it (otherwise it deadlocks on the shard we hold).
+        //      Check existence with a `contains_key` probe first; if
+        //      it's a new pair, check `len()` against the cap and
+        //      then call `insert`. `insert` is itself atomic per
+        //      shard, so the worst-case race is a transient ±N
+        //      overshoot of the cap (N = number of shards) — bounded
+        //      and harmless.
+        use dashmap::mapref::entry::Entry;
+        if self.last_accepted.contains_key(&key) {
+            // Existing pair: hold the shard guard for the
+            // time-comparison + stamp.
+            match self.last_accepted.entry(key) {
+                Entry::Occupied(mut entry) => {
+                    let last = *entry.get();
+                    let elapsed = now.saturating_duration_since(last);
+                    if elapsed < self.min_interval {
+                        self.rejected_total.fetch_add(1, Ordering::Relaxed);
+                        return RateLimitDecision::Rejected {
+                            elapsed,
+                            min_interval: self.min_interval,
+                        };
+                    }
+                    *entry.get_mut() = now;
+                    self.accepted_total.fetch_add(1, Ordering::Relaxed);
+                    RateLimitDecision::Allowed
+                }
+                // Race: the entry was concurrently removed between
+                // the contains_key probe and the entry() call. Treat
+                // as a new pair, fall through.
+                Entry::Vacant(entry) => self.insert_new_pair(entry, now),
+            }
+        } else {
+            // New pair: check cap WITHOUT holding any shard guard.
+            if self.last_accepted.len() >= self.max_tracked_pairs {
+                self.capacity_rejected_total.fetch_add(1, Ordering::Relaxed);
+                return RateLimitDecision::CapacityExceeded;
+            }
+            // Insert under the shard guard. If a concurrent insert
+            // beat us to the same key, treat as a normal admission
+            // (the other admit wins; we just bump our counter).
+            match self.last_accepted.entry(key) {
+                Entry::Vacant(entry) => self.insert_new_pair(entry, now),
+                Entry::Occupied(mut entry) => {
+                    let last = *entry.get();
+                    let elapsed = now.saturating_duration_since(last);
+                    if elapsed < self.min_interval {
+                        self.rejected_total.fetch_add(1, Ordering::Relaxed);
+                        return RateLimitDecision::Rejected {
+                            elapsed,
+                            min_interval: self.min_interval,
+                        };
+                    }
+                    *entry.get_mut() = now;
+                    self.accepted_total.fetch_add(1, Ordering::Relaxed);
+                    RateLimitDecision::Allowed
+                }
             }
         }
+    }
 
-        // Allowed: stamp the new time. `insert` overwrites; if a
-        // concurrent caller stamped a different time between our probe
-        // and this insert, the later one wins, which is fine — the
-        // rate limit is per-pair and roughly idempotent under
-        // concurrent admission.
-        self.last_accepted.insert(key, now);
+    fn insert_new_pair(
+        &self,
+        entry: dashmap::mapref::entry::VacantEntry<'_, (SocketAddr, ContractInstanceId), Instant>,
+        now: Instant,
+    ) -> RateLimitDecision {
+        entry.insert(now);
         self.accepted_total.fetch_add(1, Ordering::Relaxed);
         RateLimitDecision::Allowed
     }
@@ -200,6 +321,16 @@ impl UpdateRateLimiter {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn rejected_total(&self) -> u64 {
         self.rejected_total.load(Ordering::Relaxed)
+    }
+
+    /// Total UPDATEs rejected because the tracking map was at capacity
+    /// (a new `(sender, contract)` pair tried to register when the map
+    /// already held [`MAX_TRACKED_PAIRS`] pairs). A non-zero value
+    /// suggests an attacker is churning identities — surface separately
+    /// from `rejected_total` on the dashboard for that reason.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn capacity_rejected_total(&self) -> u64 {
+        self.capacity_rejected_total.load(Ordering::Relaxed)
     }
 
     /// Number of tracked `(sender, contract)` pairs. Used by tests and
@@ -429,5 +560,161 @@ mod tests {
             "expected >95% rejection rate, got {}",
             rejected as f64 / 1000.0
         );
+    }
+
+    /// Pin: hard cap on tracked pairs prevents an attacker churning
+    /// fresh contract identities from growing the map indefinitely.
+    /// Once `MAX_TRACKED_PAIRS` is reached, new pairs get
+    /// `CapacityExceeded`, never `Allowed`. Existing pairs keep
+    /// working — graceful degradation, not total denial.
+    #[test]
+    fn capacity_exceeded_when_cap_reached() {
+        // Small cap so the test is fast.
+        let ts = SharedMockTimeSource::new();
+        let limiter = UpdateRateLimiter::with_config(
+            Arc::new(ts.clone()),
+            MIN_UPDATE_INTERVAL,
+            8, // tiny cap for test speed
+        );
+
+        // Fill the map with 8 distinct pairs — all should be Allowed.
+        for i in 0..8 {
+            let d = limiter.check_and_record(mk_sender(i + 1), mk_contract(i + 1));
+            assert_eq!(d, RateLimitDecision::Allowed, "pair {i} should be allowed");
+        }
+        assert_eq!(limiter.len(), 8);
+
+        // Pair #9 is a new key — must be CapacityExceeded.
+        let d = limiter.check_and_record(mk_sender(99), mk_contract(99));
+        assert_eq!(
+            d,
+            RateLimitDecision::CapacityExceeded,
+            "new pair past the cap must be CapacityExceeded"
+        );
+        assert_eq!(limiter.capacity_rejected_total(), 1);
+
+        // Pair #1 (already tracked) — should still work after
+        // the min_interval elapses. Existing pairs aren't punished
+        // by the cap.
+        ts.advance(MIN_UPDATE_INTERVAL + Duration::from_millis(1));
+        let d = limiter.check_and_record(mk_sender(1), mk_contract(1));
+        assert_eq!(
+            d,
+            RateLimitDecision::Allowed,
+            "existing pair must keep working at cap"
+        );
+
+        // After cleanup drops stale entries the cap recovers, but in
+        // this test no time has passed so they're still fresh.
+    }
+
+    /// Pin the atomicity of `check_and_record` under concurrent
+    /// callers. Without `DashMap::entry()` holding the shard guard
+    /// across the time-comparison + stamp, two threads racing the
+    /// same `(sender, contract)` pair could both decide `Allowed`,
+    /// both increment `accepted_total`, and both spawn relay work.
+    /// Codex review of PR #4285 caught this. The fixed implementation
+    /// must serialize exactly one Allowed per `min_interval` window
+    /// per pair.
+    #[test]
+    fn concurrent_check_and_record_admits_one_per_window() {
+        use std::sync::{Arc as StdArc, Barrier};
+        use std::thread;
+
+        let ts = SharedMockTimeSource::new();
+        let limiter = StdArc::new(UpdateRateLimiter::new(Arc::new(ts.clone())));
+        let sender = mk_sender(1);
+        let contract = mk_contract(1);
+
+        const THREADS: usize = 16;
+        let barrier = StdArc::new(Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+
+        for _ in 0..THREADS {
+            let l = limiter.clone();
+            let b = barrier.clone();
+            handles.push(thread::spawn(move || {
+                b.wait();
+                l.check_and_record(sender, contract)
+            }));
+        }
+
+        let mut allowed = 0;
+        let mut rejected = 0;
+        for h in handles {
+            match h.join().unwrap() {
+                RateLimitDecision::Allowed => allowed += 1,
+                RateLimitDecision::Rejected { .. } => rejected += 1,
+                RateLimitDecision::CapacityExceeded => panic!("unexpected cap"),
+            }
+        }
+        assert_eq!(
+            allowed, 1,
+            "exactly ONE concurrent caller must be admitted per window; \
+             got {allowed} admits, {rejected} rejects"
+        );
+        assert_eq!(rejected, THREADS - 1);
+        assert_eq!(limiter.accepted_total(), 1);
+        assert_eq!(limiter.rejected_total(), (THREADS - 1) as u64);
+    }
+
+    /// Source-grep pin: the rate-limit gate at the UPDATE dispatch
+    /// site in `node.rs` must cover ALL four UPDATE wire variants
+    /// (`RequestUpdate`, `BroadcastTo`, `RequestUpdateStreaming`,
+    /// `BroadcastToStreaming`). Codex review of #4285 caught a
+    /// previous iteration that only gated `RequestUpdate`, letting
+    /// a flooder bypass by switching opcode.
+    ///
+    /// Strategy: scrape `node.rs` for the UPDATE dispatch block and
+    /// assert (a) the rate-limit call site appears, (b) it appears
+    /// BEFORE any `start_relay_*` spawn, and (c) the four wire-variant
+    /// names are mentioned in the same block (proving the dispatch
+    /// matches on all of them).
+    #[test]
+    fn update_dispatch_gates_all_four_wire_variants() {
+        const NODE_SRC: &str = include_str!("../node.rs");
+
+        // Find the UPDATE handler block.
+        let block_start = NODE_SRC
+            .find("NetMessageV1::Update(ref op) =>")
+            .expect("could not locate UPDATE dispatch block in node.rs");
+
+        // Bound the search to a generous slice — the UPDATE block is
+        // well under 4KB.
+        let block_end = (block_start + 8192).min(NODE_SRC.len());
+        let block = &NODE_SRC[block_start..block_end];
+
+        // (a) the gate is invoked.
+        let rate_limit_pos = block
+            .find("update_rate_limiter")
+            .expect("update_rate_limiter not invoked in UPDATE dispatch block");
+
+        // (b) the gate fires BEFORE the first relay spawn — otherwise
+        //     the spawn cost is paid even on rejection.
+        let first_spawn_pos = block
+            .find("start_relay_request_update(")
+            .expect("start_relay_request_update spawn not found in block");
+        assert!(
+            rate_limit_pos < first_spawn_pos,
+            "rate limit gate (offset {rate_limit_pos}) must appear BEFORE \
+             the first relay spawn (offset {first_spawn_pos}) so rejected \
+             messages don't pay the spawn cost"
+        );
+
+        // (c) all four wire variants are matched in the dispatch.
+        for variant in [
+            "UpdateMsg::RequestUpdate {",
+            "UpdateMsg::BroadcastTo {",
+            "UpdateMsg::RequestUpdateStreaming {",
+            "UpdateMsg::BroadcastToStreaming {",
+        ] {
+            assert!(
+                block.contains(variant),
+                "UPDATE dispatch block missing wire variant: `{variant}`. \
+                 If a new UPDATE wire variant was added, gate it through \
+                 the rate limiter and update this list. If a variant was \
+                 removed, update this list."
+            );
+        }
     }
 }
