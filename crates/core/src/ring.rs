@@ -2165,10 +2165,28 @@ impl Ring {
             None => ns::NetworkNorms::default(),
         };
 
+        // state_by_id: map ContractInstanceId → state for the
+        // Subscribed Contracts table's Gov column cross-reference.
+        // Walking iter_flagged_scores() once for the `contracts`
+        // list above gave us the flagged set; for unflagged
+        // contracts the absence from this map means "Normal".
+        let state_by_id: std::collections::HashMap<String, ns::GovernanceStateSnapshot> = contracts
+            .iter()
+            .map(|c| (c.instance_id.clone(), c.state))
+            .collect();
+
+        let observed_count = self.governance.len();
+        let min_samples = self.governance.outlier_min_samples();
+        let last_tick_at = self.governance.latest_norms().map(|n| n.at);
+
         ns::GovernanceSnapshot {
             mode,
             contracts,
+            observed_count,
+            min_samples,
             norms,
+            last_tick_at,
+            state_by_id,
         }
     }
 

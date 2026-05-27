@@ -473,7 +473,12 @@ fn build_peers_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Str
         );
     }
 
-    let ring_svg = build_ring_svg(snap.own_location, &snap.peers, Some(&snap.governance));
+    let ring_svg = build_ring_svg(
+        snap.own_location,
+        &snap.peers,
+        Some(&snap.governance),
+        &snap.contracts,
+    );
 
     let mut rows = String::new();
     for p in &snap.peers {
@@ -545,6 +550,7 @@ fn build_ring_svg(
     own_location: Option<f64>,
     peers: &[network_status::PeerSnapshot],
     governance: Option<&network_status::GovernanceSnapshot>,
+    hosted_contracts: &[network_status::ContractSnapshot],
 ) -> String {
     // Render when there's *something* to show. The historical guard
     // (at least one peer with a location) still applies.
@@ -639,19 +645,56 @@ fn build_ring_svg(
         }
     }
 
+    // Deterministic hash → ring location for placing contracts.
+    // The instance id is a 32-byte content hash; we fold the
+    // string form to a u64 and modulo onto [0, 1). Position is
+    // stable across refreshes (same id → same dot location).
+    let hash_to_loc = |s: &str| -> f64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut h = DefaultHasher::new();
+        s.hash(&mut h);
+        (h.finish() % 10_000) as f64 / 10_000.0
+    };
+
+    // === Hosted contracts on the inner ring (faint dots) ===
+    //
+    // Before drawing flagged-contract markers, draw ALL hosted
+    // contracts as faint dim dots so the inner ring isn't visually
+    // empty in healthy state. Hosted-contract data comes from the
+    // Subscribed Contracts list (different source from governance,
+    // which only carries flagged entries). A contract that's also
+    // flagged will get a brighter overlay drawn on top below.
+    //
+    // This addresses the "inner ring looks broken" finding from the
+    // UI feedback doc — operators saw the CONTRACTS wordmark with
+    // no dots beneath it and assumed the renderer was unfinished.
+    let governance_ids: std::collections::HashSet<&str> = governance
+        .map(|g| g.contracts.iter().map(|c| c.instance_id.as_str()).collect())
+        .unwrap_or_default();
+    for c in hosted_contracts {
+        // Skip contracts that are flagged — they get a more visible
+        // marker in the flagged-rendering loop below. Drawing them
+        // here would just be overlapped.
+        if governance_ids.contains(c.key_full.as_str()) {
+            continue;
+        }
+        let loc = hash_to_loc(&c.key_full);
+        let (kx, ky) = loc_to_xy(loc, r_inner);
+        // Dim teal dot — same brand color as YOU but smaller and
+        // translucent so flagged dots stand out by contrast.
+        write!(
+            svg,
+            "<circle cx=\"{x:.1}\" cy=\"{y:.1}\" r=\"2.5\" fill=\"#43c178\" fill-opacity=\"0.45\"><title>{title}</title></circle>",
+            x = kx,
+            y = ky,
+            title = html_escape(&format!("{} (hosted)", &c.key_short)),
+        )
+        .ok();
+    }
+
     // === Contract dots (and YOU → flagged-contract curves) ===
     if let Some(gov) = governance {
-        // Deterministic hash → ring location for placing contracts.
-        // The instance id is a 32-byte content hash; we fold the
-        // string form to a u64 and modulo onto [0, 1). Position is
-        // stable across refreshes (same id → same dot location).
-        let hash_to_loc = |s: &str| -> f64 {
-            use std::collections::hash_map::DefaultHasher;
-            use std::hash::{Hash, Hasher};
-            let mut h = DefaultHasher::new();
-            s.hash(&mut h);
-            (h.finish() % 10_000) as f64 / 10_000.0
-        };
         for c in &gov.contracts {
             let loc = hash_to_loc(&c.instance_id);
             let (kx, ky) = loc_to_xy(loc, r_inner);
@@ -772,17 +815,119 @@ fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
     };
     let g = &snap.governance;
 
-    // Empty state: no contracts tracked yet (cold start, or this
-    // build doesn't have the governance manager enabled). Per the
-    // design principle — show nothing rather than show fabricated
-    // data. The "history strip" pattern from the prototype lives
-    // here as a single compact line so the absence reads as
-    // working-correctly rather than missing-panel.
+    let mode_txt = match g.mode {
+        network_status::GovernanceModeSnapshot::Off => "off",
+        network_status::GovernanceModeSnapshot::DryRun => "dry-run",
+        network_status::GovernanceModeSnapshot::Enforce => "enforce",
+    };
+
+    let last_tick_footer = match g.last_tick_at {
+        Some(at) => {
+            // Compute "Ns ago" using TOKIO instant arithmetic via
+            // a wall-clock comparison. The snapshot was built
+            // moments ago so we can approximate "now" inline.
+            let now = tokio::time::Instant::now();
+            let secs = now.saturating_duration_since(at).as_secs();
+            format!("Last evaluated {} ago", format_ago(secs))
+        }
+        None => "Reaper has not yet ticked".to_string(),
+    };
+
+    // Empty state: no FLAGGED contracts. Render the structural
+    // skeleton (mode pill, 5-tile mini-strip with em-dashes if data
+    // is unavailable, observed/required progress) rather than just a
+    // paragraph — teaches operators what data will appear and what
+    // mode is active. The previous empty state hid this and made
+    // an operator think the dashboard was half-implemented.
     if g.contracts.is_empty() {
-        return r#"<div class="card">
-            <h2>Contract Governance</h2>
-            <p class="empty">Not enough contracts observed yet. Governance scoring activates once this node has seen at least 30 contracts and they have had time to accumulate cost/benefit signals.</p>
-        </div>"#.to_string();
+        let observed = g.observed_count;
+        let needed = g.min_samples;
+        let progress_msg = if needed == 0 {
+            "Governance manager is not yet wired.".to_string()
+        } else if observed == 0 {
+            format!(
+                "No contracts observed yet. Scoring activates after {needed} contracts \
+                 have accumulated cost/benefit signals."
+            )
+        } else if observed < needed {
+            format!(
+                "Observed {observed} / {needed} contracts needed for statistical scoring. \
+                 Scoring activates once {needed_remaining} more contracts accumulate \
+                 cost/benefit signals.",
+                needed_remaining = needed - observed,
+            )
+        } else {
+            // Enough samples observed but none flagged — that's the
+            // healthy steady state.
+            format!(
+                "All {observed} tracked contracts within normal range. \
+                 (Scored against the network's own observed distribution.)"
+            )
+        };
+        let verdict_main = if observed >= needed {
+            format!(
+                r#"<div class="verdict-num">✓</div>
+                   <div class="verdict-headline">{observed} contracts within normal range</div>
+                   <div class="verdict-detail">No flags raised.</div>"#
+            )
+        } else {
+            format!(
+                r#"<div class="verdict-num">{observed}<span class="verdict-num-denom">/{needed}</span></div>
+                   <div class="verdict-headline">contracts observed</div>
+                   <div class="verdict-detail">Scoring activates at {needed}.</div>"#
+            )
+        };
+
+        // 5-tile skeleton — render even with no data, using em-dashes
+        // for missing values. This shows operators what fields will
+        // populate as the reaper ticks.
+        let median_txt = g
+            .norms
+            .median_log_ratio
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_else(|| "—".to_string());
+        let mad_txt = g
+            .norms
+            .mad
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_else(|| "—".to_string());
+        let threshold_txt = g
+            .norms
+            .threshold
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_else(|| "—".to_string());
+        let sample_size_txt = if g.norms.sample_size == 0 {
+            "—".to_string()
+        } else {
+            g.norms.sample_size.to_string()
+        };
+
+        return format!(
+            r##"<div class="card">
+                <div class="card-header"><h2>Contract Governance</h2><span class="g-mode g-mode-{mode}">{mode}</span></div>
+                <div class="g-verdict-row">
+                    <div class="g-verdict verdict-ok">{verdict_main}</div>
+                    <div class="g-norms">
+                        <div class="g-norm"><div class="g-norm-label">Tracked</div><div class="g-norm-value">{observed}</div></div>
+                        <div class="g-norm"><div class="g-norm-label">Sample size</div><div class="g-norm-value">{sample_size}</div></div>
+                        <div class="g-norm"><div class="g-norm-label">Median log-ratio</div><div class="g-norm-value">{median}</div></div>
+                        <div class="g-norm"><div class="g-norm-label">MAD spread</div><div class="g-norm-value">{mad}</div></div>
+                        <div class="g-norm"><div class="g-norm-label">Eviction threshold</div><div class="g-norm-value">{threshold}</div></div>
+                    </div>
+                </div>
+                <p class="empty" style="margin: 0.6rem 0.9rem 0.2rem; font-size: 0.9rem;">{progress}</p>
+                <p class="empty" style="margin: 0 0.9rem 0.6rem; font-size: 0.78rem; color: var(--text-muted, #888);">{tick_footer}</p>
+            </div>"##,
+            mode = mode_txt,
+            verdict_main = verdict_main,
+            observed = observed,
+            sample_size = sample_size_txt,
+            median = median_txt,
+            mad = mad_txt,
+            threshold = threshold_txt,
+            progress = progress_msg,
+            tick_footer = last_tick_footer,
+        );
     }
 
     // Verdict counts. Mirror state-snapshot enum → string.
@@ -863,11 +1008,9 @@ fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
         .map(|v| format!("{:.2}", v))
         .unwrap_or_else(|| "—".to_string());
     let sample_size_txt = g.norms.sample_size.to_string();
-    let mode_txt = match g.mode {
-        network_status::GovernanceModeSnapshot::Off => "off",
-        network_status::GovernanceModeSnapshot::DryRun => "dry-run",
-        network_status::GovernanceModeSnapshot::Enforce => "enforce",
-    };
+    // `mode_txt` and `last_tick_footer` are in scope from the top
+    // of this function (defined once, reused in both empty and
+    // populated branches).
 
     // Per-contract table — flagged-only by default; an "all" link
     // could come later. Honest principle: this table reflects the
@@ -934,13 +1077,14 @@ fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
         rows = r#"<tr><td colspan="6" class="empty" style="padding: 0.5rem 0.9rem">All contracts within normal range.</td></tr>"#.to_string();
     }
 
+    let tracked_total = g.observed_count.max(total);
     format!(
         r##"<div class="card">
             <div class="card-header"><h2>Contract Governance</h2><span class="g-mode g-mode-{mode}">{mode}</span></div>
             <div class="g-verdict-row">
                 <div class="g-verdict {verdict_class}">{verdict_main}</div>
                 <div class="g-norms">
-                    <div class="g-norm"><div class="g-norm-label">Tracked</div><div class="g-norm-value">{total}</div></div>
+                    <div class="g-norm"><div class="g-norm-label">Tracked</div><div class="g-norm-value">{tracked_total}</div></div>
                     <div class="g-norm"><div class="g-norm-label">Sample size</div><div class="g-norm-value">{sample_size}</div></div>
                     <div class="g-norm"><div class="g-norm-label">Median log-ratio</div><div class="g-norm-value">{median}</div></div>
                     <div class="g-norm"><div class="g-norm-label">MAD spread</div><div class="g-norm-value">{mad}</div></div>
@@ -953,11 +1097,13 @@ fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
                     <tbody>{rows}</tbody>
                 </table>
             </div>
+            <p class="empty" style="margin: 0.4rem 0.9rem 0.6rem; font-size: 0.78rem; color: var(--text-muted, #888);">{tick_footer}</p>
         </div>"##,
         mode = mode_txt,
         verdict_class = verdict_class,
         verdict_main = verdict_main,
-        total = total,
+        tracked_total = tracked_total,
+        tick_footer = last_tick_footer,
         sample_size = sample_size_txt,
         median = median_txt,
         mad = mad_txt,
@@ -981,20 +1127,40 @@ fn build_contracts_card(snap: &Option<network_status::NetworkStatusSnapshot>) ->
         return String::new();
     }
 
+    let state_by_id = &snap.governance.state_by_id;
     let mut rows = String::new();
     for c in &snap.contracts {
         let last_update = c
             .last_updated_secs
             .map(format_ago)
             .unwrap_or_else(|| "—".to_string());
-        // last_updated_secs absent → never updated. Sort it as the
-        // largest possible "ago", so it lands at the bottom in ascending
-        // order (i.e. "never" is treated as the oldest activity).
         let last_update_sort = c.last_updated_secs.unwrap_or(u64::MAX);
+        // Governance state cell. A contract may appear in the
+        // Subscribed Contracts table without being flagged by
+        // governance — in that case the state isn't in `state_by_id`
+        // (the snapshot only carries flagged contracts) and we
+        // render it as "ok". Absence from the table specifically
+        // means "not flagged"; we trust the back-end's `iter_flagged_
+        // scores` filter.
+        let (gov_class, gov_label, gov_sort) = match state_by_id.get(&c.key_full) {
+            None => ("gov-ok", "ok", 0u8),
+            Some(network_status::GovernanceStateSnapshot::Normal) => ("gov-ok", "ok", 0),
+            Some(network_status::GovernanceStateSnapshot::Borderline) => {
+                ("gov-borderline", "borderline", 1)
+            }
+            Some(network_status::GovernanceStateSnapshot::WouldEvict) => {
+                ("gov-wouldevict", "would evict", 2)
+            }
+            Some(network_status::GovernanceStateSnapshot::Evicted) => ("gov-evicted", "evicted", 3),
+            Some(network_status::GovernanceStateSnapshot::Banned) => ("gov-banned", "banned", 4),
+        };
         rows.push_str(&format!(
-            r#"<tr><td title="{full}" data-sort="{full}"><code>{short}</code><button type="button" class="copy-key" data-copy="{full}" title="Copy contract key" aria-label="Copy contract key">⧉</button></td><td data-sort="{sub_secs}">{subscribed}</td><td data-sort="{last_sort}">{last_update}</td></tr>"#,
+            r#"<tr><td title="{full}" data-sort="{full}"><code>{short}</code><button type="button" class="copy-key" data-copy="{full}" title="Copy contract key" aria-label="Copy contract key">⧉</button></td><td data-sort="{gov_sort}"><span class="gov-pill {gov_class}">{gov_label}</span></td><td data-sort="{sub_secs}">{subscribed}</td><td data-sort="{last_sort}">{last_update}</td></tr>"#,
             full = html_escape(&c.key_full),
             short = html_escape(&c.key_short),
+            gov_sort = gov_sort,
+            gov_class = gov_class,
+            gov_label = gov_label,
             sub_secs = c.subscribed_secs,
             subscribed = format_ago(c.subscribed_secs),
             last_sort = last_update_sort,
@@ -1007,7 +1173,7 @@ fn build_contracts_card(snap: &Option<network_status::NetworkStatusSnapshot>) ->
             <h2>Subscribed Contracts</h2>
             <div class="table-wrap">
                 <table class="sortable" data-table-id="contracts">
-                    <thead><tr><th data-sort-type="text">Contract</th><th data-sort-type="num">Subscribed</th><th data-sort-type="num">Last Update</th></tr></thead>
+                    <thead><tr><th data-sort-type="text">Contract</th><th data-sort-type="num">Gov</th><th data-sort-type="num">Subscribed</th><th data-sort-type="num">Last Update</th></tr></thead>
                     <tbody>{rows}</tbody>
                 </table>
             </div>
@@ -1787,6 +1953,37 @@ table.sortable thead th.sort-desc::after { content: "▼"; opacity: 1; color: va
 .g-wouldevict { background: rgba(255,138,61,0.18);  color: #ff8a3d; }
 .g-evicted    { background: rgba(255,102,122,0.18); color: #ff667a; }
 .g-banned     { background: rgba(211,54,130,0.18);  color: #d33682; }
+
+/* Compact governance-state pill rendered inline in the Subscribed
+ * Contracts table's Gov column. Smaller than the `.g-badge` used in
+ * the main Contract Governance table so it doesn't dominate the
+ * row, while still being a single visual cue scanning down the
+ * column. */
+.gov-pill {
+    display: inline-block;
+    padding: 0.1rem 0.45rem;
+    font-size: 0.72rem;
+    border-radius: 3px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    font-weight: 500;
+    line-height: 1.2;
+}
+.gov-ok         { background: rgba(67,193,120,0.12);  color: #6b8a76; }
+.gov-borderline { background: rgba(255,182,16,0.18);  color: #ffb610; }
+.gov-wouldevict { background: rgba(255,138,61,0.20);  color: #ff8a3d; }
+.gov-evicted    { background: rgba(255,102,122,0.22); color: #ff667a; }
+.gov-banned     { background: rgba(211,54,130,0.22);  color: #d33682; }
+
+/* Denominator in the empty-state verdict ("3/30"). Smaller than the
+ * numerator so the eye reads the count first and the threshold
+ * second. */
+.verdict-num-denom {
+    font-size: 0.55em;
+    color: var(--text-muted, #888);
+    margin-left: 0.1em;
+    vertical-align: middle;
+}
 "##;
 
 /// Inline JavaScript for the dark/light mode toggle.
@@ -3788,7 +3985,7 @@ mod tests {
     #[test]
     fn ring_svg_dots_link_to_peer_pages() {
         let peers = vec![sample_peer("127.0.0.1:31337", 0.25)];
-        let svg = build_ring_svg(Some(0.5), &peers, None);
+        let svg = build_ring_svg(Some(0.5), &peers, None, &[]);
         assert!(
             svg.contains("<a href=\"/peer/127.0.0.1:31337\""),
             "ring peer dot must be wrapped in a link to /peer/{{addr}}, got: {svg}"
@@ -3892,7 +4089,7 @@ mod tests {
         // The local node has no /peer/{addr} page, so the self circle
         // must NOT be wrapped in an <a>, but it should still expose a
         // <title> for parity with the peer dots.
-        let svg = build_ring_svg(Some(0.42), &[], None);
+        let svg = build_ring_svg(Some(0.42), &[], None, &[]);
         assert!(svg.contains("<svg"), "ring SVG should still render");
         assert!(
             !svg.contains("<a "),
@@ -3924,7 +4121,7 @@ mod tests {
             bytes_received: 0,
         };
         let peer = sample_peer("10.0.0.2:31338", 0.90);
-        let svg = build_ring_svg(Some(0.5), &[gw, peer], None);
+        let svg = build_ring_svg(Some(0.5), &[gw, peer], None, &[]);
         assert!(
             svg.contains("<title>Gateway 10.0.0.1:31337"),
             "gateway dot title must say 'Gateway', got: {svg}"
@@ -3953,8 +4150,8 @@ mod tests {
             bytes_sent: 0,
             bytes_received: 0,
         };
-        assert!(build_ring_svg(None, &[no_loc_peer], None).is_empty());
-        assert!(build_ring_svg(None, &[], None).is_empty());
+        assert!(build_ring_svg(None, &[no_loc_peer], None, &[]).is_empty());
+        assert!(build_ring_svg(None, &[], None, &[]).is_empty());
     }
 
     // ── Sort attribute coverage for both tables ─────────────────────────────
@@ -4171,15 +4368,77 @@ mod tests {
 
     #[test]
     fn governance_card_empty_state_when_no_contracts() {
+        // Empty state = "no FLAGGED contracts." Post-polish slice 2 the
+        // card still renders structural skeleton (mode pill, 5-tile
+        // mini-strip with em-dashes, observed/needed progress) so an
+        // operator can see what fields will appear once data arrives.
+        // Pin: the skeleton tiles + mode pill are visible.
         let snap = base_snapshot();
         let html = build_governance_card(&Some(snap));
         assert!(
-            html.contains("Not enough contracts observed yet"),
-            "empty state should explain why governance has nothing to show — got:\n{html}"
+            html.contains(r#"g-mode g-mode-dry-run">dry-run<"#),
+            "empty state must show the mode pill — got:\n{html}"
+        );
+        assert!(
+            html.contains("Eviction threshold"),
+            "empty state must render the 5-tile skeleton — got:\n{html}"
+        );
+        assert!(
+            html.contains("—"),
+            "empty state should use em-dashes for missing tile values"
         );
         assert!(
             !html.contains("verdict-alert"),
             "empty state must not render the alert verdict block"
+        );
+    }
+
+    #[test]
+    fn governance_card_empty_state_shows_observed_progress() {
+        // Pin: the empty state surfaces "N / min_samples" so the
+        // operator can see progress toward statistical scoring.
+        let mut snap = base_snapshot();
+        snap.governance = GovernanceSnapshot {
+            mode: GovernanceModeSnapshot::DryRun,
+            contracts: Vec::new(), // none flagged
+            norms: NetworkNorms::default(),
+            observed_count: 12,
+            min_samples: 30,
+            last_tick_at: None,
+            state_by_id: std::collections::HashMap::new(),
+        };
+        let html = build_governance_card(&Some(snap));
+        assert!(
+            html.contains("12") && html.contains("30"),
+            "empty state should surface observed_count and min_samples — got:\n{html}"
+        );
+        assert!(
+            html.contains("18"),
+            "empty state should mention the remaining count (30-12=18) — got:\n{html}"
+        );
+    }
+
+    #[test]
+    fn governance_card_empty_state_healthy_when_enough_samples() {
+        // Pin: once observed_count >= min_samples but nothing is
+        // flagged, the empty state should read "all N within normal
+        // range" — the healthy-steady-state message — not the
+        // ramp-up-progress one.
+        let mut snap = base_snapshot();
+        snap.governance = GovernanceSnapshot {
+            mode: GovernanceModeSnapshot::DryRun,
+            contracts: Vec::new(),
+            norms: NetworkNorms::default(),
+            observed_count: 50,
+            min_samples: 30,
+            last_tick_at: None,
+            state_by_id: std::collections::HashMap::new(),
+        };
+        let html = build_governance_card(&Some(snap));
+        assert!(
+            html.contains("All 50 tracked contracts within normal range")
+                || html.contains("50 contracts within normal range"),
+            "healthy-steady-state empty card should declare 'normal range' — got:\n{html}"
         );
     }
 
@@ -4192,6 +4451,10 @@ mod tests {
                 .map(|i| mk_entry(GovernanceStateSnapshot::Normal, &format!("aaa{i}")))
                 .collect(),
             norms: NetworkNorms::default(),
+            observed_count: 0,
+            min_samples: 30,
+            last_tick_at: None,
+            state_by_id: std::collections::HashMap::new(),
         };
         let html = build_governance_card(&Some(snap));
         assert!(
@@ -4216,6 +4479,10 @@ mod tests {
                 mk_entry(GovernanceStateSnapshot::Normal, "ok1"),
             ],
             norms: NetworkNorms::default(),
+            observed_count: 0,
+            min_samples: 30,
+            last_tick_at: None,
+            state_by_id: std::collections::HashMap::new(),
         };
         let html = build_governance_card(&Some(snap));
         assert!(html.contains("verdict-alert"));
@@ -4244,6 +4511,10 @@ mod tests {
                 mode,
                 contracts: vec![mk_entry(GovernanceStateSnapshot::Normal, "ok")],
                 norms: NetworkNorms::default(),
+                observed_count: 0,
+                min_samples: 30,
+                last_tick_at: None,
+                state_by_id: std::collections::HashMap::new(),
             };
             let html = build_governance_card(&Some(snap));
             assert!(

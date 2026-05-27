@@ -472,11 +472,35 @@ pub struct GovernanceSnapshot {
     /// Off / DryRun / Enforce — visible on the dashboard as the
     /// "mode" pill.
     pub mode: GovernanceModeSnapshot,
-    /// One entry per contract the manager is currently tracking.
+    /// One entry per contract the manager is currently tracking
+    /// AND flagged (Borderline / WouldEvict / Evicted / Banned).
+    /// Normal contracts are excluded to keep the snapshot cheap on
+    /// large nodes — see `Ring::iter_flagged_scores`.
     pub contracts: Vec<ContractGovernanceEntry>,
+    /// Total count of contracts the manager is scoring (including
+    /// Normal). Surfaces on the dashboard as "Observed N / 30
+    /// contracts needed for scoring" — gives operators a progress
+    /// signal during the ramp-up window where the existing
+    /// `contracts` list is empty.
+    pub observed_count: usize,
+    /// `min_samples` from the outlier detector config — the
+    /// threshold at which the MAD distribution becomes reliable.
+    /// Surfaced so the dashboard can render "Observed N / `M`"
+    /// without hard-coding 30.
+    pub min_samples: usize,
     /// Network-level statistics from the last reaper tick. Drives
     /// the median / MAD / threshold / sample-size mini-tiles.
     pub norms: NetworkNorms,
+    /// When the reaper tick last ran. Surfaces as "Last evaluated
+    /// Ns ago" on the dashboard so operators can tell if the
+    /// scoring engine is alive even when there are no decisions
+    /// to log. None when the reaper has not run yet.
+    pub last_tick_at: Option<tokio::time::Instant>,
+    /// Map from `ContractInstanceId.to_string()` → governance
+    /// state. Lets the Subscribed Contracts table cross-reference
+    /// each row to its current governance state without iterating
+    /// the `contracts` list per row.
+    pub state_by_id: std::collections::HashMap<String, GovernanceStateSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
