@@ -476,7 +476,8 @@ const STREAMING_MIN_DRAIN_SECS: u64 = 30;
 /// but capping at 10 minutes prevents pathological cases (a wedged remote that
 /// never errors) from holding the driver hostage indefinitely. The retry loop
 /// can still recover by advancing to a different peer when this fires.
-const STREAMING_ATTEMPT_TIMEOUT_CAP: std::time::Duration = std::time::Duration::from_secs(600);
+pub(crate) const STREAMING_ATTEMPT_TIMEOUT_CAP: std::time::Duration =
+    std::time::Duration::from_secs(600);
 
 /// Compute the per-attempt timeout for an operation whose payload may use
 /// streaming transport.
