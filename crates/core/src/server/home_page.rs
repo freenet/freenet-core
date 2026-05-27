@@ -4271,6 +4271,46 @@ mod tests {
         );
     }
 
+    /// Regression test for the ContractKey/ContractInstanceId
+    /// id-vs-key string mismatch that Codex review of #4298 caught:
+    /// `GovernanceSnapshot.state_by_id` is keyed by
+    /// `ContractInstanceId::to_string()` (the 32-byte content hash),
+    /// while `ContractSnapshot.key_full` is the full `ContractKey`
+    /// encoding (including parameters / code-hash bookkeeping). The
+    /// two strings are NOT equal, so a lookup keyed on `key_full`
+    /// would silently miss every flagged contract.
+    ///
+    /// Pin: with a contract whose `instance_id` differs from
+    /// `key_full` and whose state in `state_by_id` is Banned, the
+    /// rendered row MUST show "banned" (not "ok"). Pre-fix the
+    /// assertion would have failed because the lookup never found
+    /// the entry.
+    #[test]
+    fn contracts_table_gov_column_uses_instance_id_not_key_full() {
+        use crate::node::network_status::{ContractSnapshot, GovernanceStateSnapshot};
+        let mut snap = base_snapshot();
+        snap.open_connections = 1;
+        // The critical part: instance_id ≠ key_full. In production
+        // key_full includes the params / code hash so this is the
+        // common case, not an edge.
+        snap.contracts = vec![ContractSnapshot {
+            key_short: "FOO1234...".to_string(),
+            key_full: "FOO1234WITH_PARAMS_AND_CODE_HASH".to_string(),
+            instance_id: "FOO1234".to_string(),
+            subscribed_secs: 60,
+            last_updated_secs: Some(10),
+        }];
+        snap.governance
+            .state_by_id
+            .insert("FOO1234".to_string(), GovernanceStateSnapshot::Banned);
+        let html = build_contracts_card(&Some(snap));
+        assert!(
+            html.contains(r#"<span class="gov-pill gov-banned">banned</span>"#),
+            "Gov column lookup must use `instance_id` (not `key_full`) so \
+             state_by_id keys match — got:\n{html}"
+        );
+    }
+
     // ── Header / version badge guarantees ───────────────────────────────────
 
     /// Helper for header-element tests: pull a specific HTML element line
