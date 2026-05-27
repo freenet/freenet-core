@@ -109,6 +109,14 @@ queueing baseline" (visible only in the per-peer signal) from
 which the Phase 1 analysis posted on #4074 showed Phase 1 alone
 cannot answer.
 
+The reference-ping spawn is **opt-in**: gated by
+`telemetry.reference-ping-enabled` (default `false`). Production
+gateway configs set it to `true`; developer machines and
+integration tests leave it off so they don't fire DNS traffic
+from CI runners (which would perturb timing-sensitive multi-node
+tests — see PR #4292 root-cause). The shadow aggregator is
+always-on; only reference-ping is gated.
+
 ```
 NEVER read SHADOW_RTT_REGISTRY, cross_connection_median_inflation,
 or the reference_ping stats from the production data path (rate

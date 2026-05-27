@@ -393,18 +393,27 @@ impl NodeP2P {
         // leaf nodes until they learn their external address. Phase
         // 1.5 accepts this; a refresh path is tracked in #4294.
         //
-        // Gate on telemetry being enabled: when telemetry is opt-out
+        // Gate on telemetry being enabled AND reference-ping being
+        // explicitly opted in: when telemetry is off
         // (`telemetry-enabled = false`) or in test environments
         // (detected by `--id` flag), `TelemetryReporter::new` returns
         // `None` and `send_standalone_event_with_peer_id` silently
         // drops events. The shadow aggregator is cheap to leave
         // running (no I/O), but reference-ping issues a real UDP DNS
-        // query at 1Hz, so we must not fire that traffic when
-        // telemetry is disabled — that would surprise opt-out
-        // operators AND flood Cloudflare with redundant queries from
-        // every CI simulation node.
-        let telemetry_enabled =
-            config.config.telemetry.enabled && !config.config.telemetry.is_test_environment;
+        // query at 1Hz, so we must not fire that traffic by default.
+        //
+        // `reference_ping_enabled` defaults to `false`; production
+        // gateway configs set it to `true` via
+        // `telemetry.reference-ping-enabled = true` in the config
+        // file (or `FREENET_REFERENCE_PING_ENABLED=true`). This keeps
+        // CI integration tests (which build `NodeConfig` directly
+        // without `--id`, so `is_test_environment` stays false) from
+        // accidentally firing DNS traffic and perturbing
+        // timing-sensitive multi-node tests. It also avoids
+        // surprising opt-out operators with default Cloudflare hits.
+        let reference_ping_enabled = config.config.telemetry.enabled
+            && !config.config.telemetry.is_test_environment
+            && config.config.telemetry.reference_ping_enabled;
         let listen_addr = config.own_addr.unwrap_or_else(|| {
             SocketAddr::new(config.network_listener_ip, config.network_listener_port)
         });
@@ -414,7 +423,7 @@ impl NodeP2P {
             local_peer_id.clone(),
             &background_task_monitor,
         );
-        if telemetry_enabled {
+        if reference_ping_enabled {
             crate::transport::reference_ping::spawn_reference_ping(
                 local_peer_id,
                 crate::transport::reference_ping::DEFAULT_REFERENCE_TARGET,

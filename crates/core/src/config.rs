@@ -377,6 +377,12 @@ impl ConfigArgs {
                     .endpoint
                     .get_or_insert(cfg.telemetry.endpoint);
             }
+            // reference-ping-enabled defaults to false via clap; override
+            // if the config file sets it to true. The inverse direction
+            // doesn't need handling — the clap default is already false.
+            if cfg.telemetry.reference_ping_enabled {
+                self.telemetry.reference_ping_enabled = true;
+            }
         }
 
         let mode = self.mode.unwrap_or(OperationMode::Network);
@@ -746,6 +752,7 @@ impl ConfigArgs {
                 // simulated networks and integration tests. We disable telemetry in these
                 // environments to avoid flooding the collector with test data.
                 is_test_environment: self.id.is_some(),
+                reference_ping_enabled: self.telemetry.reference_ping_enabled,
             },
         };
 
@@ -1472,6 +1479,24 @@ pub struct TelemetryArgs {
         skip_serializing_if = "Option::is_none"
     )]
     pub transport_snapshot_interval_secs: Option<u64>,
+
+    /// Enable the Phase 1.5 reference-ping shadow probe (#4074): a 1Hz
+    /// UDP DNS query to a fixed external target (default 1.1.1.1:53)
+    /// whose RTT is recorded alongside the per-peer overlay RTT so the
+    /// collector can disentangle overlay queueing from local uplink
+    /// contention. Opt-in: defaults to false. Production gateway
+    /// configs set this to true; developer machines and integration
+    /// tests leave it off so they don't fire DNS traffic from CI.
+    #[arg(
+        long = "reference-ping-enabled",
+        env = "FREENET_REFERENCE_PING_ENABLED",
+        default_value = "false"
+    )]
+    #[serde(
+        rename = "reference-ping-enabled",
+        default = "default_reference_ping_enabled"
+    )]
+    pub reference_ping_enabled: bool,
 }
 
 impl Default for TelemetryArgs {
@@ -1480,6 +1505,7 @@ impl Default for TelemetryArgs {
             enabled: true,
             endpoint: None,
             transport_snapshot_interval_secs: None,
+            reference_ping_enabled: false,
         }
     }
 }
@@ -1511,6 +1537,15 @@ pub struct TelemetryConfig {
     /// When true, telemetry is disabled to avoid flooding the collector with test data.
     #[serde(skip)]
     pub is_test_environment: bool,
+
+    /// Enable the Phase 1.5 reference-ping shadow probe (#4074).
+    /// Opt-in: defaults to false; production gateway configs set
+    /// this to true. See `TelemetryArgs::reference_ping_enabled`.
+    #[serde(
+        default = "default_reference_ping_enabled",
+        rename = "reference-ping-enabled"
+    )]
+    pub reference_ping_enabled: bool,
 }
 
 fn default_transport_snapshot_interval_secs() -> u64 {
@@ -1521,6 +1556,10 @@ fn default_telemetry_endpoint() -> String {
     DEFAULT_TELEMETRY_ENDPOINT.to_string()
 }
 
+fn default_reference_ping_enabled() -> bool {
+    false
+}
+
 impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
@@ -1528,6 +1567,7 @@ impl Default for TelemetryConfig {
             endpoint: DEFAULT_TELEMETRY_ENDPOINT.to_string(),
             transport_snapshot_interval_secs: default_transport_snapshot_interval_secs(),
             is_test_environment: false,
+            reference_ping_enabled: false,
         }
     }
 }
