@@ -493,7 +493,7 @@ fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> 
     let cwnd_str = if ts.avg_cwnd_bytes > 0 {
         format!(
             r#"<div class="transfer-stat">
-                <span class="transfer-label">BBR cwnd (avg/peak/min)</span>
+                <span class="transfer-label">cwnd (avg/peak/min)</span>
                 <span class="transfer-value">{avg} / {peak} / {min}</span>
             </div>"#,
             avg = format_bytes(ts.avg_cwnd_bytes as u64),
