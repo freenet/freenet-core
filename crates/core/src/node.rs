@@ -862,6 +862,7 @@ where
             // Responses to our OWN outbound requests pass through
             // above; here we drop new PUTs for banned contracts so
             // the contract can't get re-hosted while banned.
+            #[allow(clippy::wildcard_enum_match_arm)]
             let banned_key = match op {
                 put::PutMsg::Request { contract, .. } => Some(contract.key()),
                 put::PutMsg::RequestStreaming { contract_key, .. } => Some(*contract_key),
@@ -1382,6 +1383,20 @@ where
             // Only sync contracts we're actively interested in (receiving updates
             // or have downstream subscribers) — skip cached-only contracts.
             for instance_id in result.overlapping_contracts {
+                // Phase 7 egress gate. If we've banned the contract,
+                // don't proactively push its state to a sibling peer
+                // via the overlap-sync path — that would undermine
+                // the wire-boundary drop the ban list is supposed to
+                // provide.
+                if op_manager.ring.contract_ban_list.is_banned(&instance_id) {
+                    tracing::debug!(
+                        %instance_id,
+                        peer = %source_pub_key,
+                        phase = "neighbor_hosting_banned_skip",
+                        "skipping proximity sync for banned contract"
+                    );
+                    continue;
+                }
                 if let Some((key, state)) =
                     get_contract_state_by_id(&op_manager, &instance_id).await
                 {
@@ -1643,6 +1658,20 @@ async fn handle_interest_sync_message(
             // out to ALL subscribers (~28 peers), causing O(peers^2) traffic when
             // many peers reported mismatches within the same heartbeat cycle.
             for contract in stale_contracts {
+                // Phase 7 egress gate. Don't repair a stale peer's
+                // summary mismatch by pushing state for a contract
+                // we have banned — same rationale as the inbound
+                // wire-boundary drop, applied to the proactive heal
+                // path.
+                if op_manager.ring.contract_ban_list.is_banned(contract.id()) {
+                    tracing::debug!(
+                        %contract,
+                        stale_peer = %source,
+                        phase = "interest_sync_banned_skip",
+                        "skipping summary-mismatch sync for banned contract"
+                    );
+                    continue;
+                }
                 let Some(state) = get_contract_state(op_manager, &contract).await else {
                     tracing::trace!(
                         contract = %contract,

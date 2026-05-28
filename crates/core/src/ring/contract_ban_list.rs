@@ -9,9 +9,12 @@
 //! ## What this rejects
 //!
 //! - `PutMsg::Request` / `PutMsg::RequestStreaming` — refuse to store.
-//! - `GetMsg::Request` / `GetMsg::RequestStreaming` — refuse to serve.
-//! - `UpdateMsg::*` — refuse to apply or fan out.
+//! - `GetMsg::Request` — refuse to serve. (No `RequestStreaming`
+//!   variant exists for GET; only responses stream.)
+//! - `UpdateMsg::*` Request / Broadcast variants — refuse to apply or
+//!   fan out.
 //! - `SubscribeMsg::Request` — refuse to register interest.
+//!   `Unsubscribe` deliberately passes through so cleanup proceeds.
 //!
 //! ## What this does NOT reject
 //!
@@ -22,6 +25,11 @@
 //!   we focus on the receive side.
 //! - **Peer-level messages** (ConnectMsg, etc.) — those are the peer
 //!   layer's concern, not the contract layer.
+//! - **Proactive state egress for already-hosted contracts**
+//!   (`NeighborHosting` overlap sync, `InterestSync::Summaries` stale
+//!   repair). These paths are also gated (see node.rs) but the gates
+//!   live at the egress sites, not here. See issue tracking egress
+//!   self-blocking for the full design.
 //!
 //! ## Two ways entries get added
 //!
@@ -186,6 +194,7 @@ mod tests {
         // `apply_ban_decisions` wiring — only `reason` is — but
         // populate them with a plausible pair so the value reads
         // naturally in test failure output.
+        #[allow(clippy::wildcard_enum_match_arm)]
         let (from, to) = match reason {
             TransitionReason::BanTriggered => (GovernanceState::Evicted, GovernanceState::Banned),
             TransitionReason::BanLifted => (GovernanceState::Banned, GovernanceState::Normal),
@@ -394,6 +403,38 @@ mod tests {
     }
 
     #[test]
+    fn non_actionable_decision_is_skipped() {
+        // DryRun-mode safety: even if a BanTriggered somehow reaches
+        // the wiring with `actionable: false` (a future Shadow mode,
+        // a misconfigured GovernanceManager), it must not enter the
+        // ban list. Otherwise DryRun silently enforces.
+        let (bl, ts) = mk_ban_list();
+        let contract = mk_contract(9);
+        let mut decision = mk_decision(contract, TransitionReason::BanTriggered, ts.now());
+        decision.actionable = false;
+        Ring::apply_ban_decisions(&bl, &[decision], ts.now() + Duration::from_secs(60));
+        assert!(
+            !bl.is_banned(&contract),
+            "non-actionable BanTriggered must not land on the ban list"
+        );
+
+        // And the same for BanLifted — a non-actionable lift must
+        // not silently delete an enforcement-mode ban.
+        bl.ban(
+            contract,
+            ts.now() + Duration::from_secs(60),
+            BanReason::AutoMad,
+        );
+        let mut decision = mk_decision(contract, TransitionReason::BanLifted, ts.now());
+        decision.actionable = false;
+        Ring::apply_ban_decisions(&bl, &[decision], ts.now() + Duration::from_secs(60));
+        assert!(
+            bl.is_banned(&contract),
+            "non-actionable BanLifted must not remove an existing ban"
+        );
+    }
+
+    #[test]
     fn batch_mixed_decisions_apply_in_order() {
         let (bl, ts) = mk_ban_list();
         let a = mk_contract(1);
@@ -412,4 +453,189 @@ mod tests {
         assert!(!bl.is_banned(&b), "contract B must be unbanned");
         assert!(bl.is_banned(&c), "contract C must be newly banned");
     }
+
+    // Source-grep pin tests for the wire-boundary and egress gates in
+    // node.rs. The gates themselves are one-liner `is_banned(...)`
+    // checks — a refactor of `process_message` that drops or
+    // reorders one would silently disable enforcement and pass every
+    // other test in the suite. Mirrors the pattern from Phase 2's
+    // `update_dispatch_gates_all_four_wire_variants` test in
+    // `update_rate_limit.rs`. If you're here because a test below
+    // failed: the message tells you which gate moved or disappeared
+    // — re-establish the check before re-running the suite.
+
+    /// Returns the slice of `node.rs` covering one `NetMessageV1::X`
+    /// arm. Bounds the slice at the next `NetMessageV1::` arm so an
+    /// assertion can't accidentally match the next handler.
+    fn dispatch_block<'a>(src: &'a str, arm_header: &str) -> &'a str {
+        let start = src
+            .find(arm_header)
+            .unwrap_or_else(|| panic!("could not locate `{arm_header}` in node.rs"));
+        let tail = &src[start + 1..];
+        let len = tail
+            .find("\n        NetMessageV1::")
+            .or_else(|| tail.find("\n    NetMessageV1::"))
+            .unwrap_or(tail.len());
+        &src[start..start + 1 + len]
+    }
+
+    #[test]
+    fn put_dispatch_gates_banned_contracts() {
+        const NODE_SRC: &str = include_str!("../node.rs");
+        let block = dispatch_block(NODE_SRC, "NetMessageV1::Put(ref op) =>");
+        let gate_pos = block
+            .find("contract_ban_list.is_banned")
+            .expect("PUT dispatch is missing the ban-list gate");
+        let spawn_pos = block
+            .find("start_relay_put")
+            .expect("PUT dispatch is missing start_relay_put");
+        assert!(
+            gate_pos < spawn_pos,
+            "PUT ban-list gate (offset {gate_pos}) must run BEFORE \
+             start_relay_put (offset {spawn_pos}) so banned requests \
+             don't pay the spawn cost"
+        );
+        // Both inbound request variants must be matched so a flooder
+        // can't bypass by switching to streaming (mirrors the Phase 2
+        // four-variant pin).
+        for variant in ["PutMsg::Request {", "PutMsg::RequestStreaming {"] {
+            assert!(
+                block.contains(variant),
+                "PUT dispatch block is missing wire variant `{variant}`"
+            );
+        }
+    }
+
+    #[test]
+    fn get_dispatch_gates_banned_contracts() {
+        const NODE_SRC: &str = include_str!("../node.rs");
+        let block = dispatch_block(NODE_SRC, "NetMessageV1::Get(ref op) =>");
+        let gate_pos = block
+            .find("contract_ban_list.is_banned")
+            .expect("GET dispatch is missing the ban-list gate");
+        let spawn_pos = block
+            .find("start_relay_get")
+            .expect("GET dispatch is missing start_relay_get");
+        assert!(
+            gate_pos < spawn_pos,
+            "GET ban-list gate (offset {gate_pos}) must run BEFORE \
+             start_relay_get (offset {spawn_pos})"
+        );
+        assert!(
+            block.contains("GetMsg::Request {"),
+            "GET dispatch block is missing wire variant `GetMsg::Request {{`"
+        );
+    }
+
+    #[test]
+    fn update_dispatch_gates_banned_contracts() {
+        const NODE_SRC: &str = include_str!("../node.rs");
+        let block = dispatch_block(NODE_SRC, "NetMessageV1::Update(ref op) =>");
+        let gate_pos = block
+            .find("contract_ban_list.is_banned")
+            .expect("UPDATE dispatch is missing the ban-list gate");
+        let rate_limit_pos = block
+            .find("update_rate_limiter")
+            .expect("UPDATE dispatch is missing the rate limiter");
+        assert!(
+            gate_pos < rate_limit_pos,
+            "UPDATE ban-list gate (offset {gate_pos}) must run BEFORE \
+             the rate limiter (offset {rate_limit_pos}) so banned \
+             traffic doesn't consume the rate-limit budget"
+        );
+        // All four UPDATE wire variants must remain matched; if a new
+        // one is added it must be gated through both the ban list
+        // and the rate limiter.
+        for variant in [
+            "UpdateMsg::RequestUpdate {",
+            "UpdateMsg::BroadcastTo {",
+            "UpdateMsg::RequestUpdateStreaming {",
+            "UpdateMsg::BroadcastToStreaming {",
+        ] {
+            assert!(
+                block.contains(variant),
+                "UPDATE dispatch block is missing wire variant `{variant}`"
+            );
+        }
+    }
+
+    #[test]
+    fn subscribe_dispatch_gates_banned_contracts() {
+        const NODE_SRC: &str = include_str!("../node.rs");
+        let block = dispatch_block(NODE_SRC, "NetMessageV1::Subscribe(ref op) =>");
+        let gate_pos = block
+            .find("contract_ban_list.is_banned")
+            .expect("SUBSCRIBE dispatch is missing the ban-list gate");
+        // Match the call site (`(`-terminated) — `start_relay_subscribe`
+        // appears in a doc comment too, and `block.find()` returns the
+        // first match.
+        let driver_pos = block
+            .find("start_relay_subscribe(")
+            .expect("SUBSCRIBE dispatch is missing start_relay_subscribe call");
+        assert!(
+            gate_pos < driver_pos,
+            "SUBSCRIBE ban-list gate (offset {gate_pos}) must run \
+             BEFORE start_relay_subscribe call (offset {driver_pos})"
+        );
+        // Gate must match Request (block registration); Unsubscribe
+        // deliberately passes through so cleanup proceeds.
+        assert!(
+            block.contains("SubscribeMsg::Request {"),
+            "SUBSCRIBE dispatch block is missing `SubscribeMsg::Request {{`"
+        );
+    }
+
+    #[test]
+    fn neighbor_hosting_gates_banned_egress() {
+        const NODE_SRC: &str = include_str!("../node.rs");
+        let block = dispatch_block(NODE_SRC, "NetMessageV1::NeighborHosting");
+        let gate_pos = block.find("contract_ban_list.is_banned").expect(
+            "NeighborHosting overlap-sync block is missing the ban-list egress gate — \
+             banned contracts would continue to be pushed to sibling peers",
+        );
+        let emit_pos = block
+            .find("NodeEvent::SyncStateToPeer")
+            .expect("NeighborHosting block is missing SyncStateToPeer emit");
+        assert!(
+            gate_pos < emit_pos,
+            "NeighborHosting ban-list gate (offset {gate_pos}) must \
+             precede SyncStateToPeer emit (offset {emit_pos})"
+        );
+    }
+
+    #[test]
+    fn interest_sync_summaries_gates_banned_egress() {
+        // The stale-summary repair loop lives inside
+        // `handle_interest_sync_message` (the helper that the
+        // NetMessageV1::InterestSync arm delegates to), not in
+        // `process_message` itself. Search the whole file scoped to
+        // the `for contract in stale_contracts` loop.
+        const NODE_SRC: &str = include_str!("../node.rs");
+        let stale_loop = NODE_SRC
+            .find("for contract in stale_contracts")
+            .expect("node.rs is missing the stale_contracts loop");
+        // Bound the search to the loop body — the loop ends when
+        // indentation returns to the loop's level. A loose heuristic:
+        // take 2_000 bytes after the loop header (the body is short).
+        let scan = &NODE_SRC[stale_loop..stale_loop.saturating_add(2_000).min(NODE_SRC.len())];
+        let gate_pos = scan.find("contract_ban_list.is_banned").expect(
+            "stale-summary repair loop is missing the ban-list egress gate — \
+             banned contracts would continue to be pushed to peers that report \
+             stale summaries (defeats the Phase 7 wire-boundary drop)",
+        );
+        let emit_pos = scan
+            .find("NodeEvent::SyncStateToPeer")
+            .expect("stale-summary loop is missing SyncStateToPeer emit");
+        assert!(
+            gate_pos < emit_pos,
+            "InterestSync ban-list gate (offset {gate_pos}) must \
+             precede SyncStateToPeer emit (offset {emit_pos})"
+        );
+    }
+
+    // End-to-end regression test (May 21 incident pattern) lives in
+    // `contract/governance.rs` next to the BanTriggered/BanLifted
+    // unit tests, where the test helpers for the state-machine setup
+    // (mk_mgr_shared, etc.) already exist. See
+    // `governance_to_ban_list_end_to_end` in that module.
 }

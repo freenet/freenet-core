@@ -88,8 +88,8 @@ impl GovernanceState {
     }
 
     /// Whether this state actively blocks new operations on the
-    /// contract (PUT / UPDATE / SUBSCRIBE rejected at the receive
-    /// boundary). Only `Banned` does this.
+    /// contract (PUT / GET / UPDATE / SUBSCRIBE Request variants
+    /// rejected at the receive boundary). Only `Banned` does this.
     pub(crate) fn blocks_operations(self) -> bool {
         matches!(self, GovernanceState::Banned)
     }
@@ -1355,6 +1355,100 @@ mod tests {
         assert_eq!(lifted.from, GovernanceState::Banned);
         assert_eq!(lifted.to, GovernanceState::Normal);
         assert!(matches!(lifted.reason, TransitionReason::BanLifted));
+    }
+
+    /// End-to-end regression test for the May 21 incident pattern.
+    /// Drives a contract through evict → recover → re-feed → Banned
+    /// using `GovernanceManager`, then runs the decisions through
+    /// `Ring::apply_ban_decisions` and asserts the contract lands on
+    /// a fresh `ContractBanList`. Then advances past `ban_ttl` and
+    /// verifies BanLifted removes it.
+    ///
+    /// Why this lives here: the state-machine setup (mk_mgr_shared,
+    /// the honest distribution, the evicted_ttl + ban_ttl
+    /// advancements) is heavy and mirrors the existing
+    /// `ban_ttl_expires_back_to_normal` test. Keeping the e2e test
+    /// next to its setup helpers avoids cross-module test plumbing.
+    #[test]
+    fn governance_to_ban_list_end_to_end() {
+        use crate::ring::Ring;
+        use crate::ring::contract_ban_list::ContractBanList;
+
+        let (mgr, ts) = mk_mgr_shared(GovernanceMode::Enforce);
+        let ts_dyn: Arc<dyn TimeSource + Send + Sync> = ts.clone();
+        let bl = ContractBanList::new(ts_dyn);
+
+        for i in 0..30 {
+            let jitter = (i as f64 - 15.0) * 0.01;
+            mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
+            mgr.ingest_demand(mk_key(i), 1.0 + jitter);
+        }
+        let abuser = mk_key(99);
+        mgr.ingest_cost(abuser, 100.0);
+        mgr.ingest_demand(abuser, 1.0);
+        ts.advance(Duration::from_secs(2));
+
+        // Tick 1: first eviction.
+        let r1 = mgr.tick(Duration::from_millis(100));
+        Ring::apply_ban_decisions(&bl, &r1.decisions, ts.now() + mgr.ban_ttl());
+        assert!(
+            !bl.is_banned(&abuser),
+            "first eviction is not a ban — abuser must not yet be on the list"
+        );
+
+        // Recover.
+        ts.advance(Duration::from_secs(15 * 60 + 1));
+        for i in 0..30 {
+            let jitter = (i as f64 - 15.0) * 0.01;
+            mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
+            mgr.ingest_demand(mk_key(i), 1.0 + jitter);
+        }
+        let r2 = mgr.tick(Duration::from_millis(100));
+        Ring::apply_ban_decisions(&bl, &r2.decisions, ts.now() + mgr.ban_ttl());
+        assert!(
+            !bl.is_banned(&abuser),
+            "recovery does not ban — abuser must still be off the list"
+        );
+
+        // Re-feed → Banned (recently_evicted in ban_window).
+        mgr.ingest_cost(abuser, 100.0);
+        mgr.ingest_cost(abuser, 100.0);
+        mgr.ingest_demand(abuser, 1.0);
+        ts.advance(Duration::from_secs(1));
+        let r3 = mgr.tick(Duration::from_millis(100));
+        let triggered = r3
+            .decisions
+            .iter()
+            .find(|d| d.key == abuser && matches!(d.reason, TransitionReason::BanTriggered))
+            .expect("second eviction within ban_window must emit BanTriggered");
+        assert!(
+            triggered.actionable,
+            "Enforce-mode BanTriggered must be actionable"
+        );
+        Ring::apply_ban_decisions(&bl, &r3.decisions, ts.now() + mgr.ban_ttl());
+        assert!(
+            bl.is_banned(&abuser),
+            "after BanTriggered the abuser must land on the ban list — \
+             this is the wire-boundary enforcement signal for Phase 7"
+        );
+
+        // BanLifted after ban_ttl.
+        ts.advance(Duration::from_secs(60 * 60 + 1));
+        let r4 = mgr.tick(Duration::from_millis(100));
+        let lifted = r4
+            .decisions
+            .iter()
+            .find(|d| d.key == abuser && matches!(d.reason, TransitionReason::BanLifted))
+            .expect("after ban_ttl, BanLifted must fire");
+        assert!(
+            lifted.actionable,
+            "Enforce-mode BanLifted must be actionable"
+        );
+        Ring::apply_ban_decisions(&bl, &r4.decisions, ts.now() + mgr.ban_ttl());
+        assert!(
+            !bl.is_banned(&abuser),
+            "after BanLifted the abuser must be removed from the ban list"
+        );
     }
 
     #[test]

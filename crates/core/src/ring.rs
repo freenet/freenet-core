@@ -45,7 +45,7 @@ use crate::{
 mod broken_invariants;
 mod connection_backoff;
 mod connection_manager;
-mod contract_ban_list;
+pub(crate) mod contract_ban_list;
 pub(crate) use connection_manager::ConnectionManager;
 mod connection;
 mod hosting;
@@ -741,8 +741,11 @@ impl Ring {
 
             // Phase 7 enforcement wiring: BanTriggered → ban list;
             // BanLifted → unban. Done AFTER the cleanup() so a
-            // stale-cleanup race can't briefly remove an entry that
-            // a fresh BanTriggered is about to add this tick.
+            // freshly-added entry (with expiry = now + ban_ttl) is
+            // not immediately swept by the same tick's cleanup. The
+            // two calls are sequential in this task — no concurrent
+            // race — the ordering is purely to defend the
+            // not-quite-expired-yet invariant.
             Self::apply_ban_decisions(
                 &ring.contract_ban_list,
                 &result.decisions,
@@ -770,13 +773,24 @@ impl Ring {
     /// directly testable: a missing or reversed branch here would
     /// silently break Phase 7 enforcement even with the
     /// `GovernanceManager` emitting correct transitions.
-    fn apply_ban_decisions(
+    ///
+    /// **`actionable` filter:** non-actionable decisions (DryRun
+    /// mode) are skipped. Today the `GovernanceManager` only emits
+    /// `BanTriggered` in Enforce mode so this is a defense-in-depth
+    /// guard — but a future "shadow" mode that wants to surface
+    /// would-have-banned transitions in the dashboard must not
+    /// silently begin enforcing them through this wiring.
+    pub(crate) fn apply_ban_decisions(
         ban_list: &contract_ban_list::ContractBanList,
         decisions: &[crate::contract::governance::ReaperDecision],
         ban_expiry: tokio::time::Instant,
     ) {
         use crate::contract::governance::TransitionReason;
         for decision in decisions {
+            if !decision.actionable {
+                continue;
+            }
+            #[allow(clippy::wildcard_enum_match_arm)]
             match decision.reason {
                 TransitionReason::BanTriggered => {
                     ban_list.ban(
