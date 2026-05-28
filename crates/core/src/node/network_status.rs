@@ -42,7 +42,9 @@ pub type RingStatsProvider = Arc<dyn Fn() -> RingStatsSnapshot + Send + Sync + '
 /// Snapshot of ring-level statistics exposed to the dashboard.
 #[derive(Debug, Clone, Default)]
 pub struct RingStatsSnapshot {
+    /// Number of active ring connections.
     pub connection_count: u32,
+    /// Number of contracts this node is currently hosting.
     pub hosted_contracts: u32,
     /// Base58-encoded public key of this node.
     pub own_pub_key: String,

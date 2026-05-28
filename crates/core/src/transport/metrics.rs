@@ -1044,4 +1044,18 @@ mod tests {
         metrics.remove_peer(addr); // second remove must be a no-op
         assert!(metrics.per_peer_snapshot().is_empty());
     }
+
+    /// Sentinel values (`u32::MAX` / `u64::MAX`) must be mapped to 0 in the
+    /// read-snapshot — the dashboard displays them as "0ms" / "0 B", not
+    /// garbage. No samples are ever recorded, so the sentinels survive.
+    #[test]
+    fn read_snapshot_sentinels_map_to_zero() {
+        let metrics = TransportMetrics::new();
+        let snap = metrics.read_snapshot();
+        assert_eq!(
+            snap.min_cwnd_bytes, 0,
+            "no cwnd samples → min should be 0"
+        );
+        assert_eq!(snap.min_rtt_us, 0, "no RTT samples → min should be 0");
+    }
 }
