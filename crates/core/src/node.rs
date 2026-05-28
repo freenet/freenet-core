@@ -175,6 +175,15 @@ pub struct NodeConfig {
     /// Default: `Some(3)` in production.
     #[serde(default)]
     pub(crate) relay_ready_connections: Option<usize>,
+    /// Test-only override for the governance manager's configuration.
+    /// Lets simulation tests compress the production minute-to-hour
+    /// timescales and lower `min_samples` so the rate-limit → MAD →
+    /// evict → ban chain can be exercised within a paused-time sim.
+    /// `None` in production (and never serialized — `#[serde(skip)]`),
+    /// where `GovernanceConfig::default()` is used. See issue #4301.
+    #[cfg(any(test, feature = "testing"))]
+    #[serde(skip)]
+    pub(crate) governance_config_override: Option<crate::contract::governance::GovernanceConfig>,
 }
 
 impl NodeConfig {
@@ -297,6 +306,8 @@ impl NodeConfig {
             } else {
                 Some(3) // Production: require 3 relay-ready upstream peers
             },
+            #[cfg(any(test, feature = "testing"))]
+            governance_config_override: None,
         })
     }
 
