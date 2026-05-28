@@ -145,7 +145,7 @@ muda = "0.19"
 zip = { version = "8", default-features = false, features = ["deflate", "time"] }
 
 # Freenet
-freenet-stdlib = "0.8.0"
+freenet-stdlib = "0.8.1"
 
 # Crypto (secrets-at-rest KEK + DEK derivation, see crates/core/src/config/kek.rs).
 # `sha2` is already declared above (workspace-wide); only `hkdf` and `keyring`

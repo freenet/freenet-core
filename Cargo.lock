@@ -1833,7 +1833,7 @@ dependencies = [
  "ed25519-dalek",
  "either",
  "freenet",
- "freenet-stdlib 0.8.0",
+ "freenet-stdlib 0.8.1",
  "futures 0.3.32",
  "glob",
  "hex",
@@ -2019,7 +2019,7 @@ dependencies = [
  "flatbuffers 25.12.19",
  "flate2",
  "freenet-macros 0.1.0",
- "freenet-stdlib 0.8.0",
+ "freenet-stdlib 0.8.1",
  "freenet-test-network",
  "futures 0.3.32",
  "headers",
@@ -2133,7 +2133,7 @@ dependencies = [
  "clap",
  "freenet",
  "freenet-ping-types",
- "freenet-stdlib 0.8.0",
+ "freenet-stdlib 0.8.1",
  "freenet-test-network",
  "futures 0.3.32",
  "rand 0.9.4",
@@ -2153,7 +2153,7 @@ name = "freenet-ping-contract"
 version = "0.1.11"
 dependencies = [
  "freenet-ping-types",
- "freenet-stdlib 0.8.0",
+ "freenet-stdlib 0.8.1",
  "serde_json",
 ]
 
@@ -2163,7 +2163,7 @@ version = "0.1.11"
 dependencies = [
  "chrono",
  "clap",
- "freenet-stdlib 0.8.0",
+ "freenet-stdlib 0.8.1",
  "humantime",
  "humantime-serde",
  "serde",
@@ -2223,9 +2223,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.8.0"
+version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c20c5c395585e1263233eea4b2b3429519ebd05c505c46e48c7adefe65ecf3f2"
+checksum = "1964de8b9572d65001ff08b9367d398da2672ad27526c6795af57536de1f27ab"
 dependencies = [
  "arbitrary",
  "bincode",
@@ -2287,7 +2287,7 @@ dependencies = [
  "byteorder",
  "ciborium",
  "ed25519-dalek",
- "freenet-stdlib 0.8.0",
+ "freenet-stdlib 0.8.1",
  "rand 0.9.4",
  "serde",
 ]
@@ -6777,7 +6777,7 @@ dependencies = [
 name = "test-contract-integration"
 version = "0.1.11"
 dependencies = [
- "freenet-stdlib 0.8.0",
+ "freenet-stdlib 0.8.1",
  "serde",
  "serde_json",
 ]
@@ -6787,14 +6787,14 @@ name = "test-contract-mock-aligned"
 version = "0.1.0"
 dependencies = [
  "blake3",
- "freenet-stdlib 0.8.0",
+ "freenet-stdlib 0.8.1",
 ]
 
 [[package]]
 name = "test-contract-update-nochange"
 version = "0.1.0"
 dependencies = [
- "freenet-stdlib 0.8.0",
+ "freenet-stdlib 0.8.1",
  "serde",
  "serde_json",
 ]
