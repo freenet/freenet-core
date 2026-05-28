@@ -1711,3 +1711,289 @@ mod tests {
         );
     }
 }
+
+/// End-to-end simulation-network test for the contract-governance ban
+/// chain (issue #4301). This is the REQUIRED behavioral gate before
+/// flipping governance into `Enforce` mode in production.
+///
+/// Unlike the unit tests above (which drive `GovernanceManager` directly),
+/// this exercises the WHOLE production wiring inside a simulated network:
+///
+///   client UPDATE → `Executor` (production code path via `MockWasmRuntime`)
+///   → `Ring::commit_state_write` → `report_contract_resource_usage`
+///   → `GovernanceManager::ingest_cost` → the per-node `governance_reaper_loop`
+///   (spawned by `Ring::new`, ticking on virtual time) → `governance_tick`
+///   → `apply_ban_decisions` → `Ring::contract_ban_list`.
+///
+/// It asserts the full state chain reaches `Banned` for an abusive
+/// contract while honest contracts are untouched, and that the ban is a
+/// real, observable enforcement signal on the node that saw the abuse.
+///
+/// Gated behind `simulation_tests` (the runner is Turmoil-based) and only
+/// compiled in `cfg(test)`.
+#[cfg(all(test, feature = "simulation_tests"))]
+mod sim_e2e_tests {
+    use std::time::Duration;
+
+    use freenet_stdlib::prelude::ContractInstanceId;
+
+    use super::{GovernanceConfig, GovernanceMode, OutlierConfig};
+    use crate::node::testing_impl::{NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    const NETWORK: &str = "governance-ban-chain-e2e";
+    const SEED: u64 = 0xB0A1_CE11_1234_5678;
+
+    /// Compressed governance config for the sim. Values are chosen so the
+    /// Normal → Evicted → (recover) Normal → Banned chain fires within a
+    /// feasible virtual-time budget, given the production reaper's fixed
+    /// 60s `GOVERNANCE_TICK_INTERVAL` and 30-90s location-derived initial
+    /// delay (both honored on virtual time under `start_paused`/Turmoil).
+    ///
+    /// Rationale for each value (see `GovernanceConfig` field docs):
+    ///   - `mode = Enforce`: this test IS the gate for Enforce; DryRun
+    ///     would only mark `WouldEvict` and never ban.
+    ///   - `outlier.min_samples = 5`: we host ~6 honest contracts + 1
+    ///     abuser on the observing node, so 5 keeps the detector active
+    ///     without needing the production default of 30.
+    ///   - `outlier.trim_fraction = 0.0`: with a small population we can't
+    ///     afford to trim the tails; the abuser IS the tail.
+    ///   - `ramp_up = 1s`: contracts must be past ramp-up to be eligible.
+    ///     All cost is ingested early (during the UPDATE phase) and the
+    ///     first reaper tick is ≥30s later, so 1s comfortably clears it.
+    ///   - `decay_half_life = 1h`: long relative to the run so the abuser's
+    ///     cost/benefit RATIO is preserved across ticks (decay is symmetric
+    ///     on cost and benefit) — the abuser stays flagged through the
+    ///     recover→re-evict cycle without needing a continuous flood.
+    ///   - `evicted_ttl = 90s` (1.5 ticks): short enough that the abuser
+    ///     recovers to Normal between the two evictions, and strictly less
+    ///     than `ban_window`.
+    ///   - `ban_window = 1800s`: must exceed ~2 tick intervals so the
+    ///     re-eviction (which lands several ticks after the first) is still
+    ///     within the window of the FIRST eviction → escalates to Banned.
+    ///   - `ban_ttl = 1h`: long enough that the ban persists to the end of
+    ///     the run (we assert it's still banned; we do not test BanLifted
+    ///     here — that's covered by the unit tests).
+    fn compressed_config() -> GovernanceConfig {
+        GovernanceConfig {
+            mode: GovernanceMode::Enforce,
+            outlier: OutlierConfig {
+                min_samples: 5,
+                trim_fraction: 0.0,
+                ..Default::default()
+            },
+            ramp_up: Duration::from_secs(1),
+            decay_half_life: Duration::from_secs(60 * 60),
+            ban_window: Duration::from_secs(1800),
+            evicted_ttl: Duration::from_secs(90),
+            ban_ttl: Duration::from_secs(60 * 60),
+            ..Default::default()
+        }
+    }
+
+    /// Drives the ban chain end-to-end and asserts:
+    ///   (a) the abuser contract IS banned on the observing node;
+    ///   (b) every honest contract is NOT banned (no collateral damage);
+    ///   (c) the abuser's ban is the enforcement signal (`is_banned`),
+    ///       which the wire-boundary gates in `node.rs` consult to drop
+    ///       inbound ops for the contract.
+    #[test]
+    fn governance_ban_chain_end_to_end() {
+        // Build the sim: 1 gateway + 5 nodes. All governance-relevant
+        // traffic is issued FROM the gateway so the gateway's executor
+        // writes every contract's state locally — that is what makes the
+        // gateway's per-node `GovernanceManager` observe the full
+        // cost/benefit distribution (cost is ingested where the
+        // state-write happens). The extra nodes give the gateway real
+        // peers/topology so the production path isn't degenerate.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut sim = rt.block_on(async {
+            SimNetwork::new(
+                NETWORK, 1,  // gateways
+                5,  // nodes
+                7,  // max_htl
+                3,  // rnd_if_htl_above
+                10, // max_connections
+                2,  // min_connections
+                SEED,
+            )
+            .await
+        });
+
+        // Production cost-reporting only flows through the real Executor
+        // path, which `use_mock_wasm = true` selects. With the default
+        // MockRuntime, `commit_state_write` is never called and the MAD
+        // detector sees nothing.
+        sim.use_mock_wasm = true;
+        sim.with_governance_config(compressed_config());
+
+        let gateway = NodeLabel::gateway(NETWORK, 0);
+
+        // Honest contracts: distinct seeds, each PUT+subscribed (benefit)
+        // then given a few SMALL updates (modest cost). Six of them so the
+        // detector has min_samples=5 honest log-ratios plus the abuser.
+        //
+        // Honest costs are deliberately spread (per-contract state size
+        // varies) so the MAD of the honest cluster is non-zero. Without
+        // spread the honest log-ratios would be identical and MAD would
+        // collapse to 0 (`SkipReason::MadCollapsed`), flagging nothing —
+        // the abuser would never be evicted. This mirrors the jitter the
+        // `GovernanceManager` unit tests use for the same reason.
+        const NUM_HONEST: u8 = 6;
+        const HONEST_UPDATES: usize = 3;
+        const HONEST_STATE_BYTES: usize = 256;
+
+        // Abuser: one contract flooded with MANY LARGE updates → far
+        // higher cost/benefit ratio than the honest cluster.
+        const ABUSER_SEED: u8 = 0xAB;
+        const ABUSER_UPDATES: usize = 24;
+        const ABUSER_STATE_BYTES: usize = 8 * 1024;
+
+        let mut operations: Vec<ScheduledOperation> = Vec::new();
+        let mut honest_ids: Vec<ContractInstanceId> = Vec::new();
+
+        // PUT + subscribe every honest contract, then small updates.
+        for seed in 1..=NUM_HONEST {
+            let contract = SimOperation::create_test_contract(seed);
+            let key = contract.key();
+            honest_ids.push(*key.id());
+            operations.push(ScheduledOperation::new(
+                gateway.clone(),
+                SimOperation::Put {
+                    contract: contract.clone(),
+                    state: SimOperation::create_test_state(seed),
+                    subscribe: true,
+                },
+            ));
+            // Per-contract size spread so honest log-ratios differ → MAD
+            // of the honest cluster is non-zero. Range ~256..~736 bytes.
+            let honest_bytes = HONEST_STATE_BYTES + (seed as usize) * 80;
+            for u in 0..HONEST_UPDATES {
+                operations.push(ScheduledOperation::new(
+                    gateway.clone(),
+                    SimOperation::Update {
+                        key,
+                        data: SimOperation::create_large_state(
+                            honest_bytes,
+                            seed.wrapping_add(u as u8).wrapping_add(1),
+                        ),
+                    },
+                ));
+            }
+        }
+
+        // PUT + subscribe abuser, then a heavy continuous flood of large
+        // updates so its cost dwarfs the honest cluster every tick.
+        let abuser_contract = SimOperation::create_test_contract(ABUSER_SEED);
+        let abuser_key = abuser_contract.key();
+        let abuser_id = *abuser_key.id();
+        operations.push(ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: abuser_contract.clone(),
+                state: SimOperation::create_test_state(ABUSER_SEED),
+                subscribe: true,
+            },
+        ));
+        for u in 0..ABUSER_UPDATES {
+            operations.push(ScheduledOperation::new(
+                gateway.clone(),
+                SimOperation::Update {
+                    key: abuser_key,
+                    data: SimOperation::create_large_state(
+                        ABUSER_STATE_BYTES,
+                        ABUSER_SEED.wrapping_add(u as u8).wrapping_add(1),
+                    ),
+                },
+            ));
+        }
+
+        // Time budget. Each scheduled op consumes 3 virtual seconds in the
+        // controlled runner; with ~6*(1+3) + 1 + 24 ≈ 49 ops that's ~150s
+        // of op dispatch + 3s startup. The reaper's initial delay is
+        // ≤90s and it ticks every 60s, so the chain (evict → wait
+        // evicted_ttl → recover → ban) needs many ticks: budget a long
+        // post-op wait. `simulation_duration` is the hard Turmoil wall and
+        // must exceed startup + ops + post-op wait.
+        let post_op_wait = Duration::from_secs(1200);
+        let sim_duration = Duration::from_secs(1800);
+
+        let result = sim.run_controlled_simulation(SEED, operations, sim_duration, post_op_wait);
+
+        assert!(
+            result.turmoil_result.is_ok(),
+            "controlled simulation must complete: {:?}",
+            result.turmoil_result.err()
+        );
+
+        let gateway_ring = result
+            .node_rings
+            .get(&gateway)
+            .expect("gateway Ring must have been captured (node started)");
+
+        // Diagnostic: dump the gateway's governance view so a failure is
+        // debuggable (states + cost/benefit per contract). Printed via
+        // eprintln so it surfaces under `--nocapture` without depending on
+        // a tracing subscriber being installed by the harness.
+        eprintln!(
+            "[gov-e2e] gateway tracked {} contracts; latest norms: {:?}",
+            gateway_ring.governance.len(),
+            gateway_ring.governance.latest_norms(),
+        );
+        for (id, score) in gateway_ring.governance.iter_scores() {
+            eprintln!(
+                "[gov-e2e] contract={id} state={:?} cost={:.1} benefit={:.3} log_ratio={:?} abuser={}",
+                score.state,
+                score.cost_used,
+                score.benefit_score,
+                score.log_ratio(),
+                id == abuser_id,
+            );
+        }
+
+        // (a) The abuser IS banned on the node that observed the abuse.
+        assert!(
+            gateway_ring.contract_ban_list.is_banned(&abuser_id),
+            "abuser contract {abuser_id} must be BANNED on the gateway after the \
+             evict → recover → re-evict chain; gateway governance state: {:?}",
+            gateway_ring
+                .governance
+                .score_snapshot(&abuser_id)
+                .map(|s| s.state)
+        );
+
+        // (b) No collateral damage: every honest contract is NOT banned.
+        for honest in &honest_ids {
+            assert!(
+                !gateway_ring.contract_ban_list.is_banned(honest),
+                "honest contract {honest} must NOT be banned (collateral damage); \
+                 gateway governance state: {:?}",
+                gateway_ring
+                    .governance
+                    .score_snapshot(honest)
+                    .map(|s| s.state)
+            );
+        }
+
+        // (c) The abuser actually reached the terminal `Banned` state in
+        // the governance state machine (not merely Evicted) — this is the
+        // transition that fed `apply_ban_decisions` and the wire-boundary
+        // ban gates in `node.rs`. The `is_banned` assertion above already
+        // proves the ban-list side; this pins the state-machine side so a
+        // regression that bans without transitioning (or vice versa) is
+        // caught.
+        let abuser_state = gateway_ring
+            .governance
+            .score_snapshot(&abuser_id)
+            .expect("abuser must have a governance score on the gateway")
+            .state;
+        assert_eq!(
+            abuser_state,
+            super::GovernanceState::Banned,
+            "abuser governance state must be Banned (terminal), got {abuser_state:?}"
+        );
+    }
+}
