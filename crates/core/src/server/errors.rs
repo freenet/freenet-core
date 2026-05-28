@@ -67,23 +67,40 @@ impl IntoResponse for WebSocketApiError {
             }
         }
 
-        let (status, error_message) = match self {
-            WebSocketApiError::InvalidParam { error_cause } => {
-                (StatusCode::BAD_REQUEST, error_cause)
+        // Transient errors during contract fetch: the node has peers but the
+        // GET hasn't completed yet (fresh node, sparse ring, etc.).  Show a
+        // retry page that auto-refreshes the SAME URL so the user doesn't
+        // have to manually reload (#3472).
+        let is_transient = matches!(
+            &self,
+            WebSocketApiError::AxumError {
+                error: ErrorKind::FailedOperation | ErrorKind::OperationError { .. }
             }
-            WebSocketApiError::NodeError { error_cause }
-                if error_cause.starts_with("Contract not found") =>
-            {
-                (StatusCode::NOT_FOUND, error_cause)
-            }
-            WebSocketApiError::NodeError { error_cause } => {
-                (StatusCode::INTERNAL_SERVER_ERROR, error_cause)
-            }
-            err @ WebSocketApiError::MissingContract { .. } => {
-                (StatusCode::NOT_FOUND, err.error_message())
-            }
-            WebSocketApiError::AxumError { error } => {
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("{error}"))
+        );
+
+        let (status, error_message) = if is_transient {
+            (StatusCode::SERVICE_UNAVAILABLE, retry_loading_page())
+        } else {
+            match self {
+                WebSocketApiError::InvalidParam { error_cause } => {
+                    (StatusCode::BAD_REQUEST, error_cause)
+                }
+                WebSocketApiError::NodeError { error_cause }
+                    if error_cause.starts_with("Contract not found") =>
+                {
+                    (StatusCode::NOT_FOUND, error_cause)
+                }
+                WebSocketApiError::NodeError { error_cause } => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, error_cause)
+                }
+                err @ WebSocketApiError::MissingContract { .. } => {
+                    (StatusCode::NOT_FOUND, err.error_message())
+                }
+                WebSocketApiError::AxumError { error } => {
+                    // Already handled transient cases above; remaining
+                    // AxumErrors are infrastructure failures.
+                    (StatusCode::INTERNAL_SERVER_ERROR, format!("{error}"))
+                }
             }
         };
 
@@ -128,6 +145,40 @@ fn connecting_page() -> String {
         .to_string()
 }
 
+/// Returns an HTML page that auto-refreshes the current URL every 60 s.
+///
+/// Used when a contract-fetch operation timed out — the node has peers and
+/// is making progress, but the specific GET hasn't resolved yet.  Rather
+/// than showing a dead error, the page reloads itself.  Once the contract
+/// is cached, `contract_home` serves normally and the refresh loop stops
+/// (the success response carries no `<meta http-equiv="refresh">`).
+fn retry_loading_page() -> String {
+    r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta http-equiv="refresh" content="60">
+    <title>Loading contract…</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+               display: flex; justify-content: center; align-items: center; min-height: 100vh;
+               margin: 0; background: #0c0d0f; color: #edeeef; }
+        .container { text-align: center; padding: 2rem; }
+        h1 { font-size: 1.2rem; font-weight: 500; margin-bottom: 0.5rem; }
+        p { color: #94969a; font-size: 0.85rem; margin-bottom: 0.3rem; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Fetching contract from the network…</h1>
+        <p>This page will reload automatically.</p>
+        <p style="font-size:0.7rem;color:#585a5e">If this persists, check the <a href="/" style="color:#0abab5">dashboard</a>.</p>
+    </div>
+</body>
+</html>"#
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -151,9 +202,30 @@ mod tests {
     }
 
     #[test]
-    fn other_axum_error_returns_internal_server_error() {
+    fn failed_operation_returns_retry_page() {
+        let err = WebSocketApiError::AxumError {
+            error: ErrorKind::FailedOperation,
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn operation_error_returns_retry_page() {
+        // Transient errors during contract fetch return 503 + auto-refresh.
         let err = WebSocketApiError::AxumError {
             error: ErrorKind::OperationError {
+                cause: "timed out".into(),
+            },
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn other_axum_error_returns_internal_server_error() {
+        let err = WebSocketApiError::AxumError {
+            error: ErrorKind::Unhandled {
                 cause: "something broke".into(),
             },
         };
