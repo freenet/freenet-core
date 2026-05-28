@@ -461,6 +461,15 @@ impl GovernanceManager {
         self.config.mode
     }
 
+    /// MAD detector's `min_samples` threshold — the number of
+    /// contracts needed for outlier scoring to activate. Surfaced
+    /// on the dashboard so the empty-state message can read
+    /// "Observed N / min_samples contracts needed" without
+    /// hard-coding the threshold at the render site.
+    pub(crate) fn outlier_min_samples(&self) -> usize {
+        self.config.outlier.min_samples
+    }
+
     /// Read the latest network-norms snapshot, if any tick has run.
     /// Used by the dashboard snapshot builder.
     pub(crate) fn latest_norms(&self) -> Option<NetworkNormsCache> {
