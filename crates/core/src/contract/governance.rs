@@ -470,6 +470,15 @@ impl GovernanceManager {
         self.config.outlier.min_samples
     }
 
+    /// How long a `Banned` state persists before `BanLifted` fires.
+    /// Surfaced for the Phase 7 ban-list wiring: when the reaper
+    /// emits a `BanTriggered` decision, the receive-boundary ban
+    /// entry is given `now + ban_ttl()` as its expiry so the two
+    /// timers converge.
+    pub(crate) fn ban_ttl(&self) -> Duration {
+        self.config.ban_ttl
+    }
+
     /// Read the latest network-norms snapshot, if any tick has run.
     /// Used by the dashboard snapshot builder.
     pub(crate) fn latest_norms(&self) -> Option<NetworkNormsCache> {

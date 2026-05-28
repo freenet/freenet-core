@@ -858,6 +858,27 @@ where
                 return Ok(());
             }
 
+            // Phase 7 ban-list gate (inbound REQUEST variants only).
+            // Responses to our OWN outbound requests pass through
+            // above; here we drop new PUTs for banned contracts so
+            // the contract can't get re-hosted while banned.
+            let banned_key = match op {
+                put::PutMsg::Request { contract, .. } => Some(contract.key()),
+                put::PutMsg::RequestStreaming { contract_key, .. } => Some(*contract_key),
+                _ => None,
+            };
+            if let Some(key) = banned_key {
+                if op_manager.ring.contract_ban_list.is_banned(key.id()) {
+                    tracing::debug!(
+                        tx = %op.id(),
+                        %key,
+                        phase = "put_banned_drop",
+                        "PUT dispatch: dropping request for banned contract"
+                    );
+                    return Ok(());
+                }
+            }
+
             // Relay PUT dispatch. `start_relay_put` handles
             // non-streaming Request (with upgrade-on-forward to
             // streaming when payload > threshold);
@@ -971,6 +992,21 @@ where
                 return Ok(());
             }
 
+            // Phase 7 ban-list gate (inbound REQUEST only). Responses
+            // pass through above. We refuse to serve state for a
+            // banned contract.
+            if let get::GetMsg::Request { instance_id, .. } = op {
+                if op_manager.ring.contract_ban_list.is_banned(instance_id) {
+                    tracing::debug!(
+                        tx = %op.id(),
+                        %instance_id,
+                        phase = "get_banned_drop",
+                        "GET dispatch: dropping request for banned contract"
+                    );
+                    return Ok(());
+                }
+            }
+
             // Relay GET dispatch. Originator loopback
             // (`source_addr=None`) is mapped to
             // `upstream_addr=own_addr` so the same `start_relay_get`
@@ -1054,6 +1090,22 @@ where
                     | update::UpdateMsg::RequestUpdateStreaming { key, .. }
                     | update::UpdateMsg::BroadcastToStreaming { key, .. } => *key,
                 };
+
+                // Phase 7 ban-list gate. Runs BEFORE the rate limiter
+                // so a banned contract's traffic doesn't even count
+                // against the per-(sender, contract) window — keeps
+                // the rate limiter's signal-to-noise high.
+                if op_manager.ring.contract_ban_list.is_banned(key.id()) {
+                    tracing::debug!(
+                        tx = %op.id(),
+                        %key,
+                        %sender_addr,
+                        phase = "update_dispatch_banned_drop",
+                        "UPDATE dispatch: dropping request for banned contract"
+                    );
+                    return Ok(());
+                }
+
                 let rate_decision = op_manager
                     .ring
                     .update_rate_limiter
@@ -1215,6 +1267,21 @@ where
                         visited,
                         is_renewal,
                     } => {
+                        // Phase 7 ban-list gate. Drop SUBSCRIBE for
+                        // banned contracts before reaching the driver
+                        // so we don't register interest in something
+                        // we have already decided to reject.
+                        if op_manager.ring.contract_ban_list.is_banned(instance_id) {
+                            tracing::debug!(
+                                tx = %id,
+                                %instance_id,
+                                %upstream_addr,
+                                phase = "subscribe_dispatch_banned_drop",
+                                "SUBSCRIBE dispatch: dropping request for banned contract"
+                            );
+                            return Ok(());
+                        }
+
                         if let Err(err) = subscribe::op_ctx_task::start_relay_subscribe(
                             op_manager.clone(),
                             *id,

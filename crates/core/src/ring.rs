@@ -45,6 +45,7 @@ use crate::{
 mod broken_invariants;
 mod connection_backoff;
 mod connection_manager;
+mod contract_ban_list;
 pub(crate) use connection_manager::ConnectionManager;
 mod connection;
 mod hosting;
@@ -135,6 +136,13 @@ pub(crate) struct Ring {
     /// `crate::ring::update_rate_limit` and `docs/design/contract-hardening.md`
     /// Phase 2.
     pub(crate) update_rate_limiter: Arc<update_rate_limit::UpdateRateLimiter>,
+    /// Per-contract ban list. Populated by the governance reaper on
+    /// `BanTriggered` / `BanLifted` transitions; consulted at the
+    /// inbound dispatch site to drop wire requests for banned
+    /// contracts. Phase 7 of the contract-hardening plan
+    /// (`docs/design/contract-hardening.md`) and the auto-detection
+    /// half of issue #4274 (operator-CLI blocklist).
+    pub(crate) contract_ban_list: Arc<contract_ban_list::ContractBanList>,
     event_register: Box<dyn NetEventRegister>,
     op_manager: RwLock<Option<Weak<OpManager>>>,
     /// Whether this peer is a gateway or not. This will affect behavior of the node when acquiring
@@ -275,6 +283,9 @@ impl Ring {
             broken_invariants: BrokenInvariantsTracker::new(),
             governance,
             update_rate_limiter: Arc::new(update_rate_limit::UpdateRateLimiter::new(
+                time_source.clone(),
+            )),
+            contract_ban_list: Arc::new(contract_ban_list::ContractBanList::new(
                 time_source.clone(),
             )),
             live_tx_tracker: live_tx_tracker.clone(),
@@ -710,6 +721,12 @@ impl Ring {
             // for pairs that haven't tried an UPDATE since then.
             ring.update_rate_limiter.cleanup();
 
+            // Phase 7 ban-list maintenance. Defense-in-depth — the
+            // BanLifted decisions below explicitly unban, but if any
+            // entry slipped through the reaper (e.g. mode flipped off
+            // mid-window), cleanup catches it on the next tick.
+            ring.contract_ban_list.cleanup();
+
             // Network-norms summary at DEBUG — useful when debugging
             // calibration but too noisy for INFO on a healthy node.
             tracing::debug!(
@@ -720,6 +737,16 @@ impl Ring {
                 capacity_ceiling_binding = result.capacity_ceiling_binding,
                 skip_reason = ?result.skip_reason,
                 "governance reaper tick",
+            );
+
+            // Phase 7 enforcement wiring: BanTriggered → ban list;
+            // BanLifted → unban. Done AFTER the cleanup() so a
+            // stale-cleanup race can't briefly remove an entry that
+            // a fresh BanTriggered is about to add this tick.
+            Self::apply_ban_decisions(
+                &ring.contract_ban_list,
+                &result.decisions,
+                ring.time_source.now() + ring.governance.ban_ttl(),
             );
 
             // Decisions at INFO — these are the dashboard-relevant
@@ -734,6 +761,34 @@ impl Ring {
                     actionable = decision.actionable,
                     "governance state transition",
                 );
+            }
+        }
+    }
+
+    /// Translate a batch of governance decisions into ban-list
+    /// mutations. Pulled out of the reaper loop so the wiring is
+    /// directly testable: a missing or reversed branch here would
+    /// silently break Phase 7 enforcement even with the
+    /// `GovernanceManager` emitting correct transitions.
+    fn apply_ban_decisions(
+        ban_list: &contract_ban_list::ContractBanList,
+        decisions: &[crate::contract::governance::ReaperDecision],
+        ban_expiry: tokio::time::Instant,
+    ) {
+        use crate::contract::governance::TransitionReason;
+        for decision in decisions {
+            match decision.reason {
+                TransitionReason::BanTriggered => {
+                    ban_list.ban(
+                        decision.key,
+                        ban_expiry,
+                        contract_ban_list::BanReason::AutoMad,
+                    );
+                }
+                TransitionReason::BanLifted => {
+                    ban_list.unban(&decision.key);
+                }
+                _ => {}
             }
         }
     }
