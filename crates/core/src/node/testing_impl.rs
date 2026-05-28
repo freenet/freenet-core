@@ -847,6 +847,13 @@ pub struct SimNetwork {
     pub use_mock_wasm: bool,
     /// Optional churn (crash/restart) configuration for the chaos driver.
     churn_config: Option<ChurnConfig>,
+    /// Optional governance-manager config override applied to every node
+    /// this network builds. Lets governance sim tests compress the
+    /// production minute-to-hour timescales and lower `min_samples` so the
+    /// rate-limit → MAD → evict → ban chain fires within a paused-time sim.
+    /// Pair with `use_mock_wasm = true` so the production cost-reporting
+    /// path actually feeds the detector. See #4301.
+    governance_config_override: Option<crate::contract::governance::GovernanceConfig>,
 }
 
 impl SimNetwork {
@@ -906,6 +913,7 @@ impl SimNetwork {
             connection_managers: HashMap::new(),
             use_mock_wasm: false,
             churn_config: None,
+            governance_config_override: None,
         };
         net.config_gateways(
             gateways
@@ -999,6 +1007,20 @@ impl SimNetwork {
     /// Enables the chaos driver which periodically crashes and restarts nodes.
     pub fn with_churn(&mut self, config: ChurnConfig) -> &mut Self {
         self.churn_config = Some(config);
+        self
+    }
+
+    /// Inject a governance-manager config override into every node this
+    /// network builds. Compresses the production minute-to-hour governance
+    /// timescales and lowers `min_samples` so the rate-limit → MAD → evict
+    /// → ban chain can be exercised within a paused-time sim. Pair with
+    /// `use_mock_wasm = true` so the production cost-reporting path feeds
+    /// the detector. Test-only; see #4301.
+    pub(crate) fn with_governance_config(
+        &mut self,
+        config: crate::contract::governance::GovernanceConfig,
+    ) -> &mut Self {
+        self.governance_config_override = Some(config);
         self
     }
 
@@ -1519,6 +1541,7 @@ impl SimNetwork {
             let mut config = NodeConfig::new(config_args.build().await.unwrap())
                 .await
                 .unwrap();
+            config.governance_config_override = self.governance_config_override.clone();
             config.key_pair = keypair;
             config.network_listener_ip = Ipv6Addr::LOCALHOST.into();
             config.network_listener_port = port;
@@ -1609,6 +1632,7 @@ impl SimNetwork {
             let mut config = NodeConfig::new(config_args.build().await.unwrap())
                 .await
                 .unwrap();
+            config.governance_config_override = self.governance_config_override.clone();
             for GatewayConfig {
                 peer_key_location,
                 location,
