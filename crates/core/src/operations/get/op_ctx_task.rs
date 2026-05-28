@@ -44,6 +44,7 @@ use crate::client_events::HostResult;
 use crate::config::{GlobalExecutor, OPERATION_TTL};
 use crate::contract::{ContractHandlerEvent, StoreResponse};
 use crate::message::{NetMessage, NetMessageV1, Transaction};
+use crate::node::NetworkBridge;
 use crate::node::OpManager;
 #[rustfmt::skip]
 use crate::operations::op_ctx::{
@@ -1523,8 +1524,9 @@ fn missing_state_cause(instance_id: &ContractInstanceId) -> String {
 /// - GC-spawned retries.
 /// - `start_targeted_op` (UPDATE-triggered auto-fetch).
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn start_relay_get(
+pub(crate) async fn start_relay_get<CB>(
     op_manager: Arc<OpManager>,
+    conn_manager: CB,
     incoming_tx: Transaction,
     instance_id: ContractInstanceId,
     htl: usize,
@@ -1532,7 +1534,10 @@ pub(crate) async fn start_relay_get(
     visited: VisitedPeers,
     fetch_contract: bool,
     subscribe: bool,
-) -> Result<(), OpError> {
+) -> Result<(), OpError>
+where
+    CB: NetworkBridge + Clone + Send + 'static,
+{
     // Test-only: count relay driver invocations so regression tests can
     // assert the dispatch gate in node.rs actually routed a fresh inbound
     // Request through the driver rather than the legacy
@@ -1570,6 +1575,7 @@ pub(crate) async fn start_relay_get(
 
     GlobalExecutor::spawn(run_relay_get(
         op_manager,
+        conn_manager,
         incoming_tx,
         instance_id,
         htl,
@@ -1602,8 +1608,9 @@ impl Drop for RelayInflightGuard {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn run_relay_get(
+async fn run_relay_get<CB>(
     op_manager: Arc<OpManager>,
+    conn_manager: CB,
     incoming_tx: Transaction,
     instance_id: ContractInstanceId,
     htl: usize,
@@ -1611,7 +1618,9 @@ async fn run_relay_get(
     visited: VisitedPeers,
     fetch_contract: bool,
     subscribe: bool,
-) {
+) where
+    CB: NetworkBridge + Clone + Send + 'static,
+{
     RELAY_INFLIGHT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     RELAY_SPAWNED_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _guard = RelayInflightGuard {
@@ -1621,6 +1630,7 @@ async fn run_relay_get(
 
     let drive_result = drive_relay_get(
         &op_manager,
+        &conn_manager,
         incoming_tx,
         instance_id,
         htl,
@@ -1676,8 +1686,9 @@ async fn run_relay_get(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn drive_relay_get(
+async fn drive_relay_get<CB>(
     op_manager: &Arc<OpManager>,
+    conn_manager: &CB,
     incoming_tx: Transaction,
     instance_id: ContractInstanceId,
     htl: usize,
@@ -1685,9 +1696,13 @@ async fn drive_relay_get(
     visited: VisitedPeers,
     fetch_contract: bool,
     subscribe: bool,
-) -> Result<(), OpError> {
+) -> Result<(), OpError>
+where
+    CB: NetworkBridge + Clone + Send + 'static,
+{
     match drive_relay_get_inner(
         op_manager,
+        conn_manager,
         incoming_tx,
         instance_id,
         htl,
@@ -1891,8 +1906,9 @@ async fn relay_send_not_found(
 /// relay bubbling up a downstream Found, this is the downstream Response's
 /// `hop_count` (preserved through the bubble-up chain).
 #[allow(clippy::too_many_arguments)]
-async fn relay_send_found(
+async fn relay_send_found<CB>(
     op_manager: &OpManager,
+    conn_manager: &CB,
     tx: Transaction,
     instance_id: ContractInstanceId,
     upstream_addr: SocketAddr,
@@ -1900,29 +1916,106 @@ async fn relay_send_found(
     state: WrappedState,
     contract: Option<ContractContainer>,
     hop_count: usize,
-) -> Result<(), OpError> {
-    let msg = NetMessage::from(GetMsg::Response {
-        id: tx,
-        instance_id,
-        result: GetMsgResult::Found {
-            key,
-            value: StoreResponse {
-                state: Some(state),
-                contract,
-            },
-        },
-        hop_count,
-    });
+) -> Result<(), OpError>
+where
+    CB: NetworkBridge + Clone + Send + 'static,
+{
     let mut ctx = op_manager.op_ctx(tx);
     // Originator-loopback: route via `send_local_loopback` to avoid
     // the wire-bound self-connection failure. See `relay_send_not_found`
-    // for the full rationale.
+    // for the full rationale. No streaming over loopback — there's no
+    // network benefit and it avoids loopback-stream complexity.
     let own_addr = op_manager.ring.connection_manager.get_own_addr();
     if Some(upstream_addr) == own_addr {
-        ctx.send_local_loopback(msg)
+        let msg = NetMessage::from(GetMsg::Response {
+            id: tx,
+            instance_id,
+            result: GetMsgResult::Found {
+                key,
+                value: StoreResponse {
+                    state: Some(state),
+                    contract,
+                },
+            },
+            hop_count,
+        });
+        return ctx
+            .send_local_loopback(msg)
             .await
-            .map_err(|_| OpError::NotificationError)
+            .map_err(|_| OpError::NotificationError);
+    }
+
+    // Remote upstream: stream large payloads instead of falling back to
+    // message-level store-and-forward. The legacy GET producer (#3586,
+    // removed by the task-per-tx migration) did exactly this; restoring
+    // it here closes #4307. Mirrors `drive_relay_put`'s streaming-upgrade
+    // producer branch (put/op_ctx_task.rs).
+    //
+    // Capture `includes_contract` BEFORE moving `contract` into the
+    // payload, since the wire header needs it but serialization consumes
+    // the contract.
+    let includes_contract = contract.is_some();
+    let payload = GetStreamingPayload {
+        key,
+        value: StoreResponse {
+            state: Some(state),
+            contract,
+        },
+    };
+    let payload_bytes = match bincode::serialize(&payload) {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(OpError::NotificationChannelError(format!(
+                "Failed to serialize GET relay forward payload: {e}"
+            )));
+        }
+    };
+
+    if crate::operations::should_use_streaming(op_manager.streaming_threshold, payload_bytes.len())
+    {
+        let sid = StreamId::next_operations();
+        tracing::info!(
+            tx = %tx,
+            contract = %key,
+            target = %upstream_addr,
+            total_size = payload_bytes.len(),
+            %sid,
+            phase = "relay_streaming_forward",
+            "GET relay: payload exceeds threshold, streaming response upstream"
+        );
+        let header = NetMessage::from(GetMsg::ResponseStreaming {
+            id: tx,
+            instance_id,
+            stream_id: sid,
+            key,
+            total_size: payload_bytes.len() as u64,
+            includes_contract,
+        });
+        // Install nothing — the upstream already has its waiter (it sent
+        // us the Request). Send the metadata header first, then push the
+        // raw fragments. Ordering matches the PUT producer.
+        ctx.send_fire_and_forget(upstream_addr, header)
+            .await
+            .map_err(|_| OpError::NotificationError)?;
+        conn_manager
+            .send_stream(upstream_addr, sid, bytes::Bytes::from(payload_bytes), None)
+            .await
+            .map_err(|e| {
+                OpError::NotificationChannelError(format!("get relay send_stream failed: {e}"))
+            })?;
+        Ok(())
     } else {
+        // Below threshold: inline Response{Found} (legacy behavior).
+        let StoreResponse { state, contract } = payload.value;
+        let msg = NetMessage::from(GetMsg::Response {
+            id: tx,
+            instance_id,
+            result: GetMsgResult::Found {
+                key,
+                value: StoreResponse { state, contract },
+            },
+            hop_count,
+        });
         ctx.send_fire_and_forget(upstream_addr, msg)
             .await
             .map_err(|_| OpError::NotificationError)
@@ -1930,8 +2023,9 @@ async fn relay_send_found(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn drive_relay_get_inner(
+async fn drive_relay_get_inner<CB>(
     op_manager: &Arc<OpManager>,
+    conn_manager: &CB,
     incoming_tx: Transaction,
     instance_id: ContractInstanceId,
     htl: usize,
@@ -1939,7 +2033,10 @@ async fn drive_relay_get_inner(
     visited: VisitedPeers,
     fetch_contract: bool,
     subscribe: bool,
-) -> Result<(), OpError> {
+) -> Result<(), OpError>
+where
+    CB: NetworkBridge + Clone + Send + 'static,
+{
     let ring_max_htl = op_manager.ring.max_hops_to_live.max(1);
     let htl = htl.min(ring_max_htl);
 
@@ -2058,6 +2155,7 @@ async fn drive_relay_get_inner(
         let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
         let send_result = relay_send_found(
             op_manager,
+            conn_manager,
             incoming_tx,
             instance_id,
             upstream_addr,
@@ -2115,6 +2213,7 @@ async fn drive_relay_get_inner(
                     let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
                     let send_result = relay_send_found(
                         op_manager,
+                        conn_manager,
                         incoming_tx,
                         instance_id,
                         upstream_addr,
@@ -2354,6 +2453,7 @@ async fn drive_relay_get_inner(
                 // the depth from Request to this relay.
                 let send_result = relay_send_found(
                     op_manager,
+                    conn_manager,
                     incoming_tx,
                     instance_id,
                     upstream_addr,
@@ -2377,24 +2477,222 @@ async fn drive_relay_get_inner(
                 send_result?;
                 return Ok(());
             }
-            AttemptOutcome::Terminal(Terminal::Streaming { .. }) => {
-                // Streaming relay forwarding is out of scope for #3883 commit 1.
-                // The downstream peer answered correctly with a streaming
-                // response; the relay's inability to forward streams is a
-                // local implementation gap, not a peer-routing failure. Do
-                // NOT record a route event here — penalising the peer for
-                // a relay-side limitation would systematically de-prioritise
-                // peers that happen to host large contracts.
-                tracing::warn!(
+            AttemptOutcome::Terminal(Terminal::Streaming {
+                key,
+                stream_id,
+                includes_contract,
+                total_size,
+            }) => {
+                // Downstream answered with a streaming response. Restore the
+                // relay fork+pipe forward (reverted #3586 / port plan §7,
+                // issue #4307): claim the inbound stream, fork it, send the
+                // metadata header upstream, then pipe fragments onward. The
+                // relay caches a best-effort local copy from the held handle
+                // AFTER initiating the pipe. Mirrors
+                // `drive_relay_put_streaming`.
+                let own_addr = op_manager.ring.connection_manager.get_own_addr();
+
+                tracing::info!(
                     tx = %incoming_tx,
                     %instance_id,
+                    contract = %key,
                     target = %peer,
-                    "GET relay: downstream returned ResponseStreaming — \
-                     streaming relay forwarding not yet implemented (port plan §7); \
-                     trying next peer"
+                    %stream_id,
+                    total_size,
+                    phase = "relay_streaming_forward",
+                    "GET relay: downstream returned ResponseStreaming — forwarding stream upstream"
                 );
-                new_visited.mark_visited(peer_addr);
-                continue;
+
+                // ── Step 1: Claim the inbound stream (atomic dedup). The
+                //    DOWNSTREAM peer (`peer_addr`) is the responder.
+                let handle = match op_manager
+                    .orphan_stream_registry()
+                    .claim_or_wait(peer_addr, stream_id, STREAM_CLAIM_TIMEOUT)
+                    .await
+                {
+                    Ok(h) => h,
+                    Err(OrphanStreamError::AlreadyClaimed) => {
+                        tracing::debug!(
+                            tx = %incoming_tx,
+                            %stream_id,
+                            "GET relay: inbound stream already claimed (dedup), skipping"
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            tx = %incoming_tx,
+                            %stream_id,
+                            target = %peer,
+                            error = %e,
+                            "GET relay: orphan stream claim failed; advancing to next peer"
+                        );
+                        // Treat as a failed attempt — try another peer.
+                        new_visited.mark_visited(peer_addr);
+                        continue;
+                    }
+                };
+
+                // ── Step 2: Loopback safety net. If upstream IS us
+                //    (originator-loopback edge — rare), assemble + cache
+                //    locally instead of piping to self.
+                if Some(upstream_addr) == own_addr {
+                    match handle.assemble().await {
+                        Ok(bytes) => match bincode::deserialize::<GetStreamingPayload>(&bytes) {
+                            Ok(payload) => {
+                                if let Some(state) = payload.value.state {
+                                    let contract = if includes_contract {
+                                        payload.value.contract
+                                    } else {
+                                        None
+                                    };
+                                    cache_contract_locally(
+                                        op_manager,
+                                        payload.key,
+                                        state,
+                                        contract,
+                                        false,
+                                    )
+                                    .await;
+                                } else {
+                                    tracing::warn!(
+                                        tx = %incoming_tx,
+                                        %stream_id,
+                                        "GET relay (loopback): streamed payload has no state"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    tx = %incoming_tx,
+                                    %stream_id,
+                                    error = %e,
+                                    "GET relay (loopback): failed to deserialize streamed payload"
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(
+                                tx = %incoming_tx,
+                                %stream_id,
+                                error = %e,
+                                "GET relay (loopback): stream assembly failed"
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+
+                // ── Step 3: Forward path (remote upstream). Fork, send
+                //    metadata header, pipe — BEFORE any local assemble/cache.
+                //    Re-key with a FRESH outbound stream_id per hop.
+                let outbound_sid = StreamId::next_operations();
+                let forked = handle.fork();
+                let header = GetMsg::ResponseStreaming {
+                    id: incoming_tx,
+                    instance_id,
+                    stream_id: outbound_sid,
+                    key,
+                    total_size,
+                    includes_contract,
+                };
+                let header_net = NetMessage::from(header);
+                // Serialize metadata for embedding in fragment #1 (fix #2757).
+                let embedded = bincode::serialize(&header_net).ok().map(bytes::Bytes::from);
+
+                // Send the metadata header BEFORE piping. The upstream
+                // already has its waiter installed (it sent us the Request),
+                // so a fire-and-forget header suffices.
+                op_manager
+                    .op_ctx(incoming_tx)
+                    .send_fire_and_forget(upstream_addr, header_net)
+                    .await
+                    .map_err(|_| OpError::NotificationError)?;
+
+                // `pipe_stream` spawns a background task and returns
+                // promptly, so this does not block on the full transfer.
+                conn_manager
+                    .pipe_stream(upstream_addr, outbound_sid, forked, embedded)
+                    .await
+                    .map_err(|e| {
+                        OpError::NotificationChannelError(format!(
+                            "get relay pipe_stream failed: {e}"
+                        ))
+                    })?;
+
+                // ── Step 4: Record the relay route event for the downstream
+                //    peer that served the stream (it behaved correctly).
+                crate::operations::record_relay_route_event(
+                    op_manager,
+                    peer.clone(),
+                    crate::ring::Location::from(&instance_id),
+                    crate::router::RouteOutcome::SuccessUntimed,
+                    crate::node::network_status::OpType::Get,
+                );
+
+                // ── Step 5: Subscriber-forwarding parity (subscribe only).
+                if subscribe {
+                    crate::operations::subscribe::register_downstream_subscriber(
+                        op_manager,
+                        &key,
+                        upstream_addr,
+                        None,
+                        None,
+                        &incoming_tx,
+                        " (relay, streamed GET response)",
+                    )
+                    .await;
+                }
+
+                // ── Step 6: Best-effort local cache (legacy parity — relays
+                //    cache forwarded payloads). `fork()` SHARES the buffer,
+                //    so the held `handle` can still assemble. On error, log
+                //    and continue — the pipe already succeeded.
+                match handle.assemble().await {
+                    Ok(bytes) => match bincode::deserialize::<GetStreamingPayload>(&bytes) {
+                        Ok(payload) => {
+                            if let Some(state) = payload.value.state {
+                                let contract = if includes_contract {
+                                    payload.value.contract
+                                } else {
+                                    None
+                                };
+                                cache_contract_locally(
+                                    op_manager,
+                                    payload.key,
+                                    state,
+                                    contract,
+                                    false,
+                                )
+                                .await;
+                            } else {
+                                tracing::warn!(
+                                    tx = %incoming_tx,
+                                    %stream_id,
+                                    "GET relay: streamed payload has no state; skipping local cache"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                tx = %incoming_tx,
+                                %stream_id,
+                                error = %e,
+                                "GET relay: failed to deserialize streamed payload for local cache"
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            tx = %incoming_tx,
+                            %stream_id,
+                            error = %e,
+                            "GET relay: stream assembly failed for local cache (pipe already sent)"
+                        );
+                    }
+                }
+
+                return Ok(());
             }
             AttemptOutcome::Terminal(Terminal::LocalCompletion) => {
                 // A relay driver should never receive a Request-echo because
@@ -3088,7 +3386,7 @@ mod tests {
     #[test]
     fn relay_driver_htl_zero_guard_precedes_retry_loop() {
         let src = production_source();
-        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
         let htl_guard = body
             .find("if htl == 0")
             .expect("drive_relay_get_inner must have an `if htl == 0` guard");
@@ -3108,7 +3406,7 @@ mod tests {
     #[test]
     fn relay_driver_local_cache_check_precedes_retry_loop() {
         let src = production_source();
-        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
         let local_check = body
             .find("check_local_with_interest_gate")
             .expect("drive_relay_get_inner must call check_local_with_interest_gate");
@@ -3156,7 +3454,7 @@ mod tests {
     #[test]
     fn relay_driver_forwards_upstream_before_caching_on_found_response() {
         let src = production_source();
-        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
         // Find the InlineFound arm inside the loop.
         let found_arm = body
             .find("Terminal::InlineFound {")
@@ -3195,7 +3493,7 @@ mod tests {
     #[test]
     fn all_relay_callsites_forward_before_caching() {
         let src = production_source();
-        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
 
         // For each relay-style block in the function, when both
         // `relay_send_found(` and `cache_contract_locally(` appear, the
@@ -3218,15 +3516,21 @@ mod tests {
         );
         assert_eq!(
             cache_positions.len(),
-            3,
-            "drive_relay_get_inner should have exactly three \
-             `cache_contract_locally(` callsites. Found {} — a refactor \
-             has changed the shape.",
+            5,
+            "drive_relay_get_inner should have exactly five \
+             `cache_contract_locally(` callsites (R4, R10, R12a, plus the \
+             two #4307 streaming-arm caches). Found {} — a refactor has \
+             changed the shape.",
             cache_positions.len(),
         );
-        // Pair them up positionally and verify each `send` comes before
-        // its corresponding `cache`. The two slices are sorted by
-        // position by construction.
+        // Pair the three `relay_send_found` callsites (R4, R10, R12a) with
+        // their corresponding inline-Found caches and verify each `send`
+        // comes before its `cache`. The streaming-arm caches (positions
+        // 4 and 5) forward via `pipe_stream` rather than `relay_send_found`
+        // and are covered by `relay_streaming_arm_forwards_before_caching`,
+        // so they are intentionally excluded from this positional pairing.
+        // The three sends all precede the streaming arm in source order, so
+        // zipping against the first three caches is correct.
         for (idx, (send_pos, cache_pos)) in send_positions
             .iter()
             .zip(cache_positions.iter())
@@ -3246,7 +3550,7 @@ mod tests {
     #[test]
     fn relay_driver_exhaustion_sends_not_found_upstream() {
         let src = production_source();
-        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
         // Find the exhaustion branch (None arm of relay_advance_to_next_peer).
         assert!(
             body.contains("relay_send_not_found"),
@@ -3273,7 +3577,7 @@ mod tests {
     #[test]
     fn relay_driver_does_not_send_forwarding_ack() {
         let src = production_source();
-        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
         assert!(
             !body.contains("relay_send_forwarding_ack"),
             "drive_relay_get_inner must NOT call relay_send_forwarding_ack \
@@ -3311,7 +3615,7 @@ mod tests {
     #[test]
     fn relay_driver_reuses_classify_function() {
         let src = production_source();
-        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
         assert!(
             body.contains("classify(reply)"),
             "drive_relay_get_inner must call `classify(reply)` to classify \
@@ -3330,7 +3634,7 @@ mod tests {
     fn relay_entry_point_no_longer_annotated_dead_code_after_commit2() {
         let src = production_source();
         let fn_start = src
-            .find("pub(crate) async fn start_relay_get(")
+            .find("pub(crate) async fn start_relay_get<CB>(")
             .expect("start_relay_get must exist");
         // Look in the 500 chars before the fn signature for the attribute.
         let window_start = fn_start.saturating_sub(500);
@@ -3409,7 +3713,7 @@ mod tests {
     #[test]
     fn htl_zero_guard_emits_not_found_upstream_frame() {
         let src = production_source();
-        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
         // Isolate the `if htl == 0 { ... }` block (before the retry loop).
         let guard_start = body.find("if htl == 0").expect("htl==0 guard must exist");
         let after_guard = &body[guard_start..];
@@ -3458,7 +3762,7 @@ mod tests {
     #[test]
     fn exhaustion_branches_on_local_fallback_presence() {
         let src = production_source();
-        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
         // The None arm of the `match relay_advance_to_next_peer(...)` is the
         // exhaustion branch. It must contain both `local_fallback` disposition
         // AND both Found and NotFound sends.
@@ -3559,7 +3863,7 @@ mod tests {
     #[test]
     fn forwarded_request_decrements_htl_and_propagates_visited() {
         let src = production_source();
-        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
         // The forwarded Request must be built with the decremented HTL.
         assert!(
             body.contains("let new_htl = htl.saturating_sub(1);"),
@@ -3605,7 +3909,7 @@ mod tests {
     #[test]
     fn visited_bloom_seeded_with_own_and_upstream_before_loop() {
         let src = production_source();
-        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
         let loop_start = body.find("loop {").expect("retry loop must exist");
         let pre_loop = &body[..loop_start];
         assert!(
@@ -3633,7 +3937,7 @@ mod tests {
     #[test]
     fn drive_relay_get_sends_compensating_not_found_on_inner_err() {
         let src = production_source();
-        let body = extract_fn_body(src, "async fn drive_relay_get(");
+        let body = extract_fn_body(src, "async fn drive_relay_get<CB>(");
         // Expected shape:
         //   match drive_relay_get_inner(...).await {
         //     Ok(()) => Ok(()),
@@ -3675,7 +3979,7 @@ mod tests {
     #[test]
     fn relay_send_found_maps_send_failure_to_op_error() {
         let src = production_source();
-        let body = extract_fn_body(src, "async fn relay_send_found(");
+        let body = extract_fn_body(src, "async fn relay_send_found<CB>(");
         assert!(
             body.contains("map_err(|_| OpError::NotificationError)"),
             "`relay_send_found` must map fire-and-forget send errors to \
@@ -3685,53 +3989,96 @@ mod tests {
         );
     }
 
-    // ── R12b: Streaming-downstream WARN+continue regression guard ──────────
+    // ── #4307: Relay streaming-forward regression guards ───────────────────
 
-    /// Relay streaming-forward migration is deferred to a follow-up PR
-    /// (port plan §7). Until then, a downstream `ResponseStreaming` reply
-    /// must be handled by the `Terminal::Streaming { .. }` arm with
-    /// `continue;` semantics — NOT piped through to the upstream. A
-    /// regression that either claims the stream (breaking phase-5 scope)
-    /// or panics (breaking availability when any downstream peer happens
-    /// to own a large contract) is caught here.
+    /// `relay_send_found` must stream large payloads to a remote upstream
+    /// instead of falling back to inline store-and-forward. Regression
+    /// guard for #4307 (the task-per-tx migration dropped this producer).
+    /// Mirrors PUT's producer pin.
     #[test]
-    fn streaming_downstream_is_currently_warned_and_skipped() {
+    fn relay_send_found_streams_large_payload_to_remote() {
         let src = production_source();
-        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
-        let streaming_arm_start = body
-            .find("AttemptOutcome::Terminal(Terminal::Streaming { .. })")
+        let body = extract_fn_body(src, "async fn relay_send_found<CB>(");
+        assert!(
+            body.contains("should_use_streaming"),
+            "`relay_send_found` must gate the remote-upstream path on \
+             `should_use_streaming` so large payloads stream (#4307)."
+        );
+        assert!(
+            body.contains("ResponseStreaming"),
+            "`relay_send_found` must emit a `GetMsg::ResponseStreaming` \
+             metadata header on the streaming branch (#4307)."
+        );
+        assert!(
+            body.contains("conn_manager") && body.contains("send_stream"),
+            "`relay_send_found` must call `conn_manager.send_stream(..)` to \
+             push raw fragments on the streaming branch (#4307)."
+        );
+    }
+
+    /// The relay `Terminal::Streaming` arm must FORWARD (send the metadata
+    /// header + pipe fragments) BEFORE assembling/caching locally — the
+    /// #4155 forward-before-cache invariant applied to the streaming path.
+    #[test]
+    fn relay_streaming_arm_forwards_before_caching() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
+        let arm_start = body
+            .find("AttemptOutcome::Terminal(Terminal::Streaming {")
             .expect("Streaming arm must exist in relay driver");
-        let tail = &body[streaming_arm_start..];
-        // Bound at the next arm start.
+        let tail = &body[arm_start..];
+        let pipe = tail
+            .find("pipe_stream")
+            .expect("Streaming arm must call pipe_stream to forward upstream");
+        // The forward-path assemble/cache (best-effort local cache after
+        // the pipe) are the LAST occurrences in the arm. The loopback
+        // safety-net assemble/cache appear earlier but are inside a
+        // separate `return Ok(())` branch (upstream == own_addr), so we
+        // anchor on the final occurrences to verify the FORWARD path
+        // forwards before it caches.
+        let assemble = tail
+            .rfind(".assemble()")
+            .expect("Streaming arm must assemble for local cache");
+        let cache = tail
+            .rfind("cache_contract_locally")
+            .expect("Streaming arm must cache locally");
+        assert!(
+            pipe < assemble,
+            "Streaming arm forward path must `pipe_stream` BEFORE blocking \
+             on `handle.assemble()` (forward-before-cache, #4155/#4307)."
+        );
+        assert!(
+            pipe < cache,
+            "Streaming arm forward path must forward (pipe_stream) BEFORE \
+             `cache_contract_locally` (forward-before-cache, #4155/#4307)."
+        );
+    }
+
+    /// The relay `Terminal::Streaming` arm must re-key the outbound stream
+    /// with a FRESH `StreamId::next_operations()` and `fork()` the inbound
+    /// handle so it can both pipe and cache. Never reuse the inbound id.
+    #[test]
+    fn relay_streaming_arm_uses_fresh_outbound_stream_id() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
+        let arm_start = body
+            .find("AttemptOutcome::Terminal(Terminal::Streaming {")
+            .expect("Streaming arm must exist in relay driver");
+        let tail = &body[arm_start..];
         let clip = tail[1..]
             .find("AttemptOutcome::")
             .map(|p| p + 1)
             .unwrap_or(tail.len());
         let arm = &tail[..clip];
         assert!(
-            arm.contains("continue;"),
-            "Streaming arm must `continue;` to try the next peer — streaming \
-             relay forwarding is out of scope for #3883 (see port plan §7). \
-             A future PR will replace this with a proper chunk pipe-through."
+            arm.contains("StreamId::next_operations()"),
+            "Streaming arm must mint a fresh outbound stream id via \
+             `StreamId::next_operations()` per hop (#4307)."
         );
         assert!(
-            arm.contains("new_visited.mark_visited(peer_addr)"),
-            "Streaming arm must mark the streaming peer as visited so the \
-             retry loop doesn't re-select it next iteration."
-        );
-        assert!(
-            !arm.contains("relay_send_found"),
-            "Streaming arm must NOT call `relay_send_found` — doing so \
-             without the chunk payload would send a Found frame with \
-             `state: None` (Unexpected at the upstream classify). See R12b \
-             gap in port plan risk register."
-        );
-        assert!(
-            !arm.contains("orphan_stream_registry"),
-            "Streaming arm must NOT claim the stream via \
-             `orphan_stream_registry` — that's the migrated behavior for a \
-             follow-up PR. Doing it here without the upstream pipe would \
-             leak stream state."
+            arm.contains(".fork()"),
+            "Streaming arm must `fork()` the inbound handle so it can pipe \
+             AND assemble for local cache (#4307)."
         );
     }
 
@@ -3748,7 +4095,7 @@ mod tests {
     #[test]
     fn send_and_await_failure_arms_continue_to_next_peer() {
         let src = production_source();
-        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
         // Match on the outer `round_trip` match arms.
         let round_trip = body
             .find("let reply = match round_trip {")
@@ -3847,13 +4194,13 @@ mod tests {
     fn run_relay_get_skips_release_in_originator_loopback() {
         let src = include_str!("../get/op_ctx_task.rs");
         let fn_start = src
-            .find("async fn run_relay_get(")
+            .find("async fn run_relay_get<CB>(")
             .expect("run_relay_get not found");
         // Bound the search window: `drive_relay_get` follows
         // `run_relay_get` in source order, gated by the
         // `clippy::too_many_arguments` attr.
         let fn_end = src[fn_start..]
-            .find("\n#[allow(clippy::too_many_arguments)]\nasync fn drive_relay_get(")
+            .find("\n#[allow(clippy::too_many_arguments)]\nasync fn drive_relay_get<CB>(")
             .expect("end-of-run_relay_get marker not found")
             + fn_start;
         let body = &src[fn_start..fn_end];
@@ -3892,7 +4239,7 @@ mod tests {
         let src = include_str!("../get/op_ctx_task.rs");
         for fn_name in [
             "async fn relay_send_not_found(",
-            "async fn relay_send_found(",
+            "async fn relay_send_found<CB>(",
         ] {
             let fn_start = src
                 .find(fn_name)
@@ -3932,11 +4279,11 @@ mod tests {
     fn drive_relay_get_loopback_uses_fire_and_forget() {
         let src = include_str!("../get/op_ctx_task.rs");
         let fn_start = src
-            .find("async fn drive_relay_get_inner(")
+            .find("async fn drive_relay_get_inner<CB>(")
             .expect("drive_relay_get_inner not found");
-        let fn_end = src[fn_start + "async fn drive_relay_get_inner(".len()..]
+        let fn_end = src[fn_start + "async fn drive_relay_get_inner<CB>(".len()..]
             .find("\nasync fn ")
-            .map(|idx| idx + fn_start + "async fn drive_relay_get_inner(".len())
+            .map(|idx| idx + fn_start + "async fn drive_relay_get_inner<CB>(".len())
             .unwrap_or(src.len());
         let body = &src[fn_start..fn_end];
         assert!(
@@ -4009,27 +4356,30 @@ mod tests {
         );
     }
 
-    /// All three relay-driver callsites must pass `false`.
+    /// All relay-driver cache callsites must pass `false`.
     /// Relay caches forwarded Found payloads but MUST NOT flag them as
-    /// client-accessed on the relay's own hosting cache. There are three
-    /// relay callsites in `drive_relay_get_inner`:
+    /// client-accessed on the relay's own hosting cache. There are five
+    /// relay cache callsites in `drive_relay_get_inner`:
     ///   1. Active-interest local Found (R4, immediate serve)
     ///   2. Exhaustion fallback (R10, stale local state)
     ///   3. Downstream Found bubble-up (R12a, forwarded payload)
+    ///   4. Streaming loopback safety-net (#4307, upstream == own_addr)
+    ///   5. Streaming forward best-effort cache (#4307, after pipe_stream)
     #[test]
     fn all_relay_callsites_pass_is_client_requester_false() {
         let src = production_source();
-        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
         let callsites: Vec<usize> = body
             .match_indices("cache_contract_locally(")
             .map(|(i, _)| i)
             .collect();
         assert_eq!(
             callsites.len(),
-            3,
-            "drive_relay_get_inner should have exactly three \
+            5,
+            "drive_relay_get_inner should have exactly five \
              cache_contract_locally callsites (R4 immediate, R10 fallback, \
-             R12a bubble-up). Found {} — a refactor has changed the shape.",
+             R12a bubble-up, plus the two #4307 streaming-arm caches). \
+             Found {} — a refactor has changed the shape.",
             callsites.len(),
         );
         // Each callsite must terminate with `, false)` (the
@@ -4061,7 +4411,9 @@ mod tests {
             // The last argument must be `false`. Normalize whitespace.
             let normalized: String = call.chars().filter(|c| !c.is_whitespace()).collect();
             assert!(
-                normalized.ends_with("false,).await") || normalized.ends_with("false)"),
+                normalized.ends_with("false,).await")
+                    || normalized.ends_with("false)")
+                    || normalized.ends_with("false,)"),
                 "Relay callsite #{idx} of cache_contract_locally must pass \
                  `false` for is_client_requester (relay is not the client). \
                  Call text: {call}"
@@ -4163,7 +4515,7 @@ mod tests {
              tests to verify the dispatch gate routes through the relay driver."
         );
         // Increment must appear in the body of start_relay_get, under cfg.
-        let body = extract_fn_body(src, "pub(crate) async fn start_relay_get(");
+        let body = extract_fn_body(src, "pub(crate) async fn start_relay_get<CB>(");
         assert!(
             body.contains("RELAY_DRIVER_CALL_COUNT.fetch_add(1"),
             "`start_relay_get` must increment `RELAY_DRIVER_CALL_COUNT` at \
@@ -4324,7 +4676,7 @@ mod tests {
     #[test]
     fn drive_relay_get_inner_records_route_events_on_transport_failure() {
         let src = include_str!("op_ctx_task.rs");
-        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
 
         // The send_to_and_await error arm and the timeout arm must
         // record `Failure` for the chosen peer. Identify each by its
