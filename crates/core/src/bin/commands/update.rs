@@ -1181,11 +1181,11 @@ fn update_service_file(
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(format!("/home/{username}")));
         let log_dir = home_dir.join(".local/state/freenet");
-        generate_system_service_file(binary_path, &log_dir, username, &home_dir)
+        generate_system_service_file(binary_path, &log_dir, username, &home_dir, None)
     } else {
         let home_dir = dirs::home_dir().context("Failed to get home directory")?;
         let log_dir = home_dir.join(".local/state/freenet");
-        generate_user_service_file(binary_path, &log_dir)
+        generate_user_service_file(binary_path, &log_dir, None)
     };
 
     // Write the updated service file

@@ -2450,8 +2450,32 @@ fn install_user_service() -> Result<()> {
     let log_dir = home_dir.join(".local/state/freenet");
     fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
 
-    let service_content = generate_user_service_file(&exe_path, &log_dir);
     let service_path = service_dir.join("freenet.service");
+
+    // Preserve CLI flags from any existing unit file so operators who
+    // hand-tuned ExecStart (e.g. --is-gateway, --network-port, --gateway)
+    // don't lose them on `freenet service install` (#4275).
+    let preserved_args = extract_execstart_args(&service_path);
+    let extra_args = preserved_args.as_deref();
+
+    let service_content = generate_user_service_file(&exe_path, &log_dir, extra_args);
+
+    // If we changed ExecStart, back up the old unit before overwriting.
+    if preserved_args.is_some() && service_path.exists() {
+        let bak_path = service_path.with_extension("service.bak");
+        #[allow(clippy::let_underscore_must_use)]
+        if fs::copy(&service_path, &bak_path).is_ok() {
+            eprintln!(
+                "freenet: preserved existing ExecStart flags; old unit backed up to {}",
+                bak_path.display()
+            );
+        } else {
+            eprintln!(
+                "freenet: warning: failed to back up old unit to {}",
+                bak_path.display()
+            );
+        }
+    }
 
     fs::write(&service_path, service_content).context("Failed to write service file")?;
 
@@ -2506,9 +2530,31 @@ fn install_system_service() -> Result<()> {
     fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
     chown_to_user(&log_dir, &username);
 
-    let service_content = generate_system_service_file(&exe_path, &log_dir, &username, &home_dir);
+    let system_service_path = std::path::Path::new(SYSTEM_SERVICE_PATH);
+    let preserved_args = extract_execstart_args(system_service_path);
+    let extra_args = preserved_args.as_deref();
 
-    fs::write(SYSTEM_SERVICE_PATH, &service_content).with_context(|| {
+    let service_content =
+        generate_system_service_file(&exe_path, &log_dir, &username, &home_dir, extra_args);
+
+    // If we changed ExecStart, back up the old unit before overwriting.
+    if preserved_args.is_some() && system_service_path.exists() {
+        let bak_path = system_service_path.with_extension("service.bak");
+        #[allow(clippy::let_underscore_must_use)]
+        if fs::copy(system_service_path, &bak_path).is_ok() {
+            eprintln!(
+                "freenet: preserved existing ExecStart flags; old unit backed up to {}",
+                bak_path.display()
+            );
+        } else {
+            eprintln!(
+                "freenet: warning: failed to back up old unit to {}",
+                bak_path.display()
+            );
+        }
+    }
+
+    fs::write(system_service_path, &service_content).with_context(|| {
         format!(
             "Failed to write service file to {SYSTEM_SERVICE_PATH}. \
              Are you running as root? Try: sudo freenet service install --system"
@@ -2540,7 +2586,16 @@ fn install_system_service() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-pub fn generate_user_service_file(binary_path: &Path, log_dir: &Path) -> String {
+pub fn generate_user_service_file(
+    binary_path: &Path,
+    log_dir: &Path,
+    extra_args: Option<&str>,
+) -> String {
+    let exec_start = if let Some(args) = extra_args {
+        format!("{binary} network {args}", binary = binary_path.display())
+    } else {
+        format!("{binary} network", binary = binary_path.display())
+    };
     format!(
         r#"[Unit]
 Description=Freenet Node
@@ -2550,7 +2605,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={binary} network
+ExecStart={exec_start}
 Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops
 RestartSec=10
@@ -2601,6 +2656,7 @@ CPUQuota=200%
 [Install]
 WantedBy=default.target
 "#,
+        exec_start = exec_start,
         binary = binary_path.display(),
         log_dir = log_dir.display()
     )
@@ -2612,7 +2668,13 @@ pub fn generate_system_service_file(
     log_dir: &Path,
     username: &str,
     home_dir: &Path,
+    extra_args: Option<&str>,
 ) -> String {
+    let exec_start = if let Some(args) = extra_args {
+        format!("{binary} network {args}", binary = binary_path.display())
+    } else {
+        format!("{binary} network", binary = binary_path.display())
+    };
     format!(
         r#"[Unit]
 Description=Freenet Node
@@ -2624,7 +2686,7 @@ Wants=network-online.target
 Type=simple
 User={username}
 Environment=HOME={home}
-ExecStart={binary} network
+ExecStart={exec_start}
 Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops
 RestartSec=10
@@ -2675,6 +2737,7 @@ CPUQuota=200%
 [Install]
 WantedBy=multi-user.target
 "#,
+        exec_start = exec_start,
         binary = binary_path.display(),
         log_dir = log_dir.display(),
         username = username,
@@ -3683,6 +3746,34 @@ fn service_logs(_error_only: bool) -> Result<()> {
     anyhow::bail!("Service management is not supported on this platform")
 }
 
+/// Extract CLI flags from an existing systemd unit file's `ExecStart` line.
+///
+/// Reads the file at `service_path`, finds the `ExecStart=... network` line,
+/// and returns everything after `network` (the operator's custom flags).
+/// Returns `None` if the file doesn't exist or has no extra args.
+///
+/// This allows `freenet service install` to preserve CLI flags that
+/// operators added manually (e.g. `--is-gateway`, `--network-port`, etc.)
+/// instead of silently dropping them (#4275).
+fn extract_execstart_args(service_path: &std::path::Path) -> Option<String> {
+    let content = std::fs::read_to_string(service_path).ok()?;
+    let exec_line = content.lines().find(|l| l.starts_with("ExecStart="))?;
+    // Advance past the binary path (which may be a literal path or
+    // a variable like ${BINARY}) to find the `network` subcommand.
+    let after_network = exec_line
+        .strip_prefix("ExecStart=")?
+        .split_whitespace()
+        .skip_while(|w| *w != "network")
+        .skip(1) // skip "network" itself
+        .collect::<Vec<_>>()
+        .join(" ");
+    if after_network.is_empty() {
+        None
+    } else {
+        Some(after_network)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4100,7 +4191,7 @@ mod tests {
     fn test_systemd_user_service_file_generation() {
         let binary_path = PathBuf::from("/usr/local/bin/freenet");
         let log_dir = PathBuf::from("/home/test/.local/state/freenet");
-        let service_content = generate_user_service_file(&binary_path, &log_dir);
+        let service_content = generate_user_service_file(&binary_path, &log_dir, None);
 
         // Verify the service file contains expected sections
         assert!(service_content.contains("[Unit]"));
@@ -4160,7 +4251,7 @@ mod tests {
         let username = "testuser";
         let home_dir = PathBuf::from("/home/test");
         let service_content =
-            generate_system_service_file(&binary_path, &log_dir, username, &home_dir);
+            generate_system_service_file(&binary_path, &log_dir, username, &home_dir, None);
 
         // Verify sections
         assert!(service_content.contains("[Unit]"));
@@ -5080,5 +5171,44 @@ mod tests {
                 pattern
             );
         }
+    }
+
+    // ── extract_execstart_args regression tests (#4275) ──
+
+    #[test]
+    fn extract_execstart_args_returns_some_with_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("freenet.service");
+        std::fs::write(
+            &path,
+            "ExecStart=/usr/bin/freenet network --is-gateway --network-port 31337\n",
+        )
+        .unwrap();
+        let args = extract_execstart_args(&path);
+        assert_eq!(args.as_deref(), Some("--is-gateway --network-port 31337"));
+    }
+
+    #[test]
+    fn extract_execstart_args_returns_none_without_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("freenet.service");
+        std::fs::write(&path, "ExecStart=/usr/bin/freenet network\n").unwrap();
+        assert_eq!(extract_execstart_args(&path), None);
+    }
+
+    #[test]
+    fn extract_execstart_args_returns_none_for_missing_file() {
+        assert_eq!(
+            extract_execstart_args(std::path::Path::new("/nonexistent/freenet.service")),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_execstart_args_returns_none_without_network_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("freenet.service");
+        std::fs::write(&path, "ExecStart=/usr/bin/freenet\n").unwrap();
+        assert_eq!(extract_execstart_args(&path), None);
     }
 }
