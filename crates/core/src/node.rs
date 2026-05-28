@@ -1037,6 +1037,39 @@ where
             // mean an internal caller; there are none, so the else
             // branch logs and drops.
             if let Some(sender_addr) = source_addr {
+                // Phase 2 front-line rate limit. Apply UNIFORMLY across
+                // all four UPDATE wire variants so a flooder can't
+                // bypass by switching opcode (RequestUpdate /
+                // BroadcastTo / RequestUpdateStreaming /
+                // BroadcastToStreaming). The check happens BEFORE the
+                // dedup gate inside the relay drivers — that ordering
+                // is what made the previous PR-MVP iteration race-
+                // free per Codex review: rejected attempts never enter
+                // the dedup set, so a legitimate retry of the same
+                // tx is not silently dropped as a duplicate. See
+                // `crate::ring::update_rate_limit` for design.
+                let key = match op {
+                    update::UpdateMsg::RequestUpdate { key, .. }
+                    | update::UpdateMsg::BroadcastTo { key, .. }
+                    | update::UpdateMsg::RequestUpdateStreaming { key, .. }
+                    | update::UpdateMsg::BroadcastToStreaming { key, .. } => *key,
+                };
+                let rate_decision = op_manager
+                    .ring
+                    .update_rate_limiter
+                    .check_and_record(sender_addr, *key.id());
+                if !rate_decision.is_allowed() {
+                    tracing::debug!(
+                        tx = %op.id(),
+                        %key,
+                        %sender_addr,
+                        ?rate_decision,
+                        phase = "update_dispatch_rate_limited",
+                        "UPDATE dispatch: rejected by per-(sender, contract) rate limit"
+                    );
+                    return Ok(());
+                }
+
                 #[allow(clippy::wildcard_enum_match_arm)]
                 match op {
                     update::UpdateMsg::RequestUpdate {

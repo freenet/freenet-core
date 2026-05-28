@@ -564,6 +564,12 @@ pub(crate) async fn start_relay_request_update(
     #[cfg(any(test, feature = "testing"))]
     RELAY_UPDATE_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+    // Note: the Phase 2 per-(sender, contract) rate limit is applied
+    // UPSTREAM at the wire dispatch site in `node.rs` so the same
+    // gate covers all four UPDATE wire variants (RequestUpdate,
+    // BroadcastTo, RequestUpdateStreaming, BroadcastToStreaming)
+    // uniformly. Rejected messages never reach this driver.
+
     if !op_manager.active_relay_update_txs.insert(incoming_tx) {
         RELAY_UPDATE_DEDUP_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::debug!(
