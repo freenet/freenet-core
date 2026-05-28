@@ -858,6 +858,28 @@ where
                 return Ok(());
             }
 
+            // Phase 7 ban-list gate (inbound REQUEST variants only).
+            // Responses to our OWN outbound requests pass through
+            // above; here we drop new PUTs for banned contracts so
+            // the contract can't get re-hosted while banned.
+            #[allow(clippy::wildcard_enum_match_arm)]
+            let banned_key = match op {
+                put::PutMsg::Request { contract, .. } => Some(contract.key()),
+                put::PutMsg::RequestStreaming { contract_key, .. } => Some(*contract_key),
+                _ => None,
+            };
+            if let Some(key) = banned_key {
+                if op_manager.ring.contract_ban_list.is_banned(key.id()) {
+                    tracing::debug!(
+                        tx = %op.id(),
+                        %key,
+                        phase = "put_banned_drop",
+                        "PUT dispatch: dropping request for banned contract"
+                    );
+                    return Ok(());
+                }
+            }
+
             // Relay PUT dispatch. `start_relay_put` handles
             // non-streaming Request (with upgrade-on-forward to
             // streaming when payload > threshold);
@@ -971,6 +993,21 @@ where
                 return Ok(());
             }
 
+            // Phase 7 ban-list gate (inbound REQUEST only). Responses
+            // pass through above. We refuse to serve state for a
+            // banned contract.
+            if let get::GetMsg::Request { instance_id, .. } = op {
+                if op_manager.ring.contract_ban_list.is_banned(instance_id) {
+                    tracing::debug!(
+                        tx = %op.id(),
+                        %instance_id,
+                        phase = "get_banned_drop",
+                        "GET dispatch: dropping request for banned contract"
+                    );
+                    return Ok(());
+                }
+            }
+
             // Relay GET dispatch. Originator loopback
             // (`source_addr=None`) is mapped to
             // `upstream_addr=own_addr` so the same `start_relay_get`
@@ -1037,6 +1074,55 @@ where
             // mean an internal caller; there are none, so the else
             // branch logs and drops.
             if let Some(sender_addr) = source_addr {
+                // Phase 2 front-line rate limit. Apply UNIFORMLY across
+                // all four UPDATE wire variants so a flooder can't
+                // bypass by switching opcode (RequestUpdate /
+                // BroadcastTo / RequestUpdateStreaming /
+                // BroadcastToStreaming). The check happens BEFORE the
+                // dedup gate inside the relay drivers — that ordering
+                // is what made the previous PR-MVP iteration race-
+                // free per Codex review: rejected attempts never enter
+                // the dedup set, so a legitimate retry of the same
+                // tx is not silently dropped as a duplicate. See
+                // `crate::ring::update_rate_limit` for design.
+                let key = match op {
+                    update::UpdateMsg::RequestUpdate { key, .. }
+                    | update::UpdateMsg::BroadcastTo { key, .. }
+                    | update::UpdateMsg::RequestUpdateStreaming { key, .. }
+                    | update::UpdateMsg::BroadcastToStreaming { key, .. } => *key,
+                };
+
+                // Phase 7 ban-list gate. Runs BEFORE the rate limiter
+                // so a banned contract's traffic doesn't even count
+                // against the per-(sender, contract) window — keeps
+                // the rate limiter's signal-to-noise high.
+                if op_manager.ring.contract_ban_list.is_banned(key.id()) {
+                    tracing::debug!(
+                        tx = %op.id(),
+                        %key,
+                        %sender_addr,
+                        phase = "update_dispatch_banned_drop",
+                        "UPDATE dispatch: dropping request for banned contract"
+                    );
+                    return Ok(());
+                }
+
+                let rate_decision = op_manager
+                    .ring
+                    .update_rate_limiter
+                    .check_and_record(sender_addr, *key.id());
+                if !rate_decision.is_allowed() {
+                    tracing::debug!(
+                        tx = %op.id(),
+                        %key,
+                        %sender_addr,
+                        ?rate_decision,
+                        phase = "update_dispatch_rate_limited",
+                        "UPDATE dispatch: rejected by per-(sender, contract) rate limit"
+                    );
+                    return Ok(());
+                }
+
                 #[allow(clippy::wildcard_enum_match_arm)]
                 match op {
                     update::UpdateMsg::RequestUpdate {
@@ -1182,6 +1268,21 @@ where
                         visited,
                         is_renewal,
                     } => {
+                        // Phase 7 ban-list gate. Drop SUBSCRIBE for
+                        // banned contracts before reaching the driver
+                        // so we don't register interest in something
+                        // we have already decided to reject.
+                        if op_manager.ring.contract_ban_list.is_banned(instance_id) {
+                            tracing::debug!(
+                                tx = %id,
+                                %instance_id,
+                                %upstream_addr,
+                                phase = "subscribe_dispatch_banned_drop",
+                                "SUBSCRIBE dispatch: dropping request for banned contract"
+                            );
+                            return Ok(());
+                        }
+
                         if let Err(err) = subscribe::op_ctx_task::start_relay_subscribe(
                             op_manager.clone(),
                             *id,
@@ -1282,6 +1383,20 @@ where
             // Only sync contracts we're actively interested in (receiving updates
             // or have downstream subscribers) — skip cached-only contracts.
             for instance_id in result.overlapping_contracts {
+                // Phase 7 egress gate. If we've banned the contract,
+                // don't proactively push its state to a sibling peer
+                // via the overlap-sync path — that would undermine
+                // the wire-boundary drop the ban list is supposed to
+                // provide.
+                if op_manager.ring.contract_ban_list.is_banned(&instance_id) {
+                    tracing::debug!(
+                        %instance_id,
+                        peer = %source_pub_key,
+                        phase = "neighbor_hosting_banned_skip",
+                        "skipping proximity sync for banned contract"
+                    );
+                    continue;
+                }
                 if let Some((key, state)) =
                     get_contract_state_by_id(&op_manager, &instance_id).await
                 {
@@ -1543,6 +1658,20 @@ async fn handle_interest_sync_message(
             // out to ALL subscribers (~28 peers), causing O(peers^2) traffic when
             // many peers reported mismatches within the same heartbeat cycle.
             for contract in stale_contracts {
+                // Phase 7 egress gate. Don't repair a stale peer's
+                // summary mismatch by pushing state for a contract
+                // we have banned — same rationale as the inbound
+                // wire-boundary drop, applied to the proactive heal
+                // path.
+                if op_manager.ring.contract_ban_list.is_banned(contract.id()) {
+                    tracing::debug!(
+                        %contract,
+                        stale_peer = %source,
+                        phase = "interest_sync_banned_skip",
+                        "skipping summary-mismatch sync for banned contract"
+                    );
+                    continue;
+                }
                 let Some(state) = get_contract_state(op_manager, &contract).await else {
                     tracing::trace!(
                         contract = %contract,
