@@ -438,6 +438,9 @@ impl TransportMetrics {
         TransportSnapshot {
             transfers_completed,
             transfers_failed,
+            // Delta fields not applicable to non-resetting reads —
+            // `take_snapshot` computes these from period accumulators,
+            // but a read-only snapshot has no meaningful interval.
             bytes_sent: 0,
             bytes_received: 0,
             avg_transfer_time_ms,

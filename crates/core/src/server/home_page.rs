@@ -1336,10 +1336,10 @@ header {
     font-size: 0.75rem;
     font-weight: 500;
     color: var(--accent-light);
-    background: rgba(126, 207, 239, 0.1);
+    background: rgba(94, 234, 212, 0.1);
     padding: 0.15rem 0.5rem;
     border-radius: 4px;
-    border: 1px solid rgba(126, 207, 239, 0.2);
+    border: 1px solid rgba(94, 234, 212, 0.2);
     text-transform: uppercase;
     letter-spacing: 0.05em;
 }
@@ -1377,9 +1377,9 @@ header {
     cursor: pointer;
     line-height: 1;
 }
-.copy-btn:hover { color: var(--accent-light); background: rgba(126, 207, 239, 0.1); }
+.copy-btn:hover { color: var(--accent-light); background: rgba(94, 234, 212, 0.1); }
 .badge {
-    background: rgba(0, 127, 255, 0.15);
+    background: rgba(10, 186, 181, 0.15);
     color: var(--accent-light);
     padding: 0.15rem 0.5rem;
     border-radius: 12px;
@@ -1651,8 +1651,8 @@ code {
 }
 [data-theme="light"] .health-degraded { color: #92400e; }
 .health-connecting {
-    background: rgba(0, 127, 255, 0.08);
-    border: 1px solid rgba(0, 127, 255, 0.2);
+    background: rgba(10, 186, 181, 0.08);
+    border: 1px solid rgba(10, 186, 181, 0.2);
     color: var(--accent-light);
 }
 [data-theme="light"] .health-connecting { color: var(--accent-dark); }
@@ -2436,7 +2436,7 @@ fn peer_detail_html(address_str: &str) -> String {
     let info_card = format!(
         r#"<div class="card">
             <h2>Peer Info</h2>
-            <div><strong>{ptype}</strong> <code>{addr}</code><button type="button" class="copy-btn-inline" onclick="copyToClipboard('{addr_enc}').then(function(){{showToast('Address copied')}})" title="Copy address">⎘</button></div>
+            <div><strong>{ptype}</strong> <code>{addr}</code><button type="button" class="copy-btn-inline" data-addr="{addr_enc}" onclick="copyToClipboard(this.getAttribute('data-addr')).then(function(){{showToast('Address copied')}})" title="Copy address">⎘</button></div>
             <div class="info-grid">
                 <div class="info-label">Location</div><div class="info-value">{loc}</div>
                 <div class="info-label">Connected</div><div class="info-value">{connected}</div>
@@ -3529,7 +3529,7 @@ a.header-title {
     text-align: center;
 }
 .tab-label.tab-active .tab-count {
-    background: rgba(0, 127, 255, 0.15);
+    background: rgba(10, 186, 181, 0.15);
     color: var(--accent-primary);
 }
 .tab-panel { display: none; }

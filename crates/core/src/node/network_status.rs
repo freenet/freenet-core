@@ -1304,4 +1304,19 @@ mod tests {
         assert_eq!(nat.recent_attempts(), 20);
         assert_eq!(nat.recent_successes(), 0);
     }
+
+    /// Regression: `init()` must seed the global so `get_snapshot()`
+    /// returns `Some(...)` immediately — without this, the dashboard
+    /// shows "Starting up…" forever in local mode (#3507 / PR #4297).
+    #[test]
+    fn init_populates_snapshot() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        init(31337, HashSet::new(), "0.1.0-test".to_string());
+        let snap = get_snapshot();
+        assert!(snap.is_some(), "snapshot should be Some after init");
+        let s = snap.unwrap();
+        assert_eq!(s.version, "0.1.0-test");
+        assert_eq!(s.listening_port, 31337);
+        assert_eq!(s.open_connections, 0);
+    }
 }
