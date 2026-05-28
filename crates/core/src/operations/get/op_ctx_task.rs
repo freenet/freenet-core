@@ -103,6 +103,18 @@ pub static RELAY_COMPLETED_TOTAL: std::sync::atomic::AtomicUsize =
 pub static RELAY_DEDUP_REJECTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Test-only counter that increments every time the relay GET driver
+/// commits to forking + piping a streaming response to a REMOTE upstream
+/// (the `Terminal::Streaming` forward branch). Incremented after the
+/// loopback safety-net check and a successful `claim_or_wait`, before the
+/// header send. NOT incremented on the loopback branch or the
+/// `AlreadyClaimed` dedup branch. Used by `streaming_e2e` to prove a GET
+/// genuinely relayed through a streaming hop rather than falling back to
+/// store-and-forward. Mirrors `RELAY_PUT_STREAMING_DRIVER_CALL_COUNT`.
+#[cfg(any(test, feature = "testing"))]
+pub static RELAY_GET_STREAMING_FORWARD_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Start a client-initiated GET, returning as soon as the task has been
 /// spawned (mirrors legacy `request_get` timing).
 ///
@@ -997,11 +1009,12 @@ async fn cache_contract_locally(
 /// originator for driver ops (`load_or_init` would return
 /// `OpNotPresent`).
 ///
-/// `peer_addr` is the sender's transport address — currently we
-/// use `driver.current_target.socket_addr()`, which is accurate for
-/// single-hop responses. Multi-hop (where a relay answers on behalf
-/// of a further peer) is not yet supported by the driver;
-/// see #3883.
+/// `peer_addr` is the sender's transport address — we use
+/// `driver.current_target.socket_addr()`. Multi-hop streamed GET IS now
+/// supported: relays fork+pipe the stream and re-key it with a fresh
+/// outbound `stream_id` per hop (#4307), so the originator always claims
+/// the stream keyed by its `current_target` (the immediate next hop),
+/// regardless of how many relays the response traversed. See #3883.
 async fn assemble_and_cache_stream(
     op_manager: &OpManager,
     peer_addr: std::net::SocketAddr,
@@ -1051,10 +1064,11 @@ async fn assemble_and_cache_stream(
         None
     };
 
-    // Streaming assembly is reachable only from the client-driver side (the
-    // relay driver does not claim streams — port plan §7). The originator
-    // IS the client requester, so the sticky `local_client_access` flag
-    // applies.
+    // This helper runs on the client-driver (originator) side. The relay
+    // driver also claims streams now (the `Terminal::Streaming` arm, #4307),
+    // but it uses its own inline assemble+cache with `local_client_access =
+    // false`; this path is the originator, which IS the client requester, so
+    // the sticky `local_client_access` flag applies here.
     cache_contract_locally(op_manager, payload.key, state, contract, true).await;
     Ok(())
 }
@@ -1492,13 +1506,11 @@ fn missing_state_cause(instance_id: &ContractInstanceId) -> String {
 // targeting the downstream peer, and the reply (Found / NotFound) is forwarded
 // to `upstream_addr` via a fire-and-forget `conn_manager.send`.
 //
-// Out of scope for this commit (§7 of the port plan):
-//   - ResponseStreaming relay forwarding (chunk pipe-through).
+// ResponseStreaming relay forwarding (chunk pipe-through) IS now implemented
+// in the `Terminal::Streaming` arm of `drive_relay_get_inner` (fork + pipe;
+// issue #4307). Still out of scope for the driver:
 //   - GC-spawned retries.
 //   - start_targeted_op (UPDATE-triggered auto-fetch).
-//
-// This entire section is dead code in commit 1 — node.rs dispatch is not
-// changed until commit 2.
 
 /// Start a relay (non-originator) GET driver.
 ///
@@ -1507,8 +1519,11 @@ fn missing_state_cause(instance_id: &ContractInstanceId) -> String {
 /// owns routing/forwarding/retry state in its task locals — no `GetOp`
 /// is stored in `OpManager.ops.get` for this transaction.
 ///
-/// Originator loop-back (`source_addr.is_none()`) continues to use the
-/// legacy `handle_op_request` → `process_message` path.
+/// Originator loop-back (`source_addr.is_none()`) is mapped by `node.rs`
+/// dispatch to `upstream_addr = own_addr` and driven by this same driver
+/// (the legacy `process_message` path is deleted); the loopback edge is
+/// handled by the safety-net branches that cache locally instead of
+/// piping/replying to self.
 ///
 /// # Scope (#3883)
 ///
@@ -1517,10 +1532,10 @@ fn missing_state_cause(instance_id: &ContractInstanceId) -> String {
 ///   interest gate), forward-or-respond decision.
 /// - `GetMsg::Response{NotFound}` retry to next alternative peer.
 /// - `GetMsg::Response{Found}` bubble-up to upstream.
+/// - `GetMsg::ResponseStreaming` relay forwarding (fork + pipe, #4307).
 /// - `ForwardingAck` send-before-forward.
 ///
-/// NOT migrated (stays on legacy path; see port plan §7):
-/// - Streaming-chunk relay forwarding (`ResponseStreaming` pass-through).
+/// NOT migrated (stays on legacy path):
 /// - GC-spawned retries.
 /// - `start_targeted_op` (UPDATE-triggered auto-fetch).
 #[allow(clippy::too_many_arguments)]
@@ -1991,6 +2006,21 @@ where
             total_size: payload_bytes.len() as u64,
             includes_contract,
         });
+        // Embed a serialized copy of the metadata header in fragment #1
+        // (fix #2757). On a lossy link the separately-sent fire-and-forget
+        // header can be lost while fragments arrive — without self-describing
+        // metadata the upstream waiter never matches the orphan stream and
+        // the GET times out. Mirrors the forward path's `embedded`.
+        let embedded = bincode::serialize(&header).ok().map(bytes::Bytes::from);
+        if embedded.is_none() {
+            tracing::warn!(
+                tx = %tx,
+                target = %upstream_addr,
+                %sid,
+                "GET relay: failed to serialize ResponseStreaming header for \
+                 fragment-#1 embedding; sending stream without embedded metadata"
+            );
+        }
         // Install nothing — the upstream already has its waiter (it sent
         // us the Request). Send the metadata header first, then push the
         // raw fragments. Ordering matches the PUT producer.
@@ -1998,7 +2028,12 @@ where
             .await
             .map_err(|_| OpError::NotificationError)?;
         conn_manager
-            .send_stream(upstream_addr, sid, bytes::Bytes::from(payload_bytes), None)
+            .send_stream(
+                upstream_addr,
+                sid,
+                bytes::Bytes::from(payload_bytes),
+                embedded,
+            )
             .await
             .map_err(|e| {
                 OpError::NotificationChannelError(format!("get relay send_stream failed: {e}"))
@@ -2535,7 +2570,13 @@ where
 
                 // ── Step 2: Loopback safety net. If upstream IS us
                 //    (originator-loopback edge — rare), assemble + cache
-                //    locally instead of piping to self.
+                //    locally instead of piping to self. This branch is
+                //    cache-only with NO wire Response: relay-loopback
+                //    initiators (GC-spawned retries / start_targeted_op
+                //    auto-fetch) only need the local cache populated — the
+                //    interactive client GET uses the separate
+                //    `drive_client_get_inner` driver, which owns its own
+                //    client delivery.
                 if Some(upstream_addr) == own_addr {
                     match handle.assemble().await {
                         Ok(bytes) => match bincode::deserialize::<GetStreamingPayload>(&bytes) {
@@ -2600,6 +2641,11 @@ where
                 // Serialize metadata for embedding in fragment #1 (fix #2757).
                 let embedded = bincode::serialize(&header_net).ok().map(bytes::Bytes::from);
 
+                // Committed to forking + piping to a remote upstream: count
+                // this streaming-forward hop (test-only; see counter doc).
+                #[cfg(any(test, feature = "testing"))]
+                RELAY_GET_STREAMING_FORWARD_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
                 // Send the metadata header BEFORE piping. The upstream
                 // already has its waiter installed (it sent us the Request),
                 // so a fire-and-forget header suffices.
@@ -2611,14 +2657,32 @@ where
 
                 // `pipe_stream` spawns a background task and returns
                 // promptly, so this does not block on the full transfer.
-                conn_manager
+                //
+                // Do NOT `?` this error: the `ResponseStreaming` header has
+                // already gone upstream (see send above), so the upstream is
+                // committed to assembling a stream. Propagating the error
+                // would bubble up to `drive_relay_get`, which sends a
+                // compensating `Response{NotFound}` to the SAME upstream — a
+                // contradictory double-signal that stalls the upstream ~60s
+                // on `claim_or_wait`. Instead, log and return cleanly so the
+                // upstream's claim simply times out without a NotFound. We do
+                // NOT fall through to the local-cache step: the held `handle`
+                // may be partial after a pipe failure.
+                if let Err(e) = conn_manager
                     .pipe_stream(upstream_addr, outbound_sid, forked, embedded)
                     .await
-                    .map_err(|e| {
-                        OpError::NotificationChannelError(format!(
-                            "get relay pipe_stream failed: {e}"
-                        ))
-                    })?;
+                {
+                    tracing::warn!(
+                        tx = %incoming_tx,
+                        %upstream_addr,
+                        %outbound_sid,
+                        error = %e,
+                        "GET relay: pipe_stream failed AFTER the ResponseStreaming \
+                         header already went upstream; letting the upstream's claim \
+                         time out cleanly rather than sending a contradictory NotFound"
+                    );
+                    return Ok(());
+                }
 
                 // ── Step 4: Record the relay route event for the downstream
                 //    peer that served the stream (it behaved correctly).
