@@ -280,7 +280,7 @@ impl Ring {
             router,
             connection_manager,
             hosting_manager: hosting::HostingManager::new(config.config.max_hosting_storage),
-            broken_invariants: BrokenInvariantsTracker::new(),
+            broken_invariants: BrokenInvariantsTracker::new(time_source.clone()),
             governance,
             update_rate_limiter: Arc::new(update_rate_limit::UpdateRateLimiter::new(
                 time_source.clone(),
@@ -726,6 +726,11 @@ impl Ring {
             // entry slipped through the reaper (e.g. mode flipped off
             // mid-window), cleanup catches it on the next tick.
             ring.contract_ban_list.cleanup();
+
+            // Sweep expired broken-invariant flags on the same cadence so a
+            // suppressed contract (especially a false-positive) recovers
+            // after BROKEN_INVARIANT_TTL instead of being bricked forever.
+            ring.broken_invariants.cleanup();
 
             // Network-norms summary at DEBUG — useful when debugging
             // calibration but too noisy for INFO on a healthy node.
