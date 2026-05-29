@@ -18,7 +18,7 @@ use std::{
 use axum::response::{Html, IntoResponse};
 use dashmap::DashMap;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
+    client_api::{ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse},
     prelude::*,
 };
 use tokio::{fs::File, io::AsyncReadExt, sync::mpsc};
@@ -185,11 +185,15 @@ async fn handle_get_response(
     recv_result: Result<Option<HostCallbackResult>, tokio::time::error::Elapsed>,
 ) -> Result<(), WebSocketApiError> {
     match recv_result {
-        Err(_) => Err(WebSocketApiError::NodeError {
-            error_cause: "GET request timed out after 30s".into(),
+        Err(_) => Err(WebSocketApiError::AxumError {
+            error: ErrorKind::OperationError {
+                cause: "GET request timed out after 30s".into(),
+            },
         }),
-        Ok(None) => Err(WebSocketApiError::NodeError {
-            error_cause: "GET response channel closed (node may be shutting down)".into(),
+        Ok(None) => Err(WebSocketApiError::AxumError {
+            error: ErrorKind::OperationError {
+                cause: "GET response channel closed (node may be shutting down)".into(),
+            },
         }),
         Ok(Some(HostCallbackResult::Result {
             result:
@@ -1926,9 +1930,11 @@ mod tests {
     }
 
     /// Companion to the above: a `tokio::time::error::Elapsed` (30s fetch
-    /// timeout) surfaces as a `NodeError`, not a panic or hang.
+    /// timeout) surfaces as an `AxumError(OperationError)`, not a panic or
+    /// hang.  `WebSocketApiError::into_response` maps this to a 503 with
+    /// `<meta http-equiv="refresh">` — see #3472.
     #[tokio::test]
-    async fn handle_get_response_maps_timeout_to_node_error() {
+    async fn handle_get_response_maps_timeout_to_operation_error() {
         let mut bytes = [0u8; 32];
         bytes[0] = 0x3a;
         bytes[1] = 0x43;
@@ -1945,8 +1951,13 @@ mod tests {
 
         let result = handle_get_response(instance_id, recv_result).await;
         assert!(
-            matches!(result, Err(WebSocketApiError::NodeError { .. })),
-            "30s timeout must map to NodeError, got: {result:?}"
+            matches!(
+                result,
+                Err(WebSocketApiError::AxumError {
+                    error: ErrorKind::OperationError { .. }
+                })
+            ),
+            "30s timeout must map to OperationError (for retry page), got: {result:?}"
         );
     }
 

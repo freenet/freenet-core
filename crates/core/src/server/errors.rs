@@ -71,10 +71,25 @@ impl IntoResponse for WebSocketApiError {
         // GET hasn't completed yet (fresh node, sparse ring, etc.).  Show a
         // retry page that auto-refreshes the SAME URL so the user doesn't
         // have to manually reload (#3472).
+        //
+        // Note: `ErrorKind` is `#[non_exhaustive]` so new stdlib variants
+        // will NOT match here.  Each new release must explicitly decide
+        // whether the new variant is transient.  The wildcard `_` at the
+        // bottom of the `match` falls through to 500.
         let is_transient = matches!(
             &self,
             WebSocketApiError::AxumError {
-                error: ErrorKind::FailedOperation | ErrorKind::OperationError { .. }
+                error:
+                    // Timeout from handle_get_response (path_handlers.rs:188).
+                    ErrorKind::OperationError { .. }
+                    // Dead in current core (no raisers), but stdlib can emit
+                    // it; defensive include so a stdlib bump doesn't silently
+                    // lose retry behaviour.
+                    | ErrorKind::FailedOperation
+                    // Node-recovery races: channel teardown, cold-start.
+                    | ErrorKind::ChannelClosed
+                    | ErrorKind::TransportProtocolDisconnect
+                    | ErrorKind::NodeUnavailable
             }
         );
 
@@ -106,7 +121,22 @@ impl IntoResponse for WebSocketApiError {
 
         let body = Html(error_message);
 
-        (status, body).into_response()
+        // Prevent intermediaries/service-workers from pinning a stale retry
+        // page, and signal the client when it may retry.
+        let mut response = (status, body).into_response();
+        if is_transient {
+            response.headers_mut().insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from_str(&RETRY_REFRESH_SECS.to_string())
+                    .unwrap_or(axum::http::HeaderValue::from_static("60")),
+            );
+        }
+
+        response
     }
 }
 
@@ -216,6 +246,19 @@ mod tests {
         };
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .map(|v| v.as_bytes()),
+            Some(&b"no-store"[..]),
+        );
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_some(),
+        );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -236,6 +279,18 @@ mod tests {
         };
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::CACHE_CONTROL)
+                .is_some(),
+        );
+        assert!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .is_some(),
+        );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
