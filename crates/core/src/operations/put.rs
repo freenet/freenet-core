@@ -21,6 +21,78 @@ use crate::{
 };
 use either::Either;
 
+/// Upper bound on the `cause` carried by [`PutMsg::Error`] and
+/// [`PutTerminalError`]. Caps the DoS amplification surface when the
+/// envelope flows multi-hop (via [`relay_put_send_error`]).
+pub(crate) const PUT_TERMINAL_CAUSE_MAX_BYTES: usize = 2048;
+
+/// UTF-8-safe length cap with an ASCII truncation marker.
+///
+/// # Multi-hop idempotency invariant
+///
+/// `bound_cause` is called at every hop a `PutMsg::Error` traverses
+/// (loopback emit, `PutTerminalError::from_wire`, `relay_put_send_error`
+/// bubble). The bubble must forward causes **verbatim-or-rebound,
+/// never append**: any future relay that augments the cause (e.g.
+/// prepending a `[hop=N]` tag) would otherwise cause this function to
+/// re-truncate on each hop, stamping a fresh `...[truncated]` marker
+/// every time and silently injecting double/triple markers into the
+/// envelope the originator eventually classifies.
+///
+/// Today the call is idempotent on already-bounded short inputs (the
+/// `<= PUT_TERMINAL_CAUSE_MAX_BYTES` early return), so the invariant
+/// holds by construction. Don't break it without revisiting the
+/// truncation-marker contract.
+pub(crate) fn bound_cause(cause: String) -> String {
+    const SUFFIX: &str = "...[truncated]";
+    if cause.len() <= PUT_TERMINAL_CAUSE_MAX_BYTES {
+        return cause;
+    }
+    let budget = PUT_TERMINAL_CAUSE_MAX_BYTES.saturating_sub(SUFFIX.len());
+    // Walk back to a char boundary — `str` indexing must not split a codepoint.
+    let mut cut = budget.min(cause.len());
+    while cut > 0 && !cause.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = String::with_capacity(cut + SUFFIX.len());
+    out.push_str(&cause[..cut]);
+    out.push_str(SUFFIX);
+    out
+}
+
+/// In-process counterpart of the wire [`PutMsg::Error::cause`].
+/// The wire side stays as a raw `String` for bincode compat;
+/// `PutTerminalError` gives the retry-loop `Terminal` type a named
+/// shape and a single point to enforce length caps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PutTerminalError {
+    cause: String,
+}
+
+impl PutTerminalError {
+    /// Applies [`bound_cause`] so multi-hop forwarding can't amplify
+    /// attacker-controlled cause strings.
+    pub(crate) fn from_wire(cause: String) -> Self {
+        Self {
+            cause: bound_cause(cause),
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.cause
+    }
+
+    pub(crate) fn into_string(self) -> String {
+        self.cause
+    }
+}
+
+impl std::fmt::Display for PutTerminalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Telemetry data for originator-side PUT finalization.
 pub(super) struct PutFinalizationData {
     pub sender: PeerKeyLocation,
@@ -186,6 +258,7 @@ mod messages {
     /// merged state differs from the input, an Update operation is triggered to
     /// propagate the change to other subscribers.
     #[derive(Debug, Serialize, Deserialize, Clone)]
+    #[non_exhaustive]
     pub(crate) enum PutMsg {
         /// Request to store a contract. Forwarded hop-by-hop toward contract location.
         /// Each receiving node:
@@ -278,6 +351,32 @@ mod messages {
             id: Transaction,
             contract_key: ContractKey,
         },
+
+        /// Terminal failure delivered to the originator's driver via the
+        /// same `pending_op_results` bypass as `Response`. Carries the
+        /// contract-side or local-validation reason as a string so the
+        /// originator's `start_client_put` publishes a single
+        /// `HostResult::Err(OperationError { cause })` instead of
+        /// burning the retry budget on a deterministic failure and
+        /// racing the genuine reason against the synthesised
+        /// "failed notifying, channel closed" marker.
+        ///
+        /// Constructed by `run_relay_put` in the originator-loopback
+        /// failure path; bubbled up multi-hop chains by
+        /// `relay_put_send_error` (see [`op_ctx_task`]).
+        Error {
+            id: Transaction,
+            /// Human-readable failure reason surfaced to the client.
+            /// Kept as `String` (not `ClientError` / `OpError`) so the
+            /// wire variant stays dependency-free for `bincode` —
+            /// future serde changes in those types don't break wire
+            /// compatibility. Truncated to
+            /// [`PUT_TERMINAL_CAUSE_MAX_BYTES`] via [`bound_cause`] at
+            /// every entry point. Wrapped into
+            /// [`super::PutTerminalError`] for in-process
+            /// classification.
+            cause: String,
+        },
     }
 
     impl InnerMessage for PutMsg {
@@ -287,7 +386,8 @@ mod messages {
                 | Self::Response { id, .. }
                 | Self::RequestStreaming { id, .. }
                 | Self::ResponseStreaming { id, .. }
-                | Self::ForwardingAck { id, .. } => id,
+                | Self::ForwardingAck { id, .. }
+                | Self::Error { id, .. } => id,
             }
         }
 
@@ -300,6 +400,10 @@ mod messages {
                 }
                 Self::ResponseStreaming { key, .. } => Some(Location::from(key.id())),
                 Self::ForwardingAck { contract_key, .. } => Some(Location::from(contract_key.id())),
+                // No contract key in the failure envelope — the originator
+                // already knows the key it requested; the failure is keyed
+                // by tx only.
+                Self::Error { .. } => None,
             }
         }
     }
@@ -350,6 +454,9 @@ mod messages {
                 Self::ForwardingAck { id, contract_key } => {
                     write!(f, "PutForwardingAck(id: {}, key: {})", id, contract_key)
                 }
+                Self::Error { id, cause } => {
+                    write!(f, "PutError(id: {}, cause: {})", id, cause)
+                }
             }
         }
     }
@@ -386,6 +493,271 @@ mod tests {
             display.contains("PutResponse"),
             "Display should contain message type name"
         );
+    }
+
+    /// `PutMsg::Error` honours `id()` and `Display` like every other
+    /// variant.
+    #[test]
+    fn put_msg_error_id_and_display() {
+        let tx = Transaction::new::<PutMsg>();
+        let msg = PutMsg::Error {
+            id: tx,
+            cause: "contract rejected: version must be higher".into(),
+        };
+        assert_eq!(*msg.id(), tx, "id() should return the transaction ID");
+        let display = format!("{}", msg);
+        assert!(display.contains("PutError"), "Display tag");
+        assert!(display.contains("version must be higher"), "Display cause");
+    }
+
+    /// `PutMsg::Error` round-trips through bincode intact.
+    #[test]
+    fn put_msg_error_serde_roundtrip() {
+        let tx = Transaction::new::<PutMsg>();
+        let cause = "execution error: invalid contract update".to_string();
+        let msg = PutMsg::Error {
+            id: tx,
+            cause: cause.clone(),
+        };
+
+        let serialized = bincode::serialize(&msg).expect("serialize");
+        let deserialized: PutMsg = bincode::deserialize(&serialized).expect("deserialize");
+
+        match deserialized {
+            PutMsg::Error {
+                id,
+                cause: decoded_cause,
+            } => {
+                assert_eq!(id, tx);
+                assert_eq!(decoded_cause, cause);
+            }
+            other => panic!("Expected Error, got {other}"),
+        }
+    }
+
+    /// `Error` is keyed by tx only — `requested_location` must not
+    /// gain a phantom location.
+    #[test]
+    fn put_msg_error_has_no_requested_location() {
+        let tx = Transaction::new::<PutMsg>();
+        let msg = PutMsg::Error {
+            id: tx,
+            cause: "x".into(),
+        };
+        assert!(msg.requested_location().is_none());
+    }
+
+    /// Wire-format pin: bincode encodes `PutMsg` variants as a u32 LE
+    /// tag in declaration order. Reordering or inserting before an
+    /// existing variant is a silent wire-break against deployed peers.
+    /// `#[non_exhaustive]` only protects Rust match arms; tag
+    /// stability is enforced here.
+    ///
+    /// **Codec-config assumption.** This test uses default
+    /// `bincode::serialize`, which currently emits enum variant tags
+    /// as fixed-width `u32` little-endian. The test invariants
+    /// (variant tag == declaration index, encoded length ≥ 4 bytes)
+    /// depend on that. If the project ever switches bincode codec
+    /// config — e.g. to `with_varint_encoding()` (variable-length
+    /// tags, breaks length assumption) or `with_big_endian()`
+    /// (breaks LE assumption) or to bincode 2's `standard()` config
+    /// — this pin must be updated in lockstep, otherwise the wire
+    /// format silently changes against deployed peers without
+    /// tripping any test. The single source of truth for the codec
+    /// config is the deserialize site in the transport stack; keep
+    /// that and this test in sync.
+    #[test]
+    fn put_msg_wire_format_variant_tags_are_stable() {
+        let tx = Transaction::new::<PutMsg>();
+        let key = make_contract_key(0);
+        // One minimal instance per variant, in declaration order.
+        let samples: [(u32, PutMsg); 6] = [
+            (
+                0,
+                PutMsg::Request {
+                    id: tx,
+                    contract: crate::operations::test_utils::make_test_contract(&[]),
+                    related_contracts: RelatedContracts::default(),
+                    value: WrappedState::new(vec![]),
+                    htl: 0,
+                    skip_list: Default::default(),
+                },
+            ),
+            (
+                1,
+                PutMsg::Response {
+                    id: tx,
+                    key,
+                    hop_count: 0,
+                },
+            ),
+            (
+                2,
+                PutMsg::RequestStreaming {
+                    id: tx,
+                    stream_id: crate::transport::StreamId::next(),
+                    contract_key: key,
+                    total_size: 0,
+                    htl: 0,
+                    skip_list: Default::default(),
+                    subscribe: false,
+                },
+            ),
+            (
+                3,
+                PutMsg::ResponseStreaming {
+                    id: tx,
+                    key,
+                    continue_forwarding: false,
+                    hop_count: 0,
+                },
+            ),
+            (
+                4,
+                PutMsg::ForwardingAck {
+                    id: tx,
+                    contract_key: key,
+                },
+            ),
+            (
+                5,
+                PutMsg::Error {
+                    id: tx,
+                    cause: String::new(),
+                },
+            ),
+        ];
+        for (expected_tag, msg) in samples {
+            let bytes = bincode::serialize(&msg).expect("serialize");
+            assert!(
+                bytes.len() >= 4,
+                "encoded PutMsg too short to carry a tag: {msg}"
+            );
+            let actual_tag = u32::from_le_bytes(bytes[..4].try_into().expect("first 4 bytes"));
+            assert_eq!(
+                actual_tag, expected_tag,
+                "PutMsg wire tag for `{msg}` shifted — reordering variants is a wire-format \
+                 break. If you intentionally renumbered, bump the freenet-stdlib major and \
+                 coordinate the upgrade."
+            );
+        }
+    }
+
+    /// `bound_cause` keeps short strings byte-identical and truncates
+    /// long strings to `PUT_TERMINAL_CAUSE_MAX_BYTES` with a
+    /// `...[truncated]` suffix. Used as the DoS-amplification guard
+    /// when `PutMsg::Error` flows multi-hop.
+    #[test]
+    fn bound_cause_short_string_passes_through() {
+        let s = "execution error: contract rejected".to_string();
+        assert_eq!(bound_cause(s.clone()), s);
+    }
+
+    #[test]
+    fn bound_cause_truncates_oversize_at_char_boundary() {
+        let s = "a".repeat(PUT_TERMINAL_CAUSE_MAX_BYTES * 2);
+        let bounded = bound_cause(s);
+        assert!(bounded.len() <= PUT_TERMINAL_CAUSE_MAX_BYTES);
+        assert!(bounded.ends_with("...[truncated]"));
+    }
+
+    #[test]
+    fn bound_cause_never_splits_utf8_codepoint() {
+        // PR #4126 review item M2: the previous version of this test
+        // used `"好".repeat(_)` — 3-byte codepoints. The internal
+        // budget `PUT_TERMINAL_CAUSE_MAX_BYTES - "...[truncated]".len()`
+        // is currently `2048 - 14 = 2034`, and `2034 % 3 == 0`, so
+        // the cut landed exactly on a codepoint boundary and the
+        // `while !is_char_boundary(cut)` walk-back loop ran zero
+        // iterations. The "never splits" guarantee was therefore
+        // never actually exercised.
+        //
+        // Switch to a 4-byte codepoint (U+1D11E "𝄞", G clef) sized so
+        // the cap lands mid-codepoint, forcing the walk-back to
+        // execute. `2034 % 4 == 2` → byte 2034 is two bytes into a
+        // 4-byte codepoint, so `is_char_boundary(2034)` MUST be false
+        // and the loop MUST trim at least one byte.
+        const FOUR_BYTE: &str = "𝄞"; // U+1D11E, 4 bytes UTF-8
+        assert_eq!(FOUR_BYTE.len(), 4);
+
+        // 600 × 4 = 2400 bytes, well over the cap.
+        let n_codepoints = 600;
+        let s: String = FOUR_BYTE.repeat(n_codepoints);
+        assert_eq!(s.len(), 4 * n_codepoints);
+
+        // Sanity: the raw budget cut WOULD split a codepoint on this
+        // input. If this assertion ever stops holding (e.g. someone
+        // changes the cap or the suffix length so the budget realigns
+        // on 4), this test is back to being a no-op and needs to
+        // pick a different codepoint width.
+        let suffix_len = "...[truncated]".len();
+        let raw_budget = PUT_TERMINAL_CAUSE_MAX_BYTES.saturating_sub(suffix_len);
+        assert!(
+            !s.is_char_boundary(raw_budget),
+            "test invariant: raw budget {raw_budget} must land mid-codepoint \
+             for the walk-back loop to be exercised — pick a codepoint width \
+             coprime with the budget"
+        );
+
+        let bounded = bound_cause(s);
+        assert!(
+            bounded.is_char_boundary(bounded.len()),
+            "bounded output must end on a UTF-8 codepoint boundary"
+        );
+        // Strict-less-than is the proof that the walk-back actually
+        // ran: had it taken zero iterations the output length would
+        // equal exactly `PUT_TERMINAL_CAUSE_MAX_BYTES`. A trimmed
+        // walk-back leaves bounded.len() < cap.
+        assert!(
+            bounded.len() < PUT_TERMINAL_CAUSE_MAX_BYTES,
+            "walk-back must have trimmed at least one byte (cap={}, \
+             actual bounded.len()={})",
+            PUT_TERMINAL_CAUSE_MAX_BYTES,
+            bounded.len()
+        );
+        assert!(bounded.ends_with("...[truncated]"));
+        // Re-parsing must not panic.
+        let _ = bounded.chars().count();
+    }
+
+    /// PR #4126 review minor: pin the off-by-one boundary around the
+    /// cap. `bound_cause` MUST be byte-identical for input of length
+    /// `PUT_TERMINAL_CAUSE_MAX_BYTES` (the if-guard takes `<=`), and
+    /// MUST truncate (with suffix) starting at `+1`.
+    #[test]
+    fn bound_cause_cap_boundary_is_inclusive() {
+        // Exactly at the cap → no truncation.
+        let exact = "a".repeat(PUT_TERMINAL_CAUSE_MAX_BYTES);
+        let bounded = bound_cause(exact.clone());
+        assert_eq!(
+            bounded, exact,
+            "input of exactly PUT_TERMINAL_CAUSE_MAX_BYTES bytes must pass \
+             through verbatim — the cap is INCLUSIVE"
+        );
+
+        // One byte over → truncation with suffix.
+        let one_over = "a".repeat(PUT_TERMINAL_CAUSE_MAX_BYTES + 1);
+        let bounded = bound_cause(one_over);
+        assert!(
+            bounded.ends_with("...[truncated]"),
+            "input of PUT_TERMINAL_CAUSE_MAX_BYTES + 1 bytes MUST be \
+             truncated with the suffix marker"
+        );
+        assert!(
+            bounded.len() <= PUT_TERMINAL_CAUSE_MAX_BYTES,
+            "truncated output MUST fit within the cap"
+        );
+    }
+
+    /// `PutTerminalError::from_wire` applies `bound_cause`, so an
+    /// attacker-controlled upstream cannot inflate the per-hop cost
+    /// of `PutMsg::Error` by emitting multi-MB causes.
+    #[test]
+    fn put_terminal_error_from_wire_truncates() {
+        let oversize = "x".repeat(PUT_TERMINAL_CAUSE_MAX_BYTES * 3);
+        let err = PutTerminalError::from_wire(oversize);
+        assert!(err.as_str().len() <= PUT_TERMINAL_CAUSE_MAX_BYTES);
+        assert!(err.as_str().ends_with("...[truncated]"));
     }
 
     #[test]
