@@ -373,7 +373,9 @@ impl Runtime {
                 }
 
                 OutboundDelegateMsg::ContextUpdated(new_context) => {
-                    *context = new_context.as_ref().to_vec();
+                    // avoid alloc churn — buffer reuse instead of to_vec
+                    context.clear();
+                    context.extend_from_slice(new_context.as_ref());
                 }
                 OutboundDelegateMsg::GetContractRequest(req) if !req.processed => {
                     tracing::debug!(
@@ -391,7 +393,8 @@ impl Runtime {
                     ..
                 }) => {
                     tracing::debug!("GetContractRequest processed");
-                    *context = ctx.as_ref().to_vec();
+                    context.clear();
+                    context.extend_from_slice(ctx.as_ref());
                 }
                 OutboundDelegateMsg::PutContractRequest(req) if !req.processed => {
                     tracing::debug!(
@@ -409,7 +412,8 @@ impl Runtime {
                     ..
                 }) => {
                     tracing::debug!("PutContractRequest processed");
-                    *context = ctx.as_ref().to_vec();
+                    context.clear();
+                    context.extend_from_slice(ctx.as_ref());
                 }
                 OutboundDelegateMsg::UpdateContractRequest(req) if !req.processed => {
                     tracing::debug!(
@@ -427,7 +431,8 @@ impl Runtime {
                     ..
                 }) => {
                     tracing::debug!("UpdateContractRequest processed");
-                    *context = ctx.as_ref().to_vec();
+                    context.clear();
+                    context.extend_from_slice(ctx.as_ref());
                 }
                 OutboundDelegateMsg::SubscribeContractRequest(req) if !req.processed => {
                     tracing::debug!(
@@ -445,7 +450,8 @@ impl Runtime {
                     ..
                 }) => {
                     tracing::debug!("SubscribeContractRequest processed");
-                    *context = ctx.as_ref().to_vec();
+                    context.clear();
+                    context.extend_from_slice(ctx.as_ref());
                 }
                 OutboundDelegateMsg::SendDelegateMessage(mut msg) if !msg.processed => {
                     tracing::debug!(
@@ -479,7 +485,8 @@ impl Runtime {
                     context: ctx, ..
                 }) => {
                     tracing::debug!("SendDelegateMessage processed");
-                    *context = ctx.as_ref().to_vec();
+                    context.clear();
+                    context.extend_from_slice(ctx.as_ref());
                 }
             }
         }
@@ -547,6 +554,7 @@ impl DelegateRuntimeInterface for Runtime {
                         processed,
                         ..
                     }) => {
+                        // clone kept — delegates read message-level context
                         let app_msg = InboundDelegateMsg::ApplicationMessage(
                             ApplicationMessage::new(payload)
                                 .processed(processed)
@@ -558,7 +566,7 @@ impl DelegateRuntimeInterface for Runtime {
                             params,
                             origin,
                             &app_msg,
-                            context.clone(),
+                            std::mem::take(&mut context),
                             &running.handle,
                             instance_id,
                             api_version,
@@ -583,7 +591,7 @@ impl DelegateRuntimeInterface for Runtime {
                             params,
                             origin,
                             &InboundDelegateMsg::UserResponse(response),
-                            context.clone(),
+                            std::mem::take(&mut context),
                             &running.handle,
                             instance_id,
                             api_version,
@@ -608,7 +616,7 @@ impl DelegateRuntimeInterface for Runtime {
                             params,
                             origin,
                             &InboundDelegateMsg::GetContractResponse(response),
-                            context.clone(),
+                            std::mem::take(&mut context),
                             &running.handle,
                             instance_id,
                             api_version,
@@ -637,7 +645,7 @@ impl DelegateRuntimeInterface for Runtime {
                             params,
                             origin,
                             &msg,
-                            context.clone(),
+                            std::mem::take(&mut context),
                             &running.handle,
                             instance_id,
                             api_version,
@@ -667,7 +675,7 @@ impl DelegateRuntimeInterface for Runtime {
                             params,
                             origin,
                             &other,
-                            context.clone(),
+                            std::mem::take(&mut context),
                             &running.handle,
                             instance_id,
                             api_version,

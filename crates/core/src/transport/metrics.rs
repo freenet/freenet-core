@@ -230,7 +230,7 @@ impl TransportMetrics {
     }
 
     /// Record a cwnd sample (called periodically or on transfer completion).
-    fn record_cwnd_sample(&self, cwnd_bytes: u32) {
+    pub(crate) fn record_cwnd_sample(&self, cwnd_bytes: u32) {
         self.cwnd_sum
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_add(cwnd_bytes as u64))
@@ -402,6 +402,74 @@ impl TransportMetrics {
         self.per_peer_stats.remove(&addr);
     }
 
+    /// Read-only snapshot for the local dashboard. Does NOT reset counters
+    /// (unlike `take_snapshot` which is consumed by the telemetry worker).
+    ///
+    /// **Telemetry interaction**: `peak_throughput_bps`, `avg_cwnd_bytes`,
+    /// `avg_rtt_us`, and `slowdowns_triggered` are period accumulators that
+    /// `take_snapshot` resets every `transport_snapshot_interval_secs`
+    /// (default 30s).  Between resets these reflect recent activity; the
+    /// dashboard sees the current window, not a lifetime aggregate.
+    /// `cumulative_bytes_sent/received` are never reset and reflect totals.
+    pub fn read_snapshot(&self) -> TransportSnapshot {
+        let transfers_completed = self.transfers_completed.load(Ordering::Relaxed);
+        let transfers_failed = self.transfers_failed.load(Ordering::Relaxed);
+        let total_transfer_time_ms = self.total_transfer_time_ms.load(Ordering::Relaxed);
+        let peak_throughput_bps = self.peak_throughput_bps.load(Ordering::Relaxed);
+        let peak_cwnd_bytes = self.peak_cwnd_bytes.load(Ordering::Relaxed);
+        let min_cwnd_bytes = self.min_cwnd_bytes.load(Ordering::Relaxed);
+        let cwnd_sum = self.cwnd_sum.load(Ordering::Relaxed);
+        let cwnd_samples = self.cwnd_samples.load(Ordering::Relaxed);
+        let slowdowns_triggered = self.slowdowns_triggered.load(Ordering::Relaxed);
+        let min_rtt_us = self.min_rtt_us.load(Ordering::Relaxed);
+        let max_rtt_us = self.max_rtt_us.load(Ordering::Relaxed);
+        let rtt_sum_us = self.rtt_sum_us.load(Ordering::Relaxed);
+        let rtt_samples = self.rtt_samples.load(Ordering::Relaxed);
+
+        let avg_cwnd_bytes = if cwnd_samples > 0 {
+            (cwnd_sum / cwnd_samples as u64) as u32
+        } else {
+            0
+        };
+        let avg_transfer_time_ms = if transfers_completed > 0 {
+            total_transfer_time_ms / transfers_completed as u64
+        } else {
+            0
+        };
+        let avg_rtt_us = if rtt_samples > 0 {
+            rtt_sum_us / rtt_samples as u64
+        } else {
+            0
+        };
+
+        TransportSnapshot {
+            transfers_completed,
+            transfers_failed,
+            // Delta fields not applicable to non-resetting reads —
+            // `take_snapshot` computes these from period accumulators,
+            // but a read-only snapshot has no meaningful interval.
+            bytes_sent: 0,
+            bytes_received: 0,
+            avg_transfer_time_ms,
+            peak_throughput_bps,
+            avg_cwnd_bytes,
+            peak_cwnd_bytes,
+            min_cwnd_bytes: if min_cwnd_bytes == u32::MAX {
+                0
+            } else {
+                min_cwnd_bytes
+            },
+            slowdowns_triggered,
+            avg_rtt_us,
+            min_rtt_us: if min_rtt_us == u64::MAX {
+                0
+            } else {
+                min_rtt_us
+            },
+            max_rtt_us,
+        }
+    }
+
     /// Snapshot per-peer transfer stats: `(addr, bytes_sent, bytes_received)`.
     pub fn per_peer_snapshot(&self) -> Vec<(SocketAddr, u64, u64)> {
         self.per_peer_stats
@@ -511,7 +579,7 @@ impl TransportMetrics {
 /// - `min_cwnd_bytes`: 0 indicates no cwnd samples were recorded
 /// - `min_rtt_us`: 0 indicates no RTT samples were recorded
 /// - Other fields: 0 is a valid value indicating no activity for that metric
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub struct TransportSnapshot {
     /// Number of stream transfers completed successfully.
@@ -982,5 +1050,28 @@ mod tests {
         metrics.remove_peer(addr);
         metrics.remove_peer(addr); // second remove must be a no-op
         assert!(metrics.per_peer_snapshot().is_empty());
+    }
+
+    /// Sentinel values (`u32::MAX` / `u64::MAX`) must be mapped to 0 in the
+    /// read-snapshot — the dashboard displays them as "0ms" / "0 B", not
+    /// garbage. No samples are ever recorded, so the sentinels survive.
+    #[test]
+    fn read_snapshot_sentinels_map_to_zero() {
+        let metrics = TransportMetrics::new();
+        let snap = metrics.read_snapshot();
+        assert_eq!(snap.min_cwnd_bytes, 0, "no cwnd samples → min should be 0");
+        assert_eq!(snap.min_rtt_us, 0, "no RTT samples → min should be 0");
+    }
+
+    /// Happy-path: record known cwnd samples, verify read_snapshot
+    /// returns correct average.
+    #[test]
+    fn read_snapshot_happy_path() {
+        let metrics = TransportMetrics::new();
+        metrics.record_cwnd_sample(4000);
+        metrics.record_cwnd_sample(2000);
+        metrics.record_cwnd_sample(6000);
+        let snap = metrics.read_snapshot();
+        assert_eq!(snap.avg_cwnd_bytes, 4000);
     }
 }

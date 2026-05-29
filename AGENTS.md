@@ -2,6 +2,21 @@
 
 @~/.claude/freenet-local.md
 
+## Contribution Scope (read before opening a PR)
+
+[CONTRIBUTING.md](CONTRIBUTING.md) is the authoritative policy. In short:
+
+- **Bug fixes** and **non-overreaching performance improvements** (no behavior
+  change) — accepted without prior discussion.
+- **Feature changes, new features, behavior changes, API reshaping** — require
+  an issue approved by a maintainer *before* writing code. Feature PRs without
+  an approved issue are auto-closed.
+- **One logical change per PR.** Don't smuggle a feature into a bug fix or let a
+  focused change accrete unrelated cleanup — that's scope creep and grounds for
+  closing the PR.
+
+When unsure which bucket a change is in, open an issue first.
+
 ## Behavioral Rules
 
 ### BEFORE modifying any file

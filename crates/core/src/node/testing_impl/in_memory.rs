@@ -95,6 +95,13 @@ impl<ER> Builder<ER> {
             &task_monitor,
         )?);
         op_manager.ring.attach_op_manager(&op_manager);
+
+        // Publish the live Ring for governance sim tests to observe
+        // ban-list state. Mirrors the `shared_cm` capture above.
+        if let Some(out) = &self.shared_ring {
+            *out.lock() = Some(op_manager.ring.clone());
+        }
+
         std::mem::drop(_guard);
 
         let contract_handler = MemoryContractHandler::build(
@@ -217,6 +224,13 @@ impl<ER> Builder<ER> {
             &task_monitor,
         )?);
         op_manager.ring.attach_op_manager(&op_manager);
+
+        // Publish the live Ring for governance sim tests to observe
+        // ban-list state. Mirrors the `shared_cm` capture above.
+        if let Some(out) = &self.shared_ring {
+            *out.lock() = Some(op_manager.ring.clone());
+        }
+
         std::mem::drop(_guard);
 
         // Use SimulationContractHandler with shared in-memory storage
@@ -341,6 +355,13 @@ impl<ER> Builder<ER> {
             &task_monitor,
         )?);
         op_manager.ring.attach_op_manager(&op_manager);
+
+        // Publish the live Ring for governance sim tests to observe
+        // ban-list state. Mirrors the `shared_cm` capture above.
+        if let Some(out) = &self.shared_ring {
+            *out.lock() = Some(op_manager.ring.clone());
+        }
+
         std::mem::drop(_guard);
 
         // Use MockWasmContractHandler — exercises the production ContractExecutor code path

@@ -175,6 +175,18 @@ pub struct NodeConfig {
     /// Default: `Some(3)` in production.
     #[serde(default)]
     pub(crate) relay_ready_connections: Option<usize>,
+    /// Test-only override for the governance manager's configuration.
+    /// Lets simulation tests compress the production minute-to-hour
+    /// timescales and lower `min_samples` so the rate-limit → MAD →
+    /// evict → ban chain can be exercised within a paused-time sim.
+    /// `None` in production (and never serialized — `#[serde(skip)]`),
+    /// where `GovernanceConfig::default()` is used. See issue #4301.
+    ///
+    /// Not cfg-gated: `node::testing_impl` (which sets this) is compiled
+    /// unconditionally, so the field must exist in every build. The
+    /// `Option` is simply always `None` outside tests.
+    #[serde(skip)]
+    pub(crate) governance_config_override: Option<crate::contract::governance::GovernanceConfig>,
 }
 
 impl NodeConfig {
@@ -297,6 +309,7 @@ impl NodeConfig {
             } else {
                 Some(3) // Production: require 3 relay-ready upstream peers
             },
+            governance_config_override: None,
         })
     }
 
@@ -2148,6 +2161,15 @@ pub async fn run_local_node(
             socket.address
         )
     }
+
+    // Seed the dashboard so it renders immediately (not "Starting up…"
+    // forever). Local mode never joins the ring, so there are no peers,
+    // no contracts, and no transport stats.
+    crate::node::network_status::init(
+        socket.port,
+        std::collections::HashSet::new(),
+        crate::config::PCK_VERSION.to_string(),
+    );
 
     let (mut gw, mut ws_proxy) = crate::server::serve_client_api_in(socket).await?;
 

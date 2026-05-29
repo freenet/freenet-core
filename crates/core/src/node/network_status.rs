@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use crate::ring::{PeerKeyLocation, SubscribedContractSnapshot};
 use crate::router::Router;
-use crate::transport::metrics::TRANSPORT_METRICS;
+use crate::transport::metrics::{TRANSPORT_METRICS, TransportSnapshot};
 
 static NETWORK_STATUS: OnceLock<Arc<RwLock<NetworkStatus>>> = OnceLock::new();
 static ROUTER: OnceLock<Arc<parking_lot::RwLock<Router>>> = OnceLock::new();
@@ -35,6 +35,23 @@ pub type SubscriptionProvider =
 /// reporters.
 pub type GovernanceProvider = Arc<dyn Fn() -> GovernanceSnapshot + Send + Sync + 'static>;
 
+/// Provider for live ring-level stats (connection count, hosted contracts).
+/// Same provider pattern as `SubscriptionProvider`/`GovernanceProvider`.
+pub type RingStatsProvider = Arc<dyn Fn() -> RingStatsSnapshot + Send + Sync + 'static>;
+
+/// Snapshot of ring-level statistics exposed to the dashboard.
+#[derive(Debug, Clone, Default)]
+pub struct RingStatsSnapshot {
+    /// Number of active ring connections.
+    pub connection_count: u32,
+    /// Number of contracts this node is currently hosting.
+    pub hosted_contracts: u32,
+    /// Short base58 Peer ID (12-byte prefix) — how other nodes see this peer.
+    pub peer_id: String,
+    /// Base58-encoded full 32-byte X25519 public key.
+    pub own_pub_key: String,
+}
+
 static GOVERNANCE_PROVIDER: parking_lot::RwLock<Option<GovernanceProvider>> =
     parking_lot::RwLock::new(None);
 
@@ -42,6 +59,19 @@ static GOVERNANCE_PROVIDER: parking_lot::RwLock<Option<GovernanceProvider>> =
 /// previously-registered provider.
 pub fn set_governance_provider(provider: GovernanceProvider) {
     *GOVERNANCE_PROVIDER.write() = Some(provider);
+}
+
+static RING_STATS_PROVIDER: parking_lot::RwLock<Option<RingStatsProvider>> =
+    parking_lot::RwLock::new(None);
+
+/// Register the dashboard's ring-stats data source.
+pub fn set_ring_stats_provider(provider: RingStatsProvider) {
+    *RING_STATS_PROVIDER.write() = Some(provider);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_ring_stats_provider() {
+    *RING_STATS_PROVIDER.write() = None;
 }
 
 /// Clear the governance provider. Used by tests once they're added
@@ -445,6 +475,10 @@ pub struct NetworkStatusSnapshot {
     pub bytes_downloaded: u64,
     /// Overall node health level for the "everything looks good" indicator.
     pub health: HealthLevel,
+    /// Live ring-level statistics: connection count, hosted contracts.
+    pub ring_stats: RingStatsSnapshot,
+    /// Period transport metrics (current values, not reset on read).
+    pub transport_snapshot: TransportSnapshot,
     /// Per-contract governance state (Phase 4). The dashboard's
     /// verdict block, contracts table, ring inner-ring, and
     /// distribution histogram all read from this. Empty when the
@@ -794,6 +828,14 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
     let bytes_uploaded = TRANSPORT_METRICS.cumulative_bytes_sent();
     let bytes_downloaded = TRANSPORT_METRICS.cumulative_bytes_received();
 
+    let ring_stats = RING_STATS_PROVIDER
+        .read()
+        .as_ref()
+        .map(|provider| provider())
+        .unwrap_or_default();
+
+    let transport_snapshot = TRANSPORT_METRICS.read_snapshot();
+
     Some(NetworkStatusSnapshot {
         failures,
         connection_attempts: s.connection_attempts,
@@ -822,6 +864,8 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
         bytes_uploaded,
         bytes_downloaded,
         health,
+        ring_stats,
+        transport_snapshot,
         governance: GOVERNANCE_PROVIDER
             .read()
             .as_ref()
@@ -1298,5 +1342,62 @@ mod tests {
         }
         assert_eq!(nat.recent_attempts(), 20);
         assert_eq!(nat.recent_successes(), 0);
+    }
+
+    /// Regression: `init()` must seed the global so `get_snapshot()`
+    /// returns `Some(...)` immediately — without this, the dashboard
+    /// shows "Starting up…" forever in local mode (#3507 / PR #4297).
+    #[test]
+    fn init_populates_snapshot() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        init(31337, HashSet::new(), "0.1.0-test".to_string());
+        let snap = get_snapshot();
+        assert!(snap.is_some(), "snapshot should be Some after init");
+        let s = snap.unwrap();
+        assert_eq!(s.version, "0.1.0-test");
+        assert_eq!(s.listening_port, 31337);
+        assert_eq!(s.open_connections, 0);
+    }
+
+    /// Registered RingStatsProvider must surface in `snap.ring_stats`,
+    /// replacing the provider must take effect immediately, and the
+    /// no-provider default is all-zeros.
+    #[test]
+    fn ring_stats_provider_round_trip() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        // Use the same init as other tests in this module.
+        init(31337, HashSet::new(), "0.1.0-test".to_string());
+
+        // 1. No provider — default.
+        let snap = get_snapshot().unwrap();
+        assert_eq!(snap.ring_stats.connection_count, 0);
+        assert!(snap.ring_stats.own_pub_key.is_empty());
+
+        // 2. Register provider.
+        set_ring_stats_provider(Arc::new(|| RingStatsSnapshot {
+            connection_count: 42,
+            hosted_contracts: 7,
+            peer_id: "abc".to_string(),
+            own_pub_key: "test-key".to_string(),
+        }));
+        let snap = get_snapshot().unwrap();
+        assert_eq!(snap.ring_stats.connection_count, 42);
+        assert_eq!(snap.ring_stats.peer_id, "abc");
+        assert_eq!(snap.ring_stats.own_pub_key, "test-key");
+
+        // 3. Replace provider — must take effect immediately.
+        set_ring_stats_provider(Arc::new(|| RingStatsSnapshot {
+            connection_count: 99,
+            hosted_contracts: 1,
+            peer_id: "xyz".to_string(),
+            own_pub_key: "new-key".to_string(),
+        }));
+        let snap = get_snapshot().unwrap();
+        assert_eq!(snap.ring_stats.connection_count, 99);
+        assert_eq!(snap.ring_stats.peer_id, "xyz");
+        assert_eq!(snap.ring_stats.own_pub_key, "new-key");
+
+        // 4. Clean up.
+        clear_ring_stats_provider();
     }
 }

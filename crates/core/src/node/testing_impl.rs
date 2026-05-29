@@ -339,6 +339,17 @@ pub struct ControlledSimulationResult {
     /// These are clones of the Arc-backed storages passed into Turmoil,
     /// so they reflect all state stored during the simulation.
     pub node_storages: HashMap<NodeLabel, crate::wasm_runtime::MockStateStorage>,
+    /// Live `Arc<Ring>` for each node that started, keyed by NodeLabel.
+    /// Captured via the `shared_ring` slots so governance sim tests can
+    /// read `ring.contract_ban_list.is_banned(..)` after the simulation
+    /// (the `SimNetwork` itself is consumed by `run_controlled_simulation`).
+    /// Only present under `cfg(test)`/`testing`.
+    ///
+    /// `allow(dead_code)`: read only by the `cfg(test)` governance e2e
+    /// module, so non-test builds with the `testing` feature see it unused.
+    #[cfg(any(test, feature = "testing"))]
+    #[allow(dead_code)]
+    pub(crate) node_rings: HashMap<NodeLabel, Arc<crate::ring::Ring>>,
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, PartialOrd, Ord, Debug)]
@@ -707,6 +718,11 @@ pub(super) struct Builder<ER> {
     pub network_name: String,
     /// Shared handle for capturing the live `ConnectionManager` after node start.
     pub shared_cm: Option<Arc<parking_lot::Mutex<Option<crate::ring::ConnectionManager>>>>,
+    /// Shared handle for capturing the live `Arc<Ring>` after node start.
+    /// Used by governance sim tests to observe per-node ban-list state
+    /// (`ring.contract_ban_list.is_banned(..)`) without exposing the Ring
+    /// on the public `RunningNode` surface. Mirrors `shared_cm`.
+    pub shared_ring: Option<Arc<parking_lot::Mutex<Option<Arc<crate::ring::Ring>>>>>,
 }
 
 impl<ER: NetEventRegister> Builder<ER> {
@@ -727,6 +743,7 @@ impl<ER: NetEventRegister> Builder<ER> {
             rng_seed,
             network_name,
             shared_cm: None,
+            shared_ring: None,
         }
     }
 }
@@ -847,6 +864,26 @@ pub struct SimNetwork {
     pub use_mock_wasm: bool,
     /// Optional churn (crash/restart) configuration for the chaos driver.
     churn_config: Option<ChurnConfig>,
+    /// Optional governance-manager config override applied to every node
+    /// this network builds. Lets governance sim tests compress the
+    /// production minute-to-hour timescales and lower `min_samples` so the
+    /// rate-limit → MAD → evict → ban chain fires within a paused-time sim.
+    /// Pair with `use_mock_wasm = true` so the production cost-reporting
+    /// path actually feeds the detector. See #4301.
+    governance_config_override: Option<crate::contract::governance::GovernanceConfig>,
+    /// Per-node capture slots for the live `Arc<Ring>`, populated by
+    /// `run_controlled_simulation` so governance sim tests can read each
+    /// node's `contract_ban_list` after the simulation completes. Keyed by
+    /// label; the inner `Option` is filled once the node's run loop reaches
+    /// the `shared_ring` write in `run_node_with_{shared_storage,mock_wasm}`.
+    ///
+    /// `allow(dead_code)`: populated unconditionally in
+    /// `run_controlled_simulation`, but only *read* in the
+    /// `cfg(any(test, feature = "testing"))` `node_rings` extraction, so a
+    /// production build (where `testing_impl` is still compiled) sees it
+    /// as write-only.
+    #[allow(dead_code)]
+    shared_rings: HashMap<NodeLabel, Arc<parking_lot::Mutex<Option<Arc<crate::ring::Ring>>>>>,
 }
 
 impl SimNetwork {
@@ -906,6 +943,8 @@ impl SimNetwork {
             connection_managers: HashMap::new(),
             use_mock_wasm: false,
             churn_config: None,
+            governance_config_override: None,
+            shared_rings: HashMap::new(),
         };
         net.config_gateways(
             gateways
@@ -999,6 +1038,37 @@ impl SimNetwork {
     /// Enables the chaos driver which periodically crashes and restarts nodes.
     pub fn with_churn(&mut self, config: ChurnConfig) -> &mut Self {
         self.churn_config = Some(config);
+        self
+    }
+
+    /// Inject a governance-manager config override into every node this
+    /// network builds. Compresses the production minute-to-hour governance
+    /// timescales and lowers `min_samples` so the rate-limit → MAD → evict
+    /// → ban chain can be exercised within a paused-time sim. Pair with
+    /// `use_mock_wasm = true` so the production cost-reporting path feeds
+    /// the detector. Test-only; see #4301.
+    ///
+    /// `allow(dead_code)`: consumed only by the `cfg(test)` governance
+    /// e2e module, so the lib-only build sees it as unused.
+    #[allow(dead_code)]
+    pub(crate) fn with_governance_config(
+        &mut self,
+        config: crate::contract::governance::GovernanceConfig,
+    ) -> &mut Self {
+        self.governance_config_override = Some(config.clone());
+        // `config_gateways` / `config_nodes` already ran during
+        // `SimNetwork::new()`, when `governance_config_override` was still
+        // `None`, so the builders captured `None`. Patch the already-built
+        // node/gateway configs here so the override actually reaches each
+        // node's `Ring::new` → `GovernanceManager`. Without this, the
+        // builders keep the production default (e.g. `min_samples = 30`)
+        // and the override is silently a no-op.
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.governance_config_override = Some(config.clone());
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.governance_config_override = Some(config.clone());
+        }
         self
     }
 
@@ -1519,6 +1589,7 @@ impl SimNetwork {
             let mut config = NodeConfig::new(config_args.build().await.unwrap())
                 .await
                 .unwrap();
+            config.governance_config_override = self.governance_config_override.clone();
             config.key_pair = keypair;
             config.network_listener_ip = Ipv6Addr::LOCALHOST.into();
             config.network_listener_port = port;
@@ -1609,6 +1680,7 @@ impl SimNetwork {
             let mut config = NodeConfig::new(config_args.build().await.unwrap())
                 .await
                 .unwrap();
+            config.governance_config_override = self.governance_config_override.clone();
             for GatewayConfig {
                 peer_key_location,
                 location,
@@ -3472,10 +3544,17 @@ impl SimNetwork {
 
         // Register all gateways as Turmoil hosts
         let gateways: Vec<_> = self.gateways.drain(..).collect();
-        for (node, config) in gateways {
+        for (mut node, config) in gateways {
             let label = config.label.clone();
             let host_name = label.to_string();
             let receiver_ch = self.receiver_ch.clone();
+
+            // Capture slot for this node's live Ring (governance ban-list
+            // observation post-simulation). See `shared_rings`.
+            let ring_slot: Arc<parking_lot::Mutex<Option<Arc<crate::ring::Ring>>>> =
+                Arc::new(parking_lot::Mutex::new(None));
+            node.shared_ring = Some(ring_slot.clone());
+            self.shared_rings.insert(label.clone(), ring_slot);
 
             // Create shared in-memory storage for this node
             let shared_storage = crate::wasm_runtime::MockStateStorage::new();
@@ -3561,9 +3640,16 @@ impl SimNetwork {
 
         // Register all regular nodes as Turmoil hosts
         let nodes: Vec<_> = self.nodes.drain(..).collect();
-        for (node, label) in nodes {
+        for (mut node, label) in nodes {
             let host_name = label.to_string();
             let receiver_ch = self.receiver_ch.clone();
+
+            // Capture slot for this node's live Ring (governance ban-list
+            // observation post-simulation). See `shared_rings`.
+            let ring_slot: Arc<parking_lot::Mutex<Option<Arc<crate::ring::Ring>>>> =
+                Arc::new(parking_lot::Mutex::new(None));
+            node.shared_ring = Some(ring_slot.clone());
+            self.shared_rings.insert(label.clone(), ring_slot);
 
             // Create shared in-memory storage for this node
             let shared_storage = crate::wasm_runtime::MockStateStorage::new();
@@ -3737,10 +3823,18 @@ impl SimNetwork {
         // Capture topology snapshots BEFORE self is dropped (which clears them)
         let topology_snapshots = get_all_topology_snapshots(&network_name);
 
+        // Extract the live Rings captured during the run BEFORE self drops.
+        let node_rings: HashMap<NodeLabel, Arc<crate::ring::Ring>> = self
+            .shared_rings
+            .iter()
+            .filter_map(|(label, slot)| slot.lock().clone().map(|ring| (label.clone(), ring)))
+            .collect();
+
         ControlledSimulationResult {
             turmoil_result,
             topology_snapshots,
             node_storages,
+            node_rings,
         }
     }
 
