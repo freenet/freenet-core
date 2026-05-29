@@ -2406,18 +2406,22 @@ impl Ring {
         &self,
         tick_interval: Duration,
     ) -> crate::contract::governance::ReaperTickResult {
-        let benefits: std::collections::HashMap<ContractInstanceId, f64> = self
-            .governance
-            .iter_scores()
-            .into_iter()
-            .map(|(id, _score)| {
-                let local = self.hosting_manager.local_client_count(&id);
-                let downstream = self.hosting_manager.downstream_subscriber_count(&id);
-                let benefit = LOCAL_DEMAND_WEIGHT * local as f64
-                    + FORWARDED_DEMAND_WEIGHT * downstream as f64;
-                (id, benefit)
-            })
-            .collect();
+        // Single-pass live benefit snapshot: one iteration over
+        // `client_subscriptions` and one over `downstream_subscribers`
+        // (see `HostingManager::beneficiary_counts`), then filter to the
+        // contracts governance is tracking. This replaces the previous
+        // shape that deep-cloned every `ContractScore` (incl. its
+        // history Vec) via `iter_scores()` and then re-scanned the whole
+        // `downstream_subscribers` map per contract — O(N×M) per 60s
+        // tick. `tracked_ids()` returns keys only (no score clone).
+        let tracked = self.governance.tracked_ids();
+        let mut benefits = self
+            .hosting_manager
+            .beneficiary_counts(LOCAL_DEMAND_WEIGHT, FORWARDED_DEMAND_WEIGHT);
+        // Keep only tracked contracts (a contract with beneficiaries but
+        // no ingested cost has no score and must not enter the map —
+        // preserves the prior per-contract behavior).
+        benefits.retain(|id, _| tracked.contains(id));
         self.governance.tick(tick_interval, &benefits)
     }
 
