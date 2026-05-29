@@ -244,7 +244,7 @@ impl ContractScore {
             return None;
         }
         let benefit_eff = self.benefit_score.max(benefit_floor);
-        // `benefit_floor` is configured > 0 (default 0.1), so this is
+        // `benefit_floor` is configured > 0 (default 0.05), so this is
         // never a divide-by-zero. Guard defensively anyway in case a
         // test passes a degenerate floor.
         if benefit_eff <= 0.0 {
@@ -390,10 +390,20 @@ pub(crate) struct GovernanceConfig {
     ///    knee: a contract whose live benefit is below the floor is
     ///    scored as if it had exactly `benefit_floor` beneficiaries.
     ///
-    /// Default `0.1` = one tenth of a single downstream subscriber
-    /// (`FORWARDED_DEMAND_WEIGHT`), i.e. effectively "no beneficiaries"
-    /// — small enough that any real beneficiary dominates it, large
-    /// enough to keep the ratio finite.
+    /// Default `0.05`. It MUST stay strictly below the smallest real
+    /// beneficiary weight, which is a single downstream subscriber at
+    /// `FORWARDED_DEMAND_WEIGHT` = `0.1` (see `ring.rs`). If the floor
+    /// equalled `0.1`, a contract with exactly ONE live downstream
+    /// subscriber (benefit `0.1`) would be floored to the same
+    /// effective benefit as a contract with ZERO beneficiaries (also
+    /// floored to `0.1`) — they'd score an identical `log_ratio` at
+    /// equal cost, so the one-real-subscriber contract would be
+    /// indistinguishable from the abuser signature. At `0.05` the
+    /// zero-beneficiary contract is floored to `0.05` while the
+    /// one-subscriber contract keeps its real `0.1`, so the latter
+    /// always scores a strictly LOWER (safer) ratio. `0.05` is also
+    /// large enough to keep the division finite for the
+    /// zero-beneficiary case (the abuser signature we want flagged).
     pub benefit_floor: f64,
     /// Capacity ceiling for the MAD detector in log-space. If the
     /// threshold would exceed this, it's clamped. Sourced from
@@ -414,7 +424,7 @@ impl Default for GovernanceConfig {
             evicted_ttl: Duration::from_secs(15 * 60), // 15 minutes
             ban_ttl: Duration::from_secs(60 * 60),    // 1 hour
             borderline_mad_units: 3.0,
-            benefit_floor: 0.1,
+            benefit_floor: 0.05,
             capacity_ceiling_log: 4.0, // log10 ceiling = 10000× typical
         }
     }
@@ -567,6 +577,17 @@ impl GovernanceManager {
             .iter()
             .map(|e| (*e.key(), e.value().clone()))
             .collect()
+    }
+
+    /// The set of contract ids this manager is currently tracking
+    /// (i.e. has a score for, because cost has been ingested). Keys
+    /// only — does NOT clone the `ContractScore` (which carries a
+    /// per-contract transition-history `Vec`). Used by
+    /// `Ring::governance_tick` to filter the live benefit snapshot to
+    /// tracked contracts without paying the `iter_scores` deep-clone
+    /// cost on every 60s tick.
+    pub(crate) fn tracked_ids(&self) -> std::collections::HashSet<ContractInstanceId> {
+        self.scores.iter().map(|e| *e.key()).collect()
     }
 
     /// Iterate per-contract scores, returning ONLY flagged entries
@@ -986,7 +1007,7 @@ mod tests {
 
     /// Default benefit floor for unit tests of `log_ratio`. Matches
     /// `GovernanceConfig::default().benefit_floor`.
-    const TEST_BENEFIT_FLOOR: f64 = 0.1;
+    const TEST_BENEFIT_FLOOR: f64 = 0.05;
 
     #[test]
     fn log_ratio_none_when_cost_zero() {
@@ -1006,9 +1027,9 @@ mod tests {
         let mut s = ContractScore::new(instant_t(0));
         s.cost_used = 5.0;
         s.benefit_score = 0.0;
-        // 5.0 / floor(0.1) = 50 → log10(50) ≈ 1.699.
+        // 5.0 / floor(0.05) = 100 → log10(100) = 2.0.
         let r = s.log_ratio(TEST_BENEFIT_FLOOR).expect("must be Some");
-        assert!((r - 50.0_f64.log10()).abs() < 1e-9, "got {r}");
+        assert!((r - 100.0_f64.log10()).abs() < 1e-9, "got {r}");
         assert!(r > 1.0, "zero-benefit cost-positive ratio must be high");
     }
 
@@ -1032,12 +1053,48 @@ mod tests {
     fn log_ratio_floor_engages_only_below_floor() {
         let mut s = ContractScore::new(instant_t(0));
         s.cost_used = 1.0;
-        // Benefit 0.05 < floor 0.1 → uses 0.1 → log10(10) = 1.
-        s.benefit_score = 0.05;
-        assert!((s.log_ratio(TEST_BENEFIT_FLOOR).unwrap() - 1.0).abs() < 1e-9);
+        // Benefit 0.01 < floor 0.05 → uses 0.05 → log10(20) ≈ 1.301.
+        s.benefit_score = 0.01;
+        assert!((s.log_ratio(TEST_BENEFIT_FLOOR).unwrap() - 20.0_f64.log10()).abs() < 1e-9);
         // Benefit 1.0 > floor → uses 1.0 → log10(1) = 0.
         s.benefit_score = 1.0;
         assert!(s.log_ratio(TEST_BENEFIT_FLOOR).unwrap().abs() < 1e-9);
+    }
+
+    /// Calibration guard: with the default floor (0.05, strictly below
+    /// `FORWARDED_DEMAND_WEIGHT` = 0.1), a contract with exactly ONE live
+    /// downstream subscriber (benefit 0.1) MUST score a strictly LOWER
+    /// (safer) log_ratio than a zero-beneficiary contract at equal cost.
+    /// If the floor were raised to 0.1, both would floor to the same
+    /// effective benefit and the one-real-subscriber contract would be
+    /// indistinguishable from the abuser signature.
+    #[test]
+    fn one_downstream_scores_strictly_below_zero_beneficiaries() {
+        let floor = GovernanceConfig::default().benefit_floor;
+        assert!(
+            floor < 0.1,
+            "default benefit_floor must stay below FORWARDED_DEMAND_WEIGHT (0.1)"
+        );
+
+        let cost = 5.0;
+
+        // One downstream subscriber: benefit = FORWARDED_DEMAND_WEIGHT.
+        let mut one_sub = ContractScore::new(instant_t(0));
+        one_sub.cost_used = cost;
+        one_sub.benefit_score = 0.1;
+        let one_sub_ratio = one_sub.log_ratio(floor).expect("must be Some");
+
+        // Zero beneficiaries: benefit floored.
+        let mut zero = ContractScore::new(instant_t(0));
+        zero.cost_used = cost;
+        zero.benefit_score = 0.0;
+        let zero_ratio = zero.log_ratio(floor).expect("must be Some");
+
+        assert!(
+            one_sub_ratio < zero_ratio,
+            "one downstream subscriber (ratio {one_sub_ratio}) must score strictly \
+             lower than zero beneficiaries (ratio {zero_ratio})"
+        );
     }
 
     #[test]
@@ -2002,6 +2059,100 @@ mod tests {
             "borderline contract state must persist through MAD-collapse tick"
         );
     }
+
+    /// Transient all-beneficiaries-zero recovery path. A normally-popular
+    /// contract (cost + benefit) whose live benefit snapshot momentarily
+    /// reads 0 for a SINGLE tick must reach at most a flagged-but-not-
+    /// terminal state (Borderline / WouldEvict in DryRun) — it must NOT
+    /// be Banned, because a ban structurally requires an Evicted→recover
+    /// →re-Evicted sequence that a single zero-benefit tick cannot
+    /// produce. When the benefit returns on the next tick, the contract
+    /// recovers to Normal. This pins that one bad snapshot can't
+    /// immediately ban a popular contract.
+    #[test]
+    fn transient_zero_benefit_flags_but_cannot_ban_and_recovers() {
+        // DryRun so the worst single-tick outcome is WouldEvict, never
+        // Evicted — which also makes Banned structurally unreachable.
+        let (mgr, ts) = mk_mgr_shared(GovernanceMode::DryRun);
+
+        // Honest population with real cost + benefit.
+        for i in 0..30 {
+            let jitter = (i as f64 - 15.0) * 0.01;
+            mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
+        }
+        // The popular contract: cost comparable to the honest cluster, so
+        // when its benefit is present it sits at the honest ratio
+        // (Normal). The ONLY thing that flags it is the transient
+        // zero-benefit snapshot.
+        let popular = mk_key(99);
+        mgr.ingest_cost(popular, 0.1);
+        ts.advance(Duration::from_secs(2));
+
+        // Tick 1: benefit snapshot for `popular` momentarily reads 0
+        // (e.g. its subscriber leases all happened to look stale this
+        // single tick). With cost 0.1 and benefit floored to 0.05, its
+        // log-ratio (log10(2.0) ≈ +0.3) is a high outlier vs the honest
+        // cluster (~ −1.0) → it flags this tick.
+        let r1 = mgr.tick(
+            Duration::from_millis(100),
+            &jittered_honest_benefits(popular, 0.0),
+        );
+        let d1 = r1
+            .decisions
+            .iter()
+            .find(|d| d.key == popular)
+            .expect("popular contract must flag on the zero-benefit tick");
+        // Single tick can flag (Borderline or WouldEvict) but MUST NOT
+        // ban.
+        assert!(
+            matches!(
+                d1.to,
+                GovernanceState::Borderline | GovernanceState::WouldEvict
+            ),
+            "single zero-benefit tick must reach Borderline/WouldEvict, got {:?}",
+            d1.to
+        );
+        assert_ne!(
+            d1.to,
+            GovernanceState::Banned,
+            "a single zero-benefit tick must NOT ban a popular contract"
+        );
+        // No Banned transition anywhere in the tick.
+        assert!(
+            !r1.decisions
+                .iter()
+                .any(|d| d.key == popular && d.to == GovernanceState::Banned),
+        );
+
+        // Tick 2: benefit returns (well-supported again). Re-establish the
+        // honest distribution and give `popular` its normal benefit (1.0,
+        // matching the honest cluster) so its ratio drops back to the
+        // honest level (~ −1.0), below the borderline cutoff → Recovered.
+        for i in 0..30 {
+            let jitter = (i as f64 - 15.0) * 0.01;
+            mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
+        }
+        ts.advance(Duration::from_secs(60));
+        let r2 = mgr.tick(
+            Duration::from_millis(100),
+            &jittered_honest_benefits(popular, 1.0),
+        );
+        let recovered = r2
+            .decisions
+            .iter()
+            .find(|d| d.key == popular)
+            .expect("popular contract must transition when benefit returns");
+        assert_eq!(
+            recovered.to,
+            GovernanceState::Normal,
+            "popular contract must recover to Normal once benefit returns"
+        );
+        assert!(matches!(recovered.reason, TransitionReason::Recovered));
+        assert_eq!(
+            mgr.score_snapshot(&popular).unwrap().state,
+            GovernanceState::Normal
+        );
+    }
 }
 
 /// End-to-end simulation-network test for the contract-governance ban
@@ -2053,9 +2204,13 @@ mod sim_e2e_tests {
     ///     All cost is ingested early (during the UPDATE phase) and the
     ///     first reaper tick is ≥30s later, so 1s comfortably clears it.
     ///   - `decay_half_life = 1h`: long relative to the run so the abuser's
-    ///     cost/benefit RATIO is preserved across ticks (decay is symmetric
-    ///     on cost and benefit) — the abuser stays flagged through the
-    ///     recover→re-evict cycle without needing a continuous flood.
+    ///     accumulated COST is preserved across ticks. Under the snapshot
+    ///     model only cost decays (slowly, on this half-life); benefit is
+    ///     NOT decayed — it is re-read live from the hosting manager each
+    ///     tick. A long half-life keeps the abuser's cost high (and its
+    ///     live benefit stays 0) so its cost/benefit ratio remains
+    ///     flaggable through the recover→re-evict cycle without needing a
+    ///     continuous cost flood.
     ///   - `evicted_ttl = 90s` (1.5 ticks): short enough that the abuser
     ///     recovers to Normal between the two evictions, and strictly less
     ///     than `ban_window`.
