@@ -716,8 +716,8 @@ fn build_ring_svg(
     // Show the inner ring when there are *any* contracts to display
     // (governance-flagged OR hosted).  Without this the hosted dots
     // render orphaned on an invisible ring.
-    let has_inner_ring = governance.is_some_and(|g| !g.contracts.is_empty())
-        || !hosted_contracts.is_empty();
+    let has_inner_ring =
+        governance.is_some_and(|g| !g.contracts.is_empty()) || !hosted_contracts.is_empty();
 
     // === Background rings ===
     write!(
