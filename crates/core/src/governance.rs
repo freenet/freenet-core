@@ -206,6 +206,15 @@ where
     // return Some; the unwrap_or is purely defensive.
     pairs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
+    // Only the TOP tail is trimmed (the abusers we're detecting live
+    // there and would otherwise inflate the median/MAD they're measured
+    // against). The bottom tail is left intact intentionally: a very
+    // LOW cost/benefit ratio cannot drag the median into flagging a
+    // legitimate contract, and in practice the bottom tail is
+    // unreachable anyway — a real state write costs orders of magnitude
+    // more than EPSILON, so the sub-unit cost ratios that would pull the
+    // median down don't occur. Trimming the bottom would only discard
+    // honest, cheap contracts for no robustness benefit.
     let trim_count = (sample_size as f64 * config.trim_fraction).floor() as usize;
     let trimmed_len = sample_size.saturating_sub(trim_count);
     let trimmed_ratios: Vec<f64> = pairs.iter().take(trimmed_len).map(|(_, r)| *r).collect();
