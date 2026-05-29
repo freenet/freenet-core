@@ -147,18 +147,37 @@ pub(crate) const MAX_TRANSITIONS_PER_CONTRACT: usize = 32;
 /// reads from this; the reaper compares `cost_used / benefit_score`
 /// against the network's MAD-derived threshold to drive transitions.
 ///
-/// Both `cost_used` and `benefit_score` decay over a rolling window
-/// (handled by [`ContractScore::decay`] called from the reaper tick).
-/// Without decay, a once-flagged contract would stay flagged forever
-/// even if its activity calmed down.
+/// `cost_used` decays over a rolling window (handled by
+/// [`ContractScore::decay`] called from the reaper tick) so a contract
+/// that goes quiet sheds its accumulated cost. `benefit_score`, by
+/// contrast, is NOT decayed and NOT accumulated: it is a LIVE SNAPSHOT
+/// of the current beneficiary population, overwritten fresh every tick
+/// from the hosting manager's standing subscription counts. See the
+/// `benefit_score` field doc and [`ContractScore::log_ratio`] for the
+/// rationale (a mature popular contract whose subscribers all joined
+/// long ago must keep a high benefit, not decay to zero).
 #[derive(Clone, Debug)]
 pub(crate) struct ContractScore {
     /// Sum of weighted resource samples attributed to this contract.
     /// Sourced from `Meter` entries keyed on
     /// `AttributionSource::Contract(_)`.
     pub cost_used: f64,
-    /// Sum of weighted demand events. Local subscriptions weigh more
-    /// than forwarded (Sybil resistance — see design doc).
+    /// LIVE SNAPSHOT of the current weighted beneficiary count.
+    ///
+    /// Set fresh each reaper tick from the hosting manager's standing
+    /// counts: `LOCAL_DEMAND_WEIGHT × active local clients +
+    /// FORWARDED_DEMAND_WEIGHT × active downstream subscribers`. It is
+    /// NOT accumulated across events and NOT decayed — it always
+    /// reflects "how many beneficiaries does this contract have RIGHT
+    /// NOW". The ratio `cost_used / benefit_score` is therefore
+    /// cost-per-current-beneficiary.
+    ///
+    /// Why a snapshot and not a decaying accumulator: the old model
+    /// fired on each NEW subscribe event and decayed with cost. A
+    /// mature popular contract's subscribers all joined long ago, so
+    /// its benefit decayed to ~0 while cost flowed continuously — a
+    /// false-positive eviction of the most popular contract on the
+    /// network. The live snapshot has no such ramp-down.
     pub benefit_score: f64,
     /// Current state.
     pub state: GovernanceState,
@@ -199,15 +218,39 @@ impl ContractScore {
         }
     }
 
-    /// Compute the log10(cost/benefit) ratio used by the MAD detector.
-    /// Returns `None` if benefit_score is too small to produce a
-    /// stable ratio (avoids division-by-near-zero pulling the
-    /// distribution toward infinity for new contracts).
-    pub(crate) fn log_ratio(&self) -> Option<f64> {
-        if self.benefit_score <= f64::EPSILON {
+    /// Compute the log10(cost / live-benefit) ratio used by the MAD
+    /// detector, where benefit is the current beneficiary snapshot
+    /// (NOT a decaying accumulator).
+    ///
+    /// Semantics:
+    ///
+    /// * If `cost_used <= f64::EPSILON` → `None`. No cost means no
+    ///   activity to judge; the contract isn't consuming resources, so
+    ///   there is nothing for governance to flag regardless of how many
+    ///   (or few) beneficiaries it has.
+    /// * Otherwise the effective benefit is
+    ///   `self.benefit_score.max(benefit_floor)` and the ratio is
+    ///   `(cost_used / benefit_eff).log10()`.
+    ///
+    /// The floor matters: a past-ramp-up contract with `cost > 0` and
+    /// ZERO live beneficiaries is the abuser signature — it burns
+    /// resources while nobody benefits. The floor keeps the division
+    /// finite and yields a HIGH (flaggable) ratio for that case. This
+    /// is deliberate: unlike the old model, zero benefit does NOT
+    /// return `None` here. Returning `None` would hide the very
+    /// contracts governance exists to catch.
+    pub(crate) fn log_ratio(&self, benefit_floor: f64) -> Option<f64> {
+        if self.cost_used <= f64::EPSILON {
             return None;
         }
-        let ratio = self.cost_used / self.benefit_score;
+        let benefit_eff = self.benefit_score.max(benefit_floor);
+        // `benefit_floor` is configured > 0 (default 0.1), so this is
+        // never a divide-by-zero. Guard defensively anyway in case a
+        // test passes a degenerate floor.
+        if benefit_eff <= 0.0 {
+            return None;
+        }
+        let ratio = self.cost_used / benefit_eff;
         if ratio <= 0.0 {
             return None;
         }
@@ -252,22 +295,25 @@ impl ContractScore {
         self.history.push(transition);
     }
 
-    /// Apply exponential decay to cost and benefit. Called once per
-    /// reaper tick. `half_life` is the duration over which a sample
-    /// loses half its weight; with `tick_interval` smaller than
+    /// Apply exponential decay to `cost_used` ONLY. Called once per
+    /// reaper tick. `half_life` is the duration over which a cost
+    /// sample loses half its weight; with `tick_interval` smaller than
     /// `half_life` the decay per tick is gentle.
     ///
-    /// Cost decays the same way benefit does, so a contract that goes
-    /// quiet has its ratio held constant by symmetric decay — the
-    /// state stays where the algorithm last placed it until new
-    /// samples arrive.
+    /// `benefit_score` is deliberately NOT decayed here. It is a live
+    /// snapshot of the current beneficiary population, overwritten
+    /// fresh each tick by the reaper before the ratio is computed (see
+    /// [`GovernanceManager::tick`]). Decaying it would re-introduce the
+    /// false-positive this redesign removes: a popular contract whose
+    /// subscribers all joined long ago would have its benefit decay to
+    /// zero while cost flows continuously, flagging the most-used
+    /// contract on the network for eviction.
     pub(crate) fn decay(&mut self, tick_interval: Duration, half_life: Duration) {
         if tick_interval.is_zero() || half_life.is_zero() {
             return;
         }
         let factor = 0.5f64.powf(tick_interval.as_secs_f64() / half_life.as_secs_f64());
         self.cost_used *= factor;
-        self.benefit_score *= factor;
     }
 }
 
@@ -334,6 +380,21 @@ pub(crate) struct GovernanceConfig {
     /// median. Below the eviction threshold but above this enters
     /// Borderline.
     pub borderline_mad_units: f64,
+    /// Floor applied to the live benefit snapshot when computing
+    /// `log_ratio` (see [`ContractScore::log_ratio`]). Two roles:
+    ///
+    /// 1. Avoids divide-by-zero for a contract with cost but ZERO live
+    ///    beneficiaries (the abuser signature) so it produces a high,
+    ///    flaggable ratio instead of `None`.
+    /// 2. Sets the "cost is harmless below this benefit-equivalent"
+    ///    knee: a contract whose live benefit is below the floor is
+    ///    scored as if it had exactly `benefit_floor` beneficiaries.
+    ///
+    /// Default `0.1` = one tenth of a single downstream subscriber
+    /// (`FORWARDED_DEMAND_WEIGHT`), i.e. effectively "no beneficiaries"
+    /// — small enough that any real beneficiary dominates it, large
+    /// enough to keep the ratio finite.
+    pub benefit_floor: f64,
     /// Capacity ceiling for the MAD detector in log-space. If the
     /// threshold would exceed this, it's clamped. Sourced from
     /// hardware capacity; placeholder value here.
@@ -353,6 +414,7 @@ impl Default for GovernanceConfig {
             evicted_ttl: Duration::from_secs(15 * 60), // 15 minutes
             ban_ttl: Duration::from_secs(60 * 60),    // 1 hour
             borderline_mad_units: 3.0,
+            benefit_floor: 0.1,
             capacity_ceiling_log: 4.0, // log10 ceiling = 10000× typical
         }
     }
@@ -470,6 +532,15 @@ impl GovernanceManager {
         self.config.outlier.min_samples
     }
 
+    /// Benefit floor used when computing `log_ratio` (see
+    /// [`ContractScore::log_ratio`] and [`GovernanceConfig::benefit_floor`]).
+    /// Exposed so the dashboard snapshot builder can compute each
+    /// contract's displayed `log_ratio` with the same floor the reaper
+    /// tick uses.
+    pub(crate) fn benefit_floor(&self) -> f64 {
+        self.config.benefit_floor
+    }
+
     /// How long a `Banned` state persists before `BanLifted` fires.
     /// Surfaced for the Phase 7 ban-list wiring: when the reaper
     /// emits a `BanTriggered` decision, the receive-boundary ban
@@ -528,23 +599,6 @@ impl GovernanceManager {
         entry.cost_used += amount;
     }
 
-    /// Add a demand event to a contract's `benefit_score`. Called
-    /// from the HostingManager wiring (subsequent commit) on every
-    /// observed local/forwarded GET / SUBSCRIBE / client-attach.
-    /// Weight comes from the caller (local vs forwarded weighting
-    /// applied at the call site).
-    pub(crate) fn ingest_demand(&self, key: ContractInstanceId, weight: f64) {
-        if !weight.is_finite() || weight <= 0.0 {
-            return;
-        }
-        let now = self.time_source.now();
-        let mut entry = self
-            .scores
-            .entry(key)
-            .or_insert_with(|| ContractScore::new(now));
-        entry.benefit_score += weight;
-    }
-
     /// Look up the current score for a contract, for dashboard reads.
     /// Returns a cloned snapshot; the dashboard doesn't need (and
     /// shouldn't have) write access.
@@ -557,16 +611,30 @@ impl GovernanceManager {
         self.scores.len()
     }
 
-    /// Run one reaper tick. Applies decay, runs the MAD detector
-    /// across all contracts past the ramp-up window, drives state
-    /// transitions, and returns the result for the caller to act on.
+    /// Run one reaper tick. Snapshots the live benefit for every
+    /// tracked contract, decays cost, runs the MAD detector across all
+    /// contracts past the ramp-up window, drives state transitions, and
+    /// returns the result for the caller to act on.
     ///
     /// `tick_interval` is the time since the previous tick; used for
-    /// decay. If this is the first tick, pass any reasonable value
+    /// cost decay. If this is the first tick, pass any reasonable value
     /// (e.g. the same value `decay_half_life` is configured with);
     /// decay applied once at startup is a no-op anyway because all
-    /// scores are zero.
-    pub(crate) fn tick(&self, tick_interval: Duration) -> ReaperTickResult {
+    /// costs are zero.
+    ///
+    /// `benefits` maps each contract to its weighted LIVE beneficiary
+    /// count for THIS tick (`LOCAL_DEMAND_WEIGHT × active local clients
+    /// + FORWARDED_DEMAND_WEIGHT × active downstream subscribers`,
+    /// computed by the caller from the hosting manager). Each tracked
+    /// score's `benefit_score` is overwritten with this snapshot
+    /// (defaulting to `0.0` for any contract absent from the map, which
+    /// means "no current beneficiaries"). Benefit is NOT accumulated
+    /// and NOT decayed — see [`ContractScore::benefit_score`].
+    pub(crate) fn tick(
+        &self,
+        tick_interval: Duration,
+        benefits: &HashMap<ContractInstanceId, f64>,
+    ) -> ReaperTickResult {
         if matches!(self.config.mode, GovernanceMode::Off) {
             return ReaperTickResult {
                 decisions: Vec::new(),
@@ -598,6 +666,12 @@ impl GovernanceManager {
         let mut ban_lifted: Vec<ContractInstanceId> = Vec::new();
         let mut evicted_lifted: Vec<ContractInstanceId> = Vec::new();
         for mut entry in self.scores.iter_mut() {
+            // Live benefit snapshot: overwrite (not accumulate) with the
+            // caller's current beneficiary count for this contract.
+            // Absent ⇒ no current beneficiaries ⇒ 0.0.
+            let key = *entry.key();
+            entry.benefit_score = benefits.get(&key).copied().unwrap_or(0.0);
+            // Decay cost only — benefit is a fresh snapshot, never decayed.
             entry.decay(tick_interval, self.config.decay_half_life);
             match entry.state {
                 GovernanceState::Banned => {
@@ -655,7 +729,9 @@ impl GovernanceManager {
                 ) {
                     return None;
                 }
-                entry.log_ratio().map(|r| (*entry.key(), r))
+                entry
+                    .log_ratio(self.config.benefit_floor)
+                    .map(|r| (*entry.key(), r))
             })
             .collect();
 
@@ -908,23 +984,32 @@ mod tests {
         assert_eq!(s.last_transition, now);
     }
 
-    #[test]
-    fn log_ratio_none_when_no_benefit() {
-        let mut s = ContractScore::new(instant_t(0));
-        // No benefit yet → undefined ratio.
-        assert_eq!(s.log_ratio(), None);
-        s.cost_used = 5.0;
-        // Cost without benefit is still undefined — a brand-new
-        // contract has no demand baseline yet.
-        assert_eq!(s.log_ratio(), None);
-    }
+    /// Default benefit floor for unit tests of `log_ratio`. Matches
+    /// `GovernanceConfig::default().benefit_floor`.
+    const TEST_BENEFIT_FLOOR: f64 = 0.1;
 
     #[test]
     fn log_ratio_none_when_cost_zero() {
         let mut s = ContractScore::new(instant_t(0));
+        // No cost → nothing to judge regardless of benefit. None.
+        assert_eq!(s.log_ratio(TEST_BENEFIT_FLOOR), None);
         s.benefit_score = 10.0;
-        // No cost → ratio is 0, log(0) is undefined.
-        assert_eq!(s.log_ratio(), None);
+        assert_eq!(s.log_ratio(TEST_BENEFIT_FLOOR), None);
+    }
+
+    /// New abuser-signature semantics: cost > 0 with ZERO live benefit
+    /// is NOT None — it floors benefit and yields a HIGH ratio. This is
+    /// the inversion of the old model (which returned None for zero
+    /// benefit and let abusers escape).
+    #[test]
+    fn log_ratio_high_when_cost_but_zero_benefit() {
+        let mut s = ContractScore::new(instant_t(0));
+        s.cost_used = 5.0;
+        s.benefit_score = 0.0;
+        // 5.0 / floor(0.1) = 50 → log10(50) ≈ 1.699.
+        let r = s.log_ratio(TEST_BENEFIT_FLOOR).expect("must be Some");
+        assert!((r - 50.0_f64.log10()).abs() < 1e-9, "got {r}");
+        assert!(r > 1.0, "zero-benefit cost-positive ratio must be high");
     }
 
     #[test]
@@ -932,13 +1017,27 @@ mod tests {
         let mut s = ContractScore::new(instant_t(0));
         s.cost_used = 10.0;
         s.benefit_score = 1.0;
-        // log10(10) = 1
-        assert!((s.log_ratio().unwrap() - 1.0).abs() < 1e-9);
+        // log10(10) = 1 (benefit above floor, floor not engaged).
+        assert!((s.log_ratio(TEST_BENEFIT_FLOOR).unwrap() - 1.0).abs() < 1e-9);
 
         s.cost_used = 0.1;
         s.benefit_score = 10.0;
         // log10(0.01) = -2
-        assert!((s.log_ratio().unwrap() - (-2.0)).abs() < 1e-9);
+        assert!((s.log_ratio(TEST_BENEFIT_FLOOR).unwrap() - (-2.0)).abs() < 1e-9);
+    }
+
+    /// The floor only engages when live benefit is below it. A benefit
+    /// above the floor is used as-is.
+    #[test]
+    fn log_ratio_floor_engages_only_below_floor() {
+        let mut s = ContractScore::new(instant_t(0));
+        s.cost_used = 1.0;
+        // Benefit 0.05 < floor 0.1 → uses 0.1 → log10(10) = 1.
+        s.benefit_score = 0.05;
+        assert!((s.log_ratio(TEST_BENEFIT_FLOOR).unwrap() - 1.0).abs() < 1e-9);
+        // Benefit 1.0 > floor → uses 1.0 → log10(1) = 0.
+        s.benefit_score = 1.0;
+        assert!(s.log_ratio(TEST_BENEFIT_FLOOR).unwrap().abs() < 1e-9);
     }
 
     #[test]
@@ -1002,19 +1101,20 @@ mod tests {
         assert_eq!(s.history.len(), MAX_TRANSITIONS_PER_CONTRACT);
     }
 
+    /// Decay reduces ONLY cost. Benefit is a live snapshot and must be
+    /// left untouched by `decay` (it is overwritten each tick by the
+    /// reaper before the ratio is computed). This is the inversion of
+    /// the old symmetric-decay behavior — see the redesign in #4296.
     #[test]
-    fn decay_reduces_cost_and_benefit_symmetrically() {
+    fn decay_reduces_cost_only_not_benefit() {
         let mut s = ContractScore::new(instant_t(0));
         s.cost_used = 100.0;
         s.benefit_score = 10.0;
-        let initial_ratio = s.cost_used / s.benefit_score;
         s.decay(Duration::from_secs(60), Duration::from_secs(60));
-        // After one half-life, both should be half. Ratio is invariant
-        // — a contract that goes quiet doesn't drift through states.
+        // After one half-life, cost is halved.
         assert!((s.cost_used - 50.0).abs() < 1e-9);
-        assert!((s.benefit_score - 5.0).abs() < 1e-9);
-        let new_ratio = s.cost_used / s.benefit_score;
-        assert!((new_ratio - initial_ratio).abs() < 1e-9);
+        // Benefit is UNCHANGED — decay does not touch the live snapshot.
+        assert!((s.benefit_score - 10.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1026,6 +1126,8 @@ mod tests {
         assert_eq!(s.cost_used, 100.0);
         s.decay(Duration::from_secs(60), Duration::ZERO);
         assert_eq!(s.cost_used, 100.0);
+        // Benefit untouched by decay in all cases.
+        assert_eq!(s.benefit_score, 10.0);
     }
 
     #[test]
@@ -1062,6 +1164,55 @@ mod tests {
 
     fn mk_key(seed: u8) -> ContractInstanceId {
         ContractInstanceId::new([seed; 32])
+    }
+
+    /// Build a live-benefit snapshot map for a `tick` call from
+    /// `(contract, weighted-beneficiary-count)` pairs. Mirrors what
+    /// `Ring::governance_tick` computes from the hosting manager in
+    /// production. Contracts absent from the map are treated by `tick`
+    /// as having zero current beneficiaries.
+    fn benefits(pairs: &[(ContractInstanceId, f64)]) -> HashMap<ContractInstanceId, f64> {
+        pairs.iter().copied().collect()
+    }
+
+    /// Convenience: give every key in `0..n` (plus an optional abuser)
+    /// the SAME honest benefit. Used by the population-distribution
+    /// tests that previously called `ingest_demand(mk_key(i), w)` in a
+    /// loop. Each honest contract gets `honest_benefit`; the abuser (if
+    /// provided) gets `abuser_benefit`.
+    fn honest_benefits(
+        n: u8,
+        honest_benefit: f64,
+        abuser: Option<(ContractInstanceId, f64)>,
+    ) -> HashMap<ContractInstanceId, f64> {
+        let mut m: HashMap<ContractInstanceId, f64> =
+            (0..n).map(|i| (mk_key(i), honest_benefit)).collect();
+        if let Some((a, b)) = abuser {
+            m.insert(a, b);
+        }
+        m
+    }
+
+    /// The standard 30-honest-contracts + abuser benefit snapshot used
+    /// by the ban-chain / eviction tests. Reproduces EXACTLY the benefit
+    /// values the pre-redesign tests built via
+    /// `ingest_demand(mk_key(i), 1.0 + jitter)` for honest and
+    /// `ingest_demand(abuser, 1.0)` for the abuser — so the resulting
+    /// log-ratios (and therefore which contracts flag) are unchanged.
+    /// Combined with the matching `ingest_cost` loop the tests already
+    /// run, the abuser's cost/benefit ratio dwarfs the honest cluster.
+    fn jittered_honest_benefits(
+        abuser: ContractInstanceId,
+        abuser_benefit: f64,
+    ) -> HashMap<ContractInstanceId, f64> {
+        let mut m: HashMap<ContractInstanceId, f64> = (0..30u8)
+            .map(|i| {
+                let jitter = (i as f64 - 15.0) * 0.01;
+                (mk_key(i), 1.0 + jitter)
+            })
+            .collect();
+        m.insert(abuser, abuser_benefit);
+        m
     }
 
     /// Mutex-wrapping the time source for tests where we need to
@@ -1123,26 +1274,38 @@ mod tests {
         assert_eq!(s.history.len(), 1);
     }
 
+    /// Benefit is a live snapshot, not an accumulator: a `tick` writes
+    /// each tracked score's `benefit_score` from the supplied map,
+    /// overwriting (not adding to) the prior value. A score must exist
+    /// (created by `ingest_cost`) for the snapshot to land on it —
+    /// `tick` does not create scores for map entries that aren't already
+    /// tracked.
     #[test]
-    fn ingest_demand_creates_score_on_first_observation() {
+    fn benefit_snapshot_overwrites_not_accumulates() {
         let (mgr, _ts) = mk_mgr_shared(GovernanceMode::DryRun);
         let k = mk_key(1);
-        mgr.ingest_demand(k, 1.5);
-        let s = mgr.score_snapshot(&k).unwrap();
-        assert_eq!(s.benefit_score, 1.5);
-        assert_eq!(s.cost_used, 0.0);
+        mgr.ingest_cost(k, 1.0);
+        // First tick snapshots benefit = 3.0.
+        mgr.tick(Duration::from_secs(1), &benefits(&[(k, 3.0)]));
+        assert_eq!(mgr.score_snapshot(&k).unwrap().benefit_score, 3.0);
+        // Second tick snapshots benefit = 1.5 — OVERWRITES, not 4.5.
+        mgr.tick(Duration::from_secs(1), &benefits(&[(k, 1.5)]));
+        assert_eq!(mgr.score_snapshot(&k).unwrap().benefit_score, 1.5);
+        // Tick with the contract ABSENT from the map → 0.0 (no current
+        // beneficiaries).
+        mgr.tick(Duration::from_secs(1), &benefits(&[]));
+        assert_eq!(mgr.score_snapshot(&k).unwrap().benefit_score, 0.0);
     }
 
     #[test]
-    fn ingest_rejects_non_finite_or_negative_amounts() {
+    fn ingest_cost_rejects_non_finite_or_negative_amounts() {
         let (mgr, _ts) = mk_mgr_shared(GovernanceMode::DryRun);
         let k = mk_key(1);
         mgr.ingest_cost(k, -5.0); // negative ignored
         mgr.ingest_cost(k, f64::NAN);
         mgr.ingest_cost(k, f64::INFINITY);
-        mgr.ingest_demand(k, 0.0); // zero ignored (no demand)
-        mgr.ingest_demand(k, -1.0);
-        // No score created from invalid inputs.
+        // No score created from invalid cost inputs (benefit is no
+        // longer pushed — it arrives via the tick snapshot).
         assert_eq!(mgr.len(), 0);
     }
 
@@ -1151,11 +1314,83 @@ mod tests {
         let (mgr, ts) = mk_mgr_shared(GovernanceMode::Off);
         let k = mk_key(1);
         mgr.ingest_cost(k, 1000.0);
-        mgr.ingest_demand(k, 0.1);
         ts.advance(Duration::from_secs(60));
-        let result = mgr.tick(Duration::from_secs(1));
+        let result = mgr.tick(Duration::from_secs(1), &benefits(&[(k, 0.1)]));
         assert!(result.decisions.is_empty());
         assert_eq!(result.sample_size, 0);
+    }
+
+    /// New abuser signature under the live-snapshot model: a contract
+    /// past ramp-up with cost > 0 and ZERO live beneficiaries MUST be
+    /// flagged. The benefit floor keeps the ratio finite and high
+    /// instead of returning `None` (the old model returned `None` for
+    /// zero benefit and silently let the abuser escape).
+    #[test]
+    fn zero_beneficiary_contract_with_cost_is_flagged() {
+        let (mgr, ts) = mk_mgr_shared(GovernanceMode::Enforce);
+        // Honest cluster: real cost AND real beneficiaries → low ratio.
+        for i in 0..30 {
+            let jitter = (i as f64 - 15.0) * 0.01;
+            mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
+        }
+        // Abuser: cost comparable to honest, but NO beneficiaries.
+        let abuser = mk_key(99);
+        mgr.ingest_cost(abuser, 0.1);
+        ts.advance(Duration::from_secs(2));
+
+        // Honest contracts each have one local client (benefit 1.0); the
+        // abuser is absent from the map → 0 beneficiaries → benefit
+        // floored to 0.1 → cost/benefit ≈ 1.0 (log 0) while honest sit
+        // at cost/1.0 ≈ 0.1 (log -1). The abuser is the high outlier.
+        let result = mgr.tick(Duration::from_millis(100), &honest_benefits(30, 1.0, None));
+        let abuser_decision = result
+            .decisions
+            .iter()
+            .find(|d| d.key == abuser)
+            .expect("zero-beneficiary cost-positive contract MUST be flagged");
+        assert_eq!(abuser_decision.to, GovernanceState::Evicted);
+        // And no honest contract was flagged.
+        assert!(
+            !result
+                .decisions
+                .iter()
+                .any(|d| d.key == mk_key(0) && d.to.is_flagged())
+        );
+    }
+
+    /// The fix's core guarantee: a HIGH-cost contract with HIGH live
+    /// benefit (the popular-contract case) is NOT flagged, even though
+    /// its absolute cost dwarfs the honest cluster. Cost-per-beneficiary
+    /// is what matters, and the popular contract's is low.
+    #[test]
+    fn high_cost_high_benefit_contract_is_not_flagged() {
+        let (mgr, ts) = mk_mgr_shared(GovernanceMode::Enforce);
+        // Honest cluster: modest cost, one beneficiary each → ratio ~0.1.
+        for i in 0..30 {
+            let jitter = (i as f64 - 15.0) * 0.01;
+            mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
+        }
+        // Popular contract: 100× the honest cost, but 1000 beneficiaries
+        // → cost-per-beneficiary BELOW the honest cluster's.
+        let popular = mk_key(99);
+        mgr.ingest_cost(popular, 10.0);
+        ts.advance(Duration::from_secs(2));
+
+        let result = mgr.tick(
+            Duration::from_millis(100),
+            &honest_benefits(30, 1.0, Some((popular, 1000.0))),
+        );
+        // The popular contract's log-ratio is log10(10/1000) = -2, far
+        // below the honest cluster (~ -1) — it must NOT be flagged.
+        let popular_flagged = result
+            .decisions
+            .iter()
+            .any(|d| d.key == popular && d.to.is_flagged());
+        assert!(
+            !popular_flagged,
+            "high-cost/high-benefit popular contract must NOT be flagged; decisions: {:?}",
+            result.decisions
+        );
     }
 
     #[test]
@@ -1164,13 +1399,14 @@ mod tests {
         // Synthesize a clearly-abusive contract immediately on creation.
         for i in 0..10 {
             mgr.ingest_cost(mk_key(i), 1.0);
-            mgr.ingest_demand(mk_key(i), 1.0);
         }
         let abuser = mk_key(99);
         mgr.ingest_cost(abuser, 100_000.0);
-        mgr.ingest_demand(abuser, 0.1);
         // Tick immediately — all contracts are inside ramp-up.
-        let result = mgr.tick(Duration::from_secs(1));
+        let result = mgr.tick(
+            Duration::from_secs(1),
+            &honest_benefits(10, 1.0, Some((abuser, 0.1))),
+        );
         assert!(result.decisions.is_empty());
         // The detector saw zero usable samples because everything was
         // ramp-up gated.
@@ -1187,16 +1423,17 @@ mod tests {
             // a real distribution to work with.
             let jitter = (i as f64 - 15.0) * 0.01;
             mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
-            mgr.ingest_demand(mk_key(i), 1.0 + jitter);
         }
         // One abuser with cost ratio = 100 (log10 = 2).
         let abuser = mk_key(99);
         mgr.ingest_cost(abuser, 100.0);
-        mgr.ingest_demand(abuser, 1.0);
 
         // Past ramp-up window so all contracts are eligible.
         ts.advance(Duration::from_secs(2));
-        let result = mgr.tick(Duration::from_millis(100));
+        let result = mgr.tick(
+            Duration::from_millis(100),
+            &jittered_honest_benefits(abuser, 1.0),
+        );
         // Sample includes everything (31 total).
         assert_eq!(result.sample_size, 31);
         // The abuser should be flagged.
@@ -1215,13 +1452,14 @@ mod tests {
             // a real distribution to work with.
             let jitter = (i as f64 - 15.0) * 0.01;
             mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
-            mgr.ingest_demand(mk_key(i), 1.0 + jitter);
         }
         let abuser = mk_key(99);
         mgr.ingest_cost(abuser, 100.0);
-        mgr.ingest_demand(abuser, 1.0);
         ts.advance(Duration::from_secs(2));
-        let result = mgr.tick(Duration::from_millis(100));
+        let result = mgr.tick(
+            Duration::from_millis(100),
+            &jittered_honest_benefits(abuser, 1.0),
+        );
         let abuser_decision = result.decisions.iter().find(|d| d.key == abuser).unwrap();
         assert_eq!(abuser_decision.to, GovernanceState::WouldEvict);
         // Dry-run: not actionable.
@@ -1237,13 +1475,14 @@ mod tests {
             // a real distribution to work with.
             let jitter = (i as f64 - 15.0) * 0.01;
             mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
-            mgr.ingest_demand(mk_key(i), 1.0 + jitter);
         }
         let abuser = mk_key(99);
         mgr.ingest_cost(abuser, 100.0);
-        mgr.ingest_demand(abuser, 1.0);
         ts.advance(Duration::from_secs(2));
-        let result = mgr.tick(Duration::from_millis(100));
+        let result = mgr.tick(
+            Duration::from_millis(100),
+            &jittered_honest_benefits(abuser, 1.0),
+        );
         let abuser_decision = result.decisions.iter().find(|d| d.key == abuser).unwrap();
         assert_eq!(abuser_decision.to, GovernanceState::Evicted);
         assert!(abuser_decision.actionable);
@@ -1267,15 +1506,16 @@ mod tests {
         for i in 0..30 {
             let jitter = (i as f64 - 15.0) * 0.01;
             mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
-            mgr.ingest_demand(mk_key(i), 1.0 + jitter);
         }
         let abuser = mk_key(99);
         mgr.ingest_cost(abuser, 100.0);
-        mgr.ingest_demand(abuser, 1.0);
         ts.advance(Duration::from_secs(2));
 
         // Tick 1: first eviction.
-        let r1 = mgr.tick(Duration::from_millis(100));
+        let r1 = mgr.tick(
+            Duration::from_millis(100),
+            &jittered_honest_benefits(abuser, 1.0),
+        );
         assert_eq!(
             r1.decisions.iter().find(|d| d.key == abuser).unwrap().to,
             GovernanceState::Evicted
@@ -1287,9 +1527,11 @@ mod tests {
         for i in 0..30 {
             let jitter = (i as f64 - 15.0) * 0.01;
             mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
-            mgr.ingest_demand(mk_key(i), 1.0 + jitter);
         }
-        let recovery = mgr.tick(Duration::from_millis(100));
+        let recovery = mgr.tick(
+            Duration::from_millis(100),
+            &jittered_honest_benefits(abuser, 1.0),
+        );
         let recovered = recovery
             .decisions
             .iter()
@@ -1303,11 +1545,13 @@ mod tests {
         // within ban_window (we advanced 15min+1s, well under 1h).
         mgr.ingest_cost(abuser, 100.0);
         mgr.ingest_cost(abuser, 100.0);
-        mgr.ingest_demand(abuser, 1.0);
         ts.advance(Duration::from_secs(1));
 
         // Tick 3: recently_evicted check fires → Banned, not Evicted.
-        let r2 = mgr.tick(Duration::from_millis(100));
+        let r2 = mgr.tick(
+            Duration::from_millis(100),
+            &jittered_honest_benefits(abuser, 1.0),
+        );
         let second = r2.decisions.iter().find(|d| d.key == abuser).unwrap();
         assert_eq!(second.to, GovernanceState::Banned);
         assert!(matches!(second.reason, TransitionReason::BanTriggered));
@@ -1322,35 +1566,43 @@ mod tests {
         for i in 0..30 {
             let jitter = (i as f64 - 15.0) * 0.01;
             mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
-            mgr.ingest_demand(mk_key(i), 1.0 + jitter);
         }
         let abuser = mk_key(99);
         mgr.ingest_cost(abuser, 100.0);
-        mgr.ingest_demand(abuser, 1.0);
         ts.advance(Duration::from_secs(2));
 
         // Tick 1: Evicted.
-        mgr.tick(Duration::from_millis(100));
+        mgr.tick(
+            Duration::from_millis(100),
+            &jittered_honest_benefits(abuser, 1.0),
+        );
 
         // Advance past evicted_ttl + re-establish honest distribution.
         ts.advance(Duration::from_secs(15 * 60 + 1));
         for i in 0..30 {
             let jitter = (i as f64 - 15.0) * 0.01;
             mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
-            mgr.ingest_demand(mk_key(i), 1.0 + jitter);
         }
-        mgr.tick(Duration::from_millis(100)); // → Normal via Recovered.
+        mgr.tick(
+            Duration::from_millis(100),
+            &jittered_honest_benefits(abuser, 1.0),
+        ); // → Normal via Recovered.
 
         // Re-feed → Banned (recently_evicted in window).
         mgr.ingest_cost(abuser, 100.0);
         mgr.ingest_cost(abuser, 100.0);
-        mgr.ingest_demand(abuser, 1.0);
         ts.advance(Duration::from_secs(1));
-        mgr.tick(Duration::from_millis(100));
+        mgr.tick(
+            Duration::from_millis(100),
+            &jittered_honest_benefits(abuser, 1.0),
+        );
 
         // Now advance past ban_ttl (1h default).
         ts.advance(Duration::from_secs(60 * 60 + 1));
-        let result = mgr.tick(Duration::from_millis(100));
+        let result = mgr.tick(
+            Duration::from_millis(100),
+            &jittered_honest_benefits(abuser, 1.0),
+        );
         let lifted = result.decisions.iter().find(|d| d.key == abuser).unwrap();
         assert_eq!(lifted.from, GovernanceState::Banned);
         assert_eq!(lifted.to, GovernanceState::Normal);
@@ -1381,15 +1633,16 @@ mod tests {
         for i in 0..30 {
             let jitter = (i as f64 - 15.0) * 0.01;
             mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
-            mgr.ingest_demand(mk_key(i), 1.0 + jitter);
         }
         let abuser = mk_key(99);
         mgr.ingest_cost(abuser, 100.0);
-        mgr.ingest_demand(abuser, 1.0);
         ts.advance(Duration::from_secs(2));
 
         // Tick 1: first eviction.
-        let r1 = mgr.tick(Duration::from_millis(100));
+        let r1 = mgr.tick(
+            Duration::from_millis(100),
+            &jittered_honest_benefits(abuser, 1.0),
+        );
         Ring::apply_ban_decisions(&bl, &r1.decisions, ts.now() + mgr.ban_ttl());
         assert!(
             !bl.is_banned(&abuser),
@@ -1401,9 +1654,11 @@ mod tests {
         for i in 0..30 {
             let jitter = (i as f64 - 15.0) * 0.01;
             mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
-            mgr.ingest_demand(mk_key(i), 1.0 + jitter);
         }
-        let r2 = mgr.tick(Duration::from_millis(100));
+        let r2 = mgr.tick(
+            Duration::from_millis(100),
+            &jittered_honest_benefits(abuser, 1.0),
+        );
         Ring::apply_ban_decisions(&bl, &r2.decisions, ts.now() + mgr.ban_ttl());
         assert!(
             !bl.is_banned(&abuser),
@@ -1413,9 +1668,11 @@ mod tests {
         // Re-feed → Banned (recently_evicted in ban_window).
         mgr.ingest_cost(abuser, 100.0);
         mgr.ingest_cost(abuser, 100.0);
-        mgr.ingest_demand(abuser, 1.0);
         ts.advance(Duration::from_secs(1));
-        let r3 = mgr.tick(Duration::from_millis(100));
+        let r3 = mgr.tick(
+            Duration::from_millis(100),
+            &jittered_honest_benefits(abuser, 1.0),
+        );
         let triggered = r3
             .decisions
             .iter()
@@ -1434,7 +1691,10 @@ mod tests {
 
         // BanLifted after ban_ttl.
         ts.advance(Duration::from_secs(60 * 60 + 1));
-        let r4 = mgr.tick(Duration::from_millis(100));
+        let r4 = mgr.tick(
+            Duration::from_millis(100),
+            &jittered_honest_benefits(abuser, 1.0),
+        );
         let lifted = r4
             .decisions
             .iter()
@@ -1470,7 +1730,6 @@ mod tests {
         for i in 0..30 {
             let jitter = (i as f64 - 15.0) * 0.02;
             mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
-            mgr.ingest_demand(mk_key(i), 1.0);
         }
         // Borderline test contract: cost ratio designed to land at
         // ~5σ above median, which is between the borderline cutoff
@@ -1478,9 +1737,14 @@ mod tests {
         // empirically against the test fixture's MAD.
         let borderline = mk_key(99);
         mgr.ingest_cost(borderline, 0.15);
-        mgr.ingest_demand(borderline, 1.0);
         ts.advance(Duration::from_secs(2));
-        let result = mgr.tick(Duration::from_millis(100));
+        // All contracts (honest + borderline) have benefit 1.0 — the
+        // separation that lands the test contract in Borderline comes
+        // entirely from its cost, exactly as before.
+        let result = mgr.tick(
+            Duration::from_millis(100),
+            &honest_benefits(30, 1.0, Some((borderline, 1.0))),
+        );
         let decision = result
             .decisions
             .iter()
@@ -1532,8 +1796,8 @@ mod tests {
     ///
     /// Skeptical reviewer of PR #4270 flagged this as the
     /// Normal → Evicted → Normal flapping bug: an evicted contract is
-    /// still in `scores` and still receives demand events, so decay
-    /// shrinks `cost_used` faster than `benefit_score` builds, and the
+    /// still in `scores`, so cost decay plus a high live-benefit
+    /// snapshot would drag the ratio below threshold, and the
     /// ratio falls below threshold → "Recovered" transition is logged
     /// while the on-disk state is already gone. Confusing at best,
     /// state-machine vs data-plane divergence at worst.
@@ -1544,35 +1808,37 @@ mod tests {
         for i in 0..30 {
             let jitter = (i as f64 - 15.0) * 0.01;
             mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
-            mgr.ingest_demand(mk_key(i), 1.0 + jitter);
         }
         let abuser = mk_key(99);
         mgr.ingest_cost(abuser, 100.0);
-        mgr.ingest_demand(abuser, 1.0);
         ts.advance(Duration::from_secs(2));
 
         // First tick → abuser Evicted.
-        let r1 = mgr.tick(Duration::from_millis(100));
+        let r1 = mgr.tick(
+            Duration::from_millis(100),
+            &jittered_honest_benefits(abuser, 1.0),
+        );
         let evicted_decision = r1.decisions.iter().find(|d| d.key == abuser).unwrap();
         assert_eq!(evicted_decision.to, GovernanceState::Evicted);
 
         // Now flip the abuser's signal to "low cost, high benefit" —
         // dragging its log-ratio FAR below threshold and below
-        // borderline_cutoff too. Without the stickiness rule, the next
+        // borderline_cutoff too. Under the live-snapshot model this is a
+        // big benefit value in the tick map (21 beneficiaries vs the
+        // honest cluster's 1). Without the stickiness rule, the next
         // tick would log a `Recovered` transition (Evicted → Normal)
         // even though the on-disk state is already gone.
-        for _ in 0..20 {
-            mgr.ingest_demand(abuser, 1.0);
-        }
         // Re-feed honest contracts so the distribution still has a
         // sensible MAD.
         for i in 0..30 {
             let jitter = (i as f64 - 15.0) * 0.01;
             mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
-            mgr.ingest_demand(mk_key(i), 1.0);
         }
         ts.advance(Duration::from_secs(60));
-        let r2 = mgr.tick(Duration::from_millis(100));
+        let r2 = mgr.tick(
+            Duration::from_millis(100),
+            &jittered_honest_benefits(abuser, 21.0),
+        );
 
         // Critical assertion: NO `Recovered` (or any `Normal`) transition
         // logged for the abuser. It's allowed to escalate to Banned
@@ -1613,15 +1879,16 @@ mod tests {
         for i in 0..30 {
             let jitter = (i as f64 - 15.0) * 0.01;
             mgr.ingest_cost(mk_key(i), 0.1 + jitter * 0.05);
-            mgr.ingest_demand(mk_key(i), 1.0 + jitter);
         }
         let abuser = mk_key(99);
         mgr.ingest_cost(abuser, 100.0);
-        mgr.ingest_demand(abuser, 1.0);
         ts.advance(Duration::from_secs(2));
 
         // First tick → Evicted.
-        let r1 = mgr.tick(Duration::from_millis(100));
+        let r1 = mgr.tick(
+            Duration::from_millis(100),
+            &jittered_honest_benefits(abuser, 1.0),
+        );
         assert!(
             r1.decisions
                 .iter()
@@ -1630,7 +1897,10 @@ mod tests {
 
         // Advance past ban_window without re-eviction.
         ts.advance(Duration::from_secs(60 * 60 + 1));
-        let r = mgr.tick(Duration::from_millis(100));
+        let r = mgr.tick(
+            Duration::from_millis(100),
+            &jittered_honest_benefits(abuser, 1.0),
+        );
         let lift = r.decisions.iter().find(|d| d.key == abuser).unwrap();
         assert_eq!(lift.from, GovernanceState::Evicted);
         assert_eq!(lift.to, GovernanceState::Normal);
@@ -1654,13 +1924,14 @@ mod tests {
         for i in 0..30 {
             let jitter = (i as f64 - 15.0) * 0.001;
             mgr.ingest_cost(mk_key(i), 0.1 + jitter);
-            mgr.ingest_demand(mk_key(i), 1.0);
         }
         let borderline = mk_key(99);
         mgr.ingest_cost(borderline, 1.0);
-        mgr.ingest_demand(borderline, 1.0);
         ts.advance(Duration::from_secs(2));
-        let _r1 = mgr.tick(Duration::from_millis(100));
+        let _r1 = mgr.tick(
+            Duration::from_millis(100),
+            &honest_benefits(30, 1.0, Some((borderline, 1.0))),
+        );
         // The borderline contract may have ended Borderline or
         // WouldEvict — both flagged states. Confirm via the snapshot.
         let after_first_tick = mgr.score_snapshot(&borderline).unwrap().state;
@@ -1672,21 +1943,42 @@ mod tests {
             after_first_tick
         );
 
-        // Step 2: replace the honest population with identical values
-        // (MAD collapse). Re-feeding identical cost/benefit doesn't
-        // immediately replace the running averages but moves them
-        // toward homogeneity. Skip this — instead, simulate MAD
-        // collapse by NOT advancing time and feeding everyone the
-        // same value to drag the average to zero spread.
-        for i in 0..30 {
-            // Heavy injection to dominate the running average.
-            for _ in 0..100 {
-                mgr.ingest_cost(mk_key(i), 0.1);
-                mgr.ingest_demand(mk_key(i), 1.0);
-            }
+        // Step 2: force the MAD detector to collapse
+        // (`SkipReason::MadCollapsed`) by making EVERY sampled
+        // contract's log-ratio BIT-IDENTICAL. Under the live-snapshot
+        // model benefit is supplied per-tick, so we give every contract
+        // the SAME benefit (1.0). For the costs to be identical we level
+        // them: read each contract's current cost and inject the
+        // difference up to a common target above every existing cost, so
+        // post-decay every cost is the same value. Identical cost +
+        // identical benefit ⇒ identical log-ratio ⇒ MAD = 0 ⇒ collapse.
+        // (The old test relied on heavy cost injection to swamp the
+        // spread, which no longer collapses MAD now that benefit doesn't
+        // decay in lockstep with cost.) The previously-flagged contract
+        // is leveled in too, so it is part of the homogeneous
+        // population, not a lone outlier.
+        let scores = mgr.iter_scores();
+        let max_cost = scores
+            .iter()
+            .map(|(_, s)| s.cost_used)
+            .fold(0.0_f64, f64::max);
+        let target_cost = max_cost + 1.0;
+        for (id, s) in &scores {
+            mgr.ingest_cost(*id, target_cost - s.cost_used);
         }
         ts.advance(Duration::from_secs(60));
-        let r2 = mgr.tick(Duration::from_millis(100));
+        let level_benefits: HashMap<ContractInstanceId, f64> =
+            scores.iter().map(|(id, _)| (*id, 1.0)).collect();
+        let r2 = mgr.tick(Duration::from_millis(100), &level_benefits);
+        // Sanity: the detector must actually have collapsed for this
+        // test to exercise the mad-collapse path it pins.
+        assert_eq!(
+            r2.skip_reason,
+            Some(crate::governance::SkipReason::MadCollapsed),
+            "test fixture must induce MAD collapse; skip_reason={:?}, mad={:?}",
+            r2.skip_reason,
+            r2.mad,
+        );
 
         // The critical assertion: even if MAD collapsed and the
         // borderline contract's score sample is no longer extracted
@@ -1949,7 +2241,7 @@ mod sim_e2e_tests {
                 score.state,
                 score.cost_used,
                 score.benefit_score,
-                score.log_ratio(),
+                score.log_ratio(gateway_ring.governance.benefit_floor()),
                 id == abuser_id,
             );
         }

@@ -93,28 +93,24 @@ const MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT: usize = 512;
 pub struct AddClientSubscriptionResult {
     /// Whether this was the first client for this contract.
     pub is_first_client: bool,
-    /// Whether this specific `(contract, client_id)` pair was newly
-    /// added (vs. an idempotent repeat call for an already-tracked
-    /// client). Used by the governance scoring layer to gate the
-    /// `ingest_demand` call — without this distinction a client that
-    /// re-subscribes repeatedly would pad the contract's
-    /// `benefit_score` indefinitely. See
-    /// `Ring::add_client_subscription` for the caller-side gating.
-    pub is_new_for_client: bool,
 }
 
 /// Outcome of an `add_downstream_subscriber` call. The variant
 /// distinguishes "the peer was newly added" from "the peer was already
-/// tracked and this call refreshed its lease timestamp" so the
-/// governance scoring layer can gate `ingest_demand` on new-add only.
-/// See `HostingManager::add_downstream_subscriber` for the rationale.
+/// tracked and this call refreshed its lease timestamp".
+///
+/// Governance no longer reacts to these on a per-event basis: benefit
+/// is a live snapshot read each reaper tick from
+/// `downstream_subscriber_count`, so a renewal merely extends a lease
+/// the snapshot already counts. The variant is retained because callers
+/// still distinguish accept-vs-reject and new-vs-renewal for
+/// subscription bookkeeping and telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddSubscriberOutcome {
     /// Peer is now tracked for this contract; was not before.
-    /// Governance treats this as fresh demand evidence.
     NewAdd,
     /// Peer was already tracked; this call refreshed the lease
-    /// timestamp. Governance must NOT count this as fresh demand.
+    /// timestamp.
     Renewal,
     /// Per-contract subscriber cap reached; this is a new peer that
     /// was rejected. Equivalent to the old `false` return.
@@ -612,11 +608,10 @@ impl HostingManager {
     ) -> AddClientSubscriptionResult {
         let mut entry = self.client_subscriptions.entry(*instance_id).or_default();
         let is_first_client = entry.is_empty();
-        // HashSet::insert returns true if the value was newly added.
-        // Capture this so the governance scoring layer can gate
-        // `ingest_demand` to new-adds only — otherwise a client that
-        // repeatedly re-subscribes for the same contract would pad
-        // demand by `LOCAL_DEMAND_WEIGHT × N` per N calls.
+        // Idempotent re-subscribe (same client + same contract) no
+        // longer needs special handling for governance: benefit is a
+        // live snapshot of `local_client_count`, so a duplicate insert
+        // into the set is a no-op and cannot inflate the count.
         let is_new_for_client = entry.insert(client_id);
         debug!(
             contract = %instance_id,
@@ -625,10 +620,7 @@ impl HostingManager {
             is_new_for_client,
             "add_client_subscription: registered"
         );
-        AddClientSubscriptionResult {
-            is_first_client,
-            is_new_for_client,
-        }
+        AddClientSubscriptionResult { is_first_client }
     }
 
     /// Remove a client subscription.
@@ -791,6 +783,56 @@ impl HostingManager {
         self.downstream_subscribers
             .get(contract)
             .is_some_and(|peers| !peers.is_empty())
+    }
+
+    /// Number of local (WebSocket) clients currently subscribed to this
+    /// contract. Used by governance to compute the live beneficiary
+    /// snapshot (the strong, hard-to-fake demand signal). Reads
+    /// `client_subscriptions`, which is keyed by `ContractInstanceId`
+    /// and pruned on client disconnect, so the count is the
+    /// currently-active set.
+    pub(crate) fn local_client_count(&self, instance_id: &ContractInstanceId) -> usize {
+        self.client_subscriptions
+            .get(instance_id)
+            .map(|clients| clients.len())
+            .unwrap_or(0)
+    }
+
+    /// Number of downstream peers with a CURRENTLY-ACTIVE (non-expired)
+    /// subscription lease for this contract. Used by governance to
+    /// compute the live beneficiary snapshot (weak, attacker-rotatable
+    /// demand signal).
+    ///
+    /// `downstream_subscribers` is keyed by `ContractKey`, while
+    /// governance keys on `ContractInstanceId`. A `ContractInstanceId`
+    /// does not uniquely determine the parameters half of a
+    /// `ContractKey`, so we match by instance id and sum across any
+    /// matching keys (in practice a node hosts a single key per
+    /// instance id, but this is correct regardless).
+    ///
+    /// Lease expiry: this mirrors `expire_stale_downstream_subscribers`
+    /// — a lease is active iff it was renewed within
+    /// `SUBSCRIPTION_LEASE_DURATION`. We count only non-expired leases
+    /// WITHOUT mutating the map (read-only), so a contract whose leases
+    /// have all gone stale (but not yet been swept) correctly reports
+    /// zero current beneficiaries this tick. The periodic
+    /// `expire_stale_downstream_subscribers` sweep does the actual
+    /// pruning; this count must not depend on that sweep having run.
+    pub(crate) fn downstream_subscriber_count(&self, instance_id: &ContractInstanceId) -> usize {
+        let now = self.time_source.now();
+        self.downstream_subscribers
+            .iter()
+            .filter(|entry| entry.key().id() == instance_id)
+            .map(|entry| {
+                entry
+                    .value()
+                    .values()
+                    .filter(|last_renewed| {
+                        now.duration_since(**last_renewed) < SUBSCRIPTION_LEASE_DURATION
+                    })
+                    .count()
+            })
+            .sum()
     }
 
     /// Whether something still depends on this node hosting `contract` — a
@@ -3202,12 +3244,12 @@ mod tests {
         );
     }
 
-    /// Sybil-resistance pin: `add_downstream_subscriber` MUST distinguish
-    /// a genuine new add from a renewal so the governance scoring layer
-    /// can gate `ingest_demand` on new-add only. Without this distinction,
-    /// a peer renewing every 2 minutes would pad benefit_score by
-    /// `FORWARDED_DEMAND_WEIGHT × 30 = 3.0 per hour` — the equivalent of
-    /// 30 distinct subscribers from one rotating peer.
+    /// `add_downstream_subscriber` MUST distinguish a genuine new add
+    /// from a renewal. Governance no longer consumes this distinction
+    /// (benefit is a live snapshot of the current lease-valid subscriber
+    /// set, so renewals cannot inflate it), but subscription bookkeeping
+    /// and telemetry still rely on knowing whether a registration added
+    /// a new peer or merely refreshed an existing lease.
     #[test]
     fn add_downstream_subscriber_distinguishes_new_add_from_renewal() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
@@ -3225,9 +3267,7 @@ mod tests {
         assert_eq!(
             manager.add_downstream_subscriber(&contract, peer.clone()),
             AddSubscriberOutcome::Renewal,
-            "repeated registration of the same peer must be Renewal — \
-             otherwise the governance demand-ingest gate is bypassed and \
-             a churning peer pads benefit_score indefinitely"
+            "repeated registration of the same peer must be Renewal, not NewAdd"
         );
 
         // Third call also Renewal — no escalation back to NewAdd.

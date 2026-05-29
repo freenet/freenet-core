@@ -69,20 +69,21 @@ pub(crate) mod update_rate_limit;
 /// to receive updates. This is controlled by hosting cache eviction.
 pub const AUTO_SUBSCRIBE_ON_GET: bool = true;
 
-/// Governance demand weight for a local-client subscription. Strong
-/// signal: a real user on this node opted in. Hard to fake without
-/// running an actual freenet client locally.
+/// Per-beneficiary weight for a local-client subscription when
+/// computing the LIVE benefit snapshot each governance reaper tick.
+/// Strong signal: a real user on this node is currently subscribed.
+/// Hard to fake without running an actual freenet client locally.
 ///
 /// Sourced from the design doc — see "Sybil weighting falls out
 /// naturally" in `docs/design/contract-hardening.md`.
 const LOCAL_DEMAND_WEIGHT: f64 = 1.0;
 
-/// Governance demand weight for a downstream peer's subscription.
-/// Weaker signal because peer identity is attacker-rotatable —
-/// without an identity layer, a single attacker can spin up many
-/// peers and each "subscribes." We weight forwarded demand at 0.1
-/// so an attacker would need 10 peers to fake the demand of one
-/// local user.
+/// Per-beneficiary weight for a downstream peer's CURRENT subscription
+/// when computing the LIVE benefit snapshot. Weaker signal because peer
+/// identity is attacker-rotatable — without an identity layer, a single
+/// attacker can spin up many peers and each "subscribes." We weight
+/// each forwarded subscriber at 0.1 so an attacker would need 10
+/// rotating peers to fake the standing demand of one local user.
 const FORWARDED_DEMAND_WEIGHT: f64 = 0.1;
 
 /// Interval between governance reaper ticks. Each tick applies
@@ -686,8 +687,9 @@ impl Ring {
     /// Periodic governance reaper loop. Ticks every
     /// `GOVERNANCE_TICK_INTERVAL` and:
     ///
-    ///   1. Calls `governance.tick(interval)` to apply decay and
-    ///      run the MAD detector over the per-contract distribution.
+    ///   1. Calls `governance_tick(interval)` which snapshots live
+    ///      benefit, applies cost decay, and runs the MAD detector
+    ///      over the per-contract distribution.
     ///   2. Logs each `ReaperDecision` at INFO level with the from→to
     ///      state and reason. In `DryRun` mode (the default) this is
     ///      the only effect; in `Enforce` mode the caller would also
@@ -1960,18 +1962,22 @@ impl Ring {
         let outcome = self
             .hosting_manager
             .add_downstream_subscriber(contract, peer);
-        // Sybil resistance: count demand on NewAdd only. A peer that
-        // keeps renewing its subscription every few minutes would
-        // otherwise pad `benefit_score` by FORWARDED_DEMAND_WEIGHT
-        // per renewal — equivalent to N distinct subscribers from a
-        // single rotating peer over an hour. Renewals must NOT
-        // register as fresh demand. Forwarded weight (0.1, per the
-        // design doc) reflects that peer identities are
-        // attacker-rotatable. See `AddSubscriberOutcome`.
-        if matches!(outcome, crate::ring::hosting::AddSubscriberOutcome::NewAdd) {
-            self.governance
-                .ingest_demand(*contract.id(), FORWARDED_DEMAND_WEIGHT);
-        }
+        // No governance demand is ingested here anymore. Benefit is a
+        // LIVE SNAPSHOT read fresh each reaper tick from the hosting
+        // manager's standing subscriber count (see
+        // `Ring::governance_tick` and
+        // `HostingManager::downstream_subscriber_count`), not an
+        // accumulator fed by subscribe events. That makes the
+        // Sybil-on-renewal concern moot: renewals merely extend a lease
+        // the snapshot already counts, so they cannot inflate benefit —
+        // the count reflects the CURRENT lease-valid subscriber set, no
+        // matter how often each peer renews.
+        //
+        // Downstream demand is still weighted low (FORWARDED_DEMAND_WEIGHT
+        // = 0.1) when the snapshot is computed, because peer identities
+        // are attacker-rotatable: without an identity layer a single
+        // attacker can spin up many peers that each "subscribe", so each
+        // forwarded subscriber is worth one tenth of a real local client.
         // Caller-facing bool preserved for backward compat: Rejected
         // → false; NewAdd or Renewal → true (the peer is tracked).
         !matches!(
@@ -2113,16 +2119,15 @@ impl Ring {
         let result = self
             .hosting_manager
             .add_client_subscription(instance_id, client_id);
-        // Local client subscription = strong demand signal. Full
-        // weight: this is our own user telling us they care about
-        // this contract, harder to fake than a peer-side signal.
-        // Gated on `is_new_for_client` so an idempotent re-subscribe
-        // call (same client + same contract) doesn't pad demand —
-        // see `AddClientSubscriptionResult::is_new_for_client`.
-        if result.is_new_for_client {
-            self.governance
-                .ingest_demand(*instance_id, LOCAL_DEMAND_WEIGHT);
-        }
+        // No governance demand is ingested here anymore. A local client
+        // subscription is the strong demand signal (full
+        // LOCAL_DEMAND_WEIGHT = 1.0), but benefit is now a LIVE SNAPSHOT
+        // read fresh each reaper tick from
+        // `HostingManager::local_client_count` (see
+        // `Ring::governance_tick`), not an accumulator fed here. The
+        // snapshot counts the currently-subscribed client set, so an
+        // idempotent re-subscribe cannot inflate benefit and there is no
+        // need to gate on `is_new_for_client` for scoring purposes.
         result
     }
 
@@ -2237,7 +2242,7 @@ impl Ring {
                     state: map_state(score.state),
                     cost_used: score.cost_used,
                     benefit_score: score.benefit_score,
-                    log_ratio: score.log_ratio(),
+                    log_ratio: score.log_ratio(self.governance.benefit_floor()),
                     age_secs: now.saturating_duration_since(score.first_seen).as_secs(),
                     last_transition_secs_ago: now
                         .saturating_duration_since(score.last_transition)
@@ -2376,25 +2381,46 @@ impl Ring {
         self.governance.ingest_cost(contract_id, amount * weight);
     }
 
-    // Note: there is intentionally no standalone `ingest_contract_demand`
-    // method here. Demand is ingested through `add_client_subscription` /
-    // `add_downstream_subscriber` (the two production registration sites)
-    // and gated on `is_new_for_client` / `AddSubscriberOutcome::NewAdd`
-    // there. Adding a bare entry point would let a future caller bypass
-    // the Sybil-resistance gate — that exact concern was flagged by
-    // skeptical-reviewer of #4270 as a latent foot-gun.
+    // Note: there is intentionally no `ingest_contract_demand` method
+    // here, and demand is no longer pushed on subscribe events at all.
+    // Benefit is a LIVE SNAPSHOT pulled each reaper tick by
+    // `governance_tick` from the hosting manager's standing subscriber
+    // counts (`local_client_count` + `downstream_subscriber_count`).
+    // A push entry point would re-introduce the accumulate-on-event
+    // model this redesign removed (#4296).
 
     /// Run one governance reaper tick. Caller (the periodic
     /// `governance_reaper_loop` task) is expected to feed
-    /// `tick_interval` = wall-time since the previous tick for decay.
-    /// Returns the `ReaperTickResult` for the caller to act on (emit
-    /// `EvictContract` events for actionable decisions, log dry-run
-    /// decisions, surface stats on the dashboard).
+    /// `tick_interval` = wall-time since the previous tick for cost
+    /// decay. Returns the `ReaperTickResult` for the caller to act on
+    /// (emit `EvictContract` events for actionable decisions, log
+    /// dry-run decisions, surface stats on the dashboard).
+    ///
+    /// Before ticking, this builds the LIVE benefit snapshot for every
+    /// contract the governance manager is tracking: for each tracked
+    /// contract id, `LOCAL_DEMAND_WEIGHT × current local-client count +
+    /// FORWARDED_DEMAND_WEIGHT × current (non-expired) downstream
+    /// subscriber count`, read fresh from the hosting manager. This is
+    /// the cost-per-current-beneficiary denominator — a popular
+    /// contract keeps a high benefit because its beneficiaries are
+    /// counted live, not decayed from old subscribe events.
     pub(crate) fn governance_tick(
         &self,
         tick_interval: Duration,
     ) -> crate::contract::governance::ReaperTickResult {
-        self.governance.tick(tick_interval)
+        let benefits: std::collections::HashMap<ContractInstanceId, f64> = self
+            .governance
+            .iter_scores()
+            .into_iter()
+            .map(|(id, _score)| {
+                let local = self.hosting_manager.local_client_count(&id);
+                let downstream = self.hosting_manager.downstream_subscriber_count(&id);
+                let benefit = LOCAL_DEMAND_WEIGHT * local as f64
+                    + FORWARDED_DEMAND_WEIGHT * downstream as f64;
+                (id, benefit)
+            })
+            .collect();
+        self.governance.tick(tick_interval, &benefits)
     }
 }
 
