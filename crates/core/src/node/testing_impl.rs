@@ -876,6 +876,13 @@ pub struct SimNetwork {
     /// node's `contract_ban_list` after the simulation completes. Keyed by
     /// label; the inner `Option` is filled once the node's run loop reaches
     /// the `shared_ring` write in `run_node_with_{shared_storage,mock_wasm}`.
+    ///
+    /// `allow(dead_code)`: populated unconditionally in
+    /// `run_controlled_simulation`, but only *read* in the
+    /// `cfg(any(test, feature = "testing"))` `node_rings` extraction, so a
+    /// production build (where `testing_impl` is still compiled) sees it
+    /// as write-only.
+    #[allow(dead_code)]
     shared_rings: HashMap<NodeLabel, Arc<parking_lot::Mutex<Option<Arc<crate::ring::Ring>>>>>,
 }
 

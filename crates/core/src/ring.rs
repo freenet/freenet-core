@@ -272,25 +272,15 @@ impl Ring {
         };
         let time_source: Arc<dyn crate::util::time_source::TimeSource + Send + Sync> =
             Arc::new(InstantTimeSrc::new());
-        // Production always uses the design-doc defaults. Simulation
-        // tests may inject a config with compressed timescales + lower
-        // `min_samples` via `NodeConfig::governance_config_override`
-        // (test/`testing`-feature builds only) so the rate-limit → MAD
-        // → evict → ban chain can be driven within a paused-time sim.
-        // See issue #4301.
-        let governance_config = {
-            #[cfg(any(test, feature = "testing"))]
-            {
-                config
-                    .governance_config_override
-                    .clone()
-                    .unwrap_or_default()
-            }
-            #[cfg(not(any(test, feature = "testing")))]
-            {
-                crate::contract::governance::GovernanceConfig::default()
-            }
-        };
+        // Production always passes `None`, which resolves to
+        // `GovernanceConfig::default()`. The override exists only so
+        // simulation tests can inject compressed timescales + lower
+        // `min_samples` to drive the rate-limit → MAD → evict → ban
+        // chain within a paused-time sim. See issue #4301.
+        let governance_config = config
+            .governance_config_override
+            .clone()
+            .unwrap_or_default();
         let governance = Arc::new(crate::contract::governance::GovernanceManager::new(
             governance_config,
             time_source.clone(),

@@ -181,7 +181,10 @@ pub struct NodeConfig {
     /// evict → ban chain can be exercised within a paused-time sim.
     /// `None` in production (and never serialized — `#[serde(skip)]`),
     /// where `GovernanceConfig::default()` is used. See issue #4301.
-    #[cfg(any(test, feature = "testing"))]
+    ///
+    /// Not cfg-gated: `node::testing_impl` (which sets this) is compiled
+    /// unconditionally, so the field must exist in every build. The
+    /// `Option` is simply always `None` outside tests.
     #[serde(skip)]
     pub(crate) governance_config_override: Option<crate::contract::governance::GovernanceConfig>,
 }
@@ -306,7 +309,6 @@ impl NodeConfig {
             } else {
                 Some(3) // Production: require 3 relay-ready upstream peers
             },
-            #[cfg(any(test, feature = "testing"))]
             governance_config_override: None,
         })
     }
