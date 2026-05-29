@@ -45,6 +45,7 @@ use crate::{
 mod broken_invariants;
 mod connection_backoff;
 mod connection_manager;
+pub(crate) mod contract_ban_list;
 pub(crate) use connection_manager::ConnectionManager;
 mod connection;
 mod hosting;
@@ -61,6 +62,7 @@ pub(crate) mod peer_cache;
 mod peer_connection_backoff;
 mod peer_key_location;
 pub mod topology_registry;
+pub(crate) mod update_rate_limit;
 
 /// Whether to auto-subscribe to contracts on GET.
 /// When true, GET operations will automatically subscribe to the contract
@@ -128,6 +130,19 @@ pub(crate) struct Ring {
     /// already records. Mode defaults to `DryRun` per the staged-
     /// rollout plan.
     pub(crate) governance: Arc<crate::contract::governance::GovernanceManager>,
+    /// Front-line per-(sender, contract) UPDATE rate limit. Catches
+    /// flood patterns at the receive boundary in milliseconds, before
+    /// the slower MAD-based governance reaper can react. See
+    /// `crate::ring::update_rate_limit` and `docs/design/contract-hardening.md`
+    /// Phase 2.
+    pub(crate) update_rate_limiter: Arc<update_rate_limit::UpdateRateLimiter>,
+    /// Per-contract ban list. Populated by the governance reaper on
+    /// `BanTriggered` / `BanLifted` transitions; consulted at the
+    /// inbound dispatch site to drop wire requests for banned
+    /// contracts. Phase 7 of the contract-hardening plan
+    /// (`docs/design/contract-hardening.md`) and the auto-detection
+    /// half of issue #4274 (operator-CLI blocklist).
+    pub(crate) contract_ban_list: Arc<contract_ban_list::ContractBanList>,
     event_register: Box<dyn NetEventRegister>,
     op_manager: RwLock<Option<Weak<OpManager>>>,
     /// Whether this peer is a gateway or not. This will affect behavior of the node when acquiring
@@ -267,6 +282,12 @@ impl Ring {
             hosting_manager: hosting::HostingManager::new(config.config.max_hosting_storage),
             broken_invariants: BrokenInvariantsTracker::new(),
             governance,
+            update_rate_limiter: Arc::new(update_rate_limit::UpdateRateLimiter::new(
+                time_source.clone(),
+            )),
+            contract_ban_list: Arc::new(contract_ban_list::ContractBanList::new(
+                time_source.clone(),
+            )),
             live_tx_tracker: live_tx_tracker.clone(),
             event_register: Box::new(event_register),
             op_manager: RwLock::new(None),
@@ -694,6 +715,18 @@ impl Ring {
 
             let result = ring.governance_tick(elapsed);
 
+            // Cycle the UPDATE rate limiter's idle-entry cleanup on
+            // the same cadence. Keeps the `(sender, contract)` map
+            // bounded; CLEANUP_AGE is 5 minutes so this drops entries
+            // for pairs that haven't tried an UPDATE since then.
+            ring.update_rate_limiter.cleanup();
+
+            // Phase 7 ban-list maintenance. Defense-in-depth — the
+            // BanLifted decisions below explicitly unban, but if any
+            // entry slipped through the reaper (e.g. mode flipped off
+            // mid-window), cleanup catches it on the next tick.
+            ring.contract_ban_list.cleanup();
+
             // Network-norms summary at DEBUG — useful when debugging
             // calibration but too noisy for INFO on a healthy node.
             tracing::debug!(
@@ -704,6 +737,19 @@ impl Ring {
                 capacity_ceiling_binding = result.capacity_ceiling_binding,
                 skip_reason = ?result.skip_reason,
                 "governance reaper tick",
+            );
+
+            // Phase 7 enforcement wiring: BanTriggered → ban list;
+            // BanLifted → unban. Done AFTER the cleanup() so a
+            // freshly-added entry (with expiry = now + ban_ttl) is
+            // not immediately swept by the same tick's cleanup. The
+            // two calls are sequential in this task — no concurrent
+            // race — the ordering is purely to defend the
+            // not-quite-expired-yet invariant.
+            Self::apply_ban_decisions(
+                &ring.contract_ban_list,
+                &result.decisions,
+                ring.time_source.now() + ring.governance.ban_ttl(),
             );
 
             // Decisions at INFO — these are the dashboard-relevant
@@ -718,6 +764,45 @@ impl Ring {
                     actionable = decision.actionable,
                     "governance state transition",
                 );
+            }
+        }
+    }
+
+    /// Translate a batch of governance decisions into ban-list
+    /// mutations. Pulled out of the reaper loop so the wiring is
+    /// directly testable: a missing or reversed branch here would
+    /// silently break Phase 7 enforcement even with the
+    /// `GovernanceManager` emitting correct transitions.
+    ///
+    /// **`actionable` filter:** non-actionable decisions (DryRun
+    /// mode) are skipped. Today the `GovernanceManager` only emits
+    /// `BanTriggered` in Enforce mode so this is a defense-in-depth
+    /// guard — but a future "shadow" mode that wants to surface
+    /// would-have-banned transitions in the dashboard must not
+    /// silently begin enforcing them through this wiring.
+    pub(crate) fn apply_ban_decisions(
+        ban_list: &contract_ban_list::ContractBanList,
+        decisions: &[crate::contract::governance::ReaperDecision],
+        ban_expiry: tokio::time::Instant,
+    ) {
+        use crate::contract::governance::TransitionReason;
+        for decision in decisions {
+            if !decision.actionable {
+                continue;
+            }
+            #[allow(clippy::wildcard_enum_match_arm)]
+            match decision.reason {
+                TransitionReason::BanTriggered => {
+                    ban_list.ban(
+                        decision.key,
+                        ban_expiry,
+                        contract_ban_list::BanReason::AutoMad,
+                    );
+                }
+                TransitionReason::BanLifted => {
+                    ban_list.unban(&decision.key);
+                }
+                _ => {}
             }
         }
     }
@@ -2165,10 +2250,28 @@ impl Ring {
             None => ns::NetworkNorms::default(),
         };
 
+        // state_by_id: map ContractInstanceId → state for the
+        // Subscribed Contracts table's Gov column cross-reference.
+        // Walking iter_flagged_scores() once for the `contracts`
+        // list above gave us the flagged set; for unflagged
+        // contracts the absence from this map means "Normal".
+        let state_by_id: std::collections::HashMap<String, ns::GovernanceStateSnapshot> = contracts
+            .iter()
+            .map(|c| (c.instance_id.clone(), c.state))
+            .collect();
+
+        let observed_count = self.governance.len();
+        let min_samples = self.governance.outlier_min_samples();
+        let last_tick_at = self.governance.latest_norms().map(|n| n.at);
+
         ns::GovernanceSnapshot {
             mode,
             contracts,
+            observed_count,
+            min_samples,
             norms,
+            last_tick_at,
+            state_by_id,
         }
     }
 
