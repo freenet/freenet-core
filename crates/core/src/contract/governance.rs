@@ -2288,4 +2288,317 @@ mod sim_e2e_tests {
             "abuser governance state must be Banned (terminal), got {abuser_state:?}"
         );
     }
+
+    /// Regression test for the official-River-room false positive
+    /// (#4296): a HIGH-cost contract with MANY live downstream
+    /// subscribers must NOT be evicted/banned, while a same-cost
+    /// contract with NO subscribers IS. Before the live-snapshot
+    /// redesign, both contracts' benefit decayed to ~0 (their
+    /// subscribe events were old), so the popular contract's
+    /// continuous update cost flagged it for eviction — exactly the
+    /// most-used contract on the network.
+    ///
+    /// Setup: the gateway PUTs two contracts and floods BOTH with the
+    /// same heavy update load. Those updates propagate to and commit on
+    /// each contract's HOST node, so cost accrues on the host. The
+    /// "popular" contract is additionally subscribed by every other node
+    /// in the sim, so its host records them as live downstream
+    /// subscribers — a high LIVE beneficiary count read fresh each
+    /// reaper tick. The "abuser" contract has no such subscribers.
+    ///
+    /// On the popular contract's host node BOTH the heavy cost AND the
+    /// live beneficiaries coincide (exactly as for the real River room
+    /// on its host), so its cost-per-beneficiary stays low → NOT
+    /// banned. The abuser — same heavy cost, zero beneficiaries — is
+    /// banned. We assert on the popular contract's actual host node
+    /// (the one carrying its downstream subscribers) rather than
+    /// hard-coding the gateway, because the contract's ring location
+    /// determines which node hosts it.
+    ///
+    /// `min_samples = 2` here (vs the primary test's 5): the host node's
+    /// extractable population is the two high-cost contracts, and that
+    /// is the population in which the abuser must stand out as the
+    /// zero-benefit outlier.
+    #[test]
+    fn popular_contract_with_subscribers_not_evicted() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        const NETWORK2: &str = "governance-popular-not-evicted-e2e";
+        const SEED2: u64 = 0xC0FF_EE12_3456_789A;
+
+        let mut sim = rt.block_on(async {
+            SimNetwork::new(
+                NETWORK2, 1,  // gateways
+                5,  // nodes
+                7,  // max_htl
+                3,  // rnd_if_htl_above
+                10, // max_connections
+                2,  // min_connections
+                SEED2,
+            )
+            .await
+        });
+
+        sim.use_mock_wasm = true;
+        // Same as compressed_config() but with min_samples = 2 so the
+        // host node's two-contract population activates the detector.
+        let mut cfg = compressed_config();
+        cfg.outlier.min_samples = 2;
+        sim.with_governance_config(cfg);
+
+        let gateway = NodeLabel::gateway(NETWORK2, 0);
+
+        // The heavy-update load applied identically to BOTH the popular
+        // and the abuser contract, so cost is roughly equal and the ONLY
+        // distinguishing signal is the live beneficiary count.
+        const HEAVY_STATE_BYTES: usize = 8 * 1024;
+
+        const POPULAR_SEED: u8 = 0x70;
+        const ABUSER_SEED: u8 = 0xAB;
+
+        // A handful of honest low-cost contracts so the MAD detector has
+        // a real honest cluster to compute the threshold from (mirrors
+        // the primary e2e test's rationale; min_samples = 5).
+        const NUM_HONEST: u8 = 6;
+        const HONEST_UPDATES: usize = 3;
+        const HONEST_STATE_BYTES: usize = 256;
+
+        let mut operations: Vec<ScheduledOperation> = Vec::new();
+
+        // Honest contracts: PUT+subscribe on the gateway, a few small
+        // updates, with per-contract size spread to keep honest-cluster
+        // MAD non-zero.
+        for seed in 1..=NUM_HONEST {
+            let contract = SimOperation::create_test_contract(seed);
+            let key = contract.key();
+            operations.push(ScheduledOperation::new(
+                gateway.clone(),
+                SimOperation::Put {
+                    contract: contract.clone(),
+                    state: SimOperation::create_test_state(seed),
+                    subscribe: true,
+                },
+            ));
+            let honest_bytes = HONEST_STATE_BYTES + (seed as usize) * 80;
+            for u in 0..HONEST_UPDATES {
+                operations.push(ScheduledOperation::new(
+                    gateway.clone(),
+                    SimOperation::Update {
+                        key,
+                        data: SimOperation::create_large_state(
+                            honest_bytes,
+                            seed.wrapping_add(u as u8).wrapping_add(1),
+                        ),
+                    },
+                ));
+            }
+        }
+
+        // Popular + abuser contracts: PUT+subscribe on the gateway so
+        // both are seeded and hosted.
+        let popular_contract = SimOperation::create_test_contract(POPULAR_SEED);
+        let popular_key = popular_contract.key();
+        let popular_id = *popular_key.id();
+        operations.push(ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: popular_contract.clone(),
+                state: SimOperation::create_test_state(POPULAR_SEED),
+                subscribe: true,
+            },
+        ));
+        let abuser_contract = SimOperation::create_test_contract(ABUSER_SEED);
+        let abuser_key = abuser_contract.key();
+        let abuser_id = *abuser_key.id();
+        operations.push(ScheduledOperation::new(
+            gateway.clone(),
+            SimOperation::Put {
+                contract: abuser_contract.clone(),
+                state: SimOperation::create_test_state(ABUSER_SEED),
+                subscribe: true,
+            },
+        ));
+
+        // Active window: repeated cycles of
+        //   (a) every other node re-subscribes to the popular contract,
+        //       refreshing the downstream-subscriber leases on its host
+        //       (leases expire after SUBSCRIPTION_LEASE_DURATION = 8 min
+        //       without renewal, and the ban chain takes several reaper
+        //       ticks; re-subscribing each cycle keeps the live
+        //       beneficiary count > 0 throughout), and
+        //   (b) one heavy update to BOTH contracts so cost keeps flowing
+        //       equally to each.
+        // Each scheduled op consumes 3 virtual seconds, so CYCLES cycles
+        // of (5 subscribes + 2 updates) span ~CYCLES × 21s. With 40
+        // cycles that is ~14 virtual minutes — long enough for the
+        // abuser's evict → recover → re-evict → ban chain to complete
+        // while the popular contract's leases never lapse. We measure
+        // immediately after the active window (tiny post-op wait) so the
+        // popular leases are still fresh at assertion time.
+        const CYCLES: usize = 40;
+        // Node labels are 1-indexed and start AFTER the gateways, so a
+        // 1-gateway / 5-node network has nodes `node-1`..`node-5`.
+        for c in 0..CYCLES {
+            for n in 1..=5 {
+                operations.push(ScheduledOperation::new(
+                    NodeLabel::node(NETWORK2, n),
+                    SimOperation::Subscribe {
+                        contract_id: popular_id,
+                    },
+                ));
+            }
+            operations.push(ScheduledOperation::new(
+                gateway.clone(),
+                SimOperation::Update {
+                    key: popular_key,
+                    data: SimOperation::create_large_state(
+                        HEAVY_STATE_BYTES,
+                        POPULAR_SEED.wrapping_add(c as u8).wrapping_add(1),
+                    ),
+                },
+            ));
+            operations.push(ScheduledOperation::new(
+                gateway.clone(),
+                SimOperation::Update {
+                    key: abuser_key,
+                    data: SimOperation::create_large_state(
+                        HEAVY_STATE_BYTES,
+                        ABUSER_SEED.wrapping_add(c as u8).wrapping_add(1),
+                    ),
+                },
+            ));
+        }
+
+        // Measure right at the end of the active window so popular's
+        // downstream leases are still fresh.
+        let post_op_wait = Duration::from_secs(5);
+        let sim_duration = Duration::from_secs(2400);
+        let result = sim.run_controlled_simulation(SEED2, operations, sim_duration, post_op_wait);
+
+        assert!(
+            result.turmoil_result.is_ok(),
+            "controlled simulation must complete: {:?}",
+            result.turmoil_result.err()
+        );
+
+        // Diagnostic: per-node view of both contracts so a failure is
+        // debuggable (which node hosts what, with what cost/benefit).
+        for (label, ring) in &result.node_rings {
+            eprintln!(
+                "[gov-popular] node={label} POP down={} local={} state={:?} cost={:?} banned={} || \
+                 ABU down={} local={} state={:?} cost={:?} banned={}",
+                ring.hosting_manager_downstream_subscriber_count(&popular_id),
+                ring.hosting_manager_local_client_count(&popular_id),
+                ring.governance.score_snapshot(&popular_id).map(|s| s.state),
+                ring.governance
+                    .score_snapshot(&popular_id)
+                    .map(|s| s.cost_used),
+                ring.contract_ban_list.is_banned(&popular_id),
+                ring.hosting_manager_downstream_subscriber_count(&abuser_id),
+                ring.hosting_manager_local_client_count(&abuser_id),
+                ring.governance.score_snapshot(&abuser_id).map(|s| s.state),
+                ring.governance
+                    .score_snapshot(&abuser_id)
+                    .map(|s| s.cost_used),
+                ring.contract_ban_list.is_banned(&abuser_id),
+            );
+        }
+
+        // Find the popular contract's HOST: the node carrying its live
+        // downstream subscribers. That is where cost AND benefit
+        // coincide (as for a real popular contract on its host node),
+        // and therefore the node whose governance verdict matters for
+        // the false-positive this redesign fixes.
+        let (popular_host_label, popular_host_ring) = result
+            .node_rings
+            .iter()
+            .max_by_key(|(_, ring)| ring.hosting_manager_downstream_subscriber_count(&popular_id))
+            .expect("at least one node must have started");
+        let popular_downstream =
+            popular_host_ring.hosting_manager_downstream_subscriber_count(&popular_id);
+
+        assert!(
+            popular_downstream > 0,
+            "test fixture invalid: no node accumulated a live downstream subscriber \
+             for the popular contract — the cross-node Subscribe ops did not \
+             register, so this regression cannot be exercised"
+        );
+
+        // The popular host must actually carry heavy cost for the
+        // contract (otherwise the test isn't exercising the
+        // high-cost-but-spared path).
+        let popular_host_cost = popular_host_ring
+            .governance
+            .score_snapshot(&popular_id)
+            .map(|s| s.cost_used)
+            .unwrap_or(0.0);
+        assert!(
+            popular_host_cost > 1000.0,
+            "test fixture invalid: popular host {popular_host_label} must carry heavy \
+             update cost for the popular contract (got {popular_host_cost})"
+        );
+
+        // THE FIX: on its host, the popular contract — heavy cost AND
+        // many live beneficiaries — is NOT banned.
+        assert!(
+            !popular_host_ring.contract_ban_list.is_banned(&popular_id),
+            "popular contract {popular_id} must NOT be banned on its host \
+             {popular_host_label} despite heavy update cost ({popular_host_cost:.0}) — \
+             it has {popular_downstream} live downstream subscribers; governance \
+             state: {:?}",
+            popular_host_ring
+                .governance
+                .score_snapshot(&popular_id)
+                .map(|s| s.state)
+        );
+        assert_ne!(
+            popular_host_ring
+                .governance
+                .score_snapshot(&popular_id)
+                .map(|s| s.state),
+            Some(super::GovernanceState::Banned),
+            "popular contract must not reach the terminal Banned state on its host"
+        );
+
+        // THE CONTROL: a same-cost contract with NO live beneficiaries
+        // IS banned. The gateway carries the abuser's heavy cost with
+        // zero subscribers and has the full honest baseline, so it is
+        // the node that bans the abuser. This proves the cost was high
+        // enough to trip governance and that the ONLY thing sparing the
+        // popular contract is its live beneficiary count.
+        let abuser_banned_anywhere = result
+            .node_rings
+            .values()
+            .any(|ring| ring.contract_ban_list.is_banned(&abuser_id));
+        assert!(
+            abuser_banned_anywhere,
+            "abuser contract {abuser_id} (same heavy cost, NO subscribers) must be \
+             banned on at least one node that observed its cost"
+        );
+
+        // And on the popular contract's host specifically, the abuser
+        // (which also accrued cost there but has no beneficiaries) must
+        // NOT be spared the way the popular contract is — i.e. the host
+        // does not blanket-spare every high-cost contract, only the one
+        // with live benefit. We assert the abuser is NOT in a better
+        // standing than the popular contract on that host: if the host
+        // flags anything, it flags the abuser, not the popular one.
+        let host_popular_flagged = popular_host_ring
+            .governance
+            .score_snapshot(&popular_id)
+            .map(|s| s.state.is_flagged())
+            .unwrap_or(false);
+        assert!(
+            !host_popular_flagged,
+            "on its host, the popular contract must remain unflagged (Normal); \
+             state: {:?}",
+            popular_host_ring
+                .governance
+                .score_snapshot(&popular_id)
+                .map(|s| s.state)
+        );
+    }
 }

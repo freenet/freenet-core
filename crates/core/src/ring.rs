@@ -2116,9 +2116,6 @@ impl Ring {
         instance_id: &ContractInstanceId,
         client_id: crate::client_events::ClientId,
     ) -> AddClientSubscriptionResult {
-        let result = self
-            .hosting_manager
-            .add_client_subscription(instance_id, client_id);
         // No governance demand is ingested here anymore. A local client
         // subscription is the strong demand signal (full
         // LOCAL_DEMAND_WEIGHT = 1.0), but benefit is now a LIVE SNAPSHOT
@@ -2128,7 +2125,8 @@ impl Ring {
         // snapshot counts the currently-subscribed client set, so an
         // idempotent re-subscribe cannot inflate benefit and there is no
         // need to gate on `is_new_for_client` for scoring purposes.
-        result
+        self.hosting_manager
+            .add_client_subscription(instance_id, client_id)
     }
 
     /// Remove a client from all its subscriptions (used when client disconnects).
@@ -2421,6 +2419,29 @@ impl Ring {
             })
             .collect();
         self.governance.tick(tick_interval, &benefits)
+    }
+
+    /// Test-only accessor: current local-client beneficiary count for a
+    /// contract, read from the hosting manager. Used by the governance
+    /// sim e2e tests to assert the live benefit snapshot reflects real
+    /// subscriptions.
+    #[cfg(test)]
+    pub(crate) fn hosting_manager_local_client_count(
+        &self,
+        instance_id: &ContractInstanceId,
+    ) -> usize {
+        self.hosting_manager.local_client_count(instance_id)
+    }
+
+    /// Test-only accessor: current (non-expired) downstream subscriber
+    /// count for a contract, read from the hosting manager.
+    #[cfg(test)]
+    pub(crate) fn hosting_manager_downstream_subscriber_count(
+        &self,
+        instance_id: &ContractInstanceId,
+    ) -> usize {
+        self.hosting_manager
+            .downstream_subscriber_count(instance_id)
     }
 }
 
