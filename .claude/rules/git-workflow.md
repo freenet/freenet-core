@@ -31,6 +31,22 @@ Does the body explain WHY, not WHAT?
 - `test:` – adding/updating tests
 - `build:` – build system or dependencies
 
+### BEFORE opening a PR — is this change in scope?
+
+```
+Is it a feature, new behavior, or API reshaping?
+  → YES: An approved issue MUST exist first. No issue + maintainer
+         sign-off → don't open the PR; it will be auto-closed.
+         See CONTRIBUTING.md.
+
+Is it a bug fix or non-overreaching perf improvement (no behavior change)?
+  → Accepted without prior discussion. Proceed.
+
+Does the PR bundle more than one logical change?
+  → NO single focus: split it. Scope creep (feature smuggled into a
+    "fix:", unrelated cleanup riding along) is grounds for closing.
+```
+
 ### WHEN creating a PR
 
 ```
