@@ -155,14 +155,17 @@ impl NodeP2P {
         // request.
         let ring_stats = self.op_manager.ring.clone();
         super::network_status::set_ring_stats_provider(std::sync::Arc::new(move || {
-            let own_pub_key = ring_stats
-                .connection_manager
-                .own_location()
-                .pub_key()
-                .to_string();
+            let (peer_id, own_pub_key) = {
+                let pk = ring_stats.connection_manager.own_location();
+                let key_bytes = pk.pub_key().as_bytes();
+                let peer_id = pk.pub_key().to_string(); // 12-byte Display
+                let own_pub_key = bs58::encode(key_bytes).into_string(); // full 32-byte
+                (peer_id, own_pub_key)
+            };
             super::network_status::RingStatsSnapshot {
                 connection_count: ring_stats.connection_manager.connection_count() as u32,
                 hosted_contracts: ring_stats.hosting_contracts_count() as u32,
+                peer_id,
                 own_pub_key,
             }
         }));

@@ -37,10 +37,38 @@ fn homepage_html() -> String {
     let ops_card = build_ops_card(&snap);
     let transfer_card = build_transfer_card(&snap);
 
+    let peer_id = snap
+        .as_ref()
+        .and_then(|s| {
+            if s.ring_stats.peer_id.is_empty() {
+                None
+            } else {
+                Some(s.ring_stats.peer_id.as_str())
+            }
+        })
+        .unwrap_or("?");
     let pub_key = snap
         .as_ref()
-        .map(|s| s.ring_stats.own_pub_key.as_str())
+        .and_then(|s| {
+            if s.ring_stats.own_pub_key.is_empty() {
+                None
+            } else {
+                Some(s.ring_stats.own_pub_key.as_str())
+            }
+        })
         .unwrap_or("?");
+    let peer_copy_btn = if peer_id == "?" {
+        String::new()
+    } else {
+        r#"<button class="copy-btn" onclick="copyToClipboard(document.getElementById('peer-id').textContent).then(function(){showToast('Peer ID copied')})" title="Copy peer ID">&#x2398;</button>"#
+            .to_string()
+    };
+    let pub_copy_btn = if pub_key == "?" {
+        String::new()
+    } else {
+        r#"<button class="copy-btn" onclick="copyToClipboard(document.getElementById('pub-key').textContent).then(function(){showToast('Pub key copied')})" title="Copy public key">&#x2398;</button>"#
+            .to_string()
+    };
 
     format!(
         r##"<!DOCTYPE html>
@@ -61,9 +89,10 @@ fn homepage_html() -> String {
             <span class="header-scope">Local Peer</span>
             <span class="badge" id="version-badge" data-version="{version}">v{version}</span>
             <a class="update-badge" id="update-badge" href="https://github.com/freenet/freenet-core/releases/latest" target="_blank" rel="noopener noreferrer" hidden>Update available</a>
-            <span class="pub-key-label">Public key</span>
-            <code class="pub-key" id="pub-key" title="Click to copy">{pub_key}</code>
-            <button class="copy-btn" onclick="copyToClipboard(document.getElementById('pub-key').textContent).then(function(){{showToast('Public key copied')}})" title="Copy public key">&#x2398;</button>
+            <span class="pub-key-label">Peer ID</span>
+            <code class="pub-key" id="peer-id" title="Click to copy">{peer_id}</code>{peer_copy_btn}
+            <span class="pub-key-label">Pub key</span>
+            <code class="pub-key" id="pub-key" title="Click to copy">{pub_key}</code>{pub_copy_btn}
         </div>
         <div class="header-right">
             <span class="uptime">Up {uptime}</span>
@@ -114,7 +143,10 @@ fn homepage_html() -> String {
         favicon = favicon,
         version = html_escape(version),
         uptime = uptime,
+        peer_id = html_escape(peer_id),
+        peer_copy_btn = peer_copy_btn,
         pub_key = html_escape(pub_key),
+        pub_copy_btn = pub_copy_btn,
         status_card = status_card,
         peers_card = peers_card,
         transfer_card = transfer_card,
@@ -681,7 +713,11 @@ fn build_ring_svg(
         "<div class=\"ring-wrap\"><svg viewBox=\"0 0 {size:.0} {size:.0}\" class=\"ring-svg\" preserveAspectRatio=\"xMidYMid meet\">"
     );
 
-    let has_governance = governance.is_some_and(|g| !g.contracts.is_empty());
+    // Show the inner ring when there are *any* contracts to display
+    // (governance-flagged OR hosted).  Without this the hosted dots
+    // render orphaned on an invisible ring.
+    let has_inner_ring = governance.is_some_and(|g| !g.contracts.is_empty())
+        || !hosted_contracts.is_empty();
 
     // === Background rings ===
     write!(
@@ -689,7 +725,7 @@ fn build_ring_svg(
         "<circle cx=\"{cx}\" cy=\"{cy}\" r=\"{r_outer}\" fill=\"none\" stroke=\"#363c4a\" stroke-width=\"1\"/>"
     )
     .ok();
-    if has_governance {
+    if has_inner_ring {
         write!(
             svg,
             "<circle cx=\"{cx}\" cy=\"{cy}\" r=\"{r_inner}\" fill=\"none\" stroke=\"#363c4a\" stroke-width=\"1\"/>"
@@ -730,7 +766,7 @@ fn build_ring_svg(
         y = cy - r_outer - 8.0,
     )
     .ok();
-    if has_governance {
+    if has_inner_ring {
         write!(
             svg,
             "<text x=\"{cx}\" y=\"{y:.1}\" text-anchor=\"middle\" fill=\"#6b7280\" font-family=\"monospace\" font-size=\"9\" letter-spacing=\"0.18em\">CONTRACTS</text>",
@@ -1205,20 +1241,31 @@ fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
             .map(|v| format!("{:+.2}", v))
             .unwrap_or_else(|| "—".to_string());
         let age = format_ago(c.age_secs);
+        let state_rank = match c.state {
+            network_status::GovernanceStateSnapshot::Banned => 0u8,
+            network_status::GovernanceStateSnapshot::Evicted => 1,
+            network_status::GovernanceStateSnapshot::WouldEvict => 2,
+            network_status::GovernanceStateSnapshot::Borderline => 3,
+            network_status::GovernanceStateSnapshot::Normal => 4,
+        };
+        let log_ratio_sort = c.log_ratio.map(|v| format!("{v:.6}")).unwrap_or_default();
         rows.push_str(&format!(
-            r#"<tr><td title="{full}"><code>{short}</code></td><td><span class="g-badge {state_class}">{state_label}</span></td><td class="right">{log_ratio}</td><td class="right">{cost:.2}</td><td class="right">{benefit:.2}</td><td class="right">{age}</td></tr>"#,
+            r#"<tr><td title="{full}" data-sort="{full}"><code>{short}</code><button type="button" class="copy-key" data-copy="{full}" title="Copy contract key" aria-label="Copy contract key">⧉</button></td><td data-sort="{state_rank}"><span class="g-badge {state_class}">{state_label}</span></td><td class="right" data-sort="{log_ratio_sort}">{log_ratio}</td><td class="right" data-sort="{cost:.6}">{cost:.2}</td><td class="right" data-sort="{benefit:.6}">{benefit:.2}</td><td class="right" data-sort="{age_secs}">{age}</td></tr>"#,
             full = html_escape(&c.instance_id),
             short = html_escape(&c.instance_id_short),
             state_class = state_class,
             state_label = state_label,
+            state_rank = state_rank,
             log_ratio = log_ratio_txt,
+            log_ratio_sort = log_ratio_sort,
             cost = c.cost_used,
             benefit = c.benefit_score,
             age = age,
+            age_secs = c.age_secs,
         ));
     }
     if shown_count == 0 {
-        rows = r#"<tr><td colspan="6" class="empty" style="padding: 0.5rem 0.9rem">All contracts within normal range.</td></tr>"#.to_string();
+        rows = r#"<tr class="sort-disabled"><td colspan="6" class="empty" style="padding: 0.5rem 0.9rem">All contracts within normal range.</td></tr>"#.to_string();
     }
 
     let tracked_total = g.observed_count.max(total);
@@ -1236,8 +1283,8 @@ fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
                 </div>
             </div>
             <div class="table-wrap">
-                <table>
-                    <thead><tr><th>Contract</th><th>State</th><th class="right">log-ratio</th><th class="right">Cost</th><th class="right">Benefit</th><th class="right">Age</th></tr></thead>
+                <table class="sortable" data-table-id="governance">
+                    <thead><tr><th data-sort-type="text">Contract</th><th data-sort-type="num">State</th><th class="right" data-sort-type="num">log-ratio</th><th class="right" data-sort-type="num">Cost</th><th class="right" data-sort-type="num">Benefit</th><th class="right" data-sort-type="num">Age</th></tr></thead>
                     <tbody>{rows}</tbody>
                 </table>
             </div>
@@ -1539,7 +1586,7 @@ header {
     padding: 0.15rem 0.5rem;
     border-radius: 4px 0 0 4px;
     border: 1px solid var(--border-color);
-    max-width: 14ch;
+    max-width: 24ch;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -3802,7 +3849,7 @@ mod tests {
     }
 
     #[test]
-    fn favicon_blue_when_connected() {
+    fn favicon_teal_when_connected() {
         let mut snap = base_snapshot();
         snap.open_connections = 3;
         let uri = build_favicon_data_uri(&Some(snap));
@@ -3986,6 +4033,16 @@ mod tests {
         );
     }
 
+    // Superseded: the 10s grace period replaced the unconditional
+    // hide-on-zero-open-connections logic (#3507).
+    #[ignore]
+    #[test]
+    fn transfer_card_hidden_when_no_data() {
+        let mut snap = base_snapshot();
+        snap.elapsed_secs = 100; // well past grace, still no data
+        // Old behaviour: hidden. New behaviour: shown (tested above).
+    }
+
     #[test]
     fn transfer_card_shown_after_grace_period() {
         let snap = base_snapshot(); // elapsed_secs=10, no traffic → still show
@@ -3994,6 +4051,36 @@ mod tests {
             !html.is_empty(),
             "transfer card should render after grace period even without data"
         );
+    }
+
+    /// Non-zero transport metrics must render RTT, cwnd, slowdown, and
+    /// transfer sub-sections — currently every test uses default zeros,
+    /// which skips those branches entirely.
+    #[test]
+    fn transfer_card_renders_subsections_with_data() {
+        let mut snap = base_snapshot();
+        snap.bytes_uploaded = 5000;
+        snap.open_connections = 1;
+        snap.transport_snapshot.avg_rtt_us = 12500; // 12.5ms
+        snap.transport_snapshot.min_rtt_us = 8000;
+        snap.transport_snapshot.max_rtt_us = 45000;
+        snap.transport_snapshot.avg_cwnd_bytes = 32768;
+        snap.transport_snapshot.peak_cwnd_bytes = 98304;
+        snap.transport_snapshot.min_cwnd_bytes = 11264;
+        snap.transport_snapshot.slowdowns_triggered = 23;
+        snap.transport_snapshot.transfers_completed = 847;
+        snap.transport_snapshot.transfers_failed = 3;
+        snap.transport_snapshot.avg_transfer_time_ms = 1200;
+        let html = build_transfer_card(&Some(snap));
+        assert!(html.contains("RTT"), "RTT row missing");
+        assert!(html.contains("12.5ms"), "avg RTT missing");
+        assert!(html.contains("8.0ms"), "min RTT missing");
+        assert!(html.contains("45.0ms"), "max RTT missing");
+        assert!(html.contains("cwnd"), "cwnd row missing");
+        assert!(html.contains("LEDBAT"), "slowdown row missing");
+        assert!(html.contains("23</span>"), "slowdown count missing");
+        assert!(html.contains("847"), "transfers completed missing");
+        assert!(html.contains("3"), "transfers failed missing");
     }
 
     #[test]
@@ -4031,6 +4118,15 @@ mod tests {
         assert!(
             !html.contains("http-equiv=\"refresh\""),
             "meta refresh must not be present — JS partial update is used instead"
+        );
+    }
+
+    #[test]
+    fn title_is_fn_peer() {
+        let html = homepage_html();
+        assert!(
+            html.contains("<title>FN Peer</title>"),
+            "dashboard title must be 'FN Peer' — do not rename without updating this test"
         );
     }
 

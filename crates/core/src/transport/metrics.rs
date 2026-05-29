@@ -230,7 +230,7 @@ impl TransportMetrics {
     }
 
     /// Record a cwnd sample (called periodically or on transfer completion).
-    fn record_cwnd_sample(&self, cwnd_bytes: u32) {
+    pub(crate) fn record_cwnd_sample(&self, cwnd_bytes: u32) {
         self.cwnd_sum
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_add(cwnd_bytes as u64))
@@ -404,6 +404,13 @@ impl TransportMetrics {
 
     /// Read-only snapshot for the local dashboard. Does NOT reset counters
     /// (unlike `take_snapshot` which is consumed by the telemetry worker).
+    ///
+    /// **Telemetry interaction**: `peak_throughput_bps`, `avg_cwnd_bytes`,
+    /// `avg_rtt_us`, and `slowdowns_triggered` are period accumulators that
+    /// `take_snapshot` resets every `transport_snapshot_interval_secs`
+    /// (default 30s).  Between resets these reflect recent activity; the
+    /// dashboard sees the current window, not a lifetime aggregate.
+    /// `cumulative_bytes_sent/received` are never reset and reflect totals.
     pub fn read_snapshot(&self) -> TransportSnapshot {
         let transfers_completed = self.transfers_completed.load(Ordering::Relaxed);
         let transfers_failed = self.transfers_failed.load(Ordering::Relaxed);
@@ -1052,10 +1059,19 @@ mod tests {
     fn read_snapshot_sentinels_map_to_zero() {
         let metrics = TransportMetrics::new();
         let snap = metrics.read_snapshot();
-        assert_eq!(
-            snap.min_cwnd_bytes, 0,
-            "no cwnd samples → min should be 0"
-        );
+        assert_eq!(snap.min_cwnd_bytes, 0, "no cwnd samples → min should be 0");
         assert_eq!(snap.min_rtt_us, 0, "no RTT samples → min should be 0");
+    }
+
+    /// Happy-path: record known cwnd samples, verify read_snapshot
+    /// returns correct average.
+    #[test]
+    fn read_snapshot_happy_path() {
+        let metrics = TransportMetrics::new();
+        metrics.record_cwnd_sample(4000);
+        metrics.record_cwnd_sample(2000);
+        metrics.record_cwnd_sample(6000);
+        let snap = metrics.read_snapshot();
+        assert_eq!(snap.avg_cwnd_bytes, 4000);
     }
 }

@@ -46,7 +46,9 @@ pub struct RingStatsSnapshot {
     pub connection_count: u32,
     /// Number of contracts this node is currently hosting.
     pub hosted_contracts: u32,
-    /// Base58-encoded public key of this node.
+    /// Short base58 Peer ID (12-byte prefix) — how other nodes see this peer.
+    pub peer_id: String,
+    /// Base58-encoded full 32-byte X25519 public key.
     pub own_pub_key: String,
 }
 
@@ -1355,5 +1357,47 @@ mod tests {
         assert_eq!(s.version, "0.1.0-test");
         assert_eq!(s.listening_port, 31337);
         assert_eq!(s.open_connections, 0);
+    }
+
+    /// Registered RingStatsProvider must surface in `snap.ring_stats`,
+    /// replacing the provider must take effect immediately, and the
+    /// no-provider default is all-zeros.
+    #[test]
+    fn ring_stats_provider_round_trip() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        // Use the same init as other tests in this module.
+        init(31337, HashSet::new(), "0.1.0-test".to_string());
+
+        // 1. No provider — default.
+        let snap = get_snapshot().unwrap();
+        assert_eq!(snap.ring_stats.connection_count, 0);
+        assert!(snap.ring_stats.own_pub_key.is_empty());
+
+        // 2. Register provider.
+        set_ring_stats_provider(Arc::new(|| RingStatsSnapshot {
+            connection_count: 42,
+            hosted_contracts: 7,
+            peer_id: "abc".to_string(),
+            own_pub_key: "test-key".to_string(),
+        }));
+        let snap = get_snapshot().unwrap();
+        assert_eq!(snap.ring_stats.connection_count, 42);
+        assert_eq!(snap.ring_stats.peer_id, "abc");
+        assert_eq!(snap.ring_stats.own_pub_key, "test-key");
+
+        // 3. Replace provider — must take effect immediately.
+        set_ring_stats_provider(Arc::new(|| RingStatsSnapshot {
+            connection_count: 99,
+            hosted_contracts: 1,
+            peer_id: "xyz".to_string(),
+            own_pub_key: "new-key".to_string(),
+        }));
+        let snap = get_snapshot().unwrap();
+        assert_eq!(snap.ring_stats.connection_count, 99);
+        assert_eq!(snap.ring_stats.peer_id, "xyz");
+        assert_eq!(snap.ring_stats.own_pub_key, "new-key");
+
+        // 4. Clean up.
+        clear_ring_stats_provider();
     }
 }
