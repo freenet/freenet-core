@@ -2054,10 +2054,14 @@ p:last-child { margin-bottom: 0; }
     .ring-wrap { margin-bottom: 0.5rem; }
     .ring-svg { width: 160px; height: 160px; }
 
-    .governance-grid { grid-template-columns: 1fr; }
+    /* Governance: stack verdict + norms vertically, let table scroll */
+    .g-verdict-row { grid-template-columns: 1fr; }
+    .g-verdict { min-width: auto; }
+    .g-norms { grid-template-columns: repeat(3, 1fr); }
     .app-list li { padding: 0.4rem 0; }
 }
 @media (max-width: 400px) {
+    .g-norms { grid-template-columns: repeat(2, 1fr); }
     .header-title { font-size: 0.9rem; }
     .header-scope { font-size: 0.65rem; padding: 0.1rem 0.35rem; }
     .metric-tile { flex: 1 1 45%; }
