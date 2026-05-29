@@ -1,6 +1,6 @@
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
-use freenet_stdlib::client_api::ErrorKind;
+use freenet_stdlib::client_api::{ErrorKind, RequestError};
 use freenet_stdlib::prelude::ContractInstanceId;
 use std::fmt::{Display, Formatter};
 
@@ -90,10 +90,20 @@ impl IntoResponse for WebSocketApiError {
                     | ErrorKind::ChannelClosed
                     | ErrorKind::TransportProtocolDisconnect
                     | ErrorKind::NodeUnavailable
+                    // Symmetric with OperationError("…timed out…") —
+                    // a RequestError(Timeout) is the same class of
+                    // transient failure during GET fetch (#3472).
+                    | ErrorKind::RequestError(RequestError::Timeout)
             }
         );
 
         let (status, error_message) = if is_transient {
+            // Log the cause so operators can distinguish a fast op error
+            // from a slow-loading contract without changing the user-facing
+            // retry page.
+            if let WebSocketApiError::AxumError { error } = &self {
+                tracing::info!(%error, "serving retry page for transient contract-fetch error");
+            }
             (StatusCode::SERVICE_UNAVAILABLE, retry_loading_page())
         } else {
             match self {
