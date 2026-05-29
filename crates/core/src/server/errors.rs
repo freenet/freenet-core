@@ -145,7 +145,13 @@ fn connecting_page() -> String {
         .to_string()
 }
 
-/// Returns an HTML page that auto-refreshes the current URL every 60 s.
+/// How often the retry page reloads (seconds).  Long enough for a
+/// cold GET to resolve on a sparse ring, short enough that the user
+/// doesn't assume the page is dead.
+const RETRY_REFRESH_SECS: u64 = 60;
+
+/// Returns an HTML page that auto-refreshes the current URL every
+/// [`RETRY_REFRESH_SECS`] seconds.
 ///
 /// Used when a contract-fetch operation timed out — the node has peers and
 /// is making progress, but the specific GET hasn't resolved yet.  Rather
@@ -153,19 +159,20 @@ fn connecting_page() -> String {
 /// is cached, `contract_home` serves normally and the refresh loop stops
 /// (the success response carries no `<meta http-equiv="refresh">`).
 fn retry_loading_page() -> String {
-    r#"<!DOCTYPE html>
+    format!(
+        r##"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta http-equiv="refresh" content="60">
+    <meta http-equiv="refresh" content="{refresh}">
     <title>Loading contract…</title>
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        body {{{{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
                display: flex; justify-content: center; align-items: center; min-height: 100vh;
-               margin: 0; background: #0c0d0f; color: #edeeef; }
-        .container { text-align: center; padding: 2rem; }
-        h1 { font-size: 1.2rem; font-weight: 500; margin-bottom: 0.5rem; }
-        p { color: #94969a; font-size: 0.85rem; margin-bottom: 0.3rem; }
+               margin: 0; background: #0c0d0f; color: #edeeef; }}}}
+        .container {{{{ text-align: center; padding: 2rem; }}}}
+        h1 {{{{ font-size: 1.2rem; font-weight: 500; margin-bottom: 0.5rem; }}}}
+        p {{{{ color: #94969a; font-size: 0.85rem; margin-bottom: 0.3rem; }}}}
     </style>
 </head>
 <body>
@@ -175,8 +182,9 @@ fn retry_loading_page() -> String {
         <p style="font-size:0.7rem;color:#585a5e">If this persists, check the <a href="/" style="color:#0abab5">dashboard</a>.</p>
     </div>
 </body>
-</html>"#
-        .to_string()
+</html>"##,
+        refresh = RETRY_REFRESH_SECS,
+    )
 }
 
 #[cfg(test)]
@@ -201,17 +209,25 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    #[test]
-    fn failed_operation_returns_retry_page() {
+    #[tokio::test]
+    async fn failed_operation_returns_retry_page() {
         let err = WebSocketApiError::AxumError {
             error: ErrorKind::FailedOperation,
         };
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains(r#"<meta http-equiv="refresh" content="60"#),
+            "retry page must contain meta-refresh tag"
+        );
     }
 
-    #[test]
-    fn operation_error_returns_retry_page() {
+    #[tokio::test]
+    async fn operation_error_returns_retry_page() {
         // Transient errors during contract fetch return 503 + auto-refresh.
         let err = WebSocketApiError::AxumError {
             error: ErrorKind::OperationError {
@@ -220,6 +236,14 @@ mod tests {
         };
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains(r#"<meta http-equiv="refresh" content="60"#),
+            "retry page must contain meta-refresh tag"
+        );
     }
 
     #[test]
