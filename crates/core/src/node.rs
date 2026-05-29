@@ -2289,33 +2289,78 @@ mod tests {
     use rstest::rstest;
 
     /// Source-level pins for the three log sites in this file that were
-    /// demoted / format-fixed in PR #4252 for issue #4251. Each pin
-    /// asserts the macro family of the call site by scanning a 400-byte
-    /// window before the anchor message. Same shape as the
-    /// `bug-prevention-patterns.md` FreeConsole pins in `service.rs`.
-    /// Window widened from 240 to 400 in re-review #3 to absorb future
-    /// added structured fields without false-breaking the pin.
-    fn assert_log_site_pin(needle: &str, must_contain: &[&str], must_not_contain: &[&str]) {
+    /// demoted / format-fixed in PR #4252 for issue #4251.
+    ///
+    /// Anchors on the closest preceding `tracing::` macro (via `rfind`)
+    /// and parses the macro name out of the source, rather than scanning
+    /// a fixed byte window. Adopted from the #4272 pin tests (see
+    /// `operations/update.rs::no_targets_propagation_logs_at_debug_pin_test`):
+    /// the old byte-window scan false-broke when added structured fields
+    /// shifted bytes, and could false-pass off a neighboring macro. A
+    /// line-prefix guard rejects a `tracing::` match that lands inside a
+    /// string literal or comment instead of a real macro invocation.
+    ///
+    /// `expected_macro` pins the macro family (e.g. "debug"); the equality
+    /// check rejects every other level implicitly. The optional
+    /// `must_contain` / `must_not_contain` substrings are matched within
+    /// the macro invocation body (between the macro and the anchor
+    /// message) and guard format-specifier regressions such as Display
+    /// (`%field`) vs Debug (`?field`) expansion of a structured field.
+    fn assert_log_site_pin(
+        needle: &str,
+        expected_macro: &str,
+        must_contain: &[&str],
+        must_not_contain: &[&str],
+    ) {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/node.rs");
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("must read own source at {}: {e}", path.display()));
         let idx = source
             .find(needle)
             .unwrap_or_else(|| panic!("log message `{needle}` must still exist in source"));
-        let start = idx.saturating_sub(400);
-        let window = &source[start..idx];
-        for needle in must_contain {
+        let preceding = &source[..idx];
+        let macro_idx = preceding
+            .rfind("tracing::")
+            .unwrap_or_else(|| panic!("a tracing macro must precede the `{needle}` log site"));
+        let line_start = preceding[..macro_idx].rfind('\n').map_or(0, |n| n + 1);
+        let line_prefix = &preceding[line_start..macro_idx];
+        assert!(
+            line_prefix.chars().all(char::is_whitespace),
+            "rfind matched `tracing::` inside a string literal or comment, \
+             not a macro invocation. Prefix on its line: {line_prefix:?}"
+        );
+        let after_macro = &preceding[macro_idx + "tracing::".len()..];
+        let macro_name = after_macro.split('!').next().unwrap_or("");
+        // Char-boundary-safe last-200-bytes window: a raw byte slice could
+        // start mid-UTF-8-char and panic while building the failure message.
+        let tail_start = preceding
+            .char_indices()
+            .map(|(i, _)| i)
+            .find(|&i| preceding.len() - i <= 200)
+            .unwrap_or(0);
+        let context = &preceding[tail_start..];
+        assert_eq!(
+            macro_name, expected_macro,
+            "log site for `{needle}` must be at `tracing::{expected_macro}!` \
+             (closest preceding macro is `tracing::{macro_name}!`). \
+             A level change here restores an issue #4251 regression.\n\
+             Preceding source (last 200 bytes):\n{context}"
+        );
+        // Scan only the macro invocation body (macro start -> anchor
+        // message) so the format-specifier checks can't match a
+        // neighboring macro or an explanatory comment above the call.
+        let macro_body = &source[macro_idx..idx];
+        for substr in must_contain {
             assert!(
-                window.contains(needle),
-                "site `{needle}` must appear in the 240-byte window before message:\n{window}",
-                needle = needle
+                macro_body.contains(substr),
+                "log site for `{needle}` must contain `{substr}` in its macro invocation:\n{macro_body}"
             );
         }
         for forbidden in must_not_contain {
             assert!(
-                !window.contains(forbidden),
-                "site must NOT contain `{forbidden}` (would restore an issue #4251 regression):\n{window}",
-                forbidden = forbidden
+                !macro_body.contains(forbidden),
+                "log site for `{needle}` must NOT contain `{forbidden}` \
+                 (would restore an issue #4251 regression):\n{macro_body}"
             );
         }
     }
@@ -2326,8 +2371,9 @@ mod tests {
         // hot contracts. Per #4251 review (testing reviewer #1).
         assert_log_site_pin(
             "Summary mismatch in interest sync \u{2014} syncing state to stale peer",
-            &["tracing::debug!"],
-            &["tracing::info!", "tracing::warn!"],
+            "debug",
+            &[],
+            &[],
         );
     }
 
@@ -2339,8 +2385,9 @@ mod tests {
         // hand-written impl). Per #4251 review (code-first + Codex).
         assert_log_site_pin(
             "Unexpected response to resync update",
-            &["tracing::debug!", "response = %other"],
-            &["response = ?other", "tracing::warn!", "tracing::info!"],
+            "debug",
+            &["response = %other"],
+            &["response = ?other"],
         );
     }
 
@@ -2350,11 +2397,7 @@ mod tests {
         // the executor queue is saturated for a hot contract (#4251).
         // The actionable signal is the queue saturation itself, not
         // the per-summary failure. Caught by rule-review on PR #4252.
-        assert_log_site_pin(
-            "Failed to get contract summary",
-            &["tracing::debug!"],
-            &["tracing::warn!", "tracing::info!"],
-        );
+        assert_log_site_pin("Failed to get contract summary", "debug", &[], &[]);
     }
 
     // Hostname resolution tests
