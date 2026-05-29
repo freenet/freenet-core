@@ -2419,7 +2419,7 @@ impl Ring {
     /// contract, read from the hosting manager. Used by the governance
     /// sim e2e tests to assert the live benefit snapshot reflects real
     /// subscriptions.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "simulation_tests"))]
     pub(crate) fn hosting_manager_local_client_count(
         &self,
         instance_id: &ContractInstanceId,
@@ -2429,7 +2429,7 @@ impl Ring {
 
     /// Test-only accessor: current (non-expired) downstream subscriber
     /// count for a contract, read from the hosting manager.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "simulation_tests"))]
     pub(crate) fn hosting_manager_downstream_subscriber_count(
         &self,
         instance_id: &ContractInstanceId,
