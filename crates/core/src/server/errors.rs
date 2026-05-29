@@ -80,7 +80,7 @@ impl IntoResponse for WebSocketApiError {
             &self,
             WebSocketApiError::AxumError {
                 error:
-                    // Timeout from handle_get_response (path_handlers.rs:188).
+                    // Timeout from the 30s GET fetch wrapper.
                     ErrorKind::OperationError { .. }
                     // Dead in current core (no raisers), but stdlib can emit
                     // it; defensive include so a stdlib bump doesn't silently
@@ -299,6 +299,33 @@ mod tests {
             text.contains(r#"<meta http-equiv="refresh" content="60"#),
             "retry page must contain meta-refresh tag"
         );
+    }
+
+    #[test]
+    fn channel_closed_returns_retry_page() {
+        let err = WebSocketApiError::AxumError {
+            error: ErrorKind::ChannelClosed,
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn transport_disconnect_returns_retry_page() {
+        let err = WebSocketApiError::AxumError {
+            error: ErrorKind::TransportProtocolDisconnect,
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn node_unavailable_returns_retry_page() {
+        let err = WebSocketApiError::AxumError {
+            error: ErrorKind::NodeUnavailable,
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
