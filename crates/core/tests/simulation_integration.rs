@@ -9411,6 +9411,7 @@ async fn test_nightly_fault_recovery_speed() {
 ///   2. `node-2`, `node-3`, `node-4` (the `GATEWAYS..GATEWAYS + NODES`
 ///      range) ARE live regular-node labels.
 ///   3. `node-5` (one past the end) is NOT a live regular-node label.
+///
 /// Pins the `NodeLabel::node` / `NodeLabel::gateway` string format that
 /// `SimNetwork::config_nodes` and every downstream test query rely on.
 /// Keeping this as a plain `#[test]` (not `#[tokio::test]`) ensures the

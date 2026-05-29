@@ -1019,7 +1019,7 @@ fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
         } else if observed == 0 {
             format!(
                 "No contracts observed yet. Scoring activates after {needed} {n_word} \
-                 have accumulated cost/benefit signals.",
+                 have accumulated cost.",
                 n_word = plural(needed),
             )
         } else if observed < needed {
@@ -1031,7 +1031,7 @@ fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
             };
             format!(
                 "Observed {observed} / {needed} {n_word} needed for statistical scoring. \
-                 Scoring activates once {remaining} more {r_word} {verb} cost/benefit signals.",
+                 Scoring activates once {remaining} more {r_word} {verb} cost.",
                 n_word = plural(needed),
                 r_word = plural(remaining),
             )
