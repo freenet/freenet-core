@@ -45,16 +45,26 @@ A contract with no active demand has near-zero activity cost in the meter. Gover
 
 The intuition "GET + SUBSCRIBE = benefit, PUT + UPDATE = cost" is approximately right but conflates triggers with costs. Cleaner split:
 
-| Benefit (count, decayed)                                | Cost (measured, decayed)                              |
-|---------------------------------------------------------|-------------------------------------------------------|
-| Demand events. *Someone asked us to do work for this.*  | Work performed. *What we actually spent.*             |
-| `local_get` — our client GET'd                          | `exec_cpu_us` — wall-clock CPU across WASM entries    |
-| `forwarded_get` — peer asked us to forward              | `exec_fuel` — wasmtime fuel consumed                  |
-| `local_subscribe` — our client subscribed               | `state_bytes_written` — disk write volume             |
-| `forwarded_subscribe` — downstream peer subscribed      | `broadcast_bytes` — bytes emitted on contract's behalf|
-| `subscriber_minutes` — sustained subscription weighting | `fanout_cost` — Σ(subscriber × per-emit cost)         |
+| Benefit (live snapshot, NOT decayed)                            | Cost (measured, decayed)                              |
+|-----------------------------------------------------------------|-------------------------------------------------------|
+| Current beneficiaries. *Who depends on us hosting this NOW.*    | Work performed. *What we actually spent.*             |
+| `active_local_clients` — local WebSocket clients subscribed now | `exec_cpu_us` — wall-clock CPU across WASM entries    |
+| `active_downstream_subscribers` — downstream peers subscribed now (non-expired lease) | `exec_fuel` — wasmtime fuel consumed            |
+|                                                                 | `state_bytes_written` — disk write volume             |
+|                                                                 | `broadcast_bytes` — bytes emitted on contract's behalf|
 
-PUT and UPDATE disappear from both columns — they're *causes* of cost, the cost shows up in the measured columns. Cleaner because it's what the meter actually records.
+**Benefit is a live snapshot, re-read every reaper tick — not an accumulator.** The implemented model dropped the original accumulate-on-event design (counting GET/SUBSCRIBE *events* and decaying them, with a `subscriber_minutes` weighting). Counting events rewards a contract for *past* activity even after everyone has left; it also let an abuser pad benefit by churning short-lived subscribes. Instead, each tick governance reads the *current standing* beneficiary counts from `HostingManager` and overwrites `benefit_score` with:
+
+```
+benefit = LOCAL_DEMAND_WEIGHT × active_local_clients
+        + FORWARDED_DEMAND_WEIGHT × active_downstream_subscribers
+```
+
+with `LOCAL_DEMAND_WEIGHT = 1.0` (our own users, across the trust boundary) and `FORWARDED_DEMAND_WEIGHT = 0.1` (attacker-rotatable, so weighted low). This is cost-per-*current*-beneficiary. Benefit is never decayed (it's already a fresh read); only cost decays, slowly. A contract that still has subscribers keeps a high benefit; the moment its beneficiaries are all gone its benefit drops to zero on the next tick — and **a contract with cost but ZERO live beneficiaries is the abuser signature** governance exists to flag.
+
+A `benefit_floor` knob (default `0.05`) is applied when forming `log(cost/benefit)`: it keeps the ratio finite for the zero-beneficiary case and sets the "cost is harmless below this benefit-equivalent" knee. It MUST stay strictly below `FORWARDED_DEMAND_WEIGHT` (0.1) so a contract with exactly one real downstream subscriber always scores strictly better than zero beneficiaries.
+
+PUT and UPDATE disappear from the cost column directly — they're *causes* of cost, the cost shows up in the measured columns. Cleaner because it's what the meter actually records.
 
 ### Sybil weighting falls out naturally
 
@@ -173,10 +183,10 @@ The hard question: when a downstream peer is subscribed to a contract through us
 ### Three positions
 
 1. **Absolute obligation.** Never reap while subscribed. One Sybil subscriber = permanent abuse. *Essentially today.*
-2. **Obligation within network norms.** Subscribers add to `benefit_score`, which shifts the contract's position in the network's distribution of log(cost/benefit) ratios. A contract with genuine demand stays out of the outlier tail naturally — the obligation is honored implicitly by the math. When the contract *is* flagged as an outlier **despite** subscriber-buoyed benefit, send explicit unsubscribe-cancellation, then evict.
+2. **Obligation within network norms.** Current subscribers ARE the contract's `benefit_score` (a live snapshot, re-read each tick — not an accumulator), which shifts the contract's position in the network's distribution of log(cost/benefit) ratios. A contract with genuine *current* demand stays out of the outlier tail naturally — the obligation is honored implicitly by the math. When the contract *is* flagged as an outlier **despite** subscriber-buoyed benefit, send explicit unsubscribe-cancellation, then evict.
 3. **Eviction without warning.** Drops subscriber notifications silently. Strictly worse than (2).
 
-**Plan adopts (2)** — mandatory unsubscribe-before-evict. The "honor / exceed" gate is the same MAD-based outlier flag that governs the rest of the reaper. Subscribers don't grant immortality, but they do raise the contract's benefit_score which makes it harder to trip the threshold. No magic per-contract budget.
+**Plan adopts (2)** — mandatory unsubscribe-before-evict. The "honor / exceed" gate is the same MAD-based outlier flag that governs the rest of the reaper. Subscribers don't grant immortality, but each live subscriber raises the contract's snapshot `benefit_score` this tick, making it harder to trip the threshold while the demand is real. No magic per-contract budget.
 
 ### Ban TTL — repeat offenders only
 
@@ -251,7 +261,7 @@ Bugs in governance will be hard to diagnose in the live network. Operators need 
 ### Per-contract view
 
 - Cost score breakdown: `cpu_us`, `fuel`, `state_bytes_written`, `broadcast_bytes`, `fanout_cost`
-- Benefit score breakdown: local/forwarded GETs, local/forwarded SUBSCRIBEs, subscriber-minutes
+- Benefit snapshot breakdown: current `active_local_clients` and `active_downstream_subscribers` (live counts this tick, not accumulated)
 - Current `log(cost/benefit)` and where it sits vs. the threshold
 - Lifecycle state: `Normal | Suspect | WouldReap(dry_run) | Reaped | Banned(expires_at)`
 - Recently-reaped / recently-banned history
@@ -313,10 +323,18 @@ Governance bugs are silent in two directions:
 
 Phase 4 ships governance in `dry_run` mode. During that release, the dashboard logs every *would-reap* decision with full context. Phase 8 (enforce) only ships once dry-run data shows zero would-reap on known-legitimate contracts, would-reap on abusers, and stable distribution statistics.
 
+### Known limitation — cost/benefit attribution is node-local (pre-Enforce gate)
+
+Cost is attributed at the node that performs the state-write work, while benefit is counted from the subscribers *on that same node*. These two are not guaranteed to coincide for a given contract: a node can bear a popular contract's cost (it does the writes / broadcasts) while NOT carrying that contract's subscriptions (the subscribers live on other peers). On such a node the contract reads as "cost without local beneficiaries" — the abuser signature — even though the contract is genuinely popular network-wide.
+
+This is a per-node-role artifact: the same contract scores safely on its subscription hub (where benefit is counted) but can flag on a relay/gateway that only relays its writes. The scoring code intentionally does NOT try to correct for this (no cross-node benefit aggregation in v1 — that would require trusting peer-reported demand, which is attacker-synthesizable).
+
+**Gate before any Enforce flip:** the DryRun observation period must confirm that popular, known-legitimate contracts score safely across ALL node roles they appear on — gateway, relay, and leaf — not just on their subscription hub. If dry-run logs show a popular contract flagged on relay/gateway nodes despite being safe on its hub, Enforce must NOT be flipped until the attribution gap is addressed. (Tracked separately.)
+
 ## Design choices settled
 
 1. **Attribution key:** `ContractInstanceId` (matches existing keying).
-2. **Sybil resistance for benefit:** local/forwarded weighting + subscriber-minutes only. Distinct-peer-identity ranking out of scope for v1.
+2. **Sybil resistance for benefit:** local/forwarded weighting of the live beneficiary snapshot only (local clients weighted 1.0, downstream subscribers 0.1). Distinct-peer-identity ranking out of scope for v1.
 3. **Score persistence:** memory-only.
 4. **Threshold model:** MAD-based outlier detection in log-space (k=5 default). Not hardcoded budgets.
 5. **Shared governance module:** peers and contracts both consume `governance::detect_outliers`.

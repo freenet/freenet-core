@@ -93,28 +93,24 @@ const MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT: usize = 512;
 pub struct AddClientSubscriptionResult {
     /// Whether this was the first client for this contract.
     pub is_first_client: bool,
-    /// Whether this specific `(contract, client_id)` pair was newly
-    /// added (vs. an idempotent repeat call for an already-tracked
-    /// client). Used by the governance scoring layer to gate the
-    /// `ingest_demand` call — without this distinction a client that
-    /// re-subscribes repeatedly would pad the contract's
-    /// `benefit_score` indefinitely. See
-    /// `Ring::add_client_subscription` for the caller-side gating.
-    pub is_new_for_client: bool,
 }
 
 /// Outcome of an `add_downstream_subscriber` call. The variant
 /// distinguishes "the peer was newly added" from "the peer was already
-/// tracked and this call refreshed its lease timestamp" so the
-/// governance scoring layer can gate `ingest_demand` on new-add only.
-/// See `HostingManager::add_downstream_subscriber` for the rationale.
+/// tracked and this call refreshed its lease timestamp".
+///
+/// Governance no longer reacts to these on a per-event basis: benefit
+/// is a live snapshot read each reaper tick from
+/// `downstream_subscriber_count`, so a renewal merely extends a lease
+/// the snapshot already counts. The variant is retained because callers
+/// still distinguish accept-vs-reject and new-vs-renewal for
+/// subscription bookkeeping and telemetry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddSubscriberOutcome {
     /// Peer is now tracked for this contract; was not before.
-    /// Governance treats this as fresh demand evidence.
     NewAdd,
     /// Peer was already tracked; this call refreshed the lease
-    /// timestamp. Governance must NOT count this as fresh demand.
+    /// timestamp.
     Renewal,
     /// Per-contract subscriber cap reached; this is a new peer that
     /// was rejected. Equivalent to the old `false` return.
@@ -612,11 +608,10 @@ impl HostingManager {
     ) -> AddClientSubscriptionResult {
         let mut entry = self.client_subscriptions.entry(*instance_id).or_default();
         let is_first_client = entry.is_empty();
-        // HashSet::insert returns true if the value was newly added.
-        // Capture this so the governance scoring layer can gate
-        // `ingest_demand` to new-adds only — otherwise a client that
-        // repeatedly re-subscribes for the same contract would pad
-        // demand by `LOCAL_DEMAND_WEIGHT × N` per N calls.
+        // Idempotent re-subscribe (same client + same contract) no
+        // longer needs special handling for governance: benefit is a
+        // live snapshot of `local_client_count`, so a duplicate insert
+        // into the set is a no-op and cannot inflate the count.
         let is_new_for_client = entry.insert(client_id);
         debug!(
             contract = %instance_id,
@@ -625,10 +620,7 @@ impl HostingManager {
             is_new_for_client,
             "add_client_subscription: registered"
         );
-        AddClientSubscriptionResult {
-            is_first_client,
-            is_new_for_client,
-        }
+        AddClientSubscriptionResult { is_first_client }
     }
 
     /// Remove a client subscription.
@@ -791,6 +783,127 @@ impl HostingManager {
         self.downstream_subscribers
             .get(contract)
             .is_some_and(|peers| !peers.is_empty())
+    }
+
+    /// Number of local (WebSocket) clients currently subscribed to this
+    /// contract. Used by governance to compute the live beneficiary
+    /// snapshot (the strong, hard-to-fake demand signal). Reads
+    /// `client_subscriptions`, which is keyed by `ContractInstanceId`
+    /// and pruned on client disconnect, so the count is the
+    /// currently-active set.
+    ///
+    /// The production reaper-tick path no longer calls this per-contract
+    /// accessor (it uses the single-pass [`beneficiary_counts`] bulk
+    /// builder instead); this remains as the per-contract reference used
+    /// by the governance unit tests and the test-only `Ring` accessors.
+    #[cfg(test)]
+    pub(crate) fn local_client_count(&self, instance_id: &ContractInstanceId) -> usize {
+        self.client_subscriptions
+            .get(instance_id)
+            .map(|clients| clients.len())
+            .unwrap_or(0)
+    }
+
+    /// Number of downstream peers with a CURRENTLY-ACTIVE (non-expired)
+    /// subscription lease for this contract. Used by governance to
+    /// compute the live beneficiary snapshot (weak, attacker-rotatable
+    /// demand signal).
+    ///
+    /// `downstream_subscribers` is keyed by `ContractKey`, while
+    /// governance keys on `ContractInstanceId`. A `ContractInstanceId`
+    /// does not uniquely determine the parameters half of a
+    /// `ContractKey`, so we match by instance id and sum across any
+    /// matching keys (in practice a node hosts a single key per
+    /// instance id, but this is correct regardless).
+    ///
+    /// Lease expiry: this mirrors `expire_stale_downstream_subscribers`
+    /// — a lease is active iff it was renewed within
+    /// `SUBSCRIPTION_LEASE_DURATION`. We count only non-expired leases
+    /// WITHOUT mutating the map (read-only), so a contract whose leases
+    /// have all gone stale (but not yet been swept) correctly reports
+    /// zero current beneficiaries this tick. The periodic
+    /// `expire_stale_downstream_subscribers` sweep does the actual
+    /// pruning; this count must not depend on that sweep having run.
+    ///
+    /// The production reaper-tick path no longer calls this per-contract
+    /// accessor (it uses the single-pass [`beneficiary_counts`] bulk
+    /// builder instead); this remains as the per-contract reference used
+    /// by the governance unit tests and the test-only `Ring` accessors.
+    #[cfg(test)]
+    pub(crate) fn downstream_subscriber_count(&self, instance_id: &ContractInstanceId) -> usize {
+        let now = self.time_source.now();
+        self.downstream_subscribers
+            .iter()
+            .filter(|entry| entry.key().id() == instance_id)
+            .map(|entry| {
+                entry
+                    .value()
+                    .values()
+                    .filter(|last_renewed| {
+                        now.duration_since(**last_renewed) < SUBSCRIPTION_LEASE_DURATION
+                    })
+                    .count()
+            })
+            .sum()
+    }
+
+    /// Build the live beneficiary-weighted benefit value for every
+    /// contract instance with at least one current beneficiary, in a
+    /// SINGLE pass over `client_subscriptions` and
+    /// `downstream_subscribers`. Returns
+    /// `LOCAL_DEMAND_WEIGHT × active_local_clients +
+    ///  FORWARDED_DEMAND_WEIGHT × active_downstream_subscribers` keyed
+    /// by `ContractInstanceId`.
+    ///
+    /// This is the bulk equivalent of calling
+    /// `local_client_count` + `downstream_subscriber_count` per
+    /// contract, but avoids the O(N×M) cost of re-scanning the full
+    /// `downstream_subscribers` map once per tracked contract on every
+    /// reaper tick. The downstream lease-validity rule here MUST match
+    /// `downstream_subscriber_count` exactly: a lease counts iff it was
+    /// renewed within `SUBSCRIPTION_LEASE_DURATION` (read-only, no
+    /// sweep). `downstream_subscribers` is keyed by `ContractKey` but
+    /// governance keys on `ContractInstanceId`, so downstream counts are
+    /// summed across all keys sharing an instance id.
+    ///
+    /// The caller is responsible for filtering the result to the set of
+    /// contracts governance is actually tracking (a contract with
+    /// beneficiaries but no ingested cost has no score and must not be
+    /// added to the benefit map).
+    pub(crate) fn beneficiary_counts(
+        &self,
+        local_weight: f64,
+        forwarded_weight: f64,
+    ) -> HashMap<ContractInstanceId, f64> {
+        let now = self.time_source.now();
+        let mut benefits: HashMap<ContractInstanceId, f64> = HashMap::new();
+
+        // Pass 1: local-client beneficiaries.
+        for entry in self.client_subscriptions.iter() {
+            let count = entry.value().len();
+            if count > 0 {
+                *benefits.entry(*entry.key()).or_insert(0.0) += local_weight * count as f64;
+            }
+        }
+
+        // Pass 2: downstream-peer beneficiaries, counting only
+        // lease-valid entries exactly as `downstream_subscriber_count`
+        // does, and grouping by instance id.
+        for entry in self.downstream_subscribers.iter() {
+            let active = entry
+                .value()
+                .values()
+                .filter(|last_renewed| {
+                    now.duration_since(**last_renewed) < SUBSCRIPTION_LEASE_DURATION
+                })
+                .count();
+            if active > 0 {
+                *benefits.entry(*entry.key().id()).or_insert(0.0) +=
+                    forwarded_weight * active as f64;
+            }
+        }
+
+        benefits
     }
 
     /// Whether something still depends on this node hosting `contract` — a
@@ -2640,6 +2753,218 @@ mod tests {
     }
 
     // =========================================================================
+    // Governance Beneficiary-Count Accessor Tests
+    // =========================================================================
+    //
+    // These tests pin `downstream_subscriber_count` and
+    // `local_client_count`, the live-beneficiary accessors governance
+    // reads each reaper tick. Time is controlled deterministically by
+    // inserting explicit `tokio::time::Instant` lease timestamps into
+    // `downstream_subscribers` (the same technique the expiry-sweep
+    // tests above use) — under `#[tokio::test(start_paused = true)]`
+    // tokio's `Instant` clock is frozen, so a timestamp computed as
+    // `Instant::now() - D` is observed exactly `D` in the past by the
+    // read inside the accessor.
+
+    /// Active (recently-renewed) downstream leases are counted.
+    #[tokio::test(start_paused = true)]
+    async fn downstream_subscriber_count_counts_active_leases() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(1);
+        let instance_id = *contract.id();
+
+        assert_eq!(manager.downstream_subscriber_count(&instance_id), 0);
+
+        manager.add_downstream_subscriber(&contract, make_peer_key(10));
+        manager.add_downstream_subscriber(&contract, make_peer_key(20));
+
+        assert_eq!(
+            manager.downstream_subscriber_count(&instance_id),
+            2,
+            "two freshly-added downstream leases must be counted"
+        );
+    }
+
+    /// A stale-but-unswept lease (renewed longer ago than
+    /// `SUBSCRIPTION_LEASE_DURATION`) is NOT counted, even though the
+    /// expiry sweep has not run to prune it. The accessor must compute
+    /// liveness itself, not depend on the sweep.
+    #[tokio::test(start_paused = true)]
+    async fn downstream_subscriber_count_excludes_stale_unswept_lease() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(1);
+        let instance_id = *contract.id();
+        let peer = make_peer_key(10);
+
+        manager.add_downstream_subscriber(&contract, peer.clone());
+        assert_eq!(manager.downstream_subscriber_count(&instance_id), 1);
+
+        // Backdate the lease past the lease duration WITHOUT calling
+        // expire_stale_downstream_subscribers.
+        if let Some(mut peers) = manager.downstream_subscribers.get_mut(&contract) {
+            peers.insert(
+                peer,
+                Instant::now() - SUBSCRIPTION_LEASE_DURATION - Duration::from_secs(1),
+            );
+        }
+
+        // The map entry still exists (no sweep ran)...
+        assert!(manager.downstream_subscribers.contains_key(&contract));
+        // ...but the stale lease must not be counted.
+        assert_eq!(
+            manager.downstream_subscriber_count(&instance_id),
+            0,
+            "a stale-but-unswept lease must not count as a live beneficiary"
+        );
+    }
+
+    /// The exact `SUBSCRIPTION_LEASE_DURATION` boundary is NOT counted
+    /// (the liveness check is strict `<`, so a lease aged exactly the
+    /// lease duration has just expired).
+    #[tokio::test(start_paused = true)]
+    async fn downstream_subscriber_count_boundary_is_exclusive() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(1);
+        let instance_id = *contract.id();
+        let peer = make_peer_key(10);
+
+        manager.add_downstream_subscriber(&contract, peer.clone());
+
+        // Exactly at the boundary: age == SUBSCRIPTION_LEASE_DURATION.
+        if let Some(mut peers) = manager.downstream_subscribers.get_mut(&contract) {
+            peers.insert(peer.clone(), Instant::now() - SUBSCRIPTION_LEASE_DURATION);
+        }
+        assert_eq!(
+            manager.downstream_subscriber_count(&instance_id),
+            0,
+            "a lease aged exactly SUBSCRIPTION_LEASE_DURATION is expired (strict <)"
+        );
+
+        // Just inside the boundary: still live.
+        if let Some(mut peers) = manager.downstream_subscribers.get_mut(&contract) {
+            peers.insert(
+                peer,
+                Instant::now() - SUBSCRIPTION_LEASE_DURATION + Duration::from_millis(1),
+            );
+        }
+        assert_eq!(
+            manager.downstream_subscriber_count(&instance_id),
+            1,
+            "a lease just inside SUBSCRIPTION_LEASE_DURATION is still live"
+        );
+    }
+
+    /// Downstream counts are aggregated by `ContractInstanceId`
+    /// regardless of the `ContractKey`'s code-hash half (governance keys
+    /// on instance id, while `downstream_subscribers` keys on the full
+    /// `ContractKey`). The accessor matches `entry.key().id()` and sums,
+    /// so all peers under any key sharing the instance id are counted.
+    #[tokio::test(start_paused = true)]
+    async fn downstream_subscriber_count_sums_across_keys_sharing_instance_id() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let instance_id = ContractInstanceId::new([7; 32]);
+        // Two ContractKeys with the SAME instance id but different code
+        // hashes. (Note: ContractKey equality is by instance id, so these
+        // share a `downstream_subscribers` map entry — the accessor's
+        // instance-id matching must count every peer under that id.)
+        let key_a = ContractKey::from_id_and_code(instance_id, CodeHash::new([1; 32]));
+        let key_b = ContractKey::from_id_and_code(instance_id, CodeHash::new([2; 32]));
+        assert_eq!(key_a.id(), key_b.id());
+
+        manager.add_downstream_subscriber(&key_a, make_peer_key(10));
+        manager.add_downstream_subscriber(&key_a, make_peer_key(20));
+        manager.add_downstream_subscriber(&key_b, make_peer_key(30));
+
+        assert_eq!(
+            manager.downstream_subscriber_count(&instance_id),
+            3,
+            "downstream count must count all peers under any key sharing the instance id"
+        );
+    }
+
+    /// `local_client_count`: 0 / N clients / after a client removal.
+    #[tokio::test(start_paused = true)]
+    async fn local_client_count_zero_n_and_after_removal() {
+        use crate::client_events::ClientId;
+
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let instance_id = ContractInstanceId::new([5; 32]);
+
+        // 0 clients.
+        assert_eq!(manager.local_client_count(&instance_id), 0);
+
+        // N clients.
+        let c1 = ClientId::next();
+        let c2 = ClientId::next();
+        let c3 = ClientId::next();
+        manager.add_client_subscription(&instance_id, c1);
+        manager.add_client_subscription(&instance_id, c2);
+        manager.add_client_subscription(&instance_id, c3);
+        assert_eq!(manager.local_client_count(&instance_id), 3);
+
+        // After a removal.
+        manager.remove_client_subscription(&instance_id, c2);
+        assert_eq!(
+            manager.local_client_count(&instance_id),
+            2,
+            "removing one client must decrement the live local-client count"
+        );
+    }
+
+    /// `beneficiary_counts` bulk accessor must produce the same value as
+    /// the per-contract `LOCAL*locals + FORWARDED*downstreams`
+    /// computation, including lease-validity filtering and summing
+    /// across keys sharing an instance id.
+    #[tokio::test(start_paused = true)]
+    async fn beneficiary_counts_matches_per_contract_computation() {
+        use crate::client_events::ClientId;
+        const LOCAL: f64 = 1.0;
+        const FORWARDED: f64 = 0.1;
+
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+
+        // Contract A: 2 local clients + 1 live downstream.
+        let inst_a = ContractInstanceId::new([1; 32]);
+        let key_a = ContractKey::from_id_and_code(inst_a, CodeHash::new([10; 32]));
+        manager.add_client_subscription(&inst_a, ClientId::next());
+        manager.add_client_subscription(&inst_a, ClientId::next());
+        manager.add_downstream_subscriber(&key_a, make_peer_key(1));
+
+        // Contract B: downstream across two keys sharing the instance id,
+        // one of which is stale.
+        let inst_b = ContractInstanceId::new([2; 32]);
+        let key_b1 = ContractKey::from_id_and_code(inst_b, CodeHash::new([20; 32]));
+        let key_b2 = ContractKey::from_id_and_code(inst_b, CodeHash::new([21; 32]));
+        manager.add_downstream_subscriber(&key_b1, make_peer_key(2));
+        let stale_peer = make_peer_key(3);
+        manager.add_downstream_subscriber(&key_b2, stale_peer.clone());
+        if let Some(mut peers) = manager.downstream_subscribers.get_mut(&key_b2) {
+            peers.insert(
+                stale_peer,
+                Instant::now() - SUBSCRIPTION_LEASE_DURATION - Duration::from_secs(1),
+            );
+        }
+
+        let bulk = manager.beneficiary_counts(LOCAL, FORWARDED);
+
+        // Compare against the per-contract accessors for every instance
+        // id present in the bulk map.
+        for inst in [inst_a, inst_b] {
+            let expected = LOCAL * manager.local_client_count(&inst) as f64
+                + FORWARDED * manager.downstream_subscriber_count(&inst) as f64;
+            let got = bulk.get(&inst).copied().unwrap_or(0.0);
+            assert!(
+                (got - expected).abs() < 1e-12,
+                "instance {inst}: bulk {got} != per-contract {expected}"
+            );
+        }
+
+        // Concrete values: A = 1*2 + 0.1*1 = 2.1; B = 0.1*1 = 0.1.
+        assert!((bulk[&inst_a] - 2.1).abs() < 1e-12);
+        assert!((bulk[&inst_b] - 0.1).abs() < 1e-12);
+    }
+
+    // =========================================================================
     // Unsubscribe Handler Logic Tests
     // =========================================================================
 
@@ -3202,12 +3527,12 @@ mod tests {
         );
     }
 
-    /// Sybil-resistance pin: `add_downstream_subscriber` MUST distinguish
-    /// a genuine new add from a renewal so the governance scoring layer
-    /// can gate `ingest_demand` on new-add only. Without this distinction,
-    /// a peer renewing every 2 minutes would pad benefit_score by
-    /// `FORWARDED_DEMAND_WEIGHT × 30 = 3.0 per hour` — the equivalent of
-    /// 30 distinct subscribers from one rotating peer.
+    /// `add_downstream_subscriber` MUST distinguish a genuine new add
+    /// from a renewal. Governance no longer consumes this distinction
+    /// (benefit is a live snapshot of the current lease-valid subscriber
+    /// set, so renewals cannot inflate it), but subscription bookkeeping
+    /// and telemetry still rely on knowing whether a registration added
+    /// a new peer or merely refreshed an existing lease.
     #[test]
     fn add_downstream_subscriber_distinguishes_new_add_from_renewal() {
         let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
@@ -3225,9 +3550,7 @@ mod tests {
         assert_eq!(
             manager.add_downstream_subscriber(&contract, peer.clone()),
             AddSubscriberOutcome::Renewal,
-            "repeated registration of the same peer must be Renewal — \
-             otherwise the governance demand-ingest gate is bypassed and \
-             a churning peer pads benefit_score indefinitely"
+            "repeated registration of the same peer must be Renewal, not NewAdd"
         );
 
         // Third call also Renewal — no escalation back to NewAdd.

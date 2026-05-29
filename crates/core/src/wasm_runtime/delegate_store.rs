@@ -115,6 +115,19 @@ impl DelegateStore {
 
         tracing::debug!("Total delegate index entries: {}", key_to_code_part.len());
 
+        // Migrate any delegate WASM files written under the legacy lowercased
+        // Base58 name to the canonical mixed-case name (issue #4214). The .reg
+        // records are keyed by DelegateKey::encode(), which never lowercased, so
+        // only the code_hash-named .wasm files need migrating to stay reachable
+        // across the stdlib CodeHash::encode case-fix.
+        for entry in key_to_code_part.iter() {
+            super::migrate_legacy_lowercased_code_file(
+                &delegates_dir,
+                &entry.value().encode(),
+                "wasm",
+            );
+        }
+
         Ok(Self {
             delegate_cache: MokaCache::builder()
                 .max_capacity(max_size)

@@ -2,20 +2,35 @@
 
 We welcome contributions to Freenet! Here's what you need to know.
 
-## Before You Start
+## What Needs an Issue First
 
-- **Get agreement on an issue first.** For anything beyond trivial fixes, open or comment on an issue describing what you want to do and wait for a maintainer to confirm the approach before writing code. A maintainer saying "yes, a PR for this is welcome" is the green light.
-- **Read the codebase conventions.** See [AGENTS.md](AGENTS.md) for project structure, coding standards, and testing requirements.
-- **Ask questions.** If something is unclear, ask on the issue or in our [Matrix channel](https://matrix.to/#/#freenet:matrix.org) before writing code.
+Reviewer attention is the scarcest resource on this project, and code is now cheap to generate. To keep the review queue tractable, contributions fall into two buckets:
 
-## Review Capacity
+**Accepted without prior discussion:**
 
-Reviewer attention is the scarcest resource on this project, and code is now cheap to generate. To keep the review queue tractable we have to be explicit about what we can promise:
+- Bug fixes (that don't change intended behavior).
+- Performance improvements that aren't overreaching and don't change behavior.
+- Typo fixes, documentation corrections, and obvious one-line changes.
 
-- **Non-trivial PRs opened without prior agreement on an issue may be closed unreviewed.** This isn't personal — we simply can't commit to reviewing speculative work. Reopening is welcome after the issue discussion happens and a maintainer signs off on the approach.
-- **Trivial PRs are still welcome cold.** Typo fixes, obvious one-line bugfixes, documentation corrections, and similarly small changes don't need pre-agreement. Use your judgment; if in doubt, file an issue first.
+**Requires an approved issue first:**
+
+- **Any feature change or new feature.** Open an issue describing what you want to do and wait for a maintainer to confirm the approach *before* writing code. A maintainer explicitly saying "yes, a PR for this is welcome" is the green light — silence is not approval.
+- **Anything that changes behavior, adds scope, or reshapes an API**, even if it started life as a bug fix or a refactor.
+
+**Feature PRs opened without an approved issue will be auto-closed.** This isn't personal — we cannot commit to reviewing speculative feature work, and unsolicited feature PRs are now the dominant source of review load. Reopening is welcome once the issue discussion happens and a maintainer signs off on the approach.
+
+When in doubt about which bucket you're in, file an issue first. It costs you a round-trip; guessing wrong costs you the whole PR.
+
+### Scope discipline
+
+- **One logical change per PR.** Bundling a feature into a "bug fix," or letting a focused change accrete unrelated cleanup, is scope creep and a reason to close the PR pending an issue-level conversation — regardless of whether the extra change is good on its own merits.
 - **The submitter is responsible for the PR.** Whatever tools you used to produce it, you must understand the change well enough to defend the design choices, answer reviewer questions, and revise it. "I'm not sure, the AI wrote it" is grounds for closing the PR.
 - **Volume is a signal.** A burst of unrelated PRs from a new contributor will be treated as a single batch and likely closed pending an issue-level conversation about what you'd actually like to work on.
+
+## Before You Start
+
+- **Read the codebase conventions.** See [AGENTS.md](AGENTS.md) for project structure, coding standards, and testing requirements.
+- **Ask questions.** If something is unclear, ask on the issue or in our [Matrix channel](https://matrix.to/#/#freenet:matrix.org) before writing code.
 
 ## Quality Standards
 
