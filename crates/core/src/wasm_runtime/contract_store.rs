@@ -51,6 +51,18 @@ impl ContractStore {
             }
         }
 
+        // Migrate any contract WASM files written under the legacy lowercased
+        // Base58 name to the canonical mixed-case name (issue #4214) so the
+        // fetch paths below, which use `code_hash.encode()`, still find code
+        // persisted before the stdlib CodeHash::encode case-fix.
+        for entry in key_to_code_part.iter() {
+            super::migrate_legacy_lowercased_code_file(
+                &contracts_dir,
+                &entry.value().encode(),
+                "wasm",
+            );
+        }
+
         Ok(Self {
             contract_cache: MokaCache::builder()
                 .max_capacity(max_size)
