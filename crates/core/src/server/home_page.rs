@@ -37,13 +37,46 @@ fn homepage_html() -> String {
     let ops_card = build_ops_card(&snap);
     let transfer_card = build_transfer_card(&snap);
 
+    let peer_id = snap
+        .as_ref()
+        .and_then(|s| {
+            if s.ring_stats.peer_id.is_empty() {
+                None
+            } else {
+                Some(s.ring_stats.peer_id.as_str())
+            }
+        })
+        .unwrap_or("?");
+    let pub_key = snap
+        .as_ref()
+        .and_then(|s| {
+            if s.ring_stats.own_pub_key.is_empty() {
+                None
+            } else {
+                Some(s.ring_stats.own_pub_key.as_str())
+            }
+        })
+        .unwrap_or("?");
+    let peer_copy_btn = if peer_id == "?" {
+        String::new()
+    } else {
+        r#"<button class="copy-btn" onclick="copyToClipboard(document.getElementById('peer-id').textContent).then(function(){showToast('Peer ID copied')})" title="Copy peer ID">&#x2398;</button>"#
+            .to_string()
+    };
+    let pub_copy_btn = if pub_key == "?" {
+        String::new()
+    } else {
+        r#"<button class="copy-btn" onclick="copyToClipboard(document.getElementById('pub-key').textContent).then(function(){showToast('Pub key copied')})" title="Copy public key">&#x2398;</button>"#
+            .to_string()
+    };
+
     format!(
         r##"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Freenet — Local Peer</title>
+    <title>FN Peer</title>
     <link rel="icon" type="image/svg+xml" href="{favicon}">
     <style>{CSS}</style>
     <script>{JS}</script>
@@ -56,6 +89,10 @@ fn homepage_html() -> String {
             <span class="header-scope">Local Peer</span>
             <span class="badge" id="version-badge" data-version="{version}">v{version}</span>
             <a class="update-badge" id="update-badge" href="https://github.com/freenet/freenet-core/releases/latest" target="_blank" rel="noopener noreferrer" hidden>Update available</a>
+            <span class="pub-key-label">Peer ID</span>
+            <code class="pub-key" id="peer-id" title="Click to copy">{peer_id}</code>{peer_copy_btn}
+            <span class="pub-key-label">Pub key</span>
+            <code class="pub-key" id="pub-key" title="Click to copy">{pub_key}</code>{pub_copy_btn}
         </div>
         <div class="header-right">
             <span class="uptime">Up {uptime}</span>
@@ -106,6 +143,10 @@ fn homepage_html() -> String {
         favicon = favicon,
         version = html_escape(version),
         uptime = uptime,
+        peer_id = html_escape(peer_id),
+        peer_copy_btn = peer_copy_btn,
+        pub_key = html_escape(pub_key),
+        pub_copy_btn = pub_copy_btn,
         status_card = status_card,
         peers_card = peers_card,
         transfer_card = transfer_card,
@@ -193,7 +234,7 @@ fn build_favicon_data_uri(snap: &Option<network_status::NetworkStatusSnapshot>) 
     // Color is pre-encoded for data URI (# → %23) to avoid scanning the entire SVG.
     let color = match snap {
         None => "%239e9e9e",                              // grey — starting up
-        Some(s) if s.open_connections > 0 => "%23007FFF", // blue — connected
+        Some(s) if s.open_connections > 0 => "%230abab5", // teal — connected
         Some(s) if s.nat_stats.attempts > 0 && s.nat_stats.successes == 0 => "%238b0000", // dark red — NAT problems
         Some(s) if !s.failures.is_empty() => "%23f44336", // red — connection issues
         Some(_) => "%23fbbf24",                           // amber — connecting
@@ -278,6 +319,27 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
     } else {
         String::new()
     };
+
+    // Ring stats row: connection count, hosted contracts, connection attempts
+    let ring_stats_html = format!(
+        r#"<div class="metrics-row">
+            <div class="metric-tile">
+                <span class="metric-value">{conns}</span>
+                <span class="metric-label">Ring peers</span>
+            </div>
+            <div class="metric-tile">
+                <span class="metric-value">{hosted}</span>
+                <span class="metric-label">Hosted contracts</span>
+            </div>
+            <div class="metric-tile">
+                <span class="metric-value">{attempts}</span>
+                <span class="metric-label">Conn attempts</span>
+            </div>
+        </div>"#,
+        conns = snap.ring_stats.connection_count,
+        hosted = snap.ring_stats.hosted_contracts,
+        attempts = snap.connection_attempts,
+    );
 
     let spinner = if snap.open_connections == 0 {
         r#"<div class="spinner"></div>"#
@@ -393,6 +455,7 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
         r#"<div class="card">
             <h2>Connection Status</h2>
             {health_banner}
+            {ring_stats_html}
             {external_addr_html}
             {spinner}
             {gateway_warning}
@@ -400,6 +463,7 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
             {failures_html}
         </div>"#,
         health_banner = health_banner,
+        ring_stats_html = ring_stats_html,
         external_addr_html = external_addr_html,
         spinner = spinner,
         gateway_warning = gateway_warning,
@@ -429,24 +493,101 @@ fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> 
     let Some(snap) = snap else {
         return String::new();
     };
-    if snap.bytes_uploaded == 0 && snap.bytes_downloaded == 0 && snap.open_connections == 0 {
+    // Always show the card once the node has been up for more than a few
+    // seconds — initial connection flapping shouldn't make the panel
+    // appear/disappear rhythmically during auto-refresh.
+    if snap.bytes_uploaded == 0 && snap.bytes_downloaded == 0 && snap.elapsed_secs < 10 {
         return String::new();
     }
+
+    let ts = &snap.transport_snapshot;
+
+    let peak_tput = if ts.peak_throughput_bps > 0 {
+        format!(
+            " <span class=\"transfer-detail\">(peak {}/s)</span>",
+            format_bytes(ts.peak_throughput_bps)
+        )
+    } else {
+        String::new()
+    };
+
+    let rtt_str = if ts.avg_rtt_us > 0 {
+        format!(
+            r#"<div class="transfer-stat">
+                <span class="transfer-label">RTT (avg/min/max)</span>
+                <span class="transfer-value">{avg}ms / {min}ms / {max}ms</span>
+            </div>"#,
+            avg = format_args!("{:.1}", ts.avg_rtt_us as f64 / 1000.0),
+            min = format_args!("{:.1}", ts.min_rtt_us as f64 / 1000.0),
+            max = format_args!("{:.1}", ts.max_rtt_us as f64 / 1000.0),
+        )
+    } else {
+        String::new()
+    };
+
+    let cwnd_str = if ts.avg_cwnd_bytes > 0 {
+        format!(
+            r#"<div class="transfer-stat">
+                <span class="transfer-label">cwnd (avg/peak/min)</span>
+                <span class="transfer-value">{avg} / {peak} / {min}</span>
+            </div>"#,
+            avg = format_bytes(ts.avg_cwnd_bytes as u64),
+            peak = format_bytes(ts.peak_cwnd_bytes as u64),
+            min = format_bytes(ts.min_cwnd_bytes as u64),
+        )
+    } else {
+        String::new()
+    };
+
+    let slowdown_str = if ts.slowdowns_triggered > 0 {
+        format!(
+            r#"<div class="transfer-stat">
+                <span class="transfer-label">LEDBAT slowdowns</span>
+                <span class="transfer-value">{s}</span>
+            </div>"#,
+            s = ts.slowdowns_triggered,
+        )
+    } else {
+        String::new()
+    };
+
+    let xfer_str = if ts.transfers_completed > 0 || ts.transfers_failed > 0 {
+        format!(
+            r#"<div class="transfer-stat">
+                <span class="transfer-label">Transfers (avg time)</span>
+                <span class="transfer-value">{ok} ok / {fail} fail <span class="transfer-detail">({avg}s avg)</span></span>
+            </div>"#,
+            ok = ts.transfers_completed,
+            fail = ts.transfers_failed,
+            avg = format_args!("{:.3}", ts.avg_transfer_time_ms as f64 / 1000.0),
+        )
+    } else {
+        String::new()
+    };
 
     format!(
         r#"<div class="card">
             <h2>Data Transfer</h2>
             <div class="transfer-stat">
                 <span class="transfer-label">Uploaded</span>
-                <span class="transfer-value">{uploaded}</span>
+                <span class="transfer-value">{uploaded}{peak_tput}</span>
             </div>
             <div class="transfer-stat">
                 <span class="transfer-label">Downloaded</span>
                 <span class="transfer-value">{downloaded}</span>
             </div>
+            {xfer_str}
+            {rtt_str}
+            {cwnd_str}
+            {slowdown_str}
         </div>"#,
         uploaded = format_bytes(snap.bytes_uploaded),
+        peak_tput = peak_tput,
         downloaded = format_bytes(snap.bytes_downloaded),
+        xfer_str = xfer_str,
+        rtt_str = rtt_str,
+        cwnd_str = cwnd_str,
+        slowdown_str = slowdown_str,
     )
 }
 
@@ -572,17 +713,25 @@ fn build_ring_svg(
         "<div class=\"ring-wrap\"><svg viewBox=\"0 0 {size:.0} {size:.0}\" class=\"ring-svg\" preserveAspectRatio=\"xMidYMid meet\">"
     );
 
+    // Show the inner ring when there are *any* contracts to display
+    // (governance-flagged OR hosted).  Without this the hosted dots
+    // render orphaned on an invisible ring.
+    let has_inner_ring =
+        governance.is_some_and(|g| !g.contracts.is_empty()) || !hosted_contracts.is_empty();
+
     // === Background rings ===
     write!(
         svg,
         "<circle cx=\"{cx}\" cy=\"{cy}\" r=\"{r_outer}\" fill=\"none\" stroke=\"#363c4a\" stroke-width=\"1\"/>"
     )
     .ok();
-    write!(
-        svg,
-        "<circle cx=\"{cx}\" cy=\"{cy}\" r=\"{r_inner}\" fill=\"none\" stroke=\"#363c4a\" stroke-width=\"1\"/>"
-    )
-    .ok();
+    if has_inner_ring {
+        write!(
+            svg,
+            "<circle cx=\"{cx}\" cy=\"{cy}\" r=\"{r_inner}\" fill=\"none\" stroke=\"#363c4a\" stroke-width=\"1\"/>"
+        )
+        .ok();
+    }
 
     // Helper: location (0.0..1.0) → (x, y) on a ring of given radius.
     // 0.0 is at the top, increasing clockwise.
@@ -617,28 +766,44 @@ fn build_ring_svg(
         y = cy - r_outer - 8.0,
     )
     .ok();
-    write!(
-        svg,
-        "<text x=\"{cx}\" y=\"{y:.1}\" text-anchor=\"middle\" fill=\"#6b7280\" font-family=\"monospace\" font-size=\"9\" letter-spacing=\"0.18em\">CONTRACTS</text>",
-        y = cy - r_inner - 8.0,
-    )
-    .ok();
+    if has_inner_ring {
+        write!(
+            svg,
+            "<text x=\"{cx}\" y=\"{y:.1}\" text-anchor=\"middle\" fill=\"#6b7280\" font-family=\"monospace\" font-size=\"9\" letter-spacing=\"0.18em\">CONTRACTS</text>",
+            y = cy - r_inner - 8.0,
+        )
+        .ok();
+    }
 
     let own_xy = own_location.map(|loc| loc_to_xy(loc, r_outer));
 
     // === Connection curves: YOU → peers ===
-    // Only drawn if we know our own location; otherwise we can't
-    // anchor them. Bezier through the interior so the path looks
-    // like a routing arc, not a chord.
+    // Stroke width scales with total bytes transferred to this peer,
+    // giving a visual "data flow" indication.  Floor at 0.6 so even
+    // idle peers are visible; ceiling at 3.0 for the busiest peer.
+    // Gateways get a warm amber arc, regular peers a teal one.
     if let Some((ox, oy)) = own_xy {
+        // Find max transfer for relative scaling
+        let max_xfer = peers
+            .iter()
+            .map(|p| p.bytes_sent.saturating_add(p.bytes_received))
+            .max()
+            .unwrap_or(1)
+            .max(1);
         for p in peers {
             if let Some(ploc) = p.location {
                 let (px, py) = loc_to_xy(ploc, r_outer);
-                let stroke = if p.is_gateway { "#ffb610" } else { "#66d9ff" };
+                let total = p.bytes_sent.saturating_add(p.bytes_received);
+                let sw = 0.6 + 2.4 * (total as f64 / max_xfer as f64);
+                let (stroke, opacity) = if p.is_gateway {
+                    ("#f0a030", 0.55)
+                } else {
+                    ("#0abab5", 0.45)
+                };
                 let path = curve_path(ox, oy, px, py, 0.55);
                 write!(
                     svg,
-                    "<path d=\"{path}\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"1\" stroke-opacity=\"0.35\"/>"
+                    "<path d=\"{path}\" fill=\"none\" stroke=\"{stroke}\" stroke-width=\"{sw:.1}\" stroke-opacity=\"{opacity}\" stroke-linecap=\"round\"/>"
                 )
                 .ok();
             }
@@ -780,7 +945,7 @@ fn build_ring_svg(
         let (ox, oy) = loc_to_xy(own_loc, r_outer);
         write!(
             svg,
-            "<g class=\"ring-self\"><title>You (loc {own_loc:.4})</title><circle cx=\"{ox:.1}\" cy=\"{oy:.1}\" r=\"6\" fill=\"#43c178\" stroke=\"#ebecf0\" stroke-width=\"1.5\"/><text x=\"{lx:.1}\" y=\"{ly:.1}\" text-anchor=\"middle\" fill=\"#43c178\" font-family=\"monospace\" font-size=\"9\" font-weight=\"500\" letter-spacing=\"0.05em\">YOU</text></g>",
+            "<g class=\"ring-self\"><title>You (loc {own_loc:.4})</title><circle cx=\"{ox:.1}\" cy=\"{oy:.1}\" r=\"6\" fill=\"#43c178\" stroke=\"#ebecf0\" stroke-width=\"1.5\" class=\"you-dot\"/><text x=\"{lx:.1}\" y=\"{ly:.1}\" text-anchor=\"middle\" fill=\"#43c178\" font-family=\"monospace\" font-size=\"9\" font-weight=\"500\" letter-spacing=\"0.05em\">YOU</text></g>",
             lx = ox,
             ly = oy + 18.0,
         )
@@ -1076,20 +1241,31 @@ fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
             .map(|v| format!("{:+.2}", v))
             .unwrap_or_else(|| "—".to_string());
         let age = format_ago(c.age_secs);
+        let state_rank = match c.state {
+            network_status::GovernanceStateSnapshot::Banned => 0u8,
+            network_status::GovernanceStateSnapshot::Evicted => 1,
+            network_status::GovernanceStateSnapshot::WouldEvict => 2,
+            network_status::GovernanceStateSnapshot::Borderline => 3,
+            network_status::GovernanceStateSnapshot::Normal => 4,
+        };
+        let log_ratio_sort = c.log_ratio.map(|v| format!("{v:.6}")).unwrap_or_default();
         rows.push_str(&format!(
-            r#"<tr><td title="{full}"><code>{short}</code></td><td><span class="g-badge {state_class}">{state_label}</span></td><td class="right">{log_ratio}</td><td class="right">{cost:.2}</td><td class="right">{benefit:.2}</td><td class="right">{age}</td></tr>"#,
+            r#"<tr><td title="{full}" data-sort="{full}"><code>{short}</code><button type="button" class="copy-key" data-copy="{full}" title="Copy contract key" aria-label="Copy contract key">⧉</button></td><td data-sort="{state_rank}"><span class="g-badge {state_class}">{state_label}</span></td><td class="right" data-sort="{log_ratio_sort}">{log_ratio}</td><td class="right" data-sort="{cost:.6}">{cost:.2}</td><td class="right" data-sort="{benefit:.6}">{benefit:.2}</td><td class="right" data-sort="{age_secs}">{age}</td></tr>"#,
             full = html_escape(&c.instance_id),
             short = html_escape(&c.instance_id_short),
             state_class = state_class,
             state_label = state_label,
+            state_rank = state_rank,
             log_ratio = log_ratio_txt,
+            log_ratio_sort = log_ratio_sort,
             cost = c.cost_used,
             benefit = c.benefit_score,
             age = age,
+            age_secs = c.age_secs,
         ));
     }
     if shown_count == 0 {
-        rows = r#"<tr><td colspan="6" class="empty" style="padding: 0.5rem 0.9rem">All contracts within normal range.</td></tr>"#.to_string();
+        rows = r#"<tr class="sort-disabled"><td colspan="6" class="empty" style="padding: 0.5rem 0.9rem">All contracts within normal range.</td></tr>"#.to_string();
     }
 
     let tracked_total = g.observed_count.max(total);
@@ -1107,8 +1283,8 @@ fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
                 </div>
             </div>
             <div class="table-wrap">
-                <table>
-                    <thead><tr><th>Contract</th><th>State</th><th class="right">log-ratio</th><th class="right">Cost</th><th class="right">Benefit</th><th class="right">Age</th></tr></thead>
+                <table class="sortable" data-table-id="governance">
+                    <thead><tr><th data-sort-type="text">Contract</th><th data-sort-type="num">State</th><th class="right" data-sort-type="num">log-ratio</th><th class="right" data-sort-type="num">Cost</th><th class="right" data-sort-type="num">Benefit</th><th class="right" data-sort-type="num">Age</th></tr></thead>
                     <tbody>{rows}</tbody>
                 </table>
             </div>
@@ -1285,32 +1461,32 @@ fn build_ops_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> Strin
 }
 
 const CSS: &str = r##"
-/* ── CSS Variables (dark mode default, matching global telemetry dashboard) ── */
+/* ── CSS Variables (dark mode default) ── */
 :root {
-    --bg-primary: #06080c;
-    --bg-secondary: #0d1117;
-    --bg-tertiary: #161b22;
-    --bg-panel: rgba(13, 17, 23, 0.8);
-    --border-color: rgba(48, 54, 61, 0.6);
-    --text-primary: #e6edf3;
-    --text-secondary: #8b949e;
-    --text-muted: #484f58;
-    --accent-primary: #007FFF;
-    --accent-light: #7ecfef;
-    --accent-dark: #0052cc;
-    --font-mono: 'SF Mono', Monaco, 'Cascadia Code', monospace;
-    --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    --bg-primary: #0c0d0f;
+    --bg-secondary: #141518;
+    --bg-tertiary: #1a1c20;
+    --bg-panel: rgba(20, 21, 24, 0.85);
+    --border-color: rgba(64, 66, 72, 0.35);
+    --text-primary: #edeeef;
+    --text-secondary: #94969a;
+    --text-muted: #585a5e;
+    --accent-primary: #0abab5;
+    --accent-light: #5eead4;
+    --accent-dark: #0d9488;
+    --font-mono: 'Iosevka', 'JetBrains Mono', 'Cascadia Code', 'Fira Code', 'SF Mono', monospace;
+    --font-sans: 'Space Grotesk', 'DM Sans', system-ui, -apple-system, sans-serif;
 }
 /* Light mode overrides */
 [data-theme="light"] {
-    --bg-primary: #f0f4f8;
-    --bg-secondary: #e2e8f0;
-    --bg-tertiary: #cbd5e1;
-    --bg-panel: rgba(255, 255, 255, 0.85);
-    --border-color: rgba(148, 163, 184, 0.5);
-    --text-primary: #0f172a;
-    --text-secondary: #475569;
-    --text-muted: #94a3b8;
+    --bg-primary: #f7f5f2;
+    --bg-secondary: #eeebe6;
+    --bg-tertiary: #e5e0d9;
+    --bg-panel: rgba(255, 255, 255, 0.88);
+    --border-color: rgba(180, 175, 168, 0.4);
+    --text-primary: #1a1816;
+    --text-secondary: #5c5955;
+    --text-muted: #8c8985;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body {
@@ -1319,23 +1495,35 @@ body {
     color: var(--text-primary);
     line-height: 1.5;
 }
-/* Atmospheric background (matching telemetry dashboard) */
+/* Subtle warm background with dot-grid texture */
 body::before {
     content: '';
     position: fixed;
     top: 0; left: 0; right: 0; bottom: 0;
     background:
-        radial-gradient(ellipse at 50% 0%, rgba(0, 127, 255, 0.08) 0%, transparent 50%),
-        radial-gradient(ellipse at 80% 50%, rgba(126, 207, 239, 0.05) 0%, transparent 40%),
-        radial-gradient(ellipse at 20% 80%, rgba(0, 82, 204, 0.05) 0%, transparent 40%);
+        radial-gradient(ellipse at 30% 20%, rgba(224, 220, 210, 0.03) 0%, transparent 55%),
+        radial-gradient(ellipse at 70% 60%, rgba(10, 186, 181, 0.04) 0%, transparent 50%);
     pointer-events: none;
     z-index: 0;
 }
+body::after {
+    content: '';
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background-image: radial-gradient(rgba(255,255,255,0.015) 1px, transparent 1px);
+    background-size: 24px 24px;
+    pointer-events: none;
+    z-index: 0;
+    opacity: 0.6;
+}
 [data-theme="light"] body::before {
     background:
-        radial-gradient(ellipse at 50% 0%, rgba(0, 127, 255, 0.06) 0%, transparent 50%),
-        radial-gradient(ellipse at 80% 50%, rgba(126, 207, 239, 0.04) 0%, transparent 40%),
-        radial-gradient(ellipse at 20% 80%, rgba(0, 82, 204, 0.04) 0%, transparent 40%);
+        radial-gradient(ellipse at 30% 20%, rgba(180, 175, 165, 0.06) 0%, transparent 55%),
+        radial-gradient(ellipse at 70% 60%, rgba(10, 186, 181, 0.04) 0%, transparent 50%);
+}
+[data-theme="light"] body::after {
+    background-image: radial-gradient(rgba(0,0,0,0.025) 1px, transparent 1px);
+    opacity: 0.5;
 }
 header {
     display: flex;
@@ -1376,15 +1564,50 @@ header {
     font-size: 0.75rem;
     font-weight: 500;
     color: var(--accent-light);
-    background: rgba(126, 207, 239, 0.1);
+    background: rgba(94, 234, 212, 0.1);
     padding: 0.15rem 0.5rem;
     border-radius: 4px;
-    border: 1px solid rgba(126, 207, 239, 0.2);
+    border: 1px solid rgba(94, 234, 212, 0.2);
     text-transform: uppercase;
     letter-spacing: 0.05em;
 }
+.pub-key-label {
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    font-family: var(--font-mono);
+    margin-right: 0.3rem;
+}
+.pub-key {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    background: rgba(139, 148, 158, 0.08);
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px 0 0 4px;
+    border: 1px solid var(--border-color);
+    max-width: 24ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    cursor: pointer;
+}
+.pub-key:hover { color: var(--accent-light); }
+.copy-btn {
+    font-family: var(--font-mono);
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    background: rgba(139, 148, 158, 0.08);
+    border: 1px solid var(--border-color);
+    border-left: none;
+    border-radius: 0 4px 4px 0;
+    padding: 0.15rem 0.4rem;
+    cursor: pointer;
+    line-height: 1;
+}
+.copy-btn:hover { color: var(--accent-light); background: rgba(94, 234, 212, 0.1); }
 .badge {
-    background: rgba(0, 127, 255, 0.15);
+    background: rgba(10, 186, 181, 0.15);
     color: var(--accent-light);
     padding: 0.15rem 0.5rem;
     border-radius: 12px;
@@ -1406,9 +1629,10 @@ main {
 .card {
     background: var(--bg-panel);
     border: 1px solid var(--border-color);
-    border-radius: 10px;
+    border-radius: 12px;
     padding: 1rem 1.25rem;
     backdrop-filter: blur(10px);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.12);
 }
 .card-muted { background: var(--bg-secondary); }
 .card h2 {
@@ -1459,6 +1683,14 @@ main {
     margin: 0.5rem 0;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+@keyframes peer-fade-in {
+    from { opacity: 0; transform: translateY(-6px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes you-pulse {
+    0%, 100% { r: 6; }
+    50%      { r: 8.5; }
+}
 .warning {
     background: rgba(251, 191, 36, 0.1);
     border: 1px solid rgba(251, 191, 36, 0.3);
@@ -1647,8 +1879,8 @@ code {
 }
 [data-theme="light"] .health-degraded { color: #92400e; }
 .health-connecting {
-    background: rgba(0, 127, 255, 0.08);
-    border: 1px solid rgba(0, 127, 255, 0.2);
+    background: rgba(10, 186, 181, 0.08);
+    border: 1px solid rgba(10, 186, 181, 0.2);
     color: var(--accent-light);
 }
 [data-theme="light"] .health-connecting { color: var(--accent-dark); }
@@ -1678,6 +1910,36 @@ code {
 }
 .diagnostics-muted li { margin-bottom: 0.25rem; }
 .muted-hint { opacity: 0.6; font-style: italic; }
+/* ── Ring stats metric row ── */
+.metrics-row {
+    display: flex;
+    gap: 0.5rem;
+    margin: 0.75rem 0;
+}
+.metric-tile {
+    flex: 1;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    padding: 0.5rem;
+    text-align: center;
+}
+.metric-value {
+    display: block;
+    font-size: 1.3rem;
+    font-weight: 700;
+    font-family: var(--font-mono);
+    color: var(--accent-light);
+}
+[data-theme="light"] .metric-value { color: var(--accent-primary); }
+.metric-label {
+    display: block;
+    font-size: 0.65rem;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    font-family: var(--font-mono);
+    margin-top: 0.2rem;
+}
 /* ── Transfer stats ── */
 .transfer-stat {
     display: flex;
@@ -1700,6 +1962,12 @@ code {
     font-weight: 600;
     font-family: var(--font-mono);
     color: var(--text-primary);
+}
+.transfer-detail {
+    font-size: 0.75rem;
+    font-weight: 400;
+    color: var(--text-secondary);
+    margin-left: 0.4rem;
 }
 .note a { color: var(--accent-light); }
 [data-theme="light"] .note a { color: var(--accent-primary); }
@@ -1748,11 +2016,58 @@ p:last-child { margin-bottom: 0; }
     transition: border-color 0.15s;
 }
 .theme-btn:hover { border-color: var(--text-secondary); }
-@media (max-width: 600px) {
-    .op-grid { grid-template-columns: repeat(2, 1fr); }
-    header { padding: 0.5rem 1rem; }
-    main { margin: 1rem auto; }
-    .ring-svg { width: 180px; height: 180px; }
+
+/* ── Mobile responsive ── */
+@media (max-width: 768px) {
+    main { margin: 0.75rem auto; padding: 0 0.5rem; }
+    header {
+        flex-wrap: wrap; gap: 0.4rem; padding: 0.5rem 0.75rem;
+    }
+    .header-left { flex-wrap: wrap; gap: 0.3rem; }
+    .header-right { margin-left: auto; }
+    .pub-key-label { display: none; }
+    .pub-key { max-width: 10ch; font-size: 0.65rem; }
+    .copy-btn { font-size: 0.65rem; padding: 0.15rem 0.3rem; }
+    .uptime { font-size: 0.7rem; }
+    .badge, .update-badge { font-size: 0.65rem; }
+
+    .card { padding: 0.75rem 1rem; border-radius: 8px; }
+
+    .metrics-row { flex-wrap: wrap; gap: 0.35rem; }
+    .metric-tile { flex: 1 1 30%; min-width: 5rem; padding: 0.4rem; }
+    .metric-value { font-size: 1.1rem; }
+    .metric-label { font-size: 0.6rem; }
+
+    .peer-table { font-size: 0.72rem; }
+    .peer-table th, .peer-table td { padding: 0.3rem 0.4rem; }
+    .peer-table th:nth-child(4), .peer-table td:nth-child(4),
+    .peer-table th:nth-child(5), .peer-table td:nth-child(5) { display: none; }
+
+    .transfer-stat { flex-direction: column; align-items: flex-start; gap: 0.2rem; }
+    .transfer-value { font-size: 0.95rem; }
+
+    .op-grid { grid-template-columns: repeat(2, 1fr); gap: 0.35rem; }
+    .op-card { padding: 0.5rem; }
+    .op-label { font-size: 0.6rem; }
+    .op-value { font-size: 0.9rem; }
+
+    .ring-wrap { margin-bottom: 0.5rem; }
+    .ring-svg { width: 160px; height: 160px; }
+
+    /* Governance: stack verdict + norms vertically, let table scroll */
+    .g-verdict-row { grid-template-columns: 1fr; }
+    .g-verdict { min-width: auto; }
+    .g-norms { grid-template-columns: repeat(3, 1fr); }
+    .app-list li { padding: 0.4rem 0; }
+}
+@media (max-width: 400px) {
+    .g-norms { grid-template-columns: repeat(2, 1fr); }
+    .header-title { font-size: 0.9rem; }
+    .header-scope { font-size: 0.65rem; padding: 0.1rem 0.35rem; }
+    .metric-tile { flex: 1 1 45%; }
+    .peer-table { font-size: 0.68rem; }
+    .op-grid { grid-template-columns: 1fr 1fr; }
+    .metrics-row { gap: 0.25rem; }
 }
 /* ── Ring SVG peer links ── */
 .ring-svg a.ring-peer-link { cursor: pointer; }
@@ -1766,6 +2081,37 @@ p:last-child { margin-bottom: 0; }
     stroke-width: 1.5;
 }
 .ring-svg a.ring-peer-link:focus { outline: none; }
+
+/* "You" marker: subtle pulse */
+.ring-svg .you-dot {
+    animation: you-pulse 3s ease-in-out infinite;
+    transform-origin: center;
+}
+
+/* Peer table: fade-in rows */
+.peer-table tbody tr {
+    animation: peer-fade-in 0.35s ease-out both;
+}
+.peer-table tbody tr:nth-child(1) { animation-delay: 0.02s; }
+.peer-table tbody tr:nth-child(2) { animation-delay: 0.06s; }
+.peer-table tbody tr:nth-child(3) { animation-delay: 0.10s; }
+.peer-table tbody tr:nth-child(4) { animation-delay: 0.14s; }
+.peer-table tbody tr:nth-child(5) { animation-delay: 0.18s; }
+.peer-table tbody tr:nth-child(n+6) { animation-delay: 0.22s; }
+
+.copy-btn-inline {
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    background: none;
+    border: 1px solid var(--border-color);
+    border-radius: 3px;
+    padding: 0 0.35rem;
+    cursor: pointer;
+    margin-left: 0.4rem;
+    vertical-align: middle;
+}
+.copy-btn-inline:hover { color: var(--accent-light); border-color: var(--accent-light); }
 /* ── Sortable tables ── */
 table.sortable thead th {
     cursor: pointer;
@@ -2349,21 +2695,22 @@ fn peer_detail_html(address_str: &str) -> String {
     };
 
     // Build info card
+    let addr_enc = html_escape(&peer.address.to_string());
     let info_card = format!(
         r#"<div class="card">
             <h2>Peer Info</h2>
+            <div><strong>{ptype}</strong> <code>{addr}</code><button type="button" class="copy-btn-inline" data-addr="{addr_enc}" onclick="copyToClipboard(this.getAttribute('data-addr')).then(function(){{showToast('Address copied')}})" title="Copy address">⎘</button></div>
             <div class="info-grid">
-                <div class="info-label">Address</div><div class="info-value"><code>{addr}</code></div>
                 <div class="info-label">Location</div><div class="info-value">{loc}</div>
-                <div class="info-label">Type</div><div class="info-value">{ptype}</div>
                 <div class="info-label">Connected</div><div class="info-value">{connected}</div>
                 <div class="info-label">Sent</div><div class="info-value">{sent}</div>
                 <div class="info-label">Received</div><div class="info-value">{recv}</div>
             </div>
         </div>"#,
-        addr = html_escape(&peer.address.to_string()),
-        loc = loc_str,
         ptype = peer_type,
+        addr = addr_enc,
+        addr_enc = addr_enc,
+        loc = loc_str,
         connected = format_duration(peer.connected_secs),
         sent = format_bytes(peer.bytes_sent),
         recv = format_bytes(peer.bytes_received),
@@ -3445,7 +3792,7 @@ a.header-title {
     text-align: center;
 }
 .tab-label.tab-active .tab-count {
-    background: rgba(0, 127, 255, 0.15);
+    background: rgba(10, 186, 181, 0.15);
     color: var(--accent-primary);
 }
 .tab-panel { display: none; }
@@ -3469,7 +3816,9 @@ mod tests {
     use super::*;
     use crate::node::network_status::{
         FailureSnapshot, HealthLevel, NatStatsSnapshot, NetworkStatusSnapshot, OpStatsSnapshot,
+        RingStatsSnapshot,
     };
+    use crate::transport::metrics::TransportSnapshot;
     use std::net::SocketAddr;
 
     fn base_snapshot() -> NetworkStatusSnapshot {
@@ -3490,6 +3839,8 @@ mod tests {
             bytes_uploaded: 0,
             bytes_downloaded: 0,
             health: HealthLevel::Connecting,
+            ring_stats: RingStatsSnapshot::default(),
+            transport_snapshot: TransportSnapshot::default(),
             governance: Default::default(),
         }
     }
@@ -3502,11 +3853,11 @@ mod tests {
     }
 
     #[test]
-    fn favicon_blue_when_connected() {
+    fn favicon_teal_when_connected() {
         let mut snap = base_snapshot();
         snap.open_connections = 3;
         let uri = build_favicon_data_uri(&Some(snap));
-        assert!(uri.contains("%23007FFF"), "expected blue color");
+        assert!(uri.contains("%230abab5"), "expected teal color");
     }
 
     #[test]
@@ -3537,7 +3888,7 @@ mod tests {
     }
 
     #[test]
-    fn favicon_blue_takes_priority_over_failures() {
+    fn favicon_connected_overrides_failures() {
         let mut snap = base_snapshot();
         snap.open_connections = 1;
         snap.nat_stats.attempts = 5;
@@ -3548,7 +3899,7 @@ mod tests {
         });
         let uri = build_favicon_data_uri(&Some(snap));
         assert!(
-            uri.contains("%23007FFF"),
+            uri.contains("%230abab5"),
             "connected should override failure colors"
         );
     }
@@ -3676,13 +4027,64 @@ mod tests {
     }
 
     #[test]
-    fn transfer_card_hidden_when_no_data() {
-        let snap = base_snapshot();
+    fn transfer_card_hidden_when_fresh_start() {
+        let mut snap = base_snapshot();
+        snap.elapsed_secs = 3; // first few seconds, no traffic yet
         let html = build_transfer_card(&Some(snap));
         assert!(
             html.is_empty(),
-            "transfer card should be hidden with no data"
+            "transfer card should be hidden in first 10s with no data"
         );
+    }
+
+    // Superseded: the 10s grace period replaced the unconditional
+    // hide-on-zero-open-connections logic (#3507).
+    #[ignore]
+    #[test]
+    fn transfer_card_hidden_when_no_data() {
+        let mut snap = base_snapshot();
+        snap.elapsed_secs = 100; // well past grace, still no data
+        // Old behaviour: hidden. New behaviour: shown (tested above).
+    }
+
+    #[test]
+    fn transfer_card_shown_after_grace_period() {
+        let snap = base_snapshot(); // elapsed_secs=10, no traffic → still show
+        let html = build_transfer_card(&Some(snap));
+        assert!(
+            !html.is_empty(),
+            "transfer card should render after grace period even without data"
+        );
+    }
+
+    /// Non-zero transport metrics must render RTT, cwnd, slowdown, and
+    /// transfer sub-sections — currently every test uses default zeros,
+    /// which skips those branches entirely.
+    #[test]
+    fn transfer_card_renders_subsections_with_data() {
+        let mut snap = base_snapshot();
+        snap.bytes_uploaded = 5000;
+        snap.open_connections = 1;
+        snap.transport_snapshot.avg_rtt_us = 12500; // 12.5ms
+        snap.transport_snapshot.min_rtt_us = 8000;
+        snap.transport_snapshot.max_rtt_us = 45000;
+        snap.transport_snapshot.avg_cwnd_bytes = 32768;
+        snap.transport_snapshot.peak_cwnd_bytes = 98304;
+        snap.transport_snapshot.min_cwnd_bytes = 11264;
+        snap.transport_snapshot.slowdowns_triggered = 23;
+        snap.transport_snapshot.transfers_completed = 847;
+        snap.transport_snapshot.transfers_failed = 3;
+        snap.transport_snapshot.avg_transfer_time_ms = 1200;
+        let html = build_transfer_card(&Some(snap));
+        assert!(html.contains("RTT"), "RTT row missing");
+        assert!(html.contains("12.5ms"), "avg RTT missing");
+        assert!(html.contains("8.0ms"), "min RTT missing");
+        assert!(html.contains("45.0ms"), "max RTT missing");
+        assert!(html.contains("cwnd"), "cwnd row missing");
+        assert!(html.contains("LEDBAT"), "slowdown row missing");
+        assert!(html.contains("23</span>"), "slowdown count missing");
+        assert!(html.contains("847"), "transfers completed missing");
+        assert!(html.contains("3"), "transfers failed missing");
     }
 
     #[test]
@@ -3720,6 +4122,15 @@ mod tests {
         assert!(
             !html.contains("http-equiv=\"refresh\""),
             "meta refresh must not be present — JS partial update is used instead"
+        );
+    }
+
+    #[test]
+    fn title_is_fn_peer() {
+        let html = homepage_html();
+        assert!(
+            html.contains("<title>FN Peer</title>"),
+            "dashboard title must be 'FN Peer' — do not rename without updating this test"
         );
     }
 
