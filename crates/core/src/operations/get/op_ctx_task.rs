@@ -4245,6 +4245,63 @@ mod tests {
         );
     }
 
+    // ── R12b (SUPERSEDED): streaming-downstream WARN+continue guard ────────
+
+    /// SUPERSEDED by #4307: relay streaming-forward IS now implemented (the
+    /// `Terminal::Streaming` arm forks + pipes the stream upstream), so the
+    /// WARN+skip invariant this test pinned no longer holds. Kept as
+    /// historical documentation per `git-workflow.md` ("superseded by a
+    /// semantic change → add `#[ignore]`, keep as historical documentation").
+    /// The behaviour it used to assert is now inverted and pinned by
+    /// `relay_send_found_streams_large_payload_to_remote`,
+    /// `relay_streaming_arm_forwards_before_caching`,
+    /// `relay_streaming_arm_uses_fresh_outbound_stream_id`, and
+    /// `relay_streaming_arm_pipe_failure_returns_ok_without_notfound`. This
+    /// test references the pre-#4307 non-generic `drive_relay_get_inner`
+    /// signature and the old WARN+skip arm on purpose — it is a snapshot of
+    /// the prior contract, not a live guard, and is never executed.
+    #[test]
+    #[ignore = "superseded: relay streaming forwarding now implemented (#4307); kept as historical documentation per git-workflow.md"]
+    fn streaming_downstream_is_currently_warned_and_skipped() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner(");
+        let streaming_arm_start = body
+            .find("AttemptOutcome::Terminal(Terminal::Streaming { .. })")
+            .expect("Streaming arm must exist in relay driver");
+        let tail = &body[streaming_arm_start..];
+        // Bound at the next arm start.
+        let clip = tail[1..]
+            .find("AttemptOutcome::")
+            .map(|p| p + 1)
+            .unwrap_or(tail.len());
+        let arm = &tail[..clip];
+        assert!(
+            arm.contains("continue;"),
+            "Streaming arm must `continue;` to try the next peer — streaming \
+             relay forwarding is out of scope for #3883 (see port plan §7). \
+             A future PR will replace this with a proper chunk pipe-through."
+        );
+        assert!(
+            arm.contains("new_visited.mark_visited(peer_addr)"),
+            "Streaming arm must mark the streaming peer as visited so the \
+             retry loop doesn't re-select it next iteration."
+        );
+        assert!(
+            !arm.contains("relay_send_found"),
+            "Streaming arm must NOT call `relay_send_found` — doing so \
+             without the chunk payload would send a Found frame with \
+             `state: None` (Unexpected at the upstream classify). See R12b \
+             gap in port plan risk register."
+        );
+        assert!(
+            !arm.contains("orphan_stream_registry"),
+            "Streaming arm must NOT claim the stream via \
+             `orphan_stream_registry` — that's the migrated behavior for a \
+             follow-up PR. Doing it here without the upstream pipe would \
+             leak stream state."
+        );
+    }
+
     // ── R9: send_and_await Err/timeout outcomes advance to next peer ───────
 
     /// Both `Ok(Err(..))` (channel error / event loop gone) and
