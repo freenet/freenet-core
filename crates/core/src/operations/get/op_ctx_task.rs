@@ -1998,6 +1998,13 @@ where
             phase = "relay_streaming_forward",
             "GET relay: payload exceeds threshold, streaming response upstream"
         );
+        // NOTE: `hop_count` is intentionally NOT carried on the streaming
+        // wire path — the `ResponseStreaming` variant has no such field
+        // (unlike the inline `Response{Found}` below, which propagates
+        // `hop_count`). This matches the legacy streaming producer's
+        // limitation; transfer-rate routing observations on the originator
+        // come from `total_size` instead, so the lost hop depth does not
+        // degrade routing.
         let header = NetMessage::from(GetMsg::ResponseStreaming {
             id: tx,
             instance_id,
@@ -2547,6 +2554,9 @@ where
                 {
                     Ok(h) => h,
                     Err(OrphanStreamError::AlreadyClaimed) => {
+                        // Dedup, NOT a routing failure: another task already
+                        // owns this stream. Do NOT record a Failure route
+                        // event here — the downstream peer behaved correctly.
                         tracing::debug!(
                             tx = %incoming_tx,
                             %stream_id,
@@ -2561,6 +2571,22 @@ where
                             target = %peer,
                             error = %e,
                             "GET relay: orphan stream claim failed; advancing to next peer"
+                        );
+                        // The downstream advertised a `ResponseStreaming`
+                        // header but never delivered an assemblable stream
+                        // (timeout / claim error) — a genuine routing failure
+                        // for this peer. Train the router the same way the
+                        // transport-failure arms above do, so a peer that
+                        // stalls on stream delivery gets de-prioritised
+                        // instead of being re-selected. (AlreadyClaimed above
+                        // is deliberately NOT counted — that's dedup, not a
+                        // failure.)
+                        crate::operations::record_relay_route_event(
+                            op_manager,
+                            peer.clone(),
+                            crate::ring::Location::from(&instance_id),
+                            crate::router::RouteOutcome::Failure,
+                            crate::node::network_status::OpType::Get,
                         );
                         // Treat as a failed attempt — try another peer.
                         new_visited.mark_visited(peer_addr);
@@ -4135,14 +4161,87 @@ mod tests {
             .unwrap_or(tail.len());
         let arm = &tail[..clip];
         assert!(
-            arm.contains("StreamId::next_operations()"),
+            arm.contains("let outbound_sid = StreamId::next_operations()"),
             "Streaming arm must mint a fresh outbound stream id via \
-             `StreamId::next_operations()` per hop (#4307)."
+             `let outbound_sid = StreamId::next_operations()` per hop (#4307)."
         );
         assert!(
             arm.contains(".fork()"),
             "Streaming arm must `fork()` the inbound handle so it can pipe \
              AND assemble for local cache (#4307)."
+        );
+        // The fresh `outbound_sid` (NOT the inbound `stream_id`) must be the
+        // one re-keyed into the forwarded header AND piped. Without these the
+        // arm could mint `outbound_sid` yet still pipe/advertise the inbound
+        // id — exactly the re-keying bug this pin guards against.
+        assert!(
+            arm.contains("stream_id: outbound_sid"),
+            "Streaming arm must re-key the forwarded `ResponseStreaming` \
+             header with the FRESH `outbound_sid` (`stream_id: outbound_sid`), \
+             not the inbound `stream_id` (#4307)."
+        );
+        assert!(
+            arm.contains(".pipe_stream(upstream_addr, outbound_sid"),
+            "Streaming arm must pipe the forked handle under the FRESH \
+             `outbound_sid` (`pipe_stream(upstream_addr, outbound_sid, ..)`), \
+             not the inbound `stream_id` (#4307)."
+        );
+    }
+
+    /// Pin the deliberate non-`?` handling of a `pipe_stream` failure in the
+    /// relay `Terminal::Streaming` arm. Once the `ResponseStreaming` header
+    /// has gone upstream, the upstream is committed to assembling a stream;
+    /// propagating the pipe error would bubble to `drive_relay_get` and send
+    /// a compensating `Response{NotFound}` to that SAME upstream — a
+    /// contradictory double-signal that stalls it ~60s on `claim_or_wait`.
+    /// The arm therefore logs and `return Ok(())` instead. This invariant is
+    /// hard to exercise behaviourally (the mock bridge's `pipe_stream` can't
+    /// fail), so pin the SHAPE: a future refactor flipping `return Ok(())`
+    /// to `?`/`return Err(..)`/a NotFound send here would silently regress.
+    #[test]
+    fn relay_streaming_arm_pipe_failure_returns_ok_without_notfound() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
+        let arm_start = body
+            .find("AttemptOutcome::Terminal(Terminal::Streaming {")
+            .expect("Streaming arm must exist in relay driver");
+        let tail = &body[arm_start..];
+        let clip = tail[1..]
+            .find("AttemptOutcome::")
+            .map(|p| p + 1)
+            .unwrap_or(tail.len());
+        let arm = &tail[..clip];
+
+        // Isolate the `if let Err(e) = conn_manager.pipe_stream(..) { .. }`
+        // block: from the `pipe_stream` call to the end of the arm.
+        let pipe_pos = arm
+            .find(".pipe_stream(upstream_addr, outbound_sid")
+            .expect("Streaming arm must call pipe_stream on the forward path");
+        let pipe_tail = &arm[pipe_pos..];
+        // The error-handling block runs until Step 4 (route-event recording).
+        let block_end = pipe_tail
+            .find("record_relay_route_event")
+            .expect("route-event recording must follow the pipe on success");
+        let err_block = &pipe_tail[..block_end];
+
+        assert!(
+            err_block.contains("if let Err(e) = conn_manager")
+                || arm[..pipe_pos].contains("if let Err(e) = conn_manager"),
+            "pipe_stream must be guarded by an `if let Err(e) = ..` block, \
+             not `?`-propagated (the header already went upstream)."
+        );
+        assert!(
+            err_block.contains("return Ok(())"),
+            "On `pipe_stream` failure AFTER the header was sent upstream, the \
+             streaming arm MUST `return Ok(())` (let the upstream's claim time \
+             out cleanly), NOT propagate the error — a propagated error makes \
+             `drive_relay_get` send a contradictory `Response{{NotFound}}` to \
+             the same upstream and stalls it ~60s. #4307."
+        );
+        assert!(
+            !err_block.contains("relay_send_not_found"),
+            "The `pipe_stream`-failure block must NOT send a NotFound \
+             upstream — the upstream is already committed to a stream."
         );
     }
 
@@ -4749,6 +4848,10 @@ mod tests {
         for log_phrase in [
             "send_to_and_await failed; advancing to next peer",
             "attempt timed out; advancing to next peer",
+            // #4307: a downstream that advertised a ResponseStreaming header
+            // but never delivered an assemblable stream is also a routing
+            // failure for that peer — same training as the transport arms.
+            "orphan stream claim failed; advancing to next peer",
         ] {
             let pos = body.unwrap_or_default_pos(log_phrase);
             let after = &body[pos..pos + 1500.min(body.len() - pos)];
