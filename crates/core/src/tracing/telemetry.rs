@@ -53,11 +53,33 @@ static TELEMETRY_SENDER: OnceLock<mpsc::Sender<TelemetryCommand>> = OnceLock::ne
 /// This is a non-blocking, best-effort send. Events are dropped silently if:
 /// - Telemetry is not enabled (TELEMETRY_SENDER not initialized)
 /// - The telemetry channel is full
+///
+/// The `peer_id` OTLP attribute is left empty. For events that originate
+/// from a specific node and should be filterable by that node in the
+/// collector, use [`send_standalone_event_with_peer_id`] instead.
 pub fn send_standalone_event(event_type: &str, event_data: serde_json::Value) {
+    send_standalone_event_inner(event_type, "", event_data);
+}
+
+/// Send a standalone telemetry event tagged with the local node's peer id.
+///
+/// Used by node-level periodic emitters (e.g. shadow RTT aggregator) whose
+/// output is only meaningful when the collector can disaggregate samples
+/// by source node. The `peer_id` is set as the OTLP record attribute so
+/// the collector can group/filter without parsing the event body.
+pub fn send_standalone_event_with_peer_id(
+    event_type: &str,
+    peer_id: &str,
+    event_data: serde_json::Value,
+) {
+    send_standalone_event_inner(event_type, peer_id, event_data);
+}
+
+fn send_standalone_event_inner(event_type: &str, peer_id: &str, event_data: serde_json::Value) {
     if let Some(sender) = TELEMETRY_SENDER.get() {
         let event = TelemetryEvent {
             timestamp: current_timestamp_ms(),
-            peer_id: String::new(),
+            peer_id: peer_id.to_string(),
             transaction_id: String::new(),
             event_type: event_type.to_string(),
             event_data,
@@ -428,7 +450,7 @@ impl TelemetryWorker {
 
     async fn send_batch(&self, events: &[TelemetryEvent]) -> Result<(), reqwest::Error> {
         // Convert to OTLP JSON format
-        let otlp_payload = self.to_otlp_logs(events);
+        let otlp_payload = to_otlp_logs(events);
 
         let url = format!("{}/v1/logs", self.endpoint);
 
@@ -442,61 +464,61 @@ impl TelemetryWorker {
 
         Ok(())
     }
+}
 
-    fn to_otlp_logs(&self, events: &[TelemetryEvent]) -> serde_json::Value {
-        let log_records: Vec<serde_json::Value> = events
-            .iter()
-            .map(|e| {
-                let body_string = serde_json::to_string(&e.event_data).unwrap_or_else(|err| {
-                    tracing::warn!(
-                        error = %err,
-                        event_type = %e.event_type,
-                        "Failed to serialize telemetry event_data"
-                    );
-                    String::new()
-                });
-                serde_json::json!({
-                    "timeUnixNano": e.timestamp * 1_000_000, // Convert ms to ns (OTLP expects numeric)
-                    "severityNumber": 9, // INFO
-                    "severityText": "INFO",
-                    "body": {
-                        "stringValue": body_string
-                    },
-                    "attributes": [
-                        {
-                            "key": "peer_id",
-                            "value": {"stringValue": &e.peer_id}
-                        },
-                        {
-                            "key": "transaction_id",
-                            "value": {"stringValue": &e.transaction_id}
-                        },
-                        {
-                            "key": "event_type",
-                            "value": {"stringValue": &e.event_type}
-                        }
-                    ]
-                })
-            })
-            .collect();
-
-        serde_json::json!({
-            "resourceLogs": [{
-                "resource": {
-                    "attributes": [{
-                        "key": "service.name",
-                        "value": {"stringValue": "freenet-peer"}
-                    }]
+fn to_otlp_logs(events: &[TelemetryEvent]) -> serde_json::Value {
+    let log_records: Vec<serde_json::Value> = events
+        .iter()
+        .map(|e| {
+            let body_string = serde_json::to_string(&e.event_data).unwrap_or_else(|err| {
+                tracing::warn!(
+                    error = %err,
+                    event_type = %e.event_type,
+                    "Failed to serialize telemetry event_data"
+                );
+                String::new()
+            });
+            serde_json::json!({
+                "timeUnixNano": e.timestamp * 1_000_000, // Convert ms to ns (OTLP expects numeric)
+                "severityNumber": 9, // INFO
+                "severityText": "INFO",
+                "body": {
+                    "stringValue": body_string
                 },
-                "scopeLogs": [{
-                    "scope": {
-                        "name": "freenet.telemetry"
+                "attributes": [
+                    {
+                        "key": "peer_id",
+                        "value": {"stringValue": &e.peer_id}
                     },
-                    "logRecords": log_records
-                }]
-            }]
+                    {
+                        "key": "transaction_id",
+                        "value": {"stringValue": &e.transaction_id}
+                    },
+                    {
+                        "key": "event_type",
+                        "value": {"stringValue": &e.event_type}
+                    }
+                ]
+            })
         })
-    }
+        .collect();
+
+    serde_json::json!({
+        "resourceLogs": [{
+            "resource": {
+                "attributes": [{
+                    "key": "service.name",
+                    "value": {"stringValue": "freenet-peer"}
+                }]
+            },
+            "scopeLogs": [{
+                "scope": {
+                    "name": "freenet.telemetry"
+                },
+                "logRecords": log_records
+            }]
+        }]
+    })
 }
 
 fn event_kind_to_string(kind: &EventKind) -> String {
@@ -1780,6 +1802,67 @@ mod tests {
             }),
         );
         // No panic = success
+    }
+
+    #[test]
+    fn test_send_standalone_event_with_peer_id_no_panic_without_init() {
+        // Mirror of the above for the peer-id-tagged variant: must
+        // silently drop when telemetry is not initialized.
+        send_standalone_event_with_peer_id(
+            "shadow_rtt_aggregate",
+            "test-peer-id-abc",
+            serde_json::json!({"active_peers": 0}),
+        );
+        // No panic = success
+    }
+
+    #[test]
+    fn test_otlp_serialization_carries_peer_id_attribute() {
+        // Direct unit test on the serialization path: a TelemetryEvent
+        // constructed with a non-empty peer_id must surface that id in
+        // the OTLP `peer_id` attribute. Without this pin, a future
+        // refactor that drops the attribute mapping would silently
+        // anonymize every event reaching the collector.
+        let event = TelemetryEvent {
+            timestamp: 1_700_000_000_000,
+            peer_id: "test-peer-id-xyz".to_string(),
+            transaction_id: String::new(),
+            event_type: "shadow_rtt_aggregate".to_string(),
+            event_data: serde_json::json!({"active_peers": 3}),
+        };
+        let otlp = to_otlp_logs(std::slice::from_ref(&event));
+        let attrs = &otlp["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["attributes"];
+        let peer_attr = attrs
+            .as_array()
+            .expect("attributes must be an array")
+            .iter()
+            .find(|a| a["key"] == "peer_id")
+            .expect("peer_id attribute must be present");
+        assert_eq!(peer_attr["value"]["stringValue"], "test-peer-id-xyz");
+    }
+
+    #[test]
+    fn test_otlp_serialization_empty_peer_id_when_unset() {
+        // Pin the back-compat path: events sent via the original
+        // `send_standalone_event` have an empty peer_id. The OTLP
+        // attribute is still present (so the field exists in the
+        // collector schema) but contains an empty string.
+        let event = TelemetryEvent {
+            timestamp: 1_700_000_000_000,
+            peer_id: String::new(),
+            transaction_id: String::new(),
+            event_type: "other_event".to_string(),
+            event_data: serde_json::json!({}),
+        };
+        let otlp = to_otlp_logs(std::slice::from_ref(&event));
+        let attrs = &otlp["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["attributes"];
+        let peer_attr = attrs
+            .as_array()
+            .expect("attributes must be an array")
+            .iter()
+            .find(|a| a["key"] == "peer_id")
+            .expect("peer_id attribute must be present even when unset");
+        assert_eq!(peer_attr["value"]["stringValue"], "");
     }
 
     #[test]

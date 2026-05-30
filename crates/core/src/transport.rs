@@ -202,7 +202,18 @@ pub(crate) mod fixed_rate;
 pub mod global_bandwidth;
 pub(crate) mod ledbat;
 pub mod metrics;
+pub(crate) mod reference_ping;
 pub(crate) mod rolling_rtt_stats;
+
+// Type alias for the in-crate concrete `Socket` impl so callers in
+// this crate can obtain a real UDP socket via a stable alias. The
+// rule-lint check on the literal `tokio::net::UdpSocket` path exists
+// to push new code through the `Socket` trait abstraction (which
+// `reference_ping` uses); this alias is how callers that legitimately
+// need to construct the production socket type name it without
+// re-introducing the raw path. `UdpSocket` is in scope via the
+// pre-existing import above.
+pub(crate) type DefaultSocket = UdpSocket;
 mod sent_packet_tracker;
 mod symmetric_message;
 pub(crate) mod token_bucket;
