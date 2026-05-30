@@ -21,6 +21,47 @@ const RELATED_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Sample selection uses `GlobalRng` (deterministic under a fixed seed
 /// for simulation tests). See `Executor::maybe_probe_idempotency`.
 const IDEMPOTENCY_PROBE_PROBABILITY: f64 = 1.0 / 32.0;
+
+/// Returns true if `a` and `b` contain the same multiset of bytes — i.e. one
+/// is a reordering of the other — and false if their byte content differs.
+///
+/// This is the discriminator the idempotency probe uses to tell benign
+/// serialization nondeterminism apart from a genuine non-idempotent merge:
+///
+/// - **Benign flutter** (the #4295 false-positive case): a correct contract
+///   with non-canonical serialization (`HashMap`/`HashSet` iteration order)
+///   re-serializes the SAME logical state in a different byte ORDER. Reordering
+///   permutes the serialized bytes but preserves their multiset, so this
+///   returns `true` → not flagged.
+/// - **Genuine non-idempotency** (the #4251/#4279 case the gate must catch):
+///   re-applying the update changes the state's CONTENT — a counter that churns
+///   in place, an embedded timestamp/signature regenerated each merge, an
+///   added/removed entry. Any content change alters the byte multiset (e.g. a
+///   464→465 counter flips digit bytes), so this returns `false` → flagged.
+///   Crucially this catches the *fixed-size* byte-different violator (the real
+///   #4251 incident was a constant-size ~464-byte state) that a size-only
+///   check would miss.
+///
+/// Residual false-negative: a content change that coincidentally preserves the
+/// exact byte multiset (e.g. swapping two equal bytes) evades detection. This
+/// is far narrower than the size-only heuristic's blind spot and far safer than
+/// byte-equality's false positives (which permanently suppressed propagation in
+/// #4295). O(n) in the state size; only runs on the sampled, byte-different
+/// probe path.
+fn byte_multiset_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut hist = [0i64; 256];
+    for &x in a {
+        hist[x as usize] += 1;
+    }
+    for &x in b {
+        hist[x as usize] -= 1;
+    }
+    hist.iter().all(|&c| c == 0)
+}
+
 use crate::node::OpManager;
 use crate::wasm_runtime::{
     BackendEngine, DEFAULT_MODULE_CACHE_CAPACITY, MAX_STATE_SIZE, RuntimeConfig, SharedModuleCache,
@@ -2136,7 +2177,11 @@ where
 
     /// Probe-sampled idempotency check. Re-runs `update_state` with the just-
     /// produced state as the current state and the same updates; flags the
-    /// contract as broken if the result differs.
+    /// contract as broken if the re-applied state's byte MULTISET differs from
+    /// the original (a genuine content change), but NOT if it is merely a
+    /// reordering of the same bytes (benign serialization nondeterminism such
+    /// as `HashMap` key order — the #4295 false-positive case). See
+    /// [`byte_multiset_eq`].
     ///
     /// Costs one extra WASM invocation per sampled merge. With the
     /// configured probability [`IDEMPOTENCY_PROBE_PROBABILITY`] (currently
@@ -2235,21 +2280,53 @@ where
         };
         let probe_state = WrappedState::new(probe_state.into_bytes());
 
-        if probe_state.as_ref() != post_merge_state.as_ref() {
-            if let Some(op_manager) = &self.op_manager {
-                tracing::warn!(
-                    contract = %key,
-                    post_merge_size = post_merge_state.size(),
-                    probe_size = probe_state.size(),
-                    event = "non_idempotent_merge_detected",
-                    "Contract violates update_state idempotency \
-                     (update_state(update_state(S, U), U) != update_state(S, U)). \
-                     Flagging contract; outbound BroadcastStateChange will be suppressed."
-                );
-                op_manager
-                    .ring
-                    .record_broken_invariant(*key, crate::ring::BrokenInvariant::NonIdempotent);
-            }
+        // Byte-identical re-application: definitively idempotent. Fast path
+        // for contracts with canonical serialization.
+        if probe_state.as_ref() == post_merge_state.as_ref() {
+            return;
+        }
+
+        // Bytes differ — but byte inequality alone does NOT prove a CRDT
+        // violation. A correct, logically-idempotent merge can still emit
+        // byte-different output for the SAME logical state when the contract's
+        // serialization is non-canonical (HashMap/HashSet iteration order):
+        // the re-serialized state is a REORDERING of the same bytes. Flagging
+        // on that byte flutter false-positives correct contracts and — because
+        // the broken-invariant flag gates ALL propagation — silently bricks
+        // them. That was the root cause of #4295: the ping contract's
+        // `HashMap`-backed state re-serialized in non-deterministic key order.
+        //
+        // Distinguish a benign reordering from a genuine content change by
+        // comparing the byte MULTISET (not the bytes, not just the size).
+        // Reordering preserves the multiset; a real non-idempotent merge
+        // changes content (a counter, timestamp, signature, added/removed
+        // entry), which changes the multiset — INCLUDING the fixed-size
+        // byte-churn shape of the #4251/#4279 production violator that a
+        // size-only check would miss.
+        if byte_multiset_eq(post_merge_state.as_ref(), probe_state.as_ref()) {
+            tracing::debug!(
+                contract = %key,
+                size = post_merge_state.size(),
+                event = "idempotency_probe_byte_flutter_ignored",
+                "Idempotency probe saw byte-different but same-multiset re-application \
+                 (serialization reordering); treating as benign, not a violation"
+            );
+            return;
+        }
+
+        if let Some(op_manager) = &self.op_manager {
+            tracing::warn!(
+                contract = %key,
+                post_merge_size = post_merge_state.size(),
+                probe_size = probe_state.size(),
+                event = "non_idempotent_merge_detected",
+                "Contract violates update_state idempotency: re-application changes \
+                 state content (different byte multiset, not a reordering). \
+                 Flagging contract; outbound BroadcastStateChange will be suppressed."
+            );
+            op_manager
+                .ring
+                .record_broken_invariant(*key, crate::ring::BrokenInvariant::NonIdempotent);
         }
     }
 
@@ -4980,6 +5057,63 @@ mod state_write_attribution_pin_tests {
              into store_state_sync would not compile, but a refactor \
              that moves state into an intermediate first could regress \
              this silently."
+        );
+    }
+}
+
+// NOTE: this module is placed at the END of the file on purpose. The
+// `production_gate_sites_consult_is_contract_broken` pin test in
+// `pool_tests/non_idempotent_detector_tests.rs` greps the production slice of
+// this file (everything before the FIRST `#[cfg(test)]`) for
+// `is_contract_broken`; a `#[cfg(test)]` placed above the gate sites would
+// truncate that slice and break the pin. Keep new test modules below all
+// production code.
+#[cfg(test)]
+mod idempotency_probe_convergence_tests {
+    use super::byte_multiset_eq;
+
+    /// Regression for #4295: the ping contract's `HashMap` state re-serialized
+    /// in a different key ORDER on re-merge — same bytes, permuted. That MUST
+    /// be treated as benign (same multiset), not flagged.
+    #[test]
+    fn reordered_bytes_are_benign_flutter() {
+        assert!(
+            byte_multiset_eq(b"{\"a\":1,\"b\":2}", b"{\"b\":2,\"a\":1}"),
+            "a key-order permutation has the same byte multiset and must not be flagged"
+        );
+        // Identical bytes are trivially benign.
+        assert!(byte_multiset_eq(b"same", b"same"));
+    }
+
+    /// Regression for the review finding: the #4251 production violator was a
+    /// FIXED-SIZE, byte-different non-idempotent merge (a ~464-byte state whose
+    /// counter prefix churns in place). A size-only check missed it; the
+    /// multiset check MUST flag it (different content => different multiset).
+    #[test]
+    fn fixed_size_content_change_is_flagged() {
+        // Same length, one byte of content differs (e.g. a counter 464 -> 465).
+        assert!(
+            !byte_multiset_eq(b"counter=464;payload", b"counter=465;payload"),
+            "a fixed-size content change must be detected as non-idempotent"
+        );
+        // Simulate the 464-byte fixed-size shape: equal length, differing bytes.
+        let mut s1 = vec![b'x'; 464];
+        let mut s2 = vec![b'x'; 464];
+        s1[0] = 0;
+        s2[0] = 1; // counter prefix churn at constant size
+        assert!(
+            !byte_multiset_eq(&s1, &s2),
+            "fixed-size (464-byte) counter churn must be flagged (the #4251 shape)"
+        );
+    }
+
+    /// A growing (accumulating) merge changes the length (and would also change
+    /// content); the length guard alone flags it. Non-convergent.
+    #[test]
+    fn growing_state_is_flagged() {
+        assert!(
+            !byte_multiset_eq(b"abc", b"abcd"),
+            "a state that grows on re-application is non-convergent"
         );
     }
 }
