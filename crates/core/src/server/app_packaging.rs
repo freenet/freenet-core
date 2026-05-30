@@ -1,7 +1,7 @@
 //! Helper functions and types for dealing with HTTP client API compatible contracts.
 use std::{
     io::{Cursor, Read},
-    path::Path,
+    path::{Component, Path},
 };
 use tracing::{debug, instrument};
 
@@ -70,11 +70,47 @@ impl WebApp {
 
     #[instrument(level = "debug", skip(self, dst))]
     pub fn unpack(&mut self, dst: impl AsRef<Path>) -> Result<(), WebContractError> {
-        debug!("Unpacking web content to {:?}", dst.as_ref());
+        let dst = dst.as_ref();
+        debug!("Unpacking web content to {:?}", dst);
+        std::fs::create_dir_all(dst).map_err(WebContractError::StoringError)?;
+        let dst = dst.canonicalize().map_err(WebContractError::StoringError)?;
+
         let mut decoded_web = self.decode_web();
-        decoded_web
-            .unpack(dst)
-            .map_err(WebContractError::StoringError)?;
+        decoded_web.set_overwrite(false);
+        decoded_web.set_preserve_mtime(false);
+        for entry in decoded_web
+            .entries()
+            .map_err(WebContractError::StoringError)?
+        {
+            let mut entry = entry.map_err(WebContractError::StoringError)?;
+            // Reject symlinks and hardlinks outright. Even if the archive
+            // path is benign, a symlink entry's link target (which path-
+            // component checks don't see) can point anywhere; the underlying
+            // tar crate then creates the symlink verbatim, allowing serving
+            // code that follows symlinks to read files outside the cache.
+            // Web contracts have no legitimate use for these entry types.
+            let entry_type = entry.header().entry_type();
+            if entry_type.is_symlink() || entry_type.is_hard_link() {
+                return Err(WebContractError::UnpackingError(anyhow::anyhow!(
+                    "archive contains a {entry_type:?} entry; symlinks and hardlinks are not supported for web contracts"
+                )));
+            }
+            // Reject entries that would escape `dst`: an absolute path, or
+            // one with a `..` component. A malicious contract could otherwise
+            // ship an archive that writes outside the cache directory.
+            let path = entry
+                .path()
+                .map_err(WebContractError::StoringError)?
+                .into_owned();
+            if path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
+                return Err(WebContractError::UnpackingError(anyhow::anyhow!(
+                    "archive entry escapes the destination directory: {path:?}"
+                )));
+            }
+            entry
+                .unpack_in(&dst)
+                .map_err(WebContractError::StoringError)?;
+        }
         Ok(())
     }
 
@@ -166,5 +202,98 @@ impl<'a> TryFrom<&'a [u8]> for WebApp {
             .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))?;
 
         Ok(Self { metadata, web })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tar::Header;
+
+    fn web_app(entries: &[(&str, &[u8])]) -> WebApp {
+        let mut builder = Builder::new(Cursor::new(Vec::new()));
+        for (name, data) in entries {
+            let mut header = Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            // Write the name field directly: Builder::append_data rejects a
+            // `..` path, but a malicious or non-Rust tar will happily include
+            // one, which is exactly the input this guard defends against.
+            let name_bytes = name.as_bytes();
+            header.as_gnu_mut().unwrap().name[..name_bytes.len()].copy_from_slice(name_bytes);
+            header.set_cksum();
+            builder
+                .append(&header, *data)
+                .expect("append archive entry");
+        }
+        WebApp::from_data(Vec::new(), builder).expect("build WebApp")
+    }
+
+    #[test]
+    fn unpack_writes_a_benign_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = web_app(&[("index.html", b"<html></html>")]);
+        app.unpack(dir.path())
+            .expect("benign archive should unpack");
+        assert!(dir.path().join("index.html").exists());
+    }
+
+    #[test]
+    fn unpack_rejects_parent_dir_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = web_app(&[("../escape.txt", b"pwned")]);
+        let err = app
+            .unpack(dir.path().join("web"))
+            .expect_err("an archive entry with a `..` component must be rejected");
+        assert!(matches!(err, WebContractError::UnpackingError(_)));
+        // The malicious entry must not have escaped into the parent directory.
+        assert!(!dir.path().join("escape.txt").exists());
+    }
+
+    #[test]
+    fn unpack_rejects_absolute_path_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = web_app(&[("/etc/passwd", b"pwned")]);
+        let err = app
+            .unpack(dir.path())
+            .expect_err("an archive entry with an absolute path must be rejected");
+        assert!(matches!(err, WebContractError::UnpackingError(_)));
+    }
+
+    /// Build a `WebApp` whose archive contains a single symlink entry with the
+    /// given archive path and linkname. The path-traversal guards on
+    /// `entry.path()` don't see the linkname, so without an entry-type
+    /// rejection a benign archive path + escaping linkname slips through.
+    fn web_app_with_symlink(name: &str, link_target: &str) -> WebApp {
+        let mut builder = Builder::new(Cursor::new(Vec::new()));
+        let mut header = Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o644);
+        let name_bytes = name.as_bytes();
+        header.as_gnu_mut().unwrap().name[..name_bytes.len()].copy_from_slice(name_bytes);
+        let link_bytes = link_target.as_bytes();
+        header.as_gnu_mut().unwrap().linkname[..link_bytes.len()].copy_from_slice(link_bytes);
+        header.set_cksum();
+        builder
+            .append(&header, &[][..])
+            .expect("append symlink entry");
+        WebApp::from_data(Vec::new(), builder).expect("build WebApp")
+    }
+
+    #[test]
+    fn unpack_rejects_symlink_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("web");
+        let mut app = web_app_with_symlink("app.js", "../escape.txt");
+        let err = app
+            .unpack(&dst)
+            .expect_err("a symlink entry must be rejected");
+        assert!(matches!(err, WebContractError::UnpackingError(_)));
+        // The symlink must not have been created — neither at the archive
+        // path inside dst, nor at the linkname target above dst.
+        assert!(std::fs::symlink_metadata(dst.join("app.js")).is_err());
+        assert!(!dir.path().join("escape.txt").exists());
     }
 }
