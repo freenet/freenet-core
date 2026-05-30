@@ -35,7 +35,7 @@ for every inbound wire message. Pattern per op:
 
 1. **Reply bypass.** If a terminal reply variant arrives and a
    `pending_op_results` callback is registered, forward it via
-   `try_forward_task_per_tx_reply` and return. For GET/PUT/SUBSCRIBE
+   `try_forward_driver_reply` and return. For GET/PUT/SUBSCRIBE
    the gate is `Response | ResponseStreaming` only. CONNECT forwards
    all four non-`Request` variants (multi-reply fan-in).
 2. **Relay dispatch.** Spawn the matching `start_relay_*` driver.

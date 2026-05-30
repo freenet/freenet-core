@@ -1040,6 +1040,7 @@ where
                     } => {
                         if let Err(err) = get::op_ctx_task::start_relay_get(
                             op_manager.clone(),
+                            conn_manager.clone(),
                             *id,
                             *instance_id,
                             *htl,
