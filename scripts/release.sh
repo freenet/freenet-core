@@ -1434,34 +1434,10 @@ announce_to_river() {
         return 0
     fi
 
-    # Ensure Room Owner signing key is in rooms.json
-    # (riverctl uses local storage, not --signing-key for room members)
-    if [[ -f "$SIGNING_KEY_FILE" ]]; then
-        python3 -c "
-import json
-import sys
-
-signing_key_file = '$SIGNING_KEY_FILE'
-rooms_file = '$ROOMS_JSON'
-room_vk = '$ROOM_OWNER_VK'
-
-with open(signing_key_file, 'rb') as f:
-    key_bytes = list(f.read())
-
-with open(rooms_file, 'r') as f:
-    data = json.load(f)
-
-if room_vk not in data.get('rooms', {}):
-    print('Room not in local storage', file=sys.stderr)
-    sys.exit(1)
-
-# Update signing key if different
-current_key = data['rooms'][room_vk].get('signing_key_bytes', [])
-if current_key != key_bytes:
-    data['rooms'][room_vk]['signing_key_bytes'] = key_bytes
-    with open(rooms_file, 'w') as f:
-        json.dump(data, f)
-" 2>/dev/null || true
+    if [[ ! -f "$SIGNING_KEY_FILE" ]]; then
+        echo "  ⚠️  Room owner signing key not found at $SIGNING_KEY_FILE"
+        echo "     Skipping River announcement"
+        return 0
     fi
 
     # Simple announcement
@@ -1483,10 +1459,18 @@ if current_key != key_bytes:
     #
     # stderr is captured into a log instead of discarded so future failures are
     # diagnosable from the release log.
+    #
+    # --signing-key-file forces signing as the room owner. Without it riverctl
+    # signs with whatever identity rooms.json currently holds (the chat-delegate
+    # sync can silently rewrite that to a non-owner), and the room contract then
+    # drops the message on merge while riverctl still exits 0 — the silent
+    # failure that lost the v0.2.67/v0.2.68 announcements. The override is
+    # in-memory and never persisted, so it is immune to that drift. This mirrors
+    # the canonical announce-to-river.sh path used by the release-agent.
     local RIVER_DIR="$HOME/code/freenet/river/main"
     local RIVER_LOG="/tmp/release-$VERSION-river.log"
     if [[ -d "$RIVER_DIR" ]]; then
-        if (cd "$RIVER_DIR" && RIVER_SKIP_CONTRACT_CHECK=1 timeout 180 cargo run -p riverctl -- message send "$ROOM_OWNER_VK" "$announcement" >"$RIVER_LOG" 2>&1); then
+        if (cd "$RIVER_DIR" && RIVER_SKIP_CONTRACT_CHECK=1 timeout 180 cargo run -p riverctl -- --signing-key-file "$SIGNING_KEY_FILE" message send "$ROOM_OWNER_VK" "$announcement" >"$RIVER_LOG" 2>&1); then
             echo "✓"
             mark_completed "RIVER_ANNOUNCED"
         else
@@ -1495,11 +1479,11 @@ if current_key != key_bytes:
             echo "  ⚠️  Failed to send River announcement (non-critical, rc=$rc)"
             echo "     Last log lines from $RIVER_LOG:"
             tail -15 "$RIVER_LOG" 2>/dev/null | sed 's/^/       /'
-            echo "     Manual: cd $RIVER_DIR && RIVER_SKIP_CONTRACT_CHECK=1 cargo run -p riverctl -- message send $ROOM_OWNER_VK \"$announcement\""
+            echo "     Manual: cd $RIVER_DIR && RIVER_SKIP_CONTRACT_CHECK=1 cargo run -p riverctl -- --signing-key-file $SIGNING_KEY_FILE message send $ROOM_OWNER_VK \"$announcement\""
         fi
     else
         echo "⚠️  River repo not found at $RIVER_DIR"
-        echo "     Manual: cd <river-repo> && RIVER_SKIP_CONTRACT_CHECK=1 cargo run -p riverctl -- message send $ROOM_OWNER_VK \"$announcement\""
+        echo "     Manual: cd <river-repo> && RIVER_SKIP_CONTRACT_CHECK=1 cargo run -p riverctl -- --signing-key-file $SIGNING_KEY_FILE message send $ROOM_OWNER_VK \"$announcement\""
     fi
 }
 
