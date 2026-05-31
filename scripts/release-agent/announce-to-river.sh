@@ -96,19 +96,24 @@ wait_for_node() {
 # Post $MESSAGE to the room, signed by the room OWNER.
 #
 # The signing identity is load-bearing and the source of a long-standing
-# silent failure. riverctl's normal send path runs the chat-delegate sync,
-# which rewrites rooms.json's `signing_key_bytes` back to the locally-loaded
-# identity (on nova that's an unauthorized "bot" key, not the owner) right
-# before signing. If we sign with that identity, the room contract is valid
-# at the request layer but SILENTLY DROPS the delta on merge — riverctl still
+# silent failure. Without an explicit key, riverctl signs with whatever
+# identity rooms.json currently holds, and the chat-delegate sync can
+# silently rewrite that `signing_key_bytes` field to a non-owner key (on
+# nova it resolves to an unauthorized "bot" identity). riverctl documents
+# this exact hazard and provides `--signing-key-file` as the remedy (see its
+# `--help`: "signs at command time, without the UI's chat-delegate sync").
+# When the message is signed by a non-owner, the room contract is valid at
+# the request layer but SILENTLY DROPS the delta on merge — riverctl still
 # prints "Message sent successfully" and exits 0, yet the message never
 # converges into room state. Every release announcement before this fix was
 # lost exactly this way (v0.2.67 and v0.2.68 were both absent from the room).
 #
-# Pre-patching rooms.json (what this script used to do) does NOT work: the
-# delegate sync overwrites the patch in-process before signing. The fix is
-# riverctl's global `--signing-key-file` override, which is in-memory and
-# immune to the sync, so the delta is signed by the real owner and merges.
+# Pre-patching rooms.json's `signing_key_bytes` (what this script used to do)
+# is unreliable for the same reason — the sync can overwrite it before the
+# send signs. The fix is the global `--signing-key-file` override, which is
+# held in memory, never persisted, and is what riverctl returns from
+# resolve_signing_key, so the delta is deterministically signed by the real
+# owner and merges.
 #
 # `cargo run -p riverctl` from the source repo (not the installed binary) so
 # the embedded room_contract.wasm — and thus the derived contract key —

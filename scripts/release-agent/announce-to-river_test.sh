@@ -132,12 +132,12 @@ check "wait_for_node() honours NODE_WAIT_ATTEMPTS as the bound" "$CURL_CALLS" "3
 #
 # The signing-identity fix. post_message MUST hand riverctl the owner key
 # via the global `--signing-key-file` override, BEFORE the `message`
-# subcommand. Without it, riverctl's chat-delegate sync re-signs with the
-# locally-loaded (unauthorized) identity and the room contract silently
-# drops the delta on merge — the bug that lost the v0.2.67/v0.2.68
-# announcements while riverctl still exited 0. The function is extracted
-# verbatim, so dropping the override (or misplacing it after the
-# subcommand) fails these assertions.
+# subcommand. Without it riverctl signs with the identity rooms.json holds
+# (on nova an unauthorized key the chat-delegate sync can rewrite in), and
+# the room contract silently drops the delta on merge — the bug that lost
+# the v0.2.67/v0.2.68 announcements while riverctl still exited 0. The
+# function is extracted verbatim, so dropping the override (or misplacing it
+# after the subcommand) fails these assertions.
 eval "$(awk '/^post_message\(\) \{/,/^}/' "$ANNOUNCE_SH")"
 
 RIVER_DIR="$TMP"
@@ -145,21 +145,26 @@ SIGNING_KEY_FILE="$TMP/owner_key.bin"
 ROOM_OWNER_VK="OWNERVK111"
 MESSAGE="Freenet vX.Y.Z released"
 CARGO_ARGS_FILE="$TMP/cargo_args"
+CARGO_SKIP_FILE="$TMP/cargo_skip"
 
-# Stubs (inherited by the subshell that runs post_message): `timeout`
-# drops its duration and runs the rest; `cargo` records its argv joined.
+# Stubs (inherited by the subshell that runs post_message): `timeout` drops
+# its duration and runs the rest; `cargo` records its argv joined plus the
+# RIVER_SKIP_CONTRACT_CHECK env it inherits from the command prefix.
 timeout() { shift; "$@"; }
-cargo() { echo "$*" > "$CARGO_ARGS_FILE"; }
+cargo() { echo "$*" > "$CARGO_ARGS_FILE"; echo "${RIVER_SKIP_CONTRACT_CHECK:-}" > "$CARGO_SKIP_FILE"; }
 
 ( post_message ) >/dev/null 2>&1 || true
 cargo_args="$(cat "$CARGO_ARGS_FILE" 2>/dev/null || true)"
+cargo_skip="$(cat "$CARGO_SKIP_FILE" 2>/dev/null || true)"
 
 check "post_message signs with the owner key via --signing-key-file before the subcommand" \
     "$(printf '%s' "$cargo_args" | grep -cF -- "--signing-key-file $SIGNING_KEY_FILE message send" || true)" "1"
 check "post_message sends to the owner VK" \
     "$(printf '%s' "$cargo_args" | grep -cF -- "message send $ROOM_OWNER_VK" || true)" "1"
-check "post_message runs riverctl from source with the contract-check skip" \
+check "post_message runs riverctl from the source repo" \
     "$(printf '%s' "$cargo_args" | grep -cF -- "run --quiet -p riverctl" || true)" "1"
+check "post_message sets RIVER_SKIP_CONTRACT_CHECK for the riverctl run" \
+    "$cargo_skip" "1"
 
 # ── result ───────────────────────────────────────────────────────────
 
