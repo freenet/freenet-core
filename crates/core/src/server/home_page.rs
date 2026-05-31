@@ -345,10 +345,9 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
     // traffic, so idle nodes stay uncluttered. A non-zero "Rate-limited"
     // or "Capacity-dropped" count is the operator's signal that the
     // per-(sender, contract) UPDATE limiter is dropping relayed traffic.
-    let rate_limit_html = if snap.ring_stats.updates_accepted
-        + snap.ring_stats.updates_rate_limited
-        + snap.ring_stats.updates_capacity_dropped
-        > 0
+    let rate_limit_html = if snap.ring_stats.updates_accepted > 0
+        || snap.ring_stats.updates_rate_limited > 0
+        || snap.ring_stats.updates_capacity_dropped > 0
     {
         format!(
             r#"<div class="metrics-row">
