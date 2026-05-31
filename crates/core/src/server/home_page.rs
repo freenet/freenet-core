@@ -1001,6 +1001,14 @@ fn build_ring_svg(
     svg
 }
 
+/// Format the governance card's "last evaluated" footer from the number
+/// of seconds since the reaper last ticked. `format_ago` already appends
+/// " ago" (or returns "just now"), so the template must NOT add a second
+/// "ago" — doing so rendered "Last evaluated 18s ago ago".
+fn format_last_evaluated(secs: u64) -> String {
+    format!("Last evaluated {}", format_ago(secs))
+}
+
 /// Build the governance card. Reads `snap.governance` (sourced from
 /// `Ring::dashboard_governance_snapshot` → `GovernanceManager`). Every
 /// field rendered here came from the back-end's computation —
@@ -1030,7 +1038,7 @@ fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
             // moments ago so we can approximate "now" inline.
             let now = tokio::time::Instant::now();
             let secs = now.saturating_duration_since(at).as_secs();
-            format!("Last evaluated {} ago", format_ago(secs))
+            format_last_evaluated(secs)
         }
         None => "Reaper has not yet ticked".to_string(),
     };
@@ -3918,6 +3926,17 @@ mod tests {
         let snap = base_snapshot();
         let uri = build_favicon_data_uri(&Some(snap));
         assert!(uri.contains("%23fbbf24"), "expected amber color");
+    }
+
+    #[test]
+    fn last_evaluated_footer_has_single_ago() {
+        // Regression: format_ago already appends " ago", so the footer
+        // template must not add a second one. Previously rendered
+        // "Last evaluated 18s ago ago".
+        assert_eq!(format_last_evaluated(18), "Last evaluated 18s ago");
+        assert!(!format_last_evaluated(18).contains("ago ago"));
+        // Under 5s, format_ago returns "just now" (no "ago" suffix at all).
+        assert_eq!(format_last_evaluated(2), "Last evaluated just now");
     }
 
     #[test]
