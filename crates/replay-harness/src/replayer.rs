@@ -20,6 +20,13 @@ pub struct DecisionLog {
     /// Snapshot of the cross-peer state at the moment of the decision.
     /// Useful for "why did the controller (not) fire?" post-hoc analysis.
     pub n_peers_with_inflation: usize,
+    /// Cross-peer median of defined inflations, **without the N≥3
+    /// guard** that controllers should apply. This is the raw signal
+    /// the rolling stats produce; for ticks where `n_peers_with_inflation
+    /// < 3`, a well-behaved controller (e.g. `RfcDraft`) treats this
+    /// as untrustworthy and does NOT fire even if the value is large.
+    /// When reading a trace, always cross-check `n_peers_with_inflation`
+    /// before concluding "the controller should have fired".
     pub shared_inflation: Option<Duration>,
 }
 
@@ -55,6 +62,12 @@ impl ReplayReport {
 pub struct Replayer {
     tick_interval: Duration,
     starting_rate_bps: u64,
+    /// Optional override for the observation window. Without it, the
+    /// replayer ticks until one interval past the last event; with it,
+    /// the replayer ticks until at least `now > run_until`, so
+    /// scenarios with a quiet-tail observation period (e.g. "no
+    /// further fires after the burst") actually exercise that period.
+    run_until: Option<Duration>,
 }
 
 impl Replayer {
@@ -64,16 +77,35 @@ impl Replayer {
         Self {
             tick_interval: Duration::from_secs(1),
             starting_rate_bps: 1_250_000,
+            run_until: None,
         }
     }
 
+    /// # Panics (in debug builds)
+    /// `interval` must be strictly positive. A zero interval would loop
+    /// forever (`now += ZERO` never grows past `stop_at`).
     pub fn with_tick_interval(mut self, interval: Duration) -> Self {
+        debug_assert!(
+            interval > Duration::ZERO,
+            "tick_interval must be > 0; zero would loop forever",
+        );
         self.tick_interval = interval;
         self
     }
 
     pub fn with_starting_rate_bps(mut self, rate: u64) -> Self {
         self.starting_rate_bps = rate;
+        self
+    }
+
+    /// Run ticks until the observation window covers at least `until`.
+    /// Without this, the replayer stops one interval past the last
+    /// event — fine for scenarios whose events span the full intended
+    /// window, but wrong for scenarios with a quiet observation tail.
+    /// Set from [`Scenario::run_for`](crate::scenarios::Scenario) by
+    /// callers that drive a scenario.
+    pub fn run_until(mut self, until: Duration) -> Self {
+        self.run_until = Some(until);
         self
     }
 
@@ -104,11 +136,15 @@ impl Replayer {
         let mut ev_idx = 0usize;
         let mut now = Duration::ZERO;
 
-        // Tick from t=tick_interval until one tick past the last event,
-        // so we capture the final-window state. If there were no events,
-        // we tick exactly once at t=tick_interval so the controller sees
-        // an empty network.
-        let stop_at = end_time + self.tick_interval;
+        // Tick from t=tick_interval until at least one tick past the
+        // last event AND at least one tick past `run_until` (if set).
+        // If there were no events and no `run_until` override, we tick
+        // exactly once so the controller sees an empty network.
+        let event_stop_at = end_time + self.tick_interval;
+        let stop_at = match self.run_until {
+            Some(until) => event_stop_at.max(until),
+            None => event_stop_at,
+        };
         loop {
             now += self.tick_interval;
             if now > stop_at && ev_idx >= events.len() {
@@ -161,6 +197,22 @@ fn collect_stream<S: EventStream>(mut stream: S) -> Vec<Event> {
     out
 }
 
+/// Apply one event to the rolling stats. Semantics:
+///
+/// - `RttSample` for a peer the registry doesn't know yet creates the
+///   peer with a fresh stats deque and records the sample. This
+///   matches production semantics — the first ACK for a new connection
+///   implicitly registers it. **Side effect:** a `PeerLeave` followed
+///   by an `RttSample` for the *same* peer silently resurrects the
+///   peer with empty stats (re-baselining from the post-leave sample).
+///   If a churn scenario needs leave-and-stay-gone behaviour, the
+///   scenario must avoid emitting late samples for departed peers; or
+///   if reconnect should be modelled explicitly, emit a `PeerJoin`
+///   first to make the transition visible in the event trace.
+/// - `ReferenceSample` similarly creates the reference stats lazily.
+/// - `PeerJoin` is idempotent (no-op if already present).
+/// - `PeerLeave` removes the peer's stats entirely; subsequent samples
+///   for that peer trigger the resurrect behaviour above.
 fn apply_event(
     ev: &Event,
     per_peer: &mut BTreeMap<PeerKey, RollingRttStats>,

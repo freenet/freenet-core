@@ -14,10 +14,11 @@
 //! scenario's expectation.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use replay_harness::controllers::{FixedRate, RfcDraft};
-use replay_harness::scenarios::{Expectation, Scenario, all_scenarios};
-use replay_harness::{Controller, Replayer};
+use replay_harness::scenarios::{Expectation, Scenario, all_scenarios, find};
+use replay_harness::{Controller, RateDecision, Replayer};
 
 /// Whether the given controller is currently *expected* to fire on the
 /// given scenario. Anything not in the map defaults to the scenario's
@@ -50,7 +51,9 @@ fn expected_fires(controller: &str, scenario: &str) -> bool {
 }
 
 fn run<C: Controller>(s: &Scenario, controller: C) -> (String, bool /* fired */) {
-    let report = Replayer::new().run(s.events.clone().into_iter(), controller);
+    let report = Replayer::new()
+        .run_until(s.run_for)
+        .run(s.events.clone().into_iter(), controller);
     (report.controller, report.decisions_set > 0)
 }
 
@@ -89,6 +92,44 @@ fn scenarios_declare_concrete_expectations() {
             !matches!(s.expectation, Expectation::Informational),
             "scenario {} should declare NeverFires or FiresAtLeastOnce",
             s.name
+        );
+    }
+}
+
+/// Strengthen the `correlated_inflation` pin: a controller passing
+/// "decisions_set > 0" could in principle fire for the wrong reason
+/// (e.g. a startup-tick spurious fire at t=2). The scenario sets a
+/// clean 60 s baseline, then bursts at t=60s. The minimum *correctness*
+/// invariant is: no fire during the baseline phase. Any controller
+/// firing before the burst starts is reacting to the clean baseline,
+/// which means it would also fire on a healthy idle network.
+#[test]
+fn rfc_draft_correlated_inflation_first_fire_is_inside_burst_window() {
+    let s = find("correlated_inflation").expect("scenario exists");
+    let report = Replayer::new()
+        .run_until(s.run_for)
+        .run(s.events.clone().into_iter(), RfcDraft::default());
+    let fires = report.fired();
+    assert!(!fires.is_empty(), "RfcDraft must fire during burst");
+    let first_fire_at = fires[0].at;
+    let burst_start = Duration::from_secs(60);
+    assert!(
+        first_fire_at >= burst_start,
+        "first fire at {:?} is before burst_start ({:?}) — the \
+         controller fired during the clean baseline phase",
+        first_fire_at,
+        burst_start,
+    );
+    // Sanity: every fire's decision is a Set with a non-trivial rate
+    // change, not a no-op.
+    for d in fires {
+        let RateDecision::Set { .. } = &d.decision else {
+            unreachable!("fired() filters to Set");
+        };
+        assert!(
+            d.rate_after_bps < 1_250_000,
+            "Set decisions must lower the rate; got rate_after_bps={}",
+            d.rate_after_bps,
         );
     }
 }

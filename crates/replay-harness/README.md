@@ -55,11 +55,12 @@ Four scenarios, chosen to cover the most important pins for Phase 2 design:
 | `small_n` | Only 2 peers — below the `rolling_rtt_stats.rs` N≥3 trustworthy threshold | MUST NOT fire (N≥3 guard) |
 
 The `RfcDraft` reference controller intentionally **fails** the
-`idle_steady_state` pin (48 fires across the 300 s scenario, rate drops
-to ~0). That failure is the demonstration of the noise-floor problem the
-Phase 1 telemetry already showed: the 30 ms inflation threshold sits well
-below the ambient overlay queueing baseline, so the controller fires on
-healthy ambient noise. Any Phase 2 candidate MUST NOT repeat that failure.
+`idle_steady_state` pin (48 fires across the 300 s scenario, rate
+floors at 1 bps after enough successive 0.7× downsteps). That failure
+is the demonstration of the noise-floor problem the Phase 1 telemetry
+already showed: the 30 ms inflation threshold sits well below the
+ambient overlay queueing baseline, so the controller fires on healthy
+ambient noise. Any Phase 2 candidate MUST NOT repeat that failure.
 
 `FixedRate` (the production default) passes the universal sanity check
 of "never fires on any scenario."

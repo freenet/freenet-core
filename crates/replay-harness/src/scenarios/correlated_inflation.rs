@@ -1,8 +1,17 @@
 //! `correlated_inflation` — every peer's RTT rises together.
 //!
-//! Models the "user opened YouTube" case — the local uplink is contended,
-//! so every overlay path inflates at once. This is exactly the case the
-//! RFC controller is designed to detect. A sane controller MUST fire.
+//! Models the "user opened YouTube" case — the local uplink is
+//! contended, so every overlay path inflates at once. This is exactly
+//! the case the RFC controller is designed to detect. A sane
+//! controller MUST fire.
+//!
+//! Note the inherent detection lag for RFC-style controllers: the
+//! 10 s recent-median window plus the 5 s sustained-trigger check
+//! mean the controller cannot see anything above the threshold until
+//! ~15 s after the burst starts. A scenario `run_for` shorter than
+//! that would falsely show "controller didn't fire". This scenario
+//! uses a 60 s baseline + 60 s burst so the detection window has
+//! plenty of room.
 
 use std::time::Duration;
 

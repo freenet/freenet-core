@@ -43,6 +43,12 @@ enum Cmd {
         #[arg(long, default_value = "rfc_draft")]
         controller: String,
     },
+    // Note: the `compare <a> <b> <events>` subcommand listed in the
+    // #4314 design is intentionally deferred. The Replayer already
+    // produces a full DecisionLog for each run, so a future PR can
+    // diff two runs without harness-side changes. Holding off on
+    // deciding the diff/output format (text vs JSON vs side-by-side)
+    // until we have a real Phase 2 candidate to compare against.
 }
 
 fn main() -> Result<()> {
@@ -99,20 +105,32 @@ fn main() -> Result<()> {
 
 fn run_synthetic(s: &scenarios::Scenario, controller_name: &str) -> Result<()> {
     let report = match controller_name {
-        "fixed_rate" => Replayer::new().run(s.events.clone().into_iter(), FixedRate),
-        "rfc_draft" => Replayer::new().run(s.events.clone().into_iter(), RfcDraft::default()),
+        "fixed_rate" => Replayer::new()
+            .run_until(s.run_for)
+            .run(s.events.clone().into_iter(), FixedRate),
+        "rfc_draft" => Replayer::new()
+            .run_until(s.run_for)
+            .run(s.events.clone().into_iter(), RfcDraft::default()),
         other => bail!("unknown controller: {other}"),
     };
 
-    let pass = match s.expectation {
-        Expectation::NeverFires => report.decisions_set == 0,
-        Expectation::FiresAtLeastOnce => report.decisions_set > 0,
-        Expectation::Informational => true,
+    // CLI output is neutral by design: it prints what the controller
+    // actually did, plus the scenario's expectation for a *sane*
+    // controller. Whether a specific controller's behaviour is correct
+    // depends on its design philosophy — `FixedRate` (a no-op
+    // baseline) never fires by definition, so it will always
+    // "disagree" with `FiresAtLeastOnce` scenarios; that disagreement
+    // is not a bug. Per-controller-per-scenario expected outcomes
+    // live in `tests/scenarios_pin.rs` where they are pinned with
+    // explicit knowledge of each controller's design.
+    let scenario_expects = match s.expectation {
+        Expectation::NeverFires => "scenario expects: no fire (sane controller)",
+        Expectation::FiresAtLeastOnce => "scenario expects: at least one fire (sane controller)",
+        Expectation::Informational => "scenario is informational",
     };
-    let marker = if pass { "PASS" } else { "FAIL" };
     println!(
-        "{marker} {scenario}/{controller} — ticks={ticks} fires={fires} \
-         final_rate_bps={final_rate} range_bps=[{min}..{max}]",
+        "{scenario}/{controller} — ticks={ticks} fires={fires} \
+         final_rate_bps={final_rate} range_bps=[{min}..{max}]\n    ({expects})",
         scenario = s.name,
         controller = report.controller,
         ticks = report.ticks,
@@ -120,6 +138,7 @@ fn run_synthetic(s: &scenarios::Scenario, controller_name: &str) -> Result<()> {
         final_rate = report.final_rate_bps,
         min = report.min_rate_bps,
         max = report.max_rate_bps,
+        expects = scenario_expects,
     );
     if !report.fired().is_empty() {
         for d in report.fired().iter().take(5) {

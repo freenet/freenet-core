@@ -1,9 +1,19 @@
-//! `idle_steady_state` — 5 peers, all reporting flat 80 ms RTT.
+//! `idle_steady_state` — 5 peers, each anchored by a fast t=0 sample,
+//! then steady ~80 ms RTT for the rest of the window.
 //!
-//! This is the steady state we measured in production at ~55 ms p50,
-//! ~91 ms p90. Even a healthy network sits comfortably above the
-//! `RfcDraft` 30 ms threshold all the time. A sane controller must NOT
-//! interpret it as contention.
+//! Models the production noise-floor problem the Phase 1 analysis
+//! exposed: in the wild we measured ~55 ms p50 / ~91 ms p90 inflation
+//! across healthy peers, all sitting comfortably above the `RfcDraft`
+//! 30 ms threshold all the time.
+//!
+//! The synthetic construction here uses a single t=0 40 ms sample per
+//! peer to anchor `baseline_min`, then steady 80 ms for the rest of
+//! the run, producing ~40 ms persistent inflation. That's an
+//! intentionally simplified driver — real production sees a mix of
+//! transient fast samples scattered throughout, but the *signal the
+//! controller sees* (a sustained inflation well above the threshold)
+//! is the same. A sane controller MUST NOT interpret this as
+//! contention.
 
 use std::time::Duration;
 
