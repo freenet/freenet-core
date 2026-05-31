@@ -567,8 +567,10 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                 match driver.advance() {
                     AdvanceOutcome::Next => continue,
                     AdvanceOutcome::Exhausted => {
+                        let peer_attempts = attempt_count.saturating_sub(infra_retries);
                         return RetryLoopOutcome::Exhausted(format!(
-                            "{op_label} failed after {attempt_count} attempts (last error: {err})"
+                            "{op_label} failed after {peer_attempts} peer attempt(s) \
+                             ({infra_retries} infra-retries on same peer; last error: {err})"
                         ));
                     }
                 }
@@ -585,8 +587,10 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                 match driver.advance() {
                     AdvanceOutcome::Next => continue,
                     AdvanceOutcome::Exhausted => {
+                        let peer_attempts = attempt_count.saturating_sub(infra_retries);
                         return RetryLoopOutcome::Exhausted(format!(
-                            "{op_label} timed out after {attempt_count} attempts"
+                            "{op_label} timed out after {peer_attempts} peer attempt(s) \
+                             ({infra_retries} infra-retries on same peer)"
                         ));
                     }
                 }
