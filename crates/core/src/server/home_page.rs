@@ -4079,6 +4079,38 @@ mod tests {
     }
 
     #[test]
+    fn rate_limit_stats_shown_when_only_rate_limited() {
+        // Boundary: the row's most operator-critical trigger. Independently
+        // exercises the SECOND term of the OR guard so a `||`->`&&` change,
+        // a dropped term, or a field-name swap is caught. A node that has
+        // ONLY ever rate-limited (accepted/capacity both zero) must still
+        // surface the signal.
+        let mut snap = base_snapshot();
+        snap.ring_stats.updates_rate_limited = 1;
+        let html = build_status_card(&Some(snap));
+        assert!(
+            html.contains("Rate-limited"),
+            "row must render when the limiter has rate-limited traffic"
+        );
+        assert!(html.contains("1</span>"), "rate-limited count missing");
+    }
+
+    #[test]
+    fn rate_limit_stats_shown_when_only_capacity_dropped() {
+        // Boundary: independently exercises the THIRD term of the OR guard
+        // (capacity drops signal identity churn / admission pressure). A
+        // node that has ONLY ever capacity-dropped must still surface it.
+        let mut snap = base_snapshot();
+        snap.ring_stats.updates_capacity_dropped = 1;
+        let html = build_status_card(&Some(snap));
+        assert!(
+            html.contains("Capacity-dropped"),
+            "row must render when the limiter has capacity-dropped traffic"
+        );
+        assert!(html.contains("1</span>"), "capacity-dropped count missing");
+    }
+
+    #[test]
     fn failures_prominent_when_not_connected() {
         let mut snap = base_snapshot();
         snap.open_connections = 0;
