@@ -543,11 +543,16 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                 // Brief jittered delay so the receiver side can
                 // recover from whatever transient state caused the
                 // drop (e.g., a downstream handler still initializing
-                // on a freshly-booted gateway). Bounded by
-                // `MAX_INFRA_RETRIES × 100ms = 300ms` worst case —
+                // on a freshly-booted gateway). Base `50 ms ×
+                // infra_retries` with ±20% jitter via `GlobalRng`
+                // (deterministic under simulation, ±20% per the
+                // `code-style.md` retry/backoff rule). Worst-case
+                // cumulative is 50+100+150 ms × 1.2 = 360 ms —
                 // negligible against the per-attempt timeout cap.
-                tokio::time::sleep(std::time::Duration::from_millis(50 * infra_retries as u64))
-                    .await;
+                let base_ms = 50 * infra_retries as u64;
+                let jitter_factor = crate::config::GlobalRng::random_range::<f64, _>(0.8..1.2);
+                let sleep_ms = (base_ms as f64 * jitter_factor) as u64;
+                tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
                 continue;
             }
             Ok(Err(err)) => {
