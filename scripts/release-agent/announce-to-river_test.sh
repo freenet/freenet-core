@@ -128,6 +128,39 @@ wait_for_node 2>/dev/null || rc=$?
 check "wait_for_node() fails when the node never returns" "$rc" "1"
 check "wait_for_node() honours NODE_WAIT_ATTEMPTS as the bound" "$CURL_CALLS" "3"
 
+# ── post_message() ───────────────────────────────────────────────────
+#
+# The signing-identity fix. post_message MUST hand riverctl the owner key
+# via the global `--signing-key-file` override, BEFORE the `message`
+# subcommand. Without it, riverctl's chat-delegate sync re-signs with the
+# locally-loaded (unauthorized) identity and the room contract silently
+# drops the delta on merge — the bug that lost the v0.2.67/v0.2.68
+# announcements while riverctl still exited 0. The function is extracted
+# verbatim, so dropping the override (or misplacing it after the
+# subcommand) fails these assertions.
+eval "$(awk '/^post_message\(\) \{/,/^}/' "$ANNOUNCE_SH")"
+
+RIVER_DIR="$TMP"
+SIGNING_KEY_FILE="$TMP/owner_key.bin"
+ROOM_OWNER_VK="OWNERVK111"
+MESSAGE="Freenet vX.Y.Z released"
+CARGO_ARGS_FILE="$TMP/cargo_args"
+
+# Stubs (inherited by the subshell that runs post_message): `timeout`
+# drops its duration and runs the rest; `cargo` records its argv joined.
+timeout() { shift; "$@"; }
+cargo() { echo "$*" > "$CARGO_ARGS_FILE"; }
+
+( post_message ) >/dev/null 2>&1 || true
+cargo_args="$(cat "$CARGO_ARGS_FILE" 2>/dev/null || true)"
+
+check "post_message signs with the owner key via --signing-key-file before the subcommand" \
+    "$(printf '%s' "$cargo_args" | grep -cF -- "--signing-key-file $SIGNING_KEY_FILE message send" || true)" "1"
+check "post_message sends to the owner VK" \
+    "$(printf '%s' "$cargo_args" | grep -cF -- "message send $ROOM_OWNER_VK" || true)" "1"
+check "post_message runs riverctl from source with the contract-check skip" \
+    "$(printf '%s' "$cargo_args" | grep -cF -- "run --quiet -p riverctl" || true)" "1"
+
 # ── result ───────────────────────────────────────────────────────────
 
 if (( FAILURES > 0 )); then
