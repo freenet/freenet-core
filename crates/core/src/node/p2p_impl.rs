@@ -162,11 +162,15 @@ impl NodeP2P {
                 let own_pub_key = bs58::encode(key_bytes).into_string(); // full 32-byte
                 (peer_id, own_pub_key)
             };
+            let rate_limiter = &ring_stats.update_rate_limiter;
             super::network_status::RingStatsSnapshot {
                 connection_count: ring_stats.connection_manager.connection_count() as u32,
                 hosted_contracts: ring_stats.hosting_contracts_count() as u32,
                 peer_id,
                 own_pub_key,
+                updates_accepted: rate_limiter.accepted_total(),
+                updates_rate_limited: rate_limiter.rejected_total(),
+                updates_capacity_dropped: rate_limiter.capacity_rejected_total(),
             }
         }));
 

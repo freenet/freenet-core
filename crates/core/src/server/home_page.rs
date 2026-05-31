@@ -341,6 +341,38 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
         attempts = snap.connection_attempts,
     );
 
+    // UPDATE rate-limiter stats: only shown once the limiter has seen
+    // traffic, so idle nodes stay uncluttered. A non-zero "Rate-limited"
+    // or "Capacity-dropped" count is the operator's signal that the
+    // per-(sender, contract) UPDATE limiter is dropping relayed traffic.
+    let rate_limit_html = if snap.ring_stats.updates_accepted
+        + snap.ring_stats.updates_rate_limited
+        + snap.ring_stats.updates_capacity_dropped
+        > 0
+    {
+        format!(
+            r#"<div class="metrics-row">
+            <div class="metric-tile">
+                <span class="metric-value">{accepted}</span>
+                <span class="metric-label">UPDATEs relayed</span>
+            </div>
+            <div class="metric-tile">
+                <span class="metric-value">{rate_limited}</span>
+                <span class="metric-label">Rate-limited</span>
+            </div>
+            <div class="metric-tile">
+                <span class="metric-value">{capacity_dropped}</span>
+                <span class="metric-label">Capacity-dropped</span>
+            </div>
+        </div>"#,
+            accepted = snap.ring_stats.updates_accepted,
+            rate_limited = snap.ring_stats.updates_rate_limited,
+            capacity_dropped = snap.ring_stats.updates_capacity_dropped,
+        )
+    } else {
+        String::new()
+    };
+
     let spinner = if snap.open_connections == 0 {
         r#"<div class="spinner"></div>"#
     } else {
@@ -456,6 +488,7 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
             <h2>Connection Status</h2>
             {health_banner}
             {ring_stats_html}
+            {rate_limit_html}
             {external_addr_html}
             {spinner}
             {gateway_warning}
@@ -464,6 +497,7 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
         </div>"#,
         health_banner = health_banner,
         ring_stats_html = ring_stats_html,
+        rate_limit_html = rate_limit_html,
         external_addr_html = external_addr_html,
         spinner = spinner,
         gateway_warning = gateway_warning,
@@ -3996,6 +4030,52 @@ mod tests {
         assert!(
             html.contains("(normal)"),
             "should indicate failures are normal"
+        );
+    }
+
+    #[test]
+    fn rate_limit_stats_hidden_when_no_traffic() {
+        // A fresh node (no relayed UPDATEs yet) must not render the
+        // UPDATE rate-limiter row — keeps the idle dashboard uncluttered.
+        let snap = base_snapshot();
+        assert_eq!(snap.ring_stats.updates_accepted, 0);
+        let html = build_status_card(&Some(snap));
+        assert!(
+            !html.contains("Rate-limited"),
+            "rate-limit row should be hidden when the limiter has seen no traffic"
+        );
+    }
+
+    #[test]
+    fn rate_limit_stats_rendered_when_active() {
+        // Once the limiter has dropped traffic, the operator must see the
+        // accepted / rate-limited / capacity-dropped counts on the card.
+        let mut snap = base_snapshot();
+        snap.ring_stats.updates_accepted = 1234;
+        snap.ring_stats.updates_rate_limited = 56;
+        snap.ring_stats.updates_capacity_dropped = 7;
+        let html = build_status_card(&Some(snap));
+        assert!(html.contains("UPDATEs relayed"), "accepted label missing");
+        assert!(html.contains("1234</span>"), "accepted count missing");
+        assert!(html.contains("Rate-limited"), "rate-limited label missing");
+        assert!(html.contains("56</span>"), "rate-limited count missing");
+        assert!(
+            html.contains("Capacity-dropped"),
+            "capacity-dropped label missing"
+        );
+        assert!(html.contains("7</span>"), "capacity-dropped count missing");
+    }
+
+    #[test]
+    fn rate_limit_stats_shown_when_only_accepted() {
+        // Boundary: accepted>0 but zero drops should still render the row
+        // (operators want to see the limiter is active and healthy).
+        let mut snap = base_snapshot();
+        snap.ring_stats.updates_accepted = 10;
+        let html = build_status_card(&Some(snap));
+        assert!(
+            html.contains("UPDATEs relayed"),
+            "row should render once any UPDATE has been accepted"
         );
     }
 
