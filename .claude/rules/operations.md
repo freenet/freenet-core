@@ -35,7 +35,7 @@ for every inbound wire message. Pattern per op:
 
 1. **Reply bypass.** If a terminal reply variant arrives and a
    `pending_op_results` callback is registered, forward it via
-   `try_forward_task_per_tx_reply` and return. For GET/PUT/SUBSCRIBE the
+   `try_forward_driver_reply` and return. For GET/PUT/SUBSCRIBE the
    gate is `Response | ResponseStreaming` only. PUT additionally
    accepts `PutMsg::Error` so the originator-loopback failure path
    (issue #4111) delivers the contract-side cause via the same bypass

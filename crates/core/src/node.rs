@@ -2765,7 +2765,7 @@ mod tests {
 
         /// Issue #4111 regression guard. The PUT branch of
         /// `handle_pure_network_message_v1` must forward `PutMsg::Error`
-        /// through `try_forward_task_per_tx_reply` exactly like
+        /// through `try_forward_driver_reply` exactly like
         /// `PutMsg::Response` / `PutMsg::ResponseStreaming`. Without
         /// this, the originator-loopback failure path's
         /// `send_local_loopback(PutMsg::Error)` would arrive at the
