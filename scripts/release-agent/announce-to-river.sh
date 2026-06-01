@@ -93,6 +93,39 @@ wait_for_node() {
     return 1
 }
 
+# Post $MESSAGE to the room, signed by the room OWNER.
+#
+# The signing identity is load-bearing and the source of a long-standing
+# silent failure. Without an explicit key, riverctl signs with whatever
+# identity rooms.json currently holds, and the chat-delegate sync can
+# silently rewrite that `signing_key_bytes` field to a non-owner key (on
+# nova it resolves to an unauthorized "bot" identity). riverctl documents
+# this exact hazard and provides `--signing-key-file` as the remedy (see its
+# `--help`: "signs at command time, without the UI's chat-delegate sync").
+# When the message is signed by a non-owner, the room contract is valid at
+# the request layer but SILENTLY DROPS the delta on merge — riverctl still
+# prints "Message sent successfully" and exits 0, yet the message never
+# converges into room state. Every release announcement before this fix was
+# lost exactly this way (v0.2.67 and v0.2.68 were both absent from the room).
+#
+# Pre-patching rooms.json's `signing_key_bytes` (what this script used to do)
+# is unreliable for the same reason — the sync can overwrite it before the
+# send signs. The fix is the global `--signing-key-file` override, which is
+# held in memory, never persisted, and is what riverctl returns from
+# resolve_signing_key, so the delta is deterministically signed by the real
+# owner and merges.
+#
+# `cargo run -p riverctl` from the source repo (not the installed binary) so
+# the embedded room_contract.wasm — and thus the derived contract key —
+# matches the currently-deployed room.
+post_message() {
+    cd "$RIVER_DIR" || return 1
+    RIVER_SKIP_CONTRACT_CHECK=1 timeout 180 \
+        cargo run --quiet -p riverctl -- \
+            --signing-key-file "$SIGNING_KEY_FILE" \
+            message send "$ROOM_OWNER_VK" "$MESSAGE"
+}
+
 if [[ $# -ne 1 ]]; then
     usage
 fi
@@ -132,57 +165,11 @@ if ! wait_for_node; then
     exit 1
 fi
 
-# Ensure the room owner signing key in rooms.json matches the on-disk
-# key. This mirrors the equivalent block in scripts/release.sh — without
-# it, posting fails if the local rooms.json drifted.
-#
-# Failure modes are logged and abort (no `|| true` swallowing): if the
-# rooms.json schema drifted, posting with a stale key would be confusing
-# at best and identity-impersonation at worst. We'd rather fail loud.
-#
-# Writes are atomic (temp file + os.replace) so a crash mid-rewrite
-# can't leave rooms.json half-written for the human user.
-if ! python3 - <<PY; then
-import json, os, sys
-signing_key_file = "$SIGNING_KEY_FILE"
-rooms_file = "$ROOMS_JSON"
-room_vk = "$ROOM_OWNER_VK"
-try:
-    with open(signing_key_file, 'rb') as f:
-        key_bytes = list(f.read())
-    with open(rooms_file, 'r') as f:
-        data = json.load(f)
-    if room_vk not in data.get('rooms', {}):
-        # No-op if the room isn't in local storage — riverctl will
-        # itself fail with a clear error in that case.
-        sys.exit(0)
-    current_key = data['rooms'][room_vk].get('signing_key_bytes', [])
-    if current_key != key_bytes:
-        data['rooms'][room_vk]['signing_key_bytes'] = key_bytes
-        tmp = rooms_file + '.tmp'
-        with open(tmp, 'w') as f:
-            json.dump(data, f)
-        os.replace(tmp, rooms_file)
-        print("rooms.json signing key resynced", file=sys.stderr)
-except Exception as e:
-    print(f"rooms.json sync failed: {e}", file=sys.stderr)
-    sys.exit(1)
-PY
-    log "ERROR: rooms.json signing-key sync failed (see above)"
-    exit 1
-fi
-
 log "posting to River room $ROOM_OWNER_VK (msg ${#MESSAGE} bytes)"
 
-# Use `cargo run -p riverctl` from the source repo, NOT the installed
-# binary. The installed binary embeds room_contract.wasm at install
-# time, which can become stale when the contract WASM changes. The
-# repo version uses build.rs to copy the current WASM at build time.
-# RIVER_SKIP_CONTRACT_CHECK=1 bypasses the publish-time WASM staleness
-# check (only relevant when publishing riverctl, not when running it).
-cd "$RIVER_DIR"
-if RIVER_SKIP_CONTRACT_CHECK=1 timeout 180 \
-       cargo run --quiet -p riverctl -- message send "$ROOM_OWNER_VK" "$MESSAGE"; then
+# Sign as the owner via the in-memory --signing-key-file override (see
+# post_message above for why pre-patching rooms.json does not work).
+if post_message; then
     log "OK"
     exit 0
 else

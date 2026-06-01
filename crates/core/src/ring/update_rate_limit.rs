@@ -308,17 +308,16 @@ impl UpdateRateLimiter {
         }
     }
 
-    /// Total accepted UPDATEs since creation. Used by the dashboard
-    /// snapshot (follow-up PR — surfaces "rate limit drops in last
-    /// hour" on the governance card).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Total accepted UPDATEs since creation. Surfaced on the node
+    /// status dashboard via `RingStatsSnapshot` ("UPDATEs relayed").
     pub fn accepted_total(&self) -> u64 {
         self.accepted_total.load(Ordering::Relaxed)
     }
 
-    /// Total rejected UPDATEs since creation. Used by the dashboard
-    /// snapshot (follow-up PR).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Total rejected UPDATEs since creation. Surfaced on the node
+    /// status dashboard via `RingStatsSnapshot` ("Rate-limited") — a
+    /// rising value is the operator's signal that the per-(sender,
+    /// contract) limiter may be dropping legitimate relayed traffic.
     pub fn rejected_total(&self) -> u64 {
         self.rejected_total.load(Ordering::Relaxed)
     }
@@ -326,9 +325,9 @@ impl UpdateRateLimiter {
     /// Total UPDATEs rejected because the tracking map was at capacity
     /// (a new `(sender, contract)` pair tried to register when the map
     /// already held [`MAX_TRACKED_PAIRS`] pairs). A non-zero value
-    /// suggests an attacker is churning identities — surface separately
-    /// from `rejected_total` on the dashboard for that reason.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// suggests an attacker is churning identities — surfaced separately
+    /// from `rejected_total` on the dashboard ("Capacity-dropped") for
+    /// that reason.
     pub fn capacity_rejected_total(&self) -> u64 {
         self.capacity_rejected_total.load(Ordering::Relaxed)
     }

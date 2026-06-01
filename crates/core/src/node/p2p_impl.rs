@@ -1,4 +1,4 @@
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
 
 use futures::{FutureExt, future::BoxFuture};
 use tokio::task::JoinHandle;
@@ -162,11 +162,15 @@ impl NodeP2P {
                 let own_pub_key = bs58::encode(key_bytes).into_string(); // full 32-byte
                 (peer_id, own_pub_key)
             };
+            let rate_limiter = &ring_stats.update_rate_limiter;
             super::network_status::RingStatsSnapshot {
                 connection_count: ring_stats.connection_manager.connection_count() as u32,
                 hosted_contracts: ring_stats.hosting_contracts_count() as u32,
                 peer_id,
                 own_pub_key,
+                updates_accepted: rate_limiter.accepted_total(),
+                updates_rate_limited: rate_limiter.rejected_total(),
+                updates_capacity_dropped: rate_limiter.capacity_rejected_total(),
             }
         }));
 
@@ -373,10 +377,63 @@ impl NodeP2P {
         tracing::info!("Actor-based client management infrastructure installed with result router");
 
         let background_task_monitor = BackgroundTaskMonitor::new();
-        // Phase 1 of the outer-loop rate-controller RFC (#4074):
-        // start the cross-connection RTT shadow aggregator. Pure
-        // observation; never read by the production data path.
-        crate::transport::rolling_rtt_stats::spawn_aggregator(&background_task_monitor);
+        // Phase 1 / Phase 1.5 of the outer-loop rate-controller RFC
+        // (#4074): start the cross-connection RTT shadow aggregator
+        // and the out-of-band reference-path probe. Both are pure
+        // observation — never read by the production data path.
+        //
+        // The local peer id is tagged onto every emitted event so the
+        // collector can disaggregate samples by reporting node. We
+        // construct it as `PeerId::new(pub_key, addr).to_string()` to
+        // match the *format* used by other OTLP events (set elsewhere
+        // from `KnownPeerKeyLocation::Display`).
+        //
+        // Caveat: for non-gateway nodes the external `own_addr` is
+        // not known at build time, so we fall back to the listener
+        // address (typically `0.0.0.0:<port>`). Other OTLP events
+        // emitted later read the up-to-date `Ring::own_location()`,
+        // so cross-correlation with the rest of the event stream by
+        // peer_id alone works for gateways but is best-effort for
+        // leaf nodes until they learn their external address. Phase
+        // 1.5 accepts this; a refresh path is tracked in #4294.
+        //
+        // Gate on telemetry being enabled AND reference-ping being
+        // explicitly opted in: when telemetry is off
+        // (`telemetry-enabled = false`) or in test environments
+        // (detected by `--id` flag), `TelemetryReporter::new` returns
+        // `None` and `send_standalone_event_with_peer_id` silently
+        // drops events. The shadow aggregator is cheap to leave
+        // running (no I/O), but reference-ping issues a real UDP DNS
+        // query at 1Hz, so we must not fire that traffic by default.
+        //
+        // `reference_ping_enabled` defaults to `false`; production
+        // gateway configs set it to `true` via
+        // `telemetry.reference-ping-enabled = true` in the config
+        // file (or `FREENET_REFERENCE_PING_ENABLED=true`). This keeps
+        // CI integration tests (which build `NodeConfig` directly
+        // without `--id`, so `is_test_environment` stays false) from
+        // accidentally firing DNS traffic and perturbing
+        // timing-sensitive multi-node tests. It also avoids
+        // surprising opt-out operators with default Cloudflare hits.
+        let reference_ping_enabled = config.config.telemetry.enabled
+            && !config.config.telemetry.is_test_environment
+            && config.config.telemetry.reference_ping_enabled;
+        let listen_addr = config.own_addr.unwrap_or_else(|| {
+            SocketAddr::new(config.network_listener_ip, config.network_listener_port)
+        });
+        let local_peer_id =
+            crate::node::PeerId::new(config.key_pair.public().clone(), listen_addr).to_string();
+        crate::transport::rolling_rtt_stats::spawn_aggregator(
+            local_peer_id.clone(),
+            &background_task_monitor,
+        );
+        if reference_ping_enabled {
+            crate::transport::reference_ping::spawn_reference_ping(
+                local_peer_id,
+                crate::transport::reference_ping::DEFAULT_REFERENCE_TARGET,
+                &background_task_monitor,
+            );
+        }
         let connection_manager = ConnectionManager::new(&config);
         let op_manager = Arc::new(OpManager::new(
             notification_tx,

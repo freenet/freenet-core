@@ -598,9 +598,13 @@ fn test_streaming_multi_hop_forwarding() {
 /// 2. A different node GETs the contract, routing through intermediate relay nodes
 /// 3. The relay uses pipe_stream to forward the streaming GET response
 ///
-/// With 1 gateway + 4 nodes, the GET request from a non-storing node must relay
-/// through at least one intermediate node, exercising the pipe_stream forwarding
-/// path that the cwnd timeout protects.
+/// With a sparse topology (1 gateway + 6 nodes, max_connections = 3, below
+/// the node count) the GET request from node 5 cannot mesh directly with the
+/// storer and must relay through at least one intermediate node, exercising
+/// the pipe_stream forwarding path that the cwnd timeout protects. The
+/// `RELAY_GET_STREAMING_FORWARD_COUNT` assertion below proves a streaming
+/// relay hop genuinely fired (the sim is deterministic per-seed, so this is
+/// not flaky once the seed + topology are locked in).
 #[test]
 fn test_streaming_get_through_relay() {
     const SEED: u64 = 0xDE1A_0008_FACE_B00C;
@@ -613,7 +617,31 @@ fn test_streaming_get_through_relay() {
         .build()
         .unwrap();
 
-    let sim = rt.block_on(setup_streaming_network(NETWORK_NAME, 1, 4, SEED, THRESHOLD));
+    // Sparse topology: 1 gateway + 6 nodes, max_connections = 3 (below the
+    // node count) forces the getter (node 5) to relay rather than connect
+    // directly to the storer. `setup_streaming_network` hardcodes
+    // max_connections = 10, which meshes a network this small and yields a
+    // direct GET with no relay hop (counter stays 0), so build the
+    // SimNetwork inline here with the sparse cap.
+    GlobalRng::set_seed(SEED);
+    const BASE_EPOCH_MS: u64 = 1577836800000;
+    const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
+    GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
+    let sim = rt.block_on(async {
+        let mut sim = SimNetwork::new(
+            NETWORK_NAME,
+            1, // gateways
+            6, // nodes
+            7, // ring_max_htl
+            3, // rnd_if_htl_above
+            3, // max_connections (sparse: < node count → forces a relay hop)
+            2, // min_connections
+            SEED,
+        )
+        .await;
+        sim.with_streaming_threshold(THRESHOLD);
+        sim
+    });
 
     let contract = SimOperation::create_test_contract(0xAB);
     let large_state = SimOperation::create_large_state(LARGE_STATE_SIZE, 0xAB);
@@ -630,9 +658,9 @@ fn test_streaming_get_through_relay() {
                 subscribe: false,
             },
         ),
-        // A different node GETs the contract — must relay through network
+        // Node 5 GETs the contract — must relay through network
         ScheduledOperation::new(
-            NodeLabel::node(NETWORK_NAME, 3),
+            NodeLabel::node(NETWORK_NAME, 5),
             SimOperation::Get {
                 contract_id,
                 return_contract_code: false,
@@ -640,6 +668,12 @@ fn test_streaming_get_through_relay() {
             },
         ),
     ];
+
+    // Snapshot the streaming relay GET forward counter so we can assert the
+    // relay genuinely forked+piped a streaming response through a hop (vs.
+    // satisfying the GET via store-and-forward without the streaming path).
+    let forward_calls_before = freenet::dev_tool::RELAY_GET_STREAMING_FORWARD_COUNT
+        .load(std::sync::atomic::Ordering::SeqCst);
 
     let result = sim.run_controlled_simulation(
         SEED,
@@ -654,19 +688,29 @@ fn test_streaming_get_through_relay() {
         result.turmoil_result.err()
     );
 
+    let forward_calls_after = freenet::dev_tool::RELAY_GET_STREAMING_FORWARD_COUNT
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        forward_calls_after > forward_calls_before,
+        "Expected the relay GET streaming-forward path to run at least once \
+         during a 1MB relayed GET (before={forward_calls_before}, \
+         after={forward_calls_after}). Counter stuck → relay GET \
+         streaming-forward path did not run (fell back to store-and-forward)."
+    );
+
     // The GET-requesting node should have the contract state
-    let node3_label = NodeLabel::node(NETWORK_NAME, 3);
-    let node3_storage = result
+    let getter_label = NodeLabel::node(NETWORK_NAME, 5);
+    let getter_storage = result
         .node_storages
-        .get(&node3_label)
-        .expect("node 3 should have a storage handle");
-    let node3_state = node3_storage.get_stored_state(&contract_key);
+        .get(&getter_label)
+        .expect("node 5 should have a storage handle");
+    let getter_state = getter_storage.get_stored_state(&contract_key);
 
     assert!(
-        node3_state.is_some(),
-        "Node 3 should have 1MB contract state after streaming GET through relay"
+        getter_state.is_some(),
+        "Node 5 should have 1MB contract state after streaming GET through relay"
     );
-    let stored_bytes: Vec<u8> = node3_state.unwrap().as_ref().to_vec();
+    let stored_bytes: Vec<u8> = getter_state.unwrap().as_ref().to_vec();
     assert_eq!(
         stored_bytes, large_state,
         "Stored state bytes should match the original 1MB state after relay GET"

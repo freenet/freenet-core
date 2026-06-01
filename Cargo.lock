@@ -1809,7 +1809,7 @@ dependencies = [
 
 [[package]]
 name = "fdev"
-version = "0.3.229"
+version = "0.3.230"
 dependencies = [
  "anyhow",
  "axum",
@@ -1981,7 +1981,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.2.67"
+version = "0.2.68"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -5511,6 +5511,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "84e211a18baa131a6fdbb95c6b785fbb8107203ea9e71a5f492a7bf43bd50d30"
 dependencies = [
  "pav_regression",
+]
+
+[[package]]
+name = "replay-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

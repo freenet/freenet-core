@@ -50,6 +50,17 @@ pub struct RingStatsSnapshot {
     pub peer_id: String,
     /// Base58-encoded full 32-byte X25519 public key.
     pub own_pub_key: String,
+    /// Total relayed UPDATEs accepted by the per-(sender, contract) rate
+    /// limiter since startup (see `ring::update_rate_limit`).
+    pub updates_accepted: u64,
+    /// Total relayed UPDATEs dropped because the per-(sender, contract)
+    /// rate exceeded the limit. A rising value means legitimate traffic
+    /// may be getting dropped — operators should watch this.
+    pub updates_rate_limited: u64,
+    /// Total relayed UPDATEs dropped because the limiter's tracking map
+    /// was at capacity (`MAX_TRACKED_PAIRS`). A non-zero value suggests
+    /// identity churn / admission pressure, distinct from per-pair rate.
+    pub updates_capacity_dropped: u64,
 }
 
 static GOVERNANCE_PROVIDER: parking_lot::RwLock<Option<GovernanceProvider>> =
@@ -1379,11 +1390,17 @@ mod tests {
             hosted_contracts: 7,
             peer_id: "abc".to_string(),
             own_pub_key: "test-key".to_string(),
+            updates_accepted: 1000,
+            updates_rate_limited: 13,
+            updates_capacity_dropped: 2,
         }));
         let snap = get_snapshot().unwrap();
         assert_eq!(snap.ring_stats.connection_count, 42);
         assert_eq!(snap.ring_stats.peer_id, "abc");
         assert_eq!(snap.ring_stats.own_pub_key, "test-key");
+        assert_eq!(snap.ring_stats.updates_accepted, 1000);
+        assert_eq!(snap.ring_stats.updates_rate_limited, 13);
+        assert_eq!(snap.ring_stats.updates_capacity_dropped, 2);
 
         // 3. Replace provider — must take effect immediately.
         set_ring_stats_provider(Arc::new(|| RingStatsSnapshot {
@@ -1391,6 +1408,7 @@ mod tests {
             hosted_contracts: 1,
             peer_id: "xyz".to_string(),
             own_pub_key: "new-key".to_string(),
+            ..Default::default()
         }));
         let snap = get_snapshot().unwrap();
         assert_eq!(snap.ring_stats.connection_count, 99);

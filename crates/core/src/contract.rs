@@ -1538,20 +1538,40 @@ mod tests {
         let idx = source
             .find(needle)
             .expect("rejection log message must still exist in source");
-        // Window the 200 bytes preceding the message: the `tracing::*!`
-        // macro that emits it lives within that window.
-        let start = idx.saturating_sub(200);
-        let window = &source[start..idx];
+        // Anchor on the closest preceding `tracing::` macro (rfind) rather
+        // than a fixed byte window, so the assertion is immune to refactors
+        // that move this site relative to other nearby tracing macros.
+        // Adopted from the #4272 pin tests; see
+        // `operations/update.rs::no_targets_propagation_logs_at_debug_pin_test`.
+        let preceding = &source[..idx];
+        let macro_idx = preceding
+            .rfind("tracing::")
+            .expect("a tracing macro must precede the rejection log site");
+        let line_start = preceding[..macro_idx].rfind('\n').map_or(0, |n| n + 1);
+        let line_prefix = &preceding[line_start..macro_idx];
         assert!(
-            window.contains("tracing::debug!"),
-            "Rejected-event log site must be at DEBUG. \
-             Re-promotion to WARN/INFO restores the issue #4251 log-volume regression.\n\
-             Source window:\n{window}"
+            line_prefix.chars().all(char::is_whitespace),
+            "rfind matched `tracing::` inside a string literal or comment, \
+             not a macro invocation. Prefix on its line: {line_prefix:?}"
         );
-        assert!(
-            !window.contains("tracing::warn!") && !window.contains("tracing::info!"),
-            "Rejected-event log site must NOT be at WARN or INFO. \
-             Source window:\n{window}"
+        let after_macro = &preceding[macro_idx + "tracing::".len()..];
+        let macro_name = after_macro.split('!').next().unwrap_or("");
+        // Char-boundary-safe last-200-bytes window: a raw byte slice could
+        // start mid-UTF-8-char and panic while building the failure message.
+        let tail_start = preceding
+            .char_indices()
+            .map(|(i, _)| i)
+            .find(|&i| preceding.len() - i <= 200)
+            .unwrap_or(0);
+        let context = &preceding[tail_start..];
+        // Equality against "debug" rejects WARN/INFO (and any other level)
+        // implicitly: re-promotion is exactly the issue #4251 regression.
+        assert_eq!(
+            macro_name, "debug",
+            "Rejected-event log site must be at DEBUG, not WARN/INFO \
+             (closest preceding macro is `tracing::{macro_name}!`). \
+             Re-promotion restores the issue #4251 log-volume regression.\n\
+             Preceding source (last 200 bytes):\n{context}"
         );
     }
 
