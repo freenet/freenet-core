@@ -111,6 +111,13 @@ pub struct ConfigArgs {
     #[arg(long, env = "MAX_HOSTING_STORAGE")]
     pub max_hosting_storage: Option<u64>,
 
+    /// Seconds to wait on graceful shutdown for in-flight client
+    /// PUT/GET/UPDATE/SUBSCRIBE operations to finish before tearing
+    /// down peer connections. Set to 0 to disable. Default: 30s. See
+    /// `Config::shutdown_drain_secs` for the full rationale.
+    #[arg(long, env = "SHUTDOWN_DRAIN_SECS")]
+    pub shutdown_drain_secs: Option<u64>,
+
     #[command(flatten)]
     pub telemetry: TelemetryArgs,
 }
@@ -159,6 +166,7 @@ impl Default for ConfigArgs {
             version: false,
             max_blocking_threads: None,
             max_hosting_storage: None,
+            shutdown_drain_secs: None,
             telemetry: Default::default(),
         }
     }
@@ -365,6 +373,8 @@ impl ConfigArgs {
             self.log_level.get_or_insert(cfg.log_level);
             self.max_hosting_storage
                 .get_or_insert(cfg.max_hosting_storage);
+            self.shutdown_drain_secs
+                .get_or_insert(cfg.shutdown_drain_secs);
             self.config_paths.merge(cfg.config_paths.as_ref().clone());
             // Merge telemetry config - CLI args override file config
             // Note: enabled defaults to true via clap, so we only override
@@ -738,6 +748,9 @@ impl ConfigArgs {
             max_hosting_storage: self
                 .max_hosting_storage
                 .unwrap_or(crate::ring::DEFAULT_HOSTING_BUDGET_BYTES),
+            shutdown_drain_secs: self
+                .shutdown_drain_secs
+                .unwrap_or_else(default_shutdown_drain_secs),
             telemetry: TelemetryConfig {
                 enabled: self.telemetry.enabled,
                 endpoint: self
@@ -857,6 +870,33 @@ pub struct Config {
     /// Telemetry configuration
     #[serde(flatten)]
     pub telemetry: TelemetryConfig,
+    /// Maximum seconds to wait on graceful shutdown for in-flight
+    /// client-originated operations (PUT/UPDATE/GET/SUBSCRIBE) to
+    /// finish before tearing down peer connections.
+    ///
+    /// Set to `0` to disable the drain entirely (legacy behaviour:
+    /// disconnect immediately on SIGTERM). Default is 30s, which
+    /// covers a typical `freenet-git` mirror push (~3 MiB pack split
+    /// into 4 chunks) plus headroom. systemd's `TimeoutStopSec` is
+    /// set to 45s in this PR (30s drain + 15s peer-teardown
+    /// headroom) — raise both in lockstep if you raise this value;
+    /// `TimeoutStopSec` is the hard ceiling at which systemd
+    /// SIGKILLs the process.
+    ///
+    /// Motivation: release-driven auto-update was killing in-flight
+    /// `freenet-git` mirror PUTs on the nova gateway, producing
+    /// repeated `Mirror to Freenet` failure alerts to
+    /// `#freenet-dev:matrix.org`.
+    #[serde(
+        default = "default_shutdown_drain_secs",
+        rename = "shutdown-drain-secs"
+    )]
+    pub shutdown_drain_secs: u64,
+}
+
+/// Default graceful-shutdown drain window.
+fn default_shutdown_drain_secs() -> u64 {
+    30
 }
 
 /// Default max blocking threads: 2x CPU cores, clamped to 4-32.

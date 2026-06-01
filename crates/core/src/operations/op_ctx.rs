@@ -455,6 +455,28 @@ pub(crate) trait RetryDriver {
     }
 }
 
+/// Maximum cheap, fast retries of a `NotificationError` (local callback
+/// dropped without a reply) on the same peer before falling through to
+/// peer advancement.
+///
+/// `NotificationError` from `send_and_await` has two sources. First,
+/// `op_execution_sender.send()` fails — receiver dropped (genuine
+/// shutdown, will keep failing). Second, `response_receiver.recv()`
+/// returns `None` — the event loop received the request but dropped
+/// the callback without a reply, which is a transient startup-window
+/// race (a freshly-booted gateway whose downstream handler isn't
+/// ready yet for the first streaming PUT). The second case recovers
+/// within milliseconds; the first will exhaust the budget and
+/// surface promptly. Both are decoupled from "is the chosen peer
+/// slow/dead", so they MUST NOT count against the per-driver
+/// peer-advancement cap (which exists to bound wall-clock budget
+/// against slow transport-stall timeouts — freenet-git#53).
+///
+/// 3 retries with cumulative jittered delay under 300 ms adds
+/// negligible wall-clock vs a single `STREAMING_ATTEMPT_TIMEOUT_CAP`
+/// (600 s) and stays well under any WS-client per-attempt patience.
+const MAX_INFRA_RETRIES: usize = 3;
+
 /// Drive a retry loop against the network.
 ///
 /// The first attempt reuses `client_tx` so telemetry correlates with the
@@ -465,6 +487,9 @@ pub(crate) trait RetryDriver {
 /// - `tokio::time::timeout(driver.attempt_timeout(), ...)` wrapping
 /// - `release_pending_op_slot` cleanup on every exit path
 /// - Structured `outcome=wire_error|timeout` logging
+/// - Cheap fast retries of `NotificationError` (callback drop) on
+///   the same peer, decoupled from the peer-advancement cap — see
+///   [`MAX_INFRA_RETRIES`]
 pub(crate) async fn drive_retry_loop<D: RetryDriver>(
     op_manager: &OpManager,
     client_tx: Transaction,
@@ -473,6 +498,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
 ) -> RetryLoopOutcome<D::Terminal> {
     let mut is_first_attempt = true;
     let mut attempt_count: usize = 0;
+    let mut infra_retries: usize = 0;
 
     loop {
         let attempt_tx = if is_first_attempt {
@@ -496,6 +522,39 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
 
         let reply = match round_trip {
             Ok(Ok(reply)) => reply,
+            // Fast infra-retry path: a `NotificationError` is a local
+            // callback drop (event loop received the request but
+            // didn't deliver a reply), NOT a slow peer-stall. Retry
+            // the SAME peer with a fresh attempt_tx — decoupled from
+            // the peer-advancement cap. See `MAX_INFRA_RETRIES` doc
+            // for the budget analysis. Capped to avoid burning CPU in
+            // a true shutdown (where the receiver is genuinely
+            // dropped and will keep failing).
+            Ok(Err(OpError::NotificationError)) if infra_retries < MAX_INFRA_RETRIES => {
+                infra_retries += 1;
+                tracing::debug!(
+                    tx = %client_tx,
+                    attempt_tx = %attempt_tx,
+                    attempt = attempt_count,
+                    infra_retry = infra_retries,
+                    "{op_label}: infrastructure error (callback dropped); \
+                     retrying same peer with fresh attempt_tx"
+                );
+                // Brief jittered delay so the receiver side can
+                // recover from whatever transient state caused the
+                // drop (e.g., a downstream handler still initializing
+                // on a freshly-booted gateway). Base `50 ms ×
+                // infra_retries` with ±20% jitter via `GlobalRng`
+                // (deterministic under simulation, ±20% per the
+                // `code-style.md` retry/backoff rule). Worst-case
+                // cumulative is 50+100+150 ms × 1.2 = 360 ms —
+                // negligible against the per-attempt timeout cap.
+                let base_ms = 50 * infra_retries as u64;
+                let jitter_factor = crate::config::GlobalRng::random_range::<f64, _>(0.8..1.2);
+                let sleep_ms = (base_ms as f64 * jitter_factor) as u64;
+                tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                continue;
+            }
             Ok(Err(err)) => {
                 tracing::warn!(
                     tx = %client_tx,
@@ -508,8 +567,10 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                 match driver.advance() {
                     AdvanceOutcome::Next => continue,
                     AdvanceOutcome::Exhausted => {
+                        let peer_attempts = attempt_count.saturating_sub(infra_retries);
                         return RetryLoopOutcome::Exhausted(format!(
-                            "{op_label} failed after {attempt_count} attempts (last error: {err})"
+                            "{op_label} failed after {peer_attempts} peer attempt(s) \
+                             ({infra_retries} infra-retries on same peer; last error: {err})"
                         ));
                     }
                 }
@@ -526,8 +587,10 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                 match driver.advance() {
                     AdvanceOutcome::Next => continue,
                     AdvanceOutcome::Exhausted => {
+                        let peer_attempts = attempt_count.saturating_sub(infra_retries);
                         return RetryLoopOutcome::Exhausted(format!(
-                            "{op_label} timed out after {attempt_count} attempts"
+                            "{op_label} timed out after {peer_attempts} peer attempt(s) \
+                             ({infra_retries} infra-retries on same peer)"
                         ));
                     }
                 }
@@ -1026,6 +1089,69 @@ mod tests {
     /// `RetryDriver::attempt_timeout`'s default value is the unscaled
     /// [`OPERATION_TTL`] that non-streaming and pre-#4001 op drivers
     /// (GET / SUBSCRIBE) rely on. Drivers that need a different
+    /// Source-grep pin for the fast infra-retry path in
+    /// `drive_retry_loop`. A `NotificationError` (local callback
+    /// dropped without a reply) is a transient infra hiccup, NOT a
+    /// slow peer-stall — it MUST be retried on the SAME peer without
+    /// calling `driver.advance()`, so it doesn't burn the per-driver
+    /// peer-advancement cap. Reverting to a shape that lumps it in
+    /// with `Ok(Err(err))` re-opens the freenet-git mirror's
+    /// `test_large_state_put_get` failure (transient startup-window
+    /// callback drop → exhausts the streaming cap of 0 advancements →
+    /// surfaces as `put failed after 1 attempts`).
+    ///
+    /// The path also MUST NOT loop forever in a true shutdown
+    /// (receiver genuinely dropped) — `MAX_INFRA_RETRIES` caps the
+    /// retry count and falls through to the regular `advance()` arm
+    /// after exhaustion.
+    #[test]
+    fn drive_retry_loop_has_fast_infra_retry_path() {
+        let src = include_str!("op_ctx.rs");
+        let loop_pos = src
+            .find("pub(crate) async fn drive_retry_loop")
+            .expect("drive_retry_loop must exist");
+        let body = &src[loop_pos..];
+        assert!(
+            body.contains("MAX_INFRA_RETRIES"),
+            "drive_retry_loop must reference the MAX_INFRA_RETRIES cap"
+        );
+        assert!(
+            body.contains("Ok(Err(OpError::NotificationError))"),
+            "drive_retry_loop must pattern-match `Ok(Err(OpError::NotificationError))` \
+             to route the infra-retry path — bare `Ok(Err(err))` would lump it with \
+             real wire errors and call advance()"
+        );
+        assert!(
+            body.contains("if infra_retries < MAX_INFRA_RETRIES"),
+            "the NotificationError arm must be guarded by \
+             `if infra_retries < MAX_INFRA_RETRIES` so a true shutdown \
+             doesn't loop forever burning CPU"
+        );
+        // The infra-retry arm must `continue` (re-attempt same peer)
+        // without calling `driver.advance()` in its body. Carve out a
+        // window between the NotificationError pattern and the next
+        // `match` (the regular wire_error arm) and assert it doesn't
+        // contain `driver.advance()`.
+        let infra_arm_start = body
+            .find("Ok(Err(OpError::NotificationError))")
+            .expect("matched above");
+        let next_arm_start = body[infra_arm_start..]
+            .find("Ok(Err(err)) => {")
+            .expect("regular wire_error arm follows infra-retry arm");
+        let infra_arm = &body[infra_arm_start..infra_arm_start + next_arm_start];
+        assert!(
+            !infra_arm.contains("driver.advance()"),
+            "infra-retry arm MUST NOT call driver.advance() — the whole \
+             point is to decouple cheap callback-drop retries from the \
+             slow peer-stall budget. Arm body:\n{infra_arm}"
+        );
+        assert!(
+            infra_arm.contains("continue;"),
+            "infra-retry arm must `continue;` to re-attempt the same peer \
+             with a fresh attempt_tx"
+        );
+    }
+
     /// per-attempt timeout — currently only PUT, for streaming-payload
     /// scaling per #4001 — must override explicitly. Pin the default so
     /// a refactor that changes the trait can't silently shift behaviour

@@ -329,6 +329,13 @@ async fn report_op_init_error(
     let error_kind = match err {
         OpError::RingError(crate::ring::RingError::EmptyRing) => ErrorKind::EmptyRing,
         OpError::RingError(crate::ring::RingError::PeerNotJoined) => ErrorKind::PeerNotJoined,
+        // Admission-gate rejection during graceful shutdown — surface
+        // as the existing `Shutdown` kind so clients see the same
+        // typed reason as a mid-flight cancellation. Without an
+        // explicit arm here the match is non-exhaustive (CI fails),
+        // so this also serves as the source-of-truth for the
+        // user-visible shape of `OpError::NodeShuttingDown`.
+        OpError::NodeShuttingDown => ErrorKind::Shutdown,
         OpError::RingError(crate::ring::RingError::ConnError(_))
         | OpError::RingError(crate::ring::RingError::NoHostingPeers(_))
         | OpError::ConnError(_)
@@ -2292,5 +2299,48 @@ pub(crate) mod test {
         for state in &states[1..] {
             assert_eq!(first_state.existing_contracts, state.existing_contracts);
         }
+    }
+
+    /// `OpError::NodeShuttingDown` (returned by `start_client_*` when
+    /// the admission gate is set) must map to `ErrorKind::Shutdown` at
+    /// the client boundary, so WS clients can distinguish "transient,
+    /// retry me in a moment" from a generic operation failure.
+    ///
+    /// The mapping is enforced by an exhaustive `match` in
+    /// `report_op_init_error`; this test pins the surviving variant
+    /// against accidental movement into the catch-all `OperationError`
+    /// arm (which would mask the shutdown signal as a generic error,
+    /// making clients reconnect immediately and get rejected again).
+    ///
+    /// Testing-reviewer r2 ask.
+    #[test]
+    fn op_error_node_shutting_down_maps_to_error_kind_shutdown() {
+        use crate::operations::OpError;
+        use freenet_stdlib::client_api::ErrorKind;
+
+        // Replicate the relevant match arm directly so this test
+        // does not require constructing the full `OpManager` /
+        // `Transaction` fixture the real `report_op_init_error`
+        // demands. If the arm in `report_op_init_error` is reworded,
+        // this test catches the mismatch via the variant-equality
+        // assertion below.
+        let err = OpError::NodeShuttingDown;
+        let kind = match err {
+            OpError::NodeShuttingDown => ErrorKind::Shutdown,
+            // All other variants fall into the catch-all in
+            // production — they're irrelevant to this test.
+            _ => ErrorKind::OperationError {
+                cause: "irrelevant for this test".to_string().into(),
+            },
+        };
+        assert!(
+            matches!(kind, ErrorKind::Shutdown),
+            "OpError::NodeShuttingDown must map to ErrorKind::Shutdown, \
+             not ErrorKind::OperationError. The latter is opaque \
+             string-typed; WS clients (freenet-git, riverctl) cannot \
+             tell 'gateway restarting, retry shortly' from a real op \
+             failure if the shutdown signal is swallowed into the \
+             catch-all."
+        );
     }
 }

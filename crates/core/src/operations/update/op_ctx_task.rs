@@ -115,13 +115,19 @@ pub(crate) async fn start_client_update(
     // Amplification ceiling: the client_events.rs UPDATE handler allocates
     // one task per client UPDATE request. Client request rate is bounded by
     // the WS connection handler's backpressure.
-    GlobalExecutor::spawn(run_client_update(
-        op_manager,
-        client_tx,
-        key,
-        update_data,
-        related_contracts,
-    ));
+    // Atomic admission gate + counter bump (closes the drain race
+    // window). See `OpManager::admit_client_op` for the race
+    // analysis. The guard is held by the driver task for its
+    // lifetime so `ShutdownHandle::shutdown` waits for in-flight
+    // client UPDATEs before tearing down peer connections.
+    let inflight_guard = match op_manager.admit_client_op() {
+        Some(g) => g,
+        None => return Err(OpError::NodeShuttingDown),
+    };
+    GlobalExecutor::spawn(async move {
+        let _inflight_guard = inflight_guard;
+        run_client_update(op_manager, client_tx, key, update_data, related_contracts).await;
+    });
 
     Ok(client_tx)
 }
@@ -1861,6 +1867,44 @@ async fn drive_relay_broadcast_to_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `start_client_update` must acquire a `ClientOpGuard` before
+    /// the `GlobalExecutor::spawn` and move it into the spawned
+    /// future. See the sibling pin in `put/op_ctx_task.rs` for the
+    /// full rationale (shutdown drain depends on the per-driver
+    /// counter; without it the gateway tears down peer connections
+    /// mid-UPDATE on auto-update).
+    #[test]
+    fn start_client_update_acquires_inflight_guard_before_spawn() {
+        let src = include_str!("op_ctx_task.rs");
+        let entry = src
+            .find("pub(crate) async fn start_client_update(")
+            .expect("start_client_update must exist");
+        let after_spawn = src[entry..]
+            .find("GlobalExecutor::spawn(")
+            .expect("start_client_update must spawn a driver task");
+        let before_spawn = &src[entry..entry + after_spawn];
+        assert!(
+            before_spawn.contains("op_manager.admit_client_op()"),
+            "start_client_update must call op_manager.admit_client_op() \
+             before GlobalExecutor::spawn (atomic admission gate + \
+             counter bump; closes the Codex r2 TOCTOU)."
+        );
+        assert!(
+            before_spawn.contains("OpError::NodeShuttingDown"),
+            "start_client_update must early-return OpError::NodeShuttingDown \
+             on a refused admission."
+        );
+        let spawned = &src[entry + after_spawn..];
+        let block_end = spawned
+            .find("\n    Ok(client_tx)")
+            .expect("start_client_update must return Ok(client_tx)");
+        let spawn_block = &spawned[..block_end];
+        assert!(
+            spawn_block.contains("let _inflight_guard = inflight_guard;"),
+            "the ClientOpGuard must be moved into the spawned future."
+        );
+    }
 
     /// Guard: `client_events.rs` must call `start_client_update` for both the
     /// routed and legacy UPDATE paths, not the legacy `request_update`.
