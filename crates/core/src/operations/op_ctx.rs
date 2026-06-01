@@ -645,6 +645,87 @@ mod tests {
     use crate::operations::connect::ConnectMsg;
     use tokio::time::{Duration, timeout};
 
+    /// Behavioural pin on `drive_retry_loop`'s `AttemptOutcome::Terminal`
+    /// arm: it MUST return `RetryLoopOutcome::Done(value)` synchronously,
+    /// WITHOUT calling `driver.advance()`.
+    ///
+    /// Why this is a source-pin: a fully behavioural test requires
+    /// instantiating an `OpManager` (the function takes `&OpManager` to
+    /// build the per-attempt `OpCtx` and to send `TransactionCompleted`),
+    /// which costs too much for a unit test. The structural pin
+    /// scopes the assertion to the Terminal arm itself — the production
+    /// code under test is exactly five lines — and a regression that
+    /// routes Terminal through `advance()` would unambiguously contain
+    /// the substring `.advance()` inside this arm.
+    ///
+    /// Pairs with `classify_reply_error_maps_to_terminal_error_with_cause`
+    /// in `crate::operations::put::op_ctx_task::tests` to cover the full
+    /// PUT-error chain (PutMsg::Error → TerminalError → Terminal →
+    /// Done(Err) without advance).
+    #[test]
+    fn drive_retry_loop_terminal_arm_does_not_call_advance() {
+        const SOURCE: &str = include_str!("op_ctx.rs");
+
+        let fn_anchor = "pub(crate) async fn drive_retry_loop<D: RetryDriver>(";
+        let fn_start = SOURCE.find(fn_anchor).expect(
+            "drive_retry_loop not found — signature has been renamed, \
+             update this guard",
+        );
+
+        // The `match driver.classify(reply) {` block contains the
+        // Terminal arm we care about. Locate it.
+        let classify_match = SOURCE[fn_start..]
+            .find("match driver.classify(reply) {")
+            .map(|p| fn_start + p)
+            .expect("`match driver.classify(reply)` not found in drive_retry_loop");
+
+        let terminal_arm_anchor = "AttemptOutcome::Terminal(value) =>";
+        let arm_start = SOURCE[classify_match..]
+            .find(terminal_arm_anchor)
+            .map(|p| classify_match + p)
+            .expect(
+                "Terminal arm `AttemptOutcome::Terminal(value) =>` not \
+                 found — the production arm shape has changed; update \
+                 this guard with the new shape",
+            );
+
+        // The Terminal arm is delimited by the next `AttemptOutcome::`
+        // sibling arm. Anchor on that.
+        let arm_end = SOURCE[arm_start + terminal_arm_anchor.len()..]
+            .find("AttemptOutcome::")
+            .map(|p| arm_start + terminal_arm_anchor.len() + p)
+            .expect("end-of-Terminal-arm marker (next AttemptOutcome::) not found");
+
+        let arm_body = &SOURCE[arm_start..arm_end];
+
+        assert!(
+            arm_body.contains("return RetryLoopOutcome::Done(value);"),
+            "Terminal arm MUST `return RetryLoopOutcome::Done(value);` \
+             synchronously — re-routing terminal replies into the retry \
+             loop would burn the budget on a deterministic failure and \
+             re-introduce the M1/M2 race the PR fixes.\n\
+             Arm body:\n{arm_body}"
+        );
+        assert!(
+            !arm_body.contains(".advance()"),
+            "Terminal arm MUST NOT call driver.advance() — terminal \
+             classifications are by definition non-retriable. A \
+             regression that calls advance() here would burn the \
+             retry budget against the same deterministic failure and \
+             surface the synthesised 'failed notifying, channel \
+             closed' marker instead of the real cause (issue #4111).\n\
+             Arm body:\n{arm_body}"
+        );
+        assert!(
+            !arm_body.contains("continue"),
+            "Terminal arm MUST NOT `continue` — that would skip the \
+             return and fall back to the next loop iteration, which \
+             would re-`send_and_await` against the SAME closed \
+             attempt-tx channel and surface NotificationError.\n\
+             Arm body:\n{arm_body}"
+        );
+    }
+
     /// Build a synthetic terminal reply keyed by `tx`. Mirrors
     /// `node::tests::callback_forward_tests::dummy_reply` but lets the
     /// caller supply the transaction so both sides of the round-trip agree.
@@ -922,6 +1003,102 @@ mod tests {
         });
 
         let outbound = dummy_reply_with_tx(tx);
+        timeout(Duration::from_secs(1), ctx.send_local_loopback(outbound))
+            .await
+            .expect("send_local_loopback should complete quickly")
+            .expect("send_local_loopback should return Ok");
+
+        executor
+            .await
+            .expect("executor task should complete without panicking");
+    }
+
+    /// Issue #4111: the originator-loopback PUT failure path emits a
+    /// `PutMsg::Error { id, cause }` via `send_local_loopback`. This
+    /// pins the contract from the *sender* side: an Error envelope
+    /// flows through the same primitive as a successful Response, with
+    /// `target=None` and the same `is_closed()` response-receiver
+    /// signal so `handle_op_execution` skips the `pending_op_results`
+    /// insert and the originator's pre-installed callback survives.
+    ///
+    /// (The reception side — that the bypass actually forwards Error
+    /// to the originator's waiter — is pinned by
+    /// `put_branch_bypass_forwards_error` in `node.rs`.)
+    #[tokio::test]
+    async fn send_local_loopback_carries_put_error_to_event_loop() {
+        use crate::message::NetMessageV1;
+        use crate::operations::put::PutMsg;
+
+        let (receiver, sender) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut op_execution_receiver,
+            ..
+        } = receiver;
+
+        // Allocate the tx as a PutMsg tx so `Transaction::is_for::<PutMsg>()`
+        // is consistent across the round-trip.
+        let tx = Transaction::new::<PutMsg>();
+        let mut ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+        let cause = "contract rejected: invalid update".to_string();
+
+        let executor_cause = cause.clone();
+        let executor = tokio::spawn(async move {
+            let (reply_sender, outbound, target_addr) = op_execution_receiver
+                .recv()
+                .await
+                .expect("PutMsg::Error envelope should be delivered");
+
+            assert_eq!(
+                outbound.id(),
+                &tx,
+                "Error envelope tx must match the ctx tx — debug_assert in \
+                 send_local_loopback should already enforce this"
+            );
+            assert_eq!(
+                target_addr, None,
+                "send_local_loopback MUST pass target_addr=None for the \
+                 PutMsg::Error envelope so handle_op_execution dispatches \
+                 it as InboundMessage (same path as a Response loopback)"
+            );
+
+            // Verify the wire payload is the Error variant with the
+            // intended cause — not a placeholder or truncated string.
+            // The catch-all arm covers the long tail of NetMessage
+            // variants (Get/Subscribe/Update/Aborted/Connect/...) which
+            // are irrelevant here; listing each one in the assertion
+            // would obscure the actual contract.
+            #[allow(clippy::wildcard_enum_match_arm)]
+            match outbound {
+                NetMessage::V1(NetMessageV1::Put(PutMsg::Error {
+                    id,
+                    cause: decoded_cause,
+                })) => {
+                    assert_eq!(id, tx, "Error.id must equal the originator tx");
+                    assert_eq!(
+                        decoded_cause, executor_cause,
+                        "Error.cause must be the verbatim cause string"
+                    );
+                }
+                other => panic!(
+                    "expected NetMessage::V1(Put(Error {{ .. }})), got {:?}",
+                    std::any::type_name_of_val(&other)
+                ),
+            }
+
+            assert!(
+                reply_sender.is_closed(),
+                "send_local_loopback drops its response receiver, so \
+                 handle_op_execution must observe is_closed() on the \
+                 reply sender and skip the pending_op_results insert — \
+                 otherwise it would clobber the originator's pre-installed \
+                 callback (the one waiting for this Error)"
+            );
+        });
+
+        let outbound = NetMessage::V1(NetMessageV1::Put(PutMsg::Error {
+            id: tx,
+            cause: cause.clone(),
+        }));
         timeout(Duration::from_secs(1), ctx.send_local_loopback(outbound))
             .await
             .expect("send_local_loopback should complete quickly")

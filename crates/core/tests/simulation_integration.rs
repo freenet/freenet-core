@@ -2366,7 +2366,7 @@ fn test_subscribe_forwarding_ack_relay() {
 ///
 /// Note on turmoil vs production: in the turmoil simulation runner every
 /// peer shares one process, which means `pending_op_results` is effectively
-/// global. `node::try_forward_task_per_tx_reply` on an intermediate peer
+/// global. `node::try_forward_driver_reply` on an intermediate peer
 /// can therefore find the originator's task entry and short-circuit the
 /// Response before it reaches the legacy relay handler. In production each
 /// peer is an independent process with its own `pending_op_results`, so
