@@ -1074,8 +1074,10 @@ fn verify_binary(binary_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Check if the service file needs updating (missing auto-update hook) and update if so.
-/// This ensures users who installed before v0.1.75 get the ExecStopPost hook.
+/// Check if the on-disk systemd unit has drifted from the current
+/// template and rewrite it if so. Locates the user unit first, then the
+/// system unit, and delegates the staleness decision to
+/// `update_service_file` (equality-based since #4287).
 #[cfg(target_os = "linux")]
 fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
     // Try user service first
@@ -1099,36 +1101,69 @@ fn ensure_service_file_updated(binary_path: &Path, quiet: bool) -> Result<()> {
     Ok(())
 }
 
-/// Pure helper: decide whether a Linux systemd unit file needs to be
-/// regenerated. Returns true when EITHER the auto-update markers
-/// (`ExecStopPost=` + `SuccessExitStatus=42` + `RestartPreventExitStatus=43`)
-/// are missing, OR the legacy unrotated log target (`StandardOutput=append:`
-/// / `StandardError=append:` — issue #4251) is still present.
-///
-/// Filters out comment lines (those whose first non-whitespace character is
-/// `#`) so a unit annotated with the legacy directive in a comment doesn't
-/// trip a false-positive regen. Marker-presence check is whole-content
-/// because the markers we look for are uniquely-spelled and unlikely to
-/// appear in comments.
-///
-/// Cross-platform-compiled (no `#[cfg(target_os = "linux")]`) so non-Linux
-/// CI runners can exercise the predicate per code-style.md / deployment.md
-/// preference for pure decision helpers. The `#[allow(dead_code)]`
-/// suppresses the dead-code lint on non-Linux builds where the only
-/// non-test caller (`update_service_file`) is cfg'd out.
-#[allow(dead_code)]
-pub(super) fn systemd_unit_needs_regen(content: &str) -> bool {
-    let has_auto_update_markers = content.contains("ExecStopPost=")
-        && content.contains("SuccessExitStatus=42")
-        && content.contains("RestartPreventExitStatus=43");
-    let has_legacy_log_target = content
-        .lines()
-        .filter(|l| !l.trim_start().starts_with('#'))
-        .any(|l| l.contains("StandardOutput=append:") || l.contains("StandardError=append:"));
-    !has_auto_update_markers || has_legacy_log_target
+/// Build the systemd unit text that `freenet` would write *right now*
+/// for `service_path`. For system-mode units the `User=` /
+/// `Environment=HOME=` values are inherited from the on-disk unit
+/// (`existing`) so that the regenerated template only differs from
+/// what's on disk when the *template itself* has drifted — not merely
+/// because the operator chose a different service user at install time.
+/// Returning the same bytes the install path produced is what makes the
+/// equality-based staleness check (`decide_wrapper_action`) stable
+/// across runs (#4287).
+#[cfg(target_os = "linux")]
+fn render_current_systemd_unit(
+    binary_path: &Path,
+    existing: &str,
+    system_mode: bool,
+) -> Result<String> {
+    if system_mode {
+        // Extract User= and Environment=HOME= from existing file
+        let username = existing
+            .lines()
+            .find_map(|l| l.strip_prefix("User="))
+            .unwrap_or("freenet");
+        let home_dir = existing
+            .lines()
+            .find_map(|l| l.strip_prefix("Environment=HOME="))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(format!("/home/{username}")));
+        let log_dir = home_dir.join(".local/state/freenet");
+        Ok(generate_system_service_file(
+            binary_path,
+            &log_dir,
+            username,
+            &home_dir,
+        ))
+    } else {
+        let home_dir = dirs::home_dir().context("Failed to get home directory")?;
+        let log_dir = home_dir.join(".local/state/freenet");
+        Ok(generate_user_service_file(binary_path, &log_dir))
+    }
 }
 
-/// Update a specific service file if it's missing the auto-update hook.
+/// Update a specific service file if its on-disk content has drifted
+/// from the current template.
+///
+/// Staleness is decided by byte-for-byte equality against what
+/// `generate_{user,system}_service_file` produces now, NOT by grepping
+/// for a fixed set of marker substrings (issue #4287, mirroring the
+/// macOS wrapper fix #4286/#3967). The old marker check returned
+/// "up to date" for any unit that happened to contain the three
+/// markers (`ExecStopPost=`, `SuccessExitStatus=42`,
+/// `RestartPreventExitStatus=43`), so a future template change
+/// introducing a new directive (a new `ExecStartPre=`, a changed
+/// `Restart=` policy, an extra `SuccessExitStatus` value, etc.) would
+/// silently fail to propagate to existing Linux installs.
+///
+/// A `freenet.service.hash` sidecar records the SHA-256 of the unit we
+/// last wrote so a later update can tell "Freenet's previous unit" from
+/// an operator hand-edit and avoid clobbering customizations. Existing
+/// installs have no sidecar; that case is treated as "ours" so the next
+/// update fixes the unit and records the hash (migration). The shared
+/// `decide_wrapper_action` decision matrix is artifact-agnostic — it
+/// reasons about (template, on-disk content, sidecar) regardless of
+/// whether the artifact is a macOS wrapper or a systemd unit — so the
+/// Linux path reuses it rather than duplicating the logic.
 #[cfg(target_os = "linux")]
 fn update_service_file(
     binary_path: &Path,
@@ -1137,19 +1172,62 @@ fn update_service_file(
     quiet: bool,
 ) -> Result<()> {
     let content = fs::read_to_string(service_path).context("Failed to read service file")?;
+    let hash_path = service_path.with_extension("service.hash");
 
-    // Check if the service file has all required directives.
-    // RestartPreventExitStatus=43 prevents restart loops when another instance
-    // is already running (added in 0.2.5).
-    //
-    // Also force regeneration when the legacy `StandardOutput=append:` or
-    // `StandardError=append:` directive is present (issue #4251). That target
-    // wrote stdout/stderr to a fixed freenet.log / freenet.error.log that was
-    // never rotated, growing without bound on long-running nodes. The current
-    // template routes both to the systemd journal.
-    if !systemd_unit_needs_regen(&content) {
-        return Ok(()); // Already up to date
+    let new_content = render_current_systemd_unit(binary_path, &content, system_mode)?;
+
+    // Read the sidecar non-fatally: a missing/unreadable sidecar means
+    // "no recorded hash" (migration shape for every pre-#4287 install).
+    let sidecar_raw = fs::read_to_string(&hash_path).ok();
+    let action = decide_wrapper_action(&new_content, Some(&content), sidecar_raw.as_deref());
+
+    match &action {
+        WrapperAction::UserModified { on_disk_hash } => {
+            if !quiet {
+                eprintln!(
+                    "Warning: systemd unit at {} differs from the current Freenet \
+                     template AND from the hash recorded in {}, suggesting it has \
+                     been hand-edited. Leaving it alone. To accept the bundled \
+                     unit, delete the .service.hash sidecar or reinstall via \
+                     `freenet service install`. (on-disk hash: {})",
+                    service_path.display(),
+                    hash_path.display(),
+                    on_disk_hash,
+                );
+            }
+            return Ok(());
+        }
+        WrapperAction::UpToDate {
+            backfill_sidecar: Some(h),
+        } => {
+            // Unit already matches the template but the sidecar is
+            // missing/malformed — backfill it so a future hand-edit is
+            // detected instead of silently clobbered. No daemon-reload:
+            // the unit text didn't change.
+            if let Err(e) = write_wrapper_hash_sidecar(&hash_path, h) {
+                if !quiet {
+                    eprintln!(
+                        "Warning: failed to backfill service hash sidecar at {}: {}.",
+                        hash_path.display(),
+                        e
+                    );
+                }
+            }
+            return Ok(());
+        }
+        WrapperAction::UpToDate {
+            backfill_sidecar: None,
+        } => {
+            return Ok(()); // Already up to date, sidecar already correct.
+        }
+        WrapperAction::WriteOurs { .. } => {
+            // Fall through to the rewrite path below.
+        }
     }
+
+    let WrapperAction::WriteOurs { new_hash } = &action else {
+        unreachable!("non-WriteOurs actions returned above");
+    };
 
     if !quiet {
         println!("Updating service file to add auto-update support...");
@@ -1168,28 +1246,23 @@ fn update_service_file(
         println!("Backed up existing service file to {:?}", backup_path);
     }
 
-    // Generate new service file content
-    let new_content = if system_mode {
-        // Extract User= and Environment=HOME= from existing file
-        let username = content
-            .lines()
-            .find_map(|l| l.strip_prefix("User="))
-            .unwrap_or("freenet");
-        let home_dir = content
-            .lines()
-            .find_map(|l| l.strip_prefix("Environment=HOME="))
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(format!("/home/{username}")));
-        let log_dir = home_dir.join(".local/state/freenet");
-        generate_system_service_file(binary_path, &log_dir, username, &home_dir)
-    } else {
-        let home_dir = dirs::home_dir().context("Failed to get home directory")?;
-        let log_dir = home_dir.join(".local/state/freenet");
-        generate_user_service_file(binary_path, &log_dir)
-    };
-
     // Write the updated service file
-    fs::write(service_path, new_content).context("Failed to write updated service file")?;
+    fs::write(service_path, &new_content).context("Failed to write updated service file")?;
+
+    // Record the hash of what we just wrote. A failed sidecar write only
+    // weakens future user-modification detection (it falls back to
+    // treating the unit as ours), so warn but continue.
+    if let Err(e) = write_wrapper_hash_sidecar(&hash_path, new_hash) {
+        if !quiet {
+            eprintln!(
+                "Warning: failed to write service hash sidecar at {}: {}. \
+                 User-modification detection on the next `freenet update` \
+                 will fall back to treating the unit as ours.",
+                hash_path.display(),
+                e
+            );
+        }
+    }
 
     // Reload systemd daemon
     let mut cmd = Command::new("systemctl");
@@ -1927,89 +2000,189 @@ fn spawn_detached_updater(script: &Path, current_app: &Path, staged_app: &Path) 
 mod tests {
     use super::*;
 
-    // Regression tests for the issue #4251 auto-update migration logic:
-    // verify that existing units carrying the legacy unrotated log
-    // target are correctly detected as needing regen, AND that fresh
-    // units (current template) are NOT regenerated.
+    // ---- Issue #4287: systemd-unit-content-equality staleness detection. ----
     //
-    // The helpers (systemd_unit_needs_regen, launchd_plist_needs_regen)
-    // are cross-platform-compiled (string ops only), so these tests run
-    // on every CI platform per deployment.md's preference.
+    // Before #4287 the Linux unit-staleness check (`systemd_unit_needs_regen`)
+    // grepped for a fixed set of marker substrings (`ExecStopPost=`,
+    // `SuccessExitStatus=42`, `RestartPreventExitStatus=43`, and the absence
+    // of the legacy `StandardOutput=append:` target). Any future template
+    // change introducing a NEW directive (a new `ExecStartPre=`, a changed
+    // `Restart=` policy, an extra `SuccessExitStatus` value, etc.) would be
+    // invisible to the check: a stale unit still containing the three markers
+    // returned "up to date" and the update silently failed to propagate to
+    // existing Linux installs. This is the exact anti-pattern #3967/#4286
+    // surfaced on macOS.
+    //
+    // The fix reuses the cross-platform `decide_wrapper_action` decision
+    // matrix (equality against the current template + `.service.hash`
+    // sidecar for user-modification protection). The tests below exercise
+    // that matrix with synthetic systemd-unit text so they run on EVERY CI
+    // runner, not just Linux — closing the same "platform-gated path not
+    // tested in CI" gap #4286 closed for macOS.
+
+    /// Synthetic "current template" systemd unit + its hash, for the
+    /// decision-matrix tests below. The exact text is irrelevant; what
+    /// matters is whether the on-disk unit we feed in equals it.
+    fn fixture_unit() -> (String, String) {
+        let t = "[Service]\nExecStart=/usr/local/bin/freenet network\nSuccessExitStatus=42 43\n"
+            .to_string();
+        let h = wrapper_content_hash(&t);
+        (t, h)
+    }
+
     #[test]
-    fn systemd_unit_with_legacy_append_log_needs_regen() {
-        let legacy = r#"[Service]
-Type=simple
-ExecStart=/usr/local/bin/freenet network
-Restart=always
-ExecStopPost=-/bin/sh -c '...'
-SuccessExitStatus=42 43
-RestartPreventExitStatus=43
-StandardOutput=append:/home/u/.local/state/freenet/freenet.log
-StandardError=append:/home/u/.local/state/freenet/freenet.error.log
-"#;
-        assert!(
-            systemd_unit_needs_regen(legacy),
-            "legacy append:freenet.log unit must be detected as needing regen (#4251)"
+    fn systemd_unit_new_directive_drift_is_detected_4287() {
+        // The motivating scenario: a unit that still satisfies the OLD
+        // marker check (has ExecStopPost / SuccessExitStatus=42 /
+        // RestartPreventExitStatus=43) but is missing a hypothetical
+        // future directive present in the current template. The old
+        // marker grep returned "up to date"; equality detects the drift.
+        let template = "[Service]\nExecStartPre=/usr/local/bin/freenet preflight\nExecStopPost=-/bin/sh -c '...'\nSuccessExitStatus=42 43\nRestartPreventExitStatus=43\n";
+        let stale_but_markers_present = "[Service]\nExecStopPost=-/bin/sh -c '...'\nSuccessExitStatus=42 43\nRestartPreventExitStatus=43\n";
+        // No sidecar (migration shape for existing installs) → WriteOurs.
+        assert_eq!(
+            decide_wrapper_action(template, Some(stale_but_markers_present), None),
+            WrapperAction::WriteOurs {
+                new_hash: wrapper_content_hash(template)
+            },
+            "a unit missing a new template directive must be detected as \
+             drifted even though the legacy markers are all present (#4287)"
         );
     }
 
     #[test]
-    fn systemd_unit_with_journal_target_is_up_to_date() {
-        let current = r#"[Service]
-Type=simple
-ExecStart=/usr/local/bin/freenet network
-Restart=always
-ExecStopPost=-/bin/sh -c '...'
-SuccessExitStatus=42 43
-RestartPreventExitStatus=43
-StandardOutput=journal
-StandardError=journal
-"#;
-        assert!(
-            !systemd_unit_needs_regen(current),
-            "current journal-target unit must NOT be flagged for regen"
+    fn systemd_unit_no_sidecar_stale_migrates_to_ours_4287() {
+        // Pre-#4287 install: unit differs from current template (e.g.
+        // legacy append:freenet.log target) and no sidecar exists.
+        // Treat as ours so the host migrates on the next update.
+        let (template, template_hash) = fixture_unit();
+        let legacy = "[Service]\nExecStart=/usr/local/bin/freenet network\nStandardOutput=append:/home/u/.local/state/freenet/freenet.log\n";
+        assert_eq!(
+            decide_wrapper_action(&template, Some(legacy), None),
+            WrapperAction::WriteOurs {
+                new_hash: template_hash
+            }
         );
     }
 
     #[test]
-    fn systemd_unit_with_commented_out_append_does_not_force_regen() {
-        // Regression for re-review M4: a unit that ALREADY migrated
-        // to `StandardOutput=journal` but kept a comment referencing
-        // the old directive must NOT be flagged as needing regen.
-        // Otherwise every auto-update would overwrite operator-edited
-        // units forever.
-        let migrated = r#"[Service]
-Type=simple
-ExecStart=/usr/local/bin/freenet network
-Restart=always
-ExecStopPost=-/bin/sh -c '...'
-SuccessExitStatus=42 43
-RestartPreventExitStatus=43
-# StandardOutput=append:/old/path (replaced with journal on 2026-05-25)
-# StandardError=append:/old/path  (replaced with journal on 2026-05-25)
-StandardOutput=journal
-StandardError=journal
-"#;
-        assert!(
-            !systemd_unit_needs_regen(migrated),
-            "commented-out legacy append directive must NOT force regen (#4251)"
+    fn systemd_unit_identical_to_template_with_sidecar_is_noop_4287() {
+        // The post-#4287 fresh-install shape: unit byte-matches the
+        // template AND a matching sidecar exists → no rewrite, no
+        // daemon-reload loop.
+        let (template, template_hash) = fixture_unit();
+        assert_eq!(
+            decide_wrapper_action(&template, Some(&template), Some(&template_hash)),
+            WrapperAction::UpToDate {
+                backfill_sidecar: None
+            }
         );
     }
 
     #[test]
-    fn systemd_unit_without_auto_update_markers_needs_regen() {
-        // Pre-auto-update unit (no exit-42 handling) — must regen even
-        // though it has no legacy log target.
-        let ancient = r#"[Service]
-Type=simple
-ExecStart=/usr/local/bin/freenet network
-Restart=always
-StandardOutput=journal
-StandardError=journal
-"#;
-        assert!(
-            systemd_unit_needs_regen(ancient),
-            "unit without ExecStopPost/SuccessExitStatus must regen"
+    fn systemd_unit_identical_to_template_missing_sidecar_backfills_4287() {
+        // Migration self-heal: a pre-#4287 unit that happens to already
+        // match today's template gets a sidecar backfilled so a future
+        // hand-edit is detected instead of silently clobbered.
+        let (template, template_hash) = fixture_unit();
+        assert_eq!(
+            decide_wrapper_action(&template, Some(&template), None),
+            WrapperAction::UpToDate {
+                backfill_sidecar: Some(template_hash)
+            }
+        );
+    }
+
+    #[test]
+    fn systemd_unit_user_modified_is_preserved_4287() {
+        // Unit differs from the template AND the sidecar records a hash
+        // that doesn't match the on-disk content → operator hand-edited
+        // it. Leave it alone.
+        let (template, _) = fixture_unit();
+        let edited = "[Service]\nExecStart=/usr/local/bin/freenet network --custom-flag\n";
+        let edited_hash = wrapper_content_hash(edited);
+        let prior_freenet_hash =
+            wrapper_content_hash("[Service]\nExecStart=/usr/local/bin/freenet network\n");
+        assert_eq!(
+            decide_wrapper_action(&template, Some(edited), Some(&prior_freenet_hash)),
+            WrapperAction::UserModified {
+                on_disk_hash: edited_hash
+            }
+        );
+    }
+
+    #[test]
+    fn systemd_unit_malformed_sidecar_treated_as_missing_4287() {
+        // A truncated/corrupted `.service.hash` (e.g. from an interrupted
+        // prior write) must NOT lock a stale unit into permanent
+        // UserModified — fall through to WriteOurs so the host recovers.
+        let (template, template_hash) = fixture_unit();
+        let stale = "[Service]\nExecStart=/usr/local/bin/freenet network\n# old\n";
+        assert_eq!(
+            decide_wrapper_action(&template, Some(stale), Some("deadbe")),
+            WrapperAction::WriteOurs {
+                new_hash: template_hash
+            }
+        );
+    }
+
+    /// Linux-only: the REAL generators must be deterministic, otherwise
+    /// the equality check would flag the freshly-installed unit as stale
+    /// on every `freenet update` and loop-rewrite it forever. Mirrors
+    /// `freshly_generated_wrapper_does_not_trigger_regen_loop` for macOS.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn freshly_generated_systemd_unit_does_not_trigger_regen_loop_4287() {
+        use std::path::PathBuf;
+        let binary = PathBuf::from("/usr/local/bin/freenet");
+        let log_dir = PathBuf::from("/home/u/.local/state/freenet");
+
+        // User unit: install shape (unit + matching sidecar) → no-op.
+        let user_unit = generate_user_service_file(&binary, &log_dir);
+        let user_hash = wrapper_content_hash(&user_unit);
+        assert_eq!(
+            decide_wrapper_action(&user_unit, Some(&user_unit), Some(&user_hash)),
+            WrapperAction::UpToDate {
+                backfill_sidecar: None
+            },
+            "a freshly generated user unit with a matching sidecar must be \
+             a no-op — otherwise every `freenet update` loops rewriting it"
+        );
+
+        // System unit: same determinism contract, plus the User=/HOME=
+        // round-trip that `render_current_systemd_unit` relies on.
+        let home = PathBuf::from("/home/svc");
+        let system_unit = generate_system_service_file(&binary, &log_dir, "svc", &home);
+        let system_hash = wrapper_content_hash(&system_unit);
+        assert_eq!(
+            decide_wrapper_action(&system_unit, Some(&system_unit), Some(&system_hash)),
+            WrapperAction::UpToDate {
+                backfill_sidecar: None
+            },
+        );
+    }
+
+    /// Linux-only: `render_current_systemd_unit` must reproduce the
+    /// exact bytes of an installed system unit when fed that unit back
+    /// as `existing` (it re-extracts `User=` / `Environment=HOME=`). If
+    /// this round-trip drifted, every update would treat a fine unit as
+    /// stale. Covers the issue's explicit "User=/Environment= override"
+    /// edge case.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn render_current_systemd_unit_round_trips_user_and_home_4287() {
+        use std::path::PathBuf;
+        let binary = PathBuf::from("/usr/local/bin/freenet");
+        let home = PathBuf::from("/home/customsvc");
+        let log_dir = home.join(".local/state/freenet");
+        let installed = generate_system_service_file(&binary, &log_dir, "customsvc", &home);
+
+        let rendered = render_current_systemd_unit(&binary, &installed, true)
+            .expect("render must succeed for a well-formed system unit");
+        assert_eq!(
+            rendered, installed,
+            "re-rendering an installed system unit must reproduce it \
+             byte-for-byte so the equality check is a no-op (#4287)"
         );
     }
 
