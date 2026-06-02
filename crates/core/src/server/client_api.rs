@@ -199,7 +199,7 @@ async fn web_home(
         .unwrap_or(false);
 
     if is_sandbox {
-        return serve_sandbox_response(key, api_version, None, &req_headers).await;
+        return serve_sandbox_response(key, api_version, None, &req_headers, rs).await;
     }
 
     // Shell page: generate auth token, serve iframe wrapper with CSP
@@ -269,7 +269,14 @@ async fn web_subpages(
     // For sandbox sub-page requests to HTML files, serve through the sandbox
     // content pipeline (with WebSocket shim + navigation interceptor injected).
     if is_sandbox && is_html_page(&last_path) {
-        return serve_sandbox_response(key, api_version, Some(&last_path), &req_headers).await;
+        return serve_sandbox_response(
+            key,
+            api_version,
+            Some(&last_path),
+            &req_headers,
+            request_sender,
+        )
+        .await;
     }
 
     // Top-level document loads of contract HTML sub-paths (pasted URLs,
@@ -440,6 +447,7 @@ async fn serve_sandbox_response(
     api_version: ApiVersion,
     sub_path: Option<&str>,
     req_headers: &axum::http::HeaderMap,
+    request_sender: HttpClientApiRequest,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     // Block top-level navigation to sandbox URLs. Sec-Fetch-Dest: iframe is set
     // by the browser automatically and cannot be spoofed by scripts.
@@ -452,7 +460,7 @@ async fn serve_sandbox_response(
     }
 
     let contract_response =
-        path_handlers::serve_sandbox_content(key, api_version, sub_path).await?;
+        path_handlers::serve_sandbox_content(key, api_version, sub_path, request_sender).await?;
     let mut response = contract_response.into_response();
     add_sandbox_cors_headers(&mut response);
     // See `sandbox_csp_for_origin` for why we interpolate a concrete origin
@@ -945,7 +953,7 @@ mod tests {
         // top-level-document redirect inside `web_subpages`. Both
         // markers are unique to that function.
         let sandbox_idx = src
-            .find("serve_sandbox_response(key, api_version, Some(&last_path)")
+            .find("if is_sandbox && is_html_page(&last_path) {")
             .expect("sandbox short-circuit marker present in web_subpages");
         let redirect_idx = src
             .find("should_redirect_subpage_to_shell(is_sandbox")

@@ -13,6 +13,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
+    time::Duration,
 };
 
 use axum::response::{Html, IntoResponse};
@@ -21,6 +22,7 @@ use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse},
     prelude::*,
 };
+use tokio::time::Instant;
 use tokio::{fs::File, io::AsyncReadExt, sync::mpsc};
 
 use crate::client_events::AuthToken;
@@ -56,6 +58,73 @@ async fn acquire_cache_lock(instance_id: &ContractInstanceId) -> tokio::sync::Ow
     mutex.lock_owned().await
 }
 
+/// How long a contract's extracted webapp cache is trusted before the next
+/// request reconciles it against current network state.
+///
+/// `serve_sandbox_content` (the `?__sandbox=1` iframe handler) and
+/// `variable_content` (subresource handler) both serve from the on-disk cache.
+/// Without a freshness check, a republished contract keeps serving the old
+/// bundle on these paths until the shell root (`/`) is hit again — only
+/// `contract_home` unconditionally re-fetches. See #3977.
+///
+/// A short TTL re-runs `ensure_contract_cached` periodically. The actual
+/// re-extraction still only happens when the state hash changed (see
+/// `unpack_if_stale`), so the cost of a same-state refresh is one network GET,
+/// not a disk rewrite. 30s keeps the publish-then-verify loop snappy while
+/// bounding the GET rate to at most one per contract per window.
+const CONTRACT_CACHE_REFRESH_TTL: Duration = Duration::from_secs(30);
+
+/// Last time each contract's cache was reconciled against the network via
+/// `ensure_contract_cached`. Used to gate the TTL refresh so the sandbox and
+/// subresource paths don't issue a network GET on every request.
+///
+/// Like `CONTRACT_CACHE_LOCKS`, entries are retained for the process lifetime;
+/// each is a single `Instant`, so the footprint is bounded by the number of
+/// distinct web contracts the node has served.
+static CONTRACT_CACHE_REFRESH: LazyLock<DashMap<ContractInstanceId, Instant>> =
+    LazyLock::new(DashMap::new);
+
+/// Ensures the contract's webapp cache is populated and not stale before it is
+/// served from disk.
+///
+/// Calls `ensure_contract_cached` when either:
+/// - the cache is cold (no `{key}.hash` file on disk), or
+/// - more than `CONTRACT_CACHE_REFRESH_TTL` has elapsed since the last
+///   reconciliation for this contract.
+///
+/// On a successful refresh the per-contract timer is reset. This is what makes
+/// the `?__sandbox=1` and subresource paths pick up a republished bundle
+/// without requiring a prior hit on the shell root. See #3977.
+///
+/// The refresh timer is only advanced on success, so a transient fetch failure
+/// does not suppress the next request's retry. `ensure_contract_cached` already
+/// serializes the actual unpack via `CONTRACT_CACHE_LOCKS` and skips the disk
+/// rewrite when the state hash is unchanged (`unpack_if_stale`).
+async fn refresh_cache_if_due(
+    instance_id: ContractInstanceId,
+    request_sender: &HttpClientApiRequest,
+) -> Result<(), WebSocketApiError> {
+    let hash_path = state_hash_path(&instance_id);
+    let cache_warm = tokio::fs::try_exists(&hash_path).await.unwrap_or(false);
+
+    if cache_warm {
+        // Warm cache: only re-fetch if the TTL window has elapsed. Reading the
+        // timer (not removing it) keeps concurrent requests cheap — at most one
+        // will observe the window as expired and refresh.
+        let fresh = CONTRACT_CACHE_REFRESH
+            .get(&instance_id)
+            .map(|last| last.elapsed() < CONTRACT_CACHE_REFRESH_TTL)
+            .unwrap_or(false);
+        if fresh {
+            return Ok(());
+        }
+    }
+
+    ensure_contract_cached(instance_id, request_sender, None).await?;
+    CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
+    Ok(())
+}
+
 #[instrument(level = "debug", skip(request_sender))]
 pub(super) async fn contract_home(
     key: String,
@@ -80,6 +149,10 @@ pub(super) async fn contract_home(
         Some((assigned_token.clone(), instance_id)),
     )
     .await?;
+    // Record the reconciliation so the iframe load that immediately follows
+    // (`?__sandbox=1`) and any subresource fetches reuse this fresh state
+    // instead of issuing their own redundant GET within the TTL window.
+    CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
 
     // Return the shell page instead of the contract HTML directly.
     // The shell page wraps the contract in a sandboxed iframe for
@@ -315,22 +388,16 @@ pub(super) async fn variable_content(
     let base_path = contract_web_path(&instance_id);
     debug!("variable_content: Base path resolved to: {:?}", base_path);
 
-    // Fetch + unpack the contract if its cache is cold. Without this, any
-    // request for a subresource (e.g. an <img src> pointing at this contract
-    // from a different webapp) would 404 because the cache is only populated
-    // by the shell-root handler (`contract_home`). See #3940.
-    //
-    // The hash file is written last by `unpack_if_stale`, so its presence is
-    // a reliable marker that a prior unpack completed successfully.
-    let hash_path = state_hash_path(&instance_id);
-    if tokio::fs::try_exists(&hash_path).await.unwrap_or(false) {
-        debug!("variable_content: Cache already populated, serving from disk");
-    } else {
-        debug!("variable_content: Cache miss, fetching contract before serving");
-        ensure_contract_cached(instance_id, &request_sender, None)
-            .await
-            .map_err(Box::new)?;
-    }
+    // Fetch + unpack the contract if its cache is cold OR stale. Without the
+    // cold-cache fetch, any subresource request (e.g. an <img src> pointing at
+    // this contract from a different webapp) would 404 because the cache is
+    // only populated by the shell-root handler (`contract_home`). See #3940.
+    // The TTL-gated staleness refresh additionally picks up a republished
+    // bundle on this path without requiring a prior hit on the shell root.
+    // See #3977.
+    refresh_cache_if_due(instance_id, &request_sender)
+        .await
+        .map_err(Box::new)?;
 
     // Parse the full request path URI to extract the relative path using the v1 helper.
     let req_uri =
@@ -491,11 +558,12 @@ fn shell_page(
 ///
 /// The `sub_path` parameter allows serving pages other than `index.html` for
 /// multi-page websites. When `None`, defaults to `index.html`.
-#[instrument(level = "debug")]
+#[instrument(level = "debug", skip(request_sender))]
 pub(super) async fn serve_sandbox_content(
     key: String,
     api_version: ApiVersion,
     sub_path: Option<&str>,
+    request_sender: HttpClientApiRequest,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
     let page = sub_path.unwrap_or("index.html");
     debug!("serve_sandbox_content: serving iframe content for key: {key}, page: {page}");
@@ -503,6 +571,14 @@ pub(super) async fn serve_sandbox_content(
         ContractInstanceId::from_bytes(&key).map_err(|err| WebSocketApiError::InvalidParam {
             error_cause: format!("{err}"),
         })?;
+
+    // Reconcile the on-disk cache against current network state before serving.
+    // Previously this path only checked `path.exists()` and served whatever was
+    // already extracted, so a republished contract kept serving the old bundle
+    // here until the shell root (`/`) was hit again. The TTL gate bounds the
+    // network GET rate to at most one per contract per window. See #3977.
+    refresh_cache_if_due(instance_id, &request_sender).await?;
+
     let path = contract_web_path(&instance_id);
     if !path.exists() {
         return Err(WebSocketApiError::NodeError {
@@ -1747,6 +1823,10 @@ mod tests {
     /// and `state_hash_path` resolve to a shared process-global directory, so
     /// tests that exercise the cache must use unique keys AND scrub any stale
     /// filesystem residue from a prior run before asserting on behaviour.
+    ///
+    /// Also drops the in-memory `CONTRACT_CACHE_REFRESH` timer (process-global,
+    /// like the on-disk cache) so a stale timer from a prior run doesn't flip a
+    /// cold-cache assertion into a warm/fresh one.
     async fn clear_cache(instance_id: &ContractInstanceId) {
         tokio::fs::remove_file(state_hash_path(instance_id))
             .await
@@ -1754,6 +1834,7 @@ mod tests {
         tokio::fs::remove_dir_all(contract_web_path(instance_id))
             .await
             .ok();
+        CONTRACT_CACHE_REFRESH.remove(instance_id);
     }
 
     /// Regression test for #3940. `variable_content` must trigger a network
@@ -1839,11 +1920,11 @@ mod tests {
     }
 
     /// Companion to `variable_content_triggers_fetch_on_cache_miss`: when the
-    /// hash file is present (the signal that a prior unpack completed), the
-    /// handler must NOT issue a fetch. This pins the cache-hit fast path and
-    /// prevents a regression where every subpath request would re-fetch.
+    /// hash file is present AND the contract was reconciled within the refresh
+    /// TTL, the handler must NOT issue a fetch. This pins the cache-hit fast
+    /// path and prevents a regression where every subpath request re-fetches.
     #[tokio::test]
-    async fn variable_content_skips_fetch_when_cache_present() {
+    async fn variable_content_skips_fetch_when_cache_present_and_fresh() {
         let mut bytes = [0u8; 32];
         bytes[0] = 0x3a;
         bytes[1] = 0x41;
@@ -1860,6 +1941,8 @@ mod tests {
         tokio::fs::write(state_hash_path(&instance_id), 0u64.to_be_bytes())
             .await
             .unwrap();
+        // Mark the contract as just-reconciled so it falls inside the TTL window.
+        CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
 
         let (sender, mut rx) = request_channel();
         let result = variable_content(
@@ -1878,11 +1961,184 @@ mod tests {
         );
         assert!(
             rx.try_recv().is_err(),
-            "cache-hit path must not send any NewConnection/Get on the channel"
+            "fresh-cache path must not send any NewConnection/Get on the channel"
         );
 
         // Clean up last so a failed assertion above doesn't leave residue
         // that flips the next run's cold-cache check into warm-cache state.
+        clear_cache(&instance_id).await;
+    }
+
+    /// Drives `serve_sandbox_content` (or `variable_content`) to the point
+    /// where it has emitted its `NewConnection` + `Get` pair on the channel,
+    /// asserting the contract key on the `Get`, then aborts the in-flight
+    /// fetch. Returns once both messages have been observed.
+    ///
+    /// Replies to the `NewConnection` callback with a synthetic client id so
+    /// the handler progresses past its blocking `NewId` recv to the `Get`.
+    async fn expect_fetch_pair(
+        rx: &mut tokio::sync::mpsc::Receiver<ClientConnection>,
+        instance_id: ContractInstanceId,
+    ) {
+        let new_conn = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("handler must send NewConnection when a refresh is due")
+            .expect("channel must remain open for the duration of the send");
+        let callbacks = match new_conn {
+            ClientConnection::NewConnection { callbacks, .. } => callbacks,
+            other => panic!("first message must be NewConnection, got: {other:?}"),
+        };
+        callbacks
+            .send(HostCallbackResult::NewId {
+                id: crate::client_events::ClientId::next(),
+            })
+            .expect("callback receiver must be live while handler awaits NewId");
+
+        let get_req = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("handler must follow up with a Get request")
+            .expect("channel must remain open");
+        match get_req {
+            ClientConnection::Request { req, .. } => {
+                assert!(
+                    matches!(
+                        req.as_ref(),
+                        ClientRequest::ContractOp(ContractRequest::Get { key: k, .. })
+                            if *k == instance_id
+                    ),
+                    "second message must be Get({instance_id}), got: {req:?}"
+                );
+            }
+            other => panic!("expected ClientConnection::Request, got: {other:?}"),
+        }
+    }
+
+    /// Regression test for #3977. `serve_sandbox_content` (the `?__sandbox=1`
+    /// iframe handler) must reconcile the on-disk cache against current network
+    /// state, NOT serve blindly from disk.
+    ///
+    /// Before the fix, this handler only checked `path.exists()` and served the
+    /// already-extracted bundle, so a republished contract kept serving the old
+    /// bundle on the iframe path until the shell root (`/`) was hit again.
+    ///
+    /// Here the cache is warm (hash file + index.html on disk) but has never
+    /// been reconciled (`CONTRACT_CACHE_REFRESH` has no entry), so a refresh is
+    /// due and the handler must emit the `NewConnection` + `Get` fetch pair.
+    /// The pre-fix code sent nothing on the channel.
+    #[tokio::test]
+    async fn serve_sandbox_content_triggers_refresh_when_stale() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x44;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = instance_id.to_string();
+        clear_cache(&instance_id).await;
+
+        // Warm but unreconciled cache: hash file present, but no refresh timer.
+        let cache_dir = contract_web_path(&instance_id);
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        tokio::fs::write(cache_dir.join("index.html"), b"<html>old bundle</html>")
+            .await
+            .unwrap();
+        tokio::fs::write(state_hash_path(&instance_id), 0u64.to_be_bytes())
+            .await
+            .unwrap();
+
+        let (sender, mut rx) = request_channel();
+        let handler = {
+            let key = key.clone();
+            tokio::spawn(async move {
+                serve_sandbox_content(key.clone(), ApiVersion::V1, None, sender)
+                    .await
+                    .map(|_| ())
+            })
+        };
+
+        expect_fetch_pair(&mut rx, instance_id).await;
+
+        handler.abort();
+        clear_cache(&instance_id).await;
+    }
+
+    /// Companion to the above: once `serve_sandbox_content` has reconciled a
+    /// contract within the TTL window, a subsequent request must serve from
+    /// disk WITHOUT issuing another fetch. Pins the TTL fast path so the iframe
+    /// load doesn't do a network round-trip on every request.
+    #[tokio::test]
+    async fn serve_sandbox_content_skips_refresh_when_fresh() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x45;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = instance_id.to_string();
+        clear_cache(&instance_id).await;
+
+        let cache_dir = contract_web_path(&instance_id);
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        tokio::fs::write(cache_dir.join("index.html"), b"<html>fresh bundle</html>")
+            .await
+            .unwrap();
+        tokio::fs::write(state_hash_path(&instance_id), 0u64.to_be_bytes())
+            .await
+            .unwrap();
+        // Reconciled just now: inside the TTL window.
+        CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
+
+        let (sender, mut rx) = request_channel();
+        let result = serve_sandbox_content(key.clone(), ApiVersion::V1, None, sender).await;
+
+        let response = result.expect("fresh-cache sandbox request must succeed");
+        let body = response_body(response).await;
+        assert!(
+            body.contains("fresh bundle"),
+            "fresh-cache path must serve the primed index.html, got: {body}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "fresh-cache sandbox path must not send any NewConnection/Get on the channel"
+        );
+
+        clear_cache(&instance_id).await;
+    }
+
+    /// `refresh_cache_if_due` must treat a refresh timer older than
+    /// `CONTRACT_CACHE_REFRESH_TTL` as stale and re-fetch, even when the
+    /// on-disk cache is warm. This is the path that picks up a mid-session
+    /// republish (#3977 impact 3) once the TTL window elapses.
+    ///
+    /// Uses paused time so the TTL boundary is crossed deterministically by
+    /// `advance()` rather than wall-clock subtraction — `Instant::now()` on a
+    /// freshly-booted host can be too close to the monotonic origin for a
+    /// `checked_sub(TTL)` to succeed, which would make the test flaky.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_cache_if_due_refetches_after_ttl_expires() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x46;
+        let instance_id = ContractInstanceId::new(bytes);
+        clear_cache(&instance_id).await;
+
+        // Warm cache, reconciled "now" (paused clock base).
+        let cache_dir = contract_web_path(&instance_id);
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        tokio::fs::write(state_hash_path(&instance_id), 0u64.to_be_bytes())
+            .await
+            .unwrap();
+        CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
+
+        // Advance past the TTL so the timer reads as stale.
+        tokio::time::advance(CONTRACT_CACHE_REFRESH_TTL + Duration::from_secs(1)).await;
+
+        let (sender, mut rx) = request_channel();
+        let handler =
+            tokio::spawn(
+                async move { refresh_cache_if_due(instance_id, &sender).await.map(|_| ()) },
+            );
+
+        // A stale timer must trigger a fetch despite the warm on-disk cache.
+        expect_fetch_pair(&mut rx, instance_id).await;
+
+        handler.abort();
         clear_cache(&instance_id).await;
     }
 
