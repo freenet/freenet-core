@@ -2442,6 +2442,7 @@ where
                 op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
                     key: *key,
                     new_state: new_state.clone(),
+                    is_retry: false,
                 })
             {
                 // Non-blocking emit: a 30-second `notify_node_event(...).await`
@@ -2805,6 +2806,7 @@ where
                 op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
                     key,
                     new_state,
+                    is_retry: false,
                 })
             {
                 // Best-effort by design — see #4145 and the sibling

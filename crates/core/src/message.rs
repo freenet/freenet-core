@@ -694,6 +694,13 @@ pub(crate) enum NodeEvent {
     BroadcastStateChange {
         key: ContractKey,
         new_state: WrappedState,
+        /// `false` for a fresh broadcast emitted by the executor on a local
+        /// state change; `true` for a no-target retry re-emission scheduled by
+        /// `handle_broadcast_state_change`. Lets the handler count each fresh
+        /// logical broadcast once for the #4281 propagation summary without
+        /// re-counting (or being confused by) retries that share the
+        /// per-contract `broadcast_retries` state.
+        is_retry: bool,
     },
     /// Send state to a specific peer that reported a stale summary.
     /// Unlike BroadcastStateChange (which fans out to ALL subscribers),
