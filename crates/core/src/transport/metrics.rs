@@ -526,10 +526,18 @@ impl TransportMetrics {
             self.cwnd_sum.store(0, Ordering::Relaxed);
             self.cwnd_samples.store(0, Ordering::Relaxed);
             self.slowdowns_triggered.store(0, Ordering::Relaxed);
-            self.min_rtt_us.store(u64::MAX, Ordering::Relaxed);
-            self.max_rtt_us.store(0, Ordering::Relaxed);
-            self.rtt_sum_us.store(0, Ordering::Relaxed);
-            // `rtt_samples` was already swapped to 0 above.
+            // Deliberately DO NOT reset the RTT accumulators (`rtt_sum_us`,
+            // `min_rtt_us`, `max_rtt_us`) here. `rtt_samples` was already
+            // swapped to 0; if a concurrent `record_rtt_sample` lands between
+            // that swap and this point, it bumps `rtt_sum_us`/min/max *and*
+            // `rtt_samples` (back to 1). Zeroing the accumulators here would
+            // then leave a nonzero sample count paired with a zeroed
+            // sum/min/max, so the next snapshot would emit a bogus
+            // avg/min/max = 0. Since these accumulators are only ever advanced
+            // alongside a sample, they are already at their identity values
+            // (0 / u64::MAX / 0) in the genuine no-activity case, making the
+            // stores redundant anyway. Leaving them keeps the count and the
+            // accumulators mutually consistent under concurrency.
             return None;
         }
 
