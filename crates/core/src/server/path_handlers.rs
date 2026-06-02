@@ -186,6 +186,7 @@ pub(super) async fn contract_home(
     assigned_token: AuthToken,
     api_version: ApiVersion,
     query_string: Option<String>,
+    sub_path: Option<&str>,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
     let instance_id = ContractInstanceId::from_bytes(&key).map_err(|err| {
         debug!("contract_home: Failed to parse contract key: {}", err);
@@ -211,7 +212,7 @@ pub(super) async fn contract_home(
     // Return the shell page instead of the contract HTML directly.
     // The shell page wraps the contract in a sandboxed iframe for
     // origin isolation (GHSA-824h-7x5x-wfmf).
-    match shell_page(&assigned_token, &key, api_version, query_string) {
+    match shell_page(&assigned_token, &key, api_version, query_string, sub_path) {
         Ok(b) => Ok(b.into_response()),
         Err(err) => {
             tracing::error!("Failed to generate shell page: {err}");
@@ -526,6 +527,59 @@ fn html_escape_attr(s: &str) -> String {
     out
 }
 
+/// Validates a deep-link sub-path before it is interpolated into the
+/// shell iframe's `data-src` URL (#3841).
+///
+/// The sub-path comes from the request URL's path component (axum's
+/// `{*path}` wildcard), so a query string or fragment is normally split
+/// off before it reaches us. This guard rejects:
+///
+/// - Characters that would break out of the URL path component: `?`
+///   starts a query, `#` starts a fragment, `\` is treated as `/` by
+///   browsers, and whitespace/control chars (incl. CR/LF) could corrupt
+///   the attribute or — once HTML-unescaped by the browser — the
+///   surrounding markup.
+/// - A leading `/`, so the result stays relative to the contract web
+///   prefix rather than becoming an absolute path.
+/// - `.` / `..` path segments. This is the SECURITY-CRITICAL check:
+///   unlike `sandbox_content_body` (which canonicalizes the on-disk file
+///   against the contract cache dir), the dot-segments here would never
+///   reach that layer. The browser normalizes `..` in a URL *before*
+///   issuing the iframe request, so a `data-src` of
+///   `/v1/contract/web/KEY/../OTHER/?__sandbox=1` would be requested as
+///   `/v1/contract/web/OTHER/?__sandbox=1` — pointing the iframe at a
+///   *different contract* under the current shell's token/origin. We
+///   must therefore reject traversal segments here rather than relying
+///   on later file-path canonicalization (Codex review, #3841).
+fn sanitize_shell_sub_path(sub_path: &str) -> Result<String, WebSocketApiError> {
+    if sub_path.starts_with('/') {
+        return Err(WebSocketApiError::InvalidParam {
+            error_cause: "deep-link sub-path must be relative".to_string(),
+        });
+    }
+    if sub_path
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '?' | '#' | '\\'))
+    {
+        return Err(WebSocketApiError::InvalidParam {
+            error_cause: "deep-link sub-path contains an illegal character".to_string(),
+        });
+    }
+    // Reject `.`/`..` segments. Split on `/` rather than using
+    // `std::path::Component` so that a trailing-slash directory form like
+    // `a/../` and an empty middle segment are both classified from the
+    // raw URL text (no OS-specific path semantics). A browser collapses
+    // these dot-segments client-side before requesting the iframe URL, so
+    // they would escape the contract prefix without ever reaching the
+    // on-disk canonicalization in `sandbox_content_body`.
+    if sub_path.split('/').any(|seg| seg == "." || seg == "..") {
+        return Err(WebSocketApiError::InvalidParam {
+            error_cause: "deep-link sub-path must not contain '.' or '..' segments".to_string(),
+        });
+    }
+    Ok(sub_path.to_string())
+}
+
 /// Generates the shell page HTML that wraps the contract in a sandboxed iframe.
 ///
 /// The shell page holds the auth token and proxies WebSocket connections via
@@ -535,9 +589,22 @@ fn shell_page(
     contract_key: &str,
     api_version: ApiVersion,
     query_string: Option<String>,
+    sub_path: Option<&str>,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
     let version_prefix = api_version.prefix();
-    let base_path = format!("/{version_prefix}/contract/web/{contract_key}/");
+    // For a deep-link reload (#3841) the iframe must load the requested
+    // sub-page, not the contract root, so the in-iframe webapp starts on
+    // the right route. The sub-path is interpolated into the iframe's
+    // `data-src`; `sanitize_shell_sub_path` rejects anything that could
+    // break out of the URL's path component (`?`, `#`, control chars,
+    // CRLF), and the whole `data-src` is HTML-escaped below as a second
+    // layer of defence. Path traversal is additionally caught when the
+    // iframe later requests `?__sandbox=1` (see `sandbox_content_body`).
+    let sub_path = sub_path.map(sanitize_shell_sub_path).transpose()?;
+    let base_path = match sub_path.as_deref() {
+        Some(sp) => format!("/{version_prefix}/contract/web/{contract_key}/{sp}"),
+        None => format!("/{version_prefix}/contract/web/{contract_key}/"),
+    };
 
     // Build the iframe src URL: same path with __sandbox=1 plus any
     // original query params (e.g., ?invitation=...). `__sandbox` is the
@@ -2583,7 +2650,8 @@ mod tests {
         // Lock the token in so a future refactor does not regress the fix.
         let token = AuthToken::generate();
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap()).await;
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None, None).unwrap())
+                .await;
         assert!(
             html.contains("allow-downloads"),
             "iframe sandbox missing `allow-downloads` — user-initiated \
@@ -2596,7 +2664,8 @@ mod tests {
     async fn shell_page_contains_iframe_and_bridge() {
         let token = AuthToken::generate();
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap()).await;
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None, None).unwrap())
+                .await;
 
         // Shell page must contain sandboxed iframe
         assert!(
@@ -2670,7 +2739,8 @@ mod tests {
     async fn shell_page_permission_overlay_present_and_safe() {
         let token = AuthToken::generate();
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap()).await;
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None, None).unwrap())
+                .await;
 
         // Overlay root and accessibility attributes
         assert!(
@@ -2843,7 +2913,8 @@ mod tests {
     async fn shell_page_iframe_uses_data_src_for_deep_linking() {
         let token = AuthToken::generate();
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None).unwrap()).await;
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None, None).unwrap())
+                .await;
 
         // The iframe must NOT have a src attribute (which would trigger an
         // immediate load before JS can append the hash fragment).
@@ -2865,7 +2936,8 @@ mod tests {
         let token = AuthToken::generate();
         let qs = Some("invitation=abc123&room=test".to_string());
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs, None).unwrap())
+                .await;
 
         // Query params should be forwarded to iframe src
         assert!(
@@ -2881,6 +2953,165 @@ mod tests {
             html.contains("?__sandbox=1&"),
             "__sandbox=1 not first in iframe params"
         );
+    }
+
+    /// Regression test for #3841 (deep-link reload). When a sub-path is
+    /// threaded into shell generation, the iframe's `data-src` must point
+    /// at that sub-page (`/v1/contract/web/KEY/news/?__sandbox=1`) so the
+    /// in-iframe webapp starts on the requested route. Before the fix the
+    /// shell always pointed the iframe at the contract root, so reloading
+    /// a deep link silently dropped the user back at `/`.
+    #[tokio::test]
+    async fn shell_page_embeds_sub_path_in_iframe_data_src() {
+        let token = AuthToken::generate();
+
+        // Directory-style deep link.
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, Some("news/")).unwrap(),
+        )
+        .await;
+        assert!(
+            html.contains(r#"data-src="/v1/contract/web/testkey123/news/?__sandbox=1""#),
+            "iframe data-src must carry the sub-path; got: {html}"
+        );
+
+        // Nested extensionless deep link.
+        let html = response_body(
+            shell_page(
+                &token,
+                "testkey123",
+                ApiVersion::V1,
+                None,
+                Some("about/team"),
+            )
+            .unwrap(),
+        )
+        .await;
+        assert!(
+            html.contains(r#"data-src="/v1/contract/web/testkey123/about/team?__sandbox=1""#),
+            "iframe data-src must carry the nested sub-path; got: {html}"
+        );
+
+        // `None` sub-path keeps the iframe pointed at the contract root —
+        // pins that the new parameter does not change root-load behaviour.
+        let html =
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None, None).unwrap())
+                .await;
+        assert!(
+            html.contains(r#"data-src="/v1/contract/web/testkey123/?__sandbox=1""#),
+            "root load must still point the iframe at the contract root; got: {html}"
+        );
+    }
+
+    /// The sub-path is interpolated into the iframe URL's path component,
+    /// so query/fragment delimiters, control characters, and `..`/`.`
+    /// traversal segments must be rejected before they can corrupt the
+    /// `data-src` URL (or, once the browser HTML-unescapes the attribute,
+    /// the surrounding markup) or — for `..` — be normalized by the
+    /// browser into a different contract's prefix.
+    #[test]
+    fn sanitize_shell_sub_path_accepts_safe_paths_and_rejects_dangerous() {
+        // Safe relative paths used by real multi-page webapps.
+        for ok in ["news/", "about/team", "page2", "index.html", "a/b/c/"] {
+            assert_eq!(
+                sanitize_shell_sub_path(ok).unwrap(),
+                ok,
+                "{ok} must be accepted unchanged"
+            );
+        }
+
+        // `..`/`.` segments MUST be rejected (Codex review, #3841): the
+        // browser collapses dot-segments in a URL *before* requesting the
+        // iframe, so `/v1/contract/web/KEY/../OTHER/` would be normalized
+        // to `/v1/contract/web/OTHER/` and load a different contract under
+        // the current shell's token. The later `sandbox_content_body`
+        // canonicalization never sees the un-normalized traversal, so this
+        // guard is the only layer that can stop it.
+        for traversal in ["..", "../other", "a/../b", "a/..", "a/./b", "."] {
+            assert!(
+                matches!(
+                    sanitize_shell_sub_path(traversal),
+                    Err(WebSocketApiError::InvalidParam { .. })
+                ),
+                "{traversal:?} (dot-segment) must be rejected"
+            );
+        }
+
+        // Dangerous inputs that would break out of the URL path component
+        // or inject into the attribute/markup must be rejected.
+        for bad in [
+            "/absolute",        // leading slash escapes the contract prefix
+            "news/?evil=1",     // `?` starts a query, corrupting __sandbox=1
+            "news/#frag",       // `#` starts a fragment
+            "a b",              // whitespace
+            "x\r\nInjected: y", // CRLF (header/markup injection surface)
+            "back\\slash",      // backslash (browsers may treat as `/`)
+            "tab\tafter",       // control char
+        ] {
+            assert!(
+                matches!(
+                    sanitize_shell_sub_path(bad),
+                    Err(WebSocketApiError::InvalidParam { .. })
+                ),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// End-to-end regression for #3841: a deep-link reload routed through
+    /// `contract_home` (the path `web_subpages` takes for a top-level
+    /// document load of a sub-page) must fetch/cache the contract AND
+    /// produce a shell whose iframe loads the requested sub-page, not the
+    /// contract root. Drives the real `ensure_contract_cached` cycle via
+    /// `serve_one_get`, then inspects the rendered shell HTML.
+    #[tokio::test]
+    async fn contract_home_with_sub_path_renders_shell_for_that_page() {
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(vec![3, 1, 8, 4, 1])),
+            Parameters::from(vec![3, 8, 4, 1]),
+        )));
+        let instance_id = *contract.key().id();
+        let key = instance_id.to_string();
+        let state = WrappedState::new(vec![4, 2]);
+        clear_cache(&instance_id).await;
+
+        // Warm cache whose stored hash matches the state the served GET
+        // returns, so `unpack_if_stale` takes its matching-hash early
+        // return and the refresh succeeds without a real WebApp unpack.
+        let cache_dir = contract_web_path(&instance_id);
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        let matching_hash = hash_state(state.as_ref());
+        tokio::fs::write(state_hash_path(&instance_id), matching_hash.to_be_bytes())
+            .await
+            .unwrap();
+
+        let (sender, mut rx) = request_channel();
+        let token = AuthToken::generate();
+        let handler = {
+            let key = key.clone();
+            tokio::spawn(async move {
+                contract_home(key, sender, token, ApiVersion::V1, None, Some("news/"))
+                    .await
+                    .map(|resp| resp.into_response())
+            })
+        };
+
+        // Service the fetch the shell render triggers.
+        serve_one_get(&mut rx, &contract, &state).await;
+
+        let resp = handler
+            .await
+            .expect("contract_home task must not panic")
+            .expect("contract_home must succeed once the GET is served");
+        let html = response_body(resp).await;
+        assert!(
+            html.contains(&format!(
+                r#"data-src="/v1/contract/web/{key}/news/?__sandbox=1""#
+            )),
+            "deep-link shell iframe must load the sub-page; got: {html}"
+        );
+
+        clear_cache(&instance_id).await;
     }
 
     #[tokio::test]
@@ -2977,7 +3208,8 @@ mod tests {
         let token = AuthToken::generate();
         let qs = Some("__sandbox_extra=evil&invitation=abc&__sandboxFoo=bar".to_string());
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs, None).unwrap())
+                .await;
 
         // __sandbox-prefixed params must be stripped
         assert!(
@@ -3009,7 +3241,8 @@ mod tests {
         let token = AuthToken::generate();
         let qs = Some("authToken=attacker_value&invite=abc&authTokenExtra=x".to_string());
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs, None).unwrap())
+                .await;
         assert!(
             !html.contains("attacker_value"),
             "attacker-supplied authToken value must not reach iframe src"
@@ -3036,7 +3269,8 @@ mod tests {
         let token = AuthToken::generate();
         let qs = Some("foo=\"><script>alert(1)</script>".to_string());
         let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs).unwrap()).await;
+            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs, None).unwrap())
+                .await;
 
         // The double quote and angle brackets must be escaped
         assert!(

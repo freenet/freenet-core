@@ -38,9 +38,10 @@ async fn web_subpages_v1(
     Path((key, last_path)): Path<(String, String)>,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
     headers: axum::http::HeaderMap,
+    axum::extract::State(config): axum::extract::State<Config>,
     Extension(rs): Extension<HttpClientApiRequest>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
-    web_subpages(key, last_path, ApiVersion::V1, query, headers, rs).await
+    web_subpages(key, last_path, ApiVersion::V1, query, headers, &config, rs).await
 }
 
 /// Redirect `/v1/contract/web/{key}` (no trailing slash) to
