@@ -771,60 +771,15 @@ async fn query_node_diagnostics(host: &str, port: u16) -> Result<String> {
 
 /// Serialize `NodeDiagnosticsResponse` to JSON for the report payload.
 ///
-/// `contract_states` is keyed by `ContractKey`, whose derived `Serialize`
-/// impl emits a struct (`{instance, code}`). `serde_json` rejects non-string
-/// JSON map keys, so a direct `serde_json::to_string(&diag)` fails with
-/// "key must be a string" as soon as the node hosts at least one contract.
-/// We rebuild the field with stringified keys before serializing. The
-/// rest of the struct serializes natively. See freenet/freenet-core#3987.
-///
-/// The destructure-bind on the input forces a compile error if a field is
-/// added to `NodeDiagnosticsResponse` upstream — without it, the helper
-/// would silently drop the new field from the JSON payload.
+/// Since freenet-stdlib 0.8.0 (`fix!: stringify
+/// NodeDiagnosticsResponse.contract_states keys`, freenet-stdlib#70),
+/// `contract_states` is keyed by `String`, so the whole struct serializes
+/// natively with `serde_json` — no manual key stringification is needed.
+/// This previously had to rebuild `contract_states` by hand because the map
+/// was keyed by `ContractKey`, whose derived `Serialize` emits a struct and
+/// `serde_json` rejects non-string JSON map keys (freenet/freenet-core#3987).
 fn diagnostics_to_json(diag: &NodeDiagnosticsResponse) -> Result<String> {
-    use serde_json::{Map, Value};
-
-    let NodeDiagnosticsResponse {
-        node_info,
-        network_info,
-        subscriptions,
-        contract_states,
-        system_metrics,
-        connected_peers_detailed,
-    } = diag;
-
-    let mut states = Map::with_capacity(contract_states.len());
-    for (key, state) in contract_states {
-        let value =
-            serde_json::to_value(state).context("Failed to serialize contract state value")?;
-        states.insert(key.to_string(), value);
-    }
-
-    let mut value = Map::new();
-    value.insert(
-        "node_info".to_string(),
-        serde_json::to_value(node_info).context("Failed to serialize node_info")?,
-    );
-    value.insert(
-        "network_info".to_string(),
-        serde_json::to_value(network_info).context("Failed to serialize network_info")?,
-    );
-    value.insert(
-        "subscriptions".to_string(),
-        serde_json::to_value(subscriptions).context("Failed to serialize subscriptions")?,
-    );
-    value.insert("contract_states".to_string(), Value::Object(states));
-    value.insert(
-        "system_metrics".to_string(),
-        serde_json::to_value(system_metrics).context("Failed to serialize system_metrics")?,
-    );
-    value.insert(
-        "connected_peers_detailed".to_string(),
-        serde_json::to_value(connected_peers_detailed)
-            .context("Failed to serialize connected_peers_detailed")?,
-    );
-
-    serde_json::to_string_pretty(&Value::Object(value)).context("Failed to serialize diagnostics")
+    serde_json::to_string_pretty(diag).context("Failed to serialize diagnostics")
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -967,22 +922,17 @@ mod tests {
         assert_eq!(states[&key1.to_string()]["size_bytes"], 1234);
     }
 
-    // Superseded by freenet-stdlib 0.8.0: stringified
-    // `NodeDiagnosticsResponse.contract_states` map keys
-    // (freenet-stdlib#70). The pre-condition this test documented —
-    // "native serde_json rejects ContractKey-keyed map, hence
-    // diagnostics_to_json workaround" — no longer holds: the upstream
-    // type now uses String keys and `serde_json::to_string(&diag)`
-    // succeeds, so the `.expect_err` assertion fails. Kept as
-    // `#[ignore]` historical documentation per the superseded-test
-    // convention in `.claude/rules/git-workflow.md`. The
-    // `diagnostics_to_json` helper itself is retained because its
-    // sibling tests still exercise round-trip + field-coverage
-    // properties; a separate refactor could replace it with a direct
-    // `serde_json::to_string` call. See PR #4144.
-    #[ignore]
     #[test]
-    fn test_native_serde_json_on_contract_states_fails_documents_root_cause() {
+    fn test_native_serde_json_on_string_keyed_contract_states_succeeds() {
+        // Regression guard for freenet/freenet-core#3993: since
+        // freenet-stdlib 0.8.0 stringified `contract_states` keys
+        // (freenet-stdlib#70), the pre-0.8 tripwire that asserted native
+        // `serde_json::to_string` *fails* on a ContractKey-keyed map no
+        // longer applies. Its inversion — native serialization must now
+        // *succeed* and preserve the stringified key — is what lets
+        // `diagnostics_to_json` be a thin `serde_json::to_string_pretty`
+        // wrapper. If a future stdlib bump regresses the key type back to a
+        // non-string, this test trips before the report path silently breaks.
         use freenet_stdlib::client_api::ContractState;
         use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
         use std::collections::HashMap;
@@ -1009,11 +959,16 @@ mod tests {
             connected_peers_detailed: vec![],
         };
 
-        let err = serde_json::to_string(&diag)
-            .expect_err("native serde_json must reject ContractKey-keyed map");
+        let json = serde_json::to_string(&diag)
+            .expect("native serde_json must accept String-keyed contract_states");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("output must be valid JSON");
         assert!(
-            err.to_string().contains("key must be a string"),
-            "expected serde_json key-must-be-string error, got: {err}",
+            parsed["contract_states"]
+                .as_object()
+                .expect("contract_states must be a JSON object")
+                .contains_key(&key.to_string()),
+            "stringified contract key must survive native serialization, got: {json}",
         );
     }
 
@@ -1039,15 +994,12 @@ mod tests {
 
     #[test]
     fn test_diagnostics_to_json_all_fields_populated_round_trip() {
-        // Guard against typos in the manual field-by-field assembly inside
-        // diagnostics_to_json: every Option must be Some, every Vec must be
-        // non-empty, and every top-level key must round-trip with a
-        // distinguishable value. If anyone accidentally inserts the same
-        // key twice, drops a field, or mis-types a key (e.g. "nodeinfo"),
-        // the missing/duplicate field surfaces here instead of in production
-        // reports. The destructure-bind already catches *new* fields at
-        // compile time; this test catches typos in the *existing* fields
-        // that the compiler cannot.
+        // Guard against the derived serialization dropping or mangling a
+        // field: every Option must be Some, every Vec must be non-empty, and
+        // every top-level key must round-trip with a distinguishable value.
+        // If a field is renamed, dropped, or gains a serde attribute that
+        // changes the wire shape, the missing/renamed field surfaces here
+        // instead of in production reports.
         use freenet_stdlib::client_api::{
             ConnectedPeerInfo, ContractState, NetworkInfo, NodeInfo, SubscriptionInfo,
             SystemMetrics,
