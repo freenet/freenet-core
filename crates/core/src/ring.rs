@@ -520,13 +520,14 @@ impl Ring {
     /// Record a contract-directed CONNECT attempt. Doubles the backoff (up to cap).
     fn record_contract_connect_attempt(&self, contract_key: &ContractKey) {
         let mut backoff = self.contract_connect_backoff.lock();
+        let now = self.time_source.now();
         let state = backoff
             .entry(*contract_key)
             .or_insert_with(|| ContractConnectState {
                 current_backoff: Self::INITIAL_CONTRACT_CONNECT_BACKOFF,
-                last_attempt: Instant::now(),
+                last_attempt: now,
             });
-        state.last_attempt = Instant::now();
+        state.last_attempt = now;
         state.current_backoff = (state.current_backoff * 2).min(Self::MAX_CONTRACT_CONNECT_BACKOFF);
     }
 
@@ -2619,8 +2620,8 @@ impl Ring {
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         let mut pending_conn_adds = BTreeSet::new();
-        let mut last_backoff_cleanup = Instant::now();
-        let mut last_health_check = Instant::now();
+        let mut last_backoff_cleanup = self.time_source.now();
+        let mut last_health_check = self.time_source.now();
         let mut last_peer_cache_save = self.time_source.now();
         const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(300);
         // How often to snapshot the peer cache to disk.
@@ -2654,7 +2655,8 @@ impl Ring {
         // The loop guard (`!is_gateway`) ensures gateways never probe themselves.
         let initial_probe_delay_secs =
             GlobalRng::random_u64() % GATEWAY_VERSION_PROBE_INTERVAL.as_secs();
-        let mut next_gateway_probe = Instant::now() + Duration::from_secs(initial_probe_delay_secs);
+        let mut next_gateway_probe =
+            self.time_source.now() + Duration::from_secs(initial_probe_delay_secs);
 
         // Adaptive fast-tick backoff: increase the fast-tick interval when
         // connection count stops growing, to avoid hammering the network
@@ -2805,7 +2807,7 @@ impl Ring {
             // Periodic cleanup of expired backoff entries
             if last_backoff_cleanup.elapsed() > BACKOFF_CLEANUP_INTERVAL {
                 self.cleanup_connection_backoff();
-                last_backoff_cleanup = Instant::now();
+                last_backoff_cleanup = self.time_source.now();
             }
 
             // Clean up stale pending reservations to prevent permanent isolation
@@ -2842,7 +2844,7 @@ impl Ring {
 
             // Periodic peer health check: evict peers with sustained routing failures.
             if last_health_check.elapsed() > HEALTH_CHECK_INTERVAL {
-                last_health_check = Instant::now();
+                last_health_check = self.time_source.now();
                 let current_ring = self.connection_manager.connection_count();
                 let unhealthy = self
                     .connection_manager
@@ -2907,10 +2909,10 @@ impl Ring {
                             "Node isolated with zero ring connections — resetting all backoff state"
                         );
                         reset_all_backoff();
-                        zero_connections_since = Some(Instant::now());
+                        zero_connections_since = Some(self.time_source.now());
                     }
                 } else {
-                    zero_connections_since = Some(Instant::now());
+                    zero_connections_since = Some(self.time_source.now());
                     tracing::warn!(
                         is_gateway,
                         "Zero ring connections detected — starting isolation timer"
@@ -2934,7 +2936,7 @@ impl Ring {
             if should_probe_gateway(
                 is_gateway,
                 !op_manager.configured_gateways.is_empty(),
-                Instant::now(),
+                self.time_source.now(),
                 next_gateway_probe,
             ) {
                 let gw_index =
@@ -2956,7 +2958,7 @@ impl Ring {
                 let uniform_01 = (GlobalRng::random_u64() as f64) / (u64::MAX as f64);
                 let jittered_secs = base_secs + jitter_range * (2.0 * uniform_01 - 1.0);
                 next_gateway_probe =
-                    Instant::now() + Duration::from_secs_f64(jittered_secs.max(1.0));
+                    self.time_source.now() + Duration::from_secs_f64(jittered_secs.max(1.0));
             }
 
             // Gateway bootstrap fallback: at zero connections, acquire_new always
@@ -3138,7 +3140,7 @@ impl Ring {
                 .adjust_topology(
                     &neighbor_locations,
                     &self.connection_manager.own_location().location(),
-                    Instant::now(),
+                    self.time_source.now(),
                     current_connections,
                 );
 
@@ -4150,6 +4152,79 @@ mod deferred_swap_drop_tests {
     #[test]
     fn below_min_connections_no_drop() {
         assert_eq!(deferred_swap_drops_to_execute(5, 10, 2), 0);
+    }
+}
+
+/// Source-grep pin test: lock down the set of bare `Instant::now()` call
+/// sites in this file so a future change can't silently reintroduce a
+/// wall-clock time read on the connection-maintenance path.
+///
+/// All production time reads in `ring.rs` go through `self.time_source.now()`
+/// (the injectable `TimeSource`) so simulation/governance tests can drive the
+/// connection-maintenance loop under `tokio::time::start_paused(true)` (or a
+/// `SharedMockTimeSource`) deterministically. See #4277 and the #4260 fix that
+/// migrated the first such call site (`report_contract_resource_usage`).
+///
+/// Two categories are deliberately exempt and are NOT bare `Instant::now()`:
+///   * `boot_time::Instant::now()` / `WallClockInstant::now()` — the OS
+///     suspend/resume detector in `connection_maintenance`, which by design
+///     needs real wall-clock time (see `.claude/rules/code-style.md`).
+///     These carry a type prefix, so they don't match a *bare* `Instant::now()`.
+///
+/// The only remaining bare `Instant::now()` call sites live in the
+/// `#[cfg(test)]` `gateway_version_probe_predicate_tests` module, where they
+/// construct inputs for the pure `should_probe_gateway` predicate (no
+/// production time is read there). If you add a new production time read,
+/// route it through `self.time_source.now()` rather than bumping this count.
+#[cfg(test)]
+mod instant_now_pin_test {
+    /// Number of bare `Instant::now()` call sites expected in this file, all
+    /// in test code. Production code must use `self.time_source.now()`.
+    const EXPECTED_BARE_INSTANT_NOW: usize = 6;
+
+    #[test]
+    fn no_unexpected_bare_instant_now_call_sites() {
+        let src = include_str!("ring.rs");
+        // Build the needle from fragments so this test's own source line does
+        // not itself contain a verbatim bare call-site token that it would count.
+        let needle = format!("Instant{}now()", "::");
+        let mut count = 0usize;
+        for line in src.lines() {
+            // Strip a `//` line comment so doc/comment mentions (including this
+            // test's own docs) don't count.
+            let code = match line.split_once("//") {
+                Some((before, _)) => before,
+                None => line,
+            };
+            // Count bare occurrences — i.e. not preceded by an identifier or
+            // path separator (excludes `boot_time::Instant::now()` and
+            // `WallClockInstant::now()`).
+            let bytes = code.as_bytes();
+            let mut idx = 0;
+            while let Some(pos) = code[idx..].find(&needle) {
+                let abs = idx + pos;
+                let prev_is_pathy = abs
+                    .checked_sub(1)
+                    .map(|p| {
+                        let c = bytes[p];
+                        c == b':' || c == b'_' || c.is_ascii_alphanumeric()
+                    })
+                    .unwrap_or(false);
+                if !prev_is_pathy {
+                    count += 1;
+                }
+                idx = abs + needle.len();
+            }
+        }
+        assert_eq!(
+            count, EXPECTED_BARE_INSTANT_NOW,
+            "Unexpected number of bare wall-clock time-read call sites in ring.rs. \
+             Production code must read time via `self.time_source.now()` so the \
+             connection-maintenance loop stays deterministic under start_paused \
+             (#4277). If you intentionally added or removed a TEST-only call site, \
+             update EXPECTED_BARE_INSTANT_NOW; if this fired on PRODUCTION code, \
+             migrate it to `self.time_source.now()` instead of bumping the count."
+        );
     }
 }
 

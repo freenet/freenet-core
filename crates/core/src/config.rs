@@ -250,7 +250,18 @@ impl ConfigArgs {
     }
 
     /// Parse the command line arguments and return the configuration.
-    pub async fn build(mut self) -> anyhow::Result<Config> {
+    pub async fn build(self) -> anyhow::Result<Config> {
+        self.build_with_gateways_index(FREENET_GATEWAYS_INDEX).await
+    }
+
+    /// Build the configuration, fetching the remote gateway index from
+    /// `gateways_index` when `--skip-load-from-network` is not set.
+    ///
+    /// The public [`build`](Self::build) wrapper passes the production
+    /// [`FREENET_GATEWAYS_INDEX`] constant. Tests inject a local mock-server
+    /// URL so the remote-fetch path is exercised deterministically without
+    /// reaching out to `freenet.org` (which would be slow and flaky in CI).
+    async fn build_with_gateways_index(mut self, gateways_index: &str) -> anyhow::Result<Config> {
         // Validate gateway configuration
         self.network_api.validate()?;
 
@@ -416,12 +427,12 @@ impl ConfigArgs {
         let remotely_loaded_gateways = if mode == OperationMode::Local {
             Gateways::default()
         } else if !self.network_api.skip_load_from_network {
-            load_gateways_from_index(FREENET_GATEWAYS_INDEX, &config_paths.secrets_dir)
+            load_gateways_from_index(gateways_index, &config_paths.secrets_dir)
                 .await
                 .inspect_err(|error| {
                     tracing::error!(
                         error = %error,
-                        index = FREENET_GATEWAYS_INDEX,
+                        index = gateways_index,
                         "Failed to load gateways from index"
                     );
                 })
@@ -538,7 +549,28 @@ impl ConfigArgs {
                     })?
                 }
                 Err(err) => {
+                    // A gateway is allowed to start with an empty bootstrap
+                    // list (an isolated gateway is a valid configuration), so
+                    // exempt `is_gateway` nodes from this guard. A gateway
+                    // started with `--is-gateway --public-network-address X
+                    // --network-port Y` (and no `--public-network-port`) has
+                    // `peer_id == None`, because `peer_id` is derived from
+                    // `public_address.zip(public_port)` above. Keying the guard
+                    // on `peer_id.is_none()` alone would therefore wrongly
+                    // reject such a gateway on first boot when the remote index
+                    // is unreachable, no on-disk gateways.toml exists, and no
+                    // `--gateway`/`--gateways` is supplied. See issue #4268.
+                    //
+                    // The original `peer_id.is_none()` condition is preserved:
+                    // a non-gateway peer that DOES have a public identity
+                    // (`--public-network-address` + `--public-network-port`, so
+                    // `peer_id == Some`) is still allowed to initialize as a
+                    // disjoint bootstrap node with no gateways (see the
+                    // "initializing disjoint gateway" warning below). Only a
+                    // non-gateway with no public identity and no gateways is
+                    // rejected, as before.
                     if peer_id.is_none()
+                        && !self.network_api.is_gateway
                         && mode == OperationMode::Network
                         && remotely_loaded_gateways.gateways.is_empty()
                         && !has_cli_gateways
@@ -3557,6 +3589,176 @@ mod tests {
             err.to_string()
                 .contains("Cannot initialize node without gateways"),
             "Expected 'Cannot initialize node without gateways', got: {err}"
+        );
+    }
+
+    /// Serve an empty gateway index from a local mock server. Used to drive the
+    /// remote-fetch path (i.e. `--skip-load-from-network` is NOT set) into the
+    /// file-load fallback branch deterministically, without reaching out to the
+    /// real `freenet.org` index (which would be slow and flaky in CI).
+    fn empty_gateways_index_server() -> (Server, String) {
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method("GET"))
+                .times(..)
+                .respond_with(status_code(200).body("")),
+        );
+        let url = server.url_str("/gateways.toml");
+        (server, url)
+    }
+
+    /// Regression test for #4268: an isolated gateway started with
+    /// `--is-gateway --public-network-address X --network-port Y` (and no
+    /// `--public-network-port`) has a `None` `peer_id`, because `peer_id` is
+    /// derived from `public_address.zip(public_port)`. On first boot — remote
+    /// index unreachable/empty, no on-disk `gateways.toml`, and no
+    /// `--gateway`/`--gateways` — the file-load fallback branch must still
+    /// allow the gateway to start with an empty bootstrap list.
+    ///
+    /// Before the fix, the branch guarded on `peer_id.is_none()`, so this
+    /// configuration was wrongly rejected with "Cannot initialize node without
+    /// gateways". This is the file-load analogue of the
+    /// `--skip-load-from-network` guard fixed in PR #4264.
+    ///
+    /// Note: `skip_load_from_network` is intentionally NOT set here — that flag
+    /// would route an `is_gateway` node through the earlier
+    /// `skip_load && is_gateway` branch and never reach the file-load guard
+    /// this test exercises.
+    #[tokio::test]
+    async fn test_file_load_branch_isolated_gateway_without_public_port_succeeds() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path();
+        // No gateways.toml is written: the config_dir is empty, so File::open
+        // fails and we hit the guard under test.
+        assert!(!config_dir.join("gateways.toml").exists());
+
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir.to_path_buf()),
+                data_dir: Some(config_dir.to_path_buf()),
+                log_dir: Some(config_dir.to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                is_gateway: true,
+                // public_address + network_port (NOT public_port) is the valid
+                // isolated-gateway configuration that yields peer_id == None.
+                public_address: Some("203.0.113.10".parse().unwrap()),
+                network_port: Some(31337),
+                public_port: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let cfg = args
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("isolated gateway with no bootstrap gateways must be allowed to start");
+
+        assert!(cfg.is_gateway);
+        assert!(
+            cfg.gateways.is_empty(),
+            "isolated gateway should start with no bootstrap gateways, got {:?}",
+            cfg.gateways
+        );
+        // This PR intentionally does NOT change peer_id derivation: a gateway
+        // configured with --network-port but no --public-network-port still has
+        // peer_id == None (peer_id = public_address.zip(public_port)). That
+        // pre-existing behavior is out of scope here; whether such a gateway
+        // should derive peer_id from network_port is tracked separately. The
+        // fix only ensures build() no longer rejects this valid configuration.
+        assert!(
+            cfg.peer_id.is_none(),
+            "expected peer_id to remain None for a gateway without --public-network-port"
+        );
+    }
+
+    /// Companion to #4268: the widened guard must NOT let a *non-gateway* peer
+    /// start with no bootstrap gateways. A regular peer with `peer_id == None`,
+    /// an empty config_dir, an empty remote index, and no `--gateway` entries
+    /// has nothing to connect to and must still be rejected with "Cannot
+    /// initialize node without gateways". This pins that the fix only relaxes
+    /// the guard for gateways, not for peers.
+    #[tokio::test]
+    async fn test_file_load_branch_non_gateway_without_gateways_is_rejected() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path();
+        assert!(!config_dir.join("gateways.toml").exists());
+
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir.to_path_buf()),
+                data_dir: Some(config_dir.to_path_buf()),
+                log_dir: Some(config_dir.to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                is_gateway: false,
+                // No public_port -> peer_id == None, mirroring the gateway case,
+                // but as a non-gateway this peer genuinely cannot bootstrap.
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = args
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect_err("non-gateway peer without any gateways must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Cannot initialize node without gateways"),
+            "Expected 'Cannot initialize node without gateways', got: {err}"
+        );
+    }
+
+    /// Pin for #4268: the guard must keep its original `peer_id.is_none()`
+    /// condition so a non-gateway peer that DOES have a public identity
+    /// (`--public-network-address` + `--public-network-port`, hence
+    /// `peer_id == Some`) is still allowed to initialize as a disjoint
+    /// bootstrap node when no gateways are available. The first draft of the
+    /// #4268 fix gated solely on `!is_gateway`, which would have wrongly
+    /// rejected this previously-supported startup path; this test locks it in.
+    #[tokio::test]
+    async fn test_file_load_branch_public_non_gateway_bootstraps_disjoint() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path();
+        assert!(!config_dir.join("gateways.toml").exists());
+
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir.to_path_buf()),
+                data_dir: Some(config_dir.to_path_buf()),
+                log_dir: Some(config_dir.to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                is_gateway: false,
+                // Public identity set -> peer_id == Some, so the node may start
+                // disjoint even though no gateways are available.
+                public_address: Some("198.51.100.7".parse().unwrap()),
+                public_port: Some(31337),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let cfg = args
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("public non-gateway peer must be allowed to bootstrap disjoint");
+        assert!(!cfg.is_gateway);
+        assert!(
+            cfg.gateways.is_empty(),
+            "disjoint peer should start with no gateways, got {:?}",
+            cfg.gateways
         );
     }
 
