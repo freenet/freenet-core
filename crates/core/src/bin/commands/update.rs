@@ -1207,7 +1207,9 @@ fn update_service_file(
             if let Err(e) = write_wrapper_hash_sidecar(&hash_path, h) {
                 if !quiet {
                     eprintln!(
-                        "Warning: failed to backfill service hash sidecar at {}: {}.",
+                        "Warning: failed to backfill service hash sidecar at {}: {}. \
+                         User-modification detection on the next `freenet update` \
+                         will fall back to treating the unit as ours.",
                         hash_path.display(),
                         e
                     );
@@ -2183,6 +2185,37 @@ mod tests {
             rendered, installed,
             "re-rendering an installed system unit must reproduce it \
              byte-for-byte so the equality check is a no-op (#4287)"
+        );
+    }
+
+    /// Linux-only edge case (Gemini review): a system unit hand-edited
+    /// to keep `User=` but DROP `Environment=HOME=` falls back to the
+    /// inferred `/home/{user}` home. Every Freenet-generated unit always
+    /// embeds `Environment=HOME=`, so this path is only reachable when an
+    /// operator removed that line — in which case the unit already
+    /// differs from the template and the fallback's exact value can't
+    /// cause a spurious rewrite of an otherwise-pristine unit. This test
+    /// pins the inferred-home behavior so the equality check stays
+    /// predictable rather than depending on ambient state.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn render_current_systemd_unit_infers_home_when_env_home_absent_4287() {
+        use std::path::PathBuf;
+        let binary = PathBuf::from("/usr/local/bin/freenet");
+        // A unit with User= but no Environment=HOME= line.
+        let existing = "[Service]\nUser=alice\nExecStart=/usr/local/bin/freenet network\n";
+
+        let rendered = render_current_systemd_unit(&binary, existing, true)
+            .expect("render must succeed even without Environment=HOME=");
+
+        // The fallback infers /home/alice; the regenerated unit therefore
+        // equals what the template produces for that inferred home.
+        let inferred_home = PathBuf::from("/home/alice");
+        let log_dir = inferred_home.join(".local/state/freenet");
+        let expected = generate_system_service_file(&binary, &log_dir, "alice", &inferred_home);
+        assert_eq!(
+            rendered, expected,
+            "missing Environment=HOME= must infer /home/{{user}} deterministically (#4287)"
         );
     }
 
