@@ -3609,7 +3609,7 @@ mod tests {
 
     /// Regression test for #4268: an isolated gateway started with
     /// `--is-gateway --public-network-address X --network-port Y` (and no
-    /// `--public-network-port`) has `peer_id == None`, because `peer_id` is
+    /// `--public-network-port`) has a `None` `peer_id`, because `peer_id` is
     /// derived from `public_address.zip(public_port)`. On first boot — remote
     /// index unreachable/empty, no on-disk `gateways.toml`, and no
     /// `--gateway`/`--gateways` — the file-load fallback branch must still
@@ -3663,6 +3663,16 @@ mod tests {
             cfg.gateways.is_empty(),
             "isolated gateway should start with no bootstrap gateways, got {:?}",
             cfg.gateways
+        );
+        // This PR intentionally does NOT change peer_id derivation: a gateway
+        // configured with --network-port but no --public-network-port still has
+        // peer_id == None (peer_id = public_address.zip(public_port)). That
+        // pre-existing behavior is out of scope here; whether such a gateway
+        // should derive peer_id from network_port is tracked separately. The
+        // fix only ensures build() no longer rejects this valid configuration.
+        assert!(
+            cfg.peer_id.is_none(),
+            "expected peer_id to remain None for a gateway without --public-network-port"
         );
     }
 
