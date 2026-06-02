@@ -344,10 +344,20 @@ async fn drive_client_get_inner(
 
             // Forward-path hop count carried on the wire reply, used below to
             // emit the terminal `GetSuccess` telemetry event (issue #4249).
-            // Captured via `Terminal::wire_hop_count()` (not an inline match)
-            // so the `streaming_terminal_calls_assemble_and_cache_stream`
-            // source-scrape pin still anchors on the real `reply_key` arm.
+            // Captured via accessor methods (not an inline match) so the
+            // `streaming_terminal_calls_assemble_and_cache_stream` source-scrape
+            // pin still anchors on the real `reply_key` arm.
             let wire_hop_count: Option<usize> = terminal.wire_hop_count();
+            // Only the streaming reply needs a driver-emitted `GetSuccess`:
+            // the inline `Response{Found}` path already emits one at the
+            // originator via `from_inbound_msg_v1` (the reply flows through
+            // `handle_pure_network_message_v1` before the driver bypass), so
+            // emitting again here would double-count inline GET successes.
+            // `ResponseStreaming` is deliberately NOT matched in
+            // `from_inbound_msg_v1` (the header is not proof of payload
+            // arrival), leaving the streaming originator with no terminal GET
+            // telemetry — which is exactly the #4249 gap this emission fills.
+            let is_streaming_reply = terminal.is_streaming();
 
             let reply_key = match &terminal {
                 Terminal::InlineFound {
@@ -572,33 +582,33 @@ async fn drive_client_get_inner(
                 host_result.is_ok(),
             );
 
-            // Emit the terminal `GetSuccess` telemetry event from the
-            // originator (issue #4249).
+            // Emit the terminal `GetSuccess` telemetry event for the
+            // STREAMING reply path only (issue #4249).
             //
-            // In the task-per-tx architecture the GET reply is delivered
-            // straight to this driver's `pending_op_result` waiter rather
-            // than through the event loop's inbound dispatch, so the
-            // originator never runs `from_inbound_msg_v1` for its own GET
-            // reply — the implicit `GetSuccess` arm there only fires at
-            // relays that forward a downstream `Response{Found}`, and not at
-            // all for a direct (non-relayed) GET. The requester-side
-            // `GetSuccess` (the value the dashboard's GET success-rate and
-            // hop-depth panels read) must therefore be emitted explicitly
-            // here, exactly as PUT does from `finalize_put_at_originator`.
-            // This covers the inline AND streaming (`ResponseStreaming`)
-            // paths uniformly, for both direct and relayed GETs — closing
-            // the streaming-success telemetry gap #4249 describes (streamed
-            // responses previously produced no requester-side terminal GET
-            // event at all).
+            // An inline `Response{Found}` reply already produces a
+            // `GetSuccess` at this peer: it flows through
+            // `handle_pure_network_message_v1`, whose unconditional
+            // `from_inbound_msg_v1` call (node.rs) matches the inline
+            // `Response{Found}` arm BEFORE the driver bypass forwards the
+            // reply here. Emitting again for the inline path would
+            // double-count GET successes for the same `(tx, peer)`.
+            //
+            // `GetMsg::ResponseStreaming` is deliberately NOT matched in
+            // `from_inbound_msg_v1` — the stream *header* is not proof the
+            // payload arrived (it can still fail to be claimed, assembled, or
+            // deserialized). So the streaming originator gets NO terminal GET
+            // telemetry from the tracing layer; this is the exact #4249 gap.
+            // We fill it here, after the stream has actually been assembled
+            // and `build_host_response`'s local-store re-query confirms the
+            // payload is present (`host_result.is_ok()`), mirroring how PUT
+            // emits from `finalize_put_at_originator`.
             //
             // `hop_count` is the wire-carried forward depth, clamped to
             // `max_hops_to_live` for the same defence-in-depth reason the
             // `from_inbound_msg_v1` arms clamp it: a buggy or malicious peer
             // must not be able to poison originator telemetry with
-            // `usize::MAX`. Only emitted on client-visible success
-            // (`host_result.is_ok()`); the NotFound / failure paths are
-            // handled elsewhere (`relay_send_not_found`, the Exhausted arm).
-            if host_result.is_ok() {
+            // `usize::MAX`.
+            if is_streaming_reply && host_result.is_ok() {
                 let max_htl = op_manager.ring.max_hops_to_live;
                 let hop_count = wire_hop_count.map(|hc| hc.min(max_htl));
                 if let Some(event) = crate::tracing::NetEventLog::get_success(
@@ -740,6 +750,14 @@ impl Terminal {
             }
             Terminal::LocalCompletion => None,
         }
+    }
+
+    /// True for the streaming reply path (`GetMsg::ResponseStreaming`),
+    /// which — unlike inline `Response{Found}` — produces no `GetSuccess`
+    /// from `from_inbound_msg_v1`, so the driver must emit one itself
+    /// (issue #4249).
+    fn is_streaming(&self) -> bool {
+        matches!(self, Terminal::Streaming { .. })
     }
 }
 

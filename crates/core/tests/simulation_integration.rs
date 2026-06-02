@@ -9598,20 +9598,36 @@ fn test_hop_count_populated_on_terminal_get_events() {
     );
 
     let rt = create_runtime();
-    let (populated, max_hop) = rt.block_on(async {
+    let (populated, max_hop, max_dup) = rt.block_on(async {
         let logs = logs_handle.lock().await;
         // Restrict to terminal GET SUCCESS events: those carry the
-        // wire-carried hop_count (emitted by the originator's driver and by
-        // relays forwarding the response). A NotFound exhaustion event also
-        // carries hop_count, but on a controlled PUT-then-GET workload we
-        // expect successes.
+        // wire-carried hop_count (emitted at the originator by the inline
+        // `from_inbound_msg_v1` arm, and at relays forwarding the response).
+        // A NotFound exhaustion event also carries hop_count, but on a
+        // controlled PUT-then-GET workload we expect successes.
         let hop_counts: Vec<usize> = logs
             .iter()
             .filter(|m| m.kind.is_get_success())
             .filter_map(|m| m.kind.hop_count())
             .collect();
         let max_hop = hop_counts.iter().copied().max().unwrap_or(0);
-        (hop_counts.len(), max_hop)
+
+        // No-double-count guard (issue #4249 review): a single peer must
+        // emit at most ONE GetSuccess per transaction. An inline GET emits
+        // GetSuccess via `from_inbound_msg_v1`; the streaming fix adds a
+        // driver-side emission. If the driver emission were not gated to the
+        // streaming path it would double-count inline GET successes at the
+        // originator — this guard would catch that regression.
+        let mut per_tx_peer: std::collections::HashMap<(String, String), usize> =
+            std::collections::HashMap::new();
+        for m in logs.iter().filter(|m| m.kind.is_get_success()) {
+            *per_tx_peer
+                .entry((format!("{}", m.tx), format!("{:?}", m.peer_id)))
+                .or_default() += 1;
+        }
+        let max_dup = per_tx_peer.values().copied().max().unwrap_or(0);
+
+        (hop_counts.len(), max_hop, max_dup)
     });
 
     // Presence: before the #4249 fix the task-per-tx GET path emitted no
@@ -9622,6 +9638,15 @@ fn test_hop_count_populated_on_terminal_get_events() {
         "expected at least one terminal GetSuccess event with populated \
          hop_count; got 0. Indicates the originator's GET driver is no longer \
          emitting GetSuccess with the wire-carried hop_count (issues #4245/#4249)."
+    );
+
+    // No peer may emit more than one GetSuccess for the same transaction.
+    assert!(
+        max_dup <= 1,
+        "a peer emitted {max_dup} GetSuccess events for one transaction — \
+         duplicate terminal GET telemetry (the driver-side streaming emission \
+         must stay gated to the streaming path so it doesn't double-count the \
+         inline `from_inbound_msg_v1` GetSuccess; issue #4249 review)."
     );
 
     // Sanity-bound: hop_count is computed as `max_htl - htl` on the storer
