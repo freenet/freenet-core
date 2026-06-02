@@ -506,9 +506,16 @@ impl TransportMetrics {
         // Read and reset counters
         let transfers_completed = self.transfers_completed.swap(0, Ordering::Relaxed);
         let transfers_failed = self.transfers_failed.swap(0, Ordering::Relaxed);
+        // RTT samples count as activity in their own right: quiet connections
+        // that only exchange keep-alive ping/pong traffic record RTT samples
+        // but complete no transfers (#4000). Gating snapshot emission solely
+        // on transfers would discard (and reset) those samples here, so the
+        // telemetry worker would never see RTT data for a quiet node — the
+        // exact under-counting this is meant to fix.
+        let rtt_samples = self.rtt_samples.swap(0, Ordering::Relaxed);
 
         // No activity = no snapshot
-        if transfers_completed == 0 && transfers_failed == 0 {
+        if transfers_completed == 0 && transfers_failed == 0 && rtt_samples == 0 {
             // Still reset other counters to prevent stale data
             self.bytes_sent.store(0, Ordering::Relaxed);
             self.bytes_received.store(0, Ordering::Relaxed);
@@ -522,7 +529,7 @@ impl TransportMetrics {
             self.min_rtt_us.store(u64::MAX, Ordering::Relaxed);
             self.max_rtt_us.store(0, Ordering::Relaxed);
             self.rtt_sum_us.store(0, Ordering::Relaxed);
-            self.rtt_samples.store(0, Ordering::Relaxed);
+            // `rtt_samples` was already swapped to 0 above.
             return None;
         }
 
@@ -538,7 +545,6 @@ impl TransportMetrics {
         let min_rtt_us = self.min_rtt_us.swap(u64::MAX, Ordering::Relaxed);
         let max_rtt_us = self.max_rtt_us.swap(0, Ordering::Relaxed);
         let rtt_sum_us = self.rtt_sum_us.swap(0, Ordering::Relaxed);
-        let rtt_samples = self.rtt_samples.swap(0, Ordering::Relaxed);
 
         // Compute averages
         let avg_cwnd_bytes = if cwnd_samples > 0 {
@@ -775,6 +781,33 @@ mod tests {
         assert_eq!(snapshot.bytes_sent, 1024);
         assert_eq!(snapshot.peak_cwnd_bytes, 50000);
         assert_eq!(snapshot.slowdowns_triggered, 1);
+    }
+
+    /// Regression test for #4000: a quiet connection that records RTT samples
+    /// from the ping/pong keep-alive cycle but completes no transfers must
+    /// still produce a telemetry snapshot. Without counting RTT samples as
+    /// activity, `take_snapshot` would early-return `None` and reset the RTT
+    /// counters, silently discarding exactly the quiet-connection RTT data the
+    /// keep-alive sampling path is meant to surface.
+    #[test]
+    fn test_snapshot_emitted_for_rtt_only_activity() {
+        let metrics = TransportMetrics::new();
+
+        // No transfers — only a keep-alive RTT sample, as a quiet connection
+        // would produce.
+        metrics.record_rtt_sample(42_000);
+
+        let snapshot = metrics
+            .take_snapshot()
+            .expect("RTT-only activity must still produce a snapshot");
+        assert_eq!(snapshot.transfers_completed, 0);
+        assert_eq!(snapshot.transfers_failed, 0);
+        assert_eq!(snapshot.avg_rtt_us, 42_000);
+        assert_eq!(snapshot.min_rtt_us, 42_000);
+        assert_eq!(snapshot.max_rtt_us, 42_000);
+
+        // Counters reset: a subsequent snapshot with no new activity is None.
+        assert!(metrics.take_snapshot().is_none());
     }
 
     #[test]
