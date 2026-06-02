@@ -128,6 +128,20 @@ mod messages {
             total_size: u64,
             /// Whether the response includes the contract code (not just state)
             includes_contract: bool,
+            /// Forward-path hop count, mirroring `GetMsg::Response.hop_count`
+            /// (PR #4245). Set by the storer (`max_htl - htl_at_storer`) and
+            /// preserved by relays forking + piping the stream upstream — it
+            /// does NOT increment on the return path. Lets the originator's
+            /// tracing layer populate `GetSuccess.hop_count` for large
+            /// (streamed) responses, which previously emitted no terminal
+            /// telemetry event at all (issue #4249).
+            ///
+            /// `#[serde(default)]` is set for source-level clarity. Bincode
+            /// does not honour serde defaults (positional encoding), so wire
+            /// compat with peers that lack this field is handled at the
+            /// handshake layer via `min-compatible-version`.
+            #[serde(default)]
+            hop_count: usize,
         },
 
         /// Acknowledgment that a streaming response was received.
@@ -483,6 +497,54 @@ mod tests {
                     assert_eq!(hc, hop_count, "NotFound.hop_count must roundtrip ({label})")
                 }
                 _ => panic!("expected Response for {label}"),
+            }
+        }
+    }
+
+    /// Regression test (issue #4249): `GetMsg::ResponseStreaming.hop_count`
+    /// roundtrips through bincode.
+    ///
+    /// Before this fix the streaming GET response carried no `hop_count`
+    /// field, so large-contract (streamed) GET successes produced NO
+    /// terminal `GetSuccess` telemetry event at all — the variant fell into
+    /// the `Get(_) => Ignored` catch-all in `from_inbound_msg_v1`. The fix
+    /// carries the value on the wire so the originator's tracing layer can
+    /// populate `GetSuccess.hop_count` for streamed responses, exactly as
+    /// `test_get_msg_response_hop_count_roundtrip` proves for the inline
+    /// `Response` path.
+    ///
+    /// bincode-positional caveat: this positional addition breaks older
+    /// binaries; see the min-compatible-version bump that accompanies this
+    /// PR.
+    #[test]
+    fn test_get_msg_response_streaming_hop_count_roundtrip() {
+        use crate::transport::peer_connection::StreamId;
+        let key = make_contract_key(11);
+        let cases: &[(&str, usize)] = &[
+            ("zero", 0),
+            ("one", 1),
+            ("mid", 4),
+            ("htl", 10),
+            ("large", 64),
+        ];
+        for (label, hop_count) in cases.iter().copied() {
+            let streaming = GetMsg::ResponseStreaming {
+                id: Transaction::new::<GetMsg>(),
+                instance_id: *key.id(),
+                stream_id: StreamId::next(),
+                key,
+                total_size: 128 * 1024,
+                includes_contract: true,
+                hop_count,
+            };
+            let bytes = bincode::serialize(&streaming).expect(label);
+            let restored: GetMsg = bincode::deserialize(&bytes).expect(label);
+            match restored {
+                GetMsg::ResponseStreaming { hop_count: hc, .. } => assert_eq!(
+                    hc, hop_count,
+                    "ResponseStreaming.hop_count must roundtrip ({label})"
+                ),
+                _ => panic!("expected ResponseStreaming for {label}"),
             }
         }
     }

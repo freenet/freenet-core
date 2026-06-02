@@ -9504,62 +9504,124 @@ async fn sim_network_regular_node_labels_start_at_gateway_count() {
 }
 
 // =============================================================================
-// hop_count Regression Test (simulation-level, currently disabled)
+// hop_count Regression Test (simulation-level)
 // =============================================================================
 //
 // Direct regression coverage for the wire-format fix is provided by
-// `test_get_msg_response_hop_count_roundtrip` in `crates/core/src/operations/get.rs`.
-// That unit test asserts the new `hop_count` field roundtrips through bincode
-// for both `Found` and `NotFound` variants, which is the specific regression
-// scenario this PR addresses.
+// `test_get_msg_response_hop_count_roundtrip` /
+// `test_get_msg_response_streaming_hop_count_roundtrip` in
+// `crates/core/src/operations/get.rs`. Those unit tests assert the `hop_count`
+// field roundtrips through bincode for the `Found`, `NotFound`, and
+// `ResponseStreaming` variants.
 //
-// The simulation-level integration test below is left in tree, but marked
-// `#[ignore]` because the default `TestConfig`/`event_chain` workload at the
-// scales reasonable for CI does not reliably produce terminal GET events
-// (most operations are PUT/UPDATE/SUBSCRIBE).  The `nightly_tests`-gated
-// `test_get_reliability_diagnostic` above does drive GETs via
-// `run_controlled_simulation`; once that pattern is generalised, this test
-// can be rebuilt on top of it without `#[ignore]`.
+// This simulation-level test (originally #4250) was previously `#[ignore]`d
+// because the default `TestConfig`/`event_chain` workload does not reliably
+// produce terminal GET events at CI scales (2,840 events / 0 GETs observed).
+// It is now wired onto a deterministic controlled PUT-then-GETs workload via
+// `run_controlled_simulation` — the same pattern the nightly
+// `test_get_reliability_diagnostic` uses — so terminal GET successes are
+// produced every run. This became checkable once the originator's GET driver
+// began emitting `GetSuccess` explicitly (issue #4249); before that the
+// task-per-tx GET path produced no terminal GET telemetry at all.
 #[test_log::test]
-#[ignore = "tracking issue #4250 — default event_chain workload doesn't produce terminal GETs at CI scales; primary regression coverage lives in test_get_msg_response_hop_count_roundtrip (get.rs) and classify_response_found_preserves_hop_count (op_ctx_task.rs). Un-ignore once a deterministic GET-producing workload is wired through TestConfig"]
 fn test_hop_count_populated_on_terminal_get_events() {
-    // Parameters match test_router_accumulates_feedback_events (a known-good
-    // workload that produces GET events in CI).
-    let result = TestConfig::small("hop-count-regression", 0xCAFE_0001)
-        .with_nodes(4)
-        .with_max_contracts(5)
-        .with_iterations(50)
-        .with_duration(Duration::from_secs(60))
-        .with_sleep(Duration::from_secs(2))
-        .run()
-        .assert_ok();
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
 
-    // TestConfig::small uses ring_max_htl = 7, so any populated hop_count must
-    // be within [0, 7].  Anything outside that range would indicate either
-    // garbage-value propagation or a regression in how relays compute their
-    // forward depth.
+    const SEED: u64 = 0xCAFE_0001;
+    const NETWORK_NAME: &str = "hop-count-regression";
+    const NUM_GATEWAYS: usize = 1;
+    const NUM_NODES: usize = 6;
+    // SimNetwork below uses ring_max_htl = 7; the storer computes
+    // hop_count = max_htl - htl and the originator clamps to max_htl, so any
+    // populated value must land in [0, 7].
     const RING_MAX_HTL: usize = 7;
+
+    GlobalRng::set_seed(SEED);
+    const BASE_EPOCH_MS: u64 = 1577836800000;
+    const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
+    GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
+
+    let rt = create_runtime();
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            NUM_GATEWAYS,
+            NUM_NODES,
+            RING_MAX_HTL,
+            3, // rnd_if_htl_above
+            3, // max_connections (sparse: < node count → forces relayed GETs)
+            2, // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // Gateway PUTs a contract (without subscribing peers, so they don't get
+    // it pushed); the farthest node then GETs it. With the sparse topology
+    // (max_connections < node count) the GET routes through the network rather
+    // than hitting the local-cache shortcut, producing a terminal GET success
+    // whose `hop_count` is wire-carried from the storer.
+    let contract = SimOperation::create_test_contract(0x42);
+    let contract_id = *contract.key().id();
+
+    let operations = vec![
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: vec![0x42; 64],
+                subscribe: false,
+            },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, NUM_NODES - 1),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: false,
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
 
     let rt = create_runtime();
     let (populated, max_hop) = rt.block_on(async {
-        let logs = result.logs_handle.lock().await;
+        let logs = logs_handle.lock().await;
+        // Restrict to terminal GET SUCCESS events: those carry the
+        // wire-carried hop_count (emitted by the originator's driver and by
+        // relays forwarding the response). A NotFound exhaustion event also
+        // carries hop_count, but on a controlled PUT-then-GET workload we
+        // expect successes.
         let hop_counts: Vec<usize> = logs
             .iter()
-            .filter(|m| m.kind.variant_name() == "Get")
+            .filter(|m| m.kind.is_get_success())
             .filter_map(|m| m.kind.hop_count())
             .collect();
         let max_hop = hop_counts.iter().copied().max().unwrap_or(0);
         (hop_counts.len(), max_hop)
     });
 
-    // Presence: before the fix the wire-carried hop_count is dropped on the
-    // floor and every terminal GET event has hop_count = None.  After the
-    // fix every terminal GET event carries it.
+    // Presence: before the #4249 fix the task-per-tx GET path emitted no
+    // terminal GetSuccess telemetry at all, so this was always 0. After the
+    // fix every terminal GET success carries a populated hop_count.
     assert!(
         populated > 0,
-        "expected at least one terminal GET event with populated hop_count; \
-         got 0.  Indicates hop_count is no longer being threaded through the \
-         GetMsg::Response wire format (PR #4245)."
+        "expected at least one terminal GetSuccess event with populated \
+         hop_count; got 0. Indicates the originator's GET driver is no longer \
+         emitting GetSuccess with the wire-carried hop_count (issues #4245/#4249)."
     );
 
     // Sanity-bound: hop_count is computed as `max_htl - htl` on the storer
@@ -9568,9 +9630,7 @@ fn test_hop_count_populated_on_terminal_get_events() {
     // the field instead of (max_htl - htl) would trip this.
     assert!(
         max_hop <= RING_MAX_HTL,
-        "max observed hop_count {} exceeds ring_max_htl {}; suggests garbage \
-         value propagation rather than (max_htl - htl) accounting",
-        max_hop,
-        RING_MAX_HTL
+        "max observed hop_count {max_hop} exceeds ring_max_htl {RING_MAX_HTL}; \
+         suggests garbage value propagation rather than (max_htl - htl) accounting"
     );
 }

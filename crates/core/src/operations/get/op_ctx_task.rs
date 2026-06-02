@@ -342,6 +342,13 @@ async fn drive_client_get_inner(
             let mut payload_size: usize = 0;
             let mut transfer_duration: std::time::Duration = std::time::Duration::ZERO;
 
+            // Forward-path hop count carried on the wire reply, used below to
+            // emit the terminal `GetSuccess` telemetry event (issue #4249).
+            // Captured via `Terminal::wire_hop_count()` (not an inline match)
+            // so the `streaming_terminal_calls_assemble_and_cache_stream`
+            // source-scrape pin still anchors on the real `reply_key` arm.
+            let wire_hop_count: Option<usize> = terminal.wire_hop_count();
+
             let reply_key = match &terminal {
                 Terminal::InlineFound {
                     key,
@@ -376,6 +383,11 @@ async fn drive_client_get_inner(
                     stream_id,
                     includes_contract,
                     total_size,
+                    // `hop_count` is read once up-front via
+                    // `terminal.wire_hop_count()` (used by the `GetSuccess`
+                    // emission below), so this assemble-and-cache arm ignores
+                    // it.
+                    hop_count: _,
                 } => {
                     // `total_size` is the wire-authoritative payload byte
                     // count from the `ResponseStreaming` header. Using it
@@ -560,6 +572,50 @@ async fn drive_client_get_inner(
                 host_result.is_ok(),
             );
 
+            // Emit the terminal `GetSuccess` telemetry event from the
+            // originator (issue #4249).
+            //
+            // In the task-per-tx architecture the GET reply is delivered
+            // straight to this driver's `pending_op_result` waiter rather
+            // than through the event loop's inbound dispatch, so the
+            // originator never runs `from_inbound_msg_v1` for its own GET
+            // reply — the implicit `GetSuccess` arm there only fires at
+            // relays that forward a downstream `Response{Found}`, and not at
+            // all for a direct (non-relayed) GET. The requester-side
+            // `GetSuccess` (the value the dashboard's GET success-rate and
+            // hop-depth panels read) must therefore be emitted explicitly
+            // here, exactly as PUT does from `finalize_put_at_originator`.
+            // This covers the inline AND streaming (`ResponseStreaming`)
+            // paths uniformly, for both direct and relayed GETs — closing
+            // the streaming-success telemetry gap #4249 describes (streamed
+            // responses previously produced no requester-side terminal GET
+            // event at all).
+            //
+            // `hop_count` is the wire-carried forward depth, clamped to
+            // `max_hops_to_live` for the same defence-in-depth reason the
+            // `from_inbound_msg_v1` arms clamp it: a buggy or malicious peer
+            // must not be able to poison originator telemetry with
+            // `usize::MAX`. Only emitted on client-visible success
+            // (`host_result.is_ok()`); the NotFound / failure paths are
+            // handled elsewhere (`relay_send_not_found`, the Exhausted arm).
+            if host_result.is_ok() {
+                let max_htl = op_manager.ring.max_hops_to_live;
+                let hop_count = wire_hop_count.map(|hc| hc.min(max_htl));
+                if let Some(event) = crate::tracing::NetEventLog::get_success(
+                    &client_tx,
+                    &op_manager.ring,
+                    reply_key,
+                    driver.current_target.clone(),
+                    hop_count,
+                    None, // state_hash not available here
+                ) {
+                    op_manager
+                        .ring
+                        .register_events(either::Either::Left(event))
+                        .await;
+                }
+            }
+
             // Explicit-subscribe hand-off. Mirrors PUT 3a's
             // `maybe_subscribe_child` — subscribe is never handled in
             // the terminal-result construction to avoid double-subscribe
@@ -654,12 +710,37 @@ enum Terminal {
         stream_id: StreamId,
         includes_contract: bool,
         total_size: u64,
+        /// Forward-path hop count carried on the wire
+        /// `GetMsg::ResponseStreaming` header. Preserved across the relay
+        /// fork+pipe chain (relays do NOT increment on the return path).
+        /// Mirrors `InlineFound.hop_count`; lets relays bubble the value
+        /// upstream so the originator's tracing layer can populate
+        /// `GetSuccess.hop_count` for streamed responses (issue #4249).
+        hop_count: usize,
     },
     /// Request-echo from `forward_pending_op_result_if_completed` —
     /// state was already in the local store (via the pre-send
     /// local-cache shortcut), so no new PutQuery is needed. The
     /// driver just resolves the key from the store.
     LocalCompletion,
+}
+
+impl Terminal {
+    /// Forward-path hop count carried on the wire reply, used to populate
+    /// the terminal `GetSuccess` telemetry event (issue #4249).
+    ///
+    /// `InlineFound` and `Streaming` both carry it (set by the storer as
+    /// `max_htl - htl` and preserved across the relay bubble-up chain);
+    /// `LocalCompletion` is a loopback request-echo with no remote hops, so
+    /// it has no wire hop_count.
+    fn wire_hop_count(&self) -> Option<usize> {
+        match self {
+            Terminal::InlineFound { hop_count, .. } | Terminal::Streaming { hop_count, .. } => {
+                Some(*hop_count)
+            }
+            Terminal::LocalCompletion => None,
+        }
+    }
 }
 
 /// Classify a reply into a driver outcome. Extracted from the
@@ -700,12 +781,14 @@ fn classify(reply: NetMessage) -> AttemptOutcome<Terminal> {
             stream_id,
             includes_contract,
             total_size,
+            hop_count,
             ..
         })) => AttemptOutcome::Terminal(Terminal::Streaming {
             key,
             stream_id,
             includes_contract,
             total_size,
+            hop_count,
         }),
         NetMessage::V1(NetMessageV1::Get(GetMsg::Request { .. })) => {
             AttemptOutcome::Terminal(Terminal::LocalCompletion)
@@ -1436,6 +1519,10 @@ async fn drive_sub_op_get(
                     // is emitted on the sub-op path), so payload size
                     // attribution is irrelevant here.
                     total_size: _,
+                    // Sub-op GETs are internal (auto-fetch / GC retries) and
+                    // don't surface terminal client telemetry, so the
+                    // forward-path hop_count is not consumed here.
+                    hop_count: _,
                 } => {
                     if let Some(peer_addr) = driver.current_target.socket_addr() {
                         if let Err(e) = assemble_and_cache_stream(
@@ -2016,13 +2103,12 @@ where
             phase = "relay_streaming_forward",
             "GET relay: payload exceeds threshold, streaming response upstream"
         );
-        // NOTE: `hop_count` is intentionally NOT carried on the streaming
-        // wire path — the `ResponseStreaming` variant has no such field
-        // (unlike the inline `Response{Found}` below, which propagates
-        // `hop_count`). This matches the legacy streaming producer's
-        // limitation; transfer-rate routing observations on the originator
-        // come from `total_size` instead, so the lost hop depth does not
-        // degrade routing.
+        // `hop_count` is carried on the streaming header (issue #4249) the
+        // same way the inline `Response{Found}` below carries it. Without
+        // it the originator's tracing layer emitted no terminal telemetry
+        // event at all for streamed GETs (the `ResponseStreaming` variant
+        // fell into the `Get(_) => Ignored` catch-all), so large-contract
+        // GET successes were invisible to the dashboard's hop-depth panels.
         let header = NetMessage::from(GetMsg::ResponseStreaming {
             id: tx,
             instance_id,
@@ -2030,6 +2116,7 @@ where
             key,
             total_size: payload_bytes.len() as u64,
             includes_contract,
+            hop_count,
         });
         // Embed a serialized copy of the metadata header in fragment #1
         // (fix #2757). On a lossy link the separately-sent fire-and-forget
@@ -2542,6 +2629,7 @@ where
                 stream_id,
                 includes_contract,
                 total_size,
+                hop_count,
             }) => {
                 // Downstream answered with a streaming response. Restore the
                 // relay fork+pipe forward (reverted #3586 / port plan §7,
@@ -2673,6 +2761,10 @@ where
                 //    Re-key with a FRESH outbound stream_id per hop.
                 let outbound_sid = StreamId::next_operations();
                 let forked = handle.fork();
+                // Preserve the downstream's forward-path `hop_count` as the
+                // stream is re-keyed and piped one hop further upstream
+                // (issue #4249). Relays do NOT increment on the return path,
+                // so the value the storer set bubbles up unchanged.
                 let header = GetMsg::ResponseStreaming {
                     id: incoming_tx,
                     instance_id,
@@ -2680,6 +2772,7 @@ where
                     key,
                     total_size,
                     includes_contract,
+                    hop_count,
                 };
                 let header_net = NetMessage::from(header);
                 // Serialize metadata for embedding in fragment #1 (fix #2757).
@@ -2994,10 +3087,11 @@ mod tests {
             key,
             total_size: 1024,
             includes_contract: true,
+            hop_count: 3,
         }));
         assert!(matches!(
             classify(msg),
-            AttemptOutcome::Terminal(Terminal::Streaming { .. })
+            AttemptOutcome::Terminal(Terminal::Streaming { hop_count: 3, .. })
         ));
     }
 

@@ -717,6 +717,181 @@ fn test_streaming_get_through_relay() {
     );
 }
 
+/// Regression test (issue #4249): a streaming GET success emits a terminal
+/// `GetSuccess` telemetry event with a populated, in-range `hop_count`.
+///
+/// Before the fix, a GET whose response exceeded `streaming_threshold` came
+/// back as `GetMsg::ResponseStreaming`, which carried no `hop_count` field, and
+/// — because in the task-per-tx architecture the GET reply is delivered straight
+/// to the originator's driver waiter rather than through `from_inbound_msg_v1` —
+/// the originator emitted **no** terminal `GetSuccess` event at all. The
+/// dashboard's GET success-rate and hop-depth panels were silently blank for any
+/// contract large enough to stream.
+///
+/// The fix carries `hop_count` on the `ResponseStreaming` wire variant and emits
+/// `GetSuccess` explicitly from the originator's GET driver (mirroring PUT's
+/// `finalize_put_at_originator`). This test uses the exact deterministic
+/// 1MB-relayed-streaming-GET topology of `test_streaming_get_through_relay` and
+/// asserts that:
+///   1. The relay streaming-forward path actually ran (guards against a
+///      local-cache shortcut making the telemetry assertions vacuous).
+///   2. At least one terminal `GetSuccess` event was logged (proves the
+///      streaming path now produces a terminal GET event), AND
+///   3. Every such event carries a populated `hop_count` within
+///      `[0, ring_max_htl]` (proves the wire-carried value is threaded
+///      through, not garbage / not the originator's `htl_max`).
+///
+/// Without the fix this test fails at assertion (2): zero `GetSuccess`
+/// events are produced for the streamed response.
+#[test]
+fn test_streaming_get_emits_get_success_with_hop_count() {
+    // Same seed / topology / contract as `test_streaming_get_through_relay`,
+    // which is proven to deterministically force node 5's GET to relay and
+    // fork+pipe a streaming response (rather than hit a local-cache shortcut).
+    const SEED: u64 = 0xDE1A_0008_FACE_B00C;
+    const NETWORK_NAME: &str = "streaming-get-hopcount";
+    const THRESHOLD: usize = 1024;
+    const LARGE_STATE_SIZE: usize = 1024 * 1024; // ~1MB → forces streaming
+    // SimNetwork below is built with ring_max_htl = 7. The storer computes
+    // hop_count = max_htl - htl, and the originator clamps to max_htl, so any
+    // populated value must land in [0, 7].
+    const RING_MAX_HTL: usize = 7;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    // Sparse topology (matches test_streaming_get_through_relay): 1 gateway +
+    // 6 nodes, max_connections = 3 (< node count) forces node 5 to relay
+    // rather than connect directly to the storer, so the streamed response
+    // bubbles back through at least one relay hop.
+    GlobalRng::set_seed(SEED);
+    const BASE_EPOCH_MS: u64 = 1577836800000;
+    const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
+    GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
+    let sim = rt.block_on(async {
+        let mut sim = SimNetwork::new(
+            NETWORK_NAME,
+            1, // gateways
+            6, // nodes
+            RING_MAX_HTL,
+            3, // rnd_if_htl_above
+            3, // max_connections (sparse: < node count → forces a relay hop)
+            2, // min_connections
+            SEED,
+        )
+        .await;
+        sim.with_streaming_threshold(THRESHOLD);
+        sim
+    });
+
+    // Capture the shared event-log handle BEFORE run_controlled_simulation
+    // consumes `sim`. The Arc survives the move and reflects every event
+    // logged during the simulation.
+    let logs_handle = sim.event_logs_handle();
+
+    let contract = SimOperation::create_test_contract(0xAB);
+    let large_state = SimOperation::create_large_state(LARGE_STATE_SIZE, 0xAB);
+    let contract_key = contract.key();
+    let contract_id = *contract_key.id();
+
+    let operations = vec![
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: large_state.clone(),
+                subscribe: false,
+            },
+        ),
+        ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, 5),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: false,
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let forward_calls_before = freenet::dev_tool::RELAY_GET_STREAMING_FORWARD_COUNT
+        .load(std::sync::atomic::Ordering::SeqCst);
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(300),
+        Duration::from_secs(120),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Streaming GET through relay should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // (1) The relay streaming-forward path must have actually run. If a
+    // local-cache shortcut satisfied node 5's GET, the driver never runs and
+    // the GetSuccess assertions below would be vacuously checking an
+    // unexercised path.
+    let forward_calls_after = freenet::dev_tool::RELAY_GET_STREAMING_FORWARD_COUNT
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        forward_calls_after > forward_calls_before,
+        "Expected the relay GET streaming-forward path to run at least once \
+         (before={forward_calls_before}, after={forward_calls_after}). If this \
+         fails the GET was satisfied without streaming and the telemetry \
+         assertions would not exercise the fix."
+    );
+
+    // Sanity: the getter actually received the streamed 1MB state.
+    let getter_state = result
+        .node_storages
+        .get(&NodeLabel::node(NETWORK_NAME, 5))
+        .and_then(|s| s.get_stored_state(&contract_key));
+    assert!(
+        getter_state.is_some(),
+        "Node 5 should have the 1MB contract state after the streaming GET"
+    );
+
+    let (success_events, hop_counts) = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let success_events = logs.iter().filter(|m| m.kind.is_get_success()).count();
+        let hop_counts: Vec<usize> = logs
+            .iter()
+            .filter(|m| m.kind.is_get_success())
+            .filter_map(|m| m.kind.hop_count())
+            .collect();
+        (success_events, hop_counts)
+    });
+
+    // (2) Presence: before the fix a streamed GET produces ZERO GetSuccess
+    // events at the originator. After the fix the driver emits at least one.
+    assert!(
+        success_events > 0,
+        "expected at least one terminal GetSuccess event from the streaming \
+         GET; got 0. The originator's GET driver is not emitting GetSuccess for \
+         the streaming path (issue #4249)."
+    );
+
+    // (3) Populated + in-range: every GetSuccess from the streaming path must
+    // carry a hop_count threaded from the wire, bounded by ring_max_htl.
+    assert!(
+        !hop_counts.is_empty(),
+        "GetSuccess events were emitted but none carried a populated \
+         hop_count; the wire-carried ResponseStreaming.hop_count is being \
+         dropped (issue #4249)."
+    );
+    let max_hop = hop_counts.iter().copied().max().unwrap_or(0);
+    assert!(
+        max_hop <= RING_MAX_HTL,
+        "max observed GetSuccess hop_count {max_hop} exceeds ring_max_htl \
+         {RING_MAX_HTL}; suggests garbage propagation rather than \
+         (max_htl - htl) accounting"
+    );
+}
+
 /// Regression test: 1MB streaming GET with packet loss.
 ///
 /// This is the test that was missing and would have caught the loss_pause margin
