@@ -190,8 +190,6 @@ async fn web_home(
     api_version: ApiVersion,
     query_string: Option<String>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
-    use headers::{Header, HeaderMapExt};
-
     // Check if this is the sandboxed iframe requesting its content
     let is_sandbox = query_string
         .as_ref()
@@ -201,6 +199,31 @@ async fn web_home(
     if is_sandbox {
         return serve_sandbox_response(key, api_version, None, &req_headers, rs).await;
     }
+
+    // Root document load: render the shell that wraps the contract root.
+    render_shell_response(key, &config, api_version, query_string, None, rs).await
+}
+
+/// Generates a shell page response: a fresh auth token + secure cookie,
+/// the contract fetched/unpacked into the cache, and the iframe wrapper
+/// with the shell CSP and anti-framing headers.
+///
+/// Shared by `web_home` (root document loads, `sub_path = None`) and the
+/// deep-link branch of `web_subpages` (`sub_path = Some(path)` so a
+/// reloaded/bookmarked sub-page URL renders the shell pointed at that
+/// page instead of 404ing or being flattened to the contract root — see
+/// freenet/freenet-core#3841). Both must issue the SAME credentials and
+/// headers; factoring it here keeps the deep-link path from drifting out
+/// of sync with the root path (e.g. forgetting the cookie or the CSP).
+async fn render_shell_response(
+    key: String,
+    config: &Config,
+    api_version: ApiVersion,
+    query_string: Option<String>,
+    sub_path: Option<&str>,
+    rs: HttpClientApiRequest,
+) -> Result<axum::response::Response, WebSocketApiError> {
+    use headers::{Header, HeaderMapExt};
 
     // Shell page: generate auth token, serve iframe wrapper with CSP
     let token = AuthToken::generate();
@@ -219,7 +242,8 @@ async fn web_home(
 
     let token_header = headers::Authorization::bearer(token.as_str()).unwrap();
     let contract_response =
-        path_handlers::contract_home(key, rs, token.clone(), api_version, query_string).await?;
+        path_handlers::contract_home(key, rs, token.clone(), api_version, query_string, sub_path)
+            .await?;
 
     let mut response = contract_response.into_response();
     response.headers_mut().typed_insert(token_header);
@@ -259,6 +283,7 @@ async fn web_subpages(
     api_version: ApiVersion,
     query_string: Option<String>,
     req_headers: axum::http::HeaderMap,
+    config: &Config,
     request_sender: HttpClientApiRequest,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     let is_sandbox = query_string
@@ -280,29 +305,40 @@ async fn web_subpages(
     }
 
     // Top-level document loads of contract HTML sub-paths (pasted URLs,
-    // bookmarks, cross-contract link clicks) must be redirected to the
-    // shell root so `web_home` issues a fresh auth token and wraps the
-    // response in the sandbox iframe. Otherwise `variable_content` serves
-    // raw HTML with no `authToken` query parameter, breaking webapps that
-    // read credentials from `location.search` (freenet/river#208 follow-up:
-    // Delta links hit "Connection failed" on the destination).
+    // bookmarks, cross-contract link clicks, deep-link reloads) must be
+    // served the shell page — NOT the raw contract HTML — so the response
+    // carries a fresh auth token + cookie and wraps the contract in the
+    // sandbox iframe. Otherwise `variable_content` serves raw HTML with no
+    // `authToken`, breaking webapps that read credentials from
+    // `location.search` (freenet/river#208: Delta links hit "Connection
+    // failed" on the destination).
     //
-    // The browser preserves any URL fragment across a 303 redirect, which
-    // is sufficient for hash-routed webapps (e.g. Delta). Path-based
-    // multi-page apps still lose the sub-path — this redirect restores
-    // the baseline guarantee that top-level contract loads get a working
-    // shell. A fuller fix for path-based deep linking (#3841) would
-    // thread the sub-path into shell generation.
+    // The sub-path is threaded into shell generation so the iframe's
+    // `data-src` points at `/{prefix}/contract/web/{key}/{sub_path}?__sandbox=1`,
+    // landing the in-iframe webapp on the requested route instead of the
+    // contract root. This is the fuller fix for path-based deep-link reload
+    // (#3841): previously this branch issued a 303 redirect to the shell
+    // root, which preserved URL fragments (enough for hash-routed apps like
+    // Delta) but flattened path-routed deep links to `/`. Rendering the
+    // shell in place preserves the path AND avoids the extra round-trip.
     //
     // Clients without `Sec-Fetch-Dest` (curl, older browsers) intentionally
     // fall through to `variable_content` — matches pre-PR behaviour and
-    // avoids redirect loops for non-browser clients.
+    // avoids changing the response shape for non-browser clients.
     let fetch_dest = req_headers
         .get("sec-fetch-dest")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if should_redirect_subpage_to_shell(is_sandbox, &last_path, fetch_dest) {
-        return redirect_to_shell_root(&key, api_version, query_string.as_deref());
+    if should_serve_shell_for_subpage(is_sandbox, &last_path, fetch_dest) {
+        return render_shell_response(
+            key,
+            config,
+            api_version,
+            query_string,
+            Some(&last_path),
+            request_sender,
+        )
+        .await;
     }
 
     let version_prefix = api_version.prefix();
@@ -408,16 +444,19 @@ fn is_sensitive_query_param(param: &str) -> bool {
 }
 
 /// Returns true if a contract sub-path request is a top-level HTML
-/// document load that must be redirected to the shell root.
+/// document load that must be served the shell page (with the sub-path
+/// threaded into the iframe), rather than raw contract HTML.
 ///
 /// Only top-level document loads (`Sec-Fetch-Dest: document`) of HTML
-/// sub-paths are ambiguous with pasted URLs and cross-contract link
-/// clicks; redirecting them to `web_home` guarantees a fresh auth token
-/// and sandbox wrapper. The browser preserves any URL fragment across
-/// the redirect, which is sufficient for hash-routed webapps (e.g. Delta).
-/// Sandbox iframe requests (`__sandbox=1`) already flow through the
-/// sandbox pipeline and are never redirected here.
-fn should_redirect_subpage_to_shell(is_sandbox: bool, last_path: &str, fetch_dest: &str) -> bool {
+/// sub-paths are ambiguous with pasted URLs, bookmarks, cross-contract
+/// link clicks, and deep-link reloads; serving them the shell guarantees
+/// a fresh auth token + cookie and the sandbox wrapper while preserving
+/// the requested path in the iframe's `data-src` (#3841). Sandbox iframe
+/// requests (`__sandbox=1`) already flow through the sandbox pipeline and
+/// are never handled here. Sub-resource fetches (`Sec-Fetch-Dest` =
+/// `script`/`style`/`image`/`empty`/...) and non-HTML asset paths fall
+/// through to `variable_content` so real assets still 404 normally.
+fn should_serve_shell_for_subpage(is_sandbox: bool, last_path: &str, fetch_dest: &str) -> bool {
     !is_sandbox && is_html_page(last_path) && fetch_dest == "document"
 }
 
@@ -690,19 +729,20 @@ mod tests {
     }
 
     /// Regression test for cross-contract link handling (Delta report,
-    /// freenet/river#208 follow-up). Top-level HTML sub-path loads must
-    /// redirect to the shell root so `web_home` issues a fresh auth token;
-    /// before the fix these loads served raw HTML with no `authToken`.
+    /// freenet/river#208 follow-up) and deep-link reload (#3841). Top-level
+    /// HTML sub-path document loads must be served the shell page so the
+    /// response carries a fresh auth token; before the original fix these
+    /// loads served raw HTML with no `authToken`.
     #[test]
-    fn subpage_redirects_top_level_html_document_load_to_shell() {
-        assert!(should_redirect_subpage_to_shell(false, "page2", "document"));
-        assert!(should_redirect_subpage_to_shell(
+    fn subpage_serves_shell_for_top_level_html_document_load() {
+        assert!(should_serve_shell_for_subpage(false, "page2", "document"));
+        assert!(should_serve_shell_for_subpage(
             false,
             "about/team",
             "document"
         ));
-        assert!(should_redirect_subpage_to_shell(false, "news/", "document"));
-        assert!(should_redirect_subpage_to_shell(
+        assert!(should_serve_shell_for_subpage(false, "news/", "document"));
+        assert!(should_serve_shell_for_subpage(
             false,
             "index.html",
             "document"
@@ -710,30 +750,32 @@ mod tests {
     }
 
     #[test]
-    fn subpage_does_not_redirect_sub_resource_fetches() {
+    fn subpage_does_not_serve_shell_for_sub_resource_fetches() {
         // Non-HTML assets must be served so the page can load resources.
+        // These still fall through to `variable_content`, so a genuinely
+        // missing asset 404s as before (the fix must not mask real 404s).
         for path in ["app.js", "style.css", "app.wasm", "logo.png"] {
             assert!(
-                !should_redirect_subpage_to_shell(false, path, "document"),
-                "{path} must not be redirected"
+                !should_serve_shell_for_subpage(false, path, "document"),
+                "{path} must not be served the shell"
             );
         }
         // Only top-level document loads are ambiguous with pasted URLs and
-        // cross-contract clicks; iframe/xhr/fetch must never be redirected.
+        // cross-contract clicks; iframe/xhr/fetch must never be intercepted.
         for dest in ["iframe", "empty", "script", "style", "image", ""] {
             assert!(
-                !should_redirect_subpage_to_shell(false, "page2", dest),
-                "Sec-Fetch-Dest={dest} must not be redirected"
+                !should_serve_shell_for_subpage(false, "page2", dest),
+                "Sec-Fetch-Dest={dest} must not be served the shell"
             );
         }
     }
 
     #[test]
-    fn subpage_does_not_redirect_sandbox_requests() {
+    fn subpage_does_not_serve_shell_for_sandbox_requests() {
         // Sandbox iframe requests flow through the sandbox content pipeline;
-        // redirecting would break multi-page navigation inside the sandbox.
-        assert!(!should_redirect_subpage_to_shell(true, "page2", "iframe"));
-        assert!(!should_redirect_subpage_to_shell(true, "page2", "document"));
+        // intercepting would break multi-page navigation inside the sandbox.
+        assert!(!should_serve_shell_for_subpage(true, "page2", "iframe"));
+        assert!(!should_serve_shell_for_subpage(true, "page2", "document"));
     }
 
     /// A valid contract key used across redirect tests. Constructed from
@@ -847,55 +889,73 @@ mod tests {
         ));
     }
 
-    /// End-to-end regression: call `web_subpages` with the exact input
-    /// shape the Delta cross-contract-link failure mode produces, and
-    /// assert the handler responds with the shell-root redirect, the
-    /// filtered query string, and the 303 status.
+    /// A minimal localhost `Config` for handler tests (controls only the
+    /// cookie Secure flag).
+    fn localhost_config() -> Config {
+        Config { localhost: true }
+    }
+
+    /// End-to-end regression for #3841: a top-level document load of an
+    /// HTML sub-path must be served the SHELL page (rendered in place with
+    /// the sub-path threaded into the iframe), NOT a raw redirect to the
+    /// contract root and NOT raw contract HTML. Routing into the shell is
+    /// observable on the client-connection channel: `render_shell_response`
+    /// → `contract_home` → `ensure_contract_cached` emits a `NewConnection`
+    /// before any response is produced, whereas the old behaviour returned a
+    /// synchronous 303 without touching the channel.
     ///
     /// Pins the wiring the predicate-only tests do not reach: the
-    /// `Sec-Fetch-Dest` header lookup, the interaction with the query
-    /// string from `RawQuery`, the redirect URL construction, and the
-    /// full status + `Location` response contract.
+    /// `Sec-Fetch-Dest` header lookup, the `RawQuery` interaction, and the
+    /// branch selection in `web_subpages`. The full shell HTML (iframe
+    /// `data-src` carrying the sub-path) is asserted at the `contract_home`
+    /// layer in path_handlers.rs, which can prime the webapp cache.
     #[tokio::test]
-    async fn web_subpages_redirects_top_level_document_load_to_shell() {
+    async fn web_subpages_serves_shell_for_top_level_document_load() {
         let key = valid_contract_key_b58();
 
         // Case 1: top-level HTML document load of an HTML sub-path
-        // (non-sandbox, matching a pasted cross-contract link). Must
-        // redirect to shell root, preserving `invite` and stripping
-        // the attacker-supplied `authToken`.
+        // (non-sandbox — a pasted/bookmarked/reloaded deep link). Must
+        // route into the shell-render path. We observe the `NewConnection`
+        // the render emits on the channel, then abort before delivering a
+        // GetResponse to keep the test bounded.
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("sec-fetch-dest", "document".parse().unwrap());
-        let resp = web_subpages(
-            key.clone(),
-            "page2".to_string(),
-            ApiVersion::V1,
-            Some("authToken=attacker&invite=abc".to_string()),
-            headers,
-            dead_request_sender(),
-        )
-        .await
-        .expect("redirect response must be Ok");
-        assert_eq!(resp.status(), axum::http::StatusCode::SEE_OTHER);
-        let loc = resp
-            .headers()
-            .get(axum::http::header::LOCATION)
-            .expect("Location header must be set on the redirect")
-            .to_str()
-            .unwrap()
-            .to_string();
-        assert_eq!(loc, format!("/v1/contract/web/{key}/?invite=abc"));
+        let (tx, mut rx) = mpsc::channel(4);
+        let sender = HttpClientApiRequest::from_sender(tx);
+        let handler = {
+            let key = key.clone();
+            tokio::spawn(async move {
+                web_subpages(
+                    key,
+                    "page2".to_string(),
+                    ApiVersion::V1,
+                    Some("authToken=attacker&invite=abc".to_string()),
+                    headers,
+                    &localhost_config(),
+                    sender,
+                )
+                .await
+                .map(|_| ())
+            })
+        };
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("shell render must emit on the channel (not a synchronous redirect)")
+            .expect("channel must stay open for the send");
         assert!(
-            !loc.contains("authToken"),
-            "authToken must be stripped on the redirect hop"
+            matches!(msg, ClientConnection::NewConnection { .. }),
+            "top-level document load must route into the shell render path \
+             (NewConnection), not a 303 redirect; got: {msg:?}"
         );
+        handler.abort();
 
         // Case 1b: a sandbox sub-page request with `Sec-Fetch-Dest:
         // document` must still redirect to the shell root (via the
         // sandbox branch's existing top-level-load guard) rather than
-        // serving raw sandbox content in the top frame. Exercises the
-        // sandbox short-circuit that runs *before* the new redirect
-        // block, which is the path a pasted sandbox URL hits.
+        // serving raw sandbox content in the top frame. This guards the
+        // sandbox short-circuit that runs *before* the deep-link block,
+        // which is the path a pasted `?__sandbox=1` URL hits. Unchanged
+        // by #3841 — it is a security guard, not a deep-link.
         let mut headers = axum::http::HeaderMap::new();
         headers.insert("sec-fetch-dest", "document".parse().unwrap());
         let resp = web_subpages(
@@ -904,6 +964,7 @@ mod tests {
             ApiVersion::V1,
             Some("__sandbox=1".to_string()),
             headers,
+            &localhost_config(),
             dead_request_sender(),
         )
         .await
@@ -912,16 +973,17 @@ mod tests {
 
         // Case 2: missing Sec-Fetch-Dest (curl, older browsers) falls
         // through to variable_content — pre-PR behaviour preserved, no
-        // redirect loop for non-browser clients. With a dead request
-        // sender the cache-miss fetch fails fast with a closed-channel
-        // error (see `dead_request_sender` for why). We assert only
-        // that the response is NOT a shell-root redirect.
+        // change in response shape for non-browser clients. With a dead
+        // request sender the cache-miss fetch fails fast with a
+        // closed-channel error (see `dead_request_sender`). We assert
+        // only that the response is NOT a shell-root redirect.
         let res = web_subpages(
             key.clone(),
             "page2".to_string(),
             ApiVersion::V1,
             None,
             axum::http::HeaderMap::new(),
+            &localhost_config(),
             dead_request_sender(),
         )
         .await;
@@ -930,45 +992,45 @@ mod tests {
             Err(_) => {
                 // variable_content returned an error for the cache-miss
                 // fetch attempt — that's fine, the point is that we did
-                // not take the redirect branch.
+                // not take a redirect branch.
             }
         }
     }
 
     /// Regression test pinning the ordering inside `web_subpages`: a
     /// sandbox iframe request for an HTML sub-path MUST hit the sandbox
-    /// branch (line ~261), not the new top-level-document redirect,
-    /// even if a future reorder moves the redirect block earlier.
+    /// branch, not the top-level-document shell-render branch, even if a
+    /// future reorder moves the shell block earlier.
     ///
     /// We cannot exercise the full sandbox pipeline in a unit test
     /// (requires a real contract state in the cache), but we can
-    /// assert the predicate-level invariant — `should_redirect_subpage_to_shell`
+    /// assert the predicate-level invariant — `should_serve_shell_for_subpage`
     /// returns false for any sandbox request — and check the source
     /// ordering via byte-offset comparison so that a reorder is caught
     /// mechanically.
     #[test]
-    fn web_subpages_sandbox_branch_runs_before_redirect_branch() {
+    fn web_subpages_sandbox_branch_runs_before_shell_branch() {
         let src = include_str!("client_api.rs");
         // The sandbox short-circuit must appear before the
-        // top-level-document redirect inside `web_subpages`. Both
+        // top-level-document shell render inside `web_subpages`. Both
         // markers are unique to that function.
         let sandbox_idx = src
             .find("if is_sandbox && is_html_page(&last_path) {")
             .expect("sandbox short-circuit marker present in web_subpages");
-        let redirect_idx = src
-            .find("should_redirect_subpage_to_shell(is_sandbox")
-            .expect("subpage redirect marker present in web_subpages");
+        let shell_idx = src
+            .find("should_serve_shell_for_subpage(is_sandbox")
+            .expect("subpage shell-render marker present in web_subpages");
         assert!(
-            sandbox_idx < redirect_idx,
-            "sandbox branch must run before the top-level-document redirect: \
+            sandbox_idx < shell_idx,
+            "sandbox branch must run before the top-level-document shell render: \
              reordering would break sandbox iframe sub-page loads"
         );
 
         // Predicate-level invariant: sandbox requests are never
-        // redirected regardless of other inputs.
-        assert!(!should_redirect_subpage_to_shell(true, "page2", "document"));
-        assert!(!should_redirect_subpage_to_shell(true, "news/", "document"));
-        assert!(!should_redirect_subpage_to_shell(
+        // served the shell-render branch regardless of other inputs.
+        assert!(!should_serve_shell_for_subpage(true, "page2", "document"));
+        assert!(!should_serve_shell_for_subpage(true, "news/", "document"));
+        assert!(!should_serve_shell_for_subpage(
             true,
             "index.html",
             "iframe"
