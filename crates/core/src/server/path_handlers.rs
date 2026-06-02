@@ -2315,6 +2315,77 @@ mod tests {
         clear_cache(&instance_id).await;
     }
 
+    /// Regression for the failure-path invariant: when `ensure_contract_cached`
+    /// returns an error, `refresh_cache_if_due` must NOT record a fresh timer,
+    /// so the next request retries instead of being suppressed for the TTL.
+    ///
+    /// Drives a real refresh whose GET is answered with a `contract: None`
+    /// `GetResponse` (which `handle_get_response` maps to `MissingContract`),
+    /// then asserts the call returned `Err` AND no timer was inserted. This
+    /// pins the "timer advances only on success" property the
+    /// `CONTRACT_CACHE_REFRESH.insert` placement after the `?` relies on —
+    /// hoisting the insert before the GET would silently break retries.
+    #[tokio::test]
+    async fn refresh_cache_if_due_does_not_record_timer_on_fetch_failure() {
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(vec![7, 7, 7, 7])),
+            Parameters::from(vec![8, 8]),
+        )));
+        let instance_id = *contract.key().id();
+        clear_cache(&instance_id).await;
+
+        // Warm but unreconciled cache so a refresh is due (and no timer yet).
+        let cache_dir = contract_web_path(&instance_id);
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        tokio::fs::write(state_hash_path(&instance_id), 0u64.to_be_bytes())
+            .await
+            .unwrap();
+
+        let (sender, mut rx) = request_channel();
+        let handler = tokio::spawn(async move { refresh_cache_if_due(instance_id, &sender).await });
+
+        // Service the GET with a contract: None GetResponse → MissingContract.
+        let msg = rx.recv().await.expect("must issue NewConnection");
+        let callbacks = match msg {
+            ClientConnection::NewConnection { callbacks, .. } => callbacks,
+            other => panic!("expected NewConnection, got: {other:?}"),
+        };
+        callbacks
+            .send(HostCallbackResult::NewId {
+                id: crate::client_events::ClientId::next(),
+            })
+            .expect("callback receiver live");
+        let _get = rx.recv().await.expect("Get must follow NewConnection");
+        callbacks
+            .send(HostCallbackResult::Result {
+                id: crate::client_events::ClientId::next(),
+                result: Ok(HostResponse::ContractResponse(
+                    ContractResponse::GetResponse {
+                        key: contract.key(),
+                        contract: None,
+                        state: WrappedState::new(Vec::new()),
+                    },
+                )),
+            })
+            .expect("callback receiver live for GetResponse");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handler)
+            .await
+            .expect("handler must finish promptly")
+            .expect("handler must not panic");
+        assert!(
+            result.is_err(),
+            "a None-contract GetResponse must surface as an error, got: {result:?}"
+        );
+        assert!(
+            !CONTRACT_CACHE_REFRESH.contains_key(&instance_id),
+            "a failed refresh must NOT record a timer, or the next request would \
+             be suppressed for the whole TTL instead of retrying"
+        );
+
+        clear_cache(&instance_id).await;
+    }
+
     /// Direct unit test for `handle_get_response`'s `MissingContract`
     /// branch. Refactoring `handle_get_response` introduced this seam as a
     /// pure-logic boundary; covering each arm here catches regressions
