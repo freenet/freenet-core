@@ -1961,4 +1961,332 @@ mod tests {
             "fire-and-forget rejection should produce an error"
         );
     }
+
+    // ======================================================================
+    // End-to-end UpdateQuery dispatch tests (issue #4005)
+    // ======================================================================
+    //
+    // These drive an `UpdateData` variant through the *full* dispatch arm in
+    // `handle_contract_event` via the `ContractHandlerChannel`, then assert on
+    // the `UpdateResponse` that flows back to the sender. Unlike the
+    // `inject_related_state_*` unit tests (which call the helper in isolation)
+    // and `send_queue_full_response_update_query` (which only exercises the
+    // rejection path), these tests would catch a regression that reintroduced
+    // `unreachable!()` in the dispatch arm itself — the exact failure mode
+    // PR #4004 fixed. A revert of the `StateAndDelta` or `RelatedStateAndDelta`
+    // conversion arms now fails CI here.
+
+    /// Drive a single `UpdateQuery` event end-to-end through
+    /// `handle_contract_event` over a real `ContractHandlerChannel` backed by a
+    /// `MemoryContractHandler` (mock executor), returning the response the
+    /// sender observes.
+    ///
+    /// Mirrors the production driver loop (`contract_handling`): the sender's
+    /// `send_to_handler` blocks awaiting the response; the handler side
+    /// `recv_from_sender`s to register the waiting-response slot and obtain the
+    /// `EventId`, then `handle_contract_event` runs the dispatch arm and
+    /// fulfils the sender's oneshot via `send_to_sender`.
+    async fn dispatch_update_query_e2e(
+        handler: &mut MemoryContractHandler,
+        send_halve: &handler::ContractHandlerChannel<handler::SenderHalve>,
+        key: ContractKey,
+        data: UpdateData<'static>,
+        related_contracts: RelatedContracts<'static>,
+    ) -> ContractHandlerEvent {
+        let event = ContractHandlerEvent::UpdateQuery {
+            key,
+            data,
+            related_contracts,
+        };
+        // Run the sender concurrently with the handler-side dispatch via
+        // `tokio::join!` (the handler is borrowed, so it cannot move into a
+        // spawned task). `send_to_handler` awaits the oneshot until the
+        // dispatch arm replies via `send_to_sender`; the dispatch never blocks,
+        // so the two futures make progress cooperatively to completion.
+        let send_fut = send_halve.send_to_handler(event);
+        let recv_fut = async {
+            let (id, received) = handler
+                .channel()
+                .recv_from_sender()
+                .await
+                .expect("handler channel should be open");
+            handle_contract_event(handler, id, received, &user_input::AutoApprovePrompter)
+                .await
+                .expect("dispatch must not error for a well-formed UpdateQuery");
+        };
+        let (send_res, ()) = tokio::join!(send_fut, recv_fut);
+        send_res.expect("sender must receive a response")
+    }
+
+    /// Seed an initial state for `contract` via a `PutQuery` so subsequent
+    /// `UpdateQuery`s have an existing state to merge against (the mock
+    /// executor rejects an update with no prior state via `MissingContract`).
+    async fn seed_contract_state(
+        handler: &mut MemoryContractHandler,
+        send_halve: &handler::ContractHandlerChannel<handler::SenderHalve>,
+        contract: ContractContainer,
+        initial: WrappedState,
+    ) {
+        let key = contract.key();
+        let event = ContractHandlerEvent::PutQuery {
+            key,
+            state: initial,
+            related_contracts: RelatedContracts::default(),
+            contract: Some(contract),
+        };
+        let send_fut = send_halve.send_to_handler(event);
+        let recv_fut = async {
+            let (id, received) = handler
+                .channel()
+                .recv_from_sender()
+                .await
+                .expect("handler channel should be open");
+            handle_contract_event(handler, id, received, &user_input::AutoApprovePrompter)
+                .await
+                .expect("seed PutQuery must not error");
+        };
+        let (send_res, ()) = tokio::join!(send_fut, recv_fut);
+        match send_res.expect("seed PutQuery must respond") {
+            ContractHandlerEvent::PutResponse { new_value, .. } => {
+                new_value.expect("seed PutQuery must store state");
+            }
+            other => panic!("expected PutResponse from seed, got {other}"),
+        }
+    }
+
+    /// `StateAndDelta` must survive dispatch (not panic) AND the conversion
+    /// must prefer the full `state` over the `delta`. We seed a contract, then
+    /// send `StateAndDelta { state, delta }` where `state` is chosen to win the
+    /// mock's hash-comparison merge and `delta` is distinct, non-empty bytes.
+    /// If the dispatch arm wrongly routed the delta into the executor, the
+    /// stored result would be `seed ++ delta` (the mock's delta-concat merge);
+    /// asserting the response equals the full `state` bytes proves the
+    /// full-state path was taken.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_query_state_and_delta_dispatch_prefers_full_state_e2e() {
+        let (send_halve, rcv_halve, _) = handler::contract_handler_channel();
+        let mut handler = MemoryContractHandler::new(
+            rcv_halve,
+            None,
+            "update_query_state_and_delta_dispatch_prefers_full_state",
+        )
+        .await;
+
+        let contract = executor::mock_runtime::test::create_test_contract(b"sad_e2e");
+        let key = contract.key();
+
+        // Seed with bytes whose hash is the smaller of the two, so the update's
+        // full state deterministically wins the mock's "larger hash wins"
+        // merge and we observe `Updated(full_state)`.
+        let candidate_a = WrappedState::new(vec![0xAA; 16]);
+        let candidate_b = WrappedState::new(vec![0xBB; 16]);
+        let (seed_state, winning_full_state) = if blake3::hash(candidate_a.as_ref()).as_bytes()
+            < blake3::hash(candidate_b.as_ref()).as_bytes()
+        {
+            (candidate_a, candidate_b)
+        } else {
+            (candidate_b, candidate_a)
+        };
+
+        seed_contract_state(&mut handler, &send_halve, contract, seed_state.clone()).await;
+
+        // A delta distinct from the full state. If the dispatch arm used this
+        // delta instead of the state, the mock would store `seed ++ delta`,
+        // which is neither `winning_full_state` nor equal in length to it.
+        let distinct_delta = StateDelta::from(vec![0xCC; 8]);
+        let data = UpdateData::StateAndDelta {
+            state: freenet_stdlib::prelude::State::from(winning_full_state.as_ref().to_vec()),
+            delta: distinct_delta,
+        };
+
+        let response = dispatch_update_query_e2e(
+            &mut handler,
+            &send_halve,
+            key,
+            data,
+            RelatedContracts::default(),
+        )
+        .await;
+
+        match response {
+            ContractHandlerEvent::UpdateResponse {
+                new_value,
+                state_changed,
+            } => {
+                let stored = new_value.expect("StateAndDelta update must succeed");
+                assert_eq!(
+                    stored.as_ref(),
+                    winning_full_state.as_ref(),
+                    "dispatch must store the full state, not seed++delta — \
+                     a regression here means the conversion arm routed the \
+                     delta instead of the authoritative full state"
+                );
+                assert!(
+                    state_changed,
+                    "full state differs from seed, so the merge changed state"
+                );
+            }
+            other => panic!("expected UpdateResponse, got {other}"),
+        }
+    }
+
+    /// `RelatedStateAndDelta` must survive dispatch (not panic) and route
+    /// through `inject_related_state` + the delta path. We seed a contract,
+    /// then send `RelatedStateAndDelta { related_to, state, delta }`. The
+    /// dispatch arm injects the related state into `related_contracts` and
+    /// feeds the `delta` to the executor for `key`. The mock applies the delta
+    /// (seed ++ delta), so the response is a successful `UpdateResponse`
+    /// reflecting the delta application — proving the arm reaches the executor
+    /// rather than panicking. (The injection itself is unit-tested in
+    /// `inject_related_state_*`; this test covers the wiring.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_query_related_state_and_delta_dispatch_routes_through_helper_e2e() {
+        let (send_halve, rcv_halve, _) = handler::contract_handler_channel();
+        let mut handler = MemoryContractHandler::new(
+            rcv_halve,
+            None,
+            "update_query_related_state_and_delta_dispatch_routes_through_helper",
+        )
+        .await;
+
+        let contract = executor::mock_runtime::test::create_test_contract(b"rsad_e2e");
+        let key = contract.key();
+        let related_contract = executor::mock_runtime::test::create_test_contract(b"rsad_related");
+        let related_id = *related_contract.key().id();
+
+        let seed_state = WrappedState::new(vec![1, 2, 3]);
+        seed_contract_state(&mut handler, &send_halve, contract, seed_state.clone()).await;
+
+        // The mock applies a delta by concatenating `seed ++ delta` and only
+        // stores the result if its hash beats the current state's hash
+        // (otherwise `NoChange`). Pick a delta whose concatenation
+        // deterministically wins, so the test is independent of incidental
+        // hash ordering and reliably observes `Updated(seed ++ delta)`.
+        let seed_hash = *blake3::hash(seed_state.as_ref()).as_bytes();
+        let delta_bytes = (0u8..=255)
+            .map(|n| vec![n; 4])
+            .find(|candidate| {
+                let mut merged = seed_state.as_ref().to_vec();
+                merged.extend_from_slice(candidate);
+                *blake3::hash(&merged).as_bytes() > seed_hash
+            })
+            .expect("some 4-byte delta must produce a winning concatenation hash");
+        let data = UpdateData::RelatedStateAndDelta {
+            related_to: related_id,
+            state: freenet_stdlib::prelude::State::from(vec![9, 9, 9]),
+            delta: StateDelta::from(delta_bytes.clone()),
+        };
+
+        let response = dispatch_update_query_e2e(
+            &mut handler,
+            &send_halve,
+            key,
+            data,
+            RelatedContracts::default(),
+        )
+        .await;
+
+        match response {
+            ContractHandlerEvent::UpdateResponse { new_value, .. } => {
+                let stored = new_value.expect(
+                    "RelatedStateAndDelta must reach the executor and apply the \
+                     delta — an Err here (or a panic) means the dispatch arm \
+                     regressed to rejecting/unreachable!() the variant",
+                );
+                // The mock concatenates the delta onto the seed; the result must
+                // therefore contain the delta bytes as a suffix, confirming the
+                // delta (not the related state) drove the `key` update.
+                assert!(
+                    stored.as_ref().ends_with(&delta_bytes),
+                    "stored state {:?} must end with the delta bytes {:?}, \
+                     proving the delta arm of RelatedStateAndDelta was used",
+                    stored.as_ref(),
+                    delta_bytes
+                );
+            }
+            other => panic!("expected UpdateResponse, got {other}"),
+        }
+    }
+
+    /// The `RelatedState` and `RelatedDelta` variants carry a payload only for
+    /// a *related* contract, with no main-contract state/delta. They used to
+    /// hit `unreachable!()`; the fix returns a structured
+    /// `UpdateResponse { new_value: Err, state_changed: false }`. This test
+    /// drives both through dispatch end-to-end and asserts the structured
+    /// rejection (no panic, error returned via the channel, no state change).
+    ///
+    /// The unknown-`_` arm cannot be exercised from test code: `UpdateData` is
+    /// `#[non_exhaustive]` *outside* its defining crate, but within freenet-core
+    /// every existing variant is matched explicitly, so there is no constructible
+    /// value that reaches the `_` arm. It remains as defensive handling for a
+    /// future stdlib variant; the two reachable rejection variants are covered
+    /// here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn update_query_rejection_arms_return_structured_error_e2e() {
+        let (send_halve, rcv_halve, _) = handler::contract_handler_channel();
+        let mut handler = MemoryContractHandler::new(
+            rcv_halve,
+            None,
+            "update_query_rejection_arms_return_structured_error",
+        )
+        .await;
+
+        let contract = executor::mock_runtime::test::create_test_contract(b"reject_e2e");
+        let key = contract.key();
+        let related_id = *executor::mock_runtime::test::create_test_contract(b"reject_related")
+            .key()
+            .id();
+
+        // Seed so a *correct* main-contract update would succeed — this rules
+        // out "rejected because the contract was missing" and isolates the
+        // rejection to the variant itself.
+        seed_contract_state(
+            &mut handler,
+            &send_halve,
+            contract,
+            WrappedState::new(vec![7, 7, 7]),
+        )
+        .await;
+
+        let rejection_variants = [
+            UpdateData::RelatedState {
+                related_to: related_id,
+                state: freenet_stdlib::prelude::State::from(vec![1, 1]),
+            },
+            UpdateData::RelatedDelta {
+                related_to: related_id,
+                delta: StateDelta::from(vec![2, 2]),
+            },
+        ];
+
+        for data in rejection_variants {
+            let label = format!("{data:?}");
+            let response = dispatch_update_query_e2e(
+                &mut handler,
+                &send_halve,
+                key,
+                data,
+                RelatedContracts::default(),
+            )
+            .await;
+
+            match response {
+                ContractHandlerEvent::UpdateResponse {
+                    new_value,
+                    state_changed,
+                } => {
+                    assert!(
+                        new_value.is_err(),
+                        "{label} must be rejected with a structured error, \
+                         not applied as an update"
+                    );
+                    assert!(
+                        !state_changed,
+                        "{label} rejection must report state_changed = false"
+                    );
+                }
+                other => panic!("expected UpdateResponse for {label}, got {other}"),
+            }
+        }
+    }
 }
