@@ -84,6 +84,37 @@ const CONTRACT_CACHE_REFRESH_TTL: Duration = Duration::from_secs(30);
 static CONTRACT_CACHE_REFRESH: LazyLock<DashMap<ContractInstanceId, Instant>> =
     LazyLock::new(DashMap::new);
 
+/// Per-contract lock serializing the *decision* to issue a staleness-refresh
+/// GET, so a fan-out of concurrent subresource requests after the TTL expiry
+/// issues at most one `ensure_contract_cached` GET per contract per window.
+///
+/// This is deliberately distinct from `CONTRACT_CACHE_LOCKS`: that lock guards
+/// the on-disk unpack and is re-taken inside `unpack_if_stale`. `tokio`'s mutex
+/// is not reentrant, so the refresh gate — which is held *across* the GET (and
+/// therefore across `unpack_if_stale`'s own lock acquisition) — must use its
+/// own mutex to avoid a self-deadlock.
+static CONTRACT_REFRESH_LOCKS: LazyLock<DashMap<ContractInstanceId, Arc<tokio::sync::Mutex<()>>>> =
+    LazyLock::new(DashMap::new);
+
+async fn acquire_refresh_lock(
+    instance_id: &ContractInstanceId,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    let mutex = CONTRACT_REFRESH_LOCKS
+        .entry(*instance_id)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone();
+    mutex.lock_owned().await
+}
+
+/// True if the contract was reconciled against the network within the last
+/// `CONTRACT_CACHE_REFRESH_TTL`. A missing timer reads as not-fresh.
+fn cache_reconciled_recently(instance_id: &ContractInstanceId) -> bool {
+    CONTRACT_CACHE_REFRESH
+        .get(instance_id)
+        .map(|last| last.elapsed() < CONTRACT_CACHE_REFRESH_TTL)
+        .unwrap_or(false)
+}
+
 /// Ensures the contract's webapp cache is populated and not stale before it is
 /// served from disk.
 ///
@@ -96,10 +127,28 @@ static CONTRACT_CACHE_REFRESH: LazyLock<DashMap<ContractInstanceId, Instant>> =
 /// the `?__sandbox=1` and subresource paths pick up a republished bundle
 /// without requiring a prior hit on the shell root. See #3977.
 ///
+/// # Concurrency
+///
+/// A typical page load fans out several concurrent subresource requests. To
+/// keep the "at most one network GET per contract per window" bound under that
+/// fan-out, the refresh decision uses double-checked locking against the
+/// dedicated per-contract `CONTRACT_REFRESH_LOCKS` mutex:
+///
+/// 1. A lock-free freshness check fast-paths the common warm-and-fresh case so
+///    steady-state requests never contend on the lock.
+/// 2. When a refresh looks due, the refresh lock is taken and the timer is
+///    re-checked. The first holder fetches and updates the timer; every
+///    follower that queued behind it observes the fresh timer and returns
+///    without issuing its own GET. Without this gate, a burst of requests
+///    arriving just after the TTL expiry would each fire a redundant GET.
+///
+/// The refresh lock is intentionally NOT `CONTRACT_CACHE_LOCKS`: the latter is
+/// re-acquired inside `unpack_if_stale`, and `tokio`'s mutex is not reentrant,
+/// so holding it across the GET would self-deadlock.
+///
 /// The refresh timer is only advanced on success, so a transient fetch failure
-/// does not suppress the next request's retry. `ensure_contract_cached` already
-/// serializes the actual unpack via `CONTRACT_CACHE_LOCKS` and skips the disk
-/// rewrite when the state hash is unchanged (`unpack_if_stale`).
+/// does not suppress the next request's retry. `ensure_contract_cached` skips
+/// the disk rewrite when the state hash is unchanged (`unpack_if_stale`).
 async fn refresh_cache_if_due(
     instance_id: ContractInstanceId,
     request_sender: &HttpClientApiRequest,
@@ -107,17 +156,18 @@ async fn refresh_cache_if_due(
     let hash_path = state_hash_path(&instance_id);
     let cache_warm = tokio::fs::try_exists(&hash_path).await.unwrap_or(false);
 
-    if cache_warm {
-        // Warm cache: only re-fetch if the TTL window has elapsed. Reading the
-        // timer (not removing it) keeps concurrent requests cheap — at most one
-        // will observe the window as expired and refresh.
-        let fresh = CONTRACT_CACHE_REFRESH
-            .get(&instance_id)
-            .map(|last| last.elapsed() < CONTRACT_CACHE_REFRESH_TTL)
-            .unwrap_or(false);
-        if fresh {
-            return Ok(());
-        }
+    // Fast path: a warm cache reconciled within the TTL needs no work and must
+    // not contend on the refresh lock.
+    if cache_warm && cache_reconciled_recently(&instance_id) {
+        return Ok(());
+    }
+
+    // Slow path: refresh looks due. Serialize concurrent refreshers for this
+    // contract so only the first issues a GET; the rest re-check below.
+    let _guard = acquire_refresh_lock(&instance_id).await;
+    if cache_warm && cache_reconciled_recently(&instance_id) {
+        // A concurrent refresher completed while we waited for the lock.
+        return Ok(());
     }
 
     ensure_contract_cached(instance_id, request_sender, None).await?;
@@ -1835,6 +1885,7 @@ mod tests {
             .await
             .ok();
         CONTRACT_CACHE_REFRESH.remove(instance_id);
+        CONTRACT_REFRESH_LOCKS.remove(instance_id);
     }
 
     /// Regression test for #3940. `variable_content` must trigger a network
@@ -2139,6 +2190,124 @@ mod tests {
         expect_fetch_pair(&mut rx, instance_id).await;
 
         handler.abort();
+        clear_cache(&instance_id).await;
+    }
+
+    /// Services one transient client connection's worth of
+    /// `ensure_contract_cached` traffic: replies to `NewConnection` with a
+    /// fresh client id, then answers the `Get` with a successful `GetResponse`
+    /// whose state hashes to the value already on disk. Because the on-disk
+    /// `{key}.hash` matches, `unpack_if_stale` returns early (no `WebApp`
+    /// unpack needed), so the refresh succeeds and records the timer.
+    ///
+    /// Both replies go on the `callbacks` sender from `NewConnection` — that is
+    /// the `response_recv` end `ensure_contract_cached` reads from.
+    async fn serve_one_get(
+        rx: &mut tokio::sync::mpsc::Receiver<ClientConnection>,
+        contract: &ContractContainer,
+        state: &WrappedState,
+    ) {
+        let msg = rx.recv().await.expect("leader must issue NewConnection");
+        let callbacks = match msg {
+            ClientConnection::NewConnection { callbacks, .. } => callbacks,
+            other => panic!("expected NewConnection, got: {other:?}"),
+        };
+        callbacks
+            .send(HostCallbackResult::NewId {
+                id: crate::client_events::ClientId::next(),
+            })
+            .expect("callback receiver live");
+        let get = rx.recv().await.expect("Get must follow NewConnection");
+        match get {
+            ClientConnection::Request { req, .. } => assert!(
+                matches!(
+                    req.as_ref(),
+                    ClientRequest::ContractOp(ContractRequest::Get { .. })
+                ),
+                "expected Get, got: {req:?}"
+            ),
+            other => panic!("expected Get request, got: {other:?}"),
+        }
+        callbacks
+            .send(HostCallbackResult::Result {
+                id: crate::client_events::ClientId::next(),
+                result: Ok(HostResponse::ContractResponse(
+                    ContractResponse::GetResponse {
+                        key: contract.key(),
+                        contract: Some(contract.clone()),
+                        state: state.clone(),
+                    },
+                )),
+            })
+            .expect("callback receiver live for GetResponse");
+        // Drain the trailing Disconnect the handler sends on the way out.
+        let _ = rx.recv().await;
+    }
+
+    /// Concurrency regression for the Codex review finding on #3977: a fan-out
+    /// of simultaneous requests on a warm-but-stale cache must issue exactly
+    /// ONE network GET per contract per window, not one per request.
+    ///
+    /// Runs the real `refresh_cache_if_due` end-to-end. The leader's GET is
+    /// answered with a `GetResponse` whose state hash matches the on-disk
+    /// `{key}.hash`, so `unpack_if_stale` returns early, the leader records the
+    /// refresh timer, and every follower that queued behind the refresh lock
+    /// re-checks, sees the fresh timer, and skips its own GET. The receiver
+    /// services exactly one `Get`, then asserts the channel closes with no
+    /// second `NewConnection`.
+    #[tokio::test]
+    async fn refresh_cache_if_due_coalesces_concurrent_refreshes() {
+        // Derive the instance id FROM a real contract so the GetResponse key
+        // matches and `unpack_if_stale` takes its matching-hash early return.
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1, 2, 3, 4])),
+            Parameters::from(vec![5, 6]),
+        )));
+        let instance_id = *contract.key().id();
+        let state = WrappedState::new(vec![9, 9, 9]);
+        clear_cache(&instance_id).await;
+
+        // Warm cache whose stored hash matches the state we'll return, so the
+        // refresh succeeds without an actual unpack. No fresh timer ⇒ due.
+        let cache_dir = contract_web_path(&instance_id);
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        let matching_hash = hash_state(state.as_ref());
+        tokio::fs::write(state_hash_path(&instance_id), matching_hash.to_be_bytes())
+            .await
+            .unwrap();
+
+        // Shared channel so a single receiver observes every caller's traffic.
+        let (sender, mut rx) = request_channel();
+        let mut handlers = Vec::new();
+        for _ in 0..8 {
+            let sender = sender.clone();
+            handlers.push(tokio::spawn(async move {
+                refresh_cache_if_due(instance_id, &sender).await.map(|_| ())
+            }));
+        }
+        drop(sender); // channel closes once all 8 handlers finish.
+
+        // Service exactly one GET (the leader's). Every follower coalesces.
+        serve_one_get(&mut rx, &contract, &state).await;
+
+        // After the single served GET, no further NewConnection may appear:
+        // a second one would mean a follower issued a redundant GET.
+        let mut extra = 0;
+        while let Some(msg) = rx.recv().await {
+            if matches!(msg, ClientConnection::NewConnection { .. }) {
+                extra += 1;
+            }
+        }
+        assert_eq!(
+            extra, 0,
+            "concurrent refreshers must coalesce to a single GET; saw {extra} extra"
+        );
+
+        for h in handlers {
+            h.await
+                .expect("handler must not panic")
+                .expect("refresh must succeed");
+        }
         clear_cache(&instance_id).await;
     }
 
