@@ -165,8 +165,12 @@ async fn refresh_cache_if_due(
     // Slow path: refresh looks due. Serialize concurrent refreshers for this
     // contract so only the first issues a GET; the rest re-check below.
     let _guard = acquire_refresh_lock(&instance_id).await;
-    if cache_warm && cache_reconciled_recently(&instance_id) {
-        // A concurrent refresher completed while we waited for the lock.
+    // Re-check on the timer alone (not the pre-lock `cache_warm` snapshot): a
+    // concurrent refresher that completed while we waited recorded a fresh
+    // timer AND populated the cache via `ensure_contract_cached`, so a fresh
+    // timer means there is nothing left to do even if our snapshot saw the
+    // cache as cold.
+    if cache_reconciled_recently(&instance_id) {
         return Ok(());
     }
 
