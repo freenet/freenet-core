@@ -972,16 +972,42 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 pong_sequence = sequence,
                                 "Received Pong, confirming bidirectional liveness"
                             );
-                            // Remove the corresponding ping from pending set
-                            let mut pending = self.pending_pings.write();
-                            if pending.remove(sequence).is_some() {
-                                tracing::trace!(
-                                    target: "freenet_core::transport::keepalive_received",
-                                    remote = ?self.remote_conn.remote_addr,
-                                    pong_sequence = sequence,
-                                    remaining_pending = pending.len(),
-                                    "Removed acknowledged ping from pending set"
-                                );
+                            // Remove the corresponding ping from pending set and,
+                            // if found, sample the round-trip time. The keep-alive
+                            // cycle runs on every connection regardless of stream
+                            // traffic, so this keeps RTT statistics populated for
+                            // quiet, long-lived connections that rarely (or never)
+                            // complete a stream transfer (#4000). Without it,
+                            // RTT was only sampled at stream completion and quiet
+                            // connections contributed zero samples.
+                            let removed_send_nanos = {
+                                let mut pending = self.pending_pings.write();
+                                let removed = pending.remove(sequence);
+                                if removed.is_some() {
+                                    tracing::trace!(
+                                        target: "freenet_core::transport::keepalive_received",
+                                        remote = ?self.remote_conn.remote_addr,
+                                        pong_sequence = sequence,
+                                        remaining_pending = pending.len(),
+                                        "Removed acknowledged ping from pending set"
+                                    );
+                                }
+                                removed
+                            };
+                            if let Some(send_nanos) = removed_send_nanos {
+                                // The ping timestamp was recorded with this same
+                                // `time_source` (the keep-alive task clones it), so
+                                // the subtraction is over one monotonic clock.
+                                // `saturating_sub` is defensive against any skew
+                                // yielding a 0 sample rather than underflowing.
+                                let rtt_nanos = self
+                                    .time_source
+                                    .now_nanos()
+                                    .saturating_sub(send_nanos);
+                                let rtt_us = rtt_nanos / 1_000;
+                                if rtt_us > 0 {
+                                    super::TRANSPORT_METRICS.record_rtt_sample(rtt_us);
+                                }
                             }
                         }
                         SymmetricMessagePayload::AckConnection { .. } | SymmetricMessagePayload::ShortMessage { .. } | SymmetricMessagePayload::StreamFragment { .. } => {}
@@ -3029,6 +3055,136 @@ mod tests {
         );
 
         // Cleanup so the singleton doesn't leak our address into other tests.
+        crate::transport::TRANSPORT_METRICS.remove_peer(remote_addr);
+    }
+
+    /// Regression test for #4000: a Pong received for a pending keep-alive
+    /// Ping must record an RTT sample, so quiet connections that never
+    /// complete a stream transfer still contribute to the RTT statistics.
+    ///
+    /// Before the fix, the Pong handler removed the matching ping timestamp
+    /// from `pending_pings` and discarded it — `record_rtt_sample` was only
+    /// reachable from `record_transfer_completed` (stream completion), so a
+    /// connection exchanging only keep-alive traffic recorded zero RTT
+    /// samples. This test seeds a pending ping, advances the (mock) clock,
+    /// feeds an encrypted Pong, and asserts the global RTT sample counter
+    /// moved by at least one.
+    #[tokio::test]
+    async fn pong_records_rtt_sample_from_keepalive_cycle() {
+        use crate::transport::crypto::TransportKeypair;
+        use crate::transport::packet_data::PacketData;
+        use crate::transport::symmetric_message::SymmetricMessagePayload;
+        use crate::util::time_source::SharedMockTimeSource;
+        use bytes::Bytes;
+
+        let time_source = SharedMockTimeSource::new();
+        let (inbound_tx, inbound_rx) = mpsc::channel(16);
+        let remote_addr = SocketAddr::new(Ipv4Addr::new(10, 99, 99, 2).into(), 50002);
+
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
+        let cipher = Aes128Gcm::new(&key.into());
+        let keypair = TransportKeypair::new();
+
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(
+            SentPacketTracker::new_with_time_source(time_source.clone()),
+        ));
+        let congestion_controller =
+            crate::transport::congestion_control::CongestionControlConfig::default()
+                .build_arc_with_time_source(time_source.clone());
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            10_000,
+            10_000_000,
+            time_source.clone(),
+        ));
+        let socket = Arc::new(TestSocket::new(
+            mpsc::channel::<(SocketAddr, Arc<[u8]>)>(16).0,
+        ));
+
+        let rolling_rtt_stats = crate::transport::rolling_rtt_stats::RollingRttStatsHandle::new(
+            remote_addr,
+            time_source.clone(),
+        );
+        let remote_conn = RemoteConnection {
+            outbound_symmetric_key: cipher.clone(),
+            remote_addr,
+            sent_tracker,
+            last_packet_id: Arc::new(AtomicU32::new(0)),
+            inbound_packet_recv: inbound_rx,
+            inbound_symmetric_key: cipher.clone(),
+            inbound_symmetric_key_bytes: key,
+            my_address: None,
+            transport_secret_key: keypair.secret,
+            congestion_controller,
+            token_bucket,
+            socket,
+            global_bandwidth: None,
+            rolling_rtt_stats,
+            time_source: time_source.clone(),
+        };
+
+        // Build the encrypted Pong (sequence 7) and a trailing ShortMessage.
+        // The Pong handler does not make `recv()` return (it produces no
+        // message), so the ShortMessage gives the loop a value to yield once
+        // the Pong has been processed.
+        let pong_seq = 7u64;
+        let pong = SymmetricMessage::serialize_msg_to_packet_data(
+            1,
+            SymmetricMessagePayload::Pong { sequence: pong_seq },
+            &cipher,
+            vec![],
+        )
+        .expect("encrypt pong");
+        let pong_packet =
+            PacketData::<crate::transport::packet_data::UnknownEncryption>::from_buf(pong.data());
+
+        let short = SymmetricMessage::serialize_msg_to_packet_data(
+            2,
+            SymmetricMessagePayload::ShortMessage {
+                payload: Bytes::from_static(b"done"),
+            },
+            &cipher,
+            vec![],
+        )
+        .expect("encrypt short");
+        let short_packet =
+            PacketData::<crate::transport::packet_data::UnknownEncryption>::from_buf(short.data());
+
+        let mut conn = PeerConnection::new(remote_conn);
+
+        // Advance past zero before seeding so the ping's send timestamp is
+        // strictly positive. The recv loop's stale-ping cleanup retains only
+        // pings with `sent_at_nanos > now_nanos - idle_timeout`; at small mock
+        // times that threshold saturates to 0, so a ping stamped at exactly 0
+        // would be pruned before the Pong arrives. Stamp at 10 ms, then
+        // advance another 50 ms so the round-trip is a deterministic 50 ms.
+        time_source.advance_time(Duration::from_millis(10));
+        let send_nanos = time_source.now_nanos();
+        conn.pending_pings.write().insert(pong_seq, send_nanos);
+        time_source.advance_time(Duration::from_millis(50));
+
+        let samples_before = crate::transport::TRANSPORT_METRICS.rtt_sample_count();
+
+        inbound_tx.send(pong_packet).await.expect("send pong");
+        inbound_tx.send(short_packet).await.expect("send short");
+
+        let _msg = conn.recv().await.expect("recv");
+
+        let samples_after = crate::transport::TRANSPORT_METRICS.rtt_sample_count();
+        assert!(
+            samples_after >= samples_before + 1,
+            "Pong for a pending ping must record at least one RTT sample \
+             (before={samples_before}, after={samples_after}). \
+             The keep-alive RTT path (#4000) is not wired up."
+        );
+
+        // The matching ping must have been consumed so it isn't sampled twice
+        // or treated as still-unanswered by the keep-alive backoff.
+        assert!(
+            !conn.pending_pings.read().contains_key(&pong_seq),
+            "Pong must remove the matching pending ping"
+        );
+
         crate::transport::TRANSPORT_METRICS.remove_peer(remote_addr);
     }
 
