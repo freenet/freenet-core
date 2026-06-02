@@ -100,6 +100,13 @@ pub(crate) struct OpManager {
     pub interest_manager: Arc<crate::ring::interest::InterestManager<InstantTimeSrc>>,
     /// Dedup cache for skipping redundant broadcast WASM merges
     pub broadcast_dedup_cache: Arc<crate::operations::update::BroadcastDedupCache>,
+    /// Bounded per-contract UPDATE-propagation counters. Fed from the
+    /// broadcast fan-out path and drained by a periodic background task that
+    /// emits an INFO `update_propagation_summary` line per window. Restores
+    /// the operator liveness signal lost when #4272 demoted the per-event
+    /// UPDATE log sites to DEBUG (issue #4281).
+    pub(crate) update_propagation_stats:
+        Arc<crate::operations::update::propagation_stats::UpdatePropagationStats>,
     /// Request router for client request deduplication.
     ///
     /// This is initialized lazily from `client_event_handling` because the router is only
@@ -213,6 +220,7 @@ impl Clone for OpManager {
             neighbor_hosting: self.neighbor_hosting.clone(),
             interest_manager: self.interest_manager.clone(),
             broadcast_dedup_cache: self.broadcast_dedup_cache.clone(),
+            update_propagation_stats: self.update_propagation_stats.clone(),
             request_router: self.request_router.clone(),
             orphan_stream_registry: self.orphan_stream_registry.clone(),
             streaming_threshold: self.streaming_threshold,
@@ -367,6 +375,20 @@ impl OpManager {
         let orphan_stream_registry = Arc::new(OrphanStreamRegistry::new());
         OrphanStreamRegistry::start_gc_task(orphan_stream_registry.clone());
 
+        // Bounded periodic UPDATE-propagation summary emitter (#4281). The
+        // background task drains the per-contract counters and logs a single
+        // INFO summary line (plus a capped number of per-contract lines) per
+        // window, restoring the operator liveness signal lost to #4272's
+        // DEBUG demotions without re-introducing per-event log volume. It runs
+        // for the node's lifetime, so its handle is registered with the
+        // BackgroundTaskMonitor rather than dropped fire-and-forget.
+        let update_propagation_stats =
+            Arc::new(crate::operations::update::propagation_stats::UpdatePropagationStats::new());
+        task_monitor.register(
+            "update_propagation_summary",
+            update_propagation_stats.clone().start_summary_task(),
+        );
+
         Ok(Self {
             ring,
             ops,
@@ -381,6 +403,7 @@ impl OpManager {
             neighbor_hosting,
             interest_manager,
             broadcast_dedup_cache: Arc::new(crate::operations::update::BroadcastDedupCache::new()),
+            update_propagation_stats,
             request_router,
             orphan_stream_registry,
             streaming_threshold,

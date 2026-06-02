@@ -2154,9 +2154,18 @@ impl P2pConnManager {
                                 graceful_shutdown = true;
                                 break;
                             }
-                            NodeEvent::BroadcastStateChange { key, new_state } => {
-                                ctx.handle_broadcast_state_change(&op_manager, key, new_state)
-                                    .await;
+                            NodeEvent::BroadcastStateChange {
+                                key,
+                                new_state,
+                                is_retry,
+                            } => {
+                                ctx.handle_broadcast_state_change(
+                                    &op_manager,
+                                    key,
+                                    new_state,
+                                    is_retry,
+                                )
+                                .await;
                             }
                             NodeEvent::SyncStateToPeer {
                                 key,
@@ -4219,6 +4228,10 @@ impl P2pConnManager {
         op_manager: &Arc<OpManager>,
         key: freenet_stdlib::prelude::ContractKey,
         new_state: freenet_stdlib::prelude::WrappedState,
+        // `false` for a fresh executor-emitted broadcast, `true` for a
+        // no-target retry re-emission this handler scheduled. Used only to
+        // count fresh logical broadcasts once for the #4281 summary.
+        is_retry: bool,
     ) {
         tracing::debug!(
             contract = %key,
@@ -4243,6 +4256,25 @@ impl P2pConnManager {
         );
 
         if target_result.targets.is_empty() {
+            // Record the NO_TARGETS outcome once per *fresh* no-target broadcast
+            // for the #4281 summary, but NOT for retry re-emissions. Gating on
+            // `is_retry` (carried on the event) rather than the per-contract
+            // `broadcast_retries` counter is what makes the count accurate:
+            // retries and fresh broadcasts share that counter, so a fresh
+            // broadcast arriving mid-retry-cycle would otherwise be absorbed
+            // and uncounted (Codex P2). With the explicit flag, every fresh
+            // no-target broadcast is counted exactly once and retries never
+            // double-count. If a later retry heals (finds targets), the
+            // targets-found path below additionally records that success — both
+            // the initial miss and the eventual propagation are surfaced.
+            if !is_retry {
+                op_manager.update_propagation_stats.record_broadcast(
+                    *key.id(),
+                    0,
+                    target_result.interest_resolve_failed,
+                );
+            }
+
             let retry_count = self.broadcast_retries.entry(key).or_insert(0);
             if *retry_count < Self::MAX_BROADCAST_RETRIES {
                 *retry_count += 1;
@@ -4279,6 +4311,7 @@ impl P2pConnManager {
                         .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
                             key,
                             new_state,
+                            is_retry: true,
                         })
                         .await
                     {
@@ -4342,6 +4375,11 @@ impl P2pConnManager {
                             .await;
                     }
                 }
+                // The NO_TARGETS outcome was already recorded for the #4281
+                // summary at the start of this retry cycle (retry_count == 0
+                // above); retry exhaustion does not record again, so a stuck
+                // contract counts as one no_targets per fresh broadcast, not
+                // once per retry.
             }
             return;
         }
@@ -4349,6 +4387,18 @@ impl P2pConnManager {
         // Targets found - clear any pending retry and streak state for this contract
         self.broadcast_retries.remove(&key);
         self.broadcast_no_target_streak.remove(&key);
+
+        // Record a successful fan-out for the #4281 propagation summary. Fires
+        // whether targets were found on the initial attempt or on a healing
+        // retry, so a recovered in-flight-subscription race is surfaced as a
+        // propagated update (with its real target count). A fresh broadcast
+        // that found targets on the first try has no `broadcast_retries` entry,
+        // so it is recorded exactly once here.
+        op_manager.update_propagation_stats.record_broadcast(
+            *key.id(),
+            target_result.targets.len(),
+            target_result.interest_resolve_failed,
+        );
 
         // In production, enqueue each target into the broadcast queue.
         // The queue worker handles delta computation and streaming with bounded
