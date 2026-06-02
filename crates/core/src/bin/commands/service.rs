@@ -2135,22 +2135,45 @@ fn purge_data_dirs(#[allow(unused_variables)] system_mode: bool) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     let home_override: Option<std::path::PathBuf> = None;
 
-    // If we have a home override (system mode), construct paths manually using
-    // XDG defaults. Otherwise use ProjectDirs which resolves from the current user.
+    // If we have a home override (system mode on Linux), purge the service
+    // user's XDG dirs via the manually-constructed paths. Otherwise use
+    // ProjectDirs, which resolves from the current user.
     if let Some(ref home) = home_override {
-        // XDG defaults for the service user
-        remove_if_exists("data", &home.join(".local/share/Freenet"))?;
-        remove_if_exists("config", &home.join(".config/Freenet"))?;
-        remove_if_exists("cache", &home.join(".cache/Freenet"))?;
-        // Also remove lowercase cache dir used by webapp cache
-        remove_if_exists("cache", &home.join(".cache/freenet"))?;
-        remove_if_exists("logs", &home.join(".local/state/freenet"))?;
+        for (label, dir) in linux_system_purge_dirs(home) {
+            remove_if_exists(label, &dir)?;
+        }
     } else {
         let leaves = DataLeaves::from_project_dirs();
         purge_leaves_and_collapse(&leaves)?;
     }
 
     Ok(())
+}
+
+/// XDG leaf directories that `--system` mode must purge for the service user.
+///
+/// These MUST match the paths the running node actually creates. On Linux the
+/// `directories` crate lowercases the application name when building
+/// `ProjectDirs` (`ProjectDirs::from("", "The Freenet Project Inc", "Freenet")`
+/// yields `~/.local/share/freenet`, not `~/.local/share/Freenet`), and
+/// `get_log_dir` uses `~/.local/state/freenet`. The previous hardcoded
+/// uppercase `Freenet` paths matched nothing on disk, so
+/// `sudo freenet uninstall --purge --system` reported success while silently
+/// leaving all of the user's contracts, delegates, and database behind (#3907).
+///
+/// Extracted as a pure function (parameterised on `home`) so the path logic is
+/// unit-testable without mutating process-level `SUDO_USER`/home state. This is
+/// only reached in `--system` mode, which only resolves a `home_override` on
+/// Linux; the `cfg_attr` suppresses the dead-code lint on macOS/Windows, where
+/// `home_override` is always `None` so the function is never called.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_system_purge_dirs(home: &Path) -> [(&'static str, PathBuf); 4] {
+    [
+        ("data", home.join(".local/share/freenet")),
+        ("config", home.join(".config/freenet")),
+        ("cache", home.join(".cache/freenet")),
+        ("logs", home.join(".local/state/freenet")),
+    ]
 }
 
 /// The full set of leaf directories `purge_data_dirs` needs to touch in
@@ -2200,13 +2223,15 @@ struct DataLeaves {
     /// and `get_log_dir` returns `%LOCALAPPDATA%\freenet\logs`; the
     /// immediate parents (`...\Freenet`, `...\freenet`) exist only for us.
     ///
-    /// False on Linux/macOS — `ProjectDirs` builds `~/.local/share/Freenet`,
-    /// `~/.config/Freenet`, `~/.cache/Freenet` (Linux) and analogous paths
-    /// on macOS. The parents of those leaves are shared XDG/OS hierarchies
-    /// used by every other app on the system — collapsing them would at
-    /// best no-op (by luck) and at worst delete an otherwise-empty shared
-    /// root on a fresh account. The safety must be enforced at the type
-    /// level, not left to `remove_dir_if_empty`'s runtime check.
+    /// False on Linux/macOS. On Linux the `directories` crate lowercases the
+    /// application name, so `ProjectDirs` builds `~/.local/share/freenet`,
+    /// `~/.config/freenet`, `~/.cache/freenet` (note the lowercase `freenet`,
+    /// not `Freenet`); macOS uses its own `~/Library/...` scheme. The parents
+    /// of those leaves are shared XDG/OS hierarchies used by every other app
+    /// on the system — collapsing them would at best no-op (by luck) and at
+    /// worst delete an otherwise-empty shared root on a fresh account. The
+    /// safety must be enforced at the type level, not left to
+    /// `remove_dir_if_empty`'s runtime check.
     collapse_parents: bool,
 }
 
@@ -4570,13 +4595,15 @@ mod tests {
     #[test]
     fn test_purge_leaves_never_collapses_shared_parents_on_unix() {
         // Reproduces the codex-caught bug: on Linux `ProjectDirs` builds
-        // `~/.local/share/Freenet`, `~/.config/Freenet`, `~/.cache/Freenet`
-        // (and analogous macOS paths), whose parents are shared across
-        // every app on the system. Collapsing any of them, even when the
-        // `remove_dir_if_empty` non-empty check makes it safe in practice
-        // on an active system, would wipe a shared XDG root on a fresh
-        // account where Freenet was the only inhabitant. The
-        // `collapse_parents: false` setting must suppress every collapse.
+        // `~/.local/share/freenet`, `~/.config/freenet`, `~/.cache/freenet`
+        // (lowercase `freenet`; macOS uses its own `~/Library/...` scheme),
+        // whose parents are shared across every app on the system. Collapsing
+        // any of them, even when the `remove_dir_if_empty` non-empty check
+        // makes it safe in practice on an active system, would wipe a shared
+        // XDG root on a fresh account where Freenet was the only inhabitant.
+        // The `collapse_parents: false` setting must suppress every collapse.
+        // (The leaf basenames below are arbitrary — this test exercises the
+        // parent-collapse suppression, not the leaf-name resolution.)
         let tmp = tempfile::tempdir().unwrap();
 
         // Each leaf sits in its own dedicated parent to verify each
@@ -4717,6 +4744,87 @@ mod tests {
             !leaves.collapse_parents,
             "collapse_parents must stay false off Windows so shared XDG roots are never collapsed",
         );
+    }
+
+    /// Regression for #3907: `freenet uninstall --purge --system` on Linux
+    /// resolves the service user's data via a hardcoded XDG layout. The leaf
+    /// directories MUST be lowercase `freenet`, matching what the running node
+    /// actually creates — `ProjectDirs::from("", "The Freenet Project Inc",
+    /// "Freenet")` lowercases the application name on Linux, and
+    /// `get_log_dir()` uses `~/.local/state/freenet`. The pre-fix code
+    /// hardcoded uppercase `Freenet` for data/config/cache, so the purge
+    /// matched nothing on disk and returned "success" while leaving every
+    /// contract, delegate, and the database behind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_system_purge_uses_lowercase_freenet_paths() {
+        let home = PathBuf::from("/home/svc");
+        let dirs = linux_system_purge_dirs(&home);
+
+        // Pin the exact leaves. Each entry must be lowercase `freenet`; an
+        // uppercase `Freenet` (the #3907 bug) would never match the directories
+        // the node created.
+        assert_eq!(
+            dirs,
+            [
+                ("data", home.join(".local/share/freenet")),
+                ("config", home.join(".config/freenet")),
+                ("cache", home.join(".cache/freenet")),
+                ("logs", home.join(".local/state/freenet")),
+            ],
+            "system-mode purge must target lowercase `freenet` XDG dirs (#3907)",
+        );
+
+        // Defensive: assert no leaf contains the uppercase project name, which
+        // is what the directories crate never produces on Linux.
+        for (_label, dir) in &dirs {
+            assert!(
+                !dir.to_string_lossy().contains("/Freenet"),
+                "leaf {} must not use uppercase `Freenet` (#3907)",
+                dir.display(),
+            );
+        }
+    }
+
+    /// End-to-end check that the resolved leaves actually remove on-disk data
+    /// seeded at the lowercase paths a real Linux install uses. This exercises
+    /// the same `linux_system_purge_dirs` → `remove_if_exists` chain that
+    /// `purge_data_dirs` runs in `--system` mode, but rooted at a tempdir so it
+    /// never touches a real home. With the pre-fix uppercase paths the seeded
+    /// lowercase directories would survive and this test would fail.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_system_purge_removes_seeded_lowercase_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        let data = home.join(".local/share/freenet");
+        let config = home.join(".config/freenet");
+        let cache = home.join(".cache/freenet");
+        let logs = home.join(".local/state/freenet");
+
+        // Seed the directories with realistic contents the purge must remove.
+        std::fs::create_dir_all(data.join("contracts")).unwrap();
+        std::fs::create_dir_all(data.join("delegates")).unwrap();
+        std::fs::create_dir_all(data.join("db")).unwrap();
+        std::fs::write(data.join("db").join("freenet.redb"), b"x").unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("config.toml"), b"x").unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("freenet.2026-06-02.log"), b"x").unwrap();
+
+        for (label, dir) in linux_system_purge_dirs(home) {
+            remove_if_exists(label, &dir).unwrap();
+        }
+
+        for leaf in [&data, &config, &cache, &logs] {
+            assert!(
+                !leaf.exists(),
+                "system purge must remove lowercase leaf {} (#3907)",
+                leaf.display(),
+            );
+        }
     }
 
     // ── Wrapper backoff state machine tests ──
