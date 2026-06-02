@@ -745,10 +745,13 @@ fn test_streaming_get_through_relay() {
 /// events are produced for the streamed response.
 #[test]
 fn test_streaming_get_emits_get_success_with_hop_count() {
-    // Same seed / topology / contract as `test_streaming_get_through_relay`,
-    // which is proven to deterministically force node 5's GET to relay and
-    // fork+pipe a streaming response (rather than hit a local-cache shortcut).
-    const SEED: u64 = 0xDE1A_0008_FACE_B00C;
+    // Same topology / contract as `test_streaming_get_through_relay`, which
+    // forces node 5's GET to relay and fork+pipe a streaming response (rather
+    // than hit a local-cache shortcut). A UNIQUE seed (not shared with that
+    // test) avoids seed-keyed global-registry collisions under parallel test
+    // execution; the streaming-forward counter guard below verifies the
+    // streaming path still fires regardless of the exact seed.
+    const SEED: u64 = 0xDE1A_4249_FACE_B00C;
     const NETWORK_NAME: &str = "streaming-get-hopcount";
     const THRESHOLD: usize = 1024;
     const LARGE_STATE_SIZE: usize = 1024 * 1024; // ~1MB → forces streaming

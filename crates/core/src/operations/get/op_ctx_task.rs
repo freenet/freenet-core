@@ -2104,11 +2104,10 @@ where
             "GET relay: payload exceeds threshold, streaming response upstream"
         );
         // `hop_count` is carried on the streaming header (issue #4249) the
-        // same way the inline `Response{Found}` below carries it. Without
-        // it the originator's tracing layer emitted no terminal telemetry
-        // event at all for streamed GETs (the `ResponseStreaming` variant
-        // fell into the `Get(_) => Ignored` catch-all), so large-contract
-        // GET successes were invisible to the dashboard's hop-depth panels.
+        // same way the inline `Response{Found}` below carries it, so the
+        // originator's GET driver can populate `GetSuccess.hop_count` once
+        // the stream assembles. Without it, streamed large-contract GET
+        // successes were invisible to the dashboard's hop-depth panels.
         let header = NetMessage::from(GetMsg::ResponseStreaming {
             id: tx,
             instance_id,

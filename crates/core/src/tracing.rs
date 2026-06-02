@@ -1355,34 +1355,18 @@ impl<'a> NetEventLog<'a> {
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
-            // Streaming GET success at a relay (issue #4249). A relay that
-            // forwards a downstream `GetMsg::ResponseStreaming` upstream sees
-            // it here via the inbound dispatch; without this arm it fell into
-            // the `Get(_) => Ignored` catch-all below, so relays emitted a
-            // `GetSuccess` for inline `Response{Found}` responses (the arm
-            // above) but NOT for streamed ones — an asymmetry that left
-            // relay-side GET telemetry blank for large contracts. Mirrors the
-            // inline `Response{Found}` arm: emit GetSuccess with the
-            // wire-carried hop_count, clamped to max_hops_to_live against a
-            // malicious or buggy peer sending hop_count = usize::MAX. (The
-            // requester-side GetSuccess is emitted separately by the
-            // originator's GET driver — see drive_client_get_inner.)
-            NetMessageV1::Get(GetMsg::ResponseStreaming {
-                id, key, hop_count, ..
-            }) => {
-                let this_peer = op_manager.ring.connection_manager.own_location();
-                let max_htl = op_manager.ring.max_hops_to_live;
-                EventKind::Get(GetEvent::GetSuccess {
-                    id: *id,
-                    requester: this_peer.clone(),
-                    target: this_peer,
-                    key: *key,
-                    hop_count: Some((*hop_count).min(max_htl)),
-                    elapsed_ms: id.elapsed().as_millis() as u64,
-                    timestamp: chrono::Utc::now().timestamp() as u64,
-                    state_hash: None, // Hash not available from message
-                })
-            }
+            // NOTE: `GetMsg::ResponseStreaming` is deliberately NOT matched
+            // here (it falls into the `Get(_) => Ignored` catch-all below).
+            // Unlike the inline `Response{Found}` arm above — whose envelope
+            // already carries the full payload, so receiving it IS the
+            // success — a `ResponseStreaming` message is only the stream
+            // *header*: the payload arrives separately and can still fail to
+            // be delivered, claimed, assembled, or deserialized. Emitting
+            // `GetSuccess` on the header would report success for a payload
+            // the node may never receive (lossy link / malicious peer). The
+            // terminal streaming `GetSuccess` is therefore emitted by the
+            // originator's GET driver (`drive_client_get_inner`) only AFTER
+            // the stream is assembled and the local store re-query succeeds.
             NetMessageV1::Subscribe(SubscribeMsg::Request {
                 id,
                 instance_id,

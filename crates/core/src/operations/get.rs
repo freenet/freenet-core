@@ -505,13 +505,10 @@ mod tests {
     /// roundtrips through bincode.
     ///
     /// Before this fix the streaming GET response carried no `hop_count`
-    /// field, so large-contract (streamed) GET successes produced NO
-    /// terminal `GetSuccess` telemetry event at all — the variant fell into
-    /// the `Get(_) => Ignored` catch-all in `from_inbound_msg_v1`. The fix
-    /// carries the value on the wire so the originator's tracing layer can
-    /// populate `GetSuccess.hop_count` for streamed responses, exactly as
-    /// `test_get_msg_response_hop_count_roundtrip` proves for the inline
-    /// `Response` path.
+    /// field. The fix carries it on the wire so the originator's GET driver
+    /// can populate `GetSuccess.hop_count` for streamed responses (after the
+    /// stream assembles), exactly as `test_get_msg_response_hop_count_roundtrip`
+    /// covers the inline `Response` path.
     ///
     /// bincode-positional caveat: this positional addition breaks older
     /// binaries; see the min-compatible-version bump that accompanies this
