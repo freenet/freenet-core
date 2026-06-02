@@ -508,15 +508,29 @@ impl TransportMetrics {
         let transfers_failed = self.transfers_failed.swap(0, Ordering::Relaxed);
         // RTT samples count as activity in their own right: quiet connections
         // that only exchange keep-alive ping/pong traffic record RTT samples
-        // but complete no transfers (#4000). Gating snapshot emission solely
-        // on transfers would discard (and reset) those samples here, so the
-        // telemetry worker would never see RTT data for a quiet node — the
-        // exact under-counting this is meant to fix.
-        let rtt_samples = self.rtt_samples.swap(0, Ordering::Relaxed);
+        // but complete no transfers (#4000). Gating snapshot emission solely on
+        // transfers would discard those samples, so the telemetry worker would
+        // never see RTT data for a quiet node — the exact under-counting this is
+        // meant to fix.
+        //
+        // The activity check `load`s the count (peek, no reset) instead of
+        // swapping it, so the count is consumed in exactly one place — grouped
+        // with the RTT accumulator swaps below. Resetting the count up here
+        // separately would create a window where a concurrent
+        // `record_rtt_sample` has its sum/min/max consumed by this snapshot
+        // while its count carries into the next, producing a bogus
+        // avg/min/max = 0 next tick.
+        let rtt_samples_pending = self.rtt_samples.load(Ordering::Relaxed);
 
         // No activity = no snapshot
-        if transfers_completed == 0 && transfers_failed == 0 && rtt_samples == 0 {
-            // Still reset other counters to prevent stale data
+        if transfers_completed == 0 && transfers_failed == 0 && rtt_samples_pending == 0 {
+            // Still reset other counters to prevent stale data. The RTT
+            // accumulators (`rtt_samples`, `rtt_sum_us`, `min_rtt_us`,
+            // `max_rtt_us`) are deliberately left untouched: they are only ever
+            // advanced together by `record_rtt_sample`, so in the genuine
+            // no-activity case they already hold their identity values, and
+            // leaving them keeps the count and accumulators mutually consistent
+            // if a sample lands concurrently with this reset.
             self.bytes_sent.store(0, Ordering::Relaxed);
             self.bytes_received.store(0, Ordering::Relaxed);
             self.total_transfer_time_ms.store(0, Ordering::Relaxed);
@@ -526,18 +540,6 @@ impl TransportMetrics {
             self.cwnd_sum.store(0, Ordering::Relaxed);
             self.cwnd_samples.store(0, Ordering::Relaxed);
             self.slowdowns_triggered.store(0, Ordering::Relaxed);
-            // Deliberately DO NOT reset the RTT accumulators (`rtt_sum_us`,
-            // `min_rtt_us`, `max_rtt_us`) here. `rtt_samples` was already
-            // swapped to 0; if a concurrent `record_rtt_sample` lands between
-            // that swap and this point, it bumps `rtt_sum_us`/min/max *and*
-            // `rtt_samples` (back to 1). Zeroing the accumulators here would
-            // then leave a nonzero sample count paired with a zeroed
-            // sum/min/max, so the next snapshot would emit a bogus
-            // avg/min/max = 0. Since these accumulators are only ever advanced
-            // alongside a sample, they are already at their identity values
-            // (0 / u64::MAX / 0) in the genuine no-activity case, making the
-            // stores redundant anyway. Leaving them keeps the count and the
-            // accumulators mutually consistent under concurrency.
             return None;
         }
 
@@ -550,9 +552,14 @@ impl TransportMetrics {
         let cwnd_sum = self.cwnd_sum.swap(0, Ordering::Relaxed);
         let cwnd_samples = self.cwnd_samples.swap(0, Ordering::Relaxed);
         let slowdowns_triggered = self.slowdowns_triggered.swap(0, Ordering::Relaxed);
+        // Swap the RTT accumulators and the sample count together so the count
+        // is consumed in lockstep with the sum/min/max it summarizes. Order
+        // mirrors `record_rtt_sample` (sum, then count) to minimize the chance
+        // of a concurrent sample being split across two snapshots.
+        let rtt_sum_us = self.rtt_sum_us.swap(0, Ordering::Relaxed);
+        let rtt_samples = self.rtt_samples.swap(0, Ordering::Relaxed);
         let min_rtt_us = self.min_rtt_us.swap(u64::MAX, Ordering::Relaxed);
         let max_rtt_us = self.max_rtt_us.swap(0, Ordering::Relaxed);
-        let rtt_sum_us = self.rtt_sum_us.swap(0, Ordering::Relaxed);
 
         // Compute averages
         let avg_cwnd_bytes = if cwnd_samples > 0 {
