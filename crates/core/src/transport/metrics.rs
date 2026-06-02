@@ -255,7 +255,13 @@ impl TransportMetrics {
     }
 
     /// Record an RTT sample in microseconds.
-    fn record_rtt_sample(&self, rtt_us: u64) {
+    ///
+    /// Called both from [`Self::record_transfer_completed`] (LEDBAT
+    /// `base_delay` at stream completion) and from the ping/pong keep-alive
+    /// cycle in `peer_connection.rs` (round-trip of a keep-alive Ping). The
+    /// keep-alive path is what keeps RTT statistics populated for quiet,
+    /// long-lived connections that rarely complete a stream transfer (#4000).
+    pub(crate) fn record_rtt_sample(&self, rtt_us: u64) {
         self.rtt_sum_us
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                 Some(v.saturating_add(rtt_us))
@@ -288,6 +294,16 @@ impl TransportMetrics {
     /// without interfering with the periodic telemetry snapshots.
     pub fn cumulative_bytes_sent(&self) -> u64 {
         self.cumulative_bytes_sent.load(Ordering::Relaxed)
+    }
+
+    /// Number of RTT samples accumulated in the current snapshot window.
+    ///
+    /// Reset to 0 by `take_snapshot`. Exposed so tests can assert that a
+    /// code path (e.g. the ping/pong keep-alive cycle) actually recorded a
+    /// sample without consuming the snapshot.
+    #[cfg(test)]
+    pub(crate) fn rtt_sample_count(&self) -> u32 {
+        self.rtt_samples.load(Ordering::Relaxed)
     }
 
     /// Record a completed inbound stream transfer.
