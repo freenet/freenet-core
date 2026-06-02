@@ -2478,7 +2478,21 @@ fn install_user_service() -> Result<()> {
     let service_content = generate_user_service_file(&exe_path, &log_dir);
     let service_path = service_dir.join("freenet.service");
 
-    fs::write(&service_path, service_content).context("Failed to write service file")?;
+    fs::write(&service_path, &service_content).context("Failed to write service file")?;
+
+    // Sidecar records the unit's SHA-256 so a later `freenet update` can
+    // distinguish "Freenet's unit" from a hand-edited one before
+    // overwriting (#4287). A failed sidecar write only weakens future
+    // user-modification protection — warn and continue.
+    let hash_path = service_path.with_extension("service.hash");
+    let unit_hash = super::update::wrapper_content_hash(&service_content);
+    if let Err(e) = super::update::write_wrapper_hash_sidecar(&hash_path, &unit_hash) {
+        eprintln!(
+            "Warning: failed to write service hash sidecar at {}: {}.",
+            hash_path.display(),
+            e
+        );
+    }
 
     // Reload systemd user daemon
     systemctl_with_hint(false, &["daemon-reload"], "reload systemd daemon")?;
@@ -2539,6 +2553,22 @@ fn install_system_service() -> Result<()> {
              Are you running as root? Try: sudo freenet service install --system"
         )
     })?;
+
+    // Sidecar records the unit's SHA-256 so a later `freenet update` can
+    // distinguish "Freenet's unit" from a hand-edited one before
+    // overwriting (#4287). Lives next to the root-owned unit and is
+    // written by the same root process, so root owns it too. A failed
+    // sidecar write only weakens future user-modification protection —
+    // warn and continue.
+    let system_hash_path = Path::new(SYSTEM_SERVICE_PATH).with_extension("service.hash");
+    let unit_hash = super::update::wrapper_content_hash(&service_content);
+    if let Err(e) = super::update::write_wrapper_hash_sidecar(&system_hash_path, &unit_hash) {
+        eprintln!(
+            "Warning: failed to write service hash sidecar at {}: {}.",
+            system_hash_path.display(),
+            e
+        );
+    }
 
     // Reload systemd daemon (system-level, no --user)
     let status = systemctl(true, &["daemon-reload"])?;
