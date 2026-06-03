@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use replay_harness::controllers::{FixedRate, RfcDraft};
+use replay_harness::controllers::{FixedRate, LedbatPlusPlus, RfcDraft};
 use replay_harness::scenarios::{Expectation, Scenario, all_scenarios, find};
 use replay_harness::{Controller, RateDecision, Replayer};
 
@@ -35,6 +35,14 @@ fn expected_fires(controller: &str, scenario: &str) -> bool {
         // the harness exists to demonstrate, and the failure mode any
         // Phase 2 candidate must NOT repeat.
         (("rfc_draft", "idle_steady_state"), true),
+        // RfcDraft fires on reference_diverges_from_overlay because it is
+        // reference-blind: it sees correlated overlay inflation and cannot
+        // tell overlay queueing from local uplink contention. The flat
+        // reference path (which says "do NOT fire") is exactly the signal
+        // it ignores. Pinned as the documented limitation a reference-aware
+        // Phase 2 controller must fix — same overlay input as
+        // reference_tracks_overlay, opposite correct action.
+        (("rfc_draft", "reference_diverges_from_overlay"), true),
     ]
     .into_iter()
     .collect();
@@ -132,4 +140,75 @@ fn rfc_draft_correlated_inflation_first_fire_is_inside_burst_window() {
             d.rate_after_bps,
         );
     }
+}
+
+/// The LEDBAT++ death spiral, pinned. `single_packet_loss` is a transient
+/// spike on a *single* peer. LEDBAT++ reacts to the worst connection, so it
+/// cuts the aggregate rate hard and then recovers slowly; RfcDraft takes the
+/// cross-peer median, rejects the outlier, and never moves the rate. The
+/// contrast on identical input is the whole point of the scenario.
+#[test]
+fn ledbat_single_packet_loss_death_spiral() {
+    let s = find("single_packet_loss").expect("scenario exists");
+
+    // Derive the starting rate from a no-op FixedRate run rather than
+    // hard-coding the Replayer default, so this test doesn't pin a magic number.
+    let starting = Replayer::new()
+        .run_until(s.run_for)
+        .run(s.events.clone().into_iter(), FixedRate)
+        .final_rate_bps;
+
+    let ledbat = Replayer::new()
+        .run_until(s.run_for)
+        .run(s.events.clone().into_iter(), LedbatPlusPlus::default());
+
+    // 1. A deep multiplicative cut actually happened.
+    assert!(
+        ledbat.min_rate_bps <= starting / 2,
+        "LEDBAT++ should cut hard on the spike; min_rate_bps={} (> half of {starting})",
+        ledbat.min_rate_bps,
+    );
+    // 2. Additive increase is capped at the starting rate — it never overshoots.
+    assert!(
+        ledbat.max_rate_bps <= starting,
+        "max_rate_bps={} exceeded starting rate {starting}",
+        ledbat.max_rate_bps,
+    );
+
+    // 3. The defining asymmetry: the cut is fast, the recovery is slow. Measure
+    // ticks from the last pre-drop tick to the trough, vs ticks from the trough
+    // back up to within 90% of the starting rate.
+    let rates: Vec<u64> = ledbat.log.iter().map(|d| d.rate_after_bps).collect();
+    let trough = *rates.iter().min().expect("non-empty trace");
+    let trough_idx = rates
+        .iter()
+        .position(|&r| r == trough)
+        .expect("trough is in the trace");
+    let drop_start = rates[..trough_idx]
+        .iter()
+        .rposition(|&r| r >= starting)
+        .unwrap_or(0);
+    let drop_ticks = trough_idx - drop_start;
+    let recover_to = (starting as f64 * 0.9) as u64;
+    let recover_ticks = rates[trough_idx..]
+        .iter()
+        .position(|&r| r >= recover_to)
+        .expect("LEDBAT++ should recover toward the ceiling within the run");
+    assert!(
+        recover_ticks > drop_ticks * 3,
+        "death-spiral asymmetry not demonstrated: drop took {drop_ticks} ticks, \
+         recovery took {recover_ticks} ticks",
+    );
+
+    // 4. Contrast: RfcDraft's cross-peer median rejects the single-peer outlier,
+    // so it never changes the rate on the same input.
+    let rfc = Replayer::new()
+        .run_until(s.run_for)
+        .run(s.events.clone().into_iter(), RfcDraft::default());
+    assert_eq!(
+        rfc.decisions_set, 0,
+        "RfcDraft must hold on single_packet_loss (cross-peer median rejects the outlier)",
+    );
+    assert_eq!(rfc.min_rate_bps, starting);
+    assert_eq!(rfc.max_rate_bps, starting);
 }

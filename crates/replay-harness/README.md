@@ -43,9 +43,12 @@ cargo run -p replay-harness -- synthetic all --controller fixed_rate
 cargo test -p replay-harness
 ```
 
-## What's pinned in v1
+## What's pinned
 
-Four scenarios, chosen to cover the most important pins for Phase 2 design:
+Ten scenarios covering the failure modes Phase 2 design has to clear. "Sane
+behaviour" is what a *correct* controller must do; some current controllers
+deliberately disagree (see below), and those disagreements are pinned per
+`(controller, scenario)` in `tests/scenarios_pin.rs`.
 
 | Scenario | What it pins | Sane behaviour |
 |---|---|---|
@@ -53,17 +56,35 @@ Four scenarios, chosen to cover the most important pins for Phase 2 design:
 | `correlated_inflation` | Every peer's RTT rises together — the actual contention case | MUST fire at least once |
 | `single_peer_outlier` | One peer at 500 ms, four others at baseline | MUST NOT fire (cross-peer median rejects) |
 | `small_n` | Only 2 peers — below the `rolling_rtt_stats.rs` N≥3 trustworthy threshold | MUST NOT fire (N≥3 guard) |
+| `single_packet_loss` | A transient 10× spike on one peer | MUST NOT fire (transient single-connection outlier) |
+| `slow_routing_drift` | Baseline drifts up 5 ms/min for 30 min (a real path change) | MUST NOT fire (5-min baseline tracks the drift) |
+| `churning_peers` | Peers join/leave every 30 s with healthy RTTs | MUST NOT fire (churn alone is not a signal) |
+| `cold_start` | New peers on a slow path, no baseline history | MUST NOT fire (high RTT ≠ rising RTT; no panic) |
+| `reference_diverges_from_overlay` | Overlay inflates, reference path stays flat | MUST NOT fire (overlay queueing, not uplink contention) |
+| `reference_tracks_overlay` | Overlay and reference inflate together | MUST fire (shared cause is the local uplink) |
 
-The `RfcDraft` reference controller intentionally **fails** the
-`idle_steady_state` pin (48 fires across the 300 s scenario, rate
-floors at 1 bps after enough successive 0.7× downsteps). That failure
-is the demonstration of the noise-floor problem the Phase 1 telemetry
-already showed: the 30 ms inflation threshold sits well below the
-ambient overlay queueing baseline, so the controller fires on healthy
-ambient noise. Any Phase 2 candidate MUST NOT repeat that failure.
+### Controllers, and their documented failures
 
-`FixedRate` (the production default) passes the universal sanity check
-of "never fires on any scenario."
+- **`FixedRate`** (production default) passes the universal sanity check of
+  "never fires on any scenario."
+- **`RfcDraft`** (the algorithm sketched in #4074) intentionally **fails** two
+  pins, and those failures are the point:
+  - `idle_steady_state` — fires 48 times across 300 s. The 30 ms inflation
+    threshold sits below the ambient overlay noise floor Phase 1 telemetry
+    measured, so it reacts to healthy noise.
+  - `reference_diverges_from_overlay` — fires because it is reference-blind. It
+    cannot distinguish overlay queueing from uplink contention, which is the
+    entire reason the Phase 1.5 reference-ping signal (#4292) exists. It gets
+    `reference_tracks_overlay` "right" only by luck (it fires on both). A
+    reference-aware Phase 2 controller must fire on `tracks` and hold on
+    `diverges`.
+- **`ledbat`** (a stripped-down LEDBAT++) exists to reproduce the **death
+  spiral** that got LEDBAT++ abandoned in production. It reacts to the *worst*
+  single connection's queueing delay, so on `single_packet_loss` one peer's
+  transient spike drives a deep multiplicative cut (down to ~12% of the
+  starting rate) followed by slow additive recovery — while `RfcDraft`'s
+  cross-peer median rejects the same outlier and never moves. The asymmetric
+  drop/recover trajectory is pinned in `tests/scenarios_pin.rs`.
 
 ## Adding a controller
 
