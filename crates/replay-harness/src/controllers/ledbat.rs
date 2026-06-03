@@ -77,7 +77,14 @@ impl Controller for LedbatPlusPlus {
             // No defined inflation anywhere yet (cold network): nothing to act on.
             None => RateDecision::Hold,
             Some(queue_delay) if queue_delay > TARGET => {
-                let new = ((rate as f64 * MD_FACTOR).round() as u64).max(FLOOR_BPS);
+                // Multiplicative decrease, floored. The trailing `.min(rate)`
+                // keeps a "decrease" from ever raising the rate: if the
+                // configured starting rate is already below FLOOR_BPS, the
+                // `.max(FLOOR_BPS)` would otherwise clamp *upward* and emit an
+                // increase mislabelled as a cut.
+                let new = ((rate as f64 * MD_FACTOR).round() as u64)
+                    .max(FLOOR_BPS)
+                    .min(rate);
                 decide(rate, new, "ledbat_md_on_queue_delay")
             }
             Some(_) => {

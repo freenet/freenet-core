@@ -34,7 +34,13 @@ pub fn scenario() -> Scenario {
     let baseline_ms = 30;
     let spike_ms = 300; // 10× the baseline
     let spike_start = 60;
-    let spike_end = 66; // ~6 s: enough to dominate peer-0's 10 s recent median
+    // The spike must last long enough to tip peer-0's 10 s recent-median
+    // window. At 1 Hz that window holds 11 samples and the upper-middle median
+    // only flips to the spike value once >=6 of them are spike samples, so ~6 s
+    // is the bare minimum that reproduces the death spiral at all. Use 10 s for
+    // headroom — do NOT reduce below ~7 s or the median stops tipping and the
+    // `ledbat_single_packet_loss_death_spiral` pin silently stops reproducing.
+    let spike_end = 70;
 
     for peer_idx in 0..n_peers {
         let peer = format!("peer-{peer_idx}");
@@ -57,7 +63,7 @@ pub fn scenario() -> Scenario {
     Scenario {
         name: "single_packet_loss",
         description: "4 peers at a flat 30 ms baseline; one peer takes a transient 10× \
-             (300 ms) excursion for ~6 s, then returns. A cross-peer-median controller \
+             (300 ms) excursion for ~10 s, then returns. A cross-peer-median controller \
              rejects the single-connection outlier and MUST NOT fire; a per-connection \
              controller (LEDBAT++) cuts hard and recovers slowly — the death spiral.",
         expectation: Expectation::NeverFires,

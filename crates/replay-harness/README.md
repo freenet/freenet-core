@@ -81,8 +81,8 @@ deliberately disagree (see below), and those disagreements are pinned per
 - **`ledbat`** (a stripped-down LEDBAT++) exists to reproduce the **death
   spiral** that got LEDBAT++ abandoned in production. It reacts to the *worst*
   single connection's queueing delay, so on `single_packet_loss` one peer's
-  transient spike drives a deep multiplicative cut (down to ~12% of the
-  starting rate) followed by slow additive recovery — while `RfcDraft`'s
+  transient spike drives a deep multiplicative cut (down to a few percent of
+  the starting rate) followed by slow additive recovery — while `RfcDraft`'s
   cross-peer median rejects the same outlier and never moves. The asymmetric
   drop/recover trajectory is pinned in `tests/scenarios_pin.rs`.
 

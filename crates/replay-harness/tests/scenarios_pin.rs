@@ -43,6 +43,19 @@ fn expected_fires(controller: &str, scenario: &str) -> bool {
         // Phase 2 controller must fix — same overlay input as
         // reference_tracks_overlay, opposite correct action.
         (("rfc_draft", "reference_diverges_from_overlay"), true),
+        // LedbatPlusPlus is per-connection: it reacts to the single worst
+        // connection's queueing delay with no cross-peer median and no N>=3
+        // guard. So it false-positives on exactly the scenarios that isolate
+        // one bad/inflated connection — the flaw #4074 identifies. For all
+        // four the sane expectation is NeverFires; LEDBAT firing is the
+        // documented failure mode:
+        //   - single_peer_outlier / small_n: reacts to one outlier / tiny N
+        //   - single_packet_loss: the death spiral (also pinned in detail below)
+        //   - reference_diverges_from_overlay: reference-blind, same as RfcDraft
+        (("ledbat", "single_peer_outlier"), true),
+        (("ledbat", "small_n"), true),
+        (("ledbat", "single_packet_loss"), true),
+        (("ledbat", "reference_diverges_from_overlay"), true),
     ]
     .into_iter()
     .collect();
@@ -80,6 +93,23 @@ fn fixed_rate_never_fires_on_any_scenario() {
 fn rfc_draft_outcomes_match_documented_expectations() {
     for s in all_scenarios() {
         let (name, fired) = run(&s, RfcDraft::default());
+        let expected = expected_fires(&name, s.name);
+        assert_eq!(
+            fired, expected,
+            "{name} on {}: fired={fired}, expected={expected}",
+            s.name
+        );
+    }
+}
+
+#[test]
+fn ledbat_outcomes_match_documented_expectations() {
+    // Pin LedbatPlusPlus across the whole scenario matrix, not just the
+    // dedicated death-spiral test, so its per-connection false-positives
+    // (documented via the `ledbat` overrides in `expected_fires`) cannot
+    // silently change when scenarios or the controller are edited.
+    for s in all_scenarios() {
+        let (name, fired) = run(&s, LedbatPlusPlus::default());
         let expected = expected_fires(&name, s.name);
         assert_eq!(
             fired, expected,
