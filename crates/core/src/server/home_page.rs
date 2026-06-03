@@ -1058,10 +1058,17 @@ fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
     if g.contracts.is_empty() {
         let observed = g.observed_count;
         let needed = g.min_samples;
+        // When governance is Off (the default — see `GovernanceConfig`),
+        // no contract is ever scored, so the ramp-up / "scoring activates"
+        // copy below would be misleading on every default node. Render a
+        // disabled message instead.
+        let is_off = matches!(g.mode, network_status::GovernanceModeSnapshot::Off);
         // Tiny pluralization helper so the user-facing messages
         // don't read "1 contracts" — Codex review nit.
         let plural = |n: usize| if n == 1 { "contract" } else { "contracts" };
-        let progress_msg = if needed == 0 {
+        let progress_msg = if is_off {
+            "Governance is off: contracts are not scored, and nothing is evicted.".to_string()
+        } else if needed == 0 {
             "Governance manager is not yet wired.".to_string()
         } else if observed == 0 {
             format!(
@@ -1091,7 +1098,12 @@ fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
                 n_word = plural(observed),
             )
         };
-        let verdict_main = if observed >= needed {
+        let verdict_main = if is_off {
+            r#"<div class="verdict-num">—</div>
+                   <div class="verdict-headline">Governance off</div>
+                   <div class="verdict-detail">Contracts are not scored or evicted.</div>"#
+                .to_string()
+        } else if observed >= needed {
             format!(
                 r#"<div class="verdict-num">✓</div>
                    <div class="verdict-headline">{observed} contracts within normal range</div>
@@ -5350,6 +5362,37 @@ mod tests {
         assert!(
             html.contains("once 1 more contract accumulates"),
             "with remaining=1 message must use singular 'contract accumulates' — got:\n{html}"
+        );
+    }
+
+    #[test]
+    fn governance_card_empty_state_off_mode_is_disabled() {
+        // Regression (#4338 review): with the default mode now Off, the
+        // empty state must NOT claim "scoring activates after N contracts"
+        // — scoring never activates while Off, so that copy is misleading
+        // on every default node. It must say governance is off instead.
+        let mut snap = base_snapshot();
+        snap.governance = GovernanceSnapshot {
+            mode: GovernanceModeSnapshot::Off,
+            contracts: Vec::new(),
+            norms: NetworkNorms::default(),
+            observed_count: 0,
+            min_samples: 30,
+            last_tick_at: None,
+            state_by_id: std::collections::HashMap::new(),
+        };
+        let html = build_governance_card(&Some(snap));
+        assert!(
+            html.contains("Governance is off"),
+            "Off empty state must say governance is off — got:\n{html}"
+        );
+        assert!(
+            !html.contains("Scoring activates"),
+            "Off empty state must NOT claim scoring will activate — got:\n{html}"
+        );
+        assert!(
+            html.contains(r#"g-mode g-mode-off">off<"#),
+            "Off empty state must show the off mode pill — got:\n{html}"
         );
     }
 
