@@ -105,7 +105,7 @@ freenet secrets kek-migrate       --secrets-dir <path> --to     {keyring|systemd
 freenet secrets kek-rotate        --secrets-dir <path> --yes   # NOT YET IMPLEMENTED (#4137)
 freenet secrets snapshot-list     --secrets-dir <path> [--delegate <key>] [--secret <id>]
 freenet secrets snapshot-restore  --secrets-dir <path> --delegate <key> --secret <id> \
-                                  --timestamp-ms <ms> --yes
+                                  --timestamp-ms <ms> [--suffix <n>] --yes
 ```
 
 `kek-init` opts in to a specific backend BEFORE first start. It refuses
@@ -130,8 +130,12 @@ read-only, so it is safe to run while the node is up (a stopped node
 just gives a point-in-time-consistent view).
 
 `snapshot-restore` rolls one secret back to the snapshot identified by
-`--timestamp-ms` (copy the value from `snapshot-list`). The current
-active value is snapshotted first, so the restore is itself reversible.
+`--timestamp-ms` (copy the value from `snapshot-list`). If two writes
+landed in the same millisecond, `snapshot-list` shows multiple rows at
+that timestamp with a `suffix` (`-`, `0`, `1`, …); pass `--suffix <n>`
+to target the `.n` row (omit it to restore the unsuffixed `-` row, which
+is also the only entry when there is no collision). The current active
+value is snapshotted first, so the restore is itself reversible.
 Restore is a byte-level copy: the restored ciphertext stays decryptable
 by the same KEK-derived DEK that wrote it, so it only makes sense on the
 node that owns the secrets — snapshots are **not** portable across nodes

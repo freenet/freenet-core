@@ -453,22 +453,30 @@ pub enum RestoreError {
 ///    atomically rename onto the active path,
 /// 3. thin the snapshot history per `retention`.
 ///
-/// If several snapshots share `timestamp_ms` (same-millisecond collision
-/// suffixes), the unsuffixed file wins, then the lowest-numbered suffix —
-/// matching `SecretsStore::restore_snapshot`.
+/// `suffix` selects among same-millisecond collision entries (which
+/// [`list_snapshots`] / `snapshot-list` surface as the `suffix` column):
+/// - `None` — the unsuffixed file wins, then the lowest-numbered suffix
+///   (the historical `SecretsStore::restore_snapshot` behavior; the
+///   common case, since a timestamp without collisions has exactly one
+///   entry).
+/// - `Some(n)` — restore exactly the `.n` collision entry, so an operator
+///   can target a specific row from the listing rather than silently
+///   getting the unsuffixed one.
 ///
-/// Shared by `SecretsStore::restore_snapshot` (node runtime; it adds the
-/// in-memory + ReDb index repair) and the `freenet secrets
-/// snapshot-restore` CLI (node stopped). Byte-level copy: the restored
-/// ciphertext stays decryptable by whatever cipher wrote it.
+/// Shared by `SecretsStore::restore_snapshot` (node runtime; passes
+/// `None` and adds the in-memory + ReDb index repair) and the `freenet
+/// secrets snapshot-restore` CLI (node stopped). Byte-level copy: the
+/// restored ciphertext stays decryptable by whatever cipher wrote it.
 ///
 /// # Errors
-/// - [`RestoreError::NotFound`] if no snapshot matches `timestamp_ms`.
+/// - [`RestoreError::NotFound`] if no snapshot matches `timestamp_ms`
+///   (and, when `suffix` is `Some(n)`, the `.n` entry).
 /// - [`RestoreError::Io`] for filesystem errors during the restore.
 pub fn restore_snapshot_file(
     delegate_dir: &Path,
     secret_encoded: &str,
     timestamp_ms: u64,
+    suffix: Option<u32>,
     snapshots_enabled: bool,
     retention: &RetentionPolicy,
     now: SystemTime,
@@ -476,17 +484,25 @@ pub fn restore_snapshot_file(
     let snap_dir = snapshot_dir_for_encoded(delegate_dir, secret_encoded);
     let secret_file_path = delegate_dir.join(secret_encoded);
 
-    // Disambiguation rule: unsuffixed file wins, then lowest-numbered
-    // suffix. `None` sorts before `Some(_)` via the (0, 0) key.
     let entries = list_snapshots(&snap_dir)?;
-    let chosen = entries
-        .iter()
-        .filter(|m| m.timestamp_ms == timestamp_ms)
-        .min_by_key(|m| match m.suffix {
-            None => (0u32, 0u32),
-            Some(s) => (1, s),
-        })
-        .ok_or(RestoreError::NotFound(timestamp_ms))?;
+    let chosen = match suffix {
+        // Explicit selector: the exact `.n` collision entry. A missing
+        // `.n` is NotFound (never a silent fallback to the unsuffixed
+        // file, which would restore the wrong ciphertext).
+        Some(want) => entries
+            .iter()
+            .find(|m| m.timestamp_ms == timestamp_ms && m.suffix == Some(want)),
+        // Default disambiguation: unsuffixed file wins, then lowest-
+        // numbered suffix. `None` sorts before `Some(_)` via the (0,0) key.
+        None => entries
+            .iter()
+            .filter(|m| m.timestamp_ms == timestamp_ms)
+            .min_by_key(|m| match m.suffix {
+                None => (0u32, 0u32),
+                Some(s) => (1, s),
+            }),
+    }
+    .ok_or(RestoreError::NotFound(timestamp_ms))?;
     let chosen_path = chosen.path.clone();
 
     // Snapshot the value currently at the active path so the restore is
@@ -900,6 +916,7 @@ mod tests {
             &delegate_dir,
             secret,
             1000,
+            None,
             true,
             &RetentionPolicy::default(),
             SystemTime::now(),
@@ -928,6 +945,7 @@ mod tests {
             &delegate_dir,
             secret,
             stamp,
+            None,
             true,
             &RetentionPolicy::default(),
             SystemTime::now(),
@@ -964,6 +982,7 @@ mod tests {
             &delegate_dir,
             secret,
             999,
+            None,
             true,
             &RetentionPolicy::default(),
             SystemTime::now(),
@@ -983,6 +1002,7 @@ mod tests {
             &delegate_dir,
             "neversnapshotted",
             1,
+            None,
             true,
             &RetentionPolicy::default(),
             SystemTime::now(),
@@ -1014,12 +1034,63 @@ mod tests {
             &delegate_dir,
             secret,
             50,
+            None,
             false,
             &RetentionPolicy::default(),
             SystemTime::now(),
         )
         .expect("restore must succeed");
         assert_eq!(fs::read(delegate_dir.join(secret)).unwrap(), b"unsuffixed");
+    }
+
+    #[test]
+    fn restore_snapshot_file_targets_explicit_suffix() {
+        // The listing exposes collision suffixes; restore must be able to
+        // target a specific one rather than silently picking unsuffixed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let delegate_dir = dir.path().join("delegateA");
+        let secret = "secretX";
+        let snap_dir = snapshot_dir_for_encoded(&delegate_dir, secret);
+        fs::create_dir_all(&snap_dir).unwrap();
+        let base = format!(
+            "{stamp:0width$}",
+            stamp = 50u64,
+            width = SNAPSHOT_NAME_WIDTH
+        );
+        fs::write(snap_dir.join(&base), b"unsuffixed").unwrap();
+        fs::write(snap_dir.join(format!("{base}.0")), b"suffix-zero").unwrap();
+        fs::write(snap_dir.join(format!("{base}.1")), b"suffix-one").unwrap();
+        fs::create_dir_all(&delegate_dir).unwrap();
+        fs::write(delegate_dir.join(secret), b"current").unwrap();
+
+        // Explicit suffix targets the exact `.n` entry.
+        restore_snapshot_file(
+            &delegate_dir,
+            secret,
+            50,
+            Some(1),
+            false,
+            &RetentionPolicy::default(),
+            SystemTime::now(),
+        )
+        .expect("restore must succeed");
+        assert_eq!(fs::read(delegate_dir.join(secret)).unwrap(), b"suffix-one");
+
+        // A missing suffix is NotFound, never a silent fallback to the
+        // unsuffixed entry (which would restore the wrong ciphertext).
+        let err = restore_snapshot_file(
+            &delegate_dir,
+            secret,
+            50,
+            Some(9),
+            false,
+            &RetentionPolicy::default(),
+            SystemTime::now(),
+        )
+        .expect_err("missing suffix must error");
+        assert!(matches!(err, RestoreError::NotFound(50)));
+        // Active unchanged by the failed lookup.
+        assert_eq!(fs::read(delegate_dir.join(secret)).unwrap(), b"suffix-one");
     }
 
     #[test]
@@ -1061,6 +1132,7 @@ mod tests {
             &delegate_dir,
             secret,
             stamp,
+            None,
             true,
             &RetentionPolicy::default(),
             SystemTime::now(),
@@ -1106,6 +1178,7 @@ mod tests {
             &delegate_dir,
             secret,
             1000,
+            None,
             false,
             &RetentionPolicy::default(),
             SystemTime::now(),

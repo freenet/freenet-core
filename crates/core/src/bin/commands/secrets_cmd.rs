@@ -148,6 +148,13 @@ pub struct SnapshotRestoreArgs {
     /// `snapshot-list`).
     #[clap(long)]
     pub timestamp_ms: u64,
+    /// Collision suffix (the `suffix` column from `snapshot-list`), for
+    /// the rare case of multiple same-millisecond snapshots at one
+    /// timestamp. Omit to restore the unsuffixed snapshot at the
+    /// timestamp (the `-` row, and the only entry when there is no
+    /// collision); pass the number to target a specific collision row.
+    #[clap(long)]
+    pub suffix: Option<u32>,
     /// Skip the interactive confirmation prompt (for scripted use).
     #[clap(long)]
     pub yes: bool,
@@ -594,17 +601,23 @@ async fn snapshot_restore(args: SnapshotRestoreArgs) -> Result<()> {
         );
     }
 
+    // Human-readable selector for messages: "timestamp_ms=N" or
+    // "timestamp_ms=N suffix=K".
+    let selector = match args.suffix {
+        Some(s) => format!("timestamp_ms={} suffix={s}", args.timestamp_ms),
+        None => format!("timestamp_ms={}", args.timestamp_ms),
+    };
+
     if !args.yes {
         eprintln!(
             "About to restore secret `{}` of delegate `{}` to the snapshot at \
-             timestamp_ms={} in {}.\n\
+             {selector} in {}.\n\
              - The current value is snapshotted first, so this is reversible.\n\
              - The freenet node MUST be stopped (a running node may concurrently \
                write this secret).\n\
              Re-run with --yes to proceed.",
             args.secret,
             args.delegate,
-            args.timestamp_ms,
             args.secrets_dir.display()
         );
         bail!("aborted (no --yes)");
@@ -618,21 +631,22 @@ async fn snapshot_restore(args: SnapshotRestoreArgs) -> Result<()> {
         &delegate_dir,
         &args.secret,
         args.timestamp_ms,
+        args.suffix,
         true,
         &RetentionPolicy::default(),
         std::time::SystemTime::now(),
     ) {
         Ok(()) => {
             println!(
-                "Restored secret `{}` of delegate `{}` to snapshot timestamp_ms={}.",
-                args.secret, args.delegate, args.timestamp_ms
+                "Restored secret `{}` of delegate `{}` to snapshot {selector}.",
+                args.secret, args.delegate
             );
             Ok(())
         }
-        Err(RestoreError::NotFound(ts)) => bail!(
-            "no snapshot at timestamp_ms={ts} for secret `{}` of delegate `{}`. Run \
+        Err(RestoreError::NotFound(_)) => bail!(
+            "no snapshot at {selector} for secret `{}` of delegate `{}`. Run \
              `freenet secrets snapshot-list --secrets-dir {} --delegate {} --secret {}` to see \
-             available timestamps.",
+             available timestamps (and suffixes).",
             args.secret,
             args.delegate,
             args.secrets_dir.display(),
@@ -955,6 +969,7 @@ mod tests {
             delegate: delegate.to_string(),
             secret: secret.to_string(),
             timestamp_ms,
+            suffix: None,
             yes,
         }
     }
@@ -1122,6 +1137,46 @@ mod tests {
         assert!(
             res.is_err(),
             "--secret without --delegate must fail to parse"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_suffix_targets_collision_entry() {
+        // Same-millisecond collisions produce unsuffixed + `.0` + `.1`
+        // rows in `snapshot-list`; `--suffix` must be able to target each.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secrets_dir = dir.path();
+        let snap_dir = secrets_dir.join("D").join(".snapshots").join("S");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        let base = format!("{:020}", 1000u64);
+        std::fs::write(snap_dir.join(&base), b"unsuffixed").unwrap();
+        std::fs::write(snap_dir.join(format!("{base}.0")), b"suffix-zero").unwrap();
+        std::fs::write(snap_dir.join(format!("{base}.1")), b"suffix-one").unwrap();
+        std::fs::create_dir_all(secrets_dir.join("D")).unwrap();
+        std::fs::write(secrets_dir.join("D").join("S"), b"current").unwrap();
+
+        // A non-existent suffix is rejected (not silently downgraded), and
+        // the error names the suffix. Run first so it can't see mutated state.
+        let mut args = restore_args(secrets_dir, "D", "S", 1000, true);
+        args.suffix = Some(9);
+        let err = snapshot_restore(args)
+            .await
+            .expect_err("missing suffix must error");
+        assert!(err.to_string().contains("suffix=9"));
+        assert_eq!(
+            std::fs::read(secrets_dir.join("D").join("S")).unwrap(),
+            b"current"
+        );
+
+        // Explicit suffix targets the exact collision row.
+        let mut args = restore_args(secrets_dir, "D", "S", 1000, true);
+        args.suffix = Some(1);
+        snapshot_restore(args)
+            .await
+            .expect("restore .1 must succeed");
+        assert_eq!(
+            std::fs::read(secrets_dir.join("D").join("S")).unwrap(),
+            b"suffix-one"
         );
     }
 }

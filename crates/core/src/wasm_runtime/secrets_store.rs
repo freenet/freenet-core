@@ -719,6 +719,9 @@ impl SecretsStore {
             &delegate_path,
             &key.encode(),
             timestamp_ms,
+            // The runtime API selects by timestamp only (unsuffixed-wins);
+            // explicit collision-suffix selection is a CLI affordance.
+            None,
             self.snapshots_enabled,
             &self.retention,
             SystemTime::now(),
