@@ -148,13 +148,13 @@ node runtime's `SecretsStore::restore_snapshot`. `--delegate` and
 `--secret` must be single path components (the bs58 ids printed by
 `snapshot-list`); values containing `/` or `..` are rejected.
 
-After a successful restore the shared core thins the history under the
-default retention policy, the same as a normal write. One consequence:
-if you restore from a snapshot older than the 2-year `max_age` cap, that
-very old source snapshot is pruned from `.snapshots/` afterward. The
-restore itself is unaffected (the value is already the active secret by
-then) and stays reversible — the prior active value is captured as a
-fresh snapshot before the overwrite.
+After a successful restore, `snapshot-restore` thins the history under
+the default retention policy, the same as a normal write. One
+consequence: if you restore from a snapshot older than the 2-year
+`max_age` cap, that very old source snapshot is pruned from
+`.snapshots/` afterward. The restore itself is unaffected (the value is
+already the active secret by then) and stays reversible — the prior
+active value is captured as a fresh snapshot before the overwrite.
 
 ## File permissions (PR #4195 / issue #4141)
 

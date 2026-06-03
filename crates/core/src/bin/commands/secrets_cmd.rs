@@ -29,7 +29,7 @@ use chrono::{DateTime, Utc};
 use freenet::dev_tool::{
     KEK_SIZE, KekBackendKind, RestoreError, RetentionPolicy, build_backend_for, list_snapshots,
     load_from_backend, read_backend_marker, replace_backend_marker, restore_snapshot_file,
-    snapshot_dir_for_encoded, write_backend_marker,
+    snapshot_dir_for_encoded, thin_snapshots, write_backend_marker,
 };
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -626,17 +626,24 @@ async fn snapshot_restore(args: SnapshotRestoreArgs) -> Result<()> {
     // Byte-level restore via the shared core — the same code the node
     // runtime uses, so the durability discipline can't drift. The
     // reversibility snapshot is always enabled for the CLI (manual
-    // recovery should be undoable); default retention policy.
+    // recovery should be undoable).
     match restore_snapshot_file(
         &delegate_dir,
         &args.secret,
         args.timestamp_ms,
         args.suffix,
         true,
-        &RetentionPolicy::default(),
-        std::time::SystemTime::now(),
     ) {
         Ok(()) => {
+            // Bound the history (incl. the reversibility snapshot just
+            // added), matching the node runtime's default retention.
+            // Best-effort: the restore has already succeeded.
+            let snap_dir = snapshot_dir_for_encoded(&delegate_dir, &args.secret);
+            thin_snapshots(
+                &snap_dir,
+                &RetentionPolicy::default(),
+                std::time::SystemTime::now(),
+            );
             println!(
                 "Restored secret `{}` of delegate `{}` to snapshot {selector}.",
                 args.secret, args.delegate

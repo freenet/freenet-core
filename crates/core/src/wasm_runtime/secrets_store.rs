@@ -675,15 +675,13 @@ impl SecretsStore {
     /// rename and the index update still leaves the active value
     /// readable on the next `get_secret`.
     ///
-    /// The find / reversibility-snapshot / atomic-write / history-thin
-    /// sequence is delegated to the shared [`restore_snapshot_file`] (so
-    /// the node runtime and the `freenet secrets snapshot-restore` CLI
-    /// can't drift); this wrapper adds only the index repair, the one
-    /// step that needs the typed `key` + ReDb. Note the thin therefore
-    /// runs inside the shared core, just before this index repair rather
-    /// than after it — harmless, since thinning only touches the
-    /// `.snapshots/` history while the index repair touches only ReDb /
-    /// the in-memory map.
+    /// The find / reversibility-snapshot / atomic-write sequence is
+    /// delegated to the shared [`restore_snapshot_file`] (so the node
+    /// runtime and the `freenet secrets snapshot-restore` CLI can't
+    /// drift); this wrapper then adds the index repair and the
+    /// best-effort history thin, in that order — matching the
+    /// pre-extraction inline implementation exactly, so a failed index
+    /// repair never prunes snapshot history a retry would need.
     ///
     /// If multiple snapshots share `timestamp_ms` (collision suffixes
     /// from same-millisecond writes), the unsuffixed file wins; absent
@@ -709,12 +707,14 @@ impl SecretsStore {
 
         // Byte-level restore: find the snapshot, reversibly snapshot the
         // current active value, atomic tmp+fsync+rename onto the active
-        // path, then thin. This durability discipline lives in exactly
-        // one place ([`restore_snapshot_file`]) so the node runtime and
-        // the `freenet secrets snapshot-restore` CLI cannot drift. The
-        // CLI cannot reconstruct a `SecretsId` from the on-disk name
-        // (the pre-image bytes are not persisted), so the shared core is
-        // keyed on the encoded secret id rather than the typed `key`.
+        // path. This durability discipline lives in exactly one place
+        // ([`restore_snapshot_file`]) so the node runtime and the
+        // `freenet secrets snapshot-restore` CLI cannot drift. The CLI
+        // cannot reconstruct a `SecretsId` from the on-disk name (the
+        // pre-image bytes are not persisted), so the shared core is keyed
+        // on the encoded secret id rather than the typed `key`. Thinning
+        // is deliberately NOT part of the core — we thin below, after the
+        // index repair, to preserve the pre-extraction order.
         match restore_snapshot_file(
             &delegate_path,
             &key.encode(),
@@ -723,8 +723,6 @@ impl SecretsStore {
             // explicit collision-suffix selection is a CLI affordance.
             None,
             self.snapshots_enabled,
-            &self.retention,
-            SystemTime::now(),
         ) {
             Ok(()) => {}
             Err(RestoreError::NotFound(timestamp_ms)) => {
@@ -757,6 +755,19 @@ impl SecretsStore {
                 })?;
             let secret_set: HashSet<SecretKey> = current_secrets.into_iter().collect();
             self.key_to_secret_part.insert(delegate.clone(), secret_set);
+        }
+
+        // Best-effort thin LAST — only after the index repair above has
+        // committed. Mirrors the pre-extraction order: a failed
+        // `store_secrets_index` early-returns above, so the snapshot
+        // history is left intact for a clean retry instead of having
+        // already pruned source snapshots. Thinning touches only
+        // `.snapshots/`; a failure here self-corrects on the next write.
+        if self.snapshots_enabled {
+            let snap_dir = snapshot_dir_for(&delegate_path, key);
+            if snap_dir.exists() {
+                thin_snapshots(&snap_dir, &self.retention, SystemTime::now());
+            }
         }
 
         Ok(())

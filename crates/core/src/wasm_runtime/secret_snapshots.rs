@@ -450,8 +450,15 @@ pub enum RestoreError {
 /// 1. snapshot the current active value first (so the restore is itself
 ///    reversible) when `snapshots_enabled`,
 /// 2. copy the chosen snapshot to a sibling `.tmp`, fsync, then
-///    atomically rename onto the active path,
-/// 3. thin the snapshot history per `retention`.
+///    atomically rename onto the active path.
+///
+/// History thinning is intentionally NOT done here — callers thin AFTER
+/// their own post-restore bookkeeping. The node runtime thins only after
+/// its ReDb index repair commits, so a failed repair cannot prune source
+/// history a retry would need; the CLI thins right after a successful
+/// restore. (Keeping thin out of the shared core is what makes the
+/// runtime path byte-for-byte order-preserving vs. the pre-extraction
+/// inline implementation.)
 ///
 /// `suffix` selects among same-millisecond collision entries (which
 /// [`list_snapshots`] / `snapshot-list` surface as the `suffix` column):
@@ -478,8 +485,6 @@ pub fn restore_snapshot_file(
     timestamp_ms: u64,
     suffix: Option<u32>,
     snapshots_enabled: bool,
-    retention: &RetentionPolicy,
-    now: SystemTime,
 ) -> Result<(), RestoreError> {
     let snap_dir = snapshot_dir_for_encoded(delegate_dir, secret_encoded);
     let secret_file_path = delegate_dir.join(secret_encoded);
@@ -539,12 +544,6 @@ pub fn restore_snapshot_file(
         return Err(err.into());
     }
 
-    // Best-effort thin: the reversibility snapshot above may have pushed
-    // the history one over the policy target. Self-correcting on the next
-    // write even if this pass fails.
-    if snapshots_enabled && snap_dir.exists() {
-        thin_snapshots(&snap_dir, retention, now);
-    }
     Ok(())
 }
 
@@ -912,16 +911,8 @@ mod tests {
         fs::create_dir_all(&delegate_dir).unwrap();
         fs::write(delegate_dir.join(secret), b"current-value").unwrap();
 
-        restore_snapshot_file(
-            &delegate_dir,
-            secret,
-            1000,
-            None,
-            true,
-            &RetentionPolicy::default(),
-            SystemTime::now(),
-        )
-        .expect("restore must succeed");
+        restore_snapshot_file(&delegate_dir, secret, 1000, None, true)
+            .expect("restore must succeed");
 
         assert_eq!(fs::read(delegate_dir.join(secret)).unwrap(), b"old-value");
     }
@@ -941,16 +932,8 @@ mod tests {
         fs::create_dir_all(&delegate_dir).unwrap();
         fs::write(delegate_dir.join(secret), b"current-value").unwrap();
 
-        restore_snapshot_file(
-            &delegate_dir,
-            secret,
-            stamp,
-            None,
-            true,
-            &RetentionPolicy::default(),
-            SystemTime::now(),
-        )
-        .expect("restore must succeed");
+        restore_snapshot_file(&delegate_dir, secret, stamp, None, true)
+            .expect("restore must succeed");
 
         let snaps = list_snapshots(&snap_dir).expect("list");
         assert!(
@@ -978,16 +961,8 @@ mod tests {
         fs::create_dir_all(&delegate_dir).unwrap();
         fs::write(delegate_dir.join(secret), b"current").unwrap();
 
-        let err = restore_snapshot_file(
-            &delegate_dir,
-            secret,
-            999,
-            None,
-            true,
-            &RetentionPolicy::default(),
-            SystemTime::now(),
-        )
-        .expect_err("unknown timestamp must error");
+        let err = restore_snapshot_file(&delegate_dir, secret, 999, None, true)
+            .expect_err("unknown timestamp must error");
         assert!(matches!(err, RestoreError::NotFound(999)));
         // Active value untouched on the error path.
         assert_eq!(fs::read(delegate_dir.join(secret)).unwrap(), b"current");
@@ -998,16 +973,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let delegate_dir = dir.path().join("delegateA");
         // Secret never had a snapshot directory at all.
-        let err = restore_snapshot_file(
-            &delegate_dir,
-            "neversnapshotted",
-            1,
-            None,
-            true,
-            &RetentionPolicy::default(),
-            SystemTime::now(),
-        )
-        .expect_err("missing history must error");
+        let err = restore_snapshot_file(&delegate_dir, "neversnapshotted", 1, None, true)
+            .expect_err("missing history must error");
         assert!(matches!(err, RestoreError::NotFound(1)));
     }
 
@@ -1030,16 +997,8 @@ mod tests {
 
         // snapshots_enabled=false isolates the disambiguation from the
         // reversibility snapshot.
-        restore_snapshot_file(
-            &delegate_dir,
-            secret,
-            50,
-            None,
-            false,
-            &RetentionPolicy::default(),
-            SystemTime::now(),
-        )
-        .expect("restore must succeed");
+        restore_snapshot_file(&delegate_dir, secret, 50, None, false)
+            .expect("restore must succeed");
         assert_eq!(fs::read(delegate_dir.join(secret)).unwrap(), b"unsuffixed");
     }
 
@@ -1064,30 +1023,14 @@ mod tests {
         fs::write(delegate_dir.join(secret), b"current").unwrap();
 
         // Explicit suffix targets the exact `.n` entry.
-        restore_snapshot_file(
-            &delegate_dir,
-            secret,
-            50,
-            Some(1),
-            false,
-            &RetentionPolicy::default(),
-            SystemTime::now(),
-        )
-        .expect("restore must succeed");
+        restore_snapshot_file(&delegate_dir, secret, 50, Some(1), false)
+            .expect("restore must succeed");
         assert_eq!(fs::read(delegate_dir.join(secret)).unwrap(), b"suffix-one");
 
         // A missing suffix is NotFound, never a silent fallback to the
         // unsuffixed entry (which would restore the wrong ciphertext).
-        let err = restore_snapshot_file(
-            &delegate_dir,
-            secret,
-            50,
-            Some(9),
-            false,
-            &RetentionPolicy::default(),
-            SystemTime::now(),
-        )
-        .expect_err("missing suffix must error");
+        let err = restore_snapshot_file(&delegate_dir, secret, 50, Some(9), false)
+            .expect_err("missing suffix must error");
         assert!(matches!(err, RestoreError::NotFound(50)));
         // Active unchanged by the failed lookup.
         assert_eq!(fs::read(delegate_dir.join(secret)).unwrap(), b"suffix-one");
@@ -1128,16 +1071,8 @@ mod tests {
         fs::write(delegate_dir.join(secret), b"current-value").unwrap();
         fs::set_permissions(delegate_dir.join(secret), fs::Permissions::from_mode(0o600)).unwrap();
 
-        restore_snapshot_file(
-            &delegate_dir,
-            secret,
-            stamp,
-            None,
-            true,
-            &RetentionPolicy::default(),
-            SystemTime::now(),
-        )
-        .expect("restore must succeed");
+        restore_snapshot_file(&delegate_dir, secret, stamp, None, true)
+            .expect("restore must succeed");
 
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(
@@ -1158,40 +1093,34 @@ mod tests {
     }
 
     #[test]
-    fn restore_snapshot_file_disabled_skips_reversibility_and_thin() {
-        // With `snapshots_enabled=false` the restore must still replace the
-        // active value, but skip BOTH the reversibility snapshot and the
-        // thin pass. Seed two ancient snapshots the default policy's 2-year
-        // max_age WOULD prune if thinning ran — their survival proves it
-        // didn't.
+    fn restore_snapshot_file_disabled_skips_reversibility_snapshot() {
+        // `snapshots_enabled=false` replaces the active value but skips the
+        // reversibility snapshot. (Thinning is no longer the core's job —
+        // it lives in the callers — so the only history change a restore
+        // makes here is the reversibility snapshot.)
         let dir = tempfile::tempdir().expect("tempdir");
         let delegate_dir = dir.path().join("delegateA");
         let secret = "secretX";
         let snap_dir = snapshot_dir_for_encoded(&delegate_dir, secret);
         write_snapshot(&snap_dir, 1000, b"v1000");
-        write_snapshot(&snap_dir, 2000, b"v2000");
         fs::create_dir_all(&delegate_dir).unwrap();
         fs::write(delegate_dir.join(secret), b"current").unwrap();
 
         let before = list_snapshots(&snap_dir).unwrap().len();
-        restore_snapshot_file(
-            &delegate_dir,
-            secret,
-            1000,
-            None,
-            false,
-            &RetentionPolicy::default(),
-            SystemTime::now(),
-        )
-        .expect("restore must succeed");
-
+        restore_snapshot_file(&delegate_dir, secret, 1000, None, false)
+            .expect("restore must succeed");
         assert_eq!(fs::read(delegate_dir.join(secret)).unwrap(), b"v1000");
-        let after = list_snapshots(&snap_dir).unwrap();
         assert_eq!(
-            after.len(),
+            list_snapshots(&snap_dir).unwrap().len(),
             before,
-            "disabled restore must neither add a reversibility snapshot nor thin"
+            "disabled restore must not add a reversibility snapshot"
         );
-        assert_eq!(after.len(), 2);
+
+        // Contrast: with `snapshots_enabled=true` the prior active value IS
+        // snapshotted, so the history grows by exactly one (no thinning here).
+        fs::write(delegate_dir.join(secret), b"current2").unwrap();
+        restore_snapshot_file(&delegate_dir, secret, 1000, None, true)
+            .expect("restore must succeed");
+        assert_eq!(list_snapshots(&snap_dir).unwrap().len(), before + 1);
     }
 }

@@ -141,7 +141,7 @@ pub mod dev_tool {
     };
     pub use wasm_runtime::secret_snapshots::{
         RestoreError, RetentionPolicy, SnapshotMetadata, list_snapshots, restore_snapshot_file,
-        snapshot_dir_for_encoded,
+        snapshot_dir_for_encoded, thin_snapshots,
     };
     pub use wasm_runtime::{
         ContractStore, DelegateStore, MockStateStorage, Runtime, SecretStoreError, SecretsStore,
