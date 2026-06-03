@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 // Wall-clock SystemTime (not the project-wide TimeSource trait) is the
 // correct abstraction here: snapshot file names embed epoch_ms so retention
@@ -23,6 +24,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use freenet_stdlib::prelude::SecretsId;
+
+// The owner-only filesystem helpers live next door in `secrets_store`;
+// the snapshot restore path reuses them so the secret-blob and the
+// reversibility-snapshot writes share one perms discipline.
+use super::secrets_store::{create_owner_only, ensure_owner_only_dir};
 
 /// Subdirectory (relative to a delegate's secrets dir) holding the
 /// per-secret snapshot history. Leading dot keeps it visually separate from
@@ -184,11 +190,23 @@ impl RetentionPolicy {
     }
 }
 
+/// Path to the snapshot directory for a delegate secret, keyed on the
+/// secret's on-disk encoded id (bs58 of the secret hash).
+///
+/// This is the form the `freenet secrets` CLI and the filesystem-level
+/// [`restore_snapshot_file`] use: a [`SecretsId`] cannot be reconstructed
+/// from the on-disk directory name alone (the pre-image `key` bytes are
+/// not persisted, only their hash), so any tool that walks the secrets
+/// tree must work from the encoded id string.
+pub fn snapshot_dir_for_encoded(delegate_path: &Path, secret_encoded: &str) -> PathBuf {
+    delegate_path.join(SNAPSHOTS_DIR).join(secret_encoded)
+}
+
 /// Path to the snapshot directory for a particular `(delegate, secret_id)`
 /// pair. Snapshots are organized per secret so retention thinning of one
 /// busy key cannot affect another.
 pub fn snapshot_dir_for(delegate_path: &Path, key: &SecretsId) -> PathBuf {
-    delegate_path.join(SNAPSHOTS_DIR).join(key.encode())
+    snapshot_dir_for_encoded(delegate_path, &key.encode())
 }
 
 /// Pick the snapshot file path for a write happening "now". Uses the
@@ -361,6 +379,157 @@ pub(crate) fn parse_snapshot_name(path: &Path) -> Option<(u64, Option<u32>)> {
         None => None,
     };
     Some((stamp_part.parse().ok()?, suffix))
+}
+
+/// Capture the current active secret file as a snapshot so an overwrite
+/// (a `store_secret`, or a [`restore_snapshot_file`]) is reversible.
+///
+/// Hard-links the active inode into `.snapshots/{secret_encoded}/`
+/// (falling back to a copy on filesystems without hard links, e.g. FAT
+/// or some network mounts), after tightening both the `.snapshots/`
+/// umbrella and the per-secret leaf to owner-only. `active_path` must be
+/// the live secret file (`delegate_dir/{secret_encoded}`); a missing
+/// active file is a no-op (nothing to preserve).
+///
+/// The active file is never mutated here, so a crash mid-snapshot loses
+/// only the snapshot, never the live value. Best-effort by contract of
+/// its callers: they log and continue on error rather than failing the
+/// primary write/restore.
+pub fn snapshot_active_value(
+    delegate_dir: &Path,
+    secret_encoded: &str,
+    active_path: &Path,
+) -> std::io::Result<()> {
+    let snap_dir = snapshot_dir_for_encoded(delegate_dir, secret_encoded);
+    fs::create_dir_all(&snap_dir)?;
+    // Tighten BOTH the intermediate `.snapshots/` umbrella AND the
+    // per-secret leaf. Only chmodding the leaf leaves `.snapshots/` at
+    // the process umask (typically 0o755), which lets any local user
+    // enumerate per-secret subdir names, write counts (epoch_ms
+    // filenames), and write timing.
+    let snap_parent = delegate_dir.join(SNAPSHOTS_DIR);
+    if let Err(e) = ensure_owner_only_dir(&snap_parent) {
+        tracing::warn!(path = %snap_parent.display(), error = %e, "chmod snapshots parent dir failed");
+    }
+    if let Err(e) = ensure_owner_only_dir(&snap_dir) {
+        tracing::warn!(path = %snap_dir.display(), error = %e, "chmod snapshot dir failed");
+    }
+    let snap_path = next_snapshot_path(&snap_dir)?;
+    match fs::hard_link(active_path, &snap_path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => {
+            // Hard-link unsupported (FAT, cross-device, etc.). Copy is
+            // slower but always works; the active file is not mutated
+            // here so the copy can't tear.
+            fs::copy(active_path, &snap_path).map(|_| ())
+        }
+    }
+}
+
+/// Error from the filesystem-level [`restore_snapshot_file`].
+#[derive(Debug, thiserror::Error)]
+pub enum RestoreError {
+    /// No snapshot in the directory matched the requested `timestamp_ms`.
+    #[error("no snapshot at timestamp_ms {0}")]
+    NotFound(u64),
+    /// Filesystem error during the find / copy / rename / fsync sequence.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+}
+
+/// Restore the snapshot matching `timestamp_ms` onto the active secret
+/// path, purely at the filesystem level — no cipher, no ReDb index.
+///
+/// `delegate_dir` is `<secrets_dir>/<delegate_encoded>`; `secret_encoded`
+/// is the on-disk secret file name (bs58 of the secret hash). The active
+/// secret file is `delegate_dir/{secret_encoded}`; its snapshot history
+/// lives in `delegate_dir/.snapshots/{secret_encoded}/`.
+///
+/// Mirrors the durability discipline of `SecretsStore::store_secret`:
+/// 1. snapshot the current active value first (so the restore is itself
+///    reversible) when `snapshots_enabled`,
+/// 2. copy the chosen snapshot to a sibling `.tmp`, fsync, then
+///    atomically rename onto the active path,
+/// 3. thin the snapshot history per `retention`.
+///
+/// If several snapshots share `timestamp_ms` (same-millisecond collision
+/// suffixes), the unsuffixed file wins, then the lowest-numbered suffix —
+/// matching `SecretsStore::restore_snapshot`.
+///
+/// Shared by `SecretsStore::restore_snapshot` (node runtime; it adds the
+/// in-memory + ReDb index repair) and the `freenet secrets
+/// snapshot-restore` CLI (node stopped). Byte-level copy: the restored
+/// ciphertext stays decryptable by whatever cipher wrote it.
+///
+/// # Errors
+/// - [`RestoreError::NotFound`] if no snapshot matches `timestamp_ms`.
+/// - [`RestoreError::Io`] for filesystem errors during the restore.
+pub fn restore_snapshot_file(
+    delegate_dir: &Path,
+    secret_encoded: &str,
+    timestamp_ms: u64,
+    snapshots_enabled: bool,
+    retention: &RetentionPolicy,
+    now: SystemTime,
+) -> Result<(), RestoreError> {
+    let snap_dir = snapshot_dir_for_encoded(delegate_dir, secret_encoded);
+    let secret_file_path = delegate_dir.join(secret_encoded);
+
+    // Disambiguation rule: unsuffixed file wins, then lowest-numbered
+    // suffix. `None` sorts before `Some(_)` via the (0, 0) key.
+    let entries = list_snapshots(&snap_dir)?;
+    let chosen = entries
+        .iter()
+        .filter(|m| m.timestamp_ms == timestamp_ms)
+        .min_by_key(|m| match m.suffix {
+            None => (0u32, 0u32),
+            Some(s) => (1, s),
+        })
+        .ok_or(RestoreError::NotFound(timestamp_ms))?;
+    let chosen_path = chosen.path.clone();
+
+    // Snapshot the value currently at the active path so the restore is
+    // itself reversible. Best-effort: a failure here must not fail the
+    // restore (the primary operation), only forfeit reversibility.
+    if snapshots_enabled
+        && secret_file_path.exists()
+        && let Err(e) = snapshot_active_value(delegate_dir, secret_encoded, &secret_file_path)
+    {
+        tracing::warn!("failed to snapshot active value before restore for {secret_encoded}: {e}");
+    }
+
+    // Read snapshot ciphertext, write through a sibling tmp file with an
+    // atomic rename so the active path never tears. `create_owner_only`
+    // unlinks any surviving `.tmp` from a prior crashed run so the new
+    // inode always lands at mode 0o600.
+    let ciphertext = fs::read(&chosen_path)?;
+    fs::create_dir_all(delegate_dir)?;
+    if let Err(e) = ensure_owner_only_dir(delegate_dir) {
+        tracing::warn!(path = %delegate_dir.display(), error = %e, "chmod delegate dir failed");
+    }
+    let tmp_path = secret_file_path.with_extension("tmp");
+    {
+        let mut file = create_owner_only(&tmp_path)?;
+        file.write_all(&ciphertext)?;
+        file.sync_all()?;
+    }
+    if let Err(err) = fs::rename(&tmp_path, &secret_file_path) {
+        if let Err(rm_err) = fs::remove_file(&tmp_path) {
+            tracing::debug!(
+                "failed to clean up tmp file {tmp_path:?} after rename failure: {rm_err}"
+            );
+        }
+        return Err(err.into());
+    }
+
+    // Best-effort thin: the reversibility snapshot above may have pushed
+    // the history one over the policy target. Self-correcting on the next
+    // write even if this pass fails.
+    if snapshots_enabled && snap_dir.exists() {
+        thin_snapshots(&snap_dir, retention, now);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -691,5 +860,181 @@ mod tests {
         let missing = dir.path().join("never-existed");
         let entries = list_snapshots(&missing).expect("missing dir is not an error");
         assert!(entries.is_empty());
+    }
+
+    fn write_snapshot(snap_dir: &Path, stamp: u64, body: &[u8]) {
+        fs::create_dir_all(snap_dir).unwrap();
+        fs::write(
+            snap_dir.join(format!("{stamp:0width$}", width = SNAPSHOT_NAME_WIDTH)),
+            body,
+        )
+        .unwrap();
+    }
+
+    /// A snapshot timestamp ~1 minute in the past: recent enough to
+    /// survive the default retention policy's 2-year `max_age` cap, so
+    /// tests that assert on post-restore snapshot counts aren't thrown
+    /// off by legitimate thinning of an ancient (epoch-zero) timestamp.
+    fn recent_ms() -> u64 {
+        (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64)
+            - 60_000
+    }
+
+    #[test]
+    fn restore_snapshot_file_replaces_active_with_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let delegate_dir = dir.path().join("delegateA");
+        let secret = "secretX";
+        write_snapshot(
+            &snapshot_dir_for_encoded(&delegate_dir, secret),
+            1000,
+            b"old-value",
+        );
+        fs::create_dir_all(&delegate_dir).unwrap();
+        fs::write(delegate_dir.join(secret), b"current-value").unwrap();
+
+        restore_snapshot_file(
+            &delegate_dir,
+            secret,
+            1000,
+            true,
+            &RetentionPolicy::default(),
+            SystemTime::now(),
+        )
+        .expect("restore must succeed");
+
+        assert_eq!(fs::read(delegate_dir.join(secret)).unwrap(), b"old-value");
+    }
+
+    #[test]
+    fn restore_snapshot_file_is_reversible() {
+        // Restoring must first snapshot the current active value, so the
+        // operation can itself be undone. After the restore the history
+        // contains both the original snapshot and the captured prior
+        // active value.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let delegate_dir = dir.path().join("delegateA");
+        let secret = "secretX";
+        let snap_dir = snapshot_dir_for_encoded(&delegate_dir, secret);
+        let stamp = recent_ms();
+        write_snapshot(&snap_dir, stamp, b"old-value");
+        fs::create_dir_all(&delegate_dir).unwrap();
+        fs::write(delegate_dir.join(secret), b"current-value").unwrap();
+
+        restore_snapshot_file(
+            &delegate_dir,
+            secret,
+            stamp,
+            true,
+            &RetentionPolicy::default(),
+            SystemTime::now(),
+        )
+        .expect("restore must succeed");
+
+        let snaps = list_snapshots(&snap_dir).expect("list");
+        assert!(
+            snaps.len() >= 2,
+            "reversibility snapshot missing; got {}",
+            snaps.len()
+        );
+        let bodies: Vec<Vec<u8>> = snaps.iter().map(|m| fs::read(&m.path).unwrap()).collect();
+        assert!(
+            bodies.iter().any(|b| b.as_slice() == b"current-value"),
+            "prior active value was not snapshotted"
+        );
+    }
+
+    #[test]
+    fn restore_snapshot_file_unknown_timestamp_is_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let delegate_dir = dir.path().join("delegateA");
+        let secret = "secretX";
+        write_snapshot(
+            &snapshot_dir_for_encoded(&delegate_dir, secret),
+            1000,
+            b"old",
+        );
+        fs::create_dir_all(&delegate_dir).unwrap();
+        fs::write(delegate_dir.join(secret), b"current").unwrap();
+
+        let err = restore_snapshot_file(
+            &delegate_dir,
+            secret,
+            999,
+            true,
+            &RetentionPolicy::default(),
+            SystemTime::now(),
+        )
+        .expect_err("unknown timestamp must error");
+        assert!(matches!(err, RestoreError::NotFound(999)));
+        // Active value untouched on the error path.
+        assert_eq!(fs::read(delegate_dir.join(secret)).unwrap(), b"current");
+    }
+
+    #[test]
+    fn restore_snapshot_file_missing_snapshot_dir_is_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let delegate_dir = dir.path().join("delegateA");
+        // Secret never had a snapshot directory at all.
+        let err = restore_snapshot_file(
+            &delegate_dir,
+            "neversnapshotted",
+            1,
+            true,
+            &RetentionPolicy::default(),
+            SystemTime::now(),
+        )
+        .expect_err("missing history must error");
+        assert!(matches!(err, RestoreError::NotFound(1)));
+    }
+
+    #[test]
+    fn restore_snapshot_file_prefers_unsuffixed_collision() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let delegate_dir = dir.path().join("delegateA");
+        let secret = "secretX";
+        let snap_dir = snapshot_dir_for_encoded(&delegate_dir, secret);
+        fs::create_dir_all(&snap_dir).unwrap();
+        let base = format!(
+            "{stamp:0width$}",
+            stamp = 50u64,
+            width = SNAPSHOT_NAME_WIDTH
+        );
+        fs::write(snap_dir.join(&base), b"unsuffixed").unwrap();
+        fs::write(snap_dir.join(format!("{base}.0")), b"suffix-zero").unwrap();
+        fs::create_dir_all(&delegate_dir).unwrap();
+        fs::write(delegate_dir.join(secret), b"current").unwrap();
+
+        // snapshots_enabled=false isolates the disambiguation from the
+        // reversibility snapshot.
+        restore_snapshot_file(
+            &delegate_dir,
+            secret,
+            50,
+            false,
+            &RetentionPolicy::default(),
+            SystemTime::now(),
+        )
+        .expect("restore must succeed");
+        assert_eq!(fs::read(delegate_dir.join(secret)).unwrap(), b"unsuffixed");
+    }
+
+    #[test]
+    fn snapshot_active_value_missing_active_is_noop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let delegate_dir = dir.path().join("delegateA");
+        let secret = "secretX";
+        // Active file does not exist: snapshotting must not create a
+        // bogus entry.
+        snapshot_active_value(&delegate_dir, secret, &delegate_dir.join(secret))
+            .expect("missing active is not an error");
+        let snaps = list_snapshots(&snapshot_dir_for_encoded(&delegate_dir, secret)).expect("list");
+        assert!(
+            snaps.is_empty(),
+            "missing active must not produce a snapshot"
+        );
     }
 }

@@ -99,10 +99,13 @@ first write.
 ## `freenet secrets` CLI
 
 ```
-freenet secrets kek-status   --secrets-dir <path>
-freenet secrets kek-init     --secrets-dir <path> --backend {keyring|systemd|file} --yes
-freenet secrets kek-migrate  --secrets-dir <path> --to     {keyring|systemd|file} --yes
-freenet secrets kek-rotate   --secrets-dir <path> --yes   # NOT YET IMPLEMENTED (#4137)
+freenet secrets kek-status       --secrets-dir <path>
+freenet secrets kek-init          --secrets-dir <path> --backend {keyring|systemd|file} --yes
+freenet secrets kek-migrate       --secrets-dir <path> --to     {keyring|systemd|file} --yes
+freenet secrets kek-rotate        --secrets-dir <path> --yes   # NOT YET IMPLEMENTED (#4137)
+freenet secrets snapshot-list     --secrets-dir <path> [--delegate <key>] [--secret <id>]
+freenet secrets snapshot-restore  --secrets-dir <path> --delegate <key> --secret <id> \
+                                  --timestamp-ms <ms> --yes
 ```
 
 `kek-init` opts in to a specific backend BEFORE first start. It refuses
@@ -113,6 +116,31 @@ Node MUST be stopped before running migrate. `kek-rotate` currently
 bails with a clear error pointing operators at the temporary
 kek-migrate workflow; crash-safe two-phase rotation (`.rot` shadow
 files + recovery on next start) is tracked as a follow-up under #4137.
+
+### Snapshot inspect / restore (#4036)
+
+`snapshot-list` walks the secrets tree and reports the per-secret
+snapshot history created by the snapshot-on-write durability layer
+(#4034). With no filter it summarises every delegate; `--delegate`
+restricts to one; `--delegate X --secret Y` prints each individual
+snapshot's `timestamp_ms`, UTC time, and size. It is **metadata only**
+— it never decrypts or prints plaintext secret values (that would
+require the node KEK and expose secrets on the terminal), and it is
+read-only, so it is safe to run while the node is up (a stopped node
+just gives a point-in-time-consistent view).
+
+`snapshot-restore` rolls one secret back to the snapshot identified by
+`--timestamp-ms` (copy the value from `snapshot-list`). The current
+active value is snapshotted first, so the restore is itself reversible.
+Restore is a byte-level copy: the restored ciphertext stays decryptable
+by the same KEK-derived DEK that wrote it, so it only makes sense on the
+node that owns the secrets — snapshots are **not** portable across nodes
+(each node's DEK is HKDF-derived from its own KEK). The node MUST be
+stopped, because restore writes the active secret file and a running
+node may concurrently write the same secret. Both commands operate
+purely on the on-disk secrets tree (no ReDb / KEK access needed) and
+share the restore durability core (atomic tmp+fsync+rename) with the
+node runtime's `SecretsStore::restore_snapshot`.
 
 ## File permissions (PR #4195 / issue #4141)
 
