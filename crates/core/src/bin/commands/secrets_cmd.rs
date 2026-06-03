@@ -7,18 +7,29 @@
 //! - `kek-migrate --to <X>` — copy the KEK from the current backend to
 //!   target backend, update the marker, delete from the source
 //!   (operator-confirmable)
+//! - `snapshot-list` — inspect the per-secret snapshot history (the
+//!   on-write backups created since #4034). Metadata only; never prints
+//!   plaintext. Read-only, so safe with the node running, but a stopped
+//!   node gives a point-in-time-consistent view.
+//! - `snapshot-restore` — roll a delegate secret back to an earlier
+//!   snapshot. The current value is itself snapshotted first, so the
+//!   restore is reversible. The node MUST be stopped.
 //!
-//! All operations require the node process to be stopped (the on-disk
-//! secrets directory is exclusively owned during rotation/migration so
-//! a concurrent `freenet` write does not race the rewrite).
+//! The KEK operations require the node process to be stopped (the
+//! on-disk secrets directory is exclusively owned during rotation /
+//! migration so a concurrent `freenet` write does not race the rewrite);
+//! so does `snapshot-restore`, which writes the active secret file.
 
+use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow, bail};
 use chacha20poly1305::aead::{OsRng, rand_core::RngCore};
+use chrono::{DateTime, Utc};
 use freenet::dev_tool::{
-    KEK_SIZE, KekBackendKind, build_backend_for, load_from_backend, read_backend_marker,
-    replace_backend_marker, write_backend_marker,
+    KEK_SIZE, KekBackendKind, RestoreError, RetentionPolicy, build_backend_for, list_snapshots,
+    load_from_backend, read_backend_marker, replace_backend_marker, restore_snapshot_file,
+    snapshot_dir_for_encoded, thin_snapshots, write_backend_marker,
 };
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -30,12 +41,6 @@ pub struct SecretsCliConfig {
 }
 
 #[derive(clap::Subcommand, Clone, Debug)]
-#[allow(
-    clippy::enum_variant_names,
-    reason = "every variant manages the KEK and the `Kek` prefix matches the user-facing \
-              CLI verbs (`freenet secrets kek-status`, `freenet secrets kek-rotate`, \
-              `freenet secrets kek-migrate`)."
-)]
 pub enum SecretsCommand {
     /// Print the active KEK backend and the KEK fingerprint
     /// (`SHA-256(KEK)[..8]` in hex). Does NOT print the KEK itself.
@@ -54,6 +59,14 @@ pub enum SecretsCommand {
     /// Useful when migrating from `file` to `keyring` after installing
     /// a secret-storage daemon, or in reverse during disaster recovery.
     KekMigrate(KekMigrateArgs),
+    /// List the per-secret snapshot history (the on-write backups
+    /// created since #4034). Metadata only — never prints plaintext
+    /// secret values. Read-only.
+    SnapshotList(SnapshotListArgs),
+    /// Roll a delegate secret back to an earlier snapshot. The current
+    /// value is itself snapshotted first, so the restore is reversible.
+    /// The node MUST be stopped.
+    SnapshotRestore(SnapshotRestoreArgs),
 }
 
 #[derive(clap::Parser, Clone, Debug)]
@@ -103,12 +116,58 @@ pub struct KekMigrateArgs {
     pub yes: bool,
 }
 
+#[derive(clap::Parser, Clone, Debug)]
+pub struct SnapshotListArgs {
+    /// Path to the node's secrets directory (the parent of the
+    /// per-delegate secret subdirectories).
+    #[clap(long, value_parser)]
+    pub secrets_dir: PathBuf,
+    /// Restrict the listing to a single delegate, by its bs58-encoded
+    /// delegate key (as shown in the unfiltered listing).
+    #[clap(long)]
+    pub delegate: Option<String>,
+    /// Restrict the listing to a single secret, by its bs58-encoded id
+    /// (as shown in the per-delegate listing). Requires `--delegate`.
+    /// When set, every individual snapshot (timestamp + size) is printed
+    /// instead of just the per-secret count.
+    #[clap(long, requires = "delegate")]
+    pub secret: Option<String>,
+}
+
+#[derive(clap::Parser, Clone, Debug)]
+pub struct SnapshotRestoreArgs {
+    #[clap(long, value_parser)]
+    pub secrets_dir: PathBuf,
+    /// bs58-encoded delegate key (copy it from `snapshot-list`).
+    #[clap(long)]
+    pub delegate: String,
+    /// bs58-encoded secret id (copy it from `snapshot-list`).
+    #[clap(long)]
+    pub secret: String,
+    /// `timestamp_ms` of the snapshot to restore (copy it from
+    /// `snapshot-list`).
+    #[clap(long)]
+    pub timestamp_ms: u64,
+    /// Collision suffix (the `suffix` column from `snapshot-list`), for
+    /// the rare case of multiple same-millisecond snapshots at one
+    /// timestamp. Omit to restore the unsuffixed snapshot at the
+    /// timestamp (the `-` row, and the only entry when there is no
+    /// collision); pass the number to target a specific collision row.
+    #[clap(long)]
+    pub suffix: Option<u32>,
+    /// Skip the interactive confirmation prompt (for scripted use).
+    #[clap(long)]
+    pub yes: bool,
+}
+
 pub async fn run(config: SecretsCliConfig) -> Result<()> {
     match config.command {
         SecretsCommand::KekStatus(args) => kek_status(args).await,
         SecretsCommand::KekInit(args) => kek_init(args).await,
         SecretsCommand::KekRotate(args) => kek_rotate(args).await,
         SecretsCommand::KekMigrate(args) => kek_migrate(args).await,
+        SecretsCommand::SnapshotList(args) => snapshot_list(args).await,
+        SecretsCommand::SnapshotRestore(args) => snapshot_restore(args).await,
     }
 }
 
@@ -365,6 +424,244 @@ async fn kek_migrate(args: KekMigrateArgs) -> Result<()> {
 
     println!("Migrated KEK from `{current}` to `{target}`.");
     Ok(())
+}
+
+/// Format an epoch-millis timestamp as an RFC3339 UTC string for
+/// display. Falls back to a raw annotation if the value is out of range
+/// (should never happen for a real snapshot filename).
+fn format_ts(timestamp_ms: u64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(timestamp_ms as i64)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|| format!("{timestamp_ms}ms"))
+}
+
+/// Reject an operator-supplied delegate/secret id that isn't a single,
+/// normal path component, so a fat-fingered or pasted `--delegate` /
+/// `--secret` (e.g. one containing `/`, `\`, or `..`) can't make the
+/// `--secrets-dir` join escape the secrets tree and clobber or disclose
+/// a file elsewhere. On-disk ids are bs58 (no separators, no dots), so
+/// this never rejects a value copied from `snapshot-list`.
+fn validate_component(label: &str, value: &str) -> Result<()> {
+    use std::path::Component;
+    let mut comps = std::path::Path::new(value).components();
+    match (comps.next(), comps.next()) {
+        (Some(Component::Normal(c)), None) if c == std::ffi::OsStr::new(value) => Ok(()),
+        _ => bail!(
+            "invalid {label} `{value}`: must be a single path component with no `/`, `\\`, or \
+             `..` — copy the exact value shown by `freenet secrets snapshot-list`"
+        ),
+    }
+}
+
+/// Enumerate the immediate subdirectory names of `dir`, sorted. Used to
+/// walk delegate directories under the secrets root and per-secret
+/// snapshot directories under a delegate's `.snapshots/`.
+fn subdir_names(dir: &std::path::Path) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let entry = entry?;
+        if entry.file_type().is_ok_and(|ft| ft.is_dir())
+            && let Some(name) = entry.file_name().to_str()
+        {
+            out.push(name.to_string());
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+async fn snapshot_list(args: SnapshotListArgs) -> Result<()> {
+    if !args.secrets_dir.exists() {
+        bail!("secrets dir {} does not exist", args.secrets_dir.display());
+    }
+    if let Some(d) = &args.delegate {
+        validate_component("delegate", d)?;
+    }
+    if let Some(s) = &args.secret {
+        validate_component("secret", s)?;
+    }
+
+    // Detailed single-secret view (`--delegate X --secret Y`): print
+    // every snapshot row.
+    if let Some(secret) = &args.secret {
+        // clap's `requires = "delegate"` guarantees this is Some.
+        let delegate = args
+            .delegate
+            .as_ref()
+            .expect("clap enforces --secret requires --delegate");
+        let delegate_dir = args.secrets_dir.join(delegate);
+        if !delegate_dir.is_dir() {
+            bail!(
+                "no delegate directory `{delegate}` under {}",
+                args.secrets_dir.display()
+            );
+        }
+        let snap_dir = snapshot_dir_for_encoded(&delegate_dir, secret);
+        let snaps = list_snapshots(&snap_dir)
+            .with_context(|| format!("failed to list snapshots in {}", snap_dir.display()))?;
+        println!("Delegate {delegate}");
+        println!("Secret   {secret}");
+        if snaps.is_empty() {
+            println!("  (no snapshot history)");
+            return Ok(());
+        }
+        println!(
+            "  {:>16}  {:<20}  {:>9}  suffix",
+            "timestamp_ms", "utc", "bytes"
+        );
+        for s in &snaps {
+            let suffix = s
+                .suffix
+                .map(|x| x.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "  {:>16}  {:<20}  {:>9}  {suffix}",
+                s.timestamp_ms,
+                format_ts(s.timestamp_ms),
+                s.size_bytes,
+            );
+        }
+        println!("  {} snapshot(s)", snaps.len());
+        return Ok(());
+    }
+
+    // Summary view: one or all delegates, per-secret snapshot counts.
+    let delegates = match &args.delegate {
+        Some(d) => {
+            if !args.secrets_dir.join(d).is_dir() {
+                bail!(
+                    "no delegate directory `{d}` under {}",
+                    args.secrets_dir.display()
+                );
+            }
+            vec![d.clone()]
+        }
+        None => subdir_names(&args.secrets_dir)?,
+    };
+
+    if delegates.is_empty() {
+        println!(
+            "No delegate directories found under {}",
+            args.secrets_dir.display()
+        );
+        return Ok(());
+    }
+
+    println!("Secrets dir: {}", args.secrets_dir.display());
+    for delegate in &delegates {
+        let delegate_dir = args.secrets_dir.join(delegate);
+        let snapshots_root = delegate_dir.join(".snapshots");
+        println!("Delegate {delegate}");
+        let secrets = if snapshots_root.is_dir() {
+            subdir_names(&snapshots_root)?
+        } else {
+            Vec::new()
+        };
+        let mut any = false;
+        for secret in &secrets {
+            let snap_dir = snapshot_dir_for_encoded(&delegate_dir, secret);
+            // Propagate (don't swallow) a read/stat error: during the
+            // recovery scenario this tool exists for, silently rendering
+            // an unreadable snapshot dir as "no history" would mislead
+            // the operator. Matches the detail view's `?` handling.
+            let snaps = list_snapshots(&snap_dir)
+                .with_context(|| format!("failed to list snapshots in {}", snap_dir.display()))?;
+            if snaps.is_empty() {
+                continue;
+            }
+            any = true;
+            let latest = snaps
+                .last()
+                .map(|s| format_ts(s.timestamp_ms))
+                .unwrap_or_default();
+            println!(
+                "  Secret {secret}: {} snapshot(s), latest {latest}",
+                snaps.len()
+            );
+        }
+        if !any {
+            println!("  (no snapshot history)");
+        }
+    }
+    Ok(())
+}
+
+async fn snapshot_restore(args: SnapshotRestoreArgs) -> Result<()> {
+    validate_component("delegate", &args.delegate)?;
+    validate_component("secret", &args.secret)?;
+    let delegate_dir = args.secrets_dir.join(&args.delegate);
+    let snap_dir = snapshot_dir_for_encoded(&delegate_dir, &args.secret);
+    if !snap_dir.is_dir() {
+        bail!(
+            "no snapshot history for secret `{}` of delegate `{}` under {} \
+             (run `freenet secrets snapshot-list` to see what's available)",
+            args.secret,
+            args.delegate,
+            args.secrets_dir.display()
+        );
+    }
+
+    // Human-readable selector for messages: "timestamp_ms=N" or
+    // "timestamp_ms=N suffix=K".
+    let selector = match args.suffix {
+        Some(s) => format!("timestamp_ms={} suffix={s}", args.timestamp_ms),
+        None => format!("timestamp_ms={}", args.timestamp_ms),
+    };
+
+    if !args.yes {
+        eprintln!(
+            "About to restore secret `{}` of delegate `{}` to the snapshot at \
+             {selector} in {}.\n\
+             - The current value is snapshotted first, so this is reversible.\n\
+             - The freenet node MUST be stopped (a running node may concurrently \
+               write this secret).\n\
+             Re-run with --yes to proceed.",
+            args.secret,
+            args.delegate,
+            args.secrets_dir.display()
+        );
+        bail!("aborted (no --yes)");
+    }
+
+    // Byte-level restore via the shared core — the same code the node
+    // runtime uses, so the durability discipline can't drift. The
+    // reversibility snapshot is always enabled for the CLI (manual
+    // recovery should be undoable).
+    match restore_snapshot_file(
+        &delegate_dir,
+        &args.secret,
+        args.timestamp_ms,
+        args.suffix,
+        true,
+    ) {
+        Ok(()) => {
+            // Bound the history (incl. the reversibility snapshot just
+            // added), matching the node runtime's default retention.
+            // Best-effort: the restore has already succeeded.
+            let snap_dir = snapshot_dir_for_encoded(&delegate_dir, &args.secret);
+            thin_snapshots(
+                &snap_dir,
+                &RetentionPolicy::default(),
+                std::time::SystemTime::now(),
+            );
+            println!(
+                "Restored secret `{}` of delegate `{}` to snapshot {selector}.",
+                args.secret, args.delegate
+            );
+            Ok(())
+        }
+        Err(RestoreError::NotFound(_)) => bail!(
+            "no snapshot at {selector} for secret `{}` of delegate `{}`. Run \
+             `freenet secrets snapshot-list --secrets-dir {} --delegate {} --secret {}` to see \
+             available timestamps (and suffixes).",
+            args.secret,
+            args.delegate,
+            args.secrets_dir.display(),
+            args.delegate,
+            args.secret
+        ),
+        Err(RestoreError::Io(e)) => Err(anyhow::Error::new(e).context("snapshot restore failed")),
+    }
 }
 
 #[cfg(test)]
@@ -632,6 +929,261 @@ mod tests {
         assert_eq!(
             read_backend_marker(dir.path()).unwrap(),
             Some(KekBackendKind::File)
+        );
+    }
+
+    // ----- snapshot-list / snapshot-restore -----
+
+    /// Lay out `<secrets_dir>/<delegate>/<secret>` (active) and a single
+    /// `<delegate>/.snapshots/<secret>/<stamp:020>` snapshot.
+    fn seed_snapshot(
+        secrets_dir: &std::path::Path,
+        delegate: &str,
+        secret: &str,
+        active: &[u8],
+        stamp: u64,
+        snapshot: &[u8],
+    ) {
+        let delegate_dir = secrets_dir.join(delegate);
+        std::fs::create_dir_all(&delegate_dir).unwrap();
+        std::fs::write(delegate_dir.join(secret), active).unwrap();
+        let snap_dir = delegate_dir.join(".snapshots").join(secret);
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        std::fs::write(snap_dir.join(format!("{stamp:020}")), snapshot).unwrap();
+    }
+
+    fn list_args(
+        dir: &std::path::Path,
+        delegate: Option<&str>,
+        secret: Option<&str>,
+    ) -> SnapshotListArgs {
+        SnapshotListArgs {
+            secrets_dir: dir.to_path_buf(),
+            delegate: delegate.map(str::to_string),
+            secret: secret.map(str::to_string),
+        }
+    }
+
+    fn restore_args(
+        dir: &std::path::Path,
+        delegate: &str,
+        secret: &str,
+        timestamp_ms: u64,
+        yes: bool,
+    ) -> SnapshotRestoreArgs {
+        SnapshotRestoreArgs {
+            secrets_dir: dir.to_path_buf(),
+            delegate: delegate.to_string(),
+            secret: secret.to_string(),
+            timestamp_ms,
+            suffix: None,
+            yes,
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_list_empty_dir_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        snapshot_list(list_args(dir.path(), None, None))
+            .await
+            .expect("list on empty dir must succeed");
+    }
+
+    #[tokio::test]
+    async fn snapshot_list_missing_dir_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("nope");
+        let err = snapshot_list(list_args(&missing, None, None))
+            .await
+            .expect_err("missing secrets dir must error");
+        assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_list_summary_and_detail_views_succeed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_snapshot(dir.path(), "delegateA", "secretX", b"cur", 7, b"old");
+        // Summary (all delegates) and single-delegate views.
+        snapshot_list(list_args(dir.path(), None, None))
+            .await
+            .expect("summary list ok");
+        snapshot_list(list_args(dir.path(), Some("delegateA"), None))
+            .await
+            .expect("single-delegate list ok");
+        // Detailed single-secret view.
+        snapshot_list(list_args(dir.path(), Some("delegateA"), Some("secretX")))
+            .await
+            .expect("detail list ok");
+    }
+
+    #[tokio::test]
+    async fn snapshot_list_unknown_delegate_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = snapshot_list(list_args(dir.path(), Some("nope"), None))
+            .await
+            .expect_err("unknown delegate must error");
+        assert!(err.to_string().contains("no delegate directory"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_without_yes_aborts_and_preserves_active() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_snapshot(dir.path(), "D", "S", b"current", 42, b"old");
+        let err = snapshot_restore(restore_args(dir.path(), "D", "S", 42, false))
+            .await
+            .expect_err("must abort without --yes");
+        assert!(err.to_string().contains("aborted"));
+        // Active value untouched.
+        assert_eq!(
+            std::fs::read(dir.path().join("D").join("S")).unwrap(),
+            b"current"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_unknown_secret_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = snapshot_restore(restore_args(dir.path(), "D", "missing", 1, true))
+            .await
+            .expect_err("must error when no snapshot history");
+        assert!(err.to_string().contains("no snapshot history"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_round_trip_restores_prior_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Recent timestamp so the seeded snapshot survives the default
+        // retention's 2-year max_age cap during the restore's thin pass.
+        let stamp = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64)
+            - 60_000;
+        seed_snapshot(dir.path(), "D", "S", b"current", stamp, b"old-value");
+        snapshot_restore(restore_args(dir.path(), "D", "S", stamp, true))
+            .await
+            .expect("restore must succeed");
+        assert_eq!(
+            std::fs::read(dir.path().join("D").join("S")).unwrap(),
+            b"old-value"
+        );
+        // Reversible: the prior "current" value was snapshotted, so the
+        // history now has at least 2 entries.
+        let snap_dir = dir.path().join("D").join(".snapshots").join("S");
+        let count = std::fs::read_dir(&snap_dir).unwrap().count();
+        assert!(count >= 2, "expected reversibility snapshot, got {count}");
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_unknown_timestamp_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        seed_snapshot(dir.path(), "D", "S", b"current", 100, b"old");
+        let err = snapshot_restore(restore_args(dir.path(), "D", "S", 999, true))
+            .await
+            .expect_err("must error on unknown timestamp");
+        assert!(err.to_string().contains("no snapshot at timestamp_ms=999"));
+        // Active untouched on the error path.
+        assert_eq!(
+            std::fs::read(dir.path().join("D").join("S")).unwrap(),
+            b"current"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_rejects_path_traversal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = snapshot_restore(restore_args(dir.path(), "../../etc", "S", 1, true))
+            .await
+            .expect_err("traversal in --delegate must be rejected");
+        assert!(err.to_string().contains("invalid delegate"));
+        let err = snapshot_restore(restore_args(dir.path(), "D", "../../etc/passwd", 1, true))
+            .await
+            .expect_err("traversal in --secret must be rejected");
+        assert!(err.to_string().contains("invalid secret"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_list_rejects_path_traversal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = snapshot_list(list_args(dir.path(), Some("../x"), None))
+            .await
+            .expect_err("traversal in --delegate must be rejected");
+        assert!(err.to_string().contains("invalid delegate"));
+        let err = snapshot_list(list_args(dir.path(), Some("D"), Some("a/b")))
+            .await
+            .expect_err("separator in --secret must be rejected");
+        assert!(err.to_string().contains("invalid secret"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_list_detail_empty_history_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Delegate dir + active secret present, but no `.snapshots/` yet:
+        // the detail view's "(no snapshot history)" branch.
+        let delegate_dir = dir.path().join("D");
+        std::fs::create_dir_all(&delegate_dir).unwrap();
+        std::fs::write(delegate_dir.join("S"), b"v").unwrap();
+        snapshot_list(list_args(dir.path(), Some("D"), Some("S")))
+            .await
+            .expect("detail view with no history must succeed");
+    }
+
+    #[test]
+    fn snapshot_list_secret_requires_delegate_at_parse() {
+        use clap::Parser;
+        // `--secret` without `--delegate` must fail clap parsing — pins the
+        // `requires = "delegate"` invariant the `.expect()` in the detail
+        // view depends on.
+        let res = SnapshotListArgs::try_parse_from([
+            "snapshot-list",
+            "--secrets-dir",
+            "/tmp/x",
+            "--secret",
+            "y",
+        ]);
+        assert!(
+            res.is_err(),
+            "--secret without --delegate must fail to parse"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_suffix_targets_collision_entry() {
+        // Same-millisecond collisions produce unsuffixed + `.0` + `.1`
+        // rows in `snapshot-list`; `--suffix` must be able to target each.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secrets_dir = dir.path();
+        let snap_dir = secrets_dir.join("D").join(".snapshots").join("S");
+        std::fs::create_dir_all(&snap_dir).unwrap();
+        let base = format!("{:020}", 1000u64);
+        std::fs::write(snap_dir.join(&base), b"unsuffixed").unwrap();
+        std::fs::write(snap_dir.join(format!("{base}.0")), b"suffix-zero").unwrap();
+        std::fs::write(snap_dir.join(format!("{base}.1")), b"suffix-one").unwrap();
+        std::fs::create_dir_all(secrets_dir.join("D")).unwrap();
+        std::fs::write(secrets_dir.join("D").join("S"), b"current").unwrap();
+
+        // A non-existent suffix is rejected (not silently downgraded), and
+        // the error names the suffix. Run first so it can't see mutated state.
+        let mut args = restore_args(secrets_dir, "D", "S", 1000, true);
+        args.suffix = Some(9);
+        let err = snapshot_restore(args)
+            .await
+            .expect_err("missing suffix must error");
+        assert!(err.to_string().contains("suffix=9"));
+        assert_eq!(
+            std::fs::read(secrets_dir.join("D").join("S")).unwrap(),
+            b"current"
+        );
+
+        // Explicit suffix targets the exact collision row.
+        let mut args = restore_args(secrets_dir, "D", "S", 1000, true);
+        args.suffix = Some(1);
+        snapshot_restore(args)
+            .await
+            .expect("restore .1 must succeed");
+        assert_eq!(
+            std::fs::read(secrets_dir.join("D").join("S")).unwrap(),
+            b"suffix-one"
         );
     }
 }
