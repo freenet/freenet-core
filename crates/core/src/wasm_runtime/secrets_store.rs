@@ -675,6 +675,16 @@ impl SecretsStore {
     /// rename and the index update still leaves the active value
     /// readable on the next `get_secret`.
     ///
+    /// The find / reversibility-snapshot / atomic-write / history-thin
+    /// sequence is delegated to the shared [`restore_snapshot_file`] (so
+    /// the node runtime and the `freenet secrets snapshot-restore` CLI
+    /// can't drift); this wrapper adds only the index repair, the one
+    /// step that needs the typed `key` + ReDb. Note the thin therefore
+    /// runs inside the shared core, just before this index repair rather
+    /// than after it — harmless, since thinning only touches the
+    /// `.snapshots/` history while the index repair touches only ReDb /
+    /// the in-memory map.
+    ///
     /// If multiple snapshots share `timestamp_ms` (collision suffixes
     /// from same-millisecond writes), the unsuffixed file wins; absent
     /// that, the lowest-numbered suffix wins. To restore a specific

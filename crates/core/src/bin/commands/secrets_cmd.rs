@@ -428,6 +428,24 @@ fn format_ts(timestamp_ms: u64) -> String {
         .unwrap_or_else(|| format!("{timestamp_ms}ms"))
 }
 
+/// Reject an operator-supplied delegate/secret id that isn't a single,
+/// normal path component, so a fat-fingered or pasted `--delegate` /
+/// `--secret` (e.g. one containing `/`, `\`, or `..`) can't make the
+/// `--secrets-dir` join escape the secrets tree and clobber or disclose
+/// a file elsewhere. On-disk ids are bs58 (no separators, no dots), so
+/// this never rejects a value copied from `snapshot-list`.
+fn validate_component(label: &str, value: &str) -> Result<()> {
+    use std::path::Component;
+    let mut comps = std::path::Path::new(value).components();
+    match (comps.next(), comps.next()) {
+        (Some(Component::Normal(c)), None) if c == std::ffi::OsStr::new(value) => Ok(()),
+        _ => bail!(
+            "invalid {label} `{value}`: must be a single path component with no `/`, `\\`, or \
+             `..` — copy the exact value shown by `freenet secrets snapshot-list`"
+        ),
+    }
+}
+
 /// Enumerate the immediate subdirectory names of `dir`, sorted. Used to
 /// walk delegate directories under the secrets root and per-secret
 /// snapshot directories under a delegate's `.snapshots/`.
@@ -448,6 +466,12 @@ fn subdir_names(dir: &std::path::Path) -> Result<Vec<String>> {
 async fn snapshot_list(args: SnapshotListArgs) -> Result<()> {
     if !args.secrets_dir.exists() {
         bail!("secrets dir {} does not exist", args.secrets_dir.display());
+    }
+    if let Some(d) = &args.delegate {
+        validate_component("delegate", d)?;
+    }
+    if let Some(s) = &args.secret {
+        validate_component("secret", s)?;
     }
 
     // Detailed single-secret view (`--delegate X --secret Y`): print
@@ -529,7 +553,12 @@ async fn snapshot_list(args: SnapshotListArgs) -> Result<()> {
         let mut any = false;
         for secret in &secrets {
             let snap_dir = snapshot_dir_for_encoded(&delegate_dir, secret);
-            let snaps = list_snapshots(&snap_dir).unwrap_or_default();
+            // Propagate (don't swallow) a read/stat error: during the
+            // recovery scenario this tool exists for, silently rendering
+            // an unreadable snapshot dir as "no history" would mislead
+            // the operator. Matches the detail view's `?` handling.
+            let snaps = list_snapshots(&snap_dir)
+                .with_context(|| format!("failed to list snapshots in {}", snap_dir.display()))?;
             if snaps.is_empty() {
                 continue;
             }
@@ -551,6 +580,8 @@ async fn snapshot_list(args: SnapshotListArgs) -> Result<()> {
 }
 
 async fn snapshot_restore(args: SnapshotRestoreArgs) -> Result<()> {
+    validate_component("delegate", &args.delegate)?;
+    validate_component("secret", &args.secret)?;
     let delegate_dir = args.secrets_dir.join(&args.delegate);
     let snap_dir = snapshot_dir_for_encoded(&delegate_dir, &args.secret);
     if !snap_dir.is_dir() {
@@ -1033,6 +1064,64 @@ mod tests {
         assert_eq!(
             std::fs::read(dir.path().join("D").join("S")).unwrap(),
             b"current"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_rejects_path_traversal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = snapshot_restore(restore_args(dir.path(), "../../etc", "S", 1, true))
+            .await
+            .expect_err("traversal in --delegate must be rejected");
+        assert!(err.to_string().contains("invalid delegate"));
+        let err = snapshot_restore(restore_args(dir.path(), "D", "../../etc/passwd", 1, true))
+            .await
+            .expect_err("traversal in --secret must be rejected");
+        assert!(err.to_string().contains("invalid secret"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_list_rejects_path_traversal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = snapshot_list(list_args(dir.path(), Some("../x"), None))
+            .await
+            .expect_err("traversal in --delegate must be rejected");
+        assert!(err.to_string().contains("invalid delegate"));
+        let err = snapshot_list(list_args(dir.path(), Some("D"), Some("a/b")))
+            .await
+            .expect_err("separator in --secret must be rejected");
+        assert!(err.to_string().contains("invalid secret"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_list_detail_empty_history_succeeds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Delegate dir + active secret present, but no `.snapshots/` yet:
+        // the detail view's "(no snapshot history)" branch.
+        let delegate_dir = dir.path().join("D");
+        std::fs::create_dir_all(&delegate_dir).unwrap();
+        std::fs::write(delegate_dir.join("S"), b"v").unwrap();
+        snapshot_list(list_args(dir.path(), Some("D"), Some("S")))
+            .await
+            .expect("detail view with no history must succeed");
+    }
+
+    #[test]
+    fn snapshot_list_secret_requires_delegate_at_parse() {
+        use clap::Parser;
+        // `--secret` without `--delegate` must fail clap parsing — pins the
+        // `requires = "delegate"` invariant the `.expect()` in the detail
+        // view depends on.
+        let res = SnapshotListArgs::try_parse_from([
+            "snapshot-list",
+            "--secrets-dir",
+            "/tmp/x",
+            "--secret",
+            "y",
+        ]);
+        assert!(
+            res.is_err(),
+            "--secret without --delegate must fail to parse"
         );
     }
 }

@@ -1037,4 +1037,88 @@ mod tests {
             "missing active must not produce a snapshot"
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn restore_snapshot_file_writes_owner_only() {
+        // The restore write path lands the active secret at 0o600 and the
+        // snapshot dirs at 0o700 — the crypto-at-rest regression class
+        // #4146 guarded for `store_secret`, here for the restore write.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let delegate_dir = dir.path().join("delegateA");
+        let secret = "secretX";
+        let snap_dir = snapshot_dir_for_encoded(&delegate_dir, secret);
+        let stamp = recent_ms();
+        write_snapshot(&snap_dir, stamp, b"old-value");
+        fs::create_dir_all(&delegate_dir).unwrap();
+        // Seed the active file owner-only, as `store_secret` always does
+        // in production, so the hard-linked reversibility snapshot is 0o600.
+        fs::write(delegate_dir.join(secret), b"current-value").unwrap();
+        fs::set_permissions(delegate_dir.join(secret), fs::Permissions::from_mode(0o600)).unwrap();
+
+        restore_snapshot_file(
+            &delegate_dir,
+            secret,
+            stamp,
+            true,
+            &RetentionPolicy::default(),
+            SystemTime::now(),
+        )
+        .expect("restore must succeed");
+
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&delegate_dir.join(secret)),
+            0o600,
+            "restored active secret must be owner-only"
+        );
+        assert_eq!(
+            mode(&delegate_dir.join(SNAPSHOTS_DIR)),
+            0o700,
+            ".snapshots umbrella must be owner-only"
+        );
+        assert_eq!(
+            mode(&snap_dir),
+            0o700,
+            "per-secret snapshot dir must be owner-only"
+        );
+    }
+
+    #[test]
+    fn restore_snapshot_file_disabled_skips_reversibility_and_thin() {
+        // With `snapshots_enabled=false` the restore must still replace the
+        // active value, but skip BOTH the reversibility snapshot and the
+        // thin pass. Seed two ancient snapshots the default policy's 2-year
+        // max_age WOULD prune if thinning ran — their survival proves it
+        // didn't.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let delegate_dir = dir.path().join("delegateA");
+        let secret = "secretX";
+        let snap_dir = snapshot_dir_for_encoded(&delegate_dir, secret);
+        write_snapshot(&snap_dir, 1000, b"v1000");
+        write_snapshot(&snap_dir, 2000, b"v2000");
+        fs::create_dir_all(&delegate_dir).unwrap();
+        fs::write(delegate_dir.join(secret), b"current").unwrap();
+
+        let before = list_snapshots(&snap_dir).unwrap().len();
+        restore_snapshot_file(
+            &delegate_dir,
+            secret,
+            1000,
+            false,
+            &RetentionPolicy::default(),
+            SystemTime::now(),
+        )
+        .expect("restore must succeed");
+
+        assert_eq!(fs::read(delegate_dir.join(secret)).unwrap(), b"v1000");
+        let after = list_snapshots(&snap_dir).unwrap();
+        assert_eq!(
+            after.len(),
+            before,
+            "disabled restore must neither add a reversibility snapshot nor thin"
+        );
+        assert_eq!(after.len(), 2);
+    }
 }

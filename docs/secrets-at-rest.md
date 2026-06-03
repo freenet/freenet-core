@@ -140,7 +140,17 @@ stopped, because restore writes the active secret file and a running
 node may concurrently write the same secret. Both commands operate
 purely on the on-disk secrets tree (no ReDb / KEK access needed) and
 share the restore durability core (atomic tmp+fsync+rename) with the
-node runtime's `SecretsStore::restore_snapshot`.
+node runtime's `SecretsStore::restore_snapshot`. `--delegate` and
+`--secret` must be single path components (the bs58 ids printed by
+`snapshot-list`); values containing `/` or `..` are rejected.
+
+After a successful restore the shared core thins the history under the
+default retention policy, the same as a normal write. One consequence:
+if you restore from a snapshot older than the 2-year `max_age` cap, that
+very old source snapshot is pruned from `.snapshots/` afterward. The
+restore itself is unaffected (the value is already the active secret by
+then) and stays reversible — the prior active value is captured as a
+fresh snapshot before the overwrite.
 
 ## File permissions (PR #4195 / issue #4141)
 
