@@ -14,14 +14,20 @@
 //! scenario file in `scenarios/` and listing it in [`all_scenarios`] is
 //! enough; no other wiring required.
 
+pub mod churning_peers;
+pub mod cold_start;
+pub mod correlated_inflation;
+pub mod idle_steady_state;
+pub mod reference_diverges_from_overlay;
+pub mod reference_tracks_overlay;
+pub mod single_packet_loss;
+pub mod single_peer_outlier;
+pub mod slow_routing_drift;
+pub mod small_n;
+
 use std::time::Duration;
 
 use crate::event::Event;
-
-pub mod correlated_inflation;
-pub mod idle_steady_state;
-pub mod single_peer_outlier;
-pub mod small_n;
 
 /// What a sane controller is expected to do on this scenario.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +65,12 @@ pub fn all_scenarios() -> Vec<Scenario> {
         correlated_inflation::scenario(),
         single_peer_outlier::scenario(),
         small_n::scenario(),
+        single_packet_loss::scenario(),
+        slow_routing_drift::scenario(),
+        churning_peers::scenario(),
+        cold_start::scenario(),
+        reference_diverges_from_overlay::scenario(),
+        reference_tracks_overlay::scenario(),
     ]
 }
 

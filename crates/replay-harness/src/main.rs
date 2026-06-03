@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 use replay_harness::Replayer;
-use replay_harness::controllers::{FixedRate, RfcDraft};
+use replay_harness::controllers::{FixedRate, LedbatPlusPlus, RfcDraft};
 use replay_harness::scenarios::{self, Expectation};
 
 #[derive(Parser)]
@@ -74,6 +74,7 @@ fn main() -> Result<()> {
         Cmd::Controllers => {
             println!("fixed_rate   — baseline; never changes rate");
             println!("rfc_draft    — the #4074 sketched algorithm (downstep only)");
+            println!("ledbat       — stripped-down LEDBAT++; reproduces the death spiral");
         }
         Cmd::Synthetic {
             scenario,
@@ -111,6 +112,9 @@ fn run_synthetic(s: &scenarios::Scenario, controller_name: &str) -> Result<()> {
         "rfc_draft" => Replayer::new()
             .run_until(s.run_for)
             .run(s.events.clone().into_iter(), RfcDraft::default()),
+        "ledbat" => Replayer::new()
+            .run_until(s.run_for)
+            .run(s.events.clone().into_iter(), LedbatPlusPlus::default()),
         other => bail!("unknown controller: {other}"),
     };
 

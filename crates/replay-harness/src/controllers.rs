@@ -1,14 +1,16 @@
 //! [`Controller`] trait and the view it sees each tick.
 
+pub mod fixed_rate;
+pub mod ledbat;
+pub mod rfc_draft;
+
 use std::time::Duration;
 
 use crate::event::PeerKey;
 use crate::rolling::RttSnapshot;
 
-pub mod fixed_rate;
-pub mod rfc_draft;
-
 pub use fixed_rate::FixedRate;
+pub use ledbat::LedbatPlusPlus;
 pub use rfc_draft::RfcDraft;
 
 /// Snapshot the harness hands to a controller at each tick.
