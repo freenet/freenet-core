@@ -96,8 +96,25 @@ impl LiveTransactionTracker {
         // Remove all transactions for this peer from the reverse index
         if let Some((_, txs)) = self.tx_per_peer.remove(&peer_addr) {
             for tx in &txs {
-                self.peer_for_tx.remove(tx);
-                self.acquisition_txs.remove(tx);
+                // A tx that was cross-peer *rebound* to a different, still-live
+                // peer (see `add_transaction`) leaves a stale entry on the
+                // earlier peer. Pruning that earlier peer must NOT clear the
+                // reverse index or the acquisition gauge, or
+                // `active_acquisition_transaction_count` would undercount and
+                // let `connection_maintenance` exceed `max_concurrent` during
+                // churn (#4348 review). Only clear when this peer is still the
+                // tx's current owner (or the tx has no current owner). The
+                // `.map(...)` copies the addr and drops the Ref before
+                // `remove`, avoiding a same-shard self-deadlock.
+                let owned_here = self
+                    .peer_for_tx
+                    .get(tx)
+                    .map(|e| *e.value())
+                    .is_none_or(|owner| owner == peer_addr);
+                if owned_here {
+                    self.peer_for_tx.remove(tx);
+                    self.acquisition_txs.remove(tx);
+                }
             }
             txs
         } else {
@@ -267,6 +284,37 @@ mod tests {
         assert_eq!(tracker.active_acquisition_transaction_count(), 1);
 
         tracker.prune_transactions_from_peer(addr);
+        assert_eq!(tracker.active_acquisition_transaction_count(), 0);
+    }
+
+    /// Pruning the *stale* earlier peer of a cross-peer-rebound acquisition tx
+    /// must NOT drop it from the gauge — it's still in flight on the newer peer.
+    /// Otherwise `active_acquisition_transaction_count` undercounts and the
+    /// maintenance throttle can exceed max_concurrent during churn (#4348 review).
+    #[test]
+    fn acquisition_count_survives_prune_of_rebound_stale_peer() {
+        let tracker = LiveTransactionTracker::new();
+        let old_peer: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let new_peer: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        let tx = Transaction::new::<ConnectMsg>();
+
+        tracker.register_acquisition(tx);
+        tracker.add_transaction(old_peer, tx);
+        tracker.add_transaction(new_peer, tx); // rebind; old_peer entry now stale
+        assert_eq!(tracker.active_acquisition_transaction_count(), 1);
+
+        // old_peer disconnects — its stale entry is pruned, but the tx is live
+        // on new_peer, so the acquisition gauge must stay at 1.
+        tracker.prune_transactions_from_peer(old_peer);
+        assert_eq!(
+            tracker.active_acquisition_transaction_count(),
+            1,
+            "rebound acquisition must survive prune of its stale old peer"
+        );
+        assert!(tracker.has_live_connection(new_peer));
+
+        // Completion finally drains it.
+        tracker.remove_finished_transaction(tx);
         assert_eq!(tracker.active_acquisition_transaction_count(), 0);
     }
 
