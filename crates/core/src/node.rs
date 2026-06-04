@@ -804,25 +804,59 @@ where
 /// # Channel safety
 ///
 /// Uses `try_send` on the bounded capacity-1 channel created by
-/// `OpCtx::send_and_await`. On a closed receiver (caller cancelled or
-/// timed out) the send fails and is logged; the handler still makes
-/// progress. See `.claude/rules/channel-safety.md`.
+/// `OpCtx::send_and_await`. The two `try_send` failure modes mean very
+/// different things and are logged at different levels:
+///
+/// - `TrySendError::Closed` is **benign and expected**: the OpCtx caller
+///   already finished — a capacity-1 receiver hangs up after its single
+///   `recv()`, or the driver task timed out / was cancelled. The dominant
+///   source is SUBSCRIBE renewals, whose ~25s outer cancel deadline fires
+///   before the ~60s per-attempt peer wait, so a peer's reply routinely
+///   lands after the renewal task (and its receiver) was dropped. The
+///   subscription is already registered on the home node and self-heals on
+///   the next renewal cycle, so this is logged at `debug`, matching
+///   `.claude/rules/operations.md` ("WHEN a reply arrives with no waiter →
+///   Benign → debug log"). Logging it at `error` produced a steady stream
+///   of false-alarm errors on busy gateways (especially after a restart,
+///   when hundreds of hosted contracts re-subscribe at once).
+/// - `TrySendError::Full` is **unexpected**: the receiver is still open but
+///   the capacity-1 channel already holds an undrained reply — two replies
+///   were forwarded for the same tx before the driver consumed the first.
+///   That is a real double-forward bug, so it stays loud at `warn`.
+///
+/// Either way the handler still makes progress and returns `true`. See
+/// `.claude/rules/channel-safety.md`.
 fn try_forward_driver_reply(
     pending_op_result: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
     reply: NetMessage,
     op_label: &'static str,
 ) -> bool {
+    use tokio::sync::mpsc::error::TrySendError;
+
     let Some(callback) = pending_op_result else {
         return false;
     };
     let tx_id = *reply.id();
-    if let Err(err) = callback.try_send(reply) {
-        tracing::error!(
-            %err,
-            %tx_id,
-            op = op_label,
-            "Failed to forward driver reply to OpCtx task"
-        );
+    match callback.try_send(reply) {
+        Ok(()) => {}
+        // Benign late/duplicate reply: the OpCtx caller already completed,
+        // timed out, or was cancelled (see the `# Channel safety` note).
+        Err(TrySendError::Closed(_)) => {
+            tracing::debug!(
+                %tx_id,
+                op = op_label,
+                "Driver reply arrived after the OpCtx receiver closed (late/duplicate); dropping"
+            );
+        }
+        // Unexpected double-forward: receiver open but capacity-1 channel
+        // already holds an undrained reply for this tx. A real bug — stay loud.
+        Err(TrySendError::Full(_)) => {
+            tracing::warn!(
+                %tx_id,
+                op = op_label,
+                "Driver reply dropped: OpCtx channel full (capacity-1 already holds an undrained reply for this tx)"
+            );
+        }
     }
     true
 }
@@ -2800,6 +2834,77 @@ mod tests {
             assert!(
                 taken,
                 "callback present but receiver dropped → bypass still taken"
+            );
+        }
+
+        // Note: the `TrySendError::Full` arm's behavioral contract (drop the
+        // second reply, never block, still return `true`) is already pinned by
+        // `bypass_does_not_block_when_channel_already_full` above. The
+        // log-level split for that arm is pinned by the source guard below.
+
+        /// Pin the log-level split in `try_forward_driver_reply`. A closed
+        /// receiver (`TrySendError::Closed`) is the benign, expected
+        /// late/duplicate-reply case — dominated by SUBSCRIBE renewals whose
+        /// ~25s outer cancel deadline fires before the ~60s per-attempt peer
+        /// wait — and MUST be logged at `debug`, not `error`, per
+        /// `.claude/rules/operations.md` ("WHEN a reply arrives with no
+        /// waiter → Benign → debug log"). Logging it at `error` produced a
+        /// steady stream of false-alarm errors on busy gateways (observed
+        /// after the v0.2.69 rollout, ~30/hr on nova). A full channel
+        /// (`TrySendError::Full`) is a real double-forward bug and stays at
+        /// `warn`.
+        ///
+        /// This reads `node.rs` at compile time and asserts the function body
+        /// matches on both `TrySendError` variants and that it does NOT log
+        /// at `error`. A refactor that re-collapses the two cases back to a
+        /// single `error!` fails here at the unit-test level. Needles are
+        /// assembled at runtime so this test cannot match its own source.
+        #[test]
+        fn forward_driver_reply_splits_log_level_by_trysenderror_variant() {
+            const SOURCE: &str = include_str!("node.rs");
+
+            let fn_anchor: String = ["fn try_forward_driver_reply", "("].concat();
+            let start = SOURCE.find(&fn_anchor).expect(
+                "try_forward_driver_reply definition not found — \
+                 it was renamed or moved; update this guard",
+            );
+            // Bound the window at the next top-level fn so the assertions
+            // only inspect this function's body (+ the next fn's doc comment,
+            // which does not contain these patterns).
+            let next_fn: String = ["\n", "fn "].concat();
+            let after = start + fn_anchor.len();
+            let window_end = SOURCE[after..]
+                .find(&next_fn)
+                .map(|i| after + i)
+                .unwrap_or(SOURCE.len());
+            let body = &SOURCE[start..window_end];
+
+            let closed: String = ["TrySendError", "::Closed"].concat();
+            let full: String = ["TrySendError", "::Full"].concat();
+            let debug_macro: String = ["tracing", "::debug!"].concat();
+            let warn_macro: String = ["tracing", "::warn!"].concat();
+            let error_macro: String = ["tracing", "::error!"].concat();
+
+            assert!(
+                body.contains(&closed) && body.contains(&full),
+                "try_forward_driver_reply must match on both TrySendError \
+                 variants (Closed vs Full) so the benign late-reply case is \
+                 distinguished from a real double-forward."
+            );
+            assert!(
+                body.contains(&debug_macro),
+                "the benign Closed case must be logged at debug"
+            );
+            assert!(
+                body.contains(&warn_macro),
+                "the unexpected Full case must be logged at warn"
+            );
+            assert!(
+                !body.contains(&error_macro),
+                "try_forward_driver_reply must NOT log at error: the dominant \
+                 failure (Closed receiver from a cancelled SUBSCRIBE renewal) \
+                 is benign and self-heals. Re-collapsing to error! reintroduces \
+                 the false-alarm error spam this guard prevents."
             );
         }
 
