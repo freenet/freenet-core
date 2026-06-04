@@ -3021,8 +3021,17 @@ impl Ring {
             // node's own in-flight acquisitions, NOT CONNECTs it is relaying for
             // others (#4348).
             let mut active_count = live_tx_tracker.active_acquisition_transaction_count();
+            // Honor target-location backoff only once we've reached
+            // min_connections. A node still below min MUST keep probing even
+            // recently-rejected ring regions: its under-connection is a local
+            // capacity problem, not the target's fault, and the 30s→600s
+            // location backoff stamped on a `Rejected` would otherwise trap a
+            // poorly-positioned node permanently below min — the straggler tail
+            // in #4348. This mirrors the zero-connection re-bootstrap escape
+            // above, extended to the whole under-min regime.
+            let respect_backoff = current_conn_count >= self.connection_manager.min_connections;
             while let Some(ideal_location) = pending_conn_adds.pop_first() {
-                if self.is_in_connection_backoff(ideal_location) {
+                if respect_backoff && self.is_in_connection_backoff(ideal_location) {
                     tracing::debug!(
                         target_location = %ideal_location,
                         "Skipping connection attempt - target in backoff"
