@@ -29,7 +29,12 @@ pub struct LiveTransactionTracker {
     /// only `BASE = 3`, so a few relayed CONNECTs would stall the node's own
     /// growth flat just above `min_connections` (#4348). Entries are removed in
     /// lockstep with `remove_finished_transaction` / `prune_transactions_from_peer`,
-    /// inheriting their 60s-TTL release backstop, so this set cannot leak.
+    /// so this set's lifecycle is identical to (and cannot leak any worse than)
+    /// the existing `tx_per_peer` accounting. The backstop against a stuck entry
+    /// is the acquisition driver's own 60s `OPERATION_TTL`: `start_client_connect`
+    /// exits on `should_exit_for_ttl` and calls `release_pending_op_slot`, which
+    /// fires `TransactionCompleted` → `remove_finished_transaction`; peer
+    /// disconnect clears it via `prune_transactions_from_peer`.
     acquisition_txs: Arc<DashSet<Transaction>>,
 }
 
