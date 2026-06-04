@@ -526,8 +526,9 @@ async fn drive_client_connect_inner(
 /// (defensive — production never sets it to 0 but
 /// `mpsc::channel(0)` panics).
 ///
-/// Bypass uses `try_send`; over-capacity replies drop with an error
-/// log. Sequential hole-punch (seconds per acceptor) means worst-case
+/// Bypass uses `try_send`; over-capacity replies drop with a debug
+/// log (`node::try_forward_driver_reply`). Sequential hole-punch
+/// (seconds per acceptor) means worst-case
 /// burst is bounded by simultaneously-arriving relay-branch replies,
 /// which `2x` covers for normal min_connections values. A flood of
 /// rejects beyond `2x` would drop legitimate replies — flagged as
