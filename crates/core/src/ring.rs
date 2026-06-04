@@ -3017,10 +3017,18 @@ impl Ring {
             );
 
             // Drain pending connections, initiating multiple attempts per tick
-            // (up to max_concurrent) for faster mesh formation.
-            let mut active_count = live_tx_tracker.active_connect_transaction_count();
+            // (up to max_concurrent) for faster mesh formation. Counts only this
+            // node's own in-flight acquisitions, NOT CONNECTs it is relaying for
+            // others (#4348).
+            let mut active_count = live_tx_tracker.active_acquisition_transaction_count();
+            // Under-min nodes bypass per-target backoff to escape the straggler
+            // trap (#4348); see `should_respect_location_backoff`.
+            let respect_backoff = should_respect_location_backoff(
+                current_conn_count,
+                self.connection_manager.min_connections,
+            );
             while let Some(ideal_location) = pending_conn_adds.pop_first() {
-                if self.is_in_connection_backoff(ideal_location) {
+                if respect_backoff && self.is_in_connection_backoff(ideal_location) {
                     tracing::debug!(
                         target_location = %ideal_location,
                         "Skipping connection attempt - target in backoff"
@@ -3440,9 +3448,9 @@ impl Ring {
 
         // Register tx with the live transaction tracker BEFORE spawning the
         // driver. Otherwise the driver's first Response could land on the
-        // bypass before the registration completes, breaking the
-        // active_connect_transaction_count gauge that connection_maintenance
-        // uses to throttle concurrent acquisitions.
+        // bypass before the registration completes. (The acquisition-throttle
+        // registration is done inside `start_client_connect`, shared by every
+        // self-initiated CONNECT — ring acquisition, gateway join, and probe.)
         live_tx_tracker.add_transaction(gateway_addr, tx);
 
         let op_manager_spawn = op_manager.clone();
@@ -3536,6 +3544,28 @@ fn calculate_max_concurrent_connections(
     // Cap at half of min_connections, floored at BASE.
     let bootstrap_cap = (min_connections / 2).max(BASE);
     (BASE + deficit / CONNECTIONS_PER_EXTRA_SLOT).min(bootstrap_cap)
+}
+
+/// Whether `connection_maintenance` should honor per-target-location connection
+/// backoff for a node with `current_connections` open connections.
+///
+/// Backoff is honored only once the node has reached `min_connections`. A node
+/// still below min MUST keep probing even recently-rejected ring regions: its
+/// under-connection is a local capacity problem, not the target's fault (cf. the
+/// ring.md "Backoff Target Must Match Failure Cause" rule), and the 30s→600s
+/// location backoff stamped on a `Rejected` would otherwise trap a poorly
+/// positioned node permanently below min — the straggler tail in #4348. This
+/// mirrors the zero-connection re-bootstrap escape, extended to the whole
+/// under-min regime; at/above min, steady-state backoff is unchanged.
+///
+/// Storm safety: bypassing location backoff below min does NOT let a stuck node
+/// hammer indefinitely. The maintenance loop's adaptive fast-tick backoff still
+/// stretches the retry cadence toward the steady ~60s `CHECK_TICK` after
+/// consecutive no-progress ticks (connection count not changing), per-tick
+/// attempts remain bounded by [`calculate_max_concurrent_connections`], and the
+/// separate gateway re-bootstrap backoff (`gateway_backoff`) is untouched.
+fn should_respect_location_backoff(current_connections: usize, min_connections: usize) -> bool {
+    current_connections >= min_connections
 }
 
 fn calculate_allowed_connection_additions(
@@ -3923,6 +3953,29 @@ mod max_concurrent_connections_tests {
     fn high_min_connections_scales_cap() {
         // deficit=50, 3 + 50/3 = 19, cap = 50/2 = 25 → 19
         assert_eq!(calculate_max_concurrent_connections(0, 50), 19);
+    }
+}
+
+#[cfg(test)]
+mod respect_location_backoff_tests {
+    use super::should_respect_location_backoff;
+
+    /// Regression guard for the under-min backoff escape (#4348): a node below
+    /// min_connections must bypass per-target location backoff so it cannot be
+    /// trapped below min by a stamped `Rejected` backoff; at/above min, backoff
+    /// is respected as before. Pins the inequality direction and boundary.
+    #[test]
+    fn below_min_bypasses_backoff() {
+        assert!(!should_respect_location_backoff(0, 10));
+        assert!(!should_respect_location_backoff(7, 10));
+        assert!(!should_respect_location_backoff(9, 10));
+    }
+
+    #[test]
+    fn at_or_above_min_respects_backoff() {
+        assert!(should_respect_location_backoff(10, 10)); // exactly min
+        assert!(should_respect_location_backoff(11, 10));
+        assert!(should_respect_location_backoff(20, 10));
     }
 }
 

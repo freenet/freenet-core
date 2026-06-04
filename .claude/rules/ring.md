@@ -93,7 +93,17 @@ CORRECT:
 WHY: Backing off a target for a local problem prevents connecting to it
 later when local conditions improve (e.g., more connections acquired).
 
-See: ring.rs connection_maintenance, issue #3414
+COROLLARY (under-min backoff escape, #4348):
+  A node still BELOW min_connections must IGNORE per-target-location
+  backoff entirely and keep probing. Its under-connection is by definition
+  a local capacity problem, so a `Rejected`-stamped 30s→600s location
+  backoff would trap a poorly-positioned node permanently below min.
+  connection_maintenance gates this via should_respect_location_backoff()
+  (honor backoff only at/above min). Storm safety is preserved by the
+  adaptive fast-tick backoff + max_concurrent cap, not by location backoff.
+
+See: ring.rs connection_maintenance + should_respect_location_backoff,
+issues #3414, #4348
 ```
 
 ### Routing Decisions
