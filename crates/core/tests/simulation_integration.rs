@@ -7425,15 +7425,22 @@ fn test_get_routing_coverage_low_htl() {
     use std::sync::atomic::Ordering;
 
     use freenet::dev_tool::{
-        GET_RELAY_DRIVER_CALL_COUNT, NodeLabel, RELAY_GET_ROUTE_EVENT_COUNT,
-        RELAY_PUT_DRIVER_CALL_COUNT, RELAY_PUT_ROUTE_EVENT_COUNT,
-        RELAY_SUBSCRIBE_DRIVER_CALL_COUNT, RELAY_SUBSCRIBE_ROUTE_EVENT_COUNT, ScheduledOperation,
-        SimOperation, register_crdt_contract,
+        GET_RELAY_DRIVER_CALL_COUNT, NodeLabel, RELAY_PUT_DRIVER_CALL_COUNT,
+        RELAY_SUBSCRIBE_DRIVER_CALL_COUNT, ScheduledOperation, SimOperation,
+        register_crdt_contract,
     };
 
-    // Seed updated: per-peer acceptor reliability scoring replaces binary
-    // exclusion (PR #3659), changing the CONNECT routing code path and
-    // Turmoil scheduling. Previous seed: 0xC0DE_B0CA_0032 (PR #3621).
+    // NOTE: the relay-hop *route-event* assertions (RELAY_*_ROUTE_EVENT_COUNT)
+    // that used to live here were moved to `test_relay_route_events_multihop`.
+    // They require a SPARSE topology where a GET/PUT actually forwards a
+    // downstream response, but this test deliberately keeps the mesh well
+    // connected (max_connections=7) so the GET-coverage assertion (#3431)
+    // holds. Once the #4348 convergence fix let nodes reliably reach
+    // min_connections, a 15-node/max=7 net converged dense enough that ops
+    // resolved in 0-1 hops and the route-event counters stayed at 0 — a
+    // topology-coupling that the dedicated sparse test now owns. This test
+    // keeps the relay *driver-call* assertions (which fire even when a relay
+    // resolves locally) plus the coverage assertion.
     const SEED: u64 = 0xC0DE_B0CA_0032;
     const NETWORK_NAME: &str = "get-routing-coverage";
 
@@ -7449,19 +7456,6 @@ fn test_get_routing_coverage_low_htl() {
     let relay_baseline = GET_RELAY_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
     let relay_put_baseline = RELAY_PUT_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
     let relay_subscribe_baseline = RELAY_SUBSCRIBE_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
-
-    // Baselines for the relay-hop routing-event counters. Each fires when
-    // a relay forwards a downstream peer's response and feeds the result
-    // into the local Router via record_relay_route_event. Without these
-    // hooks the per-peer dashboard panels stay empty and the failure-
-    // probability model is trained only on originator-side events.
-    // The same workload that exercises the relay drivers above must
-    // also exercise these counters — drivers running without route-event
-    // emission would silently regress router quality.
-    let relay_get_route_event_baseline = RELAY_GET_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
-    let relay_put_route_event_baseline = RELAY_PUT_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
-    let relay_subscribe_route_event_baseline =
-        RELAY_SUBSCRIBE_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
 
     let rt = create_runtime();
 
@@ -7619,49 +7613,14 @@ fn test_get_routing_coverage_low_htl() {
          Baseline: {relay_subscribe_baseline}, after: {relay_subscribe_after}."
     );
 
-    // Relay-hop routing-event counters: every relay that forwards a
-    // downstream response should feed the local Router. Drivers running
-    // without route-event emission means the per-peer dashboard panels
-    // stay empty and the failure-probability model is undertrained on
-    // relay-heavy nodes (the bug this work fixes).
-    let relay_get_route_event_after = RELAY_GET_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
-    let relay_get_route_event_delta =
-        relay_get_route_event_after.saturating_sub(relay_get_route_event_baseline);
-    assert!(
-        relay_get_route_event_delta > 0,
-        "RELAY_GET_ROUTE_EVENT_COUNT did not advance — at least one \
-         relay-forwarded GET should have produced a routing event for \
-         the local Router. {num_nodes}-node / HTL=3 workload with 15 \
-         GETs must traverse at least one relay hop. \
-         Baseline: {relay_get_route_event_baseline}, after: {relay_get_route_event_after}."
-    );
-
-    let relay_put_route_event_after = RELAY_PUT_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
-    let relay_put_route_event_delta =
-        relay_put_route_event_after.saturating_sub(relay_put_route_event_baseline);
-    assert!(
-        relay_put_route_event_delta > 0,
-        "RELAY_PUT_ROUTE_EVENT_COUNT did not advance — the gateway PUT \
-         at HTL=3 should have produced a routing event at every relay \
-         hop. \
-         Baseline: {relay_put_route_event_baseline}, after: {relay_put_route_event_after}."
-    );
-
-    // SUBSCRIBE route-event coverage is intentionally NOT asserted in
-    // this test. With the gateway PUT seeded at HTL=3 and 12 nodes
-    // subscribing, every subscribe in this workload hits the local-hit
-    // fast path at `subscribe/op_ctx_task.rs::drive_relay_subscribe`
-    // step 1 — the first relay always has the contract cached and
-    // replies `Subscribed` without forwarding downstream. That's a
-    // correct zero for the route-event counter, since the route-event
-    // hook only fires on actual forwards. A dedicated SUBSCRIBE forward
-    // test (subscriber + sparse cache topology) belongs as a follow-up.
-    // The relay SUBSCRIBE driver itself is still exercised — see the
-    // RELAY_SUBSCRIBE_DRIVER_CALL_COUNT assertion above.
-    let _ = (
-        RELAY_SUBSCRIBE_ROUTE_EVENT_COUNT.load(Ordering::SeqCst),
-        relay_subscribe_route_event_baseline,
-    );
+    // Relay-hop *route-event* coverage (RELAY_*_ROUTE_EVENT_COUNT) is asserted
+    // separately in `test_relay_route_events_multihop`. Those counters only
+    // fire when a relay forwards a downstream response, which needs a sparse
+    // topology where an op actually traverses >=2 hops. This test keeps the
+    // mesh dense (max_connections=7) so the GET-coverage assertion above holds;
+    // post-#4348 that density makes ops resolve in 0-1 hops, so route events do
+    // not fire here (#4348). The relay *drivers* are still exercised — see the
+    // RELAY_*_DRIVER_CALL_COUNT assertions above.
 
     // StateVerifier anomaly check
     let rt = create_runtime();
@@ -7675,6 +7634,126 @@ fn test_get_routing_coverage_low_htl() {
          relay_driver_calls={relay_delta}",
         report.anomalies.len(),
         report.total_events,
+    );
+}
+
+/// Relay-hop route-event telemetry (#1454): a relay that forwards a downstream
+/// GET/PUT response must feed the result into the local Router via
+/// `record_relay_route_event`, or the per-peer dashboard panels stay empty and
+/// the failure-probability model is undertrained on relay-heavy nodes.
+///
+/// These assertions previously lived in `test_get_routing_coverage_low_htl`,
+/// but that test must keep a DENSE mesh so every node's GET resolves
+/// (its #3431 coverage assertion). The #4348 connection-convergence fix made
+/// that mesh converge dense enough that ops resolved in 0-1 hops, so
+/// `RELAY_*_ROUTE_EVENT_COUNT` never advanced — the test was implicitly relying
+/// on the under-connectivity bug #4348 fixed. This dedicated test instead uses a
+/// deliberately SPARSE topology where multi-hop forwarding is structural, and
+/// asserts ONLY that the route-event hooks fire. It makes NO GET-coverage claim
+/// (a NotFound reply still exercises the relay route-event hook), so improved
+/// connectivity can never invalidate it.
+///
+/// SUBSCRIBE route events are intentionally not asserted (subscribes hit the
+/// relay local-cache fast path without forwarding downstream — see the note in
+/// `test_get_routing_coverage_low_htl`); the relay SUBSCRIBE *driver* is still
+/// covered there.
+#[test_log::test]
+fn test_relay_route_events_multihop() {
+    use std::sync::atomic::Ordering;
+
+    use freenet::dev_tool::{
+        NodeLabel, RELAY_GET_ROUTE_EVENT_COUNT, RELAY_PUT_ROUTE_EVENT_COUNT, ScheduledOperation,
+        SimOperation, register_crdt_contract,
+    };
+
+    const SEED: u64 = 0xC0DE_B0CA_0040;
+    const NETWORK_NAME: &str = "relay-route-events";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+
+    let get_route_baseline = RELAY_GET_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
+    let put_route_baseline = RELAY_PUT_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
+
+    let rt = create_runtime();
+    let num_nodes = 15;
+
+    let sim = rt.block_on(async {
+        SimNetwork::new(
+            NETWORK_NAME,
+            1,         // gateways
+            num_nodes, // nodes
+            3,         // ring_max_htl
+            1,         // rnd_if_htl_above
+            // max_connections — deliberately LOW. A sparse mesh keeps requesters
+            // >=2 hops from the few holders, so GET/PUT requests forward through a
+            // non-holding relay and fire the route-event hooks. We assert only
+            // that the hooks fire, NOT that every GET resolves, so sparsity (which
+            // would fail a coverage assertion) is exactly what we want here.
+            4, // max_connections
+            3, // min_connections
+            SEED,
+        )
+        .await
+    });
+
+    let contract = SimOperation::create_test_contract(0xC0);
+    let contract_id = *contract.key().id();
+    register_crdt_contract(contract_id);
+
+    // Gateway seeds the contract; only a few nodes subscribe so the cache stays
+    // sparse and most requesters are several hops from a holder.
+    let mut operations = vec![ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_crdt_state(1, 0xC0),
+            subscribe: true,
+        },
+    )];
+    for i in 1..=4 {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, i),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+    for i in 1..=num_nodes {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, i),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(300),
+        Duration::from_secs(90),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let get_route_after = RELAY_GET_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
+    let put_route_after = RELAY_PUT_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
+    assert!(
+        get_route_after > get_route_baseline,
+        "RELAY_GET_ROUTE_EVENT_COUNT did not advance — in a sparse {num_nodes}-node \
+         mesh (max_connections=4) at least one GET must forward through a relay that \
+         feeds a route event to the local Router (a NotFound reply counts too). \
+         Baseline: {get_route_baseline}, after: {get_route_after}."
+    );
+    assert!(
+        put_route_after > put_route_baseline,
+        "RELAY_PUT_ROUTE_EVENT_COUNT did not advance — the gateway PUT at HTL=3 in a \
+         sparse {num_nodes}-node mesh must forward through at least one relay. \
+         Baseline: {put_route_baseline}, after: {put_route_after}."
     );
 }
 
