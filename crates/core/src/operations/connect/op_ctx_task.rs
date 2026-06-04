@@ -136,6 +136,16 @@ pub(crate) async fn start_client_connect(
     desired_location: Location,
     overall_timeout: Option<std::time::Duration>,
 ) -> Result<(), OpError> {
+    // Count this CONNECT toward the connection_maintenance acquisition throttle.
+    // `start_client_connect` is the single entry for every *self-initiated*
+    // (originator) CONNECT — ring acquisition (`Ring::acquire_new`), gateway
+    // joins (`join_ring_request`), and version probes (`gateway_version_probe`)
+    // all route through here — so registering once here keeps the throttle's
+    // storm-safety cap honest across all of them. Relayed CONNECTs go through
+    // `start_relay_connect` and are deliberately NOT counted (#4348). Registered
+    // before the first send below so it precedes any reply or completion.
+    op_manager.ring.live_tx_tracker.register_acquisition(tx);
+
     // Snapshot whether the joiner knows its own external address before
     // contacting the gateway. Mirrors legacy `JoinerState`'s
     // `started_without_address` field at connect.rs:1162. Used at the

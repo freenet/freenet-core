@@ -3448,14 +3448,10 @@ impl Ring {
 
         // Register tx with the live transaction tracker BEFORE spawning the
         // driver. Otherwise the driver's first Response could land on the
-        // bypass before the registration completes, breaking the
-        // acquisition gauge that connection_maintenance uses to throttle
-        // concurrent acquisitions.
+        // bypass before the registration completes. (The acquisition-throttle
+        // registration is done inside `start_client_connect`, shared by every
+        // self-initiated CONNECT — ring acquisition, gateway join, and probe.)
         live_tx_tracker.add_transaction(gateway_addr, tx);
-        // Mark this as a self-initiated acquisition so it (and only it, not
-        // relayed CONNECTs) counts toward the maintenance concurrency throttle
-        // (#4348).
-        live_tx_tracker.register_acquisition(tx);
 
         let op_manager_spawn = op_manager.clone();
         let gateway = query_target;
