@@ -3017,8 +3017,10 @@ impl Ring {
             );
 
             // Drain pending connections, initiating multiple attempts per tick
-            // (up to max_concurrent) for faster mesh formation.
-            let mut active_count = live_tx_tracker.active_connect_transaction_count();
+            // (up to max_concurrent) for faster mesh formation. Counts only this
+            // node's own in-flight acquisitions, NOT CONNECTs it is relaying for
+            // others (#4348).
+            let mut active_count = live_tx_tracker.active_acquisition_transaction_count();
             while let Some(ideal_location) = pending_conn_adds.pop_first() {
                 if self.is_in_connection_backoff(ideal_location) {
                     tracing::debug!(
@@ -3441,9 +3443,13 @@ impl Ring {
         // Register tx with the live transaction tracker BEFORE spawning the
         // driver. Otherwise the driver's first Response could land on the
         // bypass before the registration completes, breaking the
-        // active_connect_transaction_count gauge that connection_maintenance
-        // uses to throttle concurrent acquisitions.
+        // acquisition gauge that connection_maintenance uses to throttle
+        // concurrent acquisitions.
         live_tx_tracker.add_transaction(gateway_addr, tx);
+        // Mark this as a self-initiated acquisition so it (and only it, not
+        // relayed CONNECTs) counts toward the maintenance concurrency throttle
+        // (#4348).
+        live_tx_tracker.register_acquisition(tx);
 
         let op_manager_spawn = op_manager.clone();
         let gateway = query_target;
