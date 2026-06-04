@@ -329,8 +329,9 @@ mod tests {
         assert!(pruned.is_empty());
     }
 
-    /// Pins the load-bearing invariant for `Ring::connection_maintenance`
-    /// (`crates/core/src/ring.rs:2360-2365`): once a `tx` has been
+    /// Pins the load-bearing invariant for `Ring::connection_maintenance`'s
+    /// `has_live_connection` neighbor filter (`crates/core/src/ring.rs:3110`):
+    /// once a `tx` has been
     /// registered against a peer, `has_live_connection(that_peer)` must
     /// remain `true` until the tx is explicitly cleared, even after the
     /// same `tx` is re-registered against another peer.
