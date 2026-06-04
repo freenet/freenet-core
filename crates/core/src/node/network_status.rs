@@ -255,10 +255,12 @@ pub enum FailureReason {
 
 /// Initialize the global network status tracker.
 ///
-/// In production `init()` runs exactly once at node startup, so the first
-/// call always wins. If it is called again (the in-process test harness
-/// re-initializes the global between tests), the new status is written
-/// **in place** into the existing `RwLock` rather than dropped.
+/// In production `init()` runs exactly once, at node startup, on one of the
+/// two mutually-exclusive bring-up paths (`run_local_node` or `run_node`),
+/// so the first call installs the tracker. If it is called again — which in
+/// practice only happens in this module's own unit tests, each of which
+/// re-initializes the global with its own port/version — the new status is
+/// written **in place** into the existing `RwLock` rather than dropped.
 ///
 /// The previous implementation relied on `OnceLock::set`, which is
 /// first-write-wins: a second `init()` silently became a no-op. Because the
@@ -269,6 +271,11 @@ pub enum FailureReason {
 /// That made the test outcomes order-dependent: they passed in isolation but
 /// failed intermittently under parallel execution. Overwriting in place makes
 /// `init()` deterministically reset the tracker on every call.
+///
+/// This refreshes only the `NetworkStatus` value. The separately-registered
+/// providers (`SUBSCRIPTION_PROVIDER`, `GOVERNANCE_PROVIDER`,
+/// `RING_STATS_PROVIDER`, `ROUTER`) live in their own statics with their own
+/// replace-on-set semantics and are intentionally left untouched here.
 pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: String) {
     let status = NetworkStatus {
         gateway_failures: Vec::new(),
@@ -291,10 +298,15 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
                 *guard = status;
             }
         }
-        // First call: install the tracker. The race where two threads both
-        // observe `None` is benign — `set` makes exactly one win, and the
-        // loser's status is identical-shaped fresh state that a subsequent
-        // call would overwrite anyway.
+        // First call: install the tracker. A concurrent first-init race (two
+        // threads both observing `None`) cannot occur in production — `init()`
+        // is called exactly once, on a single linear startup path — and is
+        // serialized by `TEST_GLOBAL_STATE_LOCK` in tests. If it ever did
+        // occur, `set` picks exactly one winner and the loser's status (freshly
+        // built, with no accumulated failures/peers/stats) is dropped. That is
+        // the one window where the "every call overwrites" contract would not
+        // hold, but it is unreachable by construction, so we don't pay to
+        // recover the loser's value here.
         None => {
             #[allow(clippy::let_underscore_must_use)]
             let _ = NETWORK_STATUS.set(Arc::new(RwLock::new(status)));
