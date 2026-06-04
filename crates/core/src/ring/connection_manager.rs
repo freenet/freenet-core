@@ -2426,8 +2426,9 @@ mod tests {
         // test acquires below for its entire body.
         //
         // `network_status::set_external_address` is a no-op until `init()` has
-        // run. `init()` is idempotent (OnceLock — first caller wins), so this
-        // is safe even if another test already initialized the global.
+        // run. `init()` is idempotent-overwrite (installs the tracker on the
+        // first call, overwrites it in place on later calls), so this is safe
+        // even if another test already initialized the global.
         let _global = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
             .lock()
             .expect("TEST_GLOBAL_STATE_LOCK poisoned by an earlier test panic");

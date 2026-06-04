@@ -254,6 +254,28 @@ pub enum FailureReason {
 }
 
 /// Initialize the global network status tracker.
+///
+/// In production `init()` runs exactly once, at node startup, on one of the
+/// two mutually-exclusive bring-up paths (`run_local_node` or `run_node`),
+/// so the first call installs the tracker. If it is called again — which in
+/// practice only happens in this module's own unit tests, each of which
+/// re-initializes the global with its own port/version — the new status is
+/// written **in place** into the existing `RwLock` rather than dropped.
+///
+/// The previous implementation relied on `OnceLock::set`, which is
+/// first-write-wins: a second `init()` silently became a no-op. Because the
+/// `OnceLock` outlives any single test (it is process-global and cannot be
+/// reset by the `TEST_GLOBAL_STATE_LOCK` the tests serialize on), every test
+/// running after the first `init()` inherited the first test's
+/// `NetworkStatus` — wrong version, leaked gateway failures, leaked op stats.
+/// That made the test outcomes order-dependent: they passed in isolation but
+/// failed intermittently under parallel execution. Overwriting in place makes
+/// `init()` deterministically reset the tracker on every call.
+///
+/// This refreshes only the `NetworkStatus` value. The separately-registered
+/// providers (`SUBSCRIPTION_PROVIDER`, `GOVERNANCE_PROVIDER`,
+/// `RING_STATS_PROVIDER`, `ROUTER`) live in their own statics with their own
+/// replace-on-set semantics and are intentionally left untouched here.
 pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: String) {
     let status = NetworkStatus {
         gateway_failures: Vec::new(),
@@ -268,9 +290,28 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         op_stats: OperationStats::default(),
         nat_stats: NatStats::default(),
     };
-    // OnceLock::set returns Err if already initialized; this is expected on repeated calls
-    #[allow(clippy::let_underscore_must_use)]
-    let _ = NETWORK_STATUS.set(Arc::new(RwLock::new(status)));
+    match NETWORK_STATUS.get() {
+        // Already initialized: overwrite the existing tracker in place so
+        // repeated `init()` calls are idempotent-overwrite rather than no-ops.
+        Some(existing) => {
+            if let Ok(mut guard) = existing.write() {
+                *guard = status;
+            }
+        }
+        // First call: install the tracker. A concurrent first-init race (two
+        // threads both observing `None`) cannot occur in production — `init()`
+        // is called exactly once, on a single linear startup path — and is
+        // serialized by `TEST_GLOBAL_STATE_LOCK` in tests. If it ever did
+        // occur, `set` picks exactly one winner and the loser's status (freshly
+        // built, with no accumulated failures/peers/stats) is dropped. That is
+        // the one window where the "every call overwrites" contract would not
+        // hold, but it is unreachable by construction, so we don't pay to
+        // recover the loser's value here.
+        None => {
+            #[allow(clippy::let_underscore_must_use)]
+            let _ = NETWORK_STATUS.set(Arc::new(RwLock::new(status)));
+        }
+    }
 }
 
 /// Check if an address is a known gateway.
@@ -1368,6 +1409,52 @@ mod tests {
         assert_eq!(s.version, "0.1.0-test");
         assert_eq!(s.listening_port, 31337);
         assert_eq!(s.open_connections, 0);
+    }
+
+    /// Regression: a second `init()` must overwrite the global tracker in
+    /// place rather than no-op.
+    ///
+    /// The original implementation used `OnceLock::set` (first-write-wins),
+    /// so once any test initialized the process-global `NETWORK_STATUS`,
+    /// every later `init()` was silently dropped. The version/port/failures
+    /// from the first call leaked into every subsequent test, making the
+    /// whole module order-dependent and intermittently failing under
+    /// parallel execution. This test pins the fix deterministically: it
+    /// initializes twice, with a recorded failure between the calls, and
+    /// asserts the second call's values fully replace the first's.
+    #[test]
+    fn init_overwrites_existing_global() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+
+        // First initialization, then dirty the state so we can prove the
+        // second init() resets it (not just changes scalar fields).
+        init(40001, HashSet::new(), "first-version".to_string());
+        record_gateway_failure(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 31337),
+            FailureReason::Timeout,
+        );
+        let first = get_snapshot().unwrap();
+        assert_eq!(first.version, "first-version");
+        assert_eq!(first.listening_port, 40001);
+        assert_eq!(
+            first.failures.len(),
+            1,
+            "failure recorded against the first tracker"
+        );
+
+        // Second initialization with different values must take effect
+        // immediately and reset the accumulated state.
+        init(40002, HashSet::new(), "second-version".to_string());
+        let second = get_snapshot().unwrap();
+        assert_eq!(
+            second.version, "second-version",
+            "second init() version must win (first-write-wins would keep `first-version`)"
+        );
+        assert_eq!(second.listening_port, 40002);
+        assert!(
+            second.failures.is_empty(),
+            "second init() must reset accumulated gateway failures"
+        );
     }
 
     /// Registered RingStatsProvider must surface in `snap.ring_stats`,
