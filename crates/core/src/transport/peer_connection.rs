@@ -1285,13 +1285,41 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             .get_resend();
                         // Extract (idx, packet) from the resend action, applying
                         // action-specific side effects (congestion notification, logging).
+                        // Abandon releases flight size and is handled inline (it neither
+                        // re-sends nor re-registers). See #4345.
                         let (idx, packet) = match maybe_resend {
                             ResendAction::WaitUntil(deadline_nanos) => {
                                 resend_check_sleep = Some(self.time_source.sleep_until(deadline_nanos));
                                 break;
                             }
+                            ResendAction::Abandon { packet_id, payload_len } => {
+                                // The packet was retransmitted MAX_PACKET_RETRANSMITS times
+                                // with no ACK and is now permanently lost. Release its bytes
+                                // from flight size — this is the give-up that drains a flight
+                                // size pinned by a never-ACKed packet (issue #4345). The
+                                // tracker already dropped it, so we neither re-send nor
+                                // re-register; continue draining the resend queue.
+                                self.remote_conn
+                                    .congestion_controller
+                                    .release_flightsize(payload_len);
+                                tracing::debug!(
+                                    peer_addr = %self.remote_conn.remote_addr,
+                                    packet_id,
+                                    payload_len,
+                                    "Resend abandoned packet — released flight size (#4345)"
+                                );
+                                resend_count += 1;
+                                if resend_count >= MAX_RESENDS_PER_ITERATION {
+                                    resend_check_sleep = Some(self.time_source.sleep(resend_yield));
+                                    break;
+                                }
+                                continue;
+                            }
                             ResendAction::Resend(idx, packet) => {
-                                // Notify congestion controller of packet loss (timeout-based retransmission)
+                                // Notify congestion controller of packet loss (timeout-based
+                                // retransmission). The packet stays in flight — it is
+                                // immediately re-sent and re-registered below — so flight size
+                                // is unchanged; on_timeout only applies the cwnd loss response.
                                 self.remote_conn.congestion_controller.on_timeout();
                                 (idx, packet)
                             }
@@ -1316,8 +1344,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             .await
                         {
                             Ok(_) => {
-                                // Re-register packet for ACK/RTO tracking. on_send() is NOT called
-                                // because bytes were already counted in flightsize during the initial send.
+                                // Re-register packet for ACK/RTO tracking. Flight size is
+                                // unchanged: the packet never left flight (on_timeout did not
+                                // decrement), so neither on_send() nor a re-add is called.
                                 self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
                             }
                             Err(e) => {
@@ -2716,6 +2745,126 @@ mod tests {
             congestion.flightsize(),
             0,
             "All packets ACKed, flightsize should be 0"
+        );
+    }
+
+    /// Regression test for issue #4345: flight size must drain when a packet is
+    /// retransmitted forever with no ACK — the real production recv-loop path.
+    ///
+    /// This drives the EXACT production sequence (not a synthetic give-up): for
+    /// each fired RTO the recv loop calls `on_timeout()` (cwnd loss response
+    /// only — flight size unchanged), successfully re-sends, and re-registers
+    /// the packet, because with no ACK arriving the tracker keeps re-queueing
+    /// it. Crucially, since `on_timeout()` never touches flight size, it would
+    /// stay pinned forever WITHOUT a give-up mechanism. The fix is the
+    /// tracker's bounded-retransmit abandonment: after `MAX_PACKET_RETRANSMITS`
+    /// it returns `ResendAction::Abandon`, the recv loop calls
+    /// `release_flightsize(len)`, and the packet is dropped — so flight size
+    /// finally drains.
+    ///
+    /// This is the integration-level companion to the pure-controller unit
+    /// tests (`bbr`/`fixed_rate`
+    /// `test_issue_4345_release_flightsize_drains_abandoned_bytes`): it confirms
+    /// the END-TO-END path through `SentPacketTracker` actually reaches the
+    /// give-up branch in production, which the earlier draft missed (the recv
+    /// loop always re-sends on RTO, so only abandonment drains the leak).
+    ///
+    /// Before this fix, no abandonment existed: a never-ACKed packet was
+    /// retransmitted forever, its initial `on_send` bytes pinned flight size at
+    /// `cwnd`, and every subsequent stream on the connection aborted with
+    /// "cwnd wait timeout".
+    #[test]
+    fn test_issue_4345_flightsize_drains_via_bounded_retransmit() {
+        use crate::simulation::VirtualTime;
+        use crate::transport::bbr::{BbrConfig, BbrController};
+        use crate::transport::sent_packet_tracker::{ResendAction, SentPacketTracker};
+        use std::sync::Arc;
+
+        let time = VirtualTime::new();
+        let congestion = Arc::new(BbrController::new_with_time_source(
+            BbrConfig {
+                initial_cwnd: 60_000,
+                min_cwnd: 2_000,
+                max_cwnd: 10_000_000,
+                ..Default::default()
+            },
+            time.clone(),
+        ));
+        let mut tracker = SentPacketTracker::new_with_time_source(time.clone());
+
+        // Send a burst that will never be ACKed (dead reverse-ACK path).
+        let packet_size = 1424usize;
+        let num_packets = 30u32;
+        for packet_id in 0..num_packets {
+            let payload: Box<[u8]> = vec![0u8; packet_size].into_boxed_slice();
+            tracker.report_sent_packet(packet_id, payload);
+            congestion.on_send(packet_size);
+        }
+        assert_eq!(
+            congestion.flightsize(),
+            num_packets as usize * packet_size,
+            "flightsize should account for the whole in-flight burst"
+        );
+
+        // Drive the REAL production recv-loop sequence: each RTO calls
+        // on_timeout() (cwnd loss response only — the packet is immediately
+        // re-sent and stays in flight, so flight size is UNCHANGED) and
+        // re-registers, repeating (no ACK ever arrives). Because every re-send
+        // leaves flight size untouched, it would stay pinned forever WITHOUT a
+        // give-up. The fix: after MAX_PACKET_RETRANSMITS the tracker returns
+        // Abandon, the recv loop calls release_flightsize(len), and flight size
+        // finally drains.
+        let mut abandoned = 0u32;
+        let mut resends = 0u32;
+        for _ in 0..20_000 {
+            match tracker.get_resend() {
+                ResendAction::Resend(id, packet) => {
+                    // Production recv-loop Resend arm: cwnd loss response, re-send
+                    // (succeeds here), re-register. Flight size unchanged.
+                    congestion.on_timeout();
+                    tracker.report_sent_packet(id, packet);
+                    resends += 1;
+                }
+                ResendAction::Abandon { payload_len, .. } => {
+                    // The give-up that actually drains the leak.
+                    congestion.release_flightsize(payload_len);
+                    abandoned += 1;
+                }
+                ResendAction::TlpProbe(_id, _packet) => {
+                    // Speculative probe — no flight-size effect.
+                }
+                ResendAction::WaitUntil(_) => {
+                    if abandoned >= num_packets {
+                        break; // every packet abandoned
+                    }
+                    // Jump past the (backed-off) next deadline and retry.
+                    time.advance(std::time::Duration::from_secs(120));
+                }
+            }
+        }
+
+        // Sanity: flight size stayed pinned across the net-zero re-send rounds,
+        // i.e. on_timeout alone never released it — only abandonment does.
+        assert!(
+            resends >= num_packets,
+            "issue #4345: expected the production re-send path to run before \
+             abandonment (resends={resends}); the test did not exercise the \
+             real recv-loop re-send sequence"
+        );
+        assert_eq!(
+            abandoned, num_packets,
+            "issue #4345: every never-ACKed packet must eventually be abandoned \
+             (abandoned={abandoned}/{num_packets})"
+        );
+        assert!(
+            congestion.flightsize() <= packet_size,
+            "issue #4345: flight size did not drain after bounded-retransmit \
+             abandonment — got {} bytes ({} packets still in flight). Re-sends \
+             alone never release a never-ACKed packet (on_timeout leaves flight \
+             size unchanged); the tracker MUST abandon it (ResendAction::Abandon) \
+             so the recv loop calls release_flightsize().",
+            congestion.flightsize(),
+            congestion.flightsize() / packet_size,
         );
     }
 

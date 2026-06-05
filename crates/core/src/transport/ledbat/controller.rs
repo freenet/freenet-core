@@ -942,6 +942,19 @@ impl<T: TimeSource> LedbatController<T> {
         );
     }
 
+    /// Release an abandoned packet's bytes from flight size (issue #4345).
+    ///
+    /// Called when a packet is permanently abandoned after
+    /// `MAX_PACKET_RETRANSMITS`. Saturating; does NOT touch cwnd or the delay
+    /// controller.
+    pub fn release_flightsize(&self, bytes: usize) {
+        self.flightsize
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(bytes))
+            })
+            .ok();
+    }
+
     /// Get LEDBAT congestion control statistics.
     pub fn stats(&self) -> LedbatStats {
         LedbatStats {
@@ -4973,6 +4986,35 @@ mod tests {
             "Base delay should return to near baseline: {:?}",
             final_base_delay
         );
+    }
+
+    /// Issue #4345: `release_flightsize` drains an abandoned packet's bytes
+    /// (saturating), while `on_timeout` leaves flight size unchanged. Mirrors
+    /// the BBR/FixedRate `release_flightsize_drains_abandoned_bytes` tests for
+    /// the non-default LEDBAT controller.
+    #[test]
+    fn test_issue_4345_release_flightsize_drains_abandoned_bytes() {
+        let controller = LedbatController::new(100_000, 2848, 10_000_000);
+
+        controller.on_send(5000);
+        assert_eq!(controller.flightsize(), 5000);
+
+        // on_timeout (per-RTO) must NOT change flight size — the packet is still
+        // in flight, being retransmitted.
+        controller.on_timeout();
+        assert_eq!(
+            controller.flightsize(),
+            5000,
+            "on_timeout() must not change flight size; only abandonment/ACK does"
+        );
+
+        // Abandonment releases the bytes.
+        controller.release_flightsize(3000);
+        assert_eq!(controller.flightsize(), 2000);
+
+        // Saturating: releasing more than remains floors at 0, never underflows.
+        controller.release_flightsize(9999);
+        assert_eq!(controller.flightsize(), 0);
     }
 
     // ============================================================================

@@ -83,6 +83,26 @@ BEFORE changing LEDBAT++ parameters:
   4. Document reasoning in commit message
 ```
 
+### Flight-size release invariant (issue #4345)
+
+```
+Flight size MUST have a release path other than ACK. A packet whose ACKs
+never arrive (lossy path / starved reverse-ACK channel) is retransmitted up
+to MAX_PACKET_RETRANSMITS times, then SentPacketTracker returns
+ResendAction::Abandon and the recv loop calls
+CongestionControl::release_flightsize(len). Without this, a never-ACKed
+packet's on_send bytes stay in flight size for the connection's life,
+pinning flight size at cwnd and stalling every subsequent stream
+(the #4345 "cwnd wait timeout" / "no fragments received" failure).
+
+  - on_timeout() applies the cwnd loss response only; it MUST NOT change
+    flight size (the timed-out packet is immediately re-sent and stays in
+    flight). Do NOT reintroduce a decrement-on-RTO + re-add-on-resend pair —
+    the recv loop always re-sends on RTO, so that is net-zero and does not
+    drain a never-ACKed packet.
+  - Retransmissions MUST stay bounded. Do not make retransmit infinite again.
+```
+
 ### Shadow per-peer RTT registry (issue #4074, Phases 1 + 1.5)
 
 `transport/rolling_rtt_stats.rs` maintains a process-wide

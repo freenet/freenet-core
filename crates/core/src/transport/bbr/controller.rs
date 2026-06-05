@@ -428,6 +428,20 @@ impl<T: TimeSource> BbrController<T> {
         }
     }
 
+    /// Release an abandoned packet's bytes from flight size (issue #4345).
+    ///
+    /// Called when a packet is permanently abandoned after
+    /// `MAX_PACKET_RETRANSMITS`. Atomic saturating decrement (matches the ACK
+    /// path's accounting and never underflows under the concurrent `on_send`
+    /// from the sender task). Does NOT touch cwnd or the delivery sampler.
+    pub fn release_flightsize(&self, bytes: usize) {
+        self.flightsize
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(bytes))
+            })
+            .ok();
+    }
+
     /// Get the current congestion window in bytes.
     pub fn current_cwnd(&self) -> usize {
         self.cwnd.load(Ordering::Acquire)

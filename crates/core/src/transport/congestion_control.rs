@@ -206,8 +206,22 @@ pub trait CongestionControl: Send + Sync {
     /// Called when a retransmission timeout (RTO) occurs.
     ///
     /// This indicates severe congestion. Implementations typically
-    /// reset to minimum cwnd and re-enter slow start.
+    /// reset to minimum cwnd and re-enter slow start. Flight size is NOT
+    /// changed: the timed-out packet is immediately retransmitted and stays in
+    /// flight. Bytes are released only when a packet is permanently abandoned
+    /// (see [`release_flightsize`](Self::release_flightsize)).
     fn on_timeout(&self);
+
+    /// Release `bytes` from flight size for a packet that has been permanently
+    /// abandoned — retransmitted `MAX_PACKET_RETRANSMITS` times with no ACK and
+    /// dropped from tracking (see `SentPacketTracker`).
+    ///
+    /// Without this, a never-ACKed packet is retransmitted forever and its
+    /// initial `on_send` bytes stay counted in flight size for the life of the
+    /// connection, pinning flight size at cwnd and stalling every subsequent
+    /// stream on that connection (issue #4345). This is the only flight-size
+    /// release path other than ACK; the decrement saturates at zero.
+    fn release_flightsize(&self, bytes: usize);
 
     // =========================================================================
     // State Queries
@@ -350,6 +364,14 @@ impl<T: TimeSource> CongestionControl for CongestionController<T> {
         }
     }
 
+    fn release_flightsize(&self, bytes: usize) {
+        match self {
+            Self::Bbr(c) => c.release_flightsize(bytes),
+            Self::Ledbat(c) => c.release_flightsize(bytes),
+            Self::FixedRate(c) => c.release_flightsize(bytes),
+        }
+    }
+
     fn current_cwnd(&self) -> usize {
         match self {
             Self::Bbr(c) => c.current_cwnd(),
@@ -477,6 +499,10 @@ impl<T: TimeSource> CongestionControl for BbrController<T> {
         BbrController::on_timeout(self)
     }
 
+    fn release_flightsize(&self, bytes: usize) {
+        BbrController::release_flightsize(self, bytes)
+    }
+
     fn current_cwnd(&self) -> usize {
         BbrController::current_cwnd(self)
     }
@@ -551,6 +577,10 @@ impl<T: TimeSource> CongestionControl for LedbatController<T> {
         LedbatController::on_timeout(self)
     }
 
+    fn release_flightsize(&self, bytes: usize) {
+        LedbatController::release_flightsize(self, bytes)
+    }
+
     fn current_cwnd(&self) -> usize {
         LedbatController::current_cwnd(self)
     }
@@ -619,6 +649,10 @@ impl<T: TimeSource> CongestionControl for FixedRateController<T> {
 
     fn on_timeout(&self) {
         FixedRateController::on_timeout(self)
+    }
+
+    fn release_flightsize(&self, bytes: usize) {
+        FixedRateController::release_flightsize(self, bytes)
     }
 
     fn current_cwnd(&self) -> usize {
