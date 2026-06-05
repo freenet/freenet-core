@@ -46,6 +46,40 @@ pub(super) const MESSAGE_CONFIRMATION_TIMEOUT: Duration = {
 /// reached with smaller backoff multipliers.
 const MAX_RTO_BACKOFF: u32 = 512;
 
+/// Maximum number of times a single packet is retransmitted before it is
+/// abandoned (declared permanently lost).
+///
+/// Without an upper bound, a packet whose ACKs never arrive (e.g. a stream
+/// whose sender task already gave up on the `CWND_WAIT_TIMEOUT`, or a starved
+/// reverse-ACK channel) is retransmitted forever. Its bytes then stay counted
+/// in the congestion controller's flight size for the life of the connection,
+/// pinning flight size at `cwnd` and stalling every subsequent stream on that
+/// connection (issue #4345).
+///
+/// On abandon, `get_resend` returns [`ResendAction::Abandon`] instead of
+/// `Resend`; the recv loop releases the bytes from flight size via
+/// `CongestionControl::release_flightsize(len)`, and the packet is dropped from
+/// tracking.
+///
+/// Wall-clock to abandonment depends on whether OTHER packets are still being
+/// ACKed, because `rto_backoff` is tracker-wide and resets to 1 on any ACK
+/// while this count is per-packet:
+/// - **Partial loss (the common multi-fragment case):** other fragments keep
+///   ACKing, so `rto_backoff` stays at 1 and the black-holed fragment retries
+///   at the 500ms `MIN_RTO` floor — abandoned after ~6s (12 × 500ms). That is
+///   just above `STREAM_INACTIVITY_TIMEOUT` (5s), i.e. the receiver has already
+///   given up on the stream; abandoning frees the connection's flight size for
+///   the next stream.
+/// - **Fully dead link (no ACKs at all):** `rto_backoff` escalates (1→512,
+///   capped at a 60s effective RTO), so 12 retransmits span ~6 minutes; here
+///   the 120s connection idle timeout tears the connection down first, so the
+///   abandon path mainly serves the partial-loss case.
+///
+/// A still-progressing transfer is never abandoned: any ACK for the stuck
+/// packet resets its count, and a 12-consecutive-RTO black hole on an otherwise
+/// healthy path is a genuinely dead fragment.
+const MAX_PACKET_RETRANSMITS: u32 = 12;
+
 /// Minimum RTO after RTT samples have been collected.
 ///
 /// RFC 6298 recommends 1 second, but Linux TCP uses 200ms. We use 500ms because it must
@@ -127,6 +161,12 @@ pub(super) struct SentPacketTracker<T: TimeSource> {
     /// Track packets that have had TLP probes sent.
     /// TLP fires once per packet before RTO - if no ACK, RTO handles it.
     tlp_sent_packets: HashSet<PacketId>,
+
+    /// Per-packet RTO retransmission count, used to abandon a packet after
+    /// `MAX_PACKET_RETRANSMITS` (issue #4345). Incremented on each RTO fire,
+    /// cleared on ACK. An entry is removed when its packet is ACKed or
+    /// abandoned, so this map tracks only currently-unacked packets.
+    retransmit_counts: HashMap<PacketId, u32>,
 }
 
 impl<T: TimeSource> SentPacketTracker<T> {
@@ -146,6 +186,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
             total_packets_sent: 0,
             rto_backoff: 1, // No backoff initially
             tlp_sent_packets: HashSet::new(),
+            retransmit_counts: HashMap::new(),
         }
     }
 
@@ -244,10 +285,11 @@ impl<T: TimeSource> SentPacketTracker<T> {
                 }
             }
 
-            // Remove from pending, retransmitted, and TLP tracking
+            // Remove from pending, retransmitted, TLP, and retransmit-count tracking
             self.pending_receipts.remove(packet_id);
             self.retransmitted_packets.remove(packet_id);
             self.tlp_sent_packets.remove(packet_id);
+            self.retransmit_counts.remove(packet_id);
         }
 
         let loss_rate = if self.total_packets_sent > 0 {
@@ -434,6 +476,30 @@ impl<T: TimeSource> SentPacketTracker<T> {
                         * (1.0 - PACKET_LOSS_DECAY_FACTOR)
                         + PACKET_LOSS_DECAY_FACTOR;
 
+                    // Count this RTO. After MAX_PACKET_RETRANSMITS with no ACK,
+                    // abandon the packet so its bytes are released from flight
+                    // size instead of being retransmitted forever (issue #4345).
+                    let count = self.retransmit_counts.entry(entry.packet_id).or_insert(0);
+                    *count += 1;
+                    if *count > MAX_PACKET_RETRANSMITS {
+                        let payload_len = packet.len();
+                        // Drop all tracking for this packet — it will NOT be
+                        // re-queued, so the recv loop stops retransmitting it.
+                        self.retransmit_counts.remove(&entry.packet_id);
+                        self.retransmitted_packets.remove(&entry.packet_id);
+                        self.tlp_sent_packets.remove(&entry.packet_id);
+                        tracing::debug!(
+                            packet_id = entry.packet_id,
+                            retransmits = MAX_PACKET_RETRANSMITS,
+                            payload_len,
+                            "Abandoning packet after max retransmits — releasing flight size (#4345)"
+                        );
+                        return ResendAction::Abandon {
+                            packet_id: entry.packet_id,
+                            payload_len,
+                        };
+                    }
+
                     // Mark as retransmitted for Karn's algorithm
                     self.mark_retransmitted(entry.packet_id);
 
@@ -473,6 +539,13 @@ pub enum ResendAction {
     /// TLP (Tail Loss Probe) - send a probe to detect tail loss earlier than RTO.
     /// Unlike Resend, this doesn't apply backoff since it's speculative.
     TlpProbe(u32, Box<[u8]>),
+    /// The packet has been retransmitted `MAX_PACKET_RETRANSMITS` times without
+    /// an ACK and is declared permanently lost (issue #4345). It has been
+    /// removed from tracking; the caller MUST release its `payload_len` bytes
+    /// from the congestion controller's flight size via
+    /// `CongestionControl::release_flightsize(payload_len)` and MUST NOT
+    /// re-register or re-send it.
+    Abandon { packet_id: u32, payload_len: usize },
 }
 
 struct ResendQueueEntry {
@@ -566,7 +639,9 @@ pub(in crate::transport) mod tests {
         // This should not trigger a resend yet (TLP fires at 10ms)
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => (),
-            ResendAction::Resend(..) | ResendAction::TlpProbe(..) => {
+            ResendAction::Resend(..)
+            | ResendAction::TlpProbe(..)
+            | ResendAction::Abandon { .. } => {
                 panic!("Expected WaitUntil, got Resend/TlpProbe too early")
             }
         }
@@ -581,6 +656,7 @@ pub(in crate::transport) mod tests {
             }
             ResendAction::Resend(_, _) => panic!("Expected TlpProbe, got Resend"),
             ResendAction::WaitUntil(_) => panic!("Expected TlpProbe, got WaitUntil"),
+            ResendAction::Abandon { .. } => panic!("Expected TlpProbe, got Abandon"),
         }
     }
 
@@ -608,7 +684,9 @@ pub(in crate::transport) mod tests {
                     "Wait deadline should be in the future"
                 );
             }
-            ResendAction::Resend(..) | ResendAction::TlpProbe(..) => {
+            ResendAction::Resend(..)
+            | ResendAction::TlpProbe(..)
+            | ResendAction::Abandon { .. } => {
                 panic!("Expected ResendAction::WaitUntil")
             }
         }
@@ -1114,7 +1192,9 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(39));
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {} // Expected - still waiting
-            ResendAction::Resend(..) | ResendAction::TlpProbe(..) => {
+            ResendAction::Resend(..)
+            | ResendAction::TlpProbe(..)
+            | ResendAction::Abandon { .. } => {
                 panic!("Should not fire before TLP timeout (40ms)")
             }
         }
@@ -1127,6 +1207,7 @@ pub(in crate::transport) mod tests {
                 assert_eq!(id, 2, "Or Resend if TLP not yet implemented")
             }
             ResendAction::WaitUntil(_) => panic!("Should have triggered TLP after 40ms"),
+            ResendAction::Abandon { .. } => panic!("unexpected Abandon"),
         }
     }
 
@@ -1147,6 +1228,7 @@ pub(in crate::transport) mod tests {
             ResendAction::WaitUntil(_) => {} // Expected
             ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
             ResendAction::Resend(_, _) => panic!("Should not resend before RTO expires"),
+            ResendAction::Abandon { .. } => panic!("unexpected Abandon"),
         }
 
         // Advance 1 more ms to trigger timeout
@@ -1170,6 +1252,7 @@ pub(in crate::transport) mod tests {
             ResendAction::WaitUntil(_) => {} // Expected
             ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
             ResendAction::Resend(_, _) => panic!("Should not resend before backed-off RTO (2s)"),
+            ResendAction::Abandon { .. } => panic!("unexpected Abandon"),
         }
 
         // Advance 1 more ms to trigger timeout
@@ -1193,6 +1276,7 @@ pub(in crate::transport) mod tests {
             ResendAction::WaitUntil(_) => {} // Expected
             ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
             ResendAction::Resend(_, _) => panic!("Should not resend before backed-off RTO (4s)"),
+            ResendAction::Abandon { .. } => panic!("unexpected Abandon"),
         }
 
         // Advance 1 more ms to trigger timeout
@@ -1238,7 +1322,9 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(99));
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {} // Expected
-            ResendAction::Resend(..) | ResendAction::TlpProbe(..) => {
+            ResendAction::Resend(..)
+            | ResendAction::TlpProbe(..)
+            | ResendAction::Abandon { .. } => {
                 panic!("Should not fire before TLP timeout")
             }
         }
@@ -1249,6 +1335,7 @@ pub(in crate::transport) mod tests {
             ResendAction::TlpProbe(id, _) => assert_eq!(id, 2, "TLP should probe packet 2"),
             ResendAction::Resend(_, _) => panic!("Should be TLP probe, not full RTO resend"),
             ResendAction::WaitUntil(_) => panic!("TLP should have fired at 2*SRTT"),
+            ResendAction::Abandon { .. } => panic!("unexpected Abandon"),
         }
     }
 
@@ -1269,7 +1356,9 @@ pub(in crate::transport) mod tests {
 
         match tracker.get_resend() {
             ResendAction::TlpProbe(_, _) => {}
-            ResendAction::WaitUntil(_) | ResendAction::Resend(..) => panic!("Expected TLP probe"),
+            ResendAction::WaitUntil(_)
+            | ResendAction::Resend(..)
+            | ResendAction::Abandon { .. } => panic!("Expected TLP probe"),
         }
 
         // Backoff should NOT have increased (TLP is speculative)
@@ -1297,7 +1386,9 @@ pub(in crate::transport) mod tests {
                 assert_eq!(id, 2);
                 payload
             }
-            ResendAction::WaitUntil(_) | ResendAction::Resend(..) => panic!("Expected TLP probe"),
+            ResendAction::WaitUntil(_)
+            | ResendAction::Resend(..)
+            | ResendAction::Abandon { .. } => panic!("Expected TLP probe"),
         };
 
         // Re-register for RTO tracking after TLP
@@ -1308,7 +1399,9 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(499));
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {} // Still waiting for RTO
-            ResendAction::Resend(..) | ResendAction::TlpProbe(..) => {
+            ResendAction::Resend(..)
+            | ResendAction::TlpProbe(..)
+            | ResendAction::Abandon { .. } => {
                 panic!("Should still be waiting for RTO")
             }
         }
@@ -1347,6 +1440,7 @@ pub(in crate::transport) mod tests {
             ResendAction::WaitUntil(_) => {} // Good - no pending packets
             ResendAction::TlpProbe(_, _) => panic!("TLP should be cancelled by ACK"),
             ResendAction::Resend(_, _) => panic!("No resend needed, packet was ACKed"),
+            ResendAction::Abandon { .. } => panic!("unexpected Abandon"),
         }
     }
 
@@ -1367,7 +1461,9 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(9));
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {}
-            ResendAction::Resend(..) | ResendAction::TlpProbe(..) => {
+            ResendAction::Resend(..)
+            | ResendAction::TlpProbe(..)
+            | ResendAction::Abandon { .. } => {
                 panic!("Should not fire before minimum TLP timeout")
             }
         }
@@ -1376,7 +1472,9 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(2));
         match tracker.get_resend() {
             ResendAction::TlpProbe(id, _) => assert_eq!(id, 2),
-            ResendAction::WaitUntil(_) | ResendAction::Resend(..) => {
+            ResendAction::WaitUntil(_)
+            | ResendAction::Resend(..)
+            | ResendAction::Abandon { .. } => {
                 panic!("TLP should fire at minimum 10ms")
             }
         }
@@ -1397,6 +1495,7 @@ pub(in crate::transport) mod tests {
             ResendAction::WaitUntil(_) => {}
             ResendAction::TlpProbe(_, _) => panic!("TLP should not fire without RTT samples"),
             ResendAction::Resend(_, _) => panic!("RTO is 1s, should not fire at 500ms"),
+            ResendAction::Abandon { .. } => panic!("unexpected Abandon"),
         }
 
         // At 1001ms, RTO fires (no TLP)
@@ -1429,7 +1528,173 @@ pub(in crate::transport) mod tests {
                 // Should probe the oldest unacked packet
                 assert_eq!(id, 2, "TLP should probe oldest unacked packet");
             }
-            ResendAction::WaitUntil(_) | ResendAction::Resend(..) => panic!("Expected TLP probe"),
+            ResendAction::WaitUntil(_)
+            | ResendAction::Resend(..)
+            | ResendAction::Abandon { .. } => panic!("Expected TLP probe"),
         }
+    }
+
+    /// Regression test for issue #4345: a packet that is never ACKed is
+    /// retransmitted at most `MAX_PACKET_RETRANSMITS` times, then abandoned —
+    /// `get_resend` returns `Abandon` and the packet is dropped from tracking,
+    /// so it is no longer re-queued (which would otherwise pin flight size
+    /// forever). An ACK before the limit resets the count.
+    #[test]
+    fn test_issue_4345_packet_abandoned_after_max_retransmits() {
+        let mut tracker = mock_sent_packet_tracker();
+        let payload_len = 3usize;
+        tracker.report_sent_packet(1, vec![1, 2, 3].into());
+
+        // Drive RTOs, re-sending each time (production re-registers), with no ACK.
+        let mut resends = 0u32;
+        let mut abandoned = false;
+        for _ in 0..1000 {
+            // Jump past the (backed-off) RTO deadline.
+            tracker.time_source.advance(Duration::from_secs(120));
+            match tracker.get_resend() {
+                ResendAction::Resend(id, packet) => {
+                    assert_eq!(id, 1);
+                    // Re-register exactly as the production recv loop does.
+                    tracker.report_sent_packet(id, packet);
+                    resends += 1;
+                }
+                ResendAction::Abandon {
+                    packet_id,
+                    payload_len: len,
+                } => {
+                    assert_eq!(packet_id, 1);
+                    assert_eq!(len, payload_len);
+                    abandoned = true;
+                    break;
+                }
+                ResendAction::TlpProbe(..) => {}
+                ResendAction::WaitUntil(_) => {}
+            }
+        }
+
+        assert!(
+            abandoned,
+            "issue #4345: packet must be abandoned, never was"
+        );
+        assert_eq!(
+            resends, MAX_PACKET_RETRANSMITS,
+            "issue #4345: packet should be re-sent exactly MAX_PACKET_RETRANSMITS \
+             times before abandonment (got {resends})"
+        );
+        // After abandonment the packet is gone from tracking — no further resend.
+        assert!(
+            tracker.pending_receipts.is_empty(),
+            "abandoned packet must be removed from pending_receipts"
+        );
+        assert!(
+            tracker.retransmit_counts.is_empty(),
+            "abandoned packet's retransmit count must be cleared"
+        );
+        tracker.time_source.advance(Duration::from_secs(120));
+        assert!(
+            matches!(tracker.get_resend(), ResendAction::WaitUntil(_)),
+            "abandoned packet must NOT be re-queued for resend"
+        );
+    }
+
+    /// An ACK arriving before the retransmit limit resets the count, so a
+    /// flaky-but-recovering packet is never abandoned.
+    #[test]
+    fn test_issue_4345_ack_resets_retransmit_count() {
+        let mut tracker = mock_sent_packet_tracker();
+        tracker.report_sent_packet(1, vec![1, 2, 3].into());
+
+        // Fire a few RTOs (re-sending each), short of the limit.
+        for _ in 0..(MAX_PACKET_RETRANSMITS - 2) {
+            tracker.time_source.advance(Duration::from_secs(120));
+            match tracker.get_resend() {
+                ResendAction::Resend(id, packet) => tracker.report_sent_packet(id, packet),
+                other => panic!("expected Resend, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            tracker.retransmit_counts.get(&1).copied(),
+            Some(MAX_PACKET_RETRANSMITS - 2)
+        );
+
+        // ACK arrives → count cleared.
+        tracker.report_received_receipts(&[1]);
+        assert!(
+            tracker.retransmit_counts.is_empty(),
+            "ACK must clear the retransmit count so the packet can't be abandoned later"
+        );
+    }
+
+    /// Issue #4345: a flaky-but-progressing packet (intermittent loss with an
+    /// ACK before every `MAX_PACKET_RETRANSMITS`-th retransmit) is NEVER
+    /// abandoned — the per-packet count is reset by each ACK, so a slow but
+    /// alive transfer survives indefinitely.
+    #[test]
+    fn test_issue_4345_flaky_but_alive_packet_never_abandoned() {
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Run many more than MAX_PACKET_RETRANSMITS total RTO fires, but slip an
+        // ACK in before the limit each time. The packet must never be abandoned.
+        let mut id = 1u32;
+        tracker.report_sent_packet(id, vec![1, 2, 3].into());
+        for cycle in 0..(MAX_PACKET_RETRANSMITS as usize * 5) {
+            tracker.time_source.advance(Duration::from_secs(120));
+            match tracker.get_resend() {
+                ResendAction::Resend(rid, packet) => {
+                    tracker.report_sent_packet(rid, packet);
+                    // Every (MAX-1) retransmits, an ACK lands for this packet,
+                    // resetting its count — then we "send" a fresh packet id so
+                    // the flow keeps making progress.
+                    if (cycle + 1) % (MAX_PACKET_RETRANSMITS as usize - 1) == 0 {
+                        tracker.report_received_receipts(&[rid]);
+                        id += 1;
+                        tracker.report_sent_packet(id, vec![1, 2, 3].into());
+                    }
+                }
+                ResendAction::Abandon { .. } => {
+                    panic!(
+                        "issue #4345: a flaky-but-alive packet was abandoned at \
+                         cycle {cycle} — ACKs before the limit must keep it alive"
+                    );
+                }
+                ResendAction::TlpProbe(_, _) | ResendAction::WaitUntil(_) => {}
+            }
+        }
+    }
+
+    /// Issue #4345: after a packet is abandoned, a late ACK for it must NOT
+    /// release flight size a second time. Abandon removes the packet from
+    /// `pending_receipts`, so `report_received_receipts` returns no entry for it
+    /// (no `bytes_acked` for the caller to subtract) — guarding against a
+    /// double-decrement that would under-count flight size.
+    #[test]
+    fn test_issue_4345_late_ack_after_abandon_is_noop() {
+        let mut tracker = mock_sent_packet_tracker();
+        tracker.report_sent_packet(7, vec![9, 9, 9].into());
+
+        // Drive RTOs (re-sending) until the packet is abandoned.
+        let mut abandoned = false;
+        for _ in 0..1000 {
+            tracker.time_source.advance(Duration::from_secs(120));
+            match tracker.get_resend() {
+                ResendAction::Resend(id, packet) => tracker.report_sent_packet(id, packet),
+                ResendAction::Abandon { packet_id, .. } => {
+                    assert_eq!(packet_id, 7);
+                    abandoned = true;
+                    break;
+                }
+                ResendAction::TlpProbe(_, _) | ResendAction::WaitUntil(_) => {}
+            }
+        }
+        assert!(abandoned, "packet should have been abandoned");
+
+        // A late ACK for the abandoned packet must produce NO ack entry — so the
+        // caller does not call release/decrement a second time.
+        let (ack_info, _) = tracker.report_received_receipts(&[7]);
+        assert!(
+            ack_info.is_empty(),
+            "issue #4345: a late ACK for an abandoned packet must be a no-op \
+             (no double release of flight size); got {ack_info:?}"
+        );
     }
 }

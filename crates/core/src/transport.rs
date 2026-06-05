@@ -678,7 +678,9 @@ mod tests {
                     // Simulate resending packet
                     sent_tracker.report_sent_packet(id, packet);
                 }
-                ResendAction::WaitUntil(_) | ResendAction::TlpProbe(..) => {
+                ResendAction::WaitUntil(_)
+                | ResendAction::TlpProbe(..)
+                | ResendAction::Abandon { .. } => {
                     panic!("Expected resend action for packet {id}")
                 }
             }

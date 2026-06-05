@@ -244,7 +244,10 @@ flowchart TB
 2. Decrypt + deserialize
 3. **RTT update**: If ACK, update smoothed RTT and cwnd (LEDBAT feedback)
 4. **Rate update**: Recalculate `min(ledbat_rate, global_pool_rate)` (RTT-adaptive timing)
-5. **Flightsize update**: Decrement flightsize on ACK
+5. **Flightsize update**: Decrement flightsize on ACK. Flightsize is also
+   released when a packet is permanently abandoned after
+   `MAX_PACKET_RETRANSMITS` (via `CongestionControl::release_flightsize`), so a
+   never-ACKed packet cannot pin flightsize for the connection's life (#4345).
 6. Deliver to application
 
 ## Development History
