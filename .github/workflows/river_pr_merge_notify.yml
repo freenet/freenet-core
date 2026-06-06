@@ -19,12 +19,22 @@ jobs:
         run: cargo install riverctl
 
       - name: Send message to River (with exponential backoff)
+        # Untrusted PR fields (title/author are attacker-controlled) are bound
+        # to env vars and expanded by the shell as `${PR_*}` rather than
+        # interpolated as `${{ }}` script text — otherwise a crafted PR title
+        # would inject shell commands into this step. See GitHub's
+        # script-injection guidance.
         env:
           RIVER_SIGNING_KEY: ${{ secrets.RIVER_SIGNING_KEY }}
+          NODE_URL: ${{ secrets.RIVER_GATEWAY_URL }}
+          ROOM_ID: ${{ secrets.RIVER_ROOM_ID }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_MERGER: ${{ github.event.pull_request.merged_by.login }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
-          MESSAGE="PR #${{ github.event.pull_request.number }} merged: ${{ github.event.pull_request.title }} (by @${{ github.event.pull_request.user.login }}, merged by @${{ github.event.pull_request.merged_by.login }}) - ${{ github.event.pull_request.html_url }}"
-          NODE_URL="${{ secrets.RIVER_GATEWAY_URL }}"
-          ROOM_ID="${{ secrets.RIVER_ROOM_ID }}"
+          MESSAGE="PR #${PR_NUMBER} merged: ${PR_TITLE} (by @${PR_AUTHOR}, merged by @${PR_MERGER}) - ${PR_URL}"
 
           max_attempts=7
           delay=10
@@ -42,3 +52,30 @@ jobs:
           done
           echo "::warning::Failed to send River notification after $max_attempts attempts (gateway may be restarting)"
           exit 0
+
+  # Mirror the PR-merge notification into the private freenet-dev room (the
+  # notify_river job above posts to the public official room).
+  notify_dev_room:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: github.event.pull_request.merged == true
+    # Best-effort: a riverctl/toolchain install hiccup must not red-X a merged
+    # PR's workflow run.
+    continue-on-error: true
+    # Bind the (untrusted) PR title/author through job-level env so it never
+    # reaches a shell as interpolated script text — the composite action then
+    # forwards it via env into a quoted `"$MESSAGE"` argument.
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      PR_TITLE: ${{ github.event.pull_request.title }}
+      PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+      PR_MERGER: ${{ github.event.pull_request.merged_by.login }}
+      PR_URL: ${{ github.event.pull_request.html_url }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/river-dev-notify
+        with:
+          message: "✅ PR #${{ env.PR_NUMBER }} merged: ${{ env.PR_TITLE }} (by @${{ env.PR_AUTHOR }}, merged by @${{ env.PR_MERGER }}) — ${{ env.PR_URL }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}
