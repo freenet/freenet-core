@@ -59,6 +59,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     if: github.event.pull_request.merged == true
+    # Best-effort: a riverctl/toolchain install hiccup must not red-X a merged
+    # PR's workflow run.
+    continue-on-error: true
     # Bind the (untrusted) PR title/author through job-level env so it never
     # reaches a shell as interpolated script text — the composite action then
     # forwards it via env into a quoted `"$MESSAGE"` argument.

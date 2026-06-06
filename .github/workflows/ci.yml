@@ -851,14 +851,18 @@ jobs:
 
   # Notify the private freenet-dev River room when CI fails on the main branch.
   # Only fires on push to main (post-merge): the merge queue already gates PRs,
-  # so a failure here means main itself is red and someone should fix it.
-  # On push to main only fmt_check + clippy_check run (the heavy jobs are
-  # PR/merge_group-gated), so those are the dependencies that define "main CI".
+  # so a failure on the main run means main is red — a bad merge, or a transient
+  # infra/toolchain flake (the linked run shows which). On push to main only
+  # fmt_check + clippy_check run (the heavy jobs are PR/merge_group-gated), so
+  # those are the dependencies that define "main CI".
   notify_dev_room_main_failure:
     name: Notify dev room on main CI failure
     runs-on: ubuntu-latest
     needs: [fmt_check, clippy_check]
     if: failure() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Best-effort: a failure in this notifier itself must not add a second red
+    # job to an already-red run (parity with the nightly notify job).
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/river-dev-notify
