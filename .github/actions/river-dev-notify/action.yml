@@ -1,0 +1,75 @@
+name: Notify Freenet dev room
+description: >
+  Post a message to the private freenet-dev River room via riverctl. Best
+  effort: never fails the calling job. No-ops with a warning when the dev-room
+  secrets are not configured (e.g. on forks).
+
+inputs:
+  message:
+    description: The message body to post.
+    required: true
+  bot-config:
+    description: >
+      base64-encoded riverctl rooms.json carrying the CI bot's signing key and
+      the room's invitation secrets (the RIVER_DEV_BOT_CONFIG secret). Posting
+      into a PRIVATE room needs both the member signing key AND the room's
+      symmetric secret; this config supplies both.
+    required: true
+  room-id:
+    description: base58 room owner verifying key (RIVER_DEV_ROOM_ID secret).
+    required: true
+  gateway-url:
+    description: Freenet gateway WebSocket URL (RIVER_GATEWAY_URL secret).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: 1.93.0
+
+    - name: Install riverctl
+      shell: bash
+      # Private-room message sending landed in riverctl 0.1.70 (freenet/river#350);
+      # earlier versions can only post to PUBLIC rooms and would fail here.
+      run: cargo install riverctl --version '^0.1.70'
+
+    - name: Post to the dev room (with exponential backoff)
+      shell: bash
+      env:
+        BOT_CONFIG: ${{ inputs.bot-config }}
+        ROOM_ID: ${{ inputs.room-id }}
+        NODE_URL: ${{ inputs.gateway-url }}
+        MESSAGE: ${{ inputs.message }}
+      run: |
+        set -u
+        if [ -z "${BOT_CONFIG}" ] || [ -z "${ROOM_ID}" ] || [ -z "${NODE_URL}" ]; then
+          echo "::warning::Freenet dev-room secrets not configured; skipping notification"
+          exit 0
+        fi
+
+        # Materialise the bot's riverctl config from the secret. `message send`
+        # fetches fresh room state from the network, so the config only needs
+        # the signing key + invitation secrets — the stored state is ignored.
+        CFG="$(mktemp -d)"
+        trap 'rm -rf "$CFG"' EXIT
+        printf '%s' "$BOT_CONFIG" | base64 -d > "$CFG/rooms.json"
+
+        max_attempts=7
+        delay=10
+        for attempt in $(seq 1 "$max_attempts"); do
+          echo "Attempt $attempt/$max_attempts (delay ${delay}s)..."
+          if riverctl --config-dir "$CFG" --node-url "$NODE_URL" \
+               message send "$ROOM_ID" "$MESSAGE" 2>&1; then
+            echo "Dev-room notification sent on attempt $attempt"
+            exit 0
+          fi
+          if [ "$attempt" -lt "$max_attempts" ]; then
+            sleep "$delay"
+            delay=$((delay * 2))
+          fi
+        done
+        echo "::warning::Failed to send Freenet dev-room notification after $max_attempts attempts (gateway may be restarting)"
+        exit 0
