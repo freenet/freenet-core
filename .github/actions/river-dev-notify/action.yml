@@ -74,7 +74,7 @@ runs:
         max_attempts=7
         delay=10
         for attempt in $(seq 1 "$max_attempts"); do
-          echo "Attempt $attempt/$max_attempts (delay ${delay}s)..."
+          echo "Attempt $attempt/$max_attempts..."
           # Output is sent to /dev/null on purpose: freenet-core's Actions logs
           # are public, and RIVER_DEV_BOT_CONFIG carries the room's symmetric
           # secret. GitHub auto-redacts the registered secret value but NOT the
@@ -86,7 +86,11 @@ runs:
             exit 0
           fi
           if [ "$attempt" -lt "$max_attempts" ]; then
-            sleep "$delay"
+            # Exponential backoff with +/-20% jitter so a burst of notifier
+            # instances (a merge-queue flush, back-to-back merges) don't retry
+            # in lockstep and synchronously hammer the gateway. (freenet-core
+            # retry/backoff rule: jitter required.)
+            sleep $(( delay - delay / 5 + RANDOM % (2 * delay / 5 + 1) ))
             delay=$((delay * 2))
           fi
         done

@@ -23,13 +23,18 @@ Does the body explain WHY, not WHAT?
   → NO: Add reasoning. Code diff shows WHAT; message explains WHY.
 ```
 
-**Valid prefixes:**
+**Valid prefixes** (must match the `conventional_commits` CI check in `ci.yml`):
 - `feat:` – new feature
 - `fix:` – bug fix
 - `docs:` – documentation only
 - `refactor:` – code change that doesn't fix bug or add feature
 - `test:` – adding/updating tests
 - `build:` – build system or dependencies
+- `ci:` – CI/workflow configuration
+- `perf:` – performance improvement
+- `style:` – formatting/whitespace, no code-behavior change
+- `chore:` – maintenance with no src/test change
+- `revert:` – revert a previous commit
 
 ### BEFORE opening a PR — is this change in scope?
 
