@@ -4980,6 +4980,18 @@ pub(super) mod test {
 /// operation outcomes. Grouping by attempt transaction — with success
 /// dominating any co-registered failure events — yields exactly one
 /// outcome per attempt.
+///
+/// Per-tx classification precedence: success > failure (any
+/// `GetFailure` event) > timeout (max elapsed >=
+/// [`GET_TIMEOUT_CLASSIFICATION_MS`]) > not_found.
+///
+/// Semantics caveat: these are WIRE-level attempt outcomes, not
+/// client-visible outcomes. A `Found` that bubbles up after the
+/// originator's per-attempt timeout still registers `GetSuccess` for
+/// that attempt tx and counts as a success here, even though the
+/// client saw NotFound; conversely each failed attempt of an
+/// ultimately-successful GET counts as its own not_found. Suitable for
+/// reliability diagnostics; not a client-SLA metric.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct GetOutcomeSummary {
     pub successes: u64,
@@ -5010,6 +5022,9 @@ pub const GET_TIMEOUT_CLASSIFICATION_MS: u64 = 55_000;
 /// Summarize GET outcomes from an event log, deduplicated per attempt
 /// transaction. See [`GetOutcomeSummary`] for why raw event counting is
 /// wrong.
+// Wildcard is deliberate, mirroring `hop_count`: only the three terminal
+// GET variants matter here; new variants should not require updates.
+#[allow(clippy::wildcard_enum_match_arm)]
 pub fn summarize_get_outcomes_per_tx(logs: &[NetLogMessage]) -> GetOutcomeSummary {
     use std::collections::HashMap;
 
@@ -5018,33 +5033,38 @@ pub fn summarize_get_outcomes_per_tx(logs: &[NetLogMessage]) -> GetOutcomeSummar
         success: bool,
         success_elapsed: Option<u64>,
         max_hop: Option<usize>,
+        saw_failure: bool,
         max_failure_elapsed: Option<u64>,
-        failure_without_elapsed: bool,
     }
 
     let mut per_tx: HashMap<Transaction, TxAgg> = HashMap::new();
     for log in logs {
-        let Some(outcome) = log.kind.get_outcome() else {
-            continue;
-        };
-        let agg = per_tx.entry(log.tx).or_default();
-        let elapsed = log.kind.get_elapsed_ms();
-        if outcome {
-            agg.success = true;
-            if let Some(ms) = elapsed {
-                agg.success_elapsed = Some(agg.success_elapsed.map_or(ms, |cur| cur.max(ms)));
-            }
-            if let Some(hops) = log.kind.hop_count() {
-                agg.max_hop = Some(agg.max_hop.map_or(hops, |cur| cur.max(hops)));
-            }
-        } else {
-            match elapsed {
-                Some(ms) => {
-                    agg.max_failure_elapsed =
-                        Some(agg.max_failure_elapsed.map_or(ms, |cur| cur.max(ms)));
+        // Match variants directly rather than going through
+        // `get_outcome()`, which collapses `GetNotFound` and `GetFailure`
+        // into the same bucket — classifying genuine network/system
+        // failures as contract absence (Codex review of #4364).
+        let agg = match &log.kind {
+            EventKind::Get(GetEvent::GetSuccess { .. }) => {
+                let agg = per_tx.entry(log.tx).or_default();
+                agg.success = true;
+                if let Some(ms) = log.kind.get_elapsed_ms() {
+                    agg.success_elapsed = Some(agg.success_elapsed.map_or(ms, |cur| cur.max(ms)));
                 }
-                None => agg.failure_without_elapsed = true,
+                if let Some(hops) = log.kind.hop_count() {
+                    agg.max_hop = Some(agg.max_hop.map_or(hops, |cur| cur.max(hops)));
+                }
+                continue;
             }
+            EventKind::Get(GetEvent::GetNotFound { .. }) => per_tx.entry(log.tx).or_default(),
+            EventKind::Get(GetEvent::GetFailure { .. }) => {
+                let agg = per_tx.entry(log.tx).or_default();
+                agg.saw_failure = true;
+                agg
+            }
+            _ => continue,
+        };
+        if let Some(ms) = log.kind.get_elapsed_ms() {
+            agg.max_failure_elapsed = Some(agg.max_failure_elapsed.map_or(ms, |cur| cur.max(ms)));
         }
     }
 
@@ -5058,6 +5078,8 @@ pub fn summarize_get_outcomes_per_tx(logs: &[NetLogMessage]) -> GetOutcomeSummar
             if let Some(ms) = agg.success_elapsed {
                 summary.success_elapsed_ms.push(ms);
             }
+        } else if agg.saw_failure {
+            summary.failures += 1;
         } else if let Some(ms) = agg.max_failure_elapsed {
             if ms >= GET_TIMEOUT_CLASSIFICATION_MS {
                 summary.timeouts += 1;
@@ -5065,6 +5087,8 @@ pub fn summarize_get_outcomes_per_tx(logs: &[NetLogMessage]) -> GetOutcomeSummar
                 summary.not_found += 1;
             }
         } else {
+            // Unreachable today (all three terminal GET events carry
+            // elapsed_ms) but kept as a defensive bucket.
             summary.failures += 1;
         }
     }
@@ -5193,6 +5217,34 @@ mod get_outcome_summary_tests {
         let summary = summarize_get_outcomes_per_tx(&logs);
         assert_eq!(summary.successes, 1);
         assert_eq!(summary.network_successes, 0);
+    }
+
+    /// `GetFailure` events classify as failures — not as not_found —
+    /// regardless of elapsed time. Regression for the Codex review
+    /// finding on #4364: classifying by elapsed time alone collapsed
+    /// genuine network/system failures into "contract absent".
+    #[test]
+    fn get_failure_classifies_as_failure_not_not_found() {
+        let tx = Transaction::new::<GetMsg>();
+        let logs = vec![NetLogMessage {
+            tx,
+            datetime: base_time(),
+            peer_id: make_peer_id(3001),
+            kind: EventKind::Get(GetEvent::GetFailure {
+                id: tx,
+                requester: make_pkl(3001),
+                instance_id: *make_key().id(),
+                target: make_pkl(3001),
+                hop_count: Some(0),
+                reason: OperationFailure::ConnectionDropped,
+                elapsed_ms: 10,
+                timestamp: 100,
+            }),
+        }];
+        let summary = summarize_get_outcomes_per_tx(&logs);
+        assert_eq!(summary.failures, 1, "GetFailure must land in failures");
+        assert_eq!(summary.not_found, 0);
+        assert_eq!(summary.total(), 1);
     }
 
     /// Failed outcomes at or above the timeout threshold classify as

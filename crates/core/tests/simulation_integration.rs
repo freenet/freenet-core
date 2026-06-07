@@ -8456,7 +8456,7 @@ fn test_get_reliability_diagnostic() {
         total_outcomes
     );
     tracing::info!(
-        "GET dispatch: {}/{} scheduled GETs dispatched an operation",
+        "GET dispatch: {}/{} nodes dispatched at least one GET attempt",
         dispatched_nodes,
         NUM_NODES
     );

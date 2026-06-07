@@ -758,6 +758,28 @@ impl RetryDriver for GetRetryDriver<'_> {
     fn new_attempt_tx(&mut self) -> Transaction {
         let tx = Transaction::new::<GetMsg>();
         self.attempt_visited = VisitedPeers::new(&tx);
+        // Bootstrap fallback failover (#4361): the wire target for a
+        // client GET is re-picked per attempt by the originator-loopback
+        // relay, whose selection state is fresh each attempt. Without
+        // carrying the client's tried set into the new attempt's visited
+        // bloom, every retry would re-select the same first configured
+        // gateway — the client-side advance's "next gateway" pick would
+        // never reach the wire and multi-gateway failover would be
+        // bookkeeping only. Carry `tried` minus the current target (which
+        // IS this attempt's intended destination) so the relay's fallback
+        // skips gateways that already failed and converges on the same
+        // gateway the client driver selected — keeping stream claims and
+        // route telemetry (both attributed via `current_target`) aligned
+        // with the actual wire hop. Gated on the empty-ring case so
+        // normal-path retry routing semantics are unchanged.
+        if self.op_manager.ring.connection_manager.connection_count() == 0 {
+            let current_addr = self.current_target.socket_addr();
+            for addr in &self.tried {
+                if Some(*addr) != current_addr {
+                    self.attempt_visited.mark_visited(*addr);
+                }
+            }
+        }
         tx
     }
 
@@ -1151,8 +1173,18 @@ const MAX_RETRIES: usize = 3;
 /// Returns the first configured gateway that is not this node and not
 /// excluded by the caller's skip predicate — but ONLY when the ring is
 /// empty (`ring_connection_count == 0`). A non-empty ring means normal
-/// routing had candidates and exhaustion is genuine, so the fallback
-/// must stay out of the way.
+/// routing had ring entries to consider (its candidates may still all
+/// be filtered as transient/visited, but that exhaustion is genuine),
+/// so the fallback must stay out of the way.
+///
+/// Selection is deliberately deterministic (config order), unlike the
+/// randomized pick in #3219's CONNECT re-bootstrap: the client driver
+/// and the per-attempt loopback relay select independently and must
+/// converge on the same gateway given the same exclusion set — stream
+/// claims and route telemetry are attributed via the client's
+/// `current_target`, so divergence would mis-key both. Failover
+/// diversity comes from the exclusion predicate (tried/visited), not
+/// from randomization.
 ///
 /// Split out from [`bootstrap_gateway_target`] so unit tests can
 /// exercise the selection rules without constructing an `OpManager`.
@@ -1191,6 +1223,15 @@ fn select_bootstrap_gateway(
 /// and re-dials configured gateways if the transport lapsed. Mirrors
 /// the #3219 zero-connection CONNECT re-bootstrap shape, which gates
 /// on the same `connection_count() == 0` condition.
+///
+/// Tradeoff for genuinely unreachable gateways (e.g. an offline
+/// machine): a dial failure is not surfaced to the waiting driver, so
+/// each attempt waits its full per-attempt timeout (`OPERATION_TTL`,
+/// 60s) before advancing — up to ~3 minutes across the retry budget,
+/// where the pre-fallback behavior returned NotFound instantly. The
+/// instant NotFound was a false "contract absent" answer, so slower
+/// but honest is preferred; a distinct fail-fast "not bootstrapped /
+/// unreachable" client error is #4166's scope.
 fn bootstrap_gateway_target(
     op_manager: &OpManager,
     is_excluded: impl Fn(SocketAddr) -> bool,
@@ -3202,6 +3243,36 @@ mod tests {
                  k_closest_potentially_hosting yields no candidates (#4361)"
             );
         }
+
+        // The relay fallback's exclusion predicate must respect the
+        // request's visited bloom — dropping the `probably_visited` half
+        // would silently reintroduce gateway<->relay bounce (cross-hop
+        // loop prevention; testing review of #4364).
+        let relay_start = src
+            .find("fn relay_advance_to_next_peer")
+            .expect("relay_advance_to_next_peer must exist");
+        let relay_body = &src[relay_start..relay_start + 4000];
+        assert!(
+            relay_body.contains("new_visited.probably_visited"),
+            "relay_advance_to_next_peer's fallback exclusion must include \
+             new_visited.probably_visited (#4361 cross-hop loop prevention)"
+        );
+
+        // The client driver must carry its tried set into each new
+        // attempt's visited bloom (minus the current target) — without
+        // it the per-attempt loopback relay re-picks the same first
+        // gateway and multi-gateway failover never reaches the wire
+        // (skeptical review H1 on #4364).
+        let nat_start = src
+            .find("fn new_attempt_tx")
+            .expect("new_attempt_tx must exist");
+        let nat_body = &src[nat_start..nat_start + 2500];
+        assert!(
+            nat_body.contains("attempt_visited.mark_visited"),
+            "GetRetryDriver::new_attempt_tx must carry tried addrs into \
+             the fresh attempt_visited bloom so gateway failover reaches \
+             the wire (#4361 / #4364 H1)"
+        );
     }
 
     #[test]
