@@ -285,7 +285,23 @@ async fn drive_client_get_inner(
             }
             peer
         }
-        None => op_manager.ring.connection_manager.own_location(),
+        // Bootstrap fallback (#4361): with an empty ring, attribute the
+        // attempt to a configured gateway — the loopback relay's own
+        // fallback forwards there, so the gateway IS the real first hop.
+        // `own_location()` (below) remains only for the genuinely
+        // isolated case (no ring, no gateways).
+        None => match bootstrap_gateway_target(op_manager, |addr| tried.contains(&addr)) {
+            Some((gw, addr)) => {
+                tracing::info!(
+                    %instance_id,
+                    gateway = %addr,
+                    "GET client: ring empty — initial target falls back to configured gateway"
+                );
+                tried.push(addr);
+                gw
+            }
+            None => op_manager.ring.connection_manager.own_location(),
+        },
     };
 
     let mut driver = GetRetryDriver {
@@ -577,14 +593,22 @@ async fn drive_client_get_inner(
 
             Ok(DriverOutcome::Publish(host_result))
         }
-        RetryLoopOutcome::Exhausted(_cause) => {
+        RetryLoopOutcome::Exhausted(cause) => {
             // Exhaustion after retry loop means every peer either responded
             // NotFound or the operation could not be forwarded at all
             // (e.g., isolated gateway with zero ring connections). Surface
             // as `ContractResponse::NotFound` so client integrations
             // (`fdev`, `apps/freenet-ping`, integration tests) can
             // distinguish "contract genuinely absent" from "operation
-            // failed".
+            // failed". Log the cause — silently discarding it made the
+            // empty-ring bootstrap failure invisible (#4361).
+            tracing::info!(
+                tx = %client_tx,
+                %instance_id,
+                ring_connections = op_manager.ring.connection_manager.connection_count(),
+                %cause,
+                "GET client: retry loop exhausted — returning NotFound to client"
+            );
             Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
                 freenet_stdlib::client_api::ContractResponse::NotFound { instance_id },
             ))))
@@ -734,6 +758,37 @@ impl RetryDriver for GetRetryDriver<'_> {
     fn new_attempt_tx(&mut self) -> Transaction {
         let tx = Transaction::new::<GetMsg>();
         self.attempt_visited = VisitedPeers::new(&tx);
+        // Bootstrap fallback failover (#4361): the wire target for a
+        // client GET is re-picked per attempt by the originator-loopback
+        // relay, whose selection state is fresh each attempt. Without
+        // carrying the client's tried set into the new attempt's visited
+        // bloom, every retry would re-select the same first configured
+        // gateway — the client-side advance's "next gateway" pick would
+        // never reach the wire and multi-gateway failover would be
+        // bookkeeping only. Carry `tried` minus the current target (which
+        // IS this attempt's intended destination) so the relay's fallback
+        // skips gateways that already failed and converges on the same
+        // gateway the client driver selected — keeping stream claims and
+        // route telemetry (both attributed via `current_target`) aligned
+        // with the actual wire hop.
+        //
+        // The carried bloom travels the attempt's entire forward path, so
+        // a failed gateway is excluded at every hop of that attempt, not
+        // only at the loopback relay — bounded (empty-ring originators,
+        // <= MAX_RETRIES attempts) and re-keyed each retry.
+        //
+        // Gated on the empty-ring case so normal-path retry routing
+        // semantics are unchanged. The gate re-reads `connection_count()`
+        // and can race ring promotion between attempts; both directions
+        // degrade to a single wasted or spuriously-failed attempt (never
+        // a loop or hang) — see the #4364 review for the trace.
+        if self.op_manager.ring.connection_manager.connection_count() == 0 {
+            carry_tried_into_visited(
+                &mut self.attempt_visited,
+                &self.tried,
+                self.current_target.socket_addr(),
+            );
+        }
         tx
     }
 
@@ -1122,6 +1177,104 @@ async fn lookup_stored_key(
 /// touch unrelated code paths.
 const MAX_RETRIES: usize = 3;
 
+/// Pure selection core for the bootstrap gateway fallback (#4361).
+///
+/// Returns the first configured gateway that is not this node and not
+/// excluded by the caller's skip predicate — but ONLY when the ring is
+/// empty (`ring_connection_count == 0`). A non-empty ring means normal
+/// routing had ring entries to consider (its candidates may still all
+/// be filtered as transient/visited, but that exhaustion is genuine),
+/// so the fallback must stay out of the way.
+///
+/// Selection is deliberately deterministic (config order), unlike the
+/// randomized pick in #3219's CONNECT re-bootstrap: the client driver
+/// and the per-attempt loopback relay select independently and must
+/// converge on the same gateway given the same exclusion set — stream
+/// claims and route telemetry are attributed via the client's
+/// `current_target`, so divergence would mis-key both. Failover
+/// diversity comes from the exclusion predicate (tried/visited), not
+/// from randomization.
+///
+/// Split out from [`bootstrap_gateway_target`] so unit tests can
+/// exercise the selection rules without constructing an `OpManager`.
+fn select_bootstrap_gateway(
+    ring_connection_count: usize,
+    configured_gateways: &[PeerKeyLocation],
+    own_addr: Option<SocketAddr>,
+    is_excluded: impl Fn(SocketAddr) -> bool,
+) -> Option<(PeerKeyLocation, SocketAddr)> {
+    if ring_connection_count > 0 {
+        return None;
+    }
+    configured_gateways.iter().find_map(|gw| {
+        let addr = gw.socket_addr()?;
+        if Some(addr) == own_addr || is_excluded(addr) {
+            return None;
+        }
+        Some((gw.clone(), addr))
+    })
+}
+
+/// Carry the client driver's tried set into a fresh attempt's visited
+/// bloom, excluding the attempt's intended destination (#4361 / #4364
+/// review H1). Split out so unit tests can pin the exclusion behavior
+/// without constructing an `OpManager`:
+///
+/// - dropping the carry entirely resurrects the "failover never reaches
+///   the wire" bug (the per-attempt loopback relay re-picks the first
+///   configured gateway forever);
+/// - dropping the current-target exclusion makes single-gateway retries
+///   exhaust instantly (the relay would skip the client's own pick).
+fn carry_tried_into_visited(
+    visited: &mut VisitedPeers,
+    tried: &[SocketAddr],
+    current_target_addr: Option<SocketAddr>,
+) {
+    for addr in tried {
+        if Some(*addr) != current_target_addr {
+            visited.mark_visited(*addr);
+        }
+    }
+}
+
+/// Bootstrap gateway fallback (#4361).
+///
+/// A node whose ring is still empty (`connections_by_location` has no
+/// entries) has zero routing candidates, so without a fallback every
+/// GET fails instantly with NotFound — even though the node has a live
+/// transient transport connection to its gateway (the same connection
+/// its CONNECT handshake is negotiating over). Production analog: a
+/// freshly started node fails all GETs for its first minutes until
+/// ring promotion completes.
+///
+/// When the ring is empty, fall back to a configured gateway. Wire
+/// delivery works before ring promotion: the event loop's
+/// `OutboundMessageWithTarget` handler resolves targets by socket addr
+/// against the transport map (which includes transient connections)
+/// and re-dials configured gateways if the transport lapsed. Mirrors
+/// the #3219 zero-connection CONNECT re-bootstrap shape, which gates
+/// on the same `connection_count() == 0` condition.
+///
+/// Tradeoff for genuinely unreachable gateways (e.g. an offline
+/// machine): a dial failure is not surfaced to the waiting driver, so
+/// each attempt waits its full per-attempt timeout (`OPERATION_TTL`,
+/// 60s) before advancing — up to ~3 minutes across the retry budget,
+/// where the pre-fallback behavior returned NotFound instantly. The
+/// instant NotFound was a false "contract absent" answer, so slower
+/// but honest is preferred; a distinct fail-fast "not bootstrapped /
+/// unreachable" client error is #4166's scope.
+fn bootstrap_gateway_target(
+    op_manager: &OpManager,
+    is_excluded: impl Fn(SocketAddr) -> bool,
+) -> Option<(PeerKeyLocation, SocketAddr)> {
+    select_bootstrap_gateway(
+        op_manager.ring.connection_manager.connection_count(),
+        &op_manager.configured_gateways,
+        op_manager.ring.connection_manager.get_own_addr(),
+        is_excluded,
+    )
+}
+
 fn advance_to_next_peer(
     op_manager: &OpManager,
     instance_id: &ContractInstanceId,
@@ -1133,12 +1286,49 @@ fn advance_to_next_peer(
     }
     *retries += 1;
 
-    let peer = op_manager
+    let peer = match op_manager
         .ring
         .k_closest_potentially_hosting(instance_id, tried.as_slice(), 1)
         .into_iter()
-        .next()?;
-    let addr = peer.socket_addr()?;
+        .next()
+    {
+        Some(peer) => peer,
+        None => {
+            // Bootstrap fallback (#4361): empty ring → route via a
+            // configured gateway instead of silently exhausting.
+            return match bootstrap_gateway_target(op_manager, |addr| tried.contains(&addr)) {
+                Some((gw, addr)) => {
+                    tracing::info!(
+                        %instance_id,
+                        gateway = %addr,
+                        "GET advance: ring empty — falling back to configured gateway"
+                    );
+                    tried.push(addr);
+                    Some((gw, addr))
+                }
+                None => {
+                    tracing::debug!(
+                        %instance_id,
+                        tried = tried.len(),
+                        retries = *retries,
+                        "GET advance: no routing candidates — exhausted"
+                    );
+                    None
+                }
+            };
+        }
+    };
+    let Some(addr) = peer.socket_addr() else {
+        // Rare but possible — `k_closest_potentially_hosting` can return
+        // addressless candidates (ring.rs pushes them past the addr-gated
+        // filters), and an addressless pick is unusable as a wire target.
+        tracing::warn!(
+            %instance_id,
+            peer = ?peer,
+            "GET advance: selected routing candidate has no socket address — treating as exhausted"
+        );
+        return None;
+    };
     tried.push(addr);
     Some((peer, addr))
 }
@@ -1389,7 +1579,21 @@ async fn drive_sub_op_get(
             }
             peer
         }
-        None => op_manager.ring.connection_manager.own_location(),
+        // Bootstrap fallback (#4361) — same rationale as the client
+        // driver's initial pick: sub-op GETs (auto-fetch, related-contract
+        // fetches) hit the same empty-ring blind spot during bootstrap.
+        None => match bootstrap_gateway_target(op_manager, |addr| tried.contains(&addr)) {
+            Some((gw, addr)) => {
+                tracing::info!(
+                    %instance_id,
+                    gateway = %addr,
+                    "GET sub-op: ring empty — initial target falls back to configured gateway"
+                );
+                tried.push(addr);
+                gw
+            }
+            None => op_manager.ring.connection_manager.own_location(),
+        },
     };
 
     let mut driver = GetRetryDriver {
@@ -1871,14 +2075,61 @@ fn relay_advance_to_next_peer(
 
     // Use new_visited as the skip list so upstream's visited set and our own
     // marks are both respected.
-    let peer = op_manager
+    let peer = match op_manager
         .ring
         .k_closest_potentially_hosting(instance_id, new_visited.clone(), 1)
         .into_iter()
-        .next()?;
-    let addr = peer.socket_addr()?;
+        .next()
+    {
+        Some(peer) => peer,
+        None => {
+            // Bootstrap fallback (#4361): empty ring → forward via a
+            // configured gateway instead of silently exhausting. Respects
+            // both the request's visited bloom (cross-hop loop prevention —
+            // a gateway the request already traversed is never re-picked)
+            // and `tried` (exact local exclusion). Stays within
+            // MAX_RELAY_RETRIES, so the 3^HTL fan-out guard above is
+            // unaffected.
+            return match bootstrap_gateway_target(op_manager, |addr| {
+                tried.contains(&addr) || new_visited.probably_visited(addr)
+            }) {
+                Some((gw, addr)) => {
+                    tracing::info!(
+                        %instance_id,
+                        gateway = %addr,
+                        "GET relay advance: ring empty — forwarding to configured gateway"
+                    );
+                    tried.push(addr);
+                    Some((gw, addr))
+                }
+                None => {
+                    tracing::debug!(
+                        %instance_id,
+                        "GET relay advance: no routing candidates — exhausted"
+                    );
+                    None
+                }
+            };
+        }
+    };
+    let Some(addr) = peer.socket_addr() else {
+        // Rare but possible — see the matching guard in
+        // `advance_to_next_peer` for why addressless candidates can leak
+        // out of `k_closest_potentially_hosting`.
+        tracing::warn!(
+            %instance_id,
+            peer = ?peer,
+            "GET relay advance: selected routing candidate has no socket address — treating as exhausted"
+        );
+        return None;
+    };
     // Double-check against tried (exact exclusion, no bloom false positives).
     if tried.contains(&addr) {
+        tracing::debug!(
+            %instance_id,
+            peer = %addr,
+            "GET relay advance: candidate already tried — exhausted"
+        );
         return None;
     }
     tried.push(addr);
@@ -2905,6 +3156,181 @@ mod tests {
             "the ClientOpGuard must be moved into the spawned future \
              via `let _inflight_guard = inflight_guard;`."
         );
+    }
+
+    // --- Bootstrap gateway fallback (#4361) ---
+
+    fn gw(port: u16) -> PeerKeyLocation {
+        let key = crate::transport::TransportPublicKey::from_bytes([port as u8; 32]);
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        PeerKeyLocation::new(key, addr)
+    }
+
+    /// Regression for #4361: a node with an empty ring but configured
+    /// gateways must select a gateway instead of exhausting. Before the
+    /// fix, every GET on a freshly-bootstrapped node returned NotFound
+    /// without sending a single wire message.
+    #[test]
+    fn bootstrap_fallback_selects_gateway_when_ring_empty() {
+        let gateway = gw(4001);
+        let selected = select_bootstrap_gateway(0, std::slice::from_ref(&gateway), None, |_| false);
+        let (peer, addr) = selected.expect("empty ring + configured gateway must select it");
+        assert_eq!(peer.socket_addr(), gateway.socket_addr());
+        assert_eq!(addr, gateway.socket_addr().unwrap());
+    }
+
+    /// The fallback must stay out of the way when the ring has ANY
+    /// connections — a non-empty ring means normal routing had its
+    /// chance and exhaustion is genuine.
+    #[test]
+    fn bootstrap_fallback_inactive_when_ring_non_empty() {
+        let gateway = gw(4001);
+        assert!(
+            select_bootstrap_gateway(1, &[gateway], None, |_| false).is_none(),
+            "fallback must not fire with ring connections present"
+        );
+    }
+
+    /// A gateway node must never select itself (self-loop guard), but
+    /// must still be able to fall back to OTHER configured gateways.
+    #[test]
+    fn bootstrap_fallback_skips_self() {
+        let gw1 = gw(4001);
+        let gw2 = gw(4002);
+        let own_addr = gw1.socket_addr();
+        let selected =
+            select_bootstrap_gateway(0, &[gw1.clone(), gw2.clone()], own_addr, |_| false);
+        let (peer, _) = selected.expect("second gateway should be selected");
+        assert_eq!(
+            peer.socket_addr(),
+            gw2.socket_addr(),
+            "self gateway must be skipped"
+        );
+        assert!(
+            select_bootstrap_gateway(0, std::slice::from_ref(&gw1), gw1.socket_addr(), |_| false)
+                .is_none(),
+            "sole self gateway must yield no fallback"
+        );
+    }
+
+    /// Already-tried/visited gateways are excluded, so retries cannot
+    /// loop on the same gateway and a request that already traversed a
+    /// gateway is never bounced back to it.
+    #[test]
+    fn bootstrap_fallback_excludes_tried_gateways() {
+        let gw1 = gw(4001);
+        let gw2 = gw(4002);
+        let tried = [gw1.socket_addr().unwrap()];
+        let selected = select_bootstrap_gateway(0, &[gw1.clone(), gw2.clone()], None, |addr| {
+            tried.contains(&addr)
+        });
+        let (peer, _) = selected.expect("untried gateway should be selected");
+        assert_eq!(peer.socket_addr(), gw2.socket_addr());
+        let all_tried = [gw1.socket_addr().unwrap(), gw2.socket_addr().unwrap()];
+        assert!(
+            select_bootstrap_gateway(0, &[gw1, gw2], None, |addr| all_tried.contains(&addr))
+                .is_none(),
+            "all gateways tried must yield no fallback"
+        );
+    }
+
+    /// Source pin (#4361): the GET peer-selection sites — client
+    /// initial pick, sub-op initial pick, client advance, relay advance —
+    /// must all consult `bootstrap_gateway_target` when
+    /// `k_closest_potentially_hosting` yields nothing. A refactor that
+    /// drops any of these calls silently reintroduces the empty-ring
+    /// instant-NotFound bug. Uses `extract_fn_body` (brace-matched) so
+    /// the pins cannot false-pass on neighboring code or false-fail on
+    /// comment growth.
+    #[test]
+    fn all_selection_sites_use_bootstrap_gateway_fallback() {
+        let src = production_source();
+
+        for entry in [
+            "async fn drive_client_get_inner",
+            "async fn drive_sub_op_get",
+            "fn advance_to_next_peer",
+            "fn relay_advance_to_next_peer",
+        ] {
+            let body = extract_fn_body(src, entry);
+            assert!(
+                body.contains("bootstrap_gateway_target("),
+                "{entry} must consult bootstrap_gateway_target when \
+                 k_closest_potentially_hosting yields no candidates (#4361)"
+            );
+        }
+
+        // The relay fallback's exclusion predicate must respect the
+        // request's visited bloom — dropping the `probably_visited` half
+        // would silently reintroduce gateway<->relay bounce (cross-hop
+        // loop prevention; testing review of #4364).
+        let relay_body = extract_fn_body(src, "fn relay_advance_to_next_peer");
+        assert!(
+            relay_body.contains("new_visited.probably_visited"),
+            "relay_advance_to_next_peer's fallback exclusion must include \
+             new_visited.probably_visited (#4361 cross-hop loop prevention)"
+        );
+
+        // The client driver must carry its tried set into each new
+        // attempt's visited bloom — without it the per-attempt loopback
+        // relay re-picks the same first gateway and multi-gateway
+        // failover never reaches the wire (skeptical review H1 on
+        // #4364). The carry's exclusion semantics are behaviorally
+        // pinned by the `carry_tried_into_visited_*` tests below.
+        let nat_body = extract_fn_body(src, "fn new_attempt_tx");
+        assert!(
+            nat_body.contains("carry_tried_into_visited("),
+            "GetRetryDriver::new_attempt_tx must carry tried addrs into \
+             the fresh attempt_visited bloom so gateway failover reaches \
+             the wire (#4361 / #4364 H1)"
+        );
+        assert!(
+            nat_body.contains("connection_count()"),
+            "the failover carry must stay gated on the empty-ring case so \
+             normal-path retry routing semantics are unchanged (#4364)"
+        );
+    }
+
+    /// Behavioral pin for the failover carry (#4364 H1): previously
+    /// tried addrs must be excluded from the next attempt, while the
+    /// attempt's intended destination must NOT be — marking it would
+    /// make the loopback relay skip the client's own pick, and
+    /// single-gateway retries would exhaust instantly.
+    #[test]
+    fn carry_tried_into_visited_excludes_current_target() {
+        let tx = dummy_tx();
+        let mut visited = VisitedPeers::new(&tx);
+        let own = SocketAddr::from(([127, 0, 0, 1], 4000));
+        let gw1 = SocketAddr::from(([127, 0, 0, 1], 4001));
+        let gw2 = SocketAddr::from(([127, 0, 0, 1], 4002));
+
+        carry_tried_into_visited(&mut visited, &[own, gw1, gw2], Some(gw2));
+
+        assert!(
+            visited.probably_visited(own),
+            "own addr must be carried into the bloom"
+        );
+        assert!(
+            visited.probably_visited(gw1),
+            "a previously tried gateway must be excluded from the next attempt"
+        );
+        assert!(
+            !visited.probably_visited(gw2),
+            "the attempt's intended destination must NOT be excluded"
+        );
+    }
+
+    /// With no current target (genuinely isolated retry), everything
+    /// tried is carried.
+    #[test]
+    fn carry_tried_into_visited_marks_all_without_current_target() {
+        let tx = dummy_tx();
+        let mut visited = VisitedPeers::new(&tx);
+        let own = SocketAddr::from(([127, 0, 0, 1], 4000));
+
+        carry_tried_into_visited(&mut visited, &[own], None);
+
+        assert!(visited.probably_visited(own));
     }
 
     #[test]

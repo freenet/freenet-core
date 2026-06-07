@@ -8257,6 +8257,7 @@ fn test_get_reliability_diagnostic() {
     const NETWORK_NAME: &str = "get-reliability-diag";
     const NUM_NODES: usize = 100;
     const NUM_GATEWAYS: usize = 3;
+    const RING_MAX_HTL: usize = 10;
 
     GlobalTestMetrics::reset();
     setup_deterministic_state(SEED);
@@ -8268,10 +8269,10 @@ fn test_get_reliability_diagnostic() {
             NETWORK_NAME,
             NUM_GATEWAYS,
             NUM_NODES,
-            10, // ring_max_htl — realistic for 100-node network
-            7,  // rnd_if_htl_above
-            12, // max_connections
-            4,  // min_connections
+            RING_MAX_HTL, // realistic for 100-node network
+            7,            // rnd_if_htl_above
+            12,           // max_connections
+            4,            // min_connections
             SEED,
         )
         .await;
@@ -8322,47 +8323,43 @@ fn test_get_reliability_diagnostic() {
         result.turmoil_result.err()
     );
 
-    // Analyze GET outcomes from event logs
+    // Analyze GET outcomes from event logs, deduplicated per attempt
+    // transaction (#4361): raw event counting double-counts every failed
+    // attempt (relay-direct + loopback-Response registration) and counts
+    // multi-hop outcomes once per hop traversed.
     let rt = create_runtime();
-    let (successes, not_found, failures, timeouts, elapsed_ms_list) = rt.block_on(async {
+    let (summary, dispatched_nodes) = rt.block_on(async {
         let logs = logs_handle.lock().await;
-        let mut successes = 0u64;
-        let mut not_found = 0u64;
-        let mut failures = 0u64;
-        let mut timeouts = 0u64;
-        let mut elapsed_list = Vec::new();
+        let summary = freenet::tracing::summarize_get_outcomes_per_tx(&logs);
 
-        for log in logs.iter() {
-            match log.kind.get_outcome() {
-                Some(true) => {
-                    successes += 1;
-                    if let Some(ms) = log.kind.get_elapsed_ms() {
-                        elapsed_list.push(ms);
-                    }
-                }
-                Some(false) => {
-                    if let Some(ms) = log.kind.get_elapsed_ms() {
-                        if ms >= 55_000 {
-                            // Likely a timeout (close to OPERATION_TTL of 60s)
-                            timeouts += 1;
-                        } else {
-                            not_found += 1;
-                        }
-                    } else {
-                        failures += 1;
-                    }
-                }
-                None => {}
-            }
-        }
-        (successes, not_found, failures, timeouts, elapsed_list)
+        // Dispatched-vs-scheduled accounting (#4361): the client driver's
+        // loopback Request is registered at the originating node with
+        // htl == ring_max_htl; relay-received Requests have already been
+        // decremented. Unique originating peers therefore counts how many
+        // nodes actually dispatched a GET (sub-op GETs can inflate this
+        // slightly, which is why it feeds a floor assertion, not an
+        // exact-match one).
+        let dispatched_nodes: HashSet<_> = logs
+            .iter()
+            .filter(|log| log.kind.get_request_htl() == Some(RING_MAX_HTL))
+            .map(|log| log.peer_id.clone())
+            .collect();
+
+        (summary, dispatched_nodes.len())
     });
 
-    let total_outcomes = successes + not_found + failures + timeouts;
+    let (successes, not_found, failures, timeouts) = (
+        summary.successes,
+        summary.not_found,
+        summary.failures,
+        summary.timeouts,
+    );
+    let network_successes = summary.network_successes;
+    let total_outcomes = summary.total();
 
     // Compute latency percentiles for successful GETs
-    let mut sorted_latencies = elapsed_ms_list.clone();
-    sorted_latencies.sort();
+    // (success_elapsed_ms is pre-sorted ascending).
+    let sorted_latencies = &summary.success_elapsed_ms;
 
     let p50 = sorted_latencies
         .get(sorted_latencies.len() / 2)
@@ -8443,9 +8440,11 @@ fn test_get_reliability_diagnostic() {
         NUM_GATEWAYS + NUM_NODES
     );
     tracing::info!(
-        "GET outcomes: {} total — {} success, {} not_found, {} failures, {} timeouts",
+        "GET outcomes (per attempt tx): {} total — {} success ({} network-traversed), \
+         {} not_found, {} failures, {} timeouts",
         total_outcomes,
         successes,
+        network_successes,
         not_found,
         failures,
         timeouts
@@ -8455,6 +8454,11 @@ fn test_get_reliability_diagnostic() {
         success_rate * 100.0,
         successes,
         total_outcomes
+    );
+    tracing::info!(
+        "GET dispatch: {}/{} nodes dispatched at least one GET attempt",
+        dispatched_nodes,
+        NUM_NODES
     );
     tracing::info!(
         "Latency (successful GETs): p50={}ms, p90={}ms, p99={}ms, max={}ms",
@@ -8514,7 +8518,7 @@ fn test_get_reliability_diagnostic() {
     // Soft assertion — this is diagnostic, but catastrophic failure should still fail the test
     assert!(
         total_outcomes >= 10,
-        "Only {} GET outcome events — too few for meaningful analysis",
+        "Only {} GET outcome transactions — too few for meaningful analysis",
         total_outcomes
     );
     assert!(
@@ -8528,6 +8532,33 @@ fn test_get_reliability_diagnostic() {
         failures,
         timeouts,
         total_outcomes
+    );
+    // Dispatch accounting (#4361): scheduled GETs that never dispatch an
+    // operation silently shrink the denominator, so the success rate can
+    // look healthy while most of the test never ran. Currently 42/100
+    // dispatch: the rest are rejected with an explicit PeerNotJoined
+    // (the node had no completed transport handshake when its signal
+    // arrived — a footprint of the bootstrap acceptance collapse, #4362)
+    // and the harness does not retry. Catastrophic floor only — raise it
+    // when #4362 is fixed.
+    assert!(
+        dispatched_nodes >= NUM_NODES / 3,
+        "Only {}/{} scheduled GETs dispatched an operation — the test \
+         exercised only a fraction of its workload (#4361)",
+        dispatched_nodes,
+        NUM_NODES
+    );
+    // Network-traversal floor (#4361): before this assertion existed, every
+    // "success" in the failing runs was a local cache hit (hop_count == 0)
+    // on a node that already held the contract — multi-hop GET was never
+    // exercised at all. Require that a meaningful number of successes
+    // actually traversed the network.
+    assert!(
+        network_successes >= 5,
+        "Only {} of {} successful GETs traversed the network (hop_count >= 1) \
+         — the success metric is measuring local availability, not routing (#4361)",
+        network_successes,
+        successes
     );
 
     // StateVerifier anomaly check
@@ -8643,45 +8674,22 @@ fn test_get_reliability_with_latency() {
         result.turmoil_result.err()
     );
 
-    // Analyze GET outcomes
+    // Analyze GET outcomes, deduplicated per attempt transaction (#4361).
     let rt = create_runtime();
-    let (successes, not_found, failures, timeouts, elapsed_ms_list) = rt.block_on(async {
+    let summary = rt.block_on(async {
         let logs = logs_handle.lock().await;
-        let mut successes = 0u64;
-        let mut not_found = 0u64;
-        let mut failures = 0u64;
-        let mut timeouts = 0u64;
-        let mut elapsed_list = Vec::new();
-
-        for log in logs.iter() {
-            match log.kind.get_outcome() {
-                Some(true) => {
-                    successes += 1;
-                    if let Some(ms) = log.kind.get_elapsed_ms() {
-                        elapsed_list.push(ms);
-                    }
-                }
-                Some(false) => {
-                    if let Some(ms) = log.kind.get_elapsed_ms() {
-                        if ms >= 55_000 {
-                            timeouts += 1;
-                        } else {
-                            not_found += 1;
-                        }
-                    } else {
-                        failures += 1;
-                    }
-                }
-                None => {}
-            }
-        }
-        (successes, not_found, failures, timeouts, elapsed_list)
+        freenet::tracing::summarize_get_outcomes_per_tx(&logs)
     });
+    let (successes, not_found, failures, timeouts) = (
+        summary.successes,
+        summary.not_found,
+        summary.failures,
+        summary.timeouts,
+    );
+    let total_outcomes = summary.total();
 
-    let total_outcomes = successes + not_found + failures + timeouts;
-
-    let mut sorted_latencies = elapsed_ms_list.clone();
-    sorted_latencies.sort();
+    // success_elapsed_ms is pre-sorted ascending.
+    let sorted_latencies = &summary.success_elapsed_ms;
 
     let p50 = sorted_latencies
         .get(sorted_latencies.len() / 2)
@@ -8710,9 +8718,11 @@ fn test_get_reliability_with_latency() {
         NUM_NODES
     );
     tracing::info!(
-        "GET outcomes: {} total — {} success, {} not_found, {} failures, {} timeouts",
+        "GET outcomes (per attempt tx): {} total — {} success ({} network-traversed), \
+         {} not_found, {} failures, {} timeouts",
         total_outcomes,
         successes,
+        summary.network_successes,
         not_found,
         failures,
         timeouts
@@ -8881,45 +8891,23 @@ fn test_get_reliability_with_churn() {
         tracing::warn!("Direct simulation completed with error (may be expected under churn): {e}");
     }
 
-    // Analyze GET outcomes from event logs
+    // Analyze GET outcomes from event logs, deduplicated per attempt
+    // transaction (#4361).
     let rt = create_runtime();
-    let (successes, not_found, failures, timeouts, elapsed_ms_list) = rt.block_on(async {
+    let summary = rt.block_on(async {
         let logs = logs_handle.lock().await;
-        let mut successes = 0u64;
-        let mut not_found = 0u64;
-        let mut failures = 0u64;
-        let mut timeouts = 0u64;
-        let mut elapsed_list = Vec::new();
-
-        for log in logs.iter() {
-            match log.kind.get_outcome() {
-                Some(true) => {
-                    successes += 1;
-                    if let Some(ms) = log.kind.get_elapsed_ms() {
-                        elapsed_list.push(ms);
-                    }
-                }
-                Some(false) => {
-                    if let Some(ms) = log.kind.get_elapsed_ms() {
-                        if ms >= 55_000 {
-                            timeouts += 1;
-                        } else {
-                            not_found += 1;
-                        }
-                    } else {
-                        failures += 1;
-                    }
-                }
-                None => {}
-            }
-        }
-        (successes, not_found, failures, timeouts, elapsed_list)
+        freenet::tracing::summarize_get_outcomes_per_tx(&logs)
     });
+    let (successes, not_found, failures, timeouts) = (
+        summary.successes,
+        summary.not_found,
+        summary.failures,
+        summary.timeouts,
+    );
+    let total_outcomes = summary.total();
 
-    let total_outcomes = successes + not_found + failures + timeouts;
-
-    let mut sorted_latencies = elapsed_ms_list.clone();
-    sorted_latencies.sort();
+    // success_elapsed_ms is pre-sorted ascending.
+    let sorted_latencies = &summary.success_elapsed_ms;
 
     let p50 = sorted_latencies
         .get(sorted_latencies.len() / 2)
@@ -8948,9 +8936,11 @@ fn test_get_reliability_with_churn() {
         NUM_NODES
     );
     tracing::info!(
-        "GET outcomes: {} total — {} success, {} not_found, {} failures, {} timeouts",
+        "GET outcomes (per attempt tx): {} total — {} success ({} network-traversed), \
+         {} not_found, {} failures, {} timeouts",
         total_outcomes,
         successes,
+        summary.network_successes,
         not_found,
         failures,
         timeouts

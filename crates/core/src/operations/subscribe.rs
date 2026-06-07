@@ -31,11 +31,13 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, sleep};
 
 /// Maximum peers to try per hop (breadth search).
-/// Matches GET operation's DEFAULT_MAX_BREADTH; change both together.
+/// (GET's former DEFAULT_MAX_BREADTH no longer exists — its selection
+/// uses k=1 per advance; this constant is now SUBSCRIBE-only.)
 pub(super) const MAX_BREADTH: usize = 3;
 
 /// Maximum retry rounds (each round queries k_closest for new candidates).
-/// Matches GET operation's MAX_RETRIES; change both together.
+/// (No longer tied to GET's MAX_RETRIES, which is 3; this constant is
+/// SUBSCRIBE-only.)
 pub(super) const MAX_RETRIES: usize = 10;
 
 /// Timeout for waiting on contract storage notification.
