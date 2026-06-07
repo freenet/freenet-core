@@ -1815,6 +1815,18 @@ impl Ring {
                         skipped_not_ready += 1;
                         continue;
                     }
+                } else {
+                    // Addressless candidates bypass every filter above (skip
+                    // list, dedup, transient, readiness) because all of them
+                    // key on the socket addr. If the router then selects one,
+                    // the GET advance helpers can't use it as a wire target
+                    // and the hop dies. Keep the inclusion (the candidate may
+                    // gain an addr by send time) but make it visible (#4361).
+                    tracing::debug!(
+                        peer = ?conn.location,
+                        target_location = %target_location.as_f64(),
+                        "k_closest: including addressless candidate (bypasses addr-keyed filters)"
+                    );
                 }
                 candidates.push(conn.location.clone());
             }

@@ -2813,6 +2813,24 @@ impl EventKind {
         matches!(self, EventKind::Get(GetEvent::Request { .. }))
     }
 
+    /// Returns the HTL carried by a GET request event, `None` for all
+    /// other events.
+    ///
+    /// Useful for distinguishing originator-side dispatch from relay
+    /// hops in test analysis: the client driver's loopback Request is
+    /// registered at the originating node with `htl == max_hops_to_live`,
+    /// while every relay-received Request has already been decremented
+    /// (#4361 — dispatched-vs-scheduled accounting).
+    // Wildcard is deliberate, mirroring `hop_count`: this accessor cares
+    // about exactly one variant; new variants should not require updates.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub fn get_request_htl(&self) -> Option<usize> {
+        match self {
+            EventKind::Get(GetEvent::Request { htl, .. }) => Some(*htl),
+            _ => None,
+        }
+    }
+
     /// Returns whether this is a subscribe outcome event (success or not-found).
     ///
     /// Returns `Some(true)` for `SubscribeSuccess`, `Some(false)` for `SubscribeNotFound`,
@@ -4944,5 +4962,252 @@ pub(super) mod test {
             8,
             "Empty state should still produce 8-char hash"
         );
+    }
+}
+
+/// Per-attempt-transaction GET outcome summary (#4361).
+///
+/// The raw event stream multi-counts GET outcomes:
+///
+/// - a failed attempt registers a `GetNotFound` TWICE on the originator's
+///   own node — once directly from the relay driver's exhaustion branch
+///   and once when the loopback `Response{NotFound}` re-enters inbound
+///   dispatch (`from_inbound_msg_v1`);
+/// - multi-hop responses register one outcome event at every hop they
+///   bubble through, so a single terminal outcome can appear N times.
+///
+/// Counting raw events therefore measures message traversal, not
+/// operation outcomes. Grouping by attempt transaction — with success
+/// dominating any co-registered failure events — yields exactly one
+/// outcome per attempt.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GetOutcomeSummary {
+    pub successes: u64,
+    pub not_found: u64,
+    pub failures: u64,
+    pub timeouts: u64,
+    /// Subset of `successes` whose wire `hop_count >= 1` — the GET
+    /// actually traversed the network rather than completing on a node
+    /// that already held the contract locally.
+    pub network_successes: u64,
+    /// Elapsed ms per successful attempt (max across the hops that
+    /// registered the success — the originator registers last, with the
+    /// largest elapsed). Sorted ascending for deterministic output.
+    pub success_elapsed_ms: Vec<u64>,
+}
+
+impl GetOutcomeSummary {
+    pub fn total(&self) -> u64 {
+        self.successes + self.not_found + self.failures + self.timeouts
+    }
+}
+
+/// Failed GET outcomes with elapsed time at or above this threshold are
+/// classified as timeouts rather than NotFound (close to the 60s
+/// `OPERATION_TTL`).
+pub const GET_TIMEOUT_CLASSIFICATION_MS: u64 = 55_000;
+
+/// Summarize GET outcomes from an event log, deduplicated per attempt
+/// transaction. See [`GetOutcomeSummary`] for why raw event counting is
+/// wrong.
+pub fn summarize_get_outcomes_per_tx(logs: &[NetLogMessage]) -> GetOutcomeSummary {
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct TxAgg {
+        success: bool,
+        success_elapsed: Option<u64>,
+        max_hop: Option<usize>,
+        max_failure_elapsed: Option<u64>,
+        failure_without_elapsed: bool,
+    }
+
+    let mut per_tx: HashMap<Transaction, TxAgg> = HashMap::new();
+    for log in logs {
+        let Some(outcome) = log.kind.get_outcome() else {
+            continue;
+        };
+        let agg = per_tx.entry(log.tx).or_default();
+        let elapsed = log.kind.get_elapsed_ms();
+        if outcome {
+            agg.success = true;
+            if let Some(ms) = elapsed {
+                agg.success_elapsed = Some(agg.success_elapsed.map_or(ms, |cur| cur.max(ms)));
+            }
+            if let Some(hops) = log.kind.hop_count() {
+                agg.max_hop = Some(agg.max_hop.map_or(hops, |cur| cur.max(hops)));
+            }
+        } else {
+            match elapsed {
+                Some(ms) => {
+                    agg.max_failure_elapsed =
+                        Some(agg.max_failure_elapsed.map_or(ms, |cur| cur.max(ms)));
+                }
+                None => agg.failure_without_elapsed = true,
+            }
+        }
+    }
+
+    let mut summary = GetOutcomeSummary::default();
+    for agg in per_tx.values() {
+        if agg.success {
+            summary.successes += 1;
+            if agg.max_hop.unwrap_or(0) >= 1 {
+                summary.network_successes += 1;
+            }
+            if let Some(ms) = agg.success_elapsed {
+                summary.success_elapsed_ms.push(ms);
+            }
+        } else if let Some(ms) = agg.max_failure_elapsed {
+            if ms >= GET_TIMEOUT_CLASSIFICATION_MS {
+                summary.timeouts += 1;
+            } else {
+                summary.not_found += 1;
+            }
+        } else {
+            summary.failures += 1;
+        }
+    }
+    summary.success_elapsed_ms.sort_unstable();
+    summary
+}
+
+#[cfg(test)]
+mod get_outcome_summary_tests {
+    use super::*;
+    use crate::operations::get::GetMsg;
+    use crate::ring::PeerKeyLocation;
+    use crate::transport::TransportPublicKey;
+    use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+    use std::net::SocketAddr;
+
+    fn make_peer_id(port: u16) -> PeerId {
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let key = TransportPublicKey::from_bytes([port as u8; 32]);
+        PeerId::new(key, addr)
+    }
+
+    fn make_pkl(port: u16) -> PeerKeyLocation {
+        let key = TransportPublicKey::from_bytes([port as u8; 32]);
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        PeerKeyLocation::new(key, addr)
+    }
+
+    fn make_key() -> ContractKey {
+        ContractKey::from_id_and_code(ContractInstanceId::new([1u8; 32]), CodeHash::new([2u8; 32]))
+    }
+
+    fn base_time() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn not_found_event(tx: Transaction, port: u16, elapsed_ms: u64) -> NetLogMessage {
+        NetLogMessage {
+            tx,
+            datetime: base_time(),
+            peer_id: make_peer_id(port),
+            kind: EventKind::Get(GetEvent::GetNotFound {
+                id: tx,
+                requester: make_pkl(port),
+                instance_id: *make_key().id(),
+                target: make_pkl(port),
+                hop_count: Some(0),
+                elapsed_ms,
+                timestamp: 100,
+            }),
+        }
+    }
+
+    fn success_event(
+        tx: Transaction,
+        port: u16,
+        hop_count: Option<usize>,
+        elapsed_ms: u64,
+    ) -> NetLogMessage {
+        NetLogMessage {
+            tx,
+            datetime: base_time(),
+            peer_id: make_peer_id(port),
+            kind: EventKind::Get(GetEvent::GetSuccess {
+                id: tx,
+                requester: make_pkl(port),
+                target: make_pkl(port),
+                key: make_key(),
+                hop_count,
+                elapsed_ms,
+                timestamp: 100,
+                state_hash: None,
+            }),
+        }
+    }
+
+    /// Regression for #4361: one failed GET attempt registers TWO
+    /// `GetNotFound` events on the originator node (relay-direct +
+    /// loopback-Response inbound). Per-tx dedup must count it once.
+    #[test]
+    fn failed_attempt_double_registration_counts_once() {
+        let tx = Transaction::new::<GetMsg>();
+        let logs = vec![not_found_event(tx, 3001, 5), not_found_event(tx, 3001, 6)];
+        let summary = summarize_get_outcomes_per_tx(&logs);
+        assert_eq!(
+            summary.not_found, 1,
+            "double-registered NotFound must dedup"
+        );
+        assert_eq!(summary.total(), 1);
+    }
+
+    /// A success bubbling through multiple hops registers one event per
+    /// hop; it is still one outcome — and success dominates any
+    /// co-registered NotFound on the same tx (a relay that exhausted one
+    /// branch before another found the contract).
+    #[test]
+    fn multi_hop_success_counts_once_and_dominates() {
+        let tx = Transaction::new::<GetMsg>();
+        let logs = vec![
+            not_found_event(tx, 3003, 4),
+            success_event(tx, 3002, Some(2), 10),
+            success_event(tx, 3001, Some(2), 15),
+        ];
+        let summary = summarize_get_outcomes_per_tx(&logs);
+        assert_eq!(summary.successes, 1);
+        assert_eq!(summary.not_found, 0, "success must dominate per tx");
+        assert_eq!(
+            summary.network_successes, 1,
+            "hop_count >= 1 is a network success"
+        );
+        assert_eq!(
+            summary.success_elapsed_ms,
+            vec![15],
+            "originator-side (max) elapsed wins"
+        );
+    }
+
+    /// hop_count == 0 means the GET completed on a node that already had
+    /// the contract — counted as success but NOT as a network success.
+    #[test]
+    fn local_hit_is_not_a_network_success() {
+        let tx = Transaction::new::<GetMsg>();
+        let logs = vec![success_event(tx, 3001, Some(0), 1)];
+        let summary = summarize_get_outcomes_per_tx(&logs);
+        assert_eq!(summary.successes, 1);
+        assert_eq!(summary.network_successes, 0);
+    }
+
+    /// Failed outcomes at or above the timeout threshold classify as
+    /// timeouts; distinct transactions stay distinct.
+    #[test]
+    fn timeout_classification_and_distinct_txs() {
+        let tx1 = Transaction::new::<GetMsg>();
+        let tx2 = Transaction::new::<GetMsg>();
+        let logs = vec![
+            not_found_event(tx1, 3001, GET_TIMEOUT_CLASSIFICATION_MS),
+            not_found_event(tx2, 3002, 10),
+        ];
+        let summary = summarize_get_outcomes_per_tx(&logs);
+        assert_eq!(summary.timeouts, 1);
+        assert_eq!(summary.not_found, 1);
+        assert_eq!(summary.total(), 2);
     }
 }
