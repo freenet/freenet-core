@@ -95,7 +95,6 @@ stateDiagram-v2
 **Key features:**
 - Network-first strategy with local cache fallback
 - MAX_RETRIES: 3 attempts (client-side peer advancement)
-- MAX_BREADTH: 3 parallel peer queries per hop
 - Bootstrap fallback: with an empty ring (zero ring connections), peer
   selection falls back to a configured gateway over the transient
   transport connection instead of failing instantly with NotFound (#4361)
@@ -445,7 +444,7 @@ sequenceDiagram
 | `streaming_threshold` | 64 KB | Size threshold for streaming |
 | `OPERATION_TTL` | configurable | Operation timeout |
 | `MAX_RETRIES` | 3 | GET retry attempts |
-| `MAX_BREADTH` | 3 | Parallel peer queries |
+| `MAX_BREADTH` | 3 | SUBSCRIBE parallel peer queries (subscribe.rs) |
 | `CONTRACT_WAIT_TIMEOUT_MS` | 2000 | SUBSCRIBE wait for contract |
 
 ## Source Files

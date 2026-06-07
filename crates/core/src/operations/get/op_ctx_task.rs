@@ -770,15 +770,24 @@ impl RetryDriver for GetRetryDriver<'_> {
         // skips gateways that already failed and converges on the same
         // gateway the client driver selected — keeping stream claims and
         // route telemetry (both attributed via `current_target`) aligned
-        // with the actual wire hop. Gated on the empty-ring case so
-        // normal-path retry routing semantics are unchanged.
+        // with the actual wire hop.
+        //
+        // The carried bloom travels the attempt's entire forward path, so
+        // a failed gateway is excluded at every hop of that attempt, not
+        // only at the loopback relay — bounded (empty-ring originators,
+        // <= MAX_RETRIES attempts) and re-keyed each retry.
+        //
+        // Gated on the empty-ring case so normal-path retry routing
+        // semantics are unchanged. The gate re-reads `connection_count()`
+        // and can race ring promotion between attempts; both directions
+        // degrade to a single wasted or spuriously-failed attempt (never
+        // a loop or hang) — see the #4364 review for the trace.
         if self.op_manager.ring.connection_manager.connection_count() == 0 {
-            let current_addr = self.current_target.socket_addr();
-            for addr in &self.tried {
-                if Some(*addr) != current_addr {
-                    self.attempt_visited.mark_visited(*addr);
-                }
-            }
+            carry_tried_into_visited(
+                &mut self.attempt_visited,
+                &self.tried,
+                self.current_target.socket_addr(),
+            );
         }
         tx
     }
@@ -1204,6 +1213,28 @@ fn select_bootstrap_gateway(
         }
         Some((gw.clone(), addr))
     })
+}
+
+/// Carry the client driver's tried set into a fresh attempt's visited
+/// bloom, excluding the attempt's intended destination (#4361 / #4364
+/// review H1). Split out so unit tests can pin the exclusion behavior
+/// without constructing an `OpManager`:
+///
+/// - dropping the carry entirely resurrects the "failover never reaches
+///   the wire" bug (the per-attempt loopback relay re-picks the first
+///   configured gateway forever);
+/// - dropping the current-target exclusion makes single-gateway retries
+///   exhaust instantly (the relay would skip the client's own pick).
+fn carry_tried_into_visited(
+    visited: &mut VisitedPeers,
+    tried: &[SocketAddr],
+    current_target_addr: Option<SocketAddr>,
+) {
+    for addr in tried {
+        if Some(*addr) != current_target_addr {
+            visited.mark_visited(*addr);
+        }
+    }
 }
 
 /// Bootstrap gateway fallback (#4361).
@@ -3203,43 +3234,28 @@ mod tests {
         );
     }
 
-    /// Source pin (#4361): the three GET peer-selection sites — client
-    /// initial pick, client advance, relay advance — and the sub-op
-    /// initial pick must all consult `bootstrap_gateway_target` when
+    /// Source pin (#4361): the GET peer-selection sites — client
+    /// initial pick, sub-op initial pick, client advance, relay advance —
+    /// must all consult `bootstrap_gateway_target` when
     /// `k_closest_potentially_hosting` yields nothing. A refactor that
     /// drops any of these calls silently reintroduces the empty-ring
-    /// instant-NotFound bug.
+    /// instant-NotFound bug. Uses `extract_fn_body` (brace-matched) so
+    /// the pins cannot false-pass on neighboring code or false-fail on
+    /// comment growth.
     #[test]
     fn all_selection_sites_use_bootstrap_gateway_fallback() {
-        let src = include_str!("op_ctx_task.rs");
+        let src = production_source();
 
-        for (fn_name, entry) in [
-            ("drive_client_get_inner", "async fn drive_client_get_inner"),
-            ("drive_sub_op_get", "async fn drive_sub_op_get"),
-            ("advance_to_next_peer", "fn advance_to_next_peer"),
-            (
-                "relay_advance_to_next_peer",
-                "fn relay_advance_to_next_peer",
-            ),
+        for entry in [
+            "async fn drive_client_get_inner",
+            "async fn drive_sub_op_get",
+            "fn advance_to_next_peer",
+            "fn relay_advance_to_next_peer",
         ] {
-            let start = src.find(entry).unwrap_or_else(|| {
-                panic!("{fn_name} must exist");
-            });
-            // Scan a window from the function entry to the next top-level
-            // fn (sync or async, whichever comes first); each of these
-            // functions consults the fallback within its own body.
-            let rest = &src[start + entry.len()..];
-            let next_fn = match (rest.find("\nfn "), rest.find("\nasync fn ")) {
-                (Some(a), Some(b)) => Some(a.min(b)),
-                (a, b) => a.or(b),
-            };
-            let window_end = next_fn
-                .map(|off| start + entry.len() + off)
-                .unwrap_or(src.len());
-            let body = &src[start..window_end];
+            let body = extract_fn_body(src, entry);
             assert!(
                 body.contains("bootstrap_gateway_target("),
-                "{fn_name} must consult bootstrap_gateway_target when \
+                "{entry} must consult bootstrap_gateway_target when \
                  k_closest_potentially_hosting yields no candidates (#4361)"
             );
         }
@@ -3248,10 +3264,7 @@ mod tests {
         // request's visited bloom — dropping the `probably_visited` half
         // would silently reintroduce gateway<->relay bounce (cross-hop
         // loop prevention; testing review of #4364).
-        let relay_start = src
-            .find("fn relay_advance_to_next_peer")
-            .expect("relay_advance_to_next_peer must exist");
-        let relay_body = &src[relay_start..relay_start + 4000];
+        let relay_body = extract_fn_body(src, "fn relay_advance_to_next_peer");
         assert!(
             relay_body.contains("new_visited.probably_visited"),
             "relay_advance_to_next_peer's fallback exclusion must include \
@@ -3259,20 +3272,65 @@ mod tests {
         );
 
         // The client driver must carry its tried set into each new
-        // attempt's visited bloom (minus the current target) — without
-        // it the per-attempt loopback relay re-picks the same first
-        // gateway and multi-gateway failover never reaches the wire
-        // (skeptical review H1 on #4364).
-        let nat_start = src
-            .find("fn new_attempt_tx")
-            .expect("new_attempt_tx must exist");
-        let nat_body = &src[nat_start..nat_start + 2500];
+        // attempt's visited bloom — without it the per-attempt loopback
+        // relay re-picks the same first gateway and multi-gateway
+        // failover never reaches the wire (skeptical review H1 on
+        // #4364). The carry's exclusion semantics are behaviorally
+        // pinned by the `carry_tried_into_visited_*` tests below.
+        let nat_body = extract_fn_body(src, "fn new_attempt_tx");
         assert!(
-            nat_body.contains("attempt_visited.mark_visited"),
+            nat_body.contains("carry_tried_into_visited("),
             "GetRetryDriver::new_attempt_tx must carry tried addrs into \
              the fresh attempt_visited bloom so gateway failover reaches \
              the wire (#4361 / #4364 H1)"
         );
+        assert!(
+            nat_body.contains("connection_count()"),
+            "the failover carry must stay gated on the empty-ring case so \
+             normal-path retry routing semantics are unchanged (#4364)"
+        );
+    }
+
+    /// Behavioral pin for the failover carry (#4364 H1): previously
+    /// tried addrs must be excluded from the next attempt, while the
+    /// attempt's intended destination must NOT be — marking it would
+    /// make the loopback relay skip the client's own pick, and
+    /// single-gateway retries would exhaust instantly.
+    #[test]
+    fn carry_tried_into_visited_excludes_current_target() {
+        let tx = dummy_tx();
+        let mut visited = VisitedPeers::new(&tx);
+        let own = SocketAddr::from(([127, 0, 0, 1], 4000));
+        let gw1 = SocketAddr::from(([127, 0, 0, 1], 4001));
+        let gw2 = SocketAddr::from(([127, 0, 0, 1], 4002));
+
+        carry_tried_into_visited(&mut visited, &[own, gw1, gw2], Some(gw2));
+
+        assert!(
+            visited.probably_visited(own),
+            "own addr must be carried into the bloom"
+        );
+        assert!(
+            visited.probably_visited(gw1),
+            "a previously tried gateway must be excluded from the next attempt"
+        );
+        assert!(
+            !visited.probably_visited(gw2),
+            "the attempt's intended destination must NOT be excluded"
+        );
+    }
+
+    /// With no current target (genuinely isolated retry), everything
+    /// tried is carried.
+    #[test]
+    fn carry_tried_into_visited_marks_all_without_current_target() {
+        let tx = dummy_tx();
+        let mut visited = VisitedPeers::new(&tx);
+        let own = SocketAddr::from(([127, 0, 0, 1], 4000));
+
+        carry_tried_into_visited(&mut visited, &[own], None);
+
+        assert!(visited.probably_visited(own));
     }
 
     #[test]

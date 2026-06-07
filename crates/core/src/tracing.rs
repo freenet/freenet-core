@@ -5219,6 +5219,24 @@ mod get_outcome_summary_tests {
         assert_eq!(summary.network_successes, 0);
     }
 
+    fn failure_event(tx: Transaction, port: u16, elapsed_ms: u64) -> NetLogMessage {
+        NetLogMessage {
+            tx,
+            datetime: base_time(),
+            peer_id: make_peer_id(port),
+            kind: EventKind::Get(GetEvent::GetFailure {
+                id: tx,
+                requester: make_pkl(port),
+                instance_id: *make_key().id(),
+                target: make_pkl(port),
+                hop_count: Some(0),
+                reason: OperationFailure::ConnectionDropped,
+                elapsed_ms,
+                timestamp: 100,
+            }),
+        }
+    }
+
     /// `GetFailure` events classify as failures — not as not_found —
     /// regardless of elapsed time. Regression for the Codex review
     /// finding on #4364: classifying by elapsed time alone collapsed
@@ -5226,25 +5244,54 @@ mod get_outcome_summary_tests {
     #[test]
     fn get_failure_classifies_as_failure_not_not_found() {
         let tx = Transaction::new::<GetMsg>();
-        let logs = vec![NetLogMessage {
-            tx,
-            datetime: base_time(),
-            peer_id: make_peer_id(3001),
-            kind: EventKind::Get(GetEvent::GetFailure {
-                id: tx,
-                requester: make_pkl(3001),
-                instance_id: *make_key().id(),
-                target: make_pkl(3001),
-                hop_count: Some(0),
-                reason: OperationFailure::ConnectionDropped,
-                elapsed_ms: 10,
-                timestamp: 100,
-            }),
-        }];
+        let logs = vec![failure_event(tx, 3001, 10)];
         let summary = summarize_get_outcomes_per_tx(&logs);
         assert_eq!(summary.failures, 1, "GetFailure must land in failures");
         assert_eq!(summary.not_found, 0);
         assert_eq!(summary.total(), 1);
+    }
+
+    /// failure > timeout precedence: a `GetFailure` at or above the
+    /// timeout threshold is still a failure — the timeout bucket is a
+    /// heuristic for NotFound without an explicit reason. Pins the
+    /// branch order in the per-tx fold (#4364 testing review).
+    #[test]
+    fn get_failure_above_timeout_threshold_stays_failure() {
+        let tx = Transaction::new::<GetMsg>();
+        let logs = vec![failure_event(
+            tx,
+            3001,
+            GET_TIMEOUT_CLASSIFICATION_MS + 1_000,
+        )];
+        let summary = summarize_get_outcomes_per_tx(&logs);
+        assert_eq!(
+            summary.failures, 1,
+            "failure must outrank the timeout heuristic"
+        );
+        assert_eq!(summary.timeouts, 0);
+        assert_eq!(summary.total(), 1);
+    }
+
+    /// success > failure precedence on the same tx — and a mixed
+    /// NotFound + Failure tx resolves to failure.
+    #[test]
+    fn success_dominates_failure_and_failure_dominates_not_found() {
+        let tx1 = Transaction::new::<GetMsg>();
+        let tx2 = Transaction::new::<GetMsg>();
+        let logs = vec![
+            failure_event(tx1, 3002, 5),
+            success_event(tx1, 3001, Some(2), 20),
+            not_found_event(tx2, 3003, 5),
+            failure_event(tx2, 3003, 6),
+        ];
+        let summary = summarize_get_outcomes_per_tx(&logs);
+        assert_eq!(summary.successes, 1, "success must dominate failure per tx");
+        assert_eq!(
+            summary.failures, 1,
+            "failure must dominate not_found per tx"
+        );
+        assert_eq!(summary.not_found, 0);
+        assert_eq!(summary.total(), 2);
     }
 
     /// Failed outcomes at or above the timeout threshold classify as
