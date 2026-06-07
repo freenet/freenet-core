@@ -8355,12 +8355,11 @@ fn test_get_reliability_diagnostic() {
         summary.timeouts,
     );
     let network_successes = summary.network_successes;
-    let elapsed_ms_list = summary.success_elapsed_ms.clone();
     let total_outcomes = summary.total();
 
     // Compute latency percentiles for successful GETs
-    let mut sorted_latencies = elapsed_ms_list.clone();
-    sorted_latencies.sort();
+    // (success_elapsed_ms is pre-sorted ascending).
+    let sorted_latencies = &summary.success_elapsed_ms;
 
     let p50 = sorted_latencies
         .get(sorted_latencies.len() / 2)
@@ -8550,7 +8549,7 @@ fn test_get_reliability_diagnostic() {
         NUM_NODES
     );
     // Network-traversal floor (#4361): before this assertion existed, every
-    // \"success\" in the failing runs was a local cache hit (hop_count == 0)
+    // "success" in the failing runs was a local cache hit (hop_count == 0)
     // on a node that already held the contract — multi-hop GET was never
     // exercised at all. Require that a meaningful number of successes
     // actually traversed the network.
@@ -8687,11 +8686,10 @@ fn test_get_reliability_with_latency() {
         summary.failures,
         summary.timeouts,
     );
-    let elapsed_ms_list = summary.success_elapsed_ms.clone();
     let total_outcomes = summary.total();
 
-    let mut sorted_latencies = elapsed_ms_list.clone();
-    sorted_latencies.sort();
+    // success_elapsed_ms is pre-sorted ascending.
+    let sorted_latencies = &summary.success_elapsed_ms;
 
     let p50 = sorted_latencies
         .get(sorted_latencies.len() / 2)
@@ -8906,11 +8904,10 @@ fn test_get_reliability_with_churn() {
         summary.failures,
         summary.timeouts,
     );
-    let elapsed_ms_list = summary.success_elapsed_ms.clone();
     let total_outcomes = summary.total();
 
-    let mut sorted_latencies = elapsed_ms_list.clone();
-    sorted_latencies.sort();
+    // success_elapsed_ms is pre-sorted ascending.
+    let sorted_latencies = &summary.success_elapsed_ms;
 
     let p50 = sorted_latencies
         .get(sorted_latencies.len() / 2)

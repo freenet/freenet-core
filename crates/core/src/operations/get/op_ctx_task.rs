@@ -1247,7 +1247,7 @@ fn advance_to_next_peer(
         }
     };
     let Some(addr) = peer.socket_addr() else {
-        // Should not happen — `k_closest_potentially_hosting` can return
+        // Rare but possible — `k_closest_potentially_hosting` can return
         // addressless candidates (ring.rs pushes them past the addr-gated
         // filters), and an addressless pick is unusable as a wire target.
         tracing::warn!(
@@ -2041,7 +2041,7 @@ fn relay_advance_to_next_peer(
         }
     };
     let Some(addr) = peer.socket_addr() else {
-        // Should not happen — see the matching guard in
+        // Rare but possible — see the matching guard in
         // `advance_to_next_peer` for why addressless candidates can leak
         // out of `k_closest_potentially_hosting`.
         tracing::warn!(
