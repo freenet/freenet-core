@@ -40,7 +40,9 @@ use crate::{
     config::GlobalExecutor,
     contract::{ContractHandlerChannel, ExecutorTransactionStream, WaitingResolution},
     message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
-    node::{NetEventRegister, NodeConfig, OpManager, PeerId, process_message_decoupled},
+    node::{
+        NetEventRegister, NodeConfig, OpManager, PeerId, WaiterReply, process_message_decoupled,
+    },
     ring::{KnownPeerKeyLocation, PeerConnectionBackoff, PeerKeyLocation},
     tracing::NetEventLog,
 };
@@ -177,28 +179,31 @@ impl P2pBridge {
 
     /// Wake any drivers whose downstream peer just disconnected.
     ///
-    /// For each orphaned `tx` we emit
-    /// `NodeEvent::TransactionCompleted(tx)` via `try_send`. The event-
-    /// loop handler at `NodeEvent::TransactionCompleted` drops the
-    /// matching `pending_op_results` sender, which closes the channel
-    /// the driver is awaiting in `OpCtx::send_and_await`. The driver
-    /// then sees `Err(OpError::NotificationError)`; the shared retry
-    /// loop (`drive_retry_loop`) routes that to `advance()` and tries
-    /// the next peer.
+    /// For each orphaned tx, emit `NodeEvent::TransactionOrphaned`. The
+    /// event-loop handler delivers `WaiterReply::PeerDisconnected` into the
+    /// waiter channel *before* dropping the sender, so the parked driver
+    /// reads the cause deterministically and surfaces
+    /// `OpError::PeerDisconnected`, which the retry loop advances past to
+    /// the next peer (#4313).
     ///
-    /// Without this hop, a GET (or other relayed op) issued just before
-    /// its downstream peer disconnected would block for the full
-    /// `OPERATION_TTL` (60 s) before retrying — see #4154.
-    pub(crate) async fn handle_orphaned_transactions(&self, transactions: Vec<Transaction>) {
+    /// Without the wake at all, a GET issued just before its peer
+    /// disconnected stalls for `OPERATION_TTL` (60 s) — see #4154.
+    pub(crate) async fn handle_orphaned_transactions(
+        &self,
+        transactions: Vec<Transaction>,
+        disconnected_peer_addr: SocketAddr,
+    ) {
         if transactions.is_empty() {
             return;
         }
         tracing::debug!(
             count = transactions.len(),
+            peer = %disconnected_peer_addr,
             "Orphaned transactions from pruned connection — waking parked drivers"
         );
         for tx in transactions {
-            self.op_manager.try_release_pending_op_slot(tx);
+            self.op_manager
+                .notify_orphaned_transaction(tx, disconnected_peer_addr);
         }
     }
 
@@ -1458,10 +1463,11 @@ impl P2pConnManager {
                                         // Note: In the simplified architecture (2026-01), subscriptions are lease-based
                                         // and don't require explicit pruning notifications. Just handle orphaned transactions.
 
-                                        // Handle orphaned transactions immediately (retry via alternate routes)
+                                        // Handle orphaned transactions immediately (retry via alternate routes).
                                         ctx.bridge
                                             .handle_orphaned_transactions(
                                                 prune_result.orphaned_transactions,
+                                                peer_addr,
                                             )
                                             .await;
 
@@ -2030,6 +2036,28 @@ impl P2pConnManager {
                                     .live_tx_tracker
                                     .remove_finished_transaction(tx);
                             }
+                            NodeEvent::TransactionOrphaned { tx, peer } => {
+                                // The awaited peer was pruned mid-flight (#4313).
+                                // Deliver the cause THROUGH the waiter channel
+                                // before the sender drops, so the parked driver's
+                                // recv() yields PeerDisconnected before None —
+                                // race-free, no side registry. Then clean up like
+                                // TransactionCompleted.
+                                state.tx_to_client.remove(&tx);
+                                if let Some(sender) = state.pending_op_results.remove(&tx) {
+                                    // Best-effort: a full channel means a real
+                                    // reply is already queued, a closed one means
+                                    // the driver already exited — both benign.
+                                    #[allow(clippy::let_underscore_must_use)]
+                                    let _ = sender.try_send(WaiterReply::PeerDisconnected { peer });
+                                    crate::config::GlobalTestMetrics::record_pending_op_remove();
+                                }
+                                ctx.bridge
+                                    .op_manager
+                                    .ring
+                                    .live_tx_tracker
+                                    .remove_finished_transaction(tx);
+                            }
                             NodeEvent::LocalSubscribeComplete {
                                 tx,
                                 key,
@@ -2240,9 +2268,9 @@ impl P2pConnManager {
             .prune_connection(PeerId::new(peer.pub_key().clone(), peer_addr))
             .await;
 
-        // Handle orphaned transactions immediately (retry via alternate routes)
+        // Handle orphaned transactions immediately (retry via alternate routes).
         self.bridge
-            .handle_orphaned_transactions(prune_result.orphaned_transactions)
+            .handle_orphaned_transactions(prune_result.orphaned_transactions, peer_addr)
             .await;
 
         // Broadcast unready if we dropped below the readiness threshold
@@ -2340,7 +2368,7 @@ impl P2pConnManager {
 
         // Handle orphaned transactions
         self.bridge
-            .handle_orphaned_transactions(prune_result.orphaned_transactions)
+            .handle_orphaned_transactions(prune_result.orphaned_transactions, peer_addr)
             .await;
 
         if prune_result.became_unready {
@@ -3310,7 +3338,7 @@ impl P2pConnManager {
                     .prune_connection(PeerId::new(old_peer.pub_key().clone(), peer_addr))
                     .await;
                 self.bridge
-                    .handle_orphaned_transactions(prune_result.orphaned_transactions)
+                    .handle_orphaned_transactions(prune_result.orphaned_transactions, peer_addr)
                     .await;
                 if prune_result.became_unready {
                     // Deferred: broadcast after connection_manager borrow ends
@@ -3755,7 +3783,10 @@ impl P2pConnManager {
 
                     // Handle orphaned transactions immediately (retry via alternate routes)
                     self.bridge
-                        .handle_orphaned_transactions(prune_result.orphaned_transactions)
+                        .handle_orphaned_transactions(
+                            prune_result.orphaned_transactions,
+                            remote_addr,
+                        )
                         .await;
 
                     if prune_result.became_unready {
@@ -4797,7 +4828,7 @@ struct EventListenerState {
     client_waiting_transaction: Vec<(WaitingTransaction, HashSet<ClientId>)>,
     awaiting_connection: HashMap<SocketAddr, Vec<Box<dyn ConnectResultSender>>>,
     awaiting_connection_txs: HashMap<SocketAddr, Vec<Transaction>>,
-    pending_op_results: HashMap<Transaction, Sender<NetMessage>>,
+    pending_op_results: HashMap<Transaction, Sender<WaiterReply>>,
     /// Last time pending_op_results was scanned for closed senders.
     last_pending_op_cleanup: Instant,
     /// Per-peer backoff tracking for failed connection attempts.
@@ -5580,9 +5611,9 @@ mod tests {
             .expect("handle_orphaned_transactions must close cleanly");
         let body = &body_after[..end];
         assert!(
-            body.contains("try_release_pending_op_slot"),
+            body.contains("notify_orphaned_transaction"),
             "handle_orphaned_transactions must call \
-             try_release_pending_op_slot to wake parked drivers (#4154). \
+             notify_orphaned_transaction to wake parked drivers (#4154/#4313). \
              Found body:\n{body}"
         );
     }
@@ -6027,6 +6058,38 @@ mod tests {
             body.contains(".reserve()"),
             "PipeStream dispatch must use `reserve()` instead of `send().await` — \
              see #4145. Body:\n{body}"
+        );
+    }
+
+    /// Pin: the `TransactionOrphaned` handler must deliver the cause
+    /// THROUGH the waiter channel (`try_send(WaiterReply::PeerDisconnected ...)`)
+    /// before dropping the sender via `pending_op_results.remove`. A future
+    /// refactor that drops the sender without sending the signal re-opens the
+    /// #4313 race (driver wakes on close with no cause → FORBIDDEN_MARKER).
+    #[test]
+    fn transaction_orphaned_handler_sends_cause_before_dropping_sender() {
+        const SOURCE: &str = include_str!("p2p_protoc.rs");
+
+        let arm_anchor = "NodeEvent::TransactionOrphaned { tx, peer } => {";
+        let arm_start = SOURCE
+            .find(arm_anchor)
+            .expect("TransactionOrphaned handler renamed or removed");
+        let arm_end = SOURCE[arm_start..]
+            .find("\n                            }\n")
+            .map(|p| arm_start + p)
+            .expect("TransactionOrphaned arm closer not found");
+        let body = &SOURCE[arm_start..arm_end];
+
+        let send_pos = body
+            .find("WaiterReply::PeerDisconnected")
+            .expect("missing PeerDisconnected delivery — #4313 cause is dropped");
+        let remove_pos = body
+            .find("pending_op_results.remove(&tx)")
+            .expect("missing pending_op_results.remove — sender never dropped");
+        assert!(
+            send_pos > remove_pos,
+            "the PeerDisconnected send must happen on the sender taken out by \
+             pending_op_results.remove (send-before-drop). Arm body:\n{body}"
         );
     }
 }

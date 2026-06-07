@@ -49,7 +49,7 @@ use freenet_stdlib::client_api::DelegateRequest;
 use serde::{Deserialize, Serialize};
 
 pub(crate) use network_bridge::{
-    ConnectionError, EventLoopNotificationsSender, NetworkBridge, OpExecutionPayload,
+    ConnectionError, EventLoopNotificationsSender, NetworkBridge, OpExecutionPayload, WaiterReply,
 };
 #[cfg(test)]
 pub(crate) use network_bridge::{EventLoopNotificationsReceiver, event_loop_notification_channel};
@@ -753,7 +753,7 @@ pub(crate) async fn process_message_decoupled<CB>(
     op_manager: Arc<OpManager>,
     conn_manager: CB,
     mut event_listener: Box<dyn NetEventRegister>,
-    pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
+    pending_op_result: Option<tokio::sync::mpsc::Sender<crate::node::WaiterReply>>,
 ) where
     CB: NetworkBridge + Clone + 'static,
 {
@@ -782,7 +782,7 @@ async fn handle_pure_network_message<CB>(
     op_manager: Arc<OpManager>,
     conn_manager: CB,
     event_listener: &mut dyn NetEventRegister,
-    pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
+    pending_op_result: Option<tokio::sync::mpsc::Sender<crate::node::WaiterReply>>,
 ) -> Result<(), crate::node::OpError>
 where
     CB: NetworkBridge + Clone + 'static,
@@ -857,7 +857,7 @@ where
 ///
 /// Either way the handler still makes progress and returns `true`.
 fn try_forward_driver_reply(
-    pending_op_result: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
+    pending_op_result: Option<&tokio::sync::mpsc::Sender<crate::node::WaiterReply>>,
     reply: NetMessage,
     op_label: &'static str,
 ) -> bool {
@@ -865,7 +865,7 @@ fn try_forward_driver_reply(
         return false;
     };
     let tx_id = *reply.id();
-    if let Err(err) = callback.try_send(reply) {
+    if let Err(err) = callback.try_send(crate::node::WaiterReply::Reply(reply)) {
         // Benign, expected, and intentionally lossy (see `# Channel safety`):
         // the reply could not be delivered (receiver closed, or the channel
         // full for a CONNECT-style capacity-N fan-in) and the operation
@@ -926,7 +926,7 @@ async fn handle_pure_network_message_v1<CB>(
     op_manager: Arc<OpManager>,
     conn_manager: CB,
     event_listener: &mut dyn NetEventRegister,
-    pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
+    pending_op_result: Option<tokio::sync::mpsc::Sender<crate::node::WaiterReply>>,
 ) -> Result<(), crate::node::OpError>
 where
     CB: NetworkBridge + Clone + 'static,
@@ -2810,7 +2810,7 @@ mod tests {
 
         #[tokio::test]
         async fn bypass_forwards_when_callback_registered() {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             let reply = dummy_reply();
             let expected_id = *reply.id();
 
@@ -2820,7 +2820,10 @@ mod tests {
             let received = rx
                 .try_recv()
                 .expect("helper should forward the reply to the callback");
-            assert_eq!(*received.id(), expected_id);
+            match received {
+                crate::node::WaiterReply::Reply(msg) => assert_eq!(*msg.id(), expected_id),
+                other => panic!("expected WaiterReply::Reply, got: {other:?}"),
+            }
         }
 
         #[tokio::test]
@@ -2846,7 +2849,7 @@ mod tests {
             // `OpNotPresent`, which is meaningless for a tx owned by a
             // (now-dead) task and pointlessly wastes a pipeline
             // iteration.
-            let (tx, rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             drop(rx);
 
             let taken = try_forward_driver_reply(Some(&tx), dummy_reply(), "subscribe");
@@ -3087,9 +3090,9 @@ mod tests {
             // channel must fail without blocking the handler. Future
             // refactors must not switch to `.send().await` (see
             // `.claude/rules/channel-safety.md`).
-            let (tx, _rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, _rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             // Pre-fill the capacity-1 channel.
-            tx.try_send(dummy_reply())
+            tx.try_send(crate::node::WaiterReply::Reply(dummy_reply()))
                 .expect("capacity-1 channel should accept first message");
 
             let taken = try_forward_driver_reply(Some(&tx), dummy_reply(), "subscribe");
@@ -3141,7 +3144,7 @@ mod tests {
         /// driver channel (and the branch would return early).
         fn subscribe_branch_would_forward(
             op: &SubscribeMsg,
-            callback: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
+            callback: Option<&tokio::sync::mpsc::Sender<crate::node::WaiterReply>>,
         ) -> bool {
             matches!(op, SubscribeMsg::Response { .. })
                 && try_forward_driver_reply(
@@ -3153,7 +3156,7 @@ mod tests {
 
         #[tokio::test]
         async fn subscribe_response_is_forwarded_to_task() {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             let sub_tx = Transaction::new::<SubscribeMsg>();
             let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([1u8; 32]);
             let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
@@ -3170,8 +3173,10 @@ mod tests {
             let taken = subscribe_branch_would_forward(&op, Some(&tx));
             assert!(taken, "Response with callback → must be forwarded");
 
-            let received = rx.try_recv().expect("Response should be in channel");
-            assert_eq!(*received.id(), sub_tx);
+            match rx.try_recv().expect("Response should be in channel") {
+                crate::node::WaiterReply::Reply(msg) => assert_eq!(*msg.id(), sub_tx),
+                other => panic!("expected WaiterReply::Reply, got: {other:?}"),
+            }
         }
 
         #[tokio::test]
@@ -3179,7 +3184,7 @@ mod tests {
             // ForwardingAck is non-terminal: relay peers send it to
             // signal "I'm working on it". Forwarding it would fill
             // the capacity-1 channel and block the real Response.
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             let sub_tx = Transaction::new::<SubscribeMsg>();
             let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([3u8; 32]);
             let op = SubscribeMsg::ForwardingAck {
@@ -3200,7 +3205,7 @@ mod tests {
 
         #[tokio::test]
         async fn unsubscribe_is_not_forwarded_to_task() {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             let sub_tx = Transaction::new::<SubscribeMsg>();
             let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([4u8; 32]);
             let op = SubscribeMsg::Unsubscribe {
@@ -3215,7 +3220,7 @@ mod tests {
 
         #[tokio::test]
         async fn request_is_not_forwarded_to_task() {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             let sub_tx = Transaction::new::<SubscribeMsg>();
             let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([5u8; 32]);
             let op = SubscribeMsg::Request {
@@ -3324,7 +3329,7 @@ mod tests {
 
         fn put_branch_would_forward(
             op: &PutMsg,
-            callback: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
+            callback: Option<&tokio::sync::mpsc::Sender<crate::node::WaiterReply>>,
         ) -> bool {
             matches!(
                 op,
@@ -3338,7 +3343,7 @@ mod tests {
 
         #[tokio::test]
         async fn put_response_is_forwarded_to_task() {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             let put_tx = Transaction::new::<PutMsg>();
             let key = dummy_put_key(10, 11);
             let op = PutMsg::Response {
@@ -3350,13 +3355,15 @@ mod tests {
             let taken = put_branch_would_forward(&op, Some(&tx));
             assert!(taken, "Response with callback → must be forwarded");
 
-            let received = rx.try_recv().expect("Response should be in channel");
-            assert_eq!(*received.id(), put_tx);
+            match rx.try_recv().expect("Response should be in channel") {
+                crate::node::WaiterReply::Reply(msg) => assert_eq!(*msg.id(), put_tx),
+                other => panic!("expected WaiterReply::Reply, got: {other:?}"),
+            }
         }
 
         #[tokio::test]
         async fn put_response_streaming_is_forwarded_to_task() {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             let put_tx = Transaction::new::<PutMsg>();
             let key = dummy_put_key(12, 13);
             let op = PutMsg::ResponseStreaming {
@@ -3369,15 +3376,18 @@ mod tests {
             let taken = put_branch_would_forward(&op, Some(&tx));
             assert!(taken, "ResponseStreaming with callback → must be forwarded");
 
-            let received = rx
+            match rx
                 .try_recv()
-                .expect("ResponseStreaming should be in channel");
-            assert_eq!(*received.id(), put_tx);
+                .expect("ResponseStreaming should be in channel")
+            {
+                crate::node::WaiterReply::Reply(msg) => assert_eq!(*msg.id(), put_tx),
+                other => panic!("expected WaiterReply::Reply, got: {other:?}"),
+            }
         }
 
         #[tokio::test]
         async fn put_forwarding_ack_is_not_forwarded_to_task() {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             let put_tx = Transaction::new::<PutMsg>();
             let key = dummy_put_key(14, 15);
             let op = PutMsg::ForwardingAck {
@@ -3398,7 +3408,7 @@ mod tests {
 
         #[tokio::test]
         async fn put_request_is_not_forwarded_to_task() {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             let put_tx = Transaction::new::<PutMsg>();
             let op = PutMsg::Request {
                 id: put_tx,

@@ -634,6 +634,13 @@ pub(crate) enum NodeEvent {
     TransactionTimedOut(Transaction),
     /// Transaction completed successfully - cleanup client subscription
     TransactionCompleted(Transaction),
+    /// A parked op whose awaited peer was just pruned (#4313). The event-loop
+    /// handler delivers `WaiterReply::PeerDisconnected` into the waiter channel
+    /// before dropping the sender, then cleans up like `TransactionCompleted`.
+    TransactionOrphaned {
+        tx: Transaction,
+        peer: SocketAddr,
+    },
     /// **Standalone** subscription completed - deliver SubscribeResponse to client via result router.
     ///
     /// **IMPORTANT:** This event is ONLY used for standalone subscriptions (no remote peers available).
@@ -778,6 +785,9 @@ impl Display for NodeEvent {
             }
             NodeEvent::TransactionCompleted(transaction) => {
                 write!(f, "Transaction completed ({transaction})")
+            }
+            NodeEvent::TransactionOrphaned { tx, peer } => {
+                write!(f, "Transaction orphaned (tx: {tx}, peer: {peer})")
             }
             NodeEvent::LocalSubscribeComplete {
                 tx,

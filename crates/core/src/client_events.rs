@@ -344,6 +344,7 @@ async fn report_op_init_error(
         | OpError::UnexpectedOpState
         | OpError::InvalidStateTransition { .. }
         | OpError::NotificationError
+        | OpError::PeerDisconnected { .. }
         | OpError::NotificationChannelError(_)
         | OpError::IncorrectTxType(..)
         | OpError::OpNotPresent(_)

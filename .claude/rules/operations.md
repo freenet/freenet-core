@@ -314,8 +314,48 @@ at the dispatch site. Do NOT treat as an error.
 □ Test race conditions (fast responses)
 ```
 
+### WHEN awaiting a reply on `pending_op_results[tx]` (#4313)
+
+When a connection is pruned, `handle_orphaned_transactions` wakes each
+parked driver. The cause travels **through the waiter channel itself**:
+the `TransactionOrphaned { tx, peer }` event-loop handler does
+`sender.try_send(WaiterReply::PeerDisconnected { peer })` and *then*
+drops the sender. tokio mpsc delivers a buffered item before the
+channel reads `None`, so the driver deterministically observes
+`PeerDisconnected` (mapped to `OpError::PeerDisconnected`) — never the
+`"failed notifying, channel closed"` FORBIDDEN_MARKER that
+`tests/error_notification.rs` asserts against. There is no side
+registry and no record-before-release ordering to get wrong.
+
+```
+The waiter channel item is `WaiterReply` (Reply | PeerDisconnected),
+  NOT a bare NetMessage. Every recv site MUST handle PeerDisconnected
+  — the type system enforces this. Funnel through
+  OpCtx::recv_waiter_reply (used by send_and_await, send_to_and_await,
+  and the PUT/CONNECT relays) rather than matching the enum by hand.
+
+The TransactionOrphaned handler MUST send PeerDisconnected on the
+  sender it removes from pending_op_results BEFORE that sender drops
+  (send-before-drop). Dropping without sending re-opens the #4313
+  race (driver wakes on close with no cause → FORBIDDEN_MARKER).
+
+PeerDisconnected routes to the generic advance arm in
+  drive_retry_loop (the peer is gone — advance to the next route),
+  NOT the NotificationError same-peer infra-retry arm. MUST preserve
+  `{err}` interpolation in the Exhausted format so the cause Display
+  reaches the user.
+```
+
+Pins (source-scrape, fail the build on regression):
+- `transaction_orphaned_handler_sends_cause_before_dropping_sender` (p2p_protoc.rs)
+- `handle_orphaned_transactions_wakes_parked_drivers` (p2p_protoc.rs)
+- behavioural: `parked_driver_always_observes_peer_disconnected_under_churn`,
+  `recv_waiter_reply_*` (op_ctx.rs) and
+  `orphaned_transaction_wakes_parked_waiter_with_peer_disconnected` (op_state_manager.rs)
+
 ## Documentation
 
 - Architecture: `docs/architecture/operations/README.md`
 - OpManager: `crates/core/src/node/op_state_manager.rs`
 - Round-trip primitive: `crates/core/src/operations/op_ctx.rs`
+- Orphan-wake signal: `crate::node::WaiterReply::PeerDisconnected` + `NodeEvent::TransactionOrphaned` (#4313)
