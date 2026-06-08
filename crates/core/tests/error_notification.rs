@@ -745,8 +745,11 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
 
         client.send(put_request).await?;
 
-        // Give the PUT a moment to start processing
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Drop the peer almost immediately so the PUT is still in flight at
+        // prune time — that is what exercises the orphan-wake path (#4313).
+        // A long pre-drop sleep lets the PUT complete first, leaving the
+        // orphan path untested.
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Now forcibly drop the peer connection
         info!("Dropping peer connection to simulate network failure...");
@@ -756,16 +759,33 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         // The PUT may or may not succeed depending on timing, but we should get SOME response
-        // The key is that we don't hang indefinitely
+        // The key is that we don't hang indefinitely.
         info!("Waiting for response after connection drop...");
         let response_result = timeout(Duration::from_secs(30), client.recv()).await;
 
+        // Whatever response (or error) the client gets, it MUST NOT carry the
+        // FORBIDDEN_MARKER: an orphan-wake closing the waiter channel must
+        // surface `PeerDisconnected`, never the bare "channel closed" string
+        // (#4313). Pre-fix, a prune racing the terminal reply leaked this.
+        const FORBIDDEN_MARKER: &str = "failed notifying, channel closed";
         match response_result {
             Ok(Ok(response)) => {
+                let rendered = format!("{response:?}");
+                assert!(
+                    !rendered.contains(FORBIDDEN_MARKER),
+                    "connection-drop response leaked the orphan-wake marker \
+                     ({FORBIDDEN_MARKER:?}). Response was: {rendered}"
+                );
                 info!("✓ Received response after connection drop: {:?}", response);
                 info!("✓ Client properly handled connection drop scenario");
             }
             Ok(Err(e)) => {
+                let rendered = e.to_string();
+                assert!(
+                    !rendered.contains(FORBIDDEN_MARKER),
+                    "connection-drop error leaked the orphan-wake marker \
+                     ({FORBIDDEN_MARKER:?}). Error was: {rendered}"
+                );
                 info!("✓ Received error notification after connection drop: {}", e);
                 info!("✓ Client properly notified of connection issues");
             }

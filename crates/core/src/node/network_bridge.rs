@@ -206,7 +206,28 @@ pub(crate) fn event_loop_notification_channel_with_capacity(
 /// SUBSCRIBE has the contract cached locally, the loop-back `InboundMessage`
 /// was short-circuiting in `process_message` instead of propagating upstream
 /// to register as a downstream subscriber on the home node.
-pub(crate) type OpExecutionPayload = (Sender<NetMessage>, NetMessage, Option<SocketAddr>);
+/// Item delivered on a `pending_op_results[tx]` waiter channel.
+///
+/// The terminal `PeerDisconnected` variant lets a prune deliver the
+/// disconnect *cause* through the channel itself (sent before the sender
+/// drops), so the parked driver reads it deterministically — no side
+/// registry, no race (#4313).
+///
+/// `Reply` is the hot path (every op reply) and is intentionally NOT boxed:
+/// the channel previously carried `NetMessage` by value, so the enum's
+/// footprint is unchanged. Boxing to satisfy `large_enum_variant` would add
+/// an allocation per reply to save space only on the rare `PeerDisconnected`.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum WaiterReply {
+    /// A terminal op reply routed back to the parked driver.
+    Reply(NetMessage),
+    /// The peer this op was awaiting was pruned before it replied; the
+    /// driver should advance to another route.
+    PeerDisconnected { peer: SocketAddr },
+}
+
+pub(crate) type OpExecutionPayload = (Sender<WaiterReply>, NetMessage, Option<SocketAddr>);
 
 pub(crate) struct EventLoopNotificationsReceiver {
     pub(crate) notifications_receiver: Receiver<Either<NetMessage, NodeEvent>>,

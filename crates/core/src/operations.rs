@@ -87,6 +87,13 @@ pub(crate) enum OpError {
     },
     #[error("failed notifying, channel closed")]
     NotificationError,
+    /// The peer this op was awaiting was pruned before sending its terminal
+    /// reply (#4313). Delivered through the waiter channel by the
+    /// `TransactionOrphaned` handler. Routes to the generic advance arm in
+    /// `drive_retry_loop` (the peer is gone — do not infra-retry it), unlike
+    /// `NotificationError` which infra-retries the same peer.
+    #[error("awaited peer {peer} disconnected before replying")]
+    PeerDisconnected { peer: std::net::SocketAddr },
     #[error("notification channel error: {0}")]
     NotificationChannelError(String),
     #[allow(dead_code)]

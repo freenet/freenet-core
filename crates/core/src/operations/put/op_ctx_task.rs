@@ -32,6 +32,7 @@ use crate::config::{GlobalExecutor, OPERATION_TTL};
 use crate::message::{NetMessage, NetMessageV1, Transaction};
 use crate::node::NetworkBridge;
 use crate::node::OpManager;
+use crate::node::WaiterReply;
 use crate::operations::OpError;
 use crate::operations::op_ctx::{
     AdvanceOutcome, AttemptOutcome, OpCtx, RetryDriver, RetryLoopOutcome, drive_retry_loop,
@@ -1306,7 +1307,10 @@ where
         }
 
         tokio::time::timeout(OPERATION_TTL, async move {
-            reply_rx.recv().await.ok_or(OpError::NotificationError)
+            // Route through `recv_waiter_reply` so a `PeerDisconnected`
+            // signal on the waiter channel surfaces as the matching
+            // `OpError` instead of a bare close (#4313).
+            ctx.recv_waiter_reply(&mut reply_rx).await
         })
         .await
     } else {
@@ -2131,12 +2135,12 @@ where
     // `handle_pure_network_message_v1` before the waiter installs —
     // `try_forward_driver_reply` would drop the reply as
     // OpNotPresent and the driver would hang until `OPERATION_TTL`.
-    let downstream_reply_rx: Option<(SocketAddr, tokio::sync::mpsc::Receiver<NetMessage>)> =
+    let downstream_reply_rx: Option<(SocketAddr, tokio::sync::mpsc::Receiver<WaiterReply>)> =
         if let Some((next_addr, metadata_net, outbound_sid, forked_handle, embedded_metadata)) =
             piping
         {
             let mut ctx = op_manager.op_ctx(incoming_tx);
-            let rx_opt: Option<tokio::sync::mpsc::Receiver<NetMessage>> = match ctx
+            let rx_opt: Option<tokio::sync::mpsc::Receiver<WaiterReply>> = match ctx
                 .send_to_and_register_waiter(next_addr, metadata_net)
                 .await
             {
@@ -2235,12 +2239,23 @@ where
     // these into the local Router lets the failure-probability model
     // learn from forwarded traffic, not just originator-side ops.
     if let Some((next_addr, mut rx)) = downstream_reply_rx {
-        let reply = match tokio::time::timeout(OPERATION_TTL, rx.recv()).await {
-            Ok(Some(reply)) => reply,
-            Ok(None) => {
+        // Route through `recv_waiter_reply` so a `PeerDisconnected` signal
+        // delivered by `handle_orphaned_transactions` surfaces as the
+        // matching `OpError` (mapped to the downstream-failure arm below)
+        // rather than a bare channel close (#4313).
+        let ctx_for_recv = op_manager.op_ctx(incoming_tx);
+        let reply = match tokio::time::timeout(
+            OPERATION_TTL,
+            ctx_for_recv.recv_waiter_reply(&mut rx),
+        )
+        .await
+        {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(err)) => {
                 tracing::warn!(
                     tx = %incoming_tx,
                     target = %next_addr,
+                    error = %err,
                     "PUT streaming relay: downstream reply channel closed before reply"
                 );
                 if let Some(ref peer) = next_hop {

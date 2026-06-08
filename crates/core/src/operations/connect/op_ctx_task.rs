@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::message::{NetMessage, NetMessageV1, NodeEvent, Transaction};
-use crate::node::OpManager;
+use crate::node::{OpManager, WaiterReply};
 use crate::operations::OpError;
 use crate::ring::{ConnectionFailureReason, Location, PeerKeyLocation};
 use crate::tracing::NetEventLog;
@@ -257,7 +257,7 @@ async fn drive_client_connect_inner(
     desired_location: Location,
     target_connections: usize,
     started_without_address: bool,
-    mut receiver: mpsc::Receiver<NetMessage>,
+    mut receiver: mpsc::Receiver<WaiterReply>,
     op_manager: &OpManager,
 ) -> Result<(), OpError> {
     use std::collections::HashSet;
@@ -283,7 +283,19 @@ async fn drive_client_connect_inner(
         // reachable network).
         const RECV_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
         let msg = match tokio::time::timeout(RECV_POLL_INTERVAL, receiver.recv()).await {
-            Ok(Some(msg)) => msg,
+            Ok(Some(WaiterReply::Reply(msg))) => msg,
+            Ok(Some(WaiterReply::PeerDisconnected { peer })) => {
+                // The gateway we sent the CONNECT Request to was pruned
+                // mid-flight (#4313). No further Responses will arrive on
+                // this waiter; end collection with whatever was accepted.
+                tracing::debug!(
+                    %tx,
+                    %peer,
+                    accepted = accepted.len(),
+                    "connect driver: gateway disconnected mid-connect; ending reply collection"
+                );
+                break;
+            }
             Ok(None) => break,
             Err(_) => continue,
         };
@@ -893,7 +905,17 @@ async fn drive_relay_connect(
         }
 
         let msg = match tokio::time::timeout(RELAY_RECV_POLL_INTERVAL, receiver.recv()).await {
-            Ok(Some(msg)) => msg,
+            Ok(Some(WaiterReply::Reply(msg))) => msg,
+            Ok(Some(WaiterReply::PeerDisconnected { peer })) => {
+                // Downstream peer pruned mid-flight (#4313); no further
+                // re-entry replies will arrive. End the relay driver.
+                tracing::debug!(
+                    tx = %incoming_tx,
+                    %peer,
+                    "CONNECT relay: downstream peer disconnected; exiting"
+                );
+                return Ok(());
+            }
             Ok(None) => return Ok(()),
             Err(_) => continue,
         };

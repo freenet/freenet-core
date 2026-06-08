@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use tokio::sync::mpsc;
 
 use crate::message::{MessageStats, NetMessage, Transaction};
-use crate::node::OpExecutionPayload;
+use crate::node::{OpExecutionPayload, WaiterReply};
 use crate::operations::OpError;
 
 /// Per-transaction execution context for the driver model.
@@ -160,7 +160,7 @@ impl OpCtx {
             "OpCtx::send_fire_and_forget: msg.id must match ctx.tx"
         );
 
-        let (response_sender, _response_receiver) = mpsc::channel::<NetMessage>(1);
+        let (response_sender, _response_receiver) = mpsc::channel::<WaiterReply>(1);
         // _response_receiver is dropped here. The sender stored in
         // pending_op_results becomes is_closed() == true, reclaimable by
         // the 60s sweep or an explicit release_pending_op_slot call.
@@ -189,7 +189,7 @@ impl OpCtx {
             "OpCtx::send_local_loopback: msg.id must match ctx.tx"
         );
 
-        let (response_sender, _response_receiver) = mpsc::channel::<NetMessage>(1);
+        let (response_sender, _response_receiver) = mpsc::channel::<WaiterReply>(1);
 
         self.op_execution_sender
             .send((response_sender, msg, None))
@@ -231,14 +231,14 @@ impl OpCtx {
         &mut self,
         target_addr: SocketAddr,
         msg: NetMessage,
-    ) -> Result<mpsc::Receiver<NetMessage>, OpError> {
+    ) -> Result<mpsc::Receiver<WaiterReply>, OpError> {
         debug_assert_eq!(
             msg.id(),
             &self.tx,
             "OpCtx::send_to_and_register_waiter: msg.id must match ctx.tx"
         );
 
-        let (response_sender, response_receiver) = mpsc::channel::<NetMessage>(1);
+        let (response_sender, response_receiver) = mpsc::channel::<WaiterReply>(1);
 
         self.op_execution_sender
             .send((response_sender, msg, Some(target_addr)))
@@ -286,7 +286,7 @@ impl OpCtx {
         &mut self,
         msg: NetMessage,
         capacity: usize,
-    ) -> Result<mpsc::Receiver<NetMessage>, OpError> {
+    ) -> Result<mpsc::Receiver<WaiterReply>, OpError> {
         debug_assert_eq!(
             msg.id(),
             &self.tx,
@@ -297,7 +297,7 @@ impl OpCtx {
             "OpCtx::send_and_collect_replies: capacity must be >= 1"
         );
 
-        let (response_sender, response_receiver) = mpsc::channel::<NetMessage>(capacity);
+        let (response_sender, response_receiver) = mpsc::channel::<WaiterReply>(capacity);
 
         self.op_execution_sender
             .send((response_sender, msg, None))
@@ -319,7 +319,7 @@ impl OpCtx {
         target_addr: SocketAddr,
         msg: NetMessage,
         capacity: usize,
-    ) -> Result<mpsc::Receiver<NetMessage>, OpError> {
+    ) -> Result<mpsc::Receiver<WaiterReply>, OpError> {
         debug_assert_eq!(
             msg.id(),
             &self.tx,
@@ -330,7 +330,7 @@ impl OpCtx {
             "OpCtx::send_to_and_collect_replies: capacity must be >= 1"
         );
 
-        let (response_sender, response_receiver) = mpsc::channel::<NetMessage>(capacity);
+        let (response_sender, response_receiver) = mpsc::channel::<WaiterReply>(capacity);
 
         self.op_execution_sender
             .send((response_sender, msg, Some(target_addr)))
@@ -351,29 +351,42 @@ impl OpCtx {
             "OpCtx::send_and_await: msg.id must match ctx.tx"
         );
 
-        let (response_sender, mut response_receiver) = mpsc::channel::<NetMessage>(1);
+        let (response_sender, mut response_receiver) = mpsc::channel::<WaiterReply>(1);
 
         self.op_execution_sender
             .send((response_sender, msg, target_addr))
             .await
             .map_err(|_| OpError::NotificationError)?;
 
-        match response_receiver.recv().await {
-            Some(reply) => {
-                // Debug-only defense-in-depth. In a release build a
-                // mismatched reply tx would silently return to the
-                // caller (the reply is for a *different* transaction).
-                // That would be a correctness bug in whatever mislabeled
-                // the message in `p2p_protoc::pending_op_results`, not a
-                // failure mode of `send_and_await` itself — the assert
-                // exists to catch such bugs at development time.
+        self.recv_waiter_reply(&mut response_receiver).await
+    }
+
+    /// Await the next reply on a `pending_op_results[tx]` waiter channel.
+    ///
+    /// Single chokepoint: the `WaiterReply` enum forces every caller to
+    /// handle the terminal `PeerDisconnected` signal the prune path
+    /// delivers through the channel (#4313). On a `PeerDisconnected`
+    /// item the awaited peer was pruned mid-flight, so the driver should
+    /// advance to another route; a bare channel close with no terminal
+    /// item is a genuine teardown and falls back to `NotificationError`.
+    pub(crate) async fn recv_waiter_reply(
+        &self,
+        receiver: &mut mpsc::Receiver<WaiterReply>,
+    ) -> Result<NetMessage, OpError> {
+        match receiver.recv().await {
+            Some(WaiterReply::Reply(reply)) => {
+                // A mismatched reply tx would be a bug in the bypass
+                // layer; catch it in debug builds.
                 debug_assert_eq!(
                     reply.id(),
                     &self.tx,
-                    "OpCtx::send_and_await: reply tx must match ctx.tx"
+                    "recv_waiter_reply: reply tx must match ctx.tx"
                 );
                 Ok(reply)
             }
+            Some(WaiterReply::PeerDisconnected { peer }) => Err(OpError::PeerDisconnected { peer }),
+            // Genuine teardown with no terminal signal (executor torn
+            // down, callback dropped): pre-#4313 fallback.
             None => Err(OpError::NotificationError),
         }
     }
@@ -735,6 +748,15 @@ mod tests {
         NetMessage::V1(NetMessageV1::Aborted(tx))
     }
 
+    /// Unwrap a `WaiterReply::Reply` in collect-replies tests; panic on the
+    /// terminal `PeerDisconnected` variant (not expected on the happy path).
+    fn expect_reply(item: WaiterReply) -> NetMessage {
+        match item {
+            WaiterReply::Reply(msg) => msg,
+            other => panic!("expected WaiterReply::Reply, got: {other:?}"),
+        }
+    }
+
     /// Happy path: `send_and_await` fires an outbound message, the fake
     /// executor reads it, replies with a terminal message keyed by the
     /// same tx, and `send_and_await` returns `Ok(reply)`.
@@ -772,7 +794,7 @@ mod tests {
                 "send_and_await should not specify a target"
             );
             reply_sender
-                .try_send(dummy_reply_with_tx(tx))
+                .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
                 .expect("capacity-1 reply channel should accept the first send");
         });
 
@@ -833,7 +855,7 @@ mod tests {
                  through the op execution channel (regression for #3838)"
             );
             reply_sender
-                .try_send(dummy_reply_with_tx(tx))
+                .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
                 .expect("capacity-1 reply channel should accept the first send");
         });
 
@@ -1195,7 +1217,7 @@ mod tests {
                 .await
                 .expect("first outbound delivered");
             reply_sender_1
-                .try_send(dummy_reply_with_tx(tx))
+                .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
                 .expect("first reply accepted");
 
             // Second outbound: hold `reply_sender_2` alive — do NOT
@@ -1386,7 +1408,7 @@ mod tests {
             );
             for _ in 0..3 {
                 reply_sender
-                    .try_send(dummy_reply_with_tx(tx))
+                    .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
                     .expect("capacity-N reply channel should accept all sends within capacity");
             }
             // Hold reply_sender to keep the channel open while the caller drains.
@@ -1410,7 +1432,7 @@ mod tests {
             let reply = timeout(Duration::from_secs(1), rx.recv())
                 .await
                 .unwrap_or_else(|_| panic!("recv #{i} should yield buffered reply"));
-            let reply = reply.unwrap_or_else(|| panic!("recv #{i} returned None"));
+            let reply = expect_reply(reply.unwrap_or_else(|| panic!("recv #{i} returned None")));
             assert_eq!(reply.id(), &tx, "reply #{i} tx must match ctx tx");
         }
     }
@@ -1446,7 +1468,7 @@ mod tests {
                 "send_to_and_collect_replies must propagate target_addr"
             );
             reply_sender
-                .try_send(dummy_reply_with_tx(tx))
+                .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
                 .expect("capacity-N channel accepts first send");
             reply_sender
         });
@@ -1464,10 +1486,12 @@ mod tests {
             .await
             .expect("executor task should complete without panicking");
 
-        let reply = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("recv should yield buffered reply")
-            .expect("recv returned None");
+        let reply = expect_reply(
+            timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("recv should yield buffered reply")
+                .expect("recv returned None"),
+        );
         assert_eq!(reply.id(), &tx);
     }
 
@@ -1493,7 +1517,7 @@ mod tests {
                 .await
                 .expect("outbound msg should be delivered");
             reply_sender
-                .try_send(dummy_reply_with_tx(tx))
+                .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
                 .expect("capacity-1 channel accepts first send");
             reply_sender
         });
@@ -1506,7 +1530,112 @@ mod tests {
 
         let _reply_sender = executor.await.expect("executor task should complete");
 
-        let reply = rx.recv().await.expect("first recv should yield reply");
+        let reply = expect_reply(rx.recv().await.expect("first recv should yield reply"));
         assert_eq!(reply.id(), &tx);
+    }
+
+    /// A `WaiterReply::Reply` item resolves to the carried `NetMessage`.
+    #[tokio::test]
+    async fn recv_waiter_reply_returns_reply_on_reply_item() {
+        let (_receiver, sender) = event_loop_notification_channel();
+        let tx = Transaction::new::<ConnectMsg>();
+        let ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+
+        let (waiter_sender, mut rx) = mpsc::channel::<WaiterReply>(1);
+        waiter_sender
+            .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
+            .expect("capacity-1 channel accepts first send");
+
+        let reply = ctx
+            .recv_waiter_reply(&mut rx)
+            .await
+            .expect("Reply item must resolve to Ok");
+        assert_eq!(reply.id(), &tx);
+    }
+
+    /// A `WaiterReply::PeerDisconnected` item (the prune signal) surfaces as
+    /// `OpError::PeerDisconnected` carrying the peer — NOT the FORBIDDEN_MARKER
+    /// (#4313). Delivering it before the sender drops is what makes this
+    /// deterministic; see the concurrency regression below.
+    #[tokio::test]
+    async fn recv_waiter_reply_returns_peer_disconnected_signal() {
+        let (_receiver, sender) = event_loop_notification_channel();
+        let tx = Transaction::new::<ConnectMsg>();
+        let ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+        let peer: SocketAddr = "1.2.3.4:5678"
+            .parse()
+            .expect("test peer addr must be valid");
+
+        // Deliver the cause, then drop the sender — mirrors the
+        // `TransactionOrphaned` handler's send-before-drop.
+        let (waiter_sender, mut rx) = mpsc::channel::<WaiterReply>(1);
+        waiter_sender
+            .try_send(WaiterReply::PeerDisconnected { peer })
+            .expect("capacity-1 channel accepts first send");
+        drop(waiter_sender);
+
+        let err = ctx
+            .recv_waiter_reply(&mut rx)
+            .await
+            .expect_err("PeerDisconnected item must surface as Err");
+        assert!(
+            matches!(err, OpError::PeerDisconnected { peer: p } if p == peer),
+            "expected PeerDisconnected({peer}), got: {err:?}"
+        );
+    }
+
+    /// A bare channel close with no terminal item is a genuine teardown
+    /// and falls back to `NotificationError` (pre-#4313 semantics).
+    #[tokio::test]
+    async fn recv_waiter_reply_falls_back_to_notification_error_on_bare_close() {
+        let (_receiver, sender) = event_loop_notification_channel();
+        let tx = Transaction::new::<ConnectMsg>();
+        let ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+
+        let (waiter_sender, mut rx) = mpsc::channel::<WaiterReply>(1);
+        drop(waiter_sender);
+
+        let err = ctx
+            .recv_waiter_reply(&mut rx)
+            .await
+            .expect_err("closed channel must surface as Err");
+        assert!(
+            matches!(err, OpError::NotificationError),
+            "expected NotificationError fallback, got: {err:?}"
+        );
+    }
+
+    /// #4313 regression: the prune path delivers `PeerDisconnected` through
+    /// the channel BEFORE dropping the sender, so a parked driver reads it
+    /// deterministically even under multi-thread scheduling. The deleted
+    /// orphan-cause registry approach raced a `drop_entry` against this
+    /// `recv` and lost ~99.99% of the time, surfacing the FORBIDDEN_MARKER.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parked_driver_always_observes_peer_disconnected_under_churn() {
+        let (_receiver, sender) = event_loop_notification_channel();
+        let peer: SocketAddr = "9.9.9.9:9999".parse().expect("valid addr");
+
+        for _ in 0..2_000 {
+            let tx = Transaction::new::<ConnectMsg>();
+            let ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+            let (waiter_sender, mut rx) = mpsc::channel::<WaiterReply>(1);
+
+            let driver = tokio::spawn(async move { ctx.recv_waiter_reply(&mut rx).await });
+
+            // Let the driver actually park on recv() before the wake.
+            tokio::task::yield_now().await;
+
+            // Production handler order: send the cause, THEN drop the sender.
+            #[allow(clippy::let_underscore_must_use)]
+            let _ = waiter_sender.try_send(WaiterReply::PeerDisconnected { peer });
+            drop(waiter_sender);
+
+            match driver.await.expect("driver task panicked") {
+                Err(OpError::PeerDisconnected { peer: observed }) => {
+                    assert_eq!(observed, peer);
+                }
+                other => panic!("expected PeerDisconnected, got: {other:?}"),
+            }
+        }
     }
 }
