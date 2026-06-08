@@ -127,6 +127,15 @@ pub fn current_timestamp_ms() -> u64 {
 #[derive(Clone)]
 pub struct TelemetryReporter {
     sender: mpsc::Sender<TelemetryCommand>,
+    /// This node's own peer id, stamped on events that are emitted
+    /// without a `NetLogMessage` carrying one (timeouts, transfer
+    /// events, transport snapshots). Without it those events carry an
+    /// empty `peer_id` and cannot be attributed to a sender in the
+    /// collector (#4345 observability gap). The address portion is
+    /// best-effort for non-gateway nodes (listener fallback until
+    /// external-address discovery — same caveat as the shadow-RTT
+    /// events, see `p2p_impl.rs` and #4294).
+    local_peer_id: String,
 }
 
 #[allow(dead_code)]
@@ -147,8 +156,12 @@ struct TelemetryEvent {
 impl TelemetryReporter {
     /// Create a new telemetry reporter.
     ///
+    /// `local_peer_id` is this node's own peer id (public key +
+    /// best-effort address), used to attribute transport-level events
+    /// that have no `NetLogMessage` context.
+    ///
     /// Returns None if telemetry is disabled or in a test environment.
-    pub fn new(config: &TelemetryConfig) -> Option<Self> {
+    pub fn new(config: &TelemetryConfig, local_peer_id: String) -> Option<Self> {
         if !config.enabled {
             tracing::info!("Telemetry reporting is disabled");
             return None;
@@ -188,10 +201,14 @@ impl TelemetryReporter {
             receiver,
             transport_snapshot_interval_secs,
             transfer_event_receiver,
+            local_peer_id.clone(),
         );
         GlobalExecutor::spawn(worker.run());
 
-        Some(Self { sender })
+        Some(Self {
+            sender,
+            local_peer_id,
+        })
     }
 
     async fn send_event(&self, event: TelemetryEvent) {
@@ -233,10 +250,11 @@ impl NetEventRegister for TelemetryReporter {
     ) -> BoxFuture<'_, ()> {
         let sender = self.sender.clone();
         let op_type = op_type.to_string();
+        let local_peer_id = self.local_peer_id.clone();
         async move {
             let event = TelemetryEvent {
                 timestamp: current_timestamp_ms(),
-                peer_id: String::new(),
+                peer_id: local_peer_id,
                 transaction_id: tx.to_string(),
                 event_type: "timeout".to_string(),
                 event_data: serde_json::json!({
@@ -272,6 +290,8 @@ struct TelemetryWorker {
     transport_snapshot_interval_secs: u64,
     /// Receiver for per-transfer telemetry events from transport layer
     transfer_event_receiver: mpsc::Receiver<super::TransferEvent>,
+    /// This node's own peer id — see `TelemetryReporter::local_peer_id`.
+    local_peer_id: String,
 }
 
 impl TelemetryWorker {
@@ -280,6 +300,7 @@ impl TelemetryWorker {
         receiver: mpsc::Receiver<TelemetryCommand>,
         transport_snapshot_interval_secs: u64,
         transfer_event_receiver: mpsc::Receiver<super::TransferEvent>,
+        local_peer_id: String,
     ) -> Self {
         Self {
             endpoint,
@@ -295,6 +316,27 @@ impl TelemetryWorker {
             rate_limit_window_start: Instant::now(),
             transport_snapshot_interval_secs,
             transfer_event_receiver,
+            local_peer_id,
+        }
+    }
+
+    /// Wrap a transport-layer transfer event into a `TelemetryEvent`,
+    /// stamped with this node's own peer id. The transport layer has
+    /// no peer-identity context of its own, so before #4345 these
+    /// events carried an empty `peer_id` and sender attribution in the
+    /// collector was impossible.
+    fn transfer_event_to_telemetry(&self, transfer_event: super::TransferEvent) -> TelemetryEvent {
+        let event_type = match &transfer_event {
+            super::TransferEvent::Started { .. } => "transfer_started",
+            super::TransferEvent::Completed { .. } => "transfer_completed",
+            super::TransferEvent::Failed { .. } => "transfer_failed",
+        };
+        TelemetryEvent {
+            timestamp: current_timestamp_ms(),
+            peer_id: self.local_peer_id.clone(),
+            transaction_id: String::new(), // Not available at transport layer
+            event_type: event_type.to_string(),
+            event_data: event_kind_to_json(&super::EventKind::Transfer(transfer_event)),
         }
     }
 
@@ -336,18 +378,7 @@ impl TelemetryWorker {
                 transfer_event = self.transfer_event_receiver.recv() => {
                     // Handle per-transfer telemetry events from transport layer
                     if let Some(transfer_event) = transfer_event {
-                        let event_type = match &transfer_event {
-                            super::TransferEvent::Started { .. } => "transfer_started",
-                            super::TransferEvent::Completed { .. } => "transfer_completed",
-                            super::TransferEvent::Failed { .. } => "transfer_failed",
-                        };
-                        let event = TelemetryEvent {
-                            timestamp: current_timestamp_ms(),
-                            peer_id: String::new(), // Transport layer doesn't have peer identity
-                            transaction_id: String::new(), // Not available at transport layer
-                            event_type: event_type.to_string(),
-                            event_data: event_kind_to_json(&super::EventKind::Transfer(transfer_event)),
-                        };
+                        let event = self.transfer_event_to_telemetry(transfer_event);
                         self.handle_event(event).await;
                     }
                 },
@@ -360,7 +391,9 @@ impl TelemetryWorker {
                         if let Some(snapshot) = TRANSPORT_METRICS.take_snapshot() {
                             let event = TelemetryEvent {
                                 timestamp: current_timestamp_ms(),
-                                peer_id: String::new(), // Transport metrics are node-wide, not peer-specific
+                                // Node-wide metrics, attributed to this
+                                // node's own peer id (#4345).
+                                peer_id: self.local_peer_id.clone(),
                                 transaction_id: String::new(), // Not tied to a transaction
                                 event_type: "transport_snapshot".to_string(),
                                 event_data: serde_json::to_value(&snapshot).unwrap_or_default(),
@@ -506,10 +539,21 @@ fn to_otlp_logs(events: &[TelemetryEvent]) -> serde_json::Value {
     serde_json::json!({
         "resourceLogs": [{
             "resource": {
-                "attributes": [{
-                    "key": "service.name",
-                    "value": {"stringValue": "freenet-peer"}
-                }]
+                "attributes": [
+                    {
+                        "key": "service.name",
+                        "value": {"stringValue": "freenet-peer"}
+                    },
+                    {
+                        // Standard OTLP placement for the sender's
+                        // crate version — lets collector queries
+                        // attribute every event type to a release
+                        // without joining against peer_startup events
+                        // (#4345 observability gap).
+                        "key": "service.version",
+                        "value": {"stringValue": env!("CARGO_PKG_VERSION")}
+                    }
+                ]
             },
             "scopeLogs": [{
                 "scope": {
@@ -1839,6 +1883,66 @@ mod tests {
             .find(|a| a["key"] == "peer_id")
             .expect("peer_id attribute must be present");
         assert_eq!(peer_attr["value"]["stringValue"], "test-peer-id-xyz");
+    }
+
+    #[test]
+    fn test_otlp_resource_includes_service_version() {
+        // #4345 observability gap: every OTLP export must carry the
+        // sender's crate version as a standard resource attribute, so
+        // collector queries can attribute events (transfer_failed in
+        // particular) to a release without joining against
+        // peer_startup events.
+        let event = TelemetryEvent {
+            timestamp: 1_700_000_000_000,
+            peer_id: "some-peer".to_string(),
+            transaction_id: String::new(),
+            event_type: "transfer_failed".to_string(),
+            event_data: serde_json::json!({}),
+        };
+        let otlp = to_otlp_logs(std::slice::from_ref(&event));
+        let resource_attrs = &otlp["resourceLogs"][0]["resource"]["attributes"];
+        let version_attr = resource_attrs
+            .as_array()
+            .expect("resource attributes must be an array")
+            .iter()
+            .find(|a| a["key"] == "service.version")
+            .expect("service.version resource attribute must be present");
+        assert_eq!(
+            version_attr["value"]["stringValue"],
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+
+    #[test]
+    fn test_transfer_events_carry_local_peer_id() {
+        // #4345 observability gap: transfer_failed events carried an
+        // empty peer_id, making sender attribution in the collector
+        // impossible. The worker must stamp its own peer id on every
+        // transport-level transfer event.
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let (_transfer_tx, transfer_rx) = mpsc::channel(1);
+        let worker = TelemetryWorker::new(
+            "http://localhost:4318".to_string(),
+            cmd_rx,
+            0,
+            transfer_rx,
+            "test-local-peer-id".to_string(),
+        );
+        let event = worker.transfer_event_to_telemetry(crate::tracing::TransferEvent::Failed {
+            stream_id: 42,
+            peer_addr: "127.0.0.1:31337".parse().unwrap(),
+            bytes_transferred: 1024,
+            reason: "cwnd wait timeout".to_string(),
+            elapsed_ms: 3000,
+            direction: crate::tracing::TransferDirection::Send,
+            timestamp: 1_700_000_000_000,
+        });
+        assert_eq!(event.event_type, "transfer_failed");
+        assert_eq!(
+            event.peer_id, "test-local-peer-id",
+            "transfer events must be attributed to the emitting node's \
+             own peer id (#4345)"
+        );
     }
 
     #[test]

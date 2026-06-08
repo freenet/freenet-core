@@ -566,8 +566,21 @@ impl NodeConfig {
                 registers.push(Box::new(OTEventRegister::new()));
             }
 
-            // Add telemetry reporter if enabled in config
-            if let Some(telemetry) = TelemetryReporter::new(&self.config.telemetry) {
+            // Add telemetry reporter if enabled in config. The local
+            // peer id (public key + best-effort address, same
+            // construction as the shadow-RTT events in `p2p_impl.rs`)
+            // attributes transport-level events — transfer_failed,
+            // transport_snapshot, timeout — which otherwise carry an
+            // empty peer_id and cannot be correlated to a sender in
+            // the collector (#4345 observability gap).
+            let local_peer_id = PeerId::new(
+                self.key_pair.public().clone(),
+                self.own_addr.unwrap_or_else(|| {
+                    std::net::SocketAddr::new(self.network_listener_ip, self.network_listener_port)
+                }),
+            )
+            .to_string();
+            if let Some(telemetry) = TelemetryReporter::new(&self.config.telemetry, local_peer_id) {
                 registers.push(Box::new(telemetry));
             }
 
