@@ -1413,14 +1413,24 @@ fn test_streaming_get_retries_after_assembly_failure() {
 
     let mut failures: Vec<String> = Vec::new();
     let mut demonstrated = false;
-    for (attempt, cold_idx) in cold_nodes.iter().copied().enumerate() {
+    // Cap the candidates tried: each iteration is a full phase-2 sim
+    // run (~15s), and under a regression EVERY candidate fails — an
+    // uncapped loop over up to 11 cold nodes would hit the nextest ci
+    // profile's termination timeout and lose the per-candidate
+    // diagnostics below. The sim is deterministic per seed; with this
+    // seed the first four cold candidates cannot route a GET to a
+    // holder at all (their retry exhausts on the wire) and the fifth
+    // demonstrates the property, so the cap leaves one spare.
+    for (attempt, cold_idx) in cold_nodes.iter().copied().take(6).enumerate() {
         let network_name = format!("get-assembly-retry-p2-{attempt}");
 
         // (Re-)arm exactly one injected assembly failure for THIS
         // contract key — keying by contract makes this safe under
         // parallel test execution in the same process. `inject_failures`
         // overwrites, so a previous candidate that never streamed leaves
-        // no stale budget behind.
+        // no stale budget behind. (ASSEMBLY_RETRY_COUNT itself is
+        // process-global; the before/after delta below relies on
+        // nextest's process-per-test isolation in CI.)
         get_assembly_fault_injection::inject_failures(contract_key, 1);
         let retries_before =
             get_assembly_fault_injection::ASSEMBLY_RETRY_COUNT.load(Ordering::SeqCst);

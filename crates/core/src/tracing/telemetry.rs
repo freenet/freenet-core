@@ -320,6 +320,22 @@ impl TelemetryWorker {
         }
     }
 
+    /// Wrap a transport metrics snapshot into a `TelemetryEvent`.
+    /// Node-wide metrics, attributed to this node's own peer id —
+    /// same #4345 rationale as `transfer_event_to_telemetry`.
+    fn snapshot_to_telemetry(
+        &self,
+        snapshot: &crate::transport::metrics::TransportSnapshot,
+    ) -> TelemetryEvent {
+        TelemetryEvent {
+            timestamp: current_timestamp_ms(),
+            peer_id: self.local_peer_id.clone(),
+            transaction_id: String::new(), // Not tied to a transaction
+            event_type: "transport_snapshot".to_string(),
+            event_data: serde_json::to_value(snapshot).unwrap_or_default(),
+        }
+    }
+
     /// Wrap a transport-layer transfer event into a `TelemetryEvent`,
     /// stamped with this node's own peer id. The transport layer has
     /// no peer-identity context of its own, so before #4345 these
@@ -389,15 +405,7 @@ impl TelemetryWorker {
                     // Emit transport layer metrics snapshot (only if enabled)
                     if self.transport_snapshot_interval_secs > 0 {
                         if let Some(snapshot) = TRANSPORT_METRICS.take_snapshot() {
-                            let event = TelemetryEvent {
-                                timestamp: current_timestamp_ms(),
-                                // Node-wide metrics, attributed to this
-                                // node's own peer id (#4345).
-                                peer_id: self.local_peer_id.clone(),
-                                transaction_id: String::new(), // Not tied to a transaction
-                                event_type: "transport_snapshot".to_string(),
-                                event_data: serde_json::to_value(&snapshot).unwrap_or_default(),
-                            };
+                            let event = self.snapshot_to_telemetry(&snapshot);
                             self.handle_event(event).await;
                         }
                     }
@@ -1883,6 +1891,59 @@ mod tests {
             .find(|a| a["key"] == "peer_id")
             .expect("peer_id attribute must be present");
         assert_eq!(peer_attr["value"]["stringValue"], "test-peer-id-xyz");
+    }
+
+    #[test]
+    fn test_transport_snapshot_carries_local_peer_id() {
+        // #4345 observability gap, same class as transfer_failed:
+        // transport_snapshot events carried an empty peer_id. The
+        // worker must stamp its own peer id on snapshot events.
+        let (_cmd_tx, cmd_rx) = mpsc::channel(1);
+        let (_transfer_tx, transfer_rx) = mpsc::channel(1);
+        let worker = TelemetryWorker::new(
+            "http://localhost:4318".to_string(),
+            cmd_rx,
+            0,
+            transfer_rx,
+            "snapshot-peer-id".to_string(),
+        );
+        let snapshot = crate::transport::metrics::TransportSnapshot::default();
+        let event = worker.snapshot_to_telemetry(&snapshot);
+        assert_eq!(event.event_type, "transport_snapshot");
+        assert_eq!(
+            event.peer_id, "snapshot-peer-id",
+            "transport snapshots must be attributed to the emitting \
+             node's own peer id (#4345)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_timeout_events_carry_local_peer_id() {
+        // #4345 observability gap, same class as transfer_failed:
+        // timeout events carried an empty peer_id.
+        use crate::message::Transaction;
+        use crate::operations::get::GetMsg;
+
+        let (sender, mut receiver) = mpsc::channel(1);
+        let mut reporter = TelemetryReporter {
+            sender,
+            local_peer_id: "timeout-peer-id".to_string(),
+        };
+        let tx = Transaction::new::<GetMsg>();
+        reporter
+            .notify_of_time_out(tx, "get", Some("target-peer".to_string()))
+            .await;
+        let TelemetryCommand::Event(event) =
+            receiver.try_recv().expect("timeout event must be sent")
+        else {
+            panic!("expected an Event command");
+        };
+        assert_eq!(event.event_type, "timeout");
+        assert_eq!(
+            event.peer_id, "timeout-peer-id",
+            "timeout events must be attributed to the emitting node's \
+             own peer id (#4345)"
+        );
     }
 
     #[test]

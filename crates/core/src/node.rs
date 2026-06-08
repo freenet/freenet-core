@@ -302,6 +302,19 @@ pub struct NodeConfig {
 }
 
 impl NodeConfig {
+    /// This node's own peer id as a telemetry attribution string
+    /// (public key + best-effort address). The address portion falls
+    /// back to the listener address for non-gateway nodes until
+    /// external-address discovery — a refresh path is tracked in
+    /// #4294. Shared by the telemetry reporter and the shadow-RTT /
+    /// reference-ping emitters so the two constructions can't drift.
+    pub(crate) fn local_peer_id_string(&self) -> String {
+        let addr = self.own_addr.unwrap_or_else(|| {
+            std::net::SocketAddr::new(self.network_listener_ip, self.network_listener_port)
+        });
+        PeerId::new(self.key_pair.public().clone(), addr).to_string()
+    }
+
     pub async fn new(config: Config) -> anyhow::Result<NodeConfig> {
         tracing::info!("Loading node configuration for mode {}", config.mode);
 
@@ -573,14 +586,9 @@ impl NodeConfig {
             // transport_snapshot, timeout — which otherwise carry an
             // empty peer_id and cannot be correlated to a sender in
             // the collector (#4345 observability gap).
-            let local_peer_id = PeerId::new(
-                self.key_pair.public().clone(),
-                self.own_addr.unwrap_or_else(|| {
-                    std::net::SocketAddr::new(self.network_listener_ip, self.network_listener_port)
-                }),
-            )
-            .to_string();
-            if let Some(telemetry) = TelemetryReporter::new(&self.config.telemetry, local_peer_id) {
+            if let Some(telemetry) =
+                TelemetryReporter::new(&self.config.telemetry, self.local_peer_id_string())
+            {
                 registers.push(Box::new(telemetry));
             }
 

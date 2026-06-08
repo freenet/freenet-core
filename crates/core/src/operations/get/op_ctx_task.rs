@@ -845,10 +845,14 @@ struct AssemblyOutcome {
 /// would collide with the relay dedup gates (`active_relay_get_txs`)
 /// while the failed attempt's relay chain is still draining.
 ///
-/// When the budget is exhausted, the original `Done(Streaming)`
-/// outcome is returned (NOT `Exhausted`): a streaming header proves
-/// the contract exists, so the client must see an operation error
-/// rather than a false `NotFound`.
+/// Once a streaming header has been seen, exhaustion can never surface
+/// as `Exhausted` (which callers map to a false `NotFound` for a
+/// contract that provably exists). Both exhaustion shapes are covered:
+/// the assembly-time `advance()` exhaustion keeps the original
+/// `Done(Streaming)` outcome, and a wire exhaustion on a re-entered
+/// loop (every remaining candidate NotFound / timeout) is converted
+/// back to the remembered `Done(Streaming)` header. Either way the
+/// client sees an operation error carrying the assembly cause.
 async fn drive_get_with_assembly_retry(
     op_manager: &OpManager,
     first_tx: Transaction,
@@ -858,6 +862,15 @@ async fn drive_get_with_assembly_retry(
 ) -> (RetryLoopOutcome<Terminal>, AssemblyOutcome) {
     let mut attempt_tx = first_tx;
     let mut assembly = AssemblyOutcome::default();
+    // Streaming-header fields remembered across an assembly-failure
+    // retry. A header proves the contract exists, so if the re-entered
+    // loop then exhausts on the wire (every remaining candidate
+    // NotFound / timeout), the exhaustion must NOT surface as a false
+    // `NotFound` to the client — convert it back to the remembered
+    // `Done(Streaming)` so the caller synthesizes an operation error
+    // carrying the assembly cause. Pre-#4345 this state was
+    // unreachable (assembly failure never re-entered the loop).
+    let mut failed_header: Option<(ContractKey, StreamId, bool, u64)> = None;
 
     let outcome = loop {
         let result = drive_retry_loop(op_manager, attempt_tx, op_label, driver).await;
@@ -867,17 +880,48 @@ async fn drive_get_with_assembly_retry(
         // (the fields are all Copy) so `result` stays whole — every
         // give-up exit below is then `break result`, returning the
         // original `Done(Streaming)` outcome without rebuilding it.
-        let (key, stream_id, includes_contract) = match &result {
+        let (key, stream_id, includes_contract, total_size) = match &result {
             RetryLoopOutcome::Done(Terminal::Streaming {
                 key,
                 stream_id,
                 includes_contract,
-                ..
-            }) => (*key, *stream_id, *includes_contract),
-            RetryLoopOutcome::Done(Terminal::InlineFound { .. } | Terminal::LocalCompletion)
-            | RetryLoopOutcome::Exhausted(_)
-            | RetryLoopOutcome::Unexpected
-            | RetryLoopOutcome::InfraError(_) => break result,
+                total_size,
+            }) => (*key, *stream_id, *includes_contract, *total_size),
+            RetryLoopOutcome::Done(Terminal::InlineFound { .. } | Terminal::LocalCompletion) => {
+                // A non-streaming terminal delivered the state inline,
+                // so any earlier assembly failure is moot — clear the
+                // remembered error or an unrelated store-lookup miss
+                // (eviction race) would be mislabeled as an assembly
+                // failure by the caller's error synthesis.
+                assembly.error = None;
+                break result;
+            }
+            RetryLoopOutcome::Exhausted(cause) => {
+                if let Some((key, stream_id, includes_contract, total_size)) = failed_header {
+                    let prior = assembly.error.take().unwrap_or_default();
+                    assembly.error = Some(format!(
+                        "{prior}; retries after assembly failure exhausted: {cause}"
+                    ));
+                    // The remembered header's `response_received_at`
+                    // belongs to the FIRST attempt, while
+                    // `request_sent_at` was overwritten by the last
+                    // (exhausted) attempt — the pair is incoherent, and
+                    // leaving it set makes the caller's received<sent
+                    // guard fire its "clock-source regression" WARN on
+                    // every conversion. Clear both so the caller's
+                    // timed-outcome capture falls through to None.
+                    driver.request_sent_at = None;
+                    driver.response_received_at = None;
+                    break RetryLoopOutcome::Done(Terminal::Streaming {
+                        key,
+                        stream_id,
+                        includes_contract,
+                        total_size,
+                    });
+                }
+                break result;
+            }
+            RetryLoopOutcome::Unexpected | RetryLoopOutcome::InfraError(_) => break result,
         };
 
         // Uses `current_target` as the sender address — accurate for
@@ -937,6 +981,10 @@ async fn drive_get_with_assembly_retry(
                         assembly_fault_injection::ASSEMBLY_RETRY_COUNT
                             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         assembly.error = Some(e);
+                        // Remember the header so a later wire
+                        // exhaustion converts back to Done(Streaming)
+                        // instead of surfacing a false NotFound.
+                        failed_header = Some((key, stream_id, includes_contract, total_size));
                         attempt_tx = driver.new_attempt_tx();
                         continue;
                     }
@@ -1080,15 +1128,7 @@ async fn build_host_response(
             ))
         }
         _ => {
-            let cause = match assembly_error {
-                Some(e) => format!(
-                    "GET response stream assembly failed for {instance_id} \
-                     after exhausting retries: {e}"
-                ),
-                None => {
-                    format!("GET succeeded on wire but local store lookup failed for {instance_id}")
-                }
-            };
+            let cause = synthesized_get_error_cause(instance_id, assembly_error);
             tracing::warn!(
                 contract = %instance_id,
                 %cause,
@@ -1893,15 +1933,46 @@ async fn drive_sub_op_get(
                         client_contract,
                     ))
                 }
-                _ => SubOpGetOutcome::NotFound(match &streaming_assembly.error {
-                    Some(e) => format!("{}: {e}", missing_state_cause(&instance_id)),
-                    None => missing_state_cause(&instance_id),
-                }),
+                _ => SubOpGetOutcome::NotFound(sub_op_not_found_cause(
+                    &instance_id,
+                    streaming_assembly.error.as_deref(),
+                )),
             }
         }
         RetryLoopOutcome::Exhausted(cause) => SubOpGetOutcome::NotFound(cause),
         RetryLoopOutcome::Unexpected => SubOpGetOutcome::Infra(OpError::UnexpectedOpState),
         RetryLoopOutcome::InfraError(err) => SubOpGetOutcome::Infra(err),
+    }
+}
+
+/// Cause string for a client GET whose terminal reply was classified
+/// success but whose state never reached the local store. Carries the
+/// assembly failure cause when the streaming path exhausted its retry
+/// budget (#4345); otherwise the generic store-lookup message (covers
+/// eviction races and executor rejections). Pure helper so both arms
+/// are unit-testable without a real `OpManager`.
+fn synthesized_get_error_cause(
+    instance_id: &ContractInstanceId,
+    assembly_error: Option<&str>,
+) -> String {
+    match assembly_error {
+        Some(e) => format!(
+            "GET response stream assembly failed for {instance_id} \
+             after exhausting retries: {e}"
+        ),
+        None => format!("GET succeeded on wire but local store lookup failed for {instance_id}"),
+    }
+}
+
+/// Sub-op variant of [`synthesized_get_error_cause`]: the store-miss
+/// cause with the assembly failure appended when one occurred (#4345).
+fn sub_op_not_found_cause(
+    instance_id: &ContractInstanceId,
+    assembly_error: Option<&str>,
+) -> String {
+    match assembly_error {
+        Some(e) => format!("{}: {e}", missing_state_cause(instance_id)),
+        None => missing_state_cause(instance_id),
     }
 }
 
@@ -4083,8 +4154,15 @@ mod tests {
         let src = production_source();
         let body = extract_fn_body(src, "async fn drive_get_with_assembly_retry(");
 
-        let err_arm = body
+        // Anchor on the assembly call first so a future earlier
+        // `Err(e)` arm (e.g. around the claim) can't silently shift
+        // the slice this test inspects.
+        let assemble_call = body
+            .find("match assemble_and_cache_stream")
+            .expect("wrapper must match on assemble_and_cache_stream");
+        let err_arm = body[assemble_call..]
             .find("Err(e) =>")
+            .map(|p| p + assemble_call)
             .expect("wrapper must handle assembly Err");
         let err_body = &body[err_arm..];
 
@@ -4113,6 +4191,29 @@ mod tests {
              attempt tx via driver.new_attempt_tx()"
         );
 
+        // The advancing path must penalize the failed candidate (the
+        // router only learns about header-without-stream peers from
+        // this call) and must remember the header for the
+        // wire-exhaustion conversion below.
+        let next_arm = err_body
+            .find("AdvanceOutcome::Next =>")
+            .expect("Err arm must handle Next");
+        let next_body = &err_body[next_arm
+            ..err_body
+                .find("AdvanceOutcome::Exhausted =>")
+                .expect("Err arm must handle Exhausted")];
+        assert!(
+            next_body.contains("emit_get_route_failure("),
+            "the advancing path must emit a route failure for the \
+             failed candidate (gated on emit_route_failure_on_retry)"
+        );
+        assert!(
+            next_body
+                .contains("failed_header = Some((key, stream_id, includes_contract, total_size))"),
+            "the advancing path must remember the streaming header so a \
+             later wire exhaustion can't surface as a false NotFound"
+        );
+
         // Exhaustion keeps the Done(Streaming) outcome. The wrapper
         // only reaches the assembly Err arm after `result` matched
         // `Done(Terminal::Streaming { .. })`, so `break result` returns
@@ -4132,6 +4233,78 @@ mod tests {
             !exhausted_body.contains("RetryLoopOutcome::Exhausted("),
             "exhausted assembly retries must not be converted into \
              RetryLoopOutcome::Exhausted"
+        );
+        // ...and the budget-exhausted path must NOT emit a route
+        // failure: the caller's final route event (driven by the
+        // failed host_result) already records the Failure for the
+        // last target — emitting here too would double-count it.
+        assert!(
+            !exhausted_body.contains("emit_get_route_failure("),
+            "the budget-exhausted path must not emit a per-retry route \
+             failure — the caller's final Failure event covers the last \
+             target (double-count otherwise)"
+        );
+
+        // Wire exhaustion AFTER a failed assembly must convert back to
+        // the remembered Done(Streaming): a header proved the contract
+        // exists, so RetryLoopOutcome::Exhausted (mapped to NotFound by
+        // both callers) would be a false NotFound. This state is only
+        // reachable post-#4345 (assembly failure re-enters the loop).
+        let exhausted_passthrough = body
+            .find("RetryLoopOutcome::Exhausted(cause) =>")
+            .expect("wrapper must have an Exhausted pass-through arm");
+        let passthrough_body = &body[exhausted_passthrough..];
+        assert!(
+            passthrough_body.contains(
+                "if let Some((key, stream_id, includes_contract, total_size)) = failed_header"
+            ),
+            "the Exhausted pass-through must check failed_header"
+        );
+        assert!(
+            passthrough_body.contains("break RetryLoopOutcome::Done(Terminal::Streaming {"),
+            "wire exhaustion after a seen streaming header must convert \
+             back to Done(Streaming) so the client sees OperationError, \
+             not a false NotFound"
+        );
+    }
+
+    /// #4345: the synthesized client error must carry the assembly
+    /// failure cause when one occurred, and fall back to the generic
+    /// store-lookup message otherwise. Behavioral coverage for the
+    /// cause construction both callers use on the exhaustion path.
+    #[test]
+    fn synthesized_error_causes_carry_assembly_failure() {
+        let instance_id = ContractInstanceId::new([0xC1; 32]);
+
+        let with_assembly = synthesized_get_error_cause(
+            &instance_id,
+            Some("stream assembly: no fragments received within inactivity timeout"),
+        );
+        assert!(
+            with_assembly.contains("stream assembly failed")
+                && with_assembly.contains("no fragments received"),
+            "assembly-exhaustion cause must be diagnostic: {with_assembly}"
+        );
+
+        let without = synthesized_get_error_cause(&instance_id, None);
+        assert!(
+            without.contains("local store lookup failed"),
+            "fallback cause must keep the store-lookup message: {without}"
+        );
+        assert!(
+            !without.contains("assembly"),
+            "fallback cause must not mention assembly: {without}"
+        );
+
+        let sub_with = sub_op_not_found_cause(&instance_id, Some("injected failure"));
+        assert!(
+            sub_with.contains(&missing_state_cause(&instance_id))
+                && sub_with.contains("injected failure"),
+            "sub-op cause must append the assembly failure: {sub_with}"
+        );
+        assert_eq!(
+            sub_op_not_found_cause(&instance_id, None),
+            missing_state_cause(&instance_id)
         );
     }
 

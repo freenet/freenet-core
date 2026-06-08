@@ -26,7 +26,13 @@ Driver entry points:
 
 The shared retry-loop driver lives in `op_ctx.rs` (`RetryDriver` trait
 + `drive_retry_loop`). UPDATE is fire-and-forget (no retry loop, no
-upstream reply); GET/PUT/SUBSCRIBE share the retry driver.
+upstream reply); GET/PUT/SUBSCRIBE share the retry driver. GET's
+client and sub-op drivers enter the loop via
+`get/op_ctx_task.rs::drive_get_with_assembly_retry`, which treats a
+post-terminal stream-assembly failure as a retryable attempt failure
+(#4345) — post-terminal side effects that can fail retryably belong in
+such a wrapper, never inside the loop's Terminal arm (pinned by
+`drive_retry_loop_terminal_arm_does_not_call_advance`).
 
 ## Wire-variant dispatch
 
