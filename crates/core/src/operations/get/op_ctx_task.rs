@@ -807,6 +807,7 @@ impl RetryDriver for GetRetryDriver<'_> {
 // --- Assembly-retry wrapper (#4345) ---
 
 /// Outcome metadata for the streaming-assembly step of a GET.
+#[derive(Default)]
 struct AssemblyOutcome {
     /// Wall-clock duration of the successful claim + assemble +
     /// deserialize + local cache write, fed to the router's
@@ -856,27 +857,27 @@ async fn drive_get_with_assembly_retry(
     emit_route_failure_on_retry: bool,
 ) -> (RetryLoopOutcome<Terminal>, AssemblyOutcome) {
     let mut attempt_tx = first_tx;
-    let mut assembly = AssemblyOutcome {
-        transfer_duration: None,
-        error: None,
-    };
+    let mut assembly = AssemblyOutcome::default();
 
     let outcome = loop {
         let result = drive_retry_loop(op_manager, attempt_tx, op_label, driver).await;
 
         // Only a streaming terminal has a post-loop assembly step;
-        // everything else passes through unchanged.
-        let (key, stream_id, includes_contract, total_size) = match result {
+        // everything else passes through unchanged. Match by reference
+        // (the fields are all Copy) so `result` stays whole — every
+        // give-up exit below is then `break result`, returning the
+        // original `Done(Streaming)` outcome without rebuilding it.
+        let (key, stream_id, includes_contract) = match &result {
             RetryLoopOutcome::Done(Terminal::Streaming {
                 key,
                 stream_id,
                 includes_contract,
-                total_size,
-            }) => (key, stream_id, includes_contract, total_size),
-            other @ (RetryLoopOutcome::Done(_)
+                ..
+            }) => (*key, *stream_id, *includes_contract),
+            RetryLoopOutcome::Done(Terminal::InlineFound { .. } | Terminal::LocalCompletion)
             | RetryLoopOutcome::Exhausted(_)
             | RetryLoopOutcome::Unexpected
-            | RetryLoopOutcome::InfraError(_)) => break other,
+            | RetryLoopOutcome::InfraError(_) => break result,
         };
 
         // Uses `current_target` as the sender address — accurate for
@@ -894,12 +895,7 @@ async fn drive_get_with_assembly_retry(
                  cannot claim the response stream"
                     .to_string(),
             );
-            break RetryLoopOutcome::Done(Terminal::Streaming {
-                key,
-                stream_id,
-                includes_contract,
-                total_size,
-            });
+            break result;
         };
 
         let stream_start = tokio::time::Instant::now();
@@ -909,12 +905,7 @@ async fn drive_get_with_assembly_retry(
             Ok(()) => {
                 assembly.transfer_duration = Some(stream_start.elapsed());
                 assembly.error = None;
-                break RetryLoopOutcome::Done(Terminal::Streaming {
-                    key,
-                    stream_id,
-                    includes_contract,
-                    total_size,
-                });
+                break result;
             }
             Err(e) => {
                 // Capture the failing peer BEFORE advance() replaces
@@ -957,12 +948,7 @@ async fn drive_get_with_assembly_retry(
                              exhausted — state will not be cached locally"
                         );
                         assembly.error = Some(e);
-                        break RetryLoopOutcome::Done(Terminal::Streaming {
-                            key,
-                            stream_id,
-                            includes_contract,
-                            total_size,
-                        });
+                        break result;
                     }
                 }
             }
@@ -4127,17 +4113,20 @@ mod tests {
              attempt tx via driver.new_attempt_tx()"
         );
 
-        // Exhaustion keeps the Done(Streaming) outcome.
+        // Exhaustion keeps the Done(Streaming) outcome. The wrapper
+        // only reaches the assembly Err arm after `result` matched
+        // `Done(Terminal::Streaming { .. })`, so `break result` returns
+        // that original outcome unchanged.
         let exhausted_arm = err_body
             .find("AdvanceOutcome::Exhausted =>")
             .expect("Err arm must handle Exhausted");
         let exhausted_body = &err_body[exhausted_arm..];
         assert!(
-            exhausted_body.contains("break RetryLoopOutcome::Done(Terminal::Streaming {"),
+            exhausted_body.contains("break result"),
             "exhausted assembly retries must break with the original \
-             Done(Streaming) outcome so the client sees OperationError, \
-             NOT RetryLoopOutcome::Exhausted (which maps to a false \
-             NotFound for a contract that provably exists)."
+             Done(Streaming) outcome (`break result`) so the client sees \
+             OperationError, NOT RetryLoopOutcome::Exhausted (which maps \
+             to a false NotFound for a contract that provably exists)."
         );
         assert!(
             !exhausted_body.contains("RetryLoopOutcome::Exhausted("),
