@@ -109,6 +109,10 @@ pub mod dev_tool {
     pub use crate::operations::get::op_ctx_task::RELAY_DRIVER_CALL_COUNT as GET_RELAY_DRIVER_CALL_COUNT;
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::get::op_ctx_task::RELAY_GET_STREAMING_FORWARD_COUNT;
+    // Deterministic stream-assembly fault injection + retry counter for
+    // the GET driver's assembly-retry path (#4345).
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::get::op_ctx_task::assembly_fault_injection as get_assembly_fault_injection;
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::put::op_ctx_task::RELAY_PUT_DRIVER_CALL_COUNT;
     #[cfg(any(test, feature = "testing"))]

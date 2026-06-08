@@ -1289,3 +1289,222 @@ fn test_driver_inline_get_triggers_auto_subscribe() {
             .collect::<Vec<_>>()
     );
 }
+
+// =============================================================================
+// Test: GET retries after stream-assembly failure (#4345)
+// =============================================================================
+
+/// Build the sparse-but-routable topology used by
+/// `test_streaming_get_retries_after_assembly_failure`. max_connections
+/// below the node count keeps the PUT fan-out from reaching every node
+/// (so a cold getter exists), while min_connections = 3 gives nodes
+/// enough ring candidates for the assembly-failure retry to advance to.
+async fn setup_assembly_retry_network(name: &str, seed: u64, threshold: usize) -> SimNetwork {
+    GlobalRng::set_seed(seed);
+    const BASE_EPOCH_MS: u64 = 1577836800000;
+    const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
+    GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
+    let mut sim = SimNetwork::new(
+        name, 1,  // gateways
+        12, // nodes
+        7,  // ring_max_htl
+        3,  // rnd_if_htl_above
+        4,  // max_connections (sparse: < node count → cold getter exists)
+        3,  // min_connections (≥ 2 retry candidates per node)
+        seed,
+    )
+    .await;
+    sim.with_streaming_threshold(threshold);
+    sim
+}
+
+/// Regression test for #4345: a failed stream assembly must consume the
+/// GET retry budget and advance to the next candidate instead of
+/// synthesizing a client error with the budget untouched.
+///
+/// Production failure chain: packet loss → FixedRate loss-pause caps the
+/// cwnd → the sender aborts on the 3s cwnd-wait timeout → the receiver's
+/// stream assembly hits its inactivity timeout → the originator's GET
+/// driver (pre-fix) logged a WARN and synthesized "GET succeeded on wire
+/// but local store lookup failed" without retrying — one transport
+/// hiccup burned the whole GET even though `MAX_RETRIES` was untouched
+/// and other candidates could serve the contract.
+///
+/// Uses the two-phase cold-node isolation strategy from
+/// `test_driver_streaming_get_cold_cache`, but on a routable htl=7
+/// topology (the HTL=1 variant is not routable — see that test's
+/// #[ignore]): phase 1 runs the PUT alone to find the nodes the fan-out
+/// missed; phase 2 re-runs the same seed (same ring) and GETs from a
+/// cold node with exactly one injected assembly failure armed for this
+/// contract key (via `get_assembly_fault_injection`, which mirrors the
+/// production failure by leaving the inbound stream orphaned). The
+/// driver must advance to another candidate and still deliver the full
+/// state.
+///
+/// Not every fan-out-missed node can route a GET to a holder in a
+/// sparse topology (a routing property, not the #4345 assembly-retry
+/// property under test), so phase 2 iterates the cold candidates
+/// deterministically until one demonstrates the retry path end-to-end.
+/// On a regression every candidate fails and the test fails with the
+/// per-candidate diagnostics.
+#[test]
+fn test_streaming_get_retries_after_assembly_failure() {
+    use freenet::dev_tool::GET_DRIVER_CALL_COUNT;
+    use freenet::dev_tool::get_assembly_fault_injection;
+    use std::sync::atomic::Ordering;
+
+    const SEED: u64 = 0xDE1A_4345_0000_0001;
+    const NETWORK_NAME_PHASE1: &str = "get-assembly-retry-p1";
+    const THRESHOLD: usize = 1024;
+    const LARGE_STATE_SIZE: usize = 100 * 1024; // 100KB, above THRESHOLD
+    const NODES: usize = 12;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let contract = SimOperation::create_test_contract(0x45);
+    let large_state = SimOperation::create_large_state(LARGE_STATE_SIZE, 0x45);
+    let contract_key = contract.key();
+    let contract_id = *contract_key.id();
+
+    // Phase 1: run the PUT in isolation to discover the nodes that did
+    // NOT receive the state during fan-out.
+    let sim1 = rt.block_on(setup_assembly_retry_network(
+        NETWORK_NAME_PHASE1,
+        SEED,
+        THRESHOLD,
+    ));
+    let phase1_ops = vec![ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME_PHASE1, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: large_state.clone(),
+            subscribe: false,
+        },
+    )];
+    let phase1 = sim1.run_controlled_simulation(
+        SEED,
+        phase1_ops,
+        Duration::from_secs(120),
+        Duration::from_secs(30),
+    );
+    assert!(
+        phase1.turmoil_result.is_ok(),
+        "Phase 1 (PUT only) should complete: {:?}",
+        phase1.turmoil_result.err()
+    );
+    let cold_nodes: Vec<usize> = (1..=NODES)
+        .filter(|i| {
+            let label = NodeLabel::node(NETWORK_NAME_PHASE1, *i);
+            phase1
+                .node_storages
+                .get(&label)
+                .is_some_and(|s| s.get_stored_state(&contract_key).is_none())
+        })
+        .collect();
+    assert!(
+        !cold_nodes.is_empty(),
+        "Test precondition: no cold-cache node exists after the PUT in \
+         this {NODES}-node sparse topology. All nodes received the state \
+         during fan-out. Pick a different SEED or sparser max_connections."
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut demonstrated = false;
+    for (attempt, cold_idx) in cold_nodes.iter().copied().enumerate() {
+        let network_name = format!("get-assembly-retry-p2-{attempt}");
+
+        // (Re-)arm exactly one injected assembly failure for THIS
+        // contract key — keying by contract makes this safe under
+        // parallel test execution in the same process. `inject_failures`
+        // overwrites, so a previous candidate that never streamed leaves
+        // no stale budget behind.
+        get_assembly_fault_injection::inject_failures(contract_key, 1);
+        let retries_before =
+            get_assembly_fault_injection::ASSEMBLY_RETRY_COUNT.load(Ordering::SeqCst);
+        let baseline_calls = GET_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
+
+        let sim2 = rt.block_on(setup_assembly_retry_network(&network_name, SEED, THRESHOLD));
+        let cold_node_label = NodeLabel::node(&network_name, cold_idx);
+        let phase2_ops = vec![
+            ScheduledOperation::new(
+                NodeLabel::gateway(&network_name, 0),
+                SimOperation::Put {
+                    contract: contract.clone(),
+                    state: large_state.clone(),
+                    subscribe: false,
+                },
+            ),
+            ScheduledOperation::new(
+                cold_node_label.clone(),
+                SimOperation::Get {
+                    contract_id,
+                    return_contract_code: false,
+                    subscribe: false,
+                },
+            ),
+        ];
+        let phase2 = sim2.run_controlled_simulation(
+            SEED,
+            phase2_ops,
+            Duration::from_secs(300),
+            Duration::from_secs(120),
+        );
+        if let Err(e) = &phase2.turmoil_result {
+            failures.push(format!("node {cold_idx}: simulation error: {e:?}"));
+            continue;
+        }
+
+        // Driver-isolation probe: the GET must have gone through the
+        // task-per-tx driver (not the local-cache shortcut), otherwise
+        // the assembly-retry path was never reachable.
+        let driver_calls = GET_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
+        if driver_calls == baseline_calls {
+            failures.push(format!(
+                "node {cold_idx}: GET never reached the driver (locally cached?)"
+            ));
+            continue;
+        }
+
+        let retries_after =
+            get_assembly_fault_injection::ASSEMBLY_RETRY_COUNT.load(Ordering::SeqCst);
+        let stored = phase2
+            .node_storages
+            .get(&cold_node_label)
+            .and_then(|s| s.get_stored_state(&contract_key));
+
+        match (retries_after > retries_before, stored) {
+            (true, Some(state)) => {
+                // The driver took the assembly-failure retry path AND
+                // the retry delivered the full, correct state.
+                let stored_bytes: Vec<u8> = state.as_ref().to_vec();
+                assert_eq!(
+                    stored_bytes, large_state,
+                    "Stored state bytes should match the original 100KB \
+                     state after the assembly-failure retry"
+                );
+                demonstrated = true;
+                break;
+            }
+            (took_retry, stored) => {
+                failures.push(format!(
+                    "node {cold_idx}: retry_path_taken={took_retry} \
+                     state_present={} (streaming GET likely never reached \
+                     a holder from this candidate, or the retry burned \
+                     the GET — #4345 regression if this repeats for every \
+                     candidate)",
+                    stored.is_some()
+                ));
+            }
+        }
+    }
+
+    assert!(
+        demonstrated,
+        "No cold candidate demonstrated the #4345 assembly-failure retry \
+         path (injected failure → driver.advance() → fresh attempt → \
+         state delivered). Per-candidate outcomes: {failures:#?}"
+    );
+}
