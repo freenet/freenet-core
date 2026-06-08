@@ -1,4 +1,4 @@
-use std::{convert::Infallible, net::SocketAddr, sync::Arc, time::Duration};
+use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use futures::{FutureExt, future::BoxFuture};
 use tokio::task::JoinHandle;
@@ -418,11 +418,7 @@ impl NodeP2P {
         let reference_ping_enabled = config.config.telemetry.enabled
             && !config.config.telemetry.is_test_environment
             && config.config.telemetry.reference_ping_enabled;
-        let listen_addr = config.own_addr.unwrap_or_else(|| {
-            SocketAddr::new(config.network_listener_ip, config.network_listener_port)
-        });
-        let local_peer_id =
-            crate::node::PeerId::new(config.key_pair.public().clone(), listen_addr).to_string();
+        let local_peer_id = config.local_peer_id_string();
         crate::transport::rolling_rtt_stats::spawn_aggregator(
             local_peer_id.clone(),
             &background_task_monitor,

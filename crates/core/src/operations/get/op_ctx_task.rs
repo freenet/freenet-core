@@ -316,7 +316,14 @@ async fn drive_client_get_inner(
         response_received_at: None,
     };
 
-    let loop_result = drive_retry_loop(op_manager, client_tx, "get", &mut driver).await;
+    let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
+        op_manager,
+        client_tx,
+        "get",
+        &mut driver,
+        /* emit_route_failure_on_retry */ true,
+    )
+    .await;
 
     // `op_manager.completed(client_tx)` runs from the
     // `ClientGetCompletionGuard` in `run_client_get` AFTER this fn
@@ -388,10 +395,7 @@ async fn drive_client_get_inner(
                     *key
                 }
                 Terminal::Streaming {
-                    key,
-                    stream_id,
-                    includes_contract,
-                    total_size,
+                    key, total_size, ..
                 } => {
                     // `total_size` is the wire-authoritative payload byte
                     // count from the `ResponseStreaming` header. Using it
@@ -403,53 +407,15 @@ async fn drive_client_get_inner(
                     // a separate "store evicted before re-query"
                     // failure mode (the LRU has finite capacity).
                     payload_size = *total_size as usize;
-                    // Assemble the stream and cache locally. Mirrors
-                    // the legacy `process_message` streaming branch
-                    // at `get.rs:2721-3196`. Uses `current_target`
-                    // as the sender address — accurate for the
-                    // single-hop response case where the responder
-                    // equals the selected target.
-                    if let Some(peer_addr) = driver.current_target.socket_addr() {
-                        // `transfer_duration` covers stream claim +
-                        // assemble + deserialize + local cache write —
-                        // the same composite measurement the legacy
-                        // `GetStats::record_transfer_end` captured at
-                        // `get.rs:1542`. For small payloads near the
-                        // streaming threshold the local-work component
-                        // is non-negligible, but keeping the metric
-                        // composite matches the existing router prior
-                        // built on the legacy code path.
-                        let stream_start = tokio::time::Instant::now();
-                        if let Err(e) = assemble_and_cache_stream(
-                            op_manager,
-                            peer_addr,
-                            *stream_id,
-                            *key,
-                            *includes_contract,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                %key,
-                                error = %e,
-                                "get: stream assembly failed — \
-                                 state will not be cached locally"
-                            );
-                            // Assembly failed → don't emit a transfer-rate
-                            // observation (transfer_duration stays ZERO,
-                            // which makes the router skip the rate sample
-                            // at router.rs:443). The response-time
-                            // observation still goes through because the
-                            // header DID arrive.
-                        } else {
-                            transfer_duration = stream_start.elapsed();
-                        }
-                    } else {
-                        tracing::warn!(
-                            %key,
-                            "get: current_target has no socket_addr; \
-                             cannot claim orphan stream"
-                        );
+                    // Stream assembly (with per-candidate retry, #4345)
+                    // already ran inside `drive_get_with_assembly_retry`
+                    // — consume its timing here. `None` means every
+                    // assembly attempt failed: leave `transfer_duration`
+                    // at ZERO so the router skips the rate sample at
+                    // router.rs:443 (the response-time observation still
+                    // goes through because a header DID arrive).
+                    if let Some(duration) = streaming_assembly.transfer_duration {
+                        transfer_duration = duration;
                     }
                     *key
                 }
@@ -466,8 +432,13 @@ async fn drive_client_get_inner(
                 }
             };
 
-            let host_result =
-                build_host_response(op_manager, &instance_id, return_contract_code).await;
+            let host_result = build_host_response(
+                op_manager,
+                &instance_id,
+                return_contract_code,
+                streaming_assembly.error.as_deref(),
+            )
+            .await;
 
             // Auto-subscribe on successful GET at the originator —
             // mirrors the legacy branches at get.rs:2313/2408/3136/3185.
@@ -833,6 +804,280 @@ impl RetryDriver for GetRetryDriver<'_> {
     }
 }
 
+// --- Assembly-retry wrapper (#4345) ---
+
+/// Outcome metadata for the streaming-assembly step of a GET.
+#[derive(Default)]
+struct AssemblyOutcome {
+    /// Wall-clock duration of the successful claim + assemble +
+    /// deserialize + local cache write, fed to the router's
+    /// transfer-rate estimator. `None` when the terminal was not
+    /// `Streaming` or when every assembly attempt failed. The
+    /// composite measurement matches what the legacy
+    /// `GetStats::record_transfer_end` captured at `get.rs:1542`.
+    transfer_duration: Option<std::time::Duration>,
+    /// Last assembly failure cause when assembly never succeeded.
+    /// Threaded into the synthesized client error so the failure is
+    /// diagnosable instead of the generic store-lookup message.
+    error: Option<String>,
+}
+
+/// Drive the shared GET retry loop, treating stream-assembly failure
+/// as a retryable attempt failure (#4345).
+///
+/// The shared loop classifies the `ResponseStreaming` *header* as
+/// terminal (`op_ctx.rs` pins the Terminal arm to return
+/// synchronously), so stream assembly necessarily runs after the loop
+/// returns. Before this wrapper existed, an assembly failure —
+/// fragments lost on a lossy path, the sender aborting on cwnd-wait
+/// timeout, a relay's pipe dying after the header was forwarded —
+/// burned the whole GET: the driver logged a WARN, fell through to
+/// the store re-query, and synthesized a client error with the
+/// `MAX_RETRIES` budget untouched. One transport hiccup failed the op
+/// even though other candidates could serve it. The relay driver
+/// already treats header-without-stream as a retryable routing
+/// failure (`drive_relay_get_inner`'s claim-failure `continue`); this
+/// gives the originator the same semantics.
+///
+/// On assembly failure the wrapper advances the driver to the next
+/// candidate (consuming the shared retry budget) and re-enters the
+/// loop with a fresh attempt transaction — reusing the previous tx
+/// would collide with the relay dedup gates (`active_relay_get_txs`)
+/// while the failed attempt's relay chain is still draining.
+///
+/// Once a streaming header has been seen, exhaustion can never surface
+/// as `Exhausted` (which callers map to a false `NotFound` for a
+/// contract that provably exists). Both exhaustion shapes are covered:
+/// the assembly-time `advance()` exhaustion keeps the original
+/// `Done(Streaming)` outcome, and a wire exhaustion on a re-entered
+/// loop (every remaining candidate NotFound / timeout) is converted
+/// back to the remembered `Done(Streaming)` header. Either way the
+/// client sees an operation error carrying the assembly cause.
+async fn drive_get_with_assembly_retry(
+    op_manager: &OpManager,
+    first_tx: Transaction,
+    op_label: &str,
+    driver: &mut GetRetryDriver<'_>,
+    emit_route_failure_on_retry: bool,
+) -> (RetryLoopOutcome<Terminal>, AssemblyOutcome) {
+    let mut attempt_tx = first_tx;
+    let mut assembly = AssemblyOutcome::default();
+    // Streaming-header fields remembered across an assembly-failure
+    // retry. A header proves the contract exists, so if the re-entered
+    // loop then exhausts on the wire (every remaining candidate
+    // NotFound / timeout), the exhaustion must NOT surface as a false
+    // `NotFound` to the client — convert it back to the remembered
+    // `Done(Streaming)` so the caller synthesizes an operation error
+    // carrying the assembly cause. Pre-#4345 this state was
+    // unreachable (assembly failure never re-entered the loop).
+    let mut failed_header: Option<(ContractKey, StreamId, bool, u64)> = None;
+
+    let outcome = loop {
+        let result = drive_retry_loop(op_manager, attempt_tx, op_label, driver).await;
+
+        // Only a streaming terminal has a post-loop assembly step;
+        // everything else passes through unchanged. Match by reference
+        // (the fields are all Copy) so `result` stays whole — every
+        // give-up exit below is then `break result`, returning the
+        // original `Done(Streaming)` outcome without rebuilding it.
+        let (key, stream_id, includes_contract, total_size) = match &result {
+            RetryLoopOutcome::Done(Terminal::Streaming {
+                key,
+                stream_id,
+                includes_contract,
+                total_size,
+            }) => (*key, *stream_id, *includes_contract, *total_size),
+            RetryLoopOutcome::Done(Terminal::InlineFound { .. } | Terminal::LocalCompletion) => {
+                // A non-streaming terminal delivered the state inline,
+                // so any earlier assembly failure is moot — clear the
+                // remembered error or an unrelated store-lookup miss
+                // (eviction race) would be mislabeled as an assembly
+                // failure by the caller's error synthesis.
+                assembly.error = None;
+                break result;
+            }
+            RetryLoopOutcome::Exhausted(cause) => {
+                if let Some((key, stream_id, includes_contract, total_size)) = failed_header {
+                    let prior = assembly.error.take().unwrap_or_default();
+                    assembly.error = Some(format!(
+                        "{prior}; retries after assembly failure exhausted: {cause}"
+                    ));
+                    // The remembered header's `response_received_at`
+                    // belongs to the FIRST attempt, while
+                    // `request_sent_at` was overwritten by the last
+                    // (exhausted) attempt — the pair is incoherent, and
+                    // leaving it set makes the caller's received<sent
+                    // guard fire its "clock-source regression" WARN on
+                    // every conversion. Clear both so the caller's
+                    // timed-outcome capture falls through to None.
+                    driver.request_sent_at = None;
+                    driver.response_received_at = None;
+                    break RetryLoopOutcome::Done(Terminal::Streaming {
+                        key,
+                        stream_id,
+                        includes_contract,
+                        total_size,
+                    });
+                }
+                break result;
+            }
+            RetryLoopOutcome::Unexpected | RetryLoopOutcome::InfraError(_) => break result,
+        };
+
+        // Uses `current_target` as the sender address — accurate for
+        // the single-hop response case where the responder equals the
+        // selected target; relays pipe the stream hop-by-hop so the
+        // fragments arrive from the adjacent hop either way.
+        let Some(peer_addr) = driver.current_target.socket_addr() else {
+            tracing::warn!(
+                %key,
+                "get: current_target has no socket_addr; \
+                 cannot claim orphan stream"
+            );
+            assembly.error = Some(
+                "selected target has no socket address; \
+                 cannot claim the response stream"
+                    .to_string(),
+            );
+            break result;
+        };
+
+        let stream_start = tokio::time::Instant::now();
+        match assemble_and_cache_stream(op_manager, peer_addr, stream_id, key, includes_contract)
+            .await
+        {
+            Ok(()) => {
+                assembly.transfer_duration = Some(stream_start.elapsed());
+                assembly.error = None;
+                break result;
+            }
+            Err(e) => {
+                // Capture the failing peer BEFORE advance() replaces
+                // `current_target` — the routing penalty must land on
+                // the candidate whose header never became a stream.
+                let failed_target = driver.current_target.clone();
+                match driver.advance() {
+                    AdvanceOutcome::Next => {
+                        tracing::warn!(
+                            %key,
+                            error = %e,
+                            retries = driver.retries,
+                            "get: stream assembly failed; \
+                             retrying against next candidate (#4345)"
+                        );
+                        // Penalize the failed candidate so the router
+                        // learns (mirrors the relay driver's
+                        // claim-failure handling). Only on the
+                        // advancing path: when the budget is
+                        // exhausted, the caller's final route event
+                        // (driven by the failed host_result) already
+                        // records the Failure for the last target —
+                        // emitting here too would double-count it.
+                        if emit_route_failure_on_retry {
+                            emit_get_route_failure(op_manager, attempt_tx, &failed_target, &key)
+                                .await;
+                        }
+                        #[cfg(any(test, feature = "testing"))]
+                        assembly_fault_injection::ASSEMBLY_RETRY_COUNT
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        assembly.error = Some(e);
+                        // Remember the header so a later wire
+                        // exhaustion converts back to Done(Streaming)
+                        // instead of surfacing a false NotFound.
+                        failed_header = Some((key, stream_id, includes_contract, total_size));
+                        attempt_tx = driver.new_attempt_tx();
+                        continue;
+                    }
+                    AdvanceOutcome::Exhausted => {
+                        tracing::warn!(
+                            %key,
+                            error = %e,
+                            "get: stream assembly failed and retry budget \
+                             exhausted — state will not be cached locally"
+                        );
+                        assembly.error = Some(e);
+                        break result;
+                    }
+                }
+            }
+        }
+    };
+
+    (outcome, assembly)
+}
+
+/// Emit a routing-failure observation for a candidate whose streaming
+/// header never became a completed stream. Mirrors the route-event
+/// emission in `drive_client_get_inner`'s final outcome block.
+async fn emit_get_route_failure(
+    op_manager: &OpManager,
+    tx: Transaction,
+    peer: &PeerKeyLocation,
+    key: &ContractKey,
+) {
+    let route_event = RouteEvent {
+        peer: peer.clone(),
+        contract_location: Location::from(key),
+        outcome: RouteOutcome::Failure,
+        op_type: Some(crate::node::network_status::OpType::Get),
+    };
+    if let Some(log_event) =
+        crate::tracing::NetEventLog::route_event(&tx, &op_manager.ring, &route_event)
+    {
+        op_manager
+            .ring
+            .register_events(either::Either::Left(log_event))
+            .await;
+    }
+    op_manager.ring.routing_finished(route_event);
+}
+
+/// Test-only fault injection for `assemble_and_cache_stream` (#4345).
+///
+/// Keyed by `ContractKey` so concurrently-running tests in the same
+/// process cannot consume each other's injection budget. A test arms
+/// `n` failures for its own (unique) contract key; the first `n`
+/// assembly attempts for that key fail with a synthetic error,
+/// exercising the driver's assembly-retry path deterministically.
+#[cfg(any(test, feature = "testing"))]
+pub mod assembly_fault_injection {
+    use freenet_stdlib::prelude::ContractKey;
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Lifetime count of assembly-failure retries actually taken by
+    /// GET drivers (incremented when the driver advances to the next
+    /// candidate after an assembly failure). Tests snapshot
+    /// before/after to prove the retry path genuinely fired.
+    pub static ASSEMBLY_RETRY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    fn budgets() -> &'static Mutex<HashMap<ContractKey, usize>> {
+        static BUDGETS: OnceLock<Mutex<HashMap<ContractKey, usize>>> = OnceLock::new();
+        BUDGETS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Arm `n` injected assembly failures for `key`.
+    pub fn inject_failures(key: ContractKey, n: usize) {
+        budgets().lock().expect("poisoned").insert(key, n);
+    }
+
+    /// Consume one injected failure for `key`, if armed.
+    pub(crate) fn consume(key: &ContractKey) -> bool {
+        let mut map = budgets().lock().expect("poisoned");
+        match map.get_mut(key) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                if *n == 0 {
+                    map.remove(key);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
+
 // --- Host-response construction ---
 
 /// Query the local contract store for `(state, contract)` and package
@@ -842,10 +1087,17 @@ impl RetryDriver for GetRetryDriver<'_> {
 /// on the happy path — `process_message` stores before the terminal
 /// reply fires), synthesize an operation error matching the shape
 /// `to_host_result` produces on NotFound.
+///
+/// `assembly_error` carries the last stream-assembly failure cause when
+/// the streaming path exhausted its retry budget without ever caching
+/// the state (#4345). It makes the synthesized client error diagnostic
+/// — "stream assembly failed: …" — instead of the generic store-lookup
+/// message that conflates assembly failures with eviction races.
 async fn build_host_response(
     op_manager: &OpManager,
     instance_id: &ContractInstanceId,
     return_contract_code: bool,
+    assembly_error: Option<&str>,
 ) -> HostResult {
     let lookup = op_manager
         .notify_contract_handler(ContractHandlerEvent::GetQuery {
@@ -876,16 +1128,15 @@ async fn build_host_response(
             ))
         }
         _ => {
+            let cause = synthesized_get_error_cause(instance_id, assembly_error);
             tracing::warn!(
                 contract = %instance_id,
+                %cause,
                 "get: terminal reply classified success but local \
                  store lookup returned no state; synthesizing client error"
             );
             Err(ErrorKind::OperationError {
-                cause: format!(
-                    "GET succeeded on wire but local store lookup failed for {instance_id}"
-                )
-                .into(),
+                cause: cause.into(),
             }
             .into())
         }
@@ -1091,6 +1342,14 @@ async fn assemble_and_cache_stream(
     expected_key: ContractKey,
     includes_contract: bool,
 ) -> Result<(), String> {
+    // Test-only deterministic fault injection (#4345). Returning before
+    // the claim mirrors the production failure (the inbound stream is
+    // left orphaned for GC), so the retry path is exercised end-to-end.
+    #[cfg(any(test, feature = "testing"))]
+    if assembly_fault_injection::consume(&expected_key) {
+        return Err("injected stream assembly failure (assembly_fault_injection test hook)".into());
+    }
+
     let handle = match op_manager
         .orphan_stream_registry()
         .claim_or_wait(peer_addr, stream_id, STREAM_CLAIM_TIMEOUT)
@@ -1608,7 +1867,17 @@ async fn drive_sub_op_get(
         response_received_at: None,
     };
 
-    let loop_result = drive_retry_loop(op_manager, tx, "get-subop", &mut driver).await;
+    let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
+        op_manager,
+        tx,
+        "get-subop",
+        &mut driver,
+        // Sub-op GETs don't feed the router (no RouteEvent is emitted
+        // on the sub-op path), so skip the per-retry failure events.
+        /* emit_route_failure_on_retry */
+        false,
+    )
+    .await;
 
     // `op_manager.completed(tx)` runs from the
     // `SubOpGetCompletionGuard` in `run_sub_op_get` AFTER this fn
@@ -1632,43 +1901,11 @@ async fn drive_sub_op_get(
                     )
                     .await;
                 }
-                Terminal::Streaming {
-                    key,
-                    stream_id,
-                    includes_contract,
-                    // Sub-op GETs don't feed the router (no RouteEvent
-                    // is emitted on the sub-op path), so payload size
-                    // attribution is irrelevant here.
-                    total_size: _,
-                } => {
-                    if let Some(peer_addr) = driver.current_target.socket_addr() {
-                        if let Err(e) = assemble_and_cache_stream(
-                            op_manager,
-                            peer_addr,
-                            *stream_id,
-                            *key,
-                            *includes_contract,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                %key,
-                                error = %e,
-                                "get (driver sub-op): stream assembly failed"
-                            );
-                        }
-                    } else {
-                        // Mirrors the client driver's branch at op_ctx_task.rs:341-347:
-                        // without a socket_addr we cannot claim the orphan stream, so
-                        // the local-store re-query below will return NotFound. Surface
-                        // the breadcrumb so operators can correlate to the failure.
-                        tracing::warn!(
-                            %key,
-                            "get (driver sub-op): current_target has no socket_addr; \
-                             cannot claim orphan stream"
-                        );
-                    }
-                }
+                // Stream assembly (with per-candidate retry, #4345)
+                // already ran inside `drive_get_with_assembly_retry`;
+                // on persistent failure the store re-query below
+                // returns NotFound with the assembly cause attached.
+                Terminal::Streaming { .. } => {}
                 Terminal::LocalCompletion => {}
             }
 
@@ -1696,12 +1933,46 @@ async fn drive_sub_op_get(
                         client_contract,
                     ))
                 }
-                _ => SubOpGetOutcome::NotFound(missing_state_cause(&instance_id)),
+                _ => SubOpGetOutcome::NotFound(sub_op_not_found_cause(
+                    &instance_id,
+                    streaming_assembly.error.as_deref(),
+                )),
             }
         }
         RetryLoopOutcome::Exhausted(cause) => SubOpGetOutcome::NotFound(cause),
         RetryLoopOutcome::Unexpected => SubOpGetOutcome::Infra(OpError::UnexpectedOpState),
         RetryLoopOutcome::InfraError(err) => SubOpGetOutcome::Infra(err),
+    }
+}
+
+/// Cause string for a client GET whose terminal reply was classified
+/// success but whose state never reached the local store. Carries the
+/// assembly failure cause when the streaming path exhausted its retry
+/// budget (#4345); otherwise the generic store-lookup message (covers
+/// eviction races and executor rejections). Pure helper so both arms
+/// are unit-testable without a real `OpManager`.
+fn synthesized_get_error_cause(
+    instance_id: &ContractInstanceId,
+    assembly_error: Option<&str>,
+) -> String {
+    match assembly_error {
+        Some(e) => format!(
+            "GET response stream assembly failed for {instance_id} \
+             after exhausting retries: {e}"
+        ),
+        None => format!("GET succeeded on wire but local store lookup failed for {instance_id}"),
+    }
+}
+
+/// Sub-op variant of [`synthesized_get_error_cause`]: the store-miss
+/// cause with the assembly failure appended when one occurred (#4345).
+fn sub_op_not_found_cause(
+    instance_id: &ContractInstanceId,
+    assembly_error: Option<&str>,
+) -> String {
+    match assembly_error {
+        Some(e) => format!("{}: {e}", missing_state_cause(instance_id)),
+        None => missing_state_cause(instance_id),
     }
 }
 
@@ -3843,27 +4114,223 @@ mod tests {
     #[test]
     fn streaming_terminal_calls_assemble_and_cache_stream() {
         let src = production_source();
-        let body = extract_fn_body(src, "async fn drive_client_get_inner(");
-        // Find the `Terminal::Streaming` arm of the Done match.
-        let arm = body
-            .find("Terminal::Streaming {")
-            .expect("Done arm must handle Terminal::Streaming");
-        // The matching arm must call `assemble_and_cache_stream`.
-        let tail = &body[arm..];
-        // Bound the search to this arm by clipping at the next
-        // `Terminal::` match arm.
-        let arm_end = tail[1..]
-            .find("Terminal::")
-            .map(|p| p + 1)
-            .unwrap_or(tail.len());
-        let arm_body = &tail[..arm_end];
+        // Since #4345, assembly runs inside `drive_get_with_assembly_retry`
+        // (so a failed assembly can advance to the next candidate and
+        // re-enter the retry loop). Both drivers must route through the
+        // wrapper, and the wrapper must perform the assemble+cache.
+        let client_body = extract_fn_body(src, "async fn drive_client_get_inner(");
         assert!(
-            arm_body.contains("assemble_and_cache_stream"),
-            "Terminal::Streaming arm of drive_client_get_inner must call \
-             `assemble_and_cache_stream`. Without this, cold-cache streaming \
-             GETs return OperationError because nothing writes the local \
-             store. See bug #1 in PR #3884 review."
+            client_body.contains("drive_get_with_assembly_retry("),
+            "drive_client_get_inner must drive the loop via \
+             `drive_get_with_assembly_retry`. Without it, cold-cache \
+             streaming GETs return OperationError because nothing writes \
+             the local store (bug #1 in PR #3884 review), and assembly \
+             failures burn the whole GET without consuming the retry \
+             budget (#4345)."
         );
+        let sub_op_body = extract_fn_body(src, "async fn drive_sub_op_get(");
+        assert!(
+            sub_op_body.contains("drive_get_with_assembly_retry("),
+            "drive_sub_op_get must drive the loop via \
+             `drive_get_with_assembly_retry` — the sub-op path has the \
+             same assembly-failure-burns-the-op gap as the client path \
+             (#4345)."
+        );
+        let wrapper_body = extract_fn_body(src, "async fn drive_get_with_assembly_retry(");
+        assert!(
+            wrapper_body.contains("assemble_and_cache_stream("),
+            "drive_get_with_assembly_retry must call \
+             `assemble_and_cache_stream` on the Streaming terminal."
+        );
+    }
+
+    /// #4345: a failed stream assembly must be a *retryable* attempt
+    /// failure — advance to the next candidate, fresh attempt tx — and
+    /// exhaustion must still surface as `Done` (OperationError), never
+    /// as `Exhausted` (which the caller maps to a false `NotFound`:
+    /// a streaming header proves the contract exists).
+    #[test]
+    fn assembly_failure_advances_with_fresh_tx_and_never_exhausts_to_notfound() {
+        let src = production_source();
+        let body = extract_fn_body(src, "async fn drive_get_with_assembly_retry(");
+
+        // Anchor on the assembly call first so a future earlier
+        // `Err(e)` arm (e.g. around the claim) can't silently shift
+        // the slice this test inspects.
+        let assemble_call = body
+            .find("match assemble_and_cache_stream")
+            .expect("wrapper must match on assemble_and_cache_stream");
+        let err_arm = body[assemble_call..]
+            .find("Err(e) =>")
+            .map(|p| p + assemble_call)
+            .expect("wrapper must handle assembly Err");
+        let err_body = &body[err_arm..];
+
+        // The routing penalty must land on the candidate whose header
+        // never became a stream — capture it BEFORE advance() mutates
+        // `current_target`.
+        let capture_pos = err_body
+            .find("let failed_target = driver.current_target.clone()")
+            .expect("Err arm must capture the failing target");
+        let advance_pos = err_body
+            .find("driver.advance()")
+            .expect("Err arm must call driver.advance()");
+        assert!(
+            capture_pos < advance_pos,
+            "failed_target must be captured BEFORE driver.advance() — \
+             advance() replaces current_target, so capturing after \
+             penalizes the wrong (fresh) candidate."
+        );
+
+        // Re-entry must use a fresh attempt tx: reusing the previous tx
+        // collides with the relay dedup gates (`active_relay_get_txs`)
+        // while the failed attempt's relay chain is still draining.
+        assert!(
+            err_body.contains("attempt_tx = driver.new_attempt_tx()"),
+            "assembly-failure retry must re-enter the loop with a fresh \
+             attempt tx via driver.new_attempt_tx()"
+        );
+
+        // The advancing path must penalize the failed candidate (the
+        // router only learns about header-without-stream peers from
+        // this call) and must remember the header for the
+        // wire-exhaustion conversion below.
+        let next_arm = err_body
+            .find("AdvanceOutcome::Next =>")
+            .expect("Err arm must handle Next");
+        let next_body = &err_body[next_arm
+            ..err_body
+                .find("AdvanceOutcome::Exhausted =>")
+                .expect("Err arm must handle Exhausted")];
+        assert!(
+            next_body.contains("emit_get_route_failure("),
+            "the advancing path must emit a route failure for the \
+             failed candidate (gated on emit_route_failure_on_retry)"
+        );
+        assert!(
+            next_body
+                .contains("failed_header = Some((key, stream_id, includes_contract, total_size))"),
+            "the advancing path must remember the streaming header so a \
+             later wire exhaustion can't surface as a false NotFound"
+        );
+
+        // Exhaustion keeps the Done(Streaming) outcome. The wrapper
+        // only reaches the assembly Err arm after `result` matched
+        // `Done(Terminal::Streaming { .. })`, so `break result` returns
+        // that original outcome unchanged.
+        let exhausted_arm = err_body
+            .find("AdvanceOutcome::Exhausted =>")
+            .expect("Err arm must handle Exhausted");
+        let exhausted_body = &err_body[exhausted_arm..];
+        assert!(
+            exhausted_body.contains("break result"),
+            "exhausted assembly retries must break with the original \
+             Done(Streaming) outcome (`break result`) so the client sees \
+             OperationError, NOT RetryLoopOutcome::Exhausted (which maps \
+             to a false NotFound for a contract that provably exists)."
+        );
+        assert!(
+            !exhausted_body.contains("RetryLoopOutcome::Exhausted("),
+            "exhausted assembly retries must not be converted into \
+             RetryLoopOutcome::Exhausted"
+        );
+        // ...and the budget-exhausted path must NOT emit a route
+        // failure: the caller's final route event (driven by the
+        // failed host_result) already records the Failure for the
+        // last target — emitting here too would double-count it.
+        assert!(
+            !exhausted_body.contains("emit_get_route_failure("),
+            "the budget-exhausted path must not emit a per-retry route \
+             failure — the caller's final Failure event covers the last \
+             target (double-count otherwise)"
+        );
+
+        // Wire exhaustion AFTER a failed assembly must convert back to
+        // the remembered Done(Streaming): a header proved the contract
+        // exists, so RetryLoopOutcome::Exhausted (mapped to NotFound by
+        // both callers) would be a false NotFound. This state is only
+        // reachable post-#4345 (assembly failure re-enters the loop).
+        let exhausted_passthrough = body
+            .find("RetryLoopOutcome::Exhausted(cause) =>")
+            .expect("wrapper must have an Exhausted pass-through arm");
+        let passthrough_body = &body[exhausted_passthrough..];
+        assert!(
+            passthrough_body.contains(
+                "if let Some((key, stream_id, includes_contract, total_size)) = failed_header"
+            ),
+            "the Exhausted pass-through must check failed_header"
+        );
+        assert!(
+            passthrough_body.contains("break RetryLoopOutcome::Done(Terminal::Streaming {"),
+            "wire exhaustion after a seen streaming header must convert \
+             back to Done(Streaming) so the client sees OperationError, \
+             not a false NotFound"
+        );
+    }
+
+    /// #4345: the synthesized client error must carry the assembly
+    /// failure cause when one occurred, and fall back to the generic
+    /// store-lookup message otherwise. Behavioral coverage for the
+    /// cause construction both callers use on the exhaustion path.
+    #[test]
+    fn synthesized_error_causes_carry_assembly_failure() {
+        let instance_id = ContractInstanceId::new([0xC1; 32]);
+
+        let with_assembly = synthesized_get_error_cause(
+            &instance_id,
+            Some("stream assembly: no fragments received within inactivity timeout"),
+        );
+        assert!(
+            with_assembly.contains("stream assembly failed")
+                && with_assembly.contains("no fragments received"),
+            "assembly-exhaustion cause must be diagnostic: {with_assembly}"
+        );
+
+        let without = synthesized_get_error_cause(&instance_id, None);
+        assert!(
+            without.contains("local store lookup failed"),
+            "fallback cause must keep the store-lookup message: {without}"
+        );
+        assert!(
+            !without.contains("assembly"),
+            "fallback cause must not mention assembly: {without}"
+        );
+
+        let sub_with = sub_op_not_found_cause(&instance_id, Some("injected failure"));
+        assert!(
+            sub_with.contains(&missing_state_cause(&instance_id))
+                && sub_with.contains("injected failure"),
+            "sub-op cause must append the assembly failure: {sub_with}"
+        );
+        assert_eq!(
+            sub_op_not_found_cause(&instance_id, None),
+            missing_state_cause(&instance_id)
+        );
+    }
+
+    /// #4345: the injection budget is keyed by contract so parallel
+    /// tests in one process can't consume each other's failures.
+    #[test]
+    fn assembly_fault_injection_is_per_key_and_bounded() {
+        let key_a = ContractKey::from_id_and_code(
+            ContractInstanceId::new([0xA1; 32]),
+            CodeHash::new([0xA2; 32]),
+        );
+        let key_b = ContractKey::from_id_and_code(
+            ContractInstanceId::new([0xB1; 32]),
+            CodeHash::new([0xB2; 32]),
+        );
+
+        // Unarmed keys never fail.
+        assert!(!assembly_fault_injection::consume(&key_b));
+
+        assembly_fault_injection::inject_failures(key_a, 2);
+        assert!(assembly_fault_injection::consume(&key_a));
+        // Other keys are unaffected while a budget is armed.
+        assert!(!assembly_fault_injection::consume(&key_b));
+        assert!(assembly_fault_injection::consume(&key_a));
+        // Budget exhausted → assembly succeeds again.
+        assert!(!assembly_fault_injection::consume(&key_a));
     }
 
     /// Pure-data regression test for the streaming payload shape the
