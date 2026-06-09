@@ -55,12 +55,34 @@
 //! state was reset without flushing the list.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
 use freenet_stdlib::prelude::ContractInstanceId;
 use tokio::time::Instant;
 
 use crate::util::time_source::TimeSource;
+
+/// Hard upper bound on the number of contracts that can be on the ban
+/// list at once. Mirrors the defense-in-depth pattern Phase 2's
+/// [`crate::ring::update_rate_limit::MAX_TRACKED_PAIRS`] established:
+/// a bounded collection whose keys can become attacker-influenced.
+///
+/// Today the only writer is the governance reaper, and the reaper can
+/// only ban contracts the local node observes — so the natural bound
+/// is the local contract population (~hundreds). But once the
+/// operator-CLI surface (issue #4274) lands and starts writing via
+/// [`BanReason::Operator`], the input becomes operator-influenced: a
+/// misconfigured config file, a runaway script, or an attacker who
+/// reaches the management socket could otherwise push arbitrary keys
+/// into the list and silently drop legitimate contracts at the wire
+/// boundary (`is_banned` is checked before every inbound
+/// PUT/GET/UPDATE/SUBSCRIBE).
+///
+/// 8 192 is well above any expected production size (the reaper-driven
+/// list is bounded by the local contract population) while keeping the
+/// worst-case memory trivially small (~8 K entries × a handful of bytes).
+pub(crate) const MAX_BANNED_CONTRACTS: usize = 8_192;
 
 /// Why a contract was added to the ban list. Surface on the dashboard
 /// so operators can distinguish automatic (governance-driven) bans
@@ -86,18 +108,69 @@ struct BanEntry {
     reason: BanReason,
 }
 
+/// Outcome of a [`ContractBanList::ban`] call. Mirrors the
+/// `RateLimitDecision` shape in [`crate::ring::update_rate_limit`] so
+/// the cap behaviour is observable (callers / the dashboard can tell
+/// "ban applied" apart from "ban list full").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BanOutcome {
+    /// The contract was newly added to the ban list (a slot was
+    /// reserved via the size counter).
+    Banned,
+    /// The contract was already on the list; its expiry/reason were
+    /// updated in place. No new slot was consumed.
+    Updated,
+    /// The ban list was at [`MAX_BANNED_CONTRACTS`] and this add could
+    /// not be admitted. For [`BanReason::Operator`] adds this means the
+    /// list is full of reaper-driven (`AutoMad`) bans, which take
+    /// precedence. The contract is NOT banned.
+    CapacityExceeded,
+}
+
 /// Per-(contract instance) ban list. Read by the wire-message
 /// dispatch site to drop inbound requests; written by the governance
 /// reaper loop on `BanTriggered` / `BanLifted` transitions.
 pub(crate) struct ContractBanList {
     entries: DashMap<ContractInstanceId, BanEntry>,
+    /// Authoritative size counter for capacity enforcement. Held in
+    /// sync with `entries.len()` at every stable point: incremented by
+    /// successful new-key inserts in [`Self::ban`], decremented by
+    /// [`Self::unban`] and by the count of dropped entries in
+    /// [`Self::cleanup`].
+    ///
+    /// Why not just read `entries.len()`? Because `len()` walks every
+    /// shard, so it can't be consulted while holding a shard guard, and
+    /// a probe-then-insert (`if len() < cap { insert }`) overshoots the
+    /// cap by up to `num_concurrent_callers` under a concurrent flood.
+    /// The `fetch_add` reservation here strictly serializes — the same
+    /// fix Phase 2's review (#4285) applied to `UpdateRateLimiter`.
+    size: AtomicUsize,
+    /// Maximum number of simultaneously-banned contracts. Defaults to
+    /// [`MAX_BANNED_CONTRACTS`]; overridable in tests via
+    /// [`Self::with_max`].
+    max_banned: usize,
+    /// Total bans rejected because the list was at capacity (operator
+    /// adds that couldn't displace a reaper-driven ban). A non-zero
+    /// value is the operator's signal that the cap is being hit —
+    /// surfaced on the dashboard alongside the ban count.
+    capacity_rejected_total: AtomicU64,
     time_source: Arc<dyn TimeSource + Send + Sync>,
 }
 
 impl ContractBanList {
     pub fn new(time_source: Arc<dyn TimeSource + Send + Sync>) -> Self {
+        Self::with_max(time_source, MAX_BANNED_CONTRACTS)
+    }
+
+    /// Construct with an explicit cap. Used by tests to exercise the
+    /// capacity path with a small list; production always uses
+    /// [`Self::new`] (cap = [`MAX_BANNED_CONTRACTS`]).
+    pub fn with_max(time_source: Arc<dyn TimeSource + Send + Sync>, max_banned: usize) -> Self {
         Self {
             entries: DashMap::new(),
+            size: AtomicUsize::new(0),
+            max_banned,
+            capacity_rejected_total: AtomicU64::new(0),
             time_source,
         }
     }
@@ -124,10 +197,36 @@ impl ContractBanList {
     }
 
     /// Add a contract to the ban list with the given expiry instant
-    /// and reason. Idempotent: re-banning extends the expiry to
-    /// whichever value is later (the new one — typically the reaper
-    /// is calling this because a fresh `BanTriggered` just fired).
-    pub fn ban(&self, contract: ContractInstanceId, expires_at: Instant, reason: BanReason) {
+    /// and reason.
+    ///
+    /// Idempotent for an already-banned contract: re-banning extends
+    /// the expiry to whichever value is later (never shortens it) and
+    /// upgrades the reason to `Operator` if applicable. This path
+    /// consumes no new slot and is never capacity-rejected.
+    ///
+    /// New-contract inserts are bounded by [`Self::max_banned`]
+    /// (production: [`MAX_BANNED_CONTRACTS`]). A slot is reserved with
+    /// an atomic `fetch_add` BEFORE inserting, so concurrent distinct-
+    /// key inserts strictly serialize through the counter and cannot
+    /// overshoot the cap (the probe-then-insert race Phase 2's review
+    /// caught — see [`Self::size`]).
+    ///
+    /// **Priority when the list is full:** reaper-driven
+    /// ([`BanReason::AutoMad`]) bans take precedence over operator-
+    /// driven ([`BanReason::Operator`]) bans. If an `AutoMad` ban
+    /// arrives at capacity, it evicts one existing `Operator` entry to
+    /// make room; if no `Operator` entry exists (the list is entirely
+    /// reaper-driven) the add is rejected. An `Operator` ban at
+    /// capacity is always rejected — operator input must never displace
+    /// a security decision the node made itself.
+    ///
+    /// Returns a [`BanOutcome`] describing what happened.
+    pub fn ban(
+        &self,
+        contract: ContractInstanceId,
+        expires_at: Instant,
+        reason: BanReason,
+    ) -> BanOutcome {
         use dashmap::mapref::entry::Entry;
         match self.entries.entry(contract) {
             Entry::Occupied(mut e) => {
@@ -143,26 +242,113 @@ impl ContractBanList {
                 if matches!(reason, BanReason::Operator) {
                     cur.reason = BanReason::Operator;
                 }
+                BanOutcome::Updated
             }
             Entry::Vacant(e) => {
-                e.insert(BanEntry { expires_at, reason });
+                // New contract: reserve a slot via the authoritative
+                // counter BEFORE inserting. `fetch_add` is the
+                // serialization point — concurrent new-key inserts
+                // strictly serialize, no overshoot beyond the cap.
+                let prev = self.size.fetch_add(1, Ordering::Relaxed);
+                if prev < self.max_banned {
+                    e.insert(BanEntry { expires_at, reason });
+                    return BanOutcome::Banned;
+                }
+
+                // At capacity. Roll back the speculative reservation
+                // and release the per-shard guard before doing anything
+                // that touches other shards.
+                self.size.fetch_sub(1, Ordering::Relaxed);
+                drop(e);
+
+                // Reaper-driven bans take precedence: try to evict one
+                // Operator entry to free a slot, then re-attempt the
+                // insert. The guard is released above because
+                // `evict_one_operator` walks every shard via `retain`
+                // — holding a shard guard across it would deadlock.
+                if matches!(reason, BanReason::AutoMad) && self.evict_one_operator() {
+                    // `evict_one_operator` decremented the counter for
+                    // the evicted entry, so the list is now below the
+                    // cap. Re-attempt via the public path so the freed
+                    // slot is re-reserved atomically against concurrent
+                    // callers (the slot is NOT held between the two
+                    // calls — another thread may grab it, in which case
+                    // the recursion either evicts again or returns
+                    // CapacityExceeded). Recursion depth is bounded by
+                    // the number of Operator entries, which strictly
+                    // decreases on each eviction.
+                    return self.ban(contract, expires_at, reason);
+                }
+
+                self.capacity_rejected_total.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    %contract,
+                    ?reason,
+                    max_banned = self.max_banned,
+                    "contract ban rejected: ban list at capacity"
+                );
+                BanOutcome::CapacityExceeded
             }
         }
     }
 
+    /// Evict a single `Operator`-reason entry, if any exists, to free a
+    /// slot for a higher-priority `AutoMad` ban. Returns `true` if an
+    /// entry was removed (and the size counter decremented), `false` if
+    /// the list contains no `Operator` entries.
+    ///
+    /// Uses `retain` to stop after the first removal so this is O(list)
+    /// worst case but typically returns early. No particular eviction
+    /// order is promised — at the cap, any operator entry is a fair
+    /// victim, and operator bans are advisory relative to the node's
+    /// own security decisions.
+    fn evict_one_operator(&self) -> bool {
+        let mut evicted = false;
+        self.entries.retain(|_, entry| {
+            if !evicted && matches!(entry.reason, BanReason::Operator) {
+                evicted = true;
+                false // drop this entry
+            } else {
+                true
+            }
+        });
+        if evicted {
+            self.size.fetch_sub(1, Ordering::Relaxed);
+        }
+        evicted
+    }
+
     /// Remove a contract from the ban list, regardless of expiry.
     /// Called from the reaper loop when a `BanLifted` decision fires.
+    ///
+    /// Decrements the [`Self::size`] counter when an entry was actually
+    /// present, so the strict capacity accounting stays in sync.
     pub fn unban(&self, contract: &ContractInstanceId) {
-        self.entries.remove(contract);
+        if self.entries.remove(contract).is_some() {
+            self.size.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// Drop entries whose `expires_at` has passed. Called periodically
     /// from the governance reaper tick as a defense-in-depth in case
     /// an explicit `unban` was skipped (process restart, race during
     /// configuration reload, etc).
+    ///
+    /// Decrements the [`Self::size`] counter by the number of removed
+    /// entries so the cap recovers as expired bans roll off.
     pub fn cleanup(&self) {
         let now = self.time_source.now();
-        self.entries.retain(|_, entry| entry.expires_at > now);
+        let mut removed = 0usize;
+        self.entries.retain(|_, entry| {
+            let keep = entry.expires_at > now;
+            if !keep {
+                removed += 1;
+            }
+            keep
+        });
+        if removed > 0 {
+            self.size.fetch_sub(removed, Ordering::Relaxed);
+        }
     }
 
     /// Number of currently-banned contracts. Used by tests and the
@@ -170,6 +356,15 @@ impl ContractBanList {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Total bans rejected because the list was at capacity. A non-zero
+    /// value tells operators the cap is being hit — surfaced on the
+    /// dashboard's governance card alongside the ban count. Mirrors
+    /// [`crate::ring::update_rate_limit::UpdateRateLimiter::capacity_rejected_total`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn capacity_rejected_total(&self) -> u64 {
+        self.capacity_rejected_total.load(Ordering::Relaxed)
     }
 }
 
@@ -350,6 +545,259 @@ mod tests {
         assert!(bl.is_banned(&mk_contract(1)));
         assert!(!bl.is_banned(&mk_contract(2)));
         assert_eq!(bl.len(), 1);
+    }
+
+    // ---- MAX_BANNED_CONTRACTS cap (issue #4303) ----
+    //
+    // Mirrors the `UpdateRateLimiter` cap tests in
+    // `update_rate_limit.rs`: a hard size cap enforced via an
+    // `AtomicUsize::fetch_add` reservation, with strict (no-overshoot)
+    // accounting under concurrency.
+
+    fn mk_ban_list_with_max(max: usize) -> (ContractBanList, SharedMockTimeSource) {
+        let ts = SharedMockTimeSource::new();
+        let bl = ContractBanList::with_max(Arc::new(ts.clone()), max);
+        (bl, ts)
+    }
+
+    #[test]
+    fn ban_returns_outcome() {
+        let (bl, ts) = mk_ban_list();
+        let c = mk_contract(1);
+        let exp = ts.now() + Duration::from_secs(60);
+        assert_eq!(bl.ban(c, exp, BanReason::AutoMad), BanOutcome::Banned);
+        // Re-banning the same contract updates in place, no new slot.
+        assert_eq!(bl.ban(c, exp, BanReason::AutoMad), BanOutcome::Updated);
+        assert_eq!(bl.len(), 1);
+    }
+
+    #[test]
+    fn capacity_exceeded_when_cap_reached() {
+        let (bl, ts) = mk_ban_list_with_max(8);
+        let exp = ts.now() + Duration::from_secs(60);
+        // Fill to the cap — all reaper-driven so none are evictable.
+        for i in 0..8 {
+            assert_eq!(
+                bl.ban(mk_contract(i + 1), exp, BanReason::AutoMad),
+                BanOutcome::Banned,
+                "ban {i} below the cap must be admitted"
+            );
+        }
+        assert_eq!(bl.len(), 8);
+        // The 9th distinct contract is past the cap.
+        assert_eq!(
+            bl.ban(mk_contract(99), exp, BanReason::AutoMad),
+            BanOutcome::CapacityExceeded,
+            "new contract past the cap must be CapacityExceeded"
+        );
+        // Size must NOT overshoot: the rejected add rolled back its
+        // speculative reservation.
+        assert_eq!(bl.len(), 8, "cap rejection must not grow the list");
+        assert_eq!(bl.capacity_rejected_total(), 1);
+        // The rejected contract is genuinely not banned.
+        assert!(!bl.is_banned(&mk_contract(99)));
+        // An already-banned contract keeps working at the cap (the
+        // Occupied/Updated path is never capacity-rejected).
+        assert_eq!(
+            bl.ban(mk_contract(1), exp, BanReason::AutoMad),
+            BanOutcome::Updated,
+            "existing contract must keep working at the cap"
+        );
+    }
+
+    #[test]
+    fn operator_ban_rejected_at_cap_when_only_auto_present() {
+        let (bl, ts) = mk_ban_list_with_max(4);
+        let exp = ts.now() + Duration::from_secs(60);
+        for i in 0..4 {
+            bl.ban(mk_contract(i + 1), exp, BanReason::AutoMad);
+        }
+        // Operator add at the cap, with no Operator entry to displace,
+        // must be rejected — operator input must not displace a
+        // node-made security decision.
+        assert_eq!(
+            bl.ban(mk_contract(50), exp, BanReason::Operator),
+            BanOutcome::CapacityExceeded,
+            "operator ban at cap must not displace reaper-driven bans"
+        );
+        assert!(!bl.is_banned(&mk_contract(50)));
+        assert_eq!(bl.len(), 4);
+    }
+
+    #[test]
+    fn auto_ban_evicts_operator_entry_at_cap() {
+        let (bl, ts) = mk_ban_list_with_max(4);
+        let exp = ts.now() + Duration::from_secs(60);
+        // One operator entry, three reaper entries — list is full.
+        bl.ban(mk_contract(1), exp, BanReason::Operator);
+        bl.ban(mk_contract(2), exp, BanReason::AutoMad);
+        bl.ban(mk_contract(3), exp, BanReason::AutoMad);
+        bl.ban(mk_contract(4), exp, BanReason::AutoMad);
+        assert_eq!(bl.len(), 4);
+
+        // A reaper-driven ban at the cap must take precedence: it
+        // evicts the operator entry and is itself admitted.
+        assert_eq!(
+            bl.ban(mk_contract(5), exp, BanReason::AutoMad),
+            BanOutcome::Banned,
+            "reaper ban at cap must evict an operator entry and succeed"
+        );
+        assert!(bl.is_banned(&mk_contract(5)), "new reaper ban is active");
+        assert!(
+            !bl.is_banned(&mk_contract(1)),
+            "the operator entry must have been evicted to make room"
+        );
+        // Still exactly at the cap — one in, one out.
+        assert_eq!(bl.len(), 4);
+        // No capacity rejection was recorded (the add succeeded).
+        assert_eq!(bl.capacity_rejected_total(), 0);
+    }
+
+    #[test]
+    fn auto_ban_rejected_at_cap_when_no_operator_to_evict() {
+        let (bl, ts) = mk_ban_list_with_max(3);
+        let exp = ts.now() + Duration::from_secs(60);
+        // Entirely reaper-driven and full — nothing to evict.
+        for i in 0..3 {
+            bl.ban(mk_contract(i + 1), exp, BanReason::AutoMad);
+        }
+        assert_eq!(
+            bl.ban(mk_contract(9), exp, BanReason::AutoMad),
+            BanOutcome::CapacityExceeded,
+            "reaper ban at a fully-reaper-driven cap has nothing to evict"
+        );
+        assert_eq!(bl.len(), 3);
+        assert_eq!(bl.capacity_rejected_total(), 1);
+    }
+
+    #[test]
+    fn unban_decrements_size_counter_freeing_a_slot() {
+        let (bl, ts) = mk_ban_list_with_max(2);
+        let exp = ts.now() + Duration::from_secs(60);
+        bl.ban(mk_contract(1), exp, BanReason::AutoMad);
+        bl.ban(mk_contract(2), exp, BanReason::AutoMad);
+        // At cap.
+        assert_eq!(
+            bl.ban(mk_contract(3), exp, BanReason::AutoMad),
+            BanOutcome::CapacityExceeded
+        );
+        // Free a slot.
+        bl.unban(&mk_contract(1));
+        assert_eq!(bl.len(), 1);
+        // The cap must now have room again.
+        assert_eq!(
+            bl.ban(mk_contract(3), exp, BanReason::AutoMad),
+            BanOutcome::Banned,
+            "unban must free a slot for new bans (size counter decremented)"
+        );
+        assert_eq!(bl.len(), 2);
+    }
+
+    #[test]
+    fn unban_missing_contract_does_not_underflow_counter() {
+        let (bl, ts) = mk_ban_list_with_max(2);
+        let exp = ts.now() + Duration::from_secs(60);
+        // Unban a contract that was never banned — must be a no-op and
+        // must NOT decrement the (already zero) size counter.
+        bl.unban(&mk_contract(7));
+        bl.ban(mk_contract(1), exp, BanReason::AutoMad);
+        bl.ban(mk_contract(2), exp, BanReason::AutoMad);
+        // Counter is accurate: at cap.
+        assert_eq!(
+            bl.ban(mk_contract(3), exp, BanReason::AutoMad),
+            BanOutcome::CapacityExceeded,
+            "spurious unban must not corrupt the size counter"
+        );
+    }
+
+    #[test]
+    fn cleanup_decrements_size_counter_freeing_slots() {
+        let (bl, ts) = mk_ban_list_with_max(2);
+        let now = ts.now();
+        bl.ban(
+            mk_contract(1),
+            now + Duration::from_secs(10),
+            BanReason::AutoMad,
+        );
+        bl.ban(
+            mk_contract(2),
+            now + Duration::from_secs(60),
+            BanReason::AutoMad,
+        );
+        // At cap.
+        assert_eq!(
+            bl.ban(
+                mk_contract(3),
+                now + Duration::from_secs(60),
+                BanReason::AutoMad
+            ),
+            BanOutcome::CapacityExceeded
+        );
+        // Expire contract 1 and sweep it.
+        ts.advance_time(Duration::from_secs(20));
+        bl.cleanup();
+        assert_eq!(bl.len(), 1, "cleanup drops the expired entry");
+        // The freed slot must be re-usable — counter was decremented.
+        assert_eq!(
+            bl.ban(
+                mk_contract(3),
+                ts.now() + Duration::from_secs(60),
+                BanReason::AutoMad
+            ),
+            BanOutcome::Banned,
+            "cleanup must free a slot for new bans (size counter decremented)"
+        );
+        assert_eq!(bl.len(), 2);
+    }
+
+    #[test]
+    fn concurrent_distinct_bans_do_not_overshoot_cap() {
+        use std::sync::{Arc as StdArc, Barrier};
+        use std::thread;
+
+        const CAP: usize = 8;
+        const THREADS: usize = 64; // 8× the cap to stress the race
+
+        let ts = SharedMockTimeSource::new();
+        let bl = StdArc::new(ContractBanList::with_max(Arc::new(ts.clone()), CAP));
+        let exp = ts.now() + Duration::from_secs(60);
+        let barrier = StdArc::new(Barrier::new(THREADS));
+        let mut handles = Vec::with_capacity(THREADS);
+
+        for i in 0..THREADS {
+            let bl = bl.clone();
+            let b = barrier.clone();
+            handles.push(thread::spawn(move || {
+                b.wait();
+                // Each thread bans a DISTINCT contract so they all
+                // exercise the Vacant (new-key reservation) path.
+                bl.ban(mk_contract((i + 1) as u8), exp, BanReason::AutoMad)
+            }));
+        }
+
+        let mut banned = 0;
+        let mut cap_rejected = 0;
+        let mut updated = 0;
+        for h in handles {
+            match h.join().unwrap() {
+                BanOutcome::Banned => banned += 1,
+                BanOutcome::CapacityExceeded => cap_rejected += 1,
+                BanOutcome::Updated => updated += 1,
+            }
+        }
+        // Strict cap: the list size must equal CAP exactly, not
+        // CAP + overshoot. This is the property the `fetch_add`
+        // reservation guarantees over a `len()` precheck.
+        assert_eq!(
+            bl.len(),
+            CAP,
+            "strict cap: list size must equal CAP after a 64-thread flood, got {}",
+            bl.len()
+        );
+        assert_eq!(banned, CAP, "exactly CAP bans admitted, got {banned}");
+        assert_eq!(cap_rejected, THREADS - CAP);
+        assert_eq!(updated, 0, "all keys distinct, no Updated outcomes");
+        assert_eq!(bl.capacity_rejected_total(), (THREADS - CAP) as u64);
     }
 
     // Wiring tests — `Ring::apply_ban_decisions` is the bridge between
