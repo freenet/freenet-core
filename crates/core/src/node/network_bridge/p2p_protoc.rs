@@ -4286,6 +4286,14 @@ impl P2pConnManager {
                 phase = "broadcast_state_change_banned_skip",
                 "skipping state-change broadcast for banned contract"
             );
+            // Drop any in-flight retry/streak bookkeeping for this
+            // contract: if it was banned mid-retry-cycle, a previously
+            // scheduled re-emission would otherwise leave a stale entry
+            // here that nothing clears until the contract is unbanned and
+            // broadcast again. Mirrors the cleanup the targets-found and
+            // retries-exhausted paths perform.
+            self.broadcast_retries.remove(&key);
+            self.broadcast_no_target_streak.remove(&key);
             return;
         }
 
