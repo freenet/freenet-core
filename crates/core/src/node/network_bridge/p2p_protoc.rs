@@ -4269,6 +4269,34 @@ impl P2pConnManager {
             state_size = new_state.size(),
             "BroadcastStateChange event received"
         );
+
+        // Phase 7 egress self-block (#4300). A locally-applied UPDATE
+        // (e.g. delegate-driven) drives this fan-out to subscribers who
+        // don't know about our ban. If we have banned the contract, skip
+        // the fan-out entirely — and the no-target retry re-emission with
+        // it — rather than push state for a contract we have decided is
+        // harmful. There is no client to notify here (this is the
+        // fire-and-forget broadcast path), so we skip with a debug log
+        // instead of returning a typed error. Complements the
+        // client-originated UPDATE gate in `start_client_update` and the
+        // receive-side `UpdateMsg::*` drop in node.rs (PR #4299).
+        if op_manager.ring.contract_ban_list.is_banned(key.id()) {
+            tracing::debug!(
+                contract = %key,
+                phase = "broadcast_state_change_banned_skip",
+                "skipping state-change broadcast for banned contract"
+            );
+            // Drop any in-flight retry/streak bookkeeping for this
+            // contract: if it was banned mid-retry-cycle, a previously
+            // scheduled re-emission would otherwise leave a stale entry
+            // here that nothing clears until the contract is unbanned and
+            // broadcast again. Mirrors the cleanup the targets-found and
+            // retries-exhausted paths perform.
+            self.broadcast_retries.remove(&key);
+            self.broadcast_no_target_streak.remove(&key);
+            return;
+        }
+
         let self_addr = op_manager.ring.connection_manager.get_own_addr();
         let Some(self_addr) = self_addr else {
             tracing::warn!(
@@ -6090,6 +6118,75 @@ mod tests {
             send_pos > remove_pos,
             "the PeerDisconnected send must happen on the sender taken out by \
              pending_op_results.remove (send-before-drop). Arm body:\n{body}"
+        );
+    }
+
+    /// Phase 7 egress self-block pin (#4300). `handle_broadcast_state_change`
+    /// MUST skip the fan-out for a banned contract — the egress
+    /// `contract_ban_list.is_banned(key.id())` check must appear BEFORE
+    /// the target resolution (`get_broadcast_targets_update`) so a
+    /// delegate-driven UPDATE for a banned contract is not fanned out to
+    /// subscribers who don't know about our ban, and so the no-target
+    /// retry re-emission is skipped too. Mirrors the receive-side
+    /// `update_dispatch_gates_banned_contracts` and the other egress
+    /// pins in the `start_client_*` entry points.
+    #[test]
+    fn handle_broadcast_state_change_gates_banned_egress() {
+        const SOURCE: &str = include_str!("p2p_protoc.rs");
+
+        let fn_anchor = "async fn handle_broadcast_state_change(";
+        let fn_start = SOURCE
+            .find(fn_anchor)
+            .expect("handle_broadcast_state_change renamed or removed");
+        // Bound the slice at the next `async fn ` so the assertion can't
+        // accidentally match a later function's body.
+        let after_header = &SOURCE[fn_start + fn_anchor.len()..];
+        let body_end = after_header
+            .find("\n    async fn ")
+            .map(|p| fn_start + fn_anchor.len() + p)
+            .unwrap_or(SOURCE.len());
+        let body = &SOURCE[fn_start..body_end];
+
+        let gate_pos = body.find("contract_ban_list.is_banned").expect(
+            "handle_broadcast_state_change is missing the ban-list egress gate — \
+             banned contracts would continue to be fanned out to subscribers \
+             (defeats the Phase 7 egress self-block, #4300)",
+        );
+        let target_pos = body
+            .find("get_broadcast_targets_update")
+            .expect("handle_broadcast_state_change is missing get_broadcast_targets_update");
+        assert!(
+            gate_pos < target_pos,
+            "BroadcastStateChange ban-list gate (offset {gate_pos}) must run \
+             BEFORE target resolution (offset {target_pos}) so a banned \
+             contract's broadcast is skipped — including the no-target retry \
+             re-emission. Body:\n{body}"
+        );
+
+        // Regression guard for the `fix(governance): clear broadcast retry
+        // state on banned-egress skip` commit: the banned-skip branch must
+        // also clear the per-contract retry/streak bookkeeping, otherwise a
+        // contract banned mid-retry-cycle leaves a stale entry that nothing
+        // clears until it is unbanned and broadcast again. We scope the
+        // assertion to the banned-skip branch (between the gate and its
+        // early `return;`) so deleting either `remove()` call fails this
+        // test — the gate-ordering assertion above passes even without
+        // them.
+        let banned_branch = &body[gate_pos..];
+        let return_pos = banned_branch
+            .find("return;")
+            .expect("banned-egress branch must early-return");
+        let banned_branch = &banned_branch[..return_pos];
+        assert!(
+            banned_branch.contains("self.broadcast_retries.remove(&key)"),
+            "banned-egress skip must clear broadcast_retries for the contract \
+             so a ban mid-retry-cycle doesn't leave a stale entry. Branch:\n{banned_branch}"
+        );
+        assert!(
+            banned_branch.contains("self.broadcast_no_target_streak.remove(&key)"),
+            "banned-egress skip must clear broadcast_no_target_streak for the \
+             contract so a ban mid-retry-cycle doesn't leave a stale entry. \
+             Branch:\n{banned_branch}"
         );
     }
 }

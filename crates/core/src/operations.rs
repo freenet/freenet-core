@@ -117,6 +117,18 @@ pub(crate) enum OpError {
     /// `NodeEvent::Disconnect`.
     #[error("node is shutting down; client operation rejected")]
     NodeShuttingDown,
+
+    /// Phase 7 egress self-block (#4300): a local client tried to
+    /// originate a PUT/GET/SUBSCRIBE/UPDATE for a contract this node
+    /// has banned. The driver task is NOT spawned — we refuse to
+    /// launder requests for a contract we have decided is harmful. The
+    /// receive-side gate (PR #4299) already drops inbound requests for
+    /// the same contract; this is the complementary egress gate so the
+    /// ban is a true block, not just a receive-side filter. Surfaced to
+    /// the client as a typed error rather than silently proceeding into
+    /// a timeout.
+    #[error("contract {instance_id} is banned on this node; request rejected")]
+    ContractBanned { instance_id: ContractInstanceId },
 }
 
 impl OpError {
@@ -172,6 +184,69 @@ impl<T> From<SendError<T>> for OpError {
     fn from(_: SendError<T>) -> OpError {
         OpError::NotificationError
     }
+}
+
+/// Phase 7 egress self-block (#4300). Returns `Err(OpError::ContractBanned)`
+/// if `instance_id`'s contract is on this node's ban list, otherwise
+/// `Ok(())`.
+///
+/// Called at the top of every client-originator entry point
+/// (`start_client_put` / `_get` / `_subscribe` / `_update`) BEFORE the
+/// driver task is spawned, so a banned contract's request is rejected
+/// with a typed error instead of consuming this node's outbound network
+/// resources and then failing (or worse, succeeding at peers that don't
+/// know about our ban). This mirrors the receive-side wire-boundary drop
+/// added in PR #4299: a banned contract can neither receive new state via
+/// this node (receive gate) nor transmit new state via this node (this
+/// egress gate).
+///
+/// Keyed on `ContractInstanceId` because that is what the ban list keys
+/// on and what every entry point has available (`key.id()` for PUT/UPDATE,
+/// the bare `instance_id` for GET/SUBSCRIBE). Factored out of the four
+/// entry points so the gate logic is unit-testable against a
+/// `ContractBanList` directly, and so the early-return shape stays
+/// identical across ops. The fan-out egress path (`BroadcastStateChange`)
+/// has no client to notify, so it skips rather than erroring — that gate
+/// lives at its own call site in `p2p_protoc.rs`.
+///
+/// # Errors
+///
+/// Returns `Err(OpError::ContractBanned { instance_id })` when the
+/// contract is currently on this node's `ContractBanList`. Returns
+/// `Ok(())` for any non-banned (or expired-ban) contract.
+pub(crate) fn reject_if_contract_banned(
+    op_manager: &OpManager,
+    instance_id: &ContractInstanceId,
+) -> Result<(), OpError> {
+    reject_if_contract_banned_on(&op_manager.ring.contract_ban_list, instance_id)
+}
+
+/// Egress-gate core, extracted from [`reject_if_contract_banned`] so the
+/// real `is_banned`-backed decision can be unit-tested against a
+/// `ContractBanList` fixture directly, without standing up a full
+/// `OpManager` (which spawns background tasks and needs a `NodeConfig`,
+/// channels, and a `NetEventRegister`). Mirrors the `*_on` extraction
+/// convention used throughout `op_state_manager.rs` for the same reason.
+///
+/// # Errors
+///
+/// Returns `Err(OpError::ContractBanned { instance_id })` when the
+/// contract is currently on `ban_list`. Returns `Ok(())` otherwise.
+pub(crate) fn reject_if_contract_banned_on(
+    ban_list: &crate::ring::contract_ban_list::ContractBanList,
+    instance_id: &ContractInstanceId,
+) -> Result<(), OpError> {
+    if ban_list.is_banned(instance_id) {
+        tracing::debug!(
+            %instance_id,
+            phase = "egress_banned_reject",
+            "rejecting client-originated request for banned contract"
+        );
+        return Err(OpError::ContractBanned {
+            instance_id: *instance_id,
+        });
+    }
+    Ok(())
 }
 
 /// Announces to neighbors that we're hosting a contract.
@@ -1001,6 +1076,123 @@ mod sub_op_subscribe_pin_tests {
              subscribe driver `subscribe::run_client_subscribe` — \
              matches the `maybe_subscribe_child` pattern in \
              `put/op_ctx_task.rs` and `get/op_ctx_task.rs`."
+        );
+    }
+}
+
+#[cfg(test)]
+mod egress_banned_gate_tests {
+    //! Direct behavioral tests for the #4300 egress self-block gate
+    //! (`reject_if_contract_banned` → `reject_if_contract_banned_on`).
+    //!
+    //! The source-scrape pins in each `op_ctx_task.rs` prove the four
+    //! `start_client_*` entry points *call* the gate, and the mapping
+    //! test in `client_events.rs` proves `OpError::ContractBanned` maps
+    //! to the right `ErrorKind`. Neither exercises the gate's actual
+    //! decision against a real `ContractBanList`, so an inverted
+    //! predicate (`!is_banned`), a wrong-id lookup, or a swapped
+    //! `Ok`/`Err` return would pass every existing test. These tests
+    //! drive the real `is_banned`-backed logic so that class of bug
+    //! fails CI.
+    use super::{OpError, reject_if_contract_banned_on};
+    use crate::ring::contract_ban_list::{BanReason, ContractBanList};
+    use crate::util::time_source::{SharedMockTimeSource, TimeSource};
+    use freenet_stdlib::prelude::ContractInstanceId;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn mk_contract(byte: u8) -> ContractInstanceId {
+        ContractInstanceId::new([byte; 32])
+    }
+
+    fn mk_ban_list() -> (ContractBanList, SharedMockTimeSource) {
+        let ts = SharedMockTimeSource::new();
+        let bl = ContractBanList::new(Arc::new(ts.clone()));
+        (bl, ts)
+    }
+
+    /// A banned contract's id must be rejected with the typed
+    /// `OpError::ContractBanned` carrying that exact id. Catches an
+    /// inverted predicate (would return `Ok`) and a swapped return.
+    #[test]
+    fn banned_contract_is_rejected_with_typed_error() {
+        let (bl, ts) = mk_ban_list();
+        let banned = mk_contract(1);
+        bl.ban(
+            banned,
+            ts.now() + Duration::from_secs(60),
+            BanReason::AutoMad,
+        );
+
+        match reject_if_contract_banned_on(&bl, &banned) {
+            Err(OpError::ContractBanned { instance_id }) => {
+                assert_eq!(
+                    instance_id, banned,
+                    "the rejected id must be the banned contract's id, not some other id"
+                );
+            }
+            other => panic!(
+                "banned contract must be rejected with OpError::ContractBanned, got {other:?}"
+            ),
+        }
+    }
+
+    /// A contract that is NOT on the ban list must pass the gate.
+    /// Catches an inverted predicate (would reject everything).
+    #[test]
+    fn unbanned_contract_passes() {
+        let (bl, _ts) = mk_ban_list();
+        assert!(
+            reject_if_contract_banned_on(&bl, &mk_contract(2)).is_ok(),
+            "a contract that is not banned must pass the egress gate"
+        );
+    }
+
+    /// The gate keys on the specific id: banning contract A must not
+    /// reject a different, unbanned contract B. Catches a wrong-id
+    /// lookup that ignores the argument and consults the whole list.
+    #[test]
+    fn ban_is_scoped_to_the_specific_contract_id() {
+        let (bl, ts) = mk_ban_list();
+        let banned = mk_contract(1);
+        let other = mk_contract(2);
+        bl.ban(
+            banned,
+            ts.now() + Duration::from_secs(60),
+            BanReason::AutoMad,
+        );
+
+        assert!(
+            reject_if_contract_banned_on(&bl, &banned).is_err(),
+            "the banned contract must be rejected"
+        );
+        assert!(
+            reject_if_contract_banned_on(&bl, &other).is_ok(),
+            "a different, unbanned contract must NOT be rejected by another contract's ban"
+        );
+    }
+
+    /// Once a ban's TTL expires, the gate must let the contract through
+    /// again — the egress block is time-bounded, matching the
+    /// receive-side `is_banned` expiry semantics.
+    #[test]
+    fn expired_ban_no_longer_rejects() {
+        let (bl, ts) = mk_ban_list();
+        let contract = mk_contract(1);
+        bl.ban(
+            contract,
+            ts.now() + Duration::from_secs(60),
+            BanReason::AutoMad,
+        );
+        assert!(
+            reject_if_contract_banned_on(&bl, &contract).is_err(),
+            "contract must be rejected while the ban is active"
+        );
+
+        ts.advance_time(Duration::from_secs(61));
+        assert!(
+            reject_if_contract_banned_on(&bl, &contract).is_ok(),
+            "contract must pass the gate once its ban TTL has expired"
         );
     }
 }
