@@ -11,6 +11,11 @@ use super::*;
 pub(super) fn routes(config: Config) -> Router {
     Router::new()
         .route("/v1", get(home))
+        // Lightweight runtime-version probe. The homepage JS fetches this at
+        // page load and compares the live answer against the version baked into
+        // the served page; a mismatch means the browser is holding a stale
+        // cached page from an older binary (#4289).
+        .route("/v1/version", get(runtime_version))
         // No-trailing-slash redirect to the canonical contract root URL.
         // Without this, pasting `/v1/contract/web/<key>` (no slash)
         // into the address bar 404s — common HTTP UX is to either
@@ -22,6 +27,27 @@ pub(super) fn routes(config: Config) -> Router {
         .route("/v1/contract/web/{key}/", get(web_home_v1))
         .route("/v1/contract/web/{key}/{*path}", get(web_subpages_v1))
         .with_state(config)
+}
+
+/// JSON returned by `GET /v1/version`.
+#[derive(serde::Serialize)]
+struct RuntimeVersion {
+    /// Version of the binary currently serving requests
+    /// (`CARGO_PKG_VERSION` of the running process).
+    version: &'static str,
+}
+
+/// `GET /v1/version` — reports the running node's version so the homepage JS
+/// can detect when it is rendering a stale, cached page from an older binary.
+///
+/// Returns `PCK_VERSION` (the compile-time version of *this* live process)
+/// rather than the `network_status` snapshot: both are seeded from the same
+/// constant, but reading the constant directly is always available, even
+/// during the startup window before the snapshot exists.
+async fn runtime_version() -> impl IntoResponse {
+    axum::Json(RuntimeVersion {
+        version: crate::config::PCK_VERSION,
+    })
 }
 
 async fn web_home_v1(
@@ -71,6 +97,26 @@ mod tests {
 
     fn valid_key() -> &'static str {
         "EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr"
+    }
+
+    /// `GET /v1/version` must report the running binary's version as JSON so
+    /// the homepage stale-assets check (#4289) has a live runtime version to
+    /// compare against. The reported version must match the compiled-in
+    /// `CARGO_PKG_VERSION`.
+    #[tokio::test]
+    async fn runtime_version_reports_running_pkg_version() {
+        use axum::body::to_bytes;
+
+        let response = runtime_version().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json.get("version").and_then(|v| v.as_str()),
+            Some(env!("CARGO_PKG_VERSION")),
+            "endpoint must report the running binary's CARGO_PKG_VERSION"
+        );
     }
 
     /// Regression test for freenet/freenet-core#4019.

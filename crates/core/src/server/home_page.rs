@@ -102,6 +102,8 @@ fn homepage_html() -> String {
         </div>
     </header>
 
+    <div class="version-banner" id="version-mismatch-banner" data-asset-version="{asset_version}" role="alert" hidden></div>
+
     <main>
         {status_card}
         {peers_card}
@@ -142,6 +144,10 @@ fn homepage_html() -> String {
         JS = JS,
         favicon = favicon,
         version = html_escape(version),
+        // Asset version = the build that compiled THIS served page. Baked in at
+        // compile time so the JS can compare it against the live runtime version
+        // fetched from /v1/version and warn when a cached page is stale (#4289).
+        asset_version = html_escape(crate::config::PCK_VERSION),
         uptime = uptime,
         peer_id = html_escape(peer_id),
         peer_copy_btn = peer_copy_btn,
@@ -1810,6 +1816,22 @@ main {
     margin-bottom: 0.35rem;
     font-size: 0.85rem;
 }
+/* Stale-assets warning bar (#4289): shown by the JS only when the served
+   page's compile-time version differs from the live runtime version. */
+.version-banner {
+    background: rgba(248, 113, 113, 0.15);
+    border-bottom: 2px solid rgba(248, 113, 113, 0.5);
+    color: #f87171;
+    padding: 0.6rem 1.5rem;
+    font-size: 0.9rem;
+    font-weight: 500;
+    text-align: center;
+}
+[data-theme="light"] .version-banner {
+    color: #b91c1c;
+    background: rgba(220, 38, 38, 0.1);
+    border-bottom-color: rgba(220, 38, 38, 0.4);
+}
 .attempts {
     color: var(--text-muted);
     font-size: 0.8rem;
@@ -2584,6 +2606,44 @@ function checkForUpdate() {
     });
 }
 
+/* A version string is "known" when it is non-empty and not the '?'
+   placeholder the homepage uses before a node snapshot exists.
+   Mirrors version_is_known() in home_page.rs — keep both in sync. */
+function versionIsKnown(v) {
+    return !!v && v !== '?';
+}
+
+/* Show the stale-assets banner iff both the asset version (baked into this
+   served page at compile time) and the live runtime version are known and
+   differ. Mirrors should_show_version_banner() in home_page.rs. The point
+   of comparing against a LIVE fetch (not the rendered data-version) is to
+   catch the #4289 case: the browser is holding a cached page emitted by an
+   old binary while a newer binary is now answering requests. */
+function checkVersionMismatch() {
+    var banner = document.getElementById('version-mismatch-banner');
+    if (!banner) return;
+    var assetVersion = banner.getAttribute('data-asset-version') || '';
+    if (!versionIsKnown(assetVersion)) return;
+    fetch('/v1/version', { headers: { 'Accept': 'application/json' } }).then(function(r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+    }).then(function(data) {
+        var runtimeVersion = data && data.version;
+        if (!versionIsKnown(runtimeVersion)) return;
+        if (runtimeVersion !== assetVersion) {
+            banner.textContent = 'Asset version ' + assetVersion + ' ≠ node version '
+                + runtimeVersion + ' — this page is stale, refresh to load the current version.';
+            banner.hidden = false;
+        } else {
+            /* Versions agree (e.g. after a refresh fixed the staleness). */
+            banner.hidden = true;
+        }
+    }).catch(function(e) {
+        /* Endpoint unreachable / node mid-startup — don't show a spurious banner. */
+        console.debug('Version check failed:', e);
+    });
+}
+
 /* Tab switching for per-operation-type charts */
 function switchTab(el) {
     var tabId = el.getAttribute('data-tab');
@@ -2619,6 +2679,7 @@ document.addEventListener('DOMContentLoaded', function() {
     restoreTab();
     restoreSort();
     checkForUpdate();
+    checkVersionMismatch();
 
     /* Delegated click handler \u2014 survives <main> innerHTML swaps from auto-refresh,
        so we don't need to re-bind after each refresh. */
@@ -2668,6 +2729,12 @@ document.addEventListener('DOMContentLoaded', function() {
                 /* Restore tab selection and table sort after content swap */
                 restoreTab();
                 restoreSort();
+                /* Re-check the live runtime version so the stale-assets banner
+                   appears (or clears) if the serving process changes while the
+                   page stays open. The banner's data-asset-version stays anchored
+                   to the originally-loaded page, which is the version we're
+                   comparing against. */
+                checkVersionMismatch();
             }).catch(function(e) { console.warn('Dashboard refresh failed:', e); })
               .finally(scheduleRefresh);
         }, 5000);
@@ -3884,6 +3951,150 @@ mod tests {
             transport_snapshot: TransportSnapshot::default(),
             governance: Default::default(),
         }
+    }
+
+    // ── Asset/runtime version mismatch banner (#4289) ──────────────────────
+
+    /// Reference specification of the "stale assets" banner rule, used to test
+    /// the logic the homepage JS implements client-side.
+    ///
+    /// The actual mismatch detection runs in the browser (see
+    /// `checkVersionMismatch` in [`JS`]): the served page bakes in its
+    /// `asset_version` (the build that generated the HTML/JS the browser is
+    /// running) and fetches the live `runtime_version` from `/v1/version` at page
+    /// load. This Rust function is the canonical, unit-testable statement of when
+    /// the banner should appear; the JS mirrors it exactly. Keeping it here (and
+    /// tested) makes the rule's edge cases explicit and guards against the JS
+    /// drifting from the intended behaviour. It lives in the test module (not as
+    /// production code) because the production decision is made in JS, not in the
+    /// server-side render — and keeping it inside the single `#[cfg(test)]`
+    /// boundary preserves the source-scrape pin invariant relied on by
+    /// `peer_detail_panel_calls_estimator_helper_for_all_three_components` (the
+    /// first `#[cfg(test)]` marker must be the production/test boundary).
+    ///
+    /// The mismatch is meaningful in the #3967 / #4289 scenario: a browser is
+    /// still holding a cached homepage emitted by an old binary while a newer
+    /// binary is now the process actually answering requests. In that case the
+    /// asset version (frozen in the cached page) differs from the live runtime
+    /// version, and the page is genuinely stale — the user should refresh.
+    ///
+    /// The banner is shown **only** when both versions are known and they
+    /// differ. A missing/unknown version on either side (`""` or `"?"`, e.g. the
+    /// node is mid-startup and `network_status` has no snapshot yet) is treated
+    /// as "can't tell" and never triggers the banner, so the warning cannot fire
+    /// spuriously during startup. The comparison is an exact string match: any
+    /// difference in the published version string (including pre-release suffixes
+    /// like `0.2.68-rc1`) is a real asset/runtime divergence worth surfacing.
+    fn should_show_version_banner(asset_version: &str, runtime_version: &str) -> bool {
+        if !version_is_known(asset_version) || !version_is_known(runtime_version) {
+            return false;
+        }
+        asset_version != runtime_version
+    }
+
+    /// A version string is "known" when it is non-empty and not the `"?"`
+    /// placeholder used by the homepage when no `network_status` snapshot exists.
+    /// Reference for the JS `versionIsKnown`; see [`should_show_version_banner`].
+    fn version_is_known(version: &str) -> bool {
+        !version.is_empty() && version != "?"
+    }
+
+    #[test]
+    fn version_banner_hidden_when_versions_match() {
+        assert!(
+            !should_show_version_banner("0.2.49", "0.2.49"),
+            "identical asset and runtime versions must not show the banner"
+        );
+    }
+
+    #[test]
+    fn version_banner_shown_when_versions_differ() {
+        assert!(
+            should_show_version_banner("0.2.37", "0.2.49"),
+            "a stale cached asset version vs a newer runtime must show the banner"
+        );
+        // Direction is irrelevant: any divergence is worth surfacing.
+        assert!(
+            should_show_version_banner("0.2.49", "0.2.37"),
+            "asset newer than runtime is still a mismatch worth surfacing"
+        );
+    }
+
+    #[test]
+    fn version_banner_treats_prerelease_suffixes_as_distinct() {
+        // Pre-release / build-metadata suffixes are part of the published
+        // version string; an exact mismatch there is a real divergence.
+        assert!(
+            should_show_version_banner("0.2.68-rc1", "0.2.68"),
+            "0.2.68-rc1 and 0.2.68 are different builds and must mismatch"
+        );
+        assert!(
+            !should_show_version_banner("0.2.68-rc1", "0.2.68-rc1"),
+            "identical pre-release strings must not show the banner"
+        );
+    }
+
+    #[test]
+    fn version_banner_hidden_when_either_version_unknown() {
+        // Startup race: node has no snapshot yet, so the runtime version is
+        // the "?" placeholder or empty. The banner must not fire spuriously.
+        assert!(
+            !should_show_version_banner("0.2.49", "?"),
+            "unknown runtime version (?) must not trigger the banner"
+        );
+        assert!(
+            !should_show_version_banner("0.2.49", ""),
+            "empty runtime version must not trigger the banner"
+        );
+        assert!(
+            !should_show_version_banner("?", "0.2.49"),
+            "unknown asset version (?) must not trigger the banner"
+        );
+        assert!(
+            !should_show_version_banner("", "0.2.49"),
+            "empty asset version must not trigger the banner"
+        );
+        assert!(
+            !should_show_version_banner("?", "?"),
+            "both unknown must not trigger the banner"
+        );
+    }
+
+    #[test]
+    fn homepage_renders_version_mismatch_banner_slot() {
+        let html = homepage_html();
+        assert!(
+            html.contains("id=\"version-mismatch-banner\""),
+            "homepage must render a hidden banner slot the JS can reveal on mismatch"
+        );
+        assert!(
+            html.contains("data-asset-version="),
+            "banner slot must carry the compile-time asset version for the JS comparison"
+        );
+        // The slot must ship hidden so it never flashes before the live check.
+        let slot = extract_element_line(&html, "id=\"version-mismatch-banner\"");
+        assert!(
+            slot.contains("hidden"),
+            "version mismatch banner must be hidden by default, got: {slot}"
+        );
+    }
+
+    #[test]
+    fn js_contains_version_mismatch_check() {
+        assert!(
+            JS.contains("checkVersionMismatch"),
+            "JS must include the asset/runtime version mismatch check"
+        );
+        assert!(
+            JS.contains("/v1/version"),
+            "JS must query the runtime version endpoint"
+        );
+        // The JS must mirror should_show_version_banner: skip unknown ('?'/'')
+        // versions so the banner can't fire during startup.
+        assert!(
+            JS.contains("data-asset-version"),
+            "JS must read the baked-in asset version from the banner slot"
+        );
     }
 
     #[test]
