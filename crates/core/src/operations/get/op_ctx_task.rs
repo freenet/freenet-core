@@ -132,6 +132,12 @@ pub(crate) async fn start_client_get(
     subscribe: bool,
     blocking_subscribe: bool,
 ) -> Result<Transaction, OpError> {
+    // Phase 7 egress self-block (#4300): refuse to originate a GET for
+    // a contract this node has banned, BEFORE spawning the driver.
+    // Mirrors the receive-side `GetMsg::Request` drop in node.rs (PR
+    // #4299). The client gets a typed `ContractBanned` error.
+    crate::operations::reject_if_contract_banned(&op_manager, &instance_id)?;
+
     // Test-only: count driver invocations so integration tests can
     // assert the driver was actually called (as opposed to
     // `client_events.rs`'s local-cache shortcut satisfying the GET).
@@ -3426,6 +3432,30 @@ mod tests {
             spawn_block.contains("let _inflight_guard = inflight_guard;"),
             "the ClientOpGuard must be moved into the spawned future \
              via `let _inflight_guard = inflight_guard;`."
+        );
+    }
+
+    /// Phase 7 egress self-block pin (#4300). `start_client_get` MUST
+    /// reject a banned contract BEFORE spawning the driver task. Mirrors
+    /// the receive-side `get_dispatch_gates_banned_contracts` pin in
+    /// `ring/contract_ban_list.rs`. See the sibling pin in
+    /// `put/op_ctx_task.rs` for the full rationale.
+    #[test]
+    fn start_client_get_gates_banned_contracts_before_spawn() {
+        let src = include_str!("op_ctx_task.rs");
+        let entry = src
+            .find("pub(crate) async fn start_client_get(")
+            .expect("start_client_get must exist");
+        let after_spawn = src[entry..]
+            .find("GlobalExecutor::spawn(")
+            .expect("start_client_get must spawn a driver task");
+        let before_spawn = &src[entry..entry + after_spawn];
+        assert!(
+            before_spawn.contains("reject_if_contract_banned"),
+            "start_client_get must call reject_if_contract_banned() \
+             before GlobalExecutor::spawn so a banned contract's GET is \
+             rejected with a typed error instead of being driven to peers \
+             (#4300 egress self-block)."
         );
     }
 

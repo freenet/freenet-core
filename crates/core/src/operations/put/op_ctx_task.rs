@@ -64,6 +64,14 @@ pub(crate) async fn start_client_put(
     subscribe: bool,
     blocking_subscribe: bool,
 ) -> Result<Transaction, OpError> {
+    // Phase 7 egress self-block (#4300): refuse to originate a PUT for
+    // a contract this node has banned, BEFORE spawning the driver. The
+    // client gets a typed `ContractBanned` error instead of a request
+    // that proceeds to peers (who don't know about our ban) and then
+    // fails or silently succeeds. Mirrors the receive-side drop in
+    // node.rs added by PR #4299.
+    crate::operations::reject_if_contract_banned(&op_manager, contract.key().id())?;
+
     tracing::debug!(
         tx = %client_tx,
         contract = %contract.key(),
@@ -2629,6 +2637,34 @@ mod tests {
              for the full driver lifetime. A bare drop at the spawn \
              site would clear the counter before run_client_put even \
              starts."
+        );
+    }
+
+    /// Phase 7 egress self-block pin (#4300). `start_client_put` MUST
+    /// reject a banned contract BEFORE spawning the driver task, so a
+    /// banned contract's PUT never consumes outbound network resources.
+    /// Mirrors the receive-side `put_dispatch_gates_banned_contracts`
+    /// pin in `ring/contract_ban_list.rs`. Sibling pins live in the
+    /// other three `start_client_*` entry points and at the
+    /// `handle_broadcast_state_change` egress fan-out in p2p_protoc.rs.
+    /// If this fails, the egress gate was deleted or moved after the
+    /// spawn — re-establish it before re-running the suite.
+    #[test]
+    fn start_client_put_gates_banned_contracts_before_spawn() {
+        let src = include_str!("op_ctx_task.rs");
+        let entry = src
+            .find("pub(crate) async fn start_client_put(")
+            .expect("start_client_put must exist");
+        let after_spawn = src[entry..]
+            .find("GlobalExecutor::spawn(")
+            .expect("start_client_put must spawn a driver task");
+        let before_spawn = &src[entry..entry + after_spawn];
+        assert!(
+            before_spawn.contains("reject_if_contract_banned"),
+            "start_client_put must call reject_if_contract_banned() \
+             before GlobalExecutor::spawn so a banned contract's PUT is \
+             rejected with a typed error instead of being driven to peers \
+             that don't know about our ban (#4300 egress self-block)."
         );
     }
 

@@ -65,6 +65,14 @@ pub(crate) async fn start_client_subscribe(
     instance_id: ContractInstanceId,
     client_tx: Transaction,
 ) -> Result<Transaction, OpError> {
+    // Phase 7 egress self-block (#4300): refuse to originate a
+    // SUBSCRIBE for a contract this node has banned, BEFORE spawning
+    // the driver, so we don't register interest in something we have
+    // decided to reject. Mirrors the receive-side `SubscribeMsg::Request`
+    // drop in node.rs (PR #4299). The client gets a typed
+    // `ContractBanned` error.
+    crate::operations::reject_if_contract_banned(&op_manager, &instance_id)?;
+
     tracing::debug!(
         tx = %client_tx,
         contract = %instance_id,
@@ -1735,6 +1743,31 @@ mod tests {
         assert!(
             spawn_block.contains("let _inflight_guard = inflight_guard;"),
             "the ClientOpGuard must be moved into the spawned future."
+        );
+    }
+
+    /// Phase 7 egress self-block pin (#4300). `start_client_subscribe`
+    /// MUST reject a banned contract BEFORE spawning the driver, so we
+    /// don't register interest in a contract we have decided to reject.
+    /// Mirrors the receive-side `subscribe_dispatch_gates_banned_contracts`
+    /// pin in `ring/contract_ban_list.rs`. See the sibling pin in
+    /// `put/op_ctx_task.rs` for the full rationale.
+    #[test]
+    fn start_client_subscribe_gates_banned_contracts_before_spawn() {
+        let src = include_str!("op_ctx_task.rs");
+        let entry = src
+            .find("pub(crate) async fn start_client_subscribe(")
+            .expect("start_client_subscribe must exist");
+        let after_spawn = src[entry..]
+            .find("GlobalExecutor::spawn(")
+            .expect("start_client_subscribe must spawn a driver task");
+        let before_spawn = &src[entry..entry + after_spawn];
+        assert!(
+            before_spawn.contains("reject_if_contract_banned"),
+            "start_client_subscribe must call reject_if_contract_banned() \
+             before GlobalExecutor::spawn so a banned contract's SUBSCRIBE \
+             is rejected with a typed error instead of registering interest \
+             (#4300 egress self-block)."
         );
     }
 

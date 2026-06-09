@@ -117,6 +117,18 @@ pub(crate) enum OpError {
     /// `NodeEvent::Disconnect`.
     #[error("node is shutting down; client operation rejected")]
     NodeShuttingDown,
+
+    /// Phase 7 egress self-block (#4300): a local client tried to
+    /// originate a PUT/GET/SUBSCRIBE/UPDATE for a contract this node
+    /// has banned. The driver task is NOT spawned — we refuse to
+    /// launder requests for a contract we have decided is harmful. The
+    /// receive-side gate (PR #4299) already drops inbound requests for
+    /// the same contract; this is the complementary egress gate so the
+    /// ban is a true block, not just a receive-side filter. Surfaced to
+    /// the client as a typed error rather than silently proceeding into
+    /// a timeout.
+    #[error("contract {instance_id} is banned on this node; request rejected")]
+    ContractBanned { instance_id: ContractInstanceId },
 }
 
 impl OpError {
@@ -172,6 +184,45 @@ impl<T> From<SendError<T>> for OpError {
     fn from(_: SendError<T>) -> OpError {
         OpError::NotificationError
     }
+}
+
+/// Phase 7 egress self-block (#4300). Returns `Err(OpError::ContractBanned)`
+/// if `instance_id`'s contract is on this node's ban list, otherwise
+/// `Ok(())`.
+///
+/// Called at the top of every client-originator entry point
+/// (`start_client_put` / `_get` / `_subscribe` / `_update`) BEFORE the
+/// driver task is spawned, so a banned contract's request is rejected
+/// with a typed error instead of consuming this node's outbound network
+/// resources and then failing (or worse, succeeding at peers that don't
+/// know about our ban). This mirrors the receive-side wire-boundary drop
+/// added in PR #4299: a banned contract can neither receive new state via
+/// this node (receive gate) nor transmit new state via this node (this
+/// egress gate).
+///
+/// Keyed on `ContractInstanceId` because that is what the ban list keys
+/// on and what every entry point has available (`key.id()` for PUT/UPDATE,
+/// the bare `instance_id` for GET/SUBSCRIBE). Factored out of the four
+/// entry points so the gate logic is unit-testable against a
+/// `ContractBanList` directly, and so the early-return shape stays
+/// identical across ops. The fan-out egress path (`BroadcastStateChange`)
+/// has no client to notify, so it skips rather than erroring — that gate
+/// lives at its own call site in `p2p_protoc.rs`.
+pub(crate) fn reject_if_contract_banned(
+    op_manager: &OpManager,
+    instance_id: &ContractInstanceId,
+) -> Result<(), OpError> {
+    if op_manager.ring.contract_ban_list.is_banned(instance_id) {
+        tracing::debug!(
+            %instance_id,
+            phase = "egress_banned_reject",
+            "rejecting client-originated request for banned contract"
+        );
+        return Err(OpError::ContractBanned {
+            instance_id: *instance_id,
+        });
+    }
+    Ok(())
 }
 
 /// Announces to neighbors that we're hosting a contract.

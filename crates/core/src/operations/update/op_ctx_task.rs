@@ -99,6 +99,14 @@ pub(crate) async fn start_client_update(
     update_data: UpdateData<'static>,
     related_contracts: RelatedContracts<'static>,
 ) -> Result<Transaction, OpError> {
+    // Phase 7 egress self-block (#4300): refuse to originate an UPDATE
+    // for a contract this node has banned, BEFORE spawning the driver.
+    // This covers the client-originated UPDATE path; the delegate-driven
+    // broadcast fan-out is gated separately at `handle_broadcast_state_change`
+    // in p2p_protoc.rs. Mirrors the receive-side `UpdateMsg::*` drop in
+    // node.rs (PR #4299). The client gets a typed `ContractBanned` error.
+    crate::operations::reject_if_contract_banned(&op_manager, key.id())?;
+
     tracing::debug!(
         tx = %client_tx,
         contract = %key,
@@ -1903,6 +1911,51 @@ mod tests {
         assert!(
             spawn_block.contains("let _inflight_guard = inflight_guard;"),
             "the ClientOpGuard must be moved into the spawned future."
+        );
+    }
+
+    /// Phase 7 egress self-block pin (#4300). `start_client_update` MUST
+    /// reject a banned contract BEFORE spawning the driver. Mirrors the
+    /// receive-side `update_dispatch_gates_banned_contracts` pin in
+    /// `ring/contract_ban_list.rs`. See the sibling pin in
+    /// `put/op_ctx_task.rs` for the full rationale. The delegate-driven
+    /// broadcast fan-out is gated separately at
+    /// `handle_broadcast_state_change` in p2p_protoc.rs (pinned there).
+    #[test]
+    fn start_client_update_gates_banned_contracts_before_spawn() {
+        let src = include_str!("op_ctx_task.rs");
+        let entry = src
+            .find("pub(crate) async fn start_client_update(")
+            .expect("start_client_update must exist");
+        let after_spawn = src[entry..]
+            .find("GlobalExecutor::spawn(")
+            .expect("start_client_update must spawn a driver task");
+        let before_spawn = &src[entry..entry + after_spawn];
+        assert!(
+            before_spawn.contains("reject_if_contract_banned"),
+            "start_client_update must call reject_if_contract_banned() \
+             before GlobalExecutor::spawn so a banned contract's UPDATE \
+             is rejected with a typed error instead of being driven to \
+             peers (#4300 egress self-block)."
+        );
+    }
+
+    /// Phase 7 egress self-block pin (#4300). The typed
+    /// `OpError::ContractBanned` raised by the egress gate MUST be
+    /// translated to a client-visible error in `report_op_init_error`
+    /// (`client_events.rs`). The match there is exhaustive (no wildcard),
+    /// so a missing arm fails to compile — but this pin documents the
+    /// requirement and fails loudly if someone routes ContractBanned to
+    /// an inappropriate handler (e.g. silently swallows it).
+    #[test]
+    fn report_op_init_error_handles_contract_banned() {
+        let src = include_str!("../../client_events.rs");
+        assert!(
+            src.contains("OpError::ContractBanned"),
+            "report_op_init_error in client_events.rs must explicitly \
+             handle OpError::ContractBanned so the egress self-block \
+             (#4300) surfaces a typed error to the client instead of a \
+             silent proceed-then-timeout."
         );
     }
 

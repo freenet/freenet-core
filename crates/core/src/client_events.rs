@@ -336,7 +336,14 @@ async fn report_op_init_error(
         // so this also serves as the source-of-truth for the
         // user-visible shape of `OpError::NodeShuttingDown`.
         OpError::NodeShuttingDown => ErrorKind::Shutdown,
-        OpError::RingError(crate::ring::RingError::ConnError(_))
+        // Phase 7 egress self-block (#4300): a local client originated a
+        // request for a contract this node has banned. Surface as a
+        // typed `OperationError` (no dedicated wire variant exists in
+        // stdlib, and adding one would be a wire-format change requiring
+        // a separate stdlib-first release) so the client sees a clear,
+        // contract-named reason instead of a silent timeout.
+        OpError::ContractBanned { .. }
+        | OpError::RingError(crate::ring::RingError::ConnError(_))
         | OpError::RingError(crate::ring::RingError::NoHostingPeers(_))
         | OpError::ConnError(_)
         | OpError::ContractError(_)
@@ -2343,5 +2350,46 @@ pub(crate) mod test {
              failure if the shutdown signal is swallowed into the \
              catch-all."
         );
+    }
+
+    /// Phase 7 egress self-block (#4300): `OpError::ContractBanned`
+    /// (returned by `start_client_*` when the local client originates a
+    /// request for a banned contract) must map to a client-visible
+    /// `ErrorKind::OperationError` whose cause names the contract — NOT a
+    /// silent proceed-then-timeout. Replicates the relevant arm of
+    /// `report_op_init_error` to avoid constructing the full `OpManager`
+    /// fixture (same approach as the NodeShuttingDown pin above). The
+    /// production match is exhaustive, so a missing arm fails to compile;
+    /// this test additionally locks the user-visible shape.
+    #[test]
+    fn op_error_contract_banned_maps_to_operation_error_with_cause() {
+        use crate::operations::OpError;
+        use freenet_stdlib::client_api::ErrorKind;
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let instance_id = ContractInstanceId::new([7u8; 32]);
+        let err = OpError::ContractBanned { instance_id };
+        let op_name = "PUT";
+        let kind = match err {
+            OpError::ContractBanned { .. } => ErrorKind::OperationError {
+                cause: format!("{op_name} operation failed: {err}").into(),
+            },
+            // Other variants are irrelevant to this test.
+            _ => ErrorKind::Unhandled {
+                cause: "irrelevant for this test".to_string().into(),
+            },
+        };
+        match kind {
+            ErrorKind::OperationError { cause } => {
+                assert!(
+                    cause.contains("banned"),
+                    "ContractBanned cause must mention the ban so the \
+                     client understands why the request was rejected; got: {cause}"
+                );
+            }
+            other => panic!(
+                "OpError::ContractBanned must map to ErrorKind::OperationError, got {other:?}"
+            ),
+        }
     }
 }

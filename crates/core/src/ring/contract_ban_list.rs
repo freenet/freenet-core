@@ -20,16 +20,30 @@
 //!
 //! - **Responses to our own outbound requests.** If we sent a request
 //!   before the ban kicked in, allowing the reply completes that
-//!   transaction cleanly. The next request we make for the contract
-//!   would be self-blocked at the egress (Phase 7 follow-up); for now
-//!   we focus on the receive side.
+//!   transaction cleanly. The next request we originate for the contract
+//!   is self-blocked at the egress entry points
+//!   (`operations::reject_if_contract_banned`, called from every
+//!   `start_client_*` driver — #4300).
 //! - **Peer-level messages** (ConnectMsg, etc.) — those are the peer
 //!   layer's concern, not the contract layer.
+//! ## Egress self-blocking (#4300)
+//!
+//! Beyond the receive boundary, the ban also gates every path by which
+//! this node could *transmit* state for a banned contract. These gates
+//! live at the egress sites, not here:
+//!
+//! - **Client-originated requests.** `start_client_put` / `_get` /
+//!   `_subscribe` / `_update` call `operations::reject_if_contract_banned`
+//!   before spawning the driver, returning `OpError::ContractBanned` to
+//!   the local client.
+//! - **Delegate-driven UPDATE fan-out.** `handle_broadcast_state_change`
+//!   (p2p_protoc.rs) skips the broadcast for a banned contract.
 //! - **Proactive state egress for already-hosted contracts**
 //!   (`NeighborHosting` overlap sync, `InterestSync::Summaries` stale
-//!   repair). These paths are also gated (see node.rs) but the gates
-//!   live at the egress sites, not here. See issue tracking egress
-//!   self-blocking for the full design.
+//!   repair). Gated in node.rs (PR #4299).
+//!
+//! Together with the receive-side drops, a banned contract can neither
+//! receive new state via this node nor transmit new state via it.
 //!
 //! ## Two ways entries get added
 //!
