@@ -208,6 +208,12 @@ impl<T> From<SendError<T>> for OpError {
 /// identical across ops. The fan-out egress path (`BroadcastStateChange`)
 /// has no client to notify, so it skips rather than erroring — that gate
 /// lives at its own call site in `p2p_protoc.rs`.
+///
+/// # Errors
+///
+/// Returns `Err(OpError::ContractBanned { instance_id })` when the
+/// contract is currently on this node's `ContractBanList`. Returns
+/// `Ok(())` for any non-banned (or expired-ban) contract.
 pub(crate) fn reject_if_contract_banned(
     op_manager: &OpManager,
     instance_id: &ContractInstanceId,

@@ -6162,5 +6162,31 @@ mod tests {
              contract's broadcast is skipped — including the no-target retry \
              re-emission. Body:\n{body}"
         );
+
+        // Regression guard for the `fix(governance): clear broadcast retry
+        // state on banned-egress skip` commit: the banned-skip branch must
+        // also clear the per-contract retry/streak bookkeeping, otherwise a
+        // contract banned mid-retry-cycle leaves a stale entry that nothing
+        // clears until it is unbanned and broadcast again. We scope the
+        // assertion to the banned-skip branch (between the gate and its
+        // early `return;`) so deleting either `remove()` call fails this
+        // test — the gate-ordering assertion above passes even without
+        // them.
+        let banned_branch = &body[gate_pos..];
+        let return_pos = banned_branch
+            .find("return;")
+            .expect("banned-egress branch must early-return");
+        let banned_branch = &banned_branch[..return_pos];
+        assert!(
+            banned_branch.contains("self.broadcast_retries.remove(&key)"),
+            "banned-egress skip must clear broadcast_retries for the contract \
+             so a ban mid-retry-cycle doesn't leave a stale entry. Branch:\n{banned_branch}"
+        );
+        assert!(
+            banned_branch.contains("self.broadcast_no_target_streak.remove(&key)"),
+            "banned-egress skip must clear broadcast_no_target_streak for the \
+             contract so a ban mid-retry-cycle doesn't leave a stale entry. \
+             Branch:\n{banned_branch}"
+        );
     }
 }
