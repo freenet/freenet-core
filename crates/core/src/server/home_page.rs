@@ -20,48 +20,6 @@ pub(super) async fn peer_detail(Path(address): Path<String>) -> impl IntoRespons
     Html(peer_detail_html(&address))
 }
 
-/// Reference specification of the "stale assets" banner rule, used to test
-/// the logic the homepage JS implements client-side.
-///
-/// The actual mismatch detection runs in the browser (see
-/// `checkVersionMismatch` in [`JS`]): the served page bakes in its
-/// `asset_version` (the build that generated the HTML/JS the browser is
-/// running) and fetches the live `runtime_version` from `/v1/version` at page
-/// load. This Rust function is the canonical, unit-testable statement of when
-/// the banner should appear; the JS mirrors it exactly. Keeping it here (and
-/// tested) makes the rule's edge cases explicit and guards against the JS
-/// drifting from the intended behaviour. It is `#[cfg(test)]` because the
-/// production decision is made in JS, not in the server-side render.
-///
-/// The mismatch is meaningful in the #3967 / #4289 scenario: a browser is
-/// still holding a cached homepage emitted by an old binary while a newer
-/// binary is now the process actually answering requests. In that case the
-/// asset version (frozen in the cached page) differs from the live runtime
-/// version, and the page is genuinely stale — the user should refresh.
-///
-/// The banner is shown **only** when both versions are known and they
-/// differ. A missing/unknown version on either side (`""` or `"?"`, e.g. the
-/// node is mid-startup and `network_status` has no snapshot yet) is treated
-/// as "can't tell" and never triggers the banner, so the warning cannot fire
-/// spuriously during startup. The comparison is an exact string match: any
-/// difference in the published version string (including pre-release suffixes
-/// like `0.2.68-rc1`) is a real asset/runtime divergence worth surfacing.
-#[cfg(test)]
-fn should_show_version_banner(asset_version: &str, runtime_version: &str) -> bool {
-    if !version_is_known(asset_version) || !version_is_known(runtime_version) {
-        return false;
-    }
-    asset_version != runtime_version
-}
-
-/// A version string is "known" when it is non-empty and not the `"?"`
-/// placeholder used by the homepage when no `network_status` snapshot exists.
-/// Reference for the JS `versionIsKnown`; see [`should_show_version_banner`].
-#[cfg(test)]
-fn version_is_known(version: &str) -> bool {
-    !version.is_empty() && version != "?"
-}
-
 fn homepage_html() -> String {
     let snap = network_status::get_snapshot();
 
@@ -3996,6 +3954,50 @@ mod tests {
     }
 
     // ── Asset/runtime version mismatch banner (#4289) ──────────────────────
+
+    /// Reference specification of the "stale assets" banner rule, used to test
+    /// the logic the homepage JS implements client-side.
+    ///
+    /// The actual mismatch detection runs in the browser (see
+    /// `checkVersionMismatch` in [`JS`]): the served page bakes in its
+    /// `asset_version` (the build that generated the HTML/JS the browser is
+    /// running) and fetches the live `runtime_version` from `/v1/version` at page
+    /// load. This Rust function is the canonical, unit-testable statement of when
+    /// the banner should appear; the JS mirrors it exactly. Keeping it here (and
+    /// tested) makes the rule's edge cases explicit and guards against the JS
+    /// drifting from the intended behaviour. It lives in the test module (not as
+    /// production code) because the production decision is made in JS, not in the
+    /// server-side render — and keeping it inside the single `#[cfg(test)]`
+    /// boundary preserves the source-scrape pin invariant relied on by
+    /// `peer_detail_panel_calls_estimator_helper_for_all_three_components` (the
+    /// first `#[cfg(test)]` marker must be the production/test boundary).
+    ///
+    /// The mismatch is meaningful in the #3967 / #4289 scenario: a browser is
+    /// still holding a cached homepage emitted by an old binary while a newer
+    /// binary is now the process actually answering requests. In that case the
+    /// asset version (frozen in the cached page) differs from the live runtime
+    /// version, and the page is genuinely stale — the user should refresh.
+    ///
+    /// The banner is shown **only** when both versions are known and they
+    /// differ. A missing/unknown version on either side (`""` or `"?"`, e.g. the
+    /// node is mid-startup and `network_status` has no snapshot yet) is treated
+    /// as "can't tell" and never triggers the banner, so the warning cannot fire
+    /// spuriously during startup. The comparison is an exact string match: any
+    /// difference in the published version string (including pre-release suffixes
+    /// like `0.2.68-rc1`) is a real asset/runtime divergence worth surfacing.
+    fn should_show_version_banner(asset_version: &str, runtime_version: &str) -> bool {
+        if !version_is_known(asset_version) || !version_is_known(runtime_version) {
+            return false;
+        }
+        asset_version != runtime_version
+    }
+
+    /// A version string is "known" when it is non-empty and not the `"?"`
+    /// placeholder used by the homepage when no `network_status` snapshot exists.
+    /// Reference for the JS `versionIsKnown`; see [`should_show_version_banner`].
+    fn version_is_known(version: &str) -> bool {
+        !version.is_empty() && version != "?"
+    }
 
     #[test]
     fn version_banner_hidden_when_versions_match() {
