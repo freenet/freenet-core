@@ -121,9 +121,11 @@ pub(crate) enum BanOutcome {
     /// updated in place. No new slot was consumed.
     Updated,
     /// The ban list was at [`MAX_BANNED_CONTRACTS`] and this add could
-    /// not be admitted. For [`BanReason::Operator`] adds this means the
-    /// list is full of reaper-driven (`AutoMad`) bans, which take
-    /// precedence. The contract is NOT banned.
+    /// not be admitted, so the contract is NOT banned. Two ways to hit
+    /// this: an [`BanReason::Operator`] add when the list is full (it can
+    /// never displace a reaper-driven ban), or a [`BanReason::AutoMad`]
+    /// add when the list is full *and* entirely reaper-driven (no
+    /// `Operator` entry to evict).
     CapacityExceeded,
 }
 
@@ -503,6 +505,31 @@ mod tests {
             bl.is_banned(&contract),
             "extended ban window must keep contract banned past original expiry"
         );
+    }
+
+    // Superseded by the #4303 cap (PR #4370): before the size cap, an
+    // operator re-ban "won" and overwrote the stored reason to Operator.
+    // The cap introduced an eviction rule where Operator entries are the
+    // evictable (lower-priority) ones, so that old semantic would let an
+    // operator re-ban downgrade a node-made security (AutoMad) ban into a
+    // displaceable entry. The behavior was deliberately inverted —
+    // AutoMad now dominates (see `auto_reason_dominates_operator_on_reban`
+    // below). Kept here, ignored, as historical documentation of the
+    // pre-cap behavior and why it changed.
+    #[ignore = "superseded by #4303 cap: AutoMad now dominates Operator on re-ban (PR #4370)"]
+    #[test]
+    fn operator_reason_wins_over_auto() {
+        let (bl, ts) = mk_ban_list();
+        let contract = mk_contract(1);
+        let now = ts.now();
+        bl.ban(contract, now + Duration::from_secs(60), BanReason::AutoMad);
+        bl.ban(contract, now + Duration::from_secs(60), BanReason::Operator);
+        // Pre-cap invariant (NO LONGER TRUE): operator action shouldn't
+        // be overwritten by a later auto flip.
+        bl.ban(contract, now + Duration::from_secs(60), BanReason::AutoMad);
+        assert!(bl.is_banned(&contract));
+        let entry = bl.entries.get(&contract).unwrap();
+        assert_eq!(entry.reason, BanReason::Operator);
     }
 
     #[test]
