@@ -200,9 +200,13 @@ impl ContractBanList {
     /// and reason.
     ///
     /// Idempotent for an already-banned contract: re-banning extends
-    /// the expiry to whichever value is later (never shortens it) and
-    /// upgrades the reason to `Operator` if applicable. This path
-    /// consumes no new slot and is never capacity-rejected.
+    /// the expiry to whichever value is later (never shortens it). The
+    /// stored reason is the *higher-priority* of the existing and
+    /// incoming reasons: [`BanReason::AutoMad`] dominates
+    /// [`BanReason::Operator`], so once a contract has been auto-banned
+    /// by the node's own security logic, a later operator re-ban cannot
+    /// downgrade it to an evictable `Operator` entry. This path consumes
+    /// no new slot and is never capacity-rejected.
     ///
     /// New-contract inserts are bounded by [`Self::max_banned`]
     /// (production: [`MAX_BANNED_CONTRACTS`]). A slot is reserved with
@@ -228,66 +232,74 @@ impl ContractBanList {
         reason: BanReason,
     ) -> BanOutcome {
         use dashmap::mapref::entry::Entry;
-        match self.entries.entry(contract) {
-            Entry::Occupied(mut e) => {
-                let cur = e.get_mut();
-                // Keep whichever expiry is later — re-bans should
-                // never shorten an existing ban window.
-                if expires_at > cur.expires_at {
-                    cur.expires_at = expires_at;
+        // Loop (not recursion) so that an AutoMad ban that has to evict
+        // an Operator entry to make room re-attempts iteratively. Each
+        // iteration either succeeds, fails terminally, or evicts exactly
+        // one Operator entry; the number of Operator entries strictly
+        // decreases per eviction, so the loop terminates and uses O(1)
+        // stack regardless of how full the list is.
+        loop {
+            match self.entries.entry(contract) {
+                Entry::Occupied(mut e) => {
+                    let cur = e.get_mut();
+                    // Keep whichever expiry is later — re-bans should
+                    // never shorten an existing ban window.
+                    if expires_at > cur.expires_at {
+                        cur.expires_at = expires_at;
+                    }
+                    // Reason priority: AutoMad dominates Operator. A
+                    // reaper-driven (security) ban must never be
+                    // downgraded to an evictable Operator entry by a
+                    // later operator re-ban — that would let operator
+                    // input (or an attacker reaching the CLI) make a
+                    // node-made security decision displaceable under the
+                    // eviction rule below. Equivalently: the entry
+                    // becomes/stays AutoMad if either side is AutoMad.
+                    if matches!(reason, BanReason::AutoMad) {
+                        cur.reason = BanReason::AutoMad;
+                    }
+                    return BanOutcome::Updated;
                 }
-                // Reason: operator wins over auto, since explicit
-                // operator action should not be overwritten by a
-                // later auto-flip.
-                if matches!(reason, BanReason::Operator) {
-                    cur.reason = BanReason::Operator;
-                }
-                BanOutcome::Updated
-            }
-            Entry::Vacant(e) => {
-                // New contract: reserve a slot via the authoritative
-                // counter BEFORE inserting. `fetch_add` is the
-                // serialization point — concurrent new-key inserts
-                // strictly serialize, no overshoot beyond the cap.
-                let prev = self.size.fetch_add(1, Ordering::Relaxed);
-                if prev < self.max_banned {
-                    e.insert(BanEntry { expires_at, reason });
-                    return BanOutcome::Banned;
-                }
+                Entry::Vacant(e) => {
+                    // New contract: reserve a slot via the authoritative
+                    // counter BEFORE inserting. `fetch_add` is the
+                    // serialization point — concurrent new-key inserts
+                    // strictly serialize, no overshoot beyond the cap.
+                    let prev = self.size.fetch_add(1, Ordering::Relaxed);
+                    if prev < self.max_banned {
+                        e.insert(BanEntry { expires_at, reason });
+                        return BanOutcome::Banned;
+                    }
 
-                // At capacity. Roll back the speculative reservation
-                // and release the per-shard guard before doing anything
-                // that touches other shards.
-                self.size.fetch_sub(1, Ordering::Relaxed);
-                drop(e);
+                    // At capacity. Roll back the speculative reservation
+                    // and release the per-shard guard before doing
+                    // anything that touches other shards.
+                    self.size.fetch_sub(1, Ordering::Relaxed);
+                    drop(e);
 
-                // Reaper-driven bans take precedence: try to evict one
-                // Operator entry to free a slot, then re-attempt the
-                // insert. The guard is released above because
-                // `evict_one_operator` walks every shard via `retain`
-                // — holding a shard guard across it would deadlock.
-                if matches!(reason, BanReason::AutoMad) && self.evict_one_operator() {
-                    // `evict_one_operator` decremented the counter for
-                    // the evicted entry, so the list is now below the
-                    // cap. Re-attempt via the public path so the freed
-                    // slot is re-reserved atomically against concurrent
-                    // callers (the slot is NOT held between the two
-                    // calls — another thread may grab it, in which case
-                    // the recursion either evicts again or returns
-                    // CapacityExceeded). Recursion depth is bounded by
-                    // the number of Operator entries, which strictly
-                    // decreases on each eviction.
-                    return self.ban(contract, expires_at, reason);
+                    // Reaper-driven bans take precedence: try to evict
+                    // one Operator entry to free a slot, then re-attempt
+                    // the insert from the top of the loop. The guard is
+                    // released above because `evict_one_operator` walks
+                    // every shard via `retain` — holding a shard guard
+                    // across it would deadlock. The freed slot is NOT
+                    // held between the eviction and the re-attempt;
+                    // another thread may grab it, in which case the next
+                    // iteration either evicts again or falls through to
+                    // CapacityExceeded.
+                    if matches!(reason, BanReason::AutoMad) && self.evict_one_operator() {
+                        continue;
+                    }
+
+                    self.capacity_rejected_total.fetch_add(1, Ordering::Relaxed);
+                    tracing::debug!(
+                        %contract,
+                        ?reason,
+                        max_banned = self.max_banned,
+                        "contract ban rejected: ban list at capacity"
+                    );
+                    return BanOutcome::CapacityExceeded;
                 }
-
-                self.capacity_rejected_total.fetch_add(1, Ordering::Relaxed);
-                tracing::debug!(
-                    %contract,
-                    ?reason,
-                    max_banned = self.max_banned,
-                    "contract ban rejected: ban list at capacity"
-                );
-                BanOutcome::CapacityExceeded
             }
         }
     }
@@ -494,21 +506,35 @@ mod tests {
     }
 
     #[test]
-    fn operator_reason_wins_over_auto() {
+    fn auto_reason_dominates_operator_on_reban() {
+        // Semantics changed by the #4303 cap: AutoMad now DOMINATES
+        // Operator on a re-ban (previously Operator won). The cap's
+        // eviction rule makes Operator the evictable / lower-priority
+        // reason, so a reaper-driven (security) ban must not be
+        // downgraded to Operator by a later operator re-ban — otherwise
+        // an operator (or attacker reaching the CLI) could make a
+        // node-made security decision displaceable. See
+        // `auto_ban_evicts_operator_entry_at_cap`.
         let (bl, ts) = mk_ban_list();
         let contract = mk_contract(1);
         let now = ts.now();
-        bl.ban(contract, now + Duration::from_secs(60), BanReason::AutoMad);
+        // Operator-ban first, then a reaper auto-ban: must end AutoMad.
         bl.ban(contract, now + Duration::from_secs(60), BanReason::Operator);
-        // We don't expose `reason` publicly yet (Phase 7 follow-up
-        // surfaces it on the dashboard), but the invariant matters:
-        // operator action shouldn't be overwritten by a later auto
-        // flip. Test via a fresh override.
         bl.ban(contract, now + Duration::from_secs(60), BanReason::AutoMad);
         assert!(bl.is_banned(&contract));
-        // Direct inspect via internal field for test.
-        let entry = bl.entries.get(&contract).unwrap();
-        assert_eq!(entry.reason, BanReason::Operator);
+        assert_eq!(
+            bl.entries.get(&contract).unwrap().reason,
+            BanReason::AutoMad,
+            "a reaper auto-ban must upgrade an existing operator entry to AutoMad"
+        );
+
+        // And a later operator re-ban must NOT downgrade it back.
+        bl.ban(contract, now + Duration::from_secs(60), BanReason::Operator);
+        assert_eq!(
+            bl.entries.get(&contract).unwrap().reason,
+            BanReason::AutoMad,
+            "an operator re-ban must never downgrade a security (AutoMad) ban"
+        );
     }
 
     #[test]
