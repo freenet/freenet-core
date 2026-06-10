@@ -132,6 +132,15 @@ jobs:
           check "build: replace local release build"           "non-release"
           check ""                                             "non-release"
 
+      # Regression gate for the gateway-update verify decision (the vega
+      # v0.2.71 incident: binary swapped, service down, workflow falsely
+      # reported success). The decision logic in
+      # scripts/release-agent/verify-version-decision.sh is sourced both by
+      # gateway-update.yml and by this test, so they cannot drift. The
+      # load-bearing case is "service_active:false must NOT report success".
+      - name: Self-test gateway-update verify decision
+        run: bash scripts/release-agent/verify-version-decision_test.sh
+
       - name: Check for old-style mod.rs files
         run: |
           # New modules must use foo.rs + foo/ style, not foo/mod.rs

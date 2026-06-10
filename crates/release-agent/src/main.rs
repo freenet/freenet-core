@@ -13,7 +13,7 @@ use freenet_release_agent::{
     github::GitHubLatest,
     server::{AppState, build_router, serve},
     updater::Updater,
-    version::VersionCache,
+    version::{ServiceHealthCache, VersionCache},
 };
 
 #[derive(Parser)]
@@ -65,6 +65,8 @@ async fn main() -> Result<()> {
         updater,
         announcer,
         version_cache: VersionCache::new(),
+        service_health_cache: ServiceHealthCache::new(),
+        systemctl_path: PathBuf::from("systemctl"),
         last_update_attempt: Arc::new(Mutex::new(None)),
         last_announce_attempt: Arc::new(Mutex::new(None)),
     };
