@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use semver::Version;
@@ -89,33 +89,101 @@ fn parse_version_output(out: &str) -> Result<Version> {
         .with_context(|| format!("could not parse version from {out:?}"))
 }
 
-/// Query whether the managed gateway service is running, via
-/// `systemctl is-active <service>`.
+/// TTL for the [`ServiceHealthCache`]. The release workflow polls `/version`
+/// every 5s; a 2s TTL means at most one `systemctl` fork per poll while still
+/// being far fresher than the poll cadence, so the workflow never acts on a
+/// stale "active" reading for more than one cycle. The cache exists for the
+/// same reason as [`VersionCache`]: `/version` is UNAUTHENTICATED, so forking a
+/// subprocess on every hit is a cheap self-DoS vector.
+const SERVICE_HEALTH_TTL: Duration = Duration::from_secs(2);
+
+/// Caches the result of `systemctl is-active <service>` for a short TTL.
 ///
-/// The `/version` endpoint reports the ON-DISK binary version. That is not
-/// the same question as "is the gateway actually running it": during the
-/// v0.2.71 release the vega gateway's binary was swapped to 0.2.71 but the
-/// service failed to restart (old process hung on shutdown → SIGKILL → unit
-/// left `failed`). `/version` still reported 0.2.71, so the release workflow
-/// reported success while the gateway was DOWN for ~5 minutes. Surfacing the
-/// service state lets the workflow tell those two cases apart.
+/// The `/version` endpoint reports the ON-DISK binary version, which is NOT the
+/// same question as "is the gateway actually running it": during the v0.2.71
+/// release the vega gateway's binary was swapped to 0.2.71 but the service
+/// failed to restart (old process hung on shutdown → SIGKILL → unit left
+/// `failed`). `/version` still reported 0.2.71, so the release workflow reported
+/// success while the gateway was DOWN for ~5 minutes. Reporting the service
+/// state lets the workflow tell those two cases apart.
 ///
-/// Returns `Ok(true)` only when systemd reports the unit `active`. `inactive`,
+/// # Why a TTL cache
+///
+/// `/version` is unauthenticated. Without caching, every request would fork
+/// `systemctl` — the exact self-DoS vector [`VersionCache`] was built to
+/// eliminate for `freenet --version`. The TTL ([`SERVICE_HEALTH_TTL`]) is short
+/// relative to the workflow's 5s poll so a freshly-restarted (or freshly-failed)
+/// service is reflected within one poll cycle.
+///
+/// # Reliance on the update-script ordering
+///
+/// The workflow treats `installed == VERSION && service_active == true` as a
+/// successful update. That is only sound because `deploy-local-gateway.sh`
+/// (what `/update` ultimately spawns via `gateway-auto-update.sh`) performs
+/// **stop → swap binary → start**: the service is DOWN while the on-disk binary
+/// is replaced, so the binary only reads as "new" once the service has been
+/// restarted onto it. There is therefore no window where the OLD process is
+/// still `active` while the binary already reads as new. If that script is ever
+/// changed to swap-then-restart, this check would need to additionally verify
+/// the running process is the new binary (e.g. via `ActiveEnterTimestamp`); see
+/// the comment in `.github/workflows/gateway-update.yml`.
+#[derive(Default, Clone)]
+pub struct ServiceHealthCache {
+    inner: Arc<Mutex<Option<CachedServiceHealth>>>,
+}
+
+struct CachedServiceHealth {
+    service: String,
+    active: bool,
+    checked_at: Instant,
+}
+
+impl ServiceHealthCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return whether `service` is `active`, using the cached value if it is
+    /// younger than [`SERVICE_HEALTH_TTL`] and for the same service name.
+    /// Resolves `systemctl` via PATH.
+    pub async fn is_active(&self, service: &str) -> bool {
+        self.is_active_with(Path::new("systemctl"), service).await
+    }
+
+    /// [`Self::is_active`] with the `systemctl` binary path injected so tests
+    /// can point at a stub without real systemd. Production callers use
+    /// [`Self::is_active`].
+    pub async fn is_active_with(&self, systemctl: &Path, service: &str) -> bool {
+        {
+            let guard = self.inner.lock().await;
+            if let Some(c) = guard.as_ref() {
+                if c.service == service && c.checked_at.elapsed() < SERVICE_HEALTH_TTL {
+                    return c.active;
+                }
+            }
+        }
+
+        let active = query_service_active(systemctl, service).await;
+        let mut guard = self.inner.lock().await;
+        *guard = Some(CachedServiceHealth {
+            service: service.to_string(),
+            active,
+            checked_at: Instant::now(),
+        });
+        active
+    }
+}
+
+/// Run `systemctl is-active <service>` once and interpret the result.
+///
+/// Returns `true` only when systemd reports the unit `active`. `inactive`,
 /// `failed`, `activating`, an unknown unit, or a missing/erroring `systemctl`
-/// all map to `Ok(false)` — never an error and never a panic. `systemctl
-/// is-active` is a read-only query that does not require root, so no sudo is
-/// involved.
+/// all map to `false` — never an error and never a panic. `systemctl is-active`
+/// is a read-only query that does not require root, so no sudo is involved.
 ///
 /// Note: `is-active` exits non-zero for any non-active state, so we key on the
 /// printed state word (stdout) rather than the exit status.
-pub async fn service_active(service: &str) -> bool {
-    service_active_with(Path::new("systemctl"), service).await
-}
-
-/// Implementation of [`service_active`] with the `systemctl` binary path
-/// injected so tests can point at a stub without real systemd. Production
-/// callers use [`service_active`], which resolves `systemctl` via PATH.
-async fn service_active_with(systemctl: &Path, service: &str) -> bool {
+async fn query_service_active(systemctl: &Path, service: &str) -> bool {
     let unit = if service.ends_with(".service") {
         service.to_string()
     } else {
@@ -181,11 +249,16 @@ mod tests {
 
     /// Write a stub `systemctl` that prints `state` on stdout and exits 0 for
     /// `active`, 3 otherwise — matching real `systemctl is-active` behaviour
-    /// (non-active states exit non-zero but still print the state word).
-    fn write_stub_systemctl(dir: &Path, state: &str) -> PathBuf {
+    /// (non-active states exit non-zero but still print the state word). Each
+    /// invocation also appends a line to `counter_path` so a test can assert
+    /// how many times the stub was forked (cache coverage).
+    fn write_stub_systemctl_counting(dir: &Path, state: &str, counter_path: &Path) -> PathBuf {
         let bin = dir.join("fake-systemctl");
         let exit = if state == "active" { 0 } else { 3 };
-        let script = format!("#!/bin/sh\necho {state}\nexit {exit}\n");
+        let script = format!(
+            "#!/bin/sh\necho x >> {counter}\necho {state}\nexit {exit}\n",
+            counter = counter_path.display()
+        );
         let mut f = std::fs::File::create(&bin).unwrap();
         f.write_all(script.as_bytes()).unwrap();
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
@@ -194,11 +267,16 @@ mod tests {
         bin
     }
 
+    /// Convenience: stub `systemctl` without a fork counter.
+    fn write_stub_systemctl(dir: &Path, state: &str) -> PathBuf {
+        write_stub_systemctl_counting(dir, state, &dir.join("ignored-count"))
+    }
+
     #[tokio::test]
     async fn service_active_true_when_systemctl_reports_active() {
         let dir = tempfile::tempdir().unwrap();
         let systemctl = write_stub_systemctl(dir.path(), "active");
-        assert!(service_active_with(&systemctl, "freenet-gateway").await);
+        assert!(query_service_active(&systemctl, "freenet-gateway").await);
     }
 
     #[tokio::test]
@@ -206,14 +284,14 @@ mod tests {
         // The vega v0.2.71 case: binary swapped, but the unit is `failed`.
         let dir = tempfile::tempdir().unwrap();
         let systemctl = write_stub_systemctl(dir.path(), "failed");
-        assert!(!service_active_with(&systemctl, "freenet-gateway").await);
+        assert!(!query_service_active(&systemctl, "freenet-gateway").await);
     }
 
     #[tokio::test]
     async fn service_active_false_when_inactive() {
         let dir = tempfile::tempdir().unwrap();
         let systemctl = write_stub_systemctl(dir.path(), "inactive");
-        assert!(!service_active_with(&systemctl, "freenet-gateway").await);
+        assert!(!query_service_active(&systemctl, "freenet-gateway").await);
     }
 
     #[tokio::test]
@@ -221,7 +299,7 @@ mod tests {
         // `activating` is not yet up; must not be counted as active.
         let dir = tempfile::tempdir().unwrap();
         let systemctl = write_stub_systemctl(dir.path(), "activating");
-        assert!(!service_active_with(&systemctl, "freenet-gateway").await);
+        assert!(!query_service_active(&systemctl, "freenet-gateway").await);
     }
 
     #[tokio::test]
@@ -230,7 +308,50 @@ mod tests {
         // error — just report the service as not active.
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist-systemctl");
-        assert!(!service_active_with(&missing, "freenet-gateway").await);
+        assert!(!query_service_active(&missing, "freenet-gateway").await);
+    }
+
+    #[tokio::test]
+    async fn service_health_cache_does_not_refork_within_ttl() {
+        // The unauthenticated /version endpoint must NOT fork systemctl on
+        // every hit (self-DoS vector). A second lookup within the TTL must be
+        // served from cache, so the stub is forked exactly once.
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("count");
+        let systemctl = write_stub_systemctl_counting(dir.path(), "active", &counter);
+
+        let cache = ServiceHealthCache::new();
+        assert!(cache.is_active_with(&systemctl, "freenet-gateway").await);
+        assert!(cache.is_active_with(&systemctl, "freenet-gateway").await);
+
+        let forks = std::fs::read_to_string(&counter).unwrap_or_default();
+        assert_eq!(
+            forks.lines().count(),
+            1,
+            "second is_active within TTL must hit the cache, not refork systemctl"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_health_cache_reforks_for_different_service() {
+        // A different service name is a different question — must not be served
+        // from a cache entry keyed on the previous name.
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("count");
+        let systemctl = write_stub_systemctl_counting(dir.path(), "active", &counter);
+
+        let cache = ServiceHealthCache::new();
+        cache.is_active_with(&systemctl, "freenet-gateway").await;
+        cache
+            .is_active_with(&systemctl, "freenet-gateway-hector")
+            .await;
+
+        let forks = std::fs::read_to_string(&counter).unwrap_or_default();
+        assert_eq!(
+            forks.lines().count(),
+            2,
+            "different service name must re-query, not reuse the cached entry"
+        );
     }
 
     #[tokio::test]

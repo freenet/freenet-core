@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -20,7 +21,7 @@ use crate::auth::{HEADER_SIGNATURE, check_clock_skew, verify_signature};
 use crate::config::Config;
 use crate::github::LatestSource;
 use crate::updater::Updater;
-use crate::version::VersionCache;
+use crate::version::{ServiceHealthCache, VersionCache};
 
 /// Cap on the request body for `POST /update`. The legitimate body is ~60
 /// bytes (a small JSON object). 4 KiB is generous and rejects megabyte
@@ -45,6 +46,14 @@ pub struct AppState {
     pub updater: Updater,
     pub announcer: Announcer,
     pub version_cache: VersionCache,
+    /// Short-TTL cache of `systemctl is-active <managed_service>`, so the
+    /// unauthenticated `/version` endpoint doesn't fork a subprocess on every
+    /// request (the same self-DoS concern that motivates `version_cache`).
+    pub service_health_cache: ServiceHealthCache,
+    /// Path to the `systemctl` binary. Production is `systemctl` (resolved via
+    /// PATH); tests point this at a stub script so the `/version` service-health
+    /// reporting can be exercised over the HTTP layer without real systemd.
+    pub systemctl_path: PathBuf,
     pub last_update_attempt: Arc<Mutex<Option<Instant>>>,
     pub last_announce_attempt: Arc<Mutex<Option<Instant>>>,
 }
@@ -127,8 +136,12 @@ async fn version_handler(State(state): State<AppState>) -> Response {
             // Report the SERVICE's health, not just the on-disk binary: a
             // gateway whose binary was swapped but whose service failed to
             // restart must NOT look like a successful update (vega v0.2.71).
-            let service_active =
-                crate::version::service_active(&state.config.managed_service).await;
+            // Cached with a short TTL so this unauthenticated endpoint doesn't
+            // fork systemctl on every hit.
+            let service_active = state
+                .service_health_cache
+                .is_active_with(&state.systemctl_path, &state.config.managed_service)
+                .await;
             Json(VersionResponse {
                 version: v.to_string(),
                 binary_path: state.config.binary_path.display().to_string(),

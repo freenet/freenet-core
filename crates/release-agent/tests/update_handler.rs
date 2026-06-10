@@ -16,7 +16,7 @@ use freenet_release_agent::{
     github::{LatestSource, StaticLatest},
     server::{AppState, UpdateRequest, build_router},
     updater::Updater,
-    version::VersionCache,
+    version::{ServiceHealthCache, VersionCache},
 };
 use semver::Version;
 use serde_json::json;
@@ -32,6 +32,20 @@ fn now_secs() -> i64 {
 fn write_stub_freenet(dir: &Path, version: &str) -> std::path::PathBuf {
     let bin = dir.join("fake-freenet");
     let script = format!("#!/bin/sh\necho freenet {version}\n");
+    std::fs::write(&bin, script).unwrap();
+    let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&bin, perms).unwrap();
+    bin
+}
+
+/// Write a stub `systemctl` that prints `state` and exits 0 for `active`, 3
+/// otherwise — matching real `systemctl is-active`. Lets the `/version`
+/// service-health reporting be exercised over HTTP without real systemd.
+fn write_stub_systemctl(dir: &Path, state: &str) -> std::path::PathBuf {
+    let bin = dir.join("fake-systemctl");
+    let exit = if state == "active" { 0 } else { 3 };
+    let script = format!("#!/bin/sh\necho {state}\nexit {exit}\n");
     std::fs::write(&bin, script).unwrap();
     let mut perms = std::fs::metadata(&bin).unwrap().permissions();
     perms.set_mode(0o755);
@@ -75,6 +89,12 @@ impl Harness {
             managed_service: "freenet-gateway".into(),
         };
 
+        // Default stub: report the service active so the /version handler
+        // returns a deterministic `service_active: true` regardless of the
+        // host's real systemd state. Tests that care about the false case use
+        // `build_with_service_state`.
+        let systemctl_path = write_stub_systemctl(tmp.path(), "active");
+
         let latest_source: Arc<dyn LatestSource> = Arc::new(StaticLatest(latest_on_github));
         let state = AppState {
             config: Arc::new(config.clone()),
@@ -87,6 +107,68 @@ impl Harness {
                 String::new(),
             ),
             version_cache: VersionCache::new(),
+            service_health_cache: ServiceHealthCache::new(),
+            systemctl_path,
+            last_update_attempt: Arc::new(Mutex::new(None)),
+            last_announce_attempt: Arc::new(Mutex::new(None)),
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = build_router(state);
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        Self {
+            base: format!("http://{addr}"),
+            secret,
+            _tmp: tmp,
+        }
+    }
+
+    /// Like [`Harness::build`] but with the gateway service-state stub set to
+    /// `service_state` (e.g. `active`, `failed`), so the `/version`
+    /// service-health field can be pinned over the HTTP layer. Always reports
+    /// the binary as already on `binary_version` (dry-run, no spawn).
+    async fn build_with_service_state(binary_version: &str, service_state: &str) -> Self {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary_path = write_stub_freenet(tmp.path(), binary_version);
+        let systemctl_path = write_stub_systemctl(tmp.path(), service_state);
+
+        let secret: Vec<u8> = (0..32).map(|i| i as u8).collect();
+        let secret_path = tmp.path().join("hmac.key");
+        std::fs::write(&secret_path, hex::encode(&secret)).unwrap();
+
+        let config = Config {
+            listen_addr: "127.0.0.1:0".parse().unwrap(),
+            binary_path: binary_path.clone(),
+            update_command: tmp.path().join("never-invoked.sh"),
+            hmac_secret_path: secret_path,
+            github_repo: "freenet/freenet-core".into(),
+            dry_run: true,
+            rate_limit_seconds: 600,
+            clock_skew_tolerance_seconds: 300,
+            river_announce_command: std::path::PathBuf::new(),
+            river_announce_user: String::new(),
+            managed_service: "freenet-gateway".into(),
+        };
+
+        let latest_source: Arc<dyn LatestSource> =
+            Arc::new(StaticLatest(Version::parse(binary_version).unwrap()));
+        let state = AppState {
+            config: Arc::new(config.clone()),
+            secret: Arc::new(secret.clone()),
+            latest_source,
+            updater: Updater::new_with_sudo(config.update_command.clone(), true),
+            announcer: freenet_release_agent::announcer::Announcer::new_with_sudo(
+                std::path::PathBuf::new(),
+                true,
+                String::new(),
+            ),
+            version_cache: VersionCache::new(),
+            service_health_cache: ServiceHealthCache::new(),
+            systemctl_path,
             last_update_attempt: Arc::new(Mutex::new(None)),
             last_announce_attempt: Arc::new(Mutex::new(None)),
         };
@@ -162,6 +244,7 @@ impl Harness {
             managed_service: "freenet-gateway".into(),
         };
 
+        let systemctl_path = write_stub_systemctl(tmp.path(), "active");
         let latest_source: Arc<dyn LatestSource> = Arc::new(StaticLatest(latest_on_github));
         let updater = freenet_release_agent::updater::Updater {
             command: update_command,
@@ -179,6 +262,8 @@ impl Harness {
                 String::new(),
             ),
             version_cache: VersionCache::new(),
+            service_health_cache: ServiceHealthCache::new(),
+            systemctl_path,
             last_update_attempt: Arc::new(Mutex::new(None)),
             last_announce_attempt: Arc::new(Mutex::new(None)),
         };
@@ -375,16 +460,47 @@ async fn version_endpoint_reads_stub_binary() {
 
     // Service-health fields must be present so the release workflow can
     // distinguish a successful binary swap from a gateway whose service
-    // failed to restart (vega v0.2.71). `managed_service` is the configured
-    // unit name; `service_active` is a bool whose value depends on whether
-    // that unit happens to be active on the test host (the unit doesn't exist
-    // on CI runners, so it's typically false) — we assert presence + type, not
-    // the runtime value.
+    // failed to restart (vega v0.2.71). The default harness stub reports the
+    // service `active`, so this asserts the field is wired through as `true`.
     assert_eq!(j["managed_service"], "freenet-gateway");
-    assert!(
-        j["service_active"].is_boolean(),
-        "service_active must be a boolean field, got: {:?}",
-        j["service_active"]
+    assert_eq!(j["service_active"], true);
+}
+
+#[tokio::test]
+async fn version_endpoint_reports_service_active_true() {
+    // Stub systemctl reports `active` → /version must report service_active: true.
+    let h = Harness::build_with_service_state("0.2.71", "active").await;
+    let resp = reqwest::Client::new()
+        .get(format!("{}/version", h.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let j: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(j["version"], "0.2.71");
+    assert_eq!(j["service_active"], true);
+}
+
+#[tokio::test]
+async fn version_endpoint_reports_service_active_false_when_failed() {
+    // The exact vega v0.2.71 shape: binary swapped to the new version on disk
+    // but the service is `failed`. /version must report service_active: false
+    // so the workflow does NOT treat the update as successful.
+    let h = Harness::build_with_service_state("0.2.71", "failed").await;
+    let resp = reqwest::Client::new()
+        .get(format!("{}/version", h.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let j: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        j["version"], "0.2.71",
+        "binary reads as the new version (swap succeeded)"
+    );
+    assert_eq!(
+        j["service_active"], false,
+        "service is failed → must NOT look like a successful update"
     );
 }
 
@@ -547,6 +663,7 @@ async fn build_with_announcer(announce_script: &str, record_file: &Path) -> Harn
         sudo_command: fake_sudo,
         run_as_user: "nobody".into(),
     };
+    let systemctl_path = write_stub_systemctl(tmp.path(), "active");
     let state = AppState {
         config: Arc::new(config),
         secret: Arc::new(secret.clone()),
@@ -554,6 +671,8 @@ async fn build_with_announcer(announce_script: &str, record_file: &Path) -> Harn
         updater: Updater::new_with_sudo(std::path::PathBuf::from("/bin/true"), true),
         announcer,
         version_cache: VersionCache::new(),
+        service_health_cache: ServiceHealthCache::new(),
+        systemctl_path,
         last_update_attempt: Arc::new(Mutex::new(None)),
         last_announce_attempt: Arc::new(Mutex::new(None)),
     };

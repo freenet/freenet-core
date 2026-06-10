@@ -178,15 +178,33 @@ gh workflow run release-announce.yml --field version=X.Y.Z
 
 ### One gateway didn't converge
 
-The `Gateway Update` workflow polls `/version` for 120 s after the POST. If
-that times out the workflow reports failure for that gateway and the
-remaining gateway doesn't try (fail-fast). Recovery:
+The `Gateway Update` workflow polls `/version` for 120 s after the POST. It
+now requires BOTH that the on-disk binary reports the new version AND that the
+gateway service is actually `active` on it (the `service_active` field). So a
+converge timeout now has two possible meanings:
+
+- the binary never updated (download/swap failed), OR
+- the binary swapped but the **service failed to restart** — this is the
+  vega v0.2.71 case, where `/version` reported the new version while the
+  gateway was down. Check `ssh <host> 'sudo systemctl status freenet-gateway'`
+  (or `freenet-gateway-hector` on vega's secondary instance); a `failed`/
+  `inactive` unit with the new binary on disk is this failure mode.
+
+(Note: against a gateway running an OLD release-agent that predates the
+`service_active` field, the workflow logs a `::warning::` and falls back to the
+binary-only check, so the stronger signal is only enforced once the agent
+itself has been updated.)
+
+Recovery:
 
 1. Check the agent's status: `ssh ian@<host> 'sudo systemctl status
    freenet-release-agent && sudo journalctl -u freenet-release-agent
    --since "10 min ago"'`
-2. If the agent is fine but the script failed, the manual fix is
-   `ssh ian@<host> 'sudo /usr/local/bin/gateway-auto-update.sh --force'`.
+2. If the agent is fine but the service is down, restart it directly:
+   `ssh ian@<host> 'sudo systemctl restart freenet-gateway'` (then confirm
+   `systemctl is-active freenet-gateway`). If the script itself failed, the
+   manual fix is `ssh ian@<host> 'sudo /usr/local/bin/gateway-auto-update.sh
+   --force'`.
 3. Re-run the gateway-update workflow against just the failed gateway:
    `gh workflow run gateway-update.yml --field version=X.Y.Z --field
    gateways=vega`.

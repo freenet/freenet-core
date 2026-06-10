@@ -125,6 +125,11 @@ jobs:
       matrix:
         gateway: ${{ fromJson(needs.plan.outputs.matrix) }}
     steps:
+      # Needed for the verify step, which sources
+      # scripts/release-agent/verify-version-decision.sh so the workflow and
+      # its regression test share one copy of the decision logic.
+      - uses: actions/checkout@v6
+
       - name: Resolve secret
         id: secret
         env:
@@ -206,48 +211,50 @@ jobs:
           # finishes; /version will briefly 502/connection-refused while
           # the systemd unit cycles. Poll for up to 120s.
           #
-          # Success requires BOTH:
-          #   1. the on-disk binary reports the new version, AND
-          #   2. the gateway SERVICE is actually up on it.
+          # Success requires BOTH the on-disk binary on the new version AND
+          # the gateway SERVICE actually active on it. The binary-version check
+          # alone is NOT sufficient: during the v0.2.71 release vega's binary
+          # was swapped to 0.2.71 but the service failed to restart (old
+          # process hung on shutdown → SIGKILL → unit left `failed`).
+          # `/version` still reported 0.2.71 (on-disk), so this step reported
+          # SUCCESS while vega's gateway was DOWN for ~5 minutes. The
+          # `service_active` field closes that gap.
           #
-          # The binary-version check alone is NOT sufficient: during the
-          # v0.2.71 release the vega gateway's binary was swapped to 0.2.71
-          # but the service failed to restart (the old process hung on
-          # shutdown → SIGKILL → unit left `failed`). `/version` still
-          # reported 0.2.71 (on-disk), so this step reported SUCCESS while
-          # vega's gateway was DOWN for ~5 minutes. The `service_active`
-          # field (added to the agent's `/version` response) closes that gap.
-          #
-          # BACKWARD COMPATIBILITY: a deployed agent that predates this field
-          # won't report `service_active` until it is itself updated. When the
-          # field is ABSENT we must NOT hard-fail — we log a warning and fall
-          # back to the old binary-only check. We only ENFORCE the
-          # service-running requirement when the field is present.
+          # The decision logic lives in verify-version-decision.sh so it is
+          # unit-tested (verify-version-decision_test.sh, run in CI) and shared
+          # with this workflow — see that script for the backward-compat and
+          # swap-ordering rationale.
+          source scripts/release-agent/verify-version-decision.sh
+
           DEADLINE=$(( $(date +%s) + 120 ))
           while (( $(date +%s) < DEADLINE )); do
             RESPONSE=$(curl -sS --max-time 5 "$GATEWAY_URL/version" || true)
-            INSTALLED=$(echo "$RESPONSE" | jq -r '.version // empty')
-            # `// empty` yields "" for both a missing field (old agent) and a
-            # null. Distinguish "field present" from "field absent" with `has`.
-            HAS_SERVICE_FIELD=$(echo "$RESPONSE" | jq -r 'has("service_active") // false' 2>/dev/null || echo "false")
-            SERVICE_ACTIVE=$(echo "$RESPONSE" | jq -r '.service_active // false' 2>/dev/null || echo "false")
-            MANAGED_SERVICE=$(echo "$RESPONSE" | jq -r '.managed_service // empty' 2>/dev/null || echo "")
+            INSTALLED=$(printf '%s' "$RESPONSE" | jq -r '.version // empty' 2>/dev/null || echo "")
+            MANAGED_SERVICE=$(printf '%s' "$RESPONSE" | jq -r '.managed_service // empty' 2>/dev/null || echo "")
+            DECISION=$(verify_version_decision "$RESPONSE" "$VERSION")
 
-            if [[ "$INSTALLED" == "$VERSION" ]]; then
-              if [[ "$HAS_SERVICE_FIELD" == "true" ]]; then
-                if [[ "$SERVICE_ACTIVE" == "true" ]]; then
-                  echo "✓ Gateway ${{ matrix.gateway.name }} reports version $INSTALLED and service ${MANAGED_SERVICE:-?} is active"
-                  exit 0
-                fi
-                echo "Binary is $INSTALLED but service ${MANAGED_SERVICE:-?} is NOT active yet; waiting for restart…"
-              else
+            case "$DECISION" in
+              success)
+                echo "✓ Gateway ${{ matrix.gateway.name }} reports version $INSTALLED and service ${MANAGED_SERVICE:-?} is active"
+                exit 0
+                ;;
+              success-fallback)
                 echo "::warning::Gateway ${{ matrix.gateway.name }} agent predates the service-health check (no 'service_active' in /version); falling back to binary-only verification. Update the release-agent on this gateway to enable the stronger check."
                 echo "✓ Gateway ${{ matrix.gateway.name }} now reports version $INSTALLED (binary-only check)"
                 exit 0
-              fi
-            else
-              echo "Waiting for ${{ matrix.gateway.name }} to report $VERSION (current: ${INSTALLED:-unreachable})…"
-            fi
+                ;;
+              wait)
+                if [[ "$INSTALLED" == "$VERSION" ]]; then
+                  echo "Binary is $INSTALLED but service ${MANAGED_SERVICE:-?} is NOT active yet; waiting for restart…"
+                else
+                  echo "Waiting for ${{ matrix.gateway.name }} to report $VERSION (current: ${INSTALLED:-unreachable})…"
+                fi
+                ;;
+              *)
+                echo "::error::Unexpected decision token: $DECISION"
+                exit 1
+                ;;
+            esac
             sleep 5
           done
           echo "::error::Gateway ${{ matrix.gateway.name }} did not converge on $VERSION with an active service within 120s"
