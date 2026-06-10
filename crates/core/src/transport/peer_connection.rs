@@ -579,6 +579,13 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
                 match socket.send_to(&ping_packet, remote_addr).await {
                     Ok(_) => {
+                        // Phase 1.6 (#4074): keep-alive Ping bypasses
+                        // `packet_sending`; count it as must-flow here.
+                        // Observation only.
+                        crate::transport::shadow_demand::record_outbound(
+                            crate::transport::shadow_demand::OutboundClass::MustFlow,
+                            ping_packet.len(),
+                        );
                         tracing::debug!(
                             target: "freenet_core::transport::keepalive_lifecycle",
                             remote = ?remote_addr,
@@ -1842,6 +1849,12 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             .await
         {
             Ok(_) => {
+                // Phase 1.6 (#4074): Pong bypasses `packet_sending`, so
+                // classify it as must-flow here. Observation only.
+                super::shadow_demand::record_outbound(
+                    super::shadow_demand::OutboundClass::MustFlow,
+                    pong_packet.len(),
+                );
                 tracing::trace!(
                     peer_addr = %self.remote_conn.remote_addr,
                     packet_id,
@@ -2095,6 +2108,16 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
         "Attempting to send packet"
     );
 
+    // Phase 1.6 shadow telemetry (#4074): classify this outbound payload
+    // (must-flow / short / bulk) before it is consumed by serialization,
+    // so the must-flow-vs-bulk split can be measured. Converting to the
+    // concrete payload here is a no-op for callers that already pass one
+    // and a cheap `Into` for the rest; `try_serialize_msg_to_packet_data`
+    // still accepts it via `Into<Self>`. Observation only — see
+    // `transport/shadow_demand.rs` and `.claude/rules/transport.md`.
+    let payload: SymmetricMessagePayload = payload.into();
+    let outbound_class = super::shadow_demand::classify(&payload);
+
     match SymmetricMessage::try_serialize_msg_to_packet_data(
         packet_id,
         payload,
@@ -2119,6 +2142,9 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                         elapsed_ms = elapsed.as_millis(),
                         "Successfully sent packet"
                     );
+                    // Record the classified on-wire bytes once the packet
+                    // is actually sent (not on the error path).
+                    super::shadow_demand::record_outbound(outbound_class, packet_data.len());
                     sent_tracker.lock().report_sent_packet_with_token(
                         packet_id,
                         packet_data,
@@ -2143,6 +2169,10 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                 packet_id,
                 "Sending multi-packet message"
             );
+            // Accumulate on-wire bytes across all packets of this multi-part
+            // message so the Phase 1.6 class counters see the full cost,
+            // attributed to the primary payload's class.
+            let mut sent_on_wire = 0usize;
             macro_rules! send {
                 ($packets:ident) => {{
                     for packet in $packets {
@@ -2151,6 +2181,7 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                             .send_to(&packet_data, remote_addr)
                             .await
                             .map_err(|e| TransportError::SendFailed(remote_addr, e.kind()))?;
+                        sent_on_wire += packet_data.len();
                         sent_tracker.lock().report_sent_packet_with_token(
                             packet_id,
                             packet_data,
@@ -2180,6 +2211,7 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                 ];
 
                 send!(packets);
+                super::shadow_demand::record_outbound(outbound_class, sent_on_wire);
                 return Ok(());
             }
 
@@ -2209,6 +2241,7 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
             }
 
             send!(packets);
+            super::shadow_demand::record_outbound(outbound_class, sent_on_wire);
             Ok(())
         }
     }

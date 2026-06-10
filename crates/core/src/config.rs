@@ -404,6 +404,11 @@ impl ConfigArgs {
             if cfg.telemetry.reference_ping_enabled {
                 self.telemetry.reference_ping_enabled = true;
             }
+            // iface-tx-enabled: same one-directional override as
+            // reference-ping (clap default is already false).
+            if cfg.telemetry.iface_tx_enabled {
+                self.telemetry.iface_tx_enabled = true;
+            }
         }
 
         let mode = self.mode.unwrap_or(OperationMode::Network);
@@ -798,6 +803,7 @@ impl ConfigArgs {
                 // environments to avoid flooding the collector with test data.
                 is_test_environment: self.id.is_some(),
                 reference_ping_enabled: self.telemetry.reference_ping_enabled,
+                iface_tx_enabled: self.telemetry.iface_tx_enabled,
             },
         };
 
@@ -1569,6 +1575,21 @@ pub struct TelemetryArgs {
         default = "default_reference_ping_enabled"
     )]
     pub reference_ping_enabled: bool,
+
+    /// Enable the Phase 1.6 OS-interface-tx shadow probe (#4074): a 1Hz
+    /// read of `/proc/net/dev` (Linux) that emits aggregate interface tx
+    /// bytes and the derived `op = total - freenet_own` so the floor
+    /// analysis can attribute uplink saturation to Freenet vs the
+    /// operator's other traffic. Best-effort and opt-in: defaults to
+    /// false; production gateway configs set this to true. Like
+    /// reference-ping, it stays off on developer machines and in tests.
+    #[arg(
+        long = "iface-tx-enabled",
+        env = "FREENET_IFACE_TX_ENABLED",
+        default_value = "false"
+    )]
+    #[serde(rename = "iface-tx-enabled", default = "default_iface_tx_enabled")]
+    pub iface_tx_enabled: bool,
 }
 
 impl Default for TelemetryArgs {
@@ -1578,6 +1599,7 @@ impl Default for TelemetryArgs {
             endpoint: None,
             transport_snapshot_interval_secs: None,
             reference_ping_enabled: false,
+            iface_tx_enabled: false,
         }
     }
 }
@@ -1618,6 +1640,12 @@ pub struct TelemetryConfig {
         rename = "reference-ping-enabled"
     )]
     pub reference_ping_enabled: bool,
+
+    /// Enable the Phase 1.6 OS-interface-tx shadow probe (#4074).
+    /// Opt-in: defaults to false; production gateway configs set this to
+    /// true. See `TelemetryArgs::iface_tx_enabled`.
+    #[serde(default = "default_iface_tx_enabled", rename = "iface-tx-enabled")]
+    pub iface_tx_enabled: bool,
 }
 
 fn default_transport_snapshot_interval_secs() -> u64 {
@@ -1632,6 +1660,10 @@ fn default_reference_ping_enabled() -> bool {
     false
 }
 
+fn default_iface_tx_enabled() -> bool {
+    false
+}
+
 impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
@@ -1640,6 +1672,7 @@ impl Default for TelemetryConfig {
             transport_snapshot_interval_secs: default_transport_snapshot_interval_secs(),
             is_test_environment: false,
             reference_ping_enabled: false,
+            iface_tx_enabled: false,
         }
     }
 }

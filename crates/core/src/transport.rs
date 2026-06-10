@@ -204,6 +204,8 @@ pub(crate) mod ledbat;
 pub mod metrics;
 pub(crate) mod reference_ping;
 pub(crate) mod rolling_rtt_stats;
+pub(crate) mod shadow_demand;
+pub(crate) mod shadow_iface_tx;
 
 // Type alias for the in-crate concrete `Socket` impl so callers in
 // this crate can obtain a real UDP socket via a stable alias. The

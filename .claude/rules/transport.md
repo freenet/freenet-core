@@ -137,15 +137,67 @@ from CI runners (which would perturb timing-sensitive multi-node
 tests — see PR #4292 root-cause). The shadow aggregator is
 always-on; only reference-ping is gated.
 
+### Shadow demand / queue / OS-counter / class telemetry (Phase 1.6)
+
+`transport/shadow_demand.rs` adds the *demand* side of the floor
+analysis. Three process-wide observation hooks are written from the
+hot send path with a single relaxed atomic add each, and read only
+by the 1Hz aggregator tasks:
+
+- **Outbound class counters** (`record_outbound`): cumulative bytes
+  split into must-flow / short / bulk. `classify()` keys off the
+  `SymmetricMessagePayload` variant — `StreamFragment` is `Bulk`
+  (the only class the token bucket meters, i.e. the only slowable
+  traffic), `ShortMessage` is `Short` (opaque serialized `NetMessage`
+  — small contract op or control plane, unsplittable at the transport
+  layer), and `Ping`/`Pong`/`NoOp`/`AckConnection` are `MustFlow`.
+  Tagged at `packet_sending` (covers short/noop/ack/stream) plus the
+  two bypass sites `send_pong` and the keep-alive `Ping`.
+- **Broadcast-queue depth gauge** (`record_broadcast_queue_depth`):
+  updated by `node/network_bridge/broadcast_queue.rs` under its own
+  queue lock, so the shadow reader never contends on the queue mutex.
+- **Global-bandwidth handle** (`register_global_bandwidth`): a `Weak`
+  to the node's `GlobalBandwidthManager`, registered at construction
+  in `p2p_protoc.rs`, so the demand aggregator can read the effective
+  aggregate rate `R` — present only in global-pool mode
+  (`total_bandwidth_limit` set); null under the default per-connection
+  FixedRate mode.
+
+Two always-on 1Hz tasks (spawned from `p2p_impl.rs`, registered with
+`BackgroundTaskMonitor` as `shadow_demand_aggregator` /
+`shadow_outbound_class_aggregator`) emit `shadow_rate_demand`
+(achieved throughput vs `R`, active-connection count, broadcast-queue
+depth) and `shadow_outbound_class` (the must-flow / short / bulk byte
+split). Same OTLP shape and peer-id tagging as `shadow_rtt_aggregate`.
+
+`transport/shadow_iface_tx.rs` adds the OS-interface counter: a 1Hz
+read of Linux `/proc/net/dev` summing non-loopback `tx_bytes`, emitting
+`shadow_iface_tx` with the derived `op = total_tx − freenet_own_tx`
+(`freenet_own_tx` = `TRANSPORT_METRICS.cumulative_bytes_sent`). It is
+**opt-in and best-effort**: gated by `telemetry.iface-tx-enabled`
+(default `false`, same gating as reference-ping); if `/proc/net/dev`
+is unavailable the tick is silently omitted, never blocking.
+
+The class tagging is the only Phase 1.6 hook that touches the hot send
+path; it is a single relaxed atomic add per packet (no allocation, no
+lock, no blocking). Everything else is read from the separate
+aggregator tasks.
+
 ```
 NEVER read SHADOW_RTT_REGISTRY, cross_connection_median_inflation,
-or the reference_ping stats from the production data path (rate
-limiter, retry, congestion control). They exist only for the
-staged rollout in #4074:
+the reference_ping stats, OR the Phase 1.6 shadow_demand counters /
+broadcast-depth gauge / registered bandwidth handle from the
+production data path (rate limiter, retry, congestion control). The
+hot path only WRITES the cheap class counters; all reads happen in
+the aggregator tasks. They exist only for the staged rollout in
+#4074:
   Phase 1   → observation only — per-peer overlay RTT (current)
   Phase 1.5 → observation only — adds reference-path RTT + peer_id
               tagging so signals can be disaggregated per node and
               the overlay-vs-uplink confound can be tested
+  Phase 1.6 → observation only — adds outbound demand vs R, broadcast
+              queue depth, OS interface tx (op = total − own), and the
+              must-flow-vs-bulk outbound split
   Phase 2   → shadow controller, still no behaviour change
   Phase 3   → opt-in flag
   Phase 4   → default switch only after Phase 3 shows improvement
