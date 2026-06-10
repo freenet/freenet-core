@@ -418,15 +418,40 @@ impl NodeP2P {
         let reference_ping_enabled = config.config.telemetry.enabled
             && !config.config.telemetry.is_test_environment
             && config.config.telemetry.reference_ping_enabled;
+        // Phase 1.6 OS-interface-tx probe (#4074): same opt-in gating as
+        // reference-ping (telemetry on + not a test env + flag set). It
+        // reads /proc/net/dev at 1Hz, so it must not fire on dev machines
+        // or in CI by default.
+        let iface_tx_enabled = config.config.telemetry.enabled
+            && !config.config.telemetry.is_test_environment
+            && config.config.telemetry.iface_tx_enabled;
         let local_peer_id = config.local_peer_id_string();
         crate::transport::rolling_rtt_stats::spawn_aggregator(
             local_peer_id.clone(),
             &background_task_monitor,
         );
+        // Phase 1.6 demand + outbound-class aggregators (#4074). Both are
+        // always-on like the RTT aggregator: they only read atomics + the
+        // bandwidth handle and emit one OTLP event per second each (no
+        // I/O). Observation only.
+        crate::transport::shadow_demand::spawn_demand_aggregator(
+            local_peer_id.clone(),
+            &background_task_monitor,
+        );
+        crate::transport::shadow_demand::spawn_outbound_class_aggregator(
+            local_peer_id.clone(),
+            &background_task_monitor,
+        );
         if reference_ping_enabled {
             crate::transport::reference_ping::spawn_reference_ping(
-                local_peer_id,
+                local_peer_id.clone(),
                 crate::transport::reference_ping::DEFAULT_REFERENCE_TARGET,
+                &background_task_monitor,
+            );
+        }
+        if iface_tx_enabled {
+            crate::transport::shadow_iface_tx::spawn_iface_tx_monitor(
+                local_peer_id,
                 &background_task_monitor,
             );
         }

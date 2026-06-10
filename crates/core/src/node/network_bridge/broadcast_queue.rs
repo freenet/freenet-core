@@ -181,6 +181,12 @@ mod queue {
                 queue.order.push_back(dedup_key);
             }
 
+            // Phase 1.6 shadow telemetry (#4074): publish the post-mutation
+            // depth while still under the lock so the depth gauge is exact;
+            // the shadow demand aggregator reads it lock-free. Observation
+            // only — see transport/shadow_demand.rs.
+            crate::transport::shadow_demand::record_broadcast_queue_depth(queue.len());
+
             drop(queue);
             self.notify.notify_one();
         }
@@ -210,7 +216,11 @@ mod queue {
                     loop {
                         let entry = {
                             let mut q = queue.lock().await;
-                            q.pop_front()
+                            let entry = q.pop_front();
+                            // Phase 1.6 (#4074): publish post-drain depth
+                            // under the lock for the shadow demand gauge.
+                            crate::transport::shadow_demand::record_broadcast_queue_depth(q.len());
+                            entry
                         };
 
                         let Some(entry) = entry else {

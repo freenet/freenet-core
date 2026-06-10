@@ -589,10 +589,16 @@ impl P2pConnManager {
                 .network_api
                 .total_bandwidth_limit
                 .map(|total| {
-                    Arc::new(GlobalBandwidthManager::new(
+                    let manager = Arc::new(GlobalBandwidthManager::new(
                         total,
                         config.config.network_api.min_bandwidth_per_connection,
-                    ))
+                    ));
+                    // Phase 1.6 shadow telemetry (#4074): expose the
+                    // effective aggregate rate R to the demand aggregator.
+                    // Observation only — the manager is read, never written,
+                    // by the shadow side. See transport/shadow_demand.rs.
+                    crate::transport::shadow_demand::register_global_bandwidth(&manager);
+                    manager
                 }),
             ledbat_min_ssthresh: config.config.network_api.ledbat_min_ssthresh,
             congestion_config: config.config.network_api.build_congestion_config(),
