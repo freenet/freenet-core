@@ -236,8 +236,15 @@ jobs:
 
           echo "⏳ Waiting for PR #$PR_NUMBER to merge..."
 
-          while [ $ELAPSED -lt $MAX_WAIT ]; do
-            PR_STATE=$(gh pr view $PR_NUMBER --json state --jq '.state')
+          while [ "$ELAPSED" -lt "$MAX_WAIT" ]; do
+            # Guard the gh call so a transient API error (e.g. the
+            # HTTP 401 that aborted the v0.2.71 release on the first
+            # poll) doesn't kill the whole step under `bash -e`. A
+            # non-zero exit or empty/unparseable output is treated as
+            # "retry next interval" rather than a fatal failure; the
+            # MAX_WAIT budget still bounds total waiting, so persistent
+            # API failure eventually times out (exit 1) below.
+            PR_STATE=$(gh pr view "$PR_NUMBER" --json state --jq '.state' 2>/dev/null || true)
 
             if [ "$PR_STATE" == "MERGED" ]; then
               echo "✅ PR #$PR_NUMBER merged successfully!"
@@ -245,10 +252,13 @@ jobs:
             elif [ "$PR_STATE" == "CLOSED" ]; then
               echo "❌ PR #$PR_NUMBER was closed without merging"
               exit 1
+            elif [ -z "$PR_STATE" ]; then
+              echo "  ⚠️  transient gh error querying PR state, will retry (${ELAPSED}s elapsed)"
+            else
+              echo "  Still waiting... (${ELAPSED}s elapsed)"
             fi
 
-            echo "  Still waiting... (${ELAPSED}s elapsed)"
-            sleep $WAIT_INTERVAL
+            sleep "$WAIT_INTERVAL"
             ELAPSED=$((ELAPSED + WAIT_INTERVAL))
           done
 
