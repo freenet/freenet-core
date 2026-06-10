@@ -346,8 +346,8 @@ pub enum TransportError {
     ProtocolVersionMismatch { expected: String, actual: String },
     #[error("send to {0} failed: {1}")]
     SendFailed(SocketAddr, std::io::ErrorKind),
-    #[error("outbound stream to {0} aborted: cwnd wait timeout")]
-    OutboundStreamTimeout(SocketAddr),
+    #[error("outbound stream to {0} failed (stream-scoped, connection survives)")]
+    OutboundStreamFailed(SocketAddr),
     #[error(transparent)]
     IO(#[from] std::io::Error),
     #[error(transparent)]
@@ -368,15 +368,21 @@ impl TransportError {
     /// Covers:
     /// - [`TransportError::SendFailed`]: a transient UDP send error (e.g.
     ///   ENETUNREACH) on a single packet.
-    /// - [`TransportError::OutboundStreamTimeout`]: the outbound stream's
-    ///   congestion-window wait exceeded `CWND_WAIT_TIMEOUT`. Tearing down
-    ///   the whole connection here would kill every other operation
-    ///   multiplexed on it and force a re-handshake (#4345). The connection
-    ///   stays up and the idle timeout decides liveness instead.
+    /// - [`TransportError::OutboundStreamFailed`]: any stream-scoped failure
+    ///   in `outbound_stream::{send_stream, pipe_stream}` — the
+    ///   congestion-window wait exceeding `CWND_WAIT_TIMEOUT`, or (for the
+    ///   relay-pipe path) the upstream inbound feed stalling past
+    ///   `STREAM_INACTIVITY_TIMEOUT` or yielding an error. All three are
+    ///   problems with one transfer or its inbound feed, not with the
+    ///   downstream connection. Tearing down the whole connection here would
+    ///   kill every other operation multiplexed on it and force a
+    ///   re-handshake (#4345). The connection stays up and the idle timeout
+    ///   decides liveness instead; the op layer times out and retries against
+    ///   another candidate.
     pub fn is_transient_send_failure(&self) -> bool {
         matches!(
             self,
-            TransportError::SendFailed(..) | TransportError::OutboundStreamTimeout(..)
+            TransportError::SendFailed(..) | TransportError::OutboundStreamFailed(..)
         )
     }
 }
