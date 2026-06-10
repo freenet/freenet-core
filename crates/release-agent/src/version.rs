@@ -127,9 +127,30 @@ const SERVICE_HEALTH_TTL: Duration = Duration::from_secs(2);
 /// changed to swap-then-restart, this check would need to additionally verify
 /// the running process is the new binary (e.g. via `ActiveEnterTimestamp`); see
 /// the comment in `.github/workflows/gateway-update.yml`.
-#[derive(Default, Clone)]
+///
+/// # Concurrency
+///
+/// Concurrent cache-misses each fork `systemctl` before the cache fills (no
+/// single-flight). This matches [`VersionCache`]'s accepted tradeoff and is
+/// bounded by the short TTL; the `/version` poll is sequential in practice, so
+/// adding single-flight would diverge from the established pattern for no real
+/// gain.
+#[derive(Clone)]
 pub struct ServiceHealthCache {
     inner: Arc<Mutex<Option<CachedServiceHealth>>>,
+    /// Entries older than this are re-queried. Defaults to
+    /// [`SERVICE_HEALTH_TTL`]; injectable so tests can force expiry instantly
+    /// instead of sleeping the real 2s.
+    ttl: Duration,
+}
+
+impl Default for ServiceHealthCache {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(None)),
+            ttl: SERVICE_HEALTH_TTL,
+        }
+    }
 }
 
 struct CachedServiceHealth {
@@ -143,9 +164,19 @@ impl ServiceHealthCache {
         Self::default()
     }
 
+    /// Construct a cache with a custom TTL. Production uses [`Self::new`] (2s);
+    /// this exists so tests can pin both sides of the TTL boundary without a
+    /// real `sleep`.
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            ..Self::default()
+        }
+    }
+
     /// Return whether `service` is `active`, using the cached value if it is
-    /// younger than [`SERVICE_HEALTH_TTL`] and for the same service name.
-    /// Resolves `systemctl` via PATH.
+    /// younger than the cache's TTL and for the same service name. Resolves
+    /// `systemctl` via PATH.
     pub async fn is_active(&self, service: &str) -> bool {
         self.is_active_with(Path::new("systemctl"), service).await
     }
@@ -154,16 +185,32 @@ impl ServiceHealthCache {
     /// can point at a stub without real systemd. Production callers use
     /// [`Self::is_active`].
     pub async fn is_active_with(&self, systemctl: &Path, service: &str) -> bool {
+        self.is_active_inner(service, || query_service_active(systemctl, service))
+            .await
+    }
+
+    /// Cache logic (TTL check + store) with the underlying query injected as a
+    /// closure. Production passes [`query_service_active`] (which forks
+    /// `systemctl`); cache-behaviour tests pass an in-process closure so they
+    /// can assert query counts deterministically without forking a subprocess
+    /// per cached call (which is flaky under plain `cargo test` — see
+    /// `write_stub_systemctl` for why). The real fork-and-interpret path is
+    /// covered separately by the `query_service_active` tests.
+    async fn is_active_inner<F, Fut>(&self, service: &str, query: F) -> bool
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = bool>,
+    {
         {
             let guard = self.inner.lock().await;
             if let Some(c) = guard.as_ref() {
-                if c.service == service && c.checked_at.elapsed() < SERVICE_HEALTH_TTL {
+                if c.service == service && c.checked_at.elapsed() < self.ttl {
                     return c.active;
                 }
             }
         }
 
-        let active = query_service_active(systemctl, service).await;
+        let active = query().await;
         let mut guard = self.inner.lock().await;
         *guard = Some(CachedServiceHealth {
             service: service.to_string(),
@@ -249,27 +296,33 @@ mod tests {
 
     /// Write a stub `systemctl` that prints `state` on stdout and exits 0 for
     /// `active`, 3 otherwise — matching real `systemctl is-active` behaviour
-    /// (non-active states exit non-zero but still print the state word). Each
-    /// invocation also appends a line to `counter_path` so a test can assert
-    /// how many times the stub was forked (cache coverage).
-    fn write_stub_systemctl_counting(dir: &Path, state: &str, counter_path: &Path) -> PathBuf {
+    /// (non-active states exit non-zero but still print the state word). Used
+    /// by the `query_service_active` interpretation tests and the
+    /// `is_active_with` production-wiring smoke test. Cache-behaviour tests do
+    /// NOT fork a stub (see the `is_active_inner` closure tests below): a real
+    /// fork per cached call made those assertions flaky under plain
+    /// `cargo test`, because each `#[tokio::test]` is its own current-thread
+    /// runtime and many of them spawning+reaping children concurrently in one
+    /// process races tokio's Unix child reaper, so `child.wait()` occasionally
+    /// fails. CI runs these under `cargo nextest`, which isolates each test in
+    /// its own process and avoids the race; the in-process `is_active_inner`
+    /// closure tests keep the cache logic deterministic under either runner.
+    ///
+    /// The write handle is flushed and explicitly closed before chmod/exec —
+    /// good hygiene against ETXTBSY, independent of the reaper race above.
+    fn write_stub_systemctl(dir: &Path, state: &str) -> PathBuf {
         let bin = dir.join("fake-systemctl");
         let exit = if state == "active" { 0 } else { 3 };
-        let script = format!(
-            "#!/bin/sh\necho x >> {counter}\necho {state}\nexit {exit}\n",
-            counter = counter_path.display()
-        );
-        let mut f = std::fs::File::create(&bin).unwrap();
-        f.write_all(script.as_bytes()).unwrap();
+        let script = format!("#!/bin/sh\necho {state}\nexit {exit}\n");
+        {
+            let mut f = std::fs::File::create(&bin).unwrap();
+            f.write_all(script.as_bytes()).unwrap();
+            f.flush().unwrap();
+        } // f dropped/closed here, so the file is not open-for-write at exec.
         let mut perms = std::fs::metadata(&bin).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
         bin
-    }
-
-    /// Convenience: stub `systemctl` without a fork counter.
-    fn write_stub_systemctl(dir: &Path, state: &str) -> PathBuf {
-        write_stub_systemctl_counting(dir, state, &dir.join("ignored-count"))
     }
 
     #[tokio::test]
@@ -311,24 +364,34 @@ mod tests {
         assert!(!query_service_active(&missing, "freenet-gateway").await);
     }
 
+    // Cache-behaviour tests drive the cache through `is_active_inner` with an
+    // in-process counting closure rather than forking a real stub. The
+    // subprocess fork-and-interpret path is covered by the
+    // `service_active_*` tests above; mixing a per-call fork into the
+    // cache-behaviour assertions made them flaky under the parallel test
+    // runner (ETXTBSY when exec'ing freshly-written stub scripts). Counting an
+    // AtomicUsize is deterministic and has no shared OS state.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     #[tokio::test]
     async fn service_health_cache_does_not_refork_within_ttl() {
-        // The unauthenticated /version endpoint must NOT fork systemctl on
+        // The unauthenticated /version endpoint must NOT re-query systemctl on
         // every hit (self-DoS vector). A second lookup within the TTL must be
-        // served from cache, so the stub is forked exactly once.
-        let dir = tempfile::tempdir().unwrap();
-        let counter = dir.path().join("count");
-        let systemctl = write_stub_systemctl_counting(dir.path(), "active", &counter);
+        // served from cache, so the query closure runs exactly once.
+        let queries = AtomicUsize::new(0);
+        let q = || {
+            queries.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(true)
+        };
 
-        let cache = ServiceHealthCache::new();
-        assert!(cache.is_active_with(&systemctl, "freenet-gateway").await);
-        assert!(cache.is_active_with(&systemctl, "freenet-gateway").await);
+        let cache = ServiceHealthCache::new(); // 2s TTL: both calls are within it.
+        assert!(cache.is_active_inner("freenet-gateway", q).await);
+        assert!(cache.is_active_inner("freenet-gateway", q).await);
 
-        let forks = std::fs::read_to_string(&counter).unwrap_or_default();
         assert_eq!(
-            forks.lines().count(),
+            queries.load(Ordering::SeqCst),
             1,
-            "second is_active within TTL must hit the cache, not refork systemctl"
+            "second is_active within TTL must hit the cache, not re-query"
         );
     }
 
@@ -336,22 +399,72 @@ mod tests {
     async fn service_health_cache_reforks_for_different_service() {
         // A different service name is a different question — must not be served
         // from a cache entry keyed on the previous name.
-        let dir = tempfile::tempdir().unwrap();
-        let counter = dir.path().join("count");
-        let systemctl = write_stub_systemctl_counting(dir.path(), "active", &counter);
+        let queries = AtomicUsize::new(0);
+        let q = || {
+            queries.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(true)
+        };
 
         let cache = ServiceHealthCache::new();
-        cache.is_active_with(&systemctl, "freenet-gateway").await;
-        cache
-            .is_active_with(&systemctl, "freenet-gateway-hector")
-            .await;
+        cache.is_active_inner("freenet-gateway", q).await;
+        cache.is_active_inner("freenet-gateway-hector", q).await;
 
-        let forks = std::fs::read_to_string(&counter).unwrap_or_default();
         assert_eq!(
-            forks.lines().count(),
+            queries.load(Ordering::SeqCst),
             2,
             "different service name must re-query, not reuse the cached entry"
         );
+    }
+
+    #[tokio::test]
+    async fn service_health_cache_reforks_after_ttl_expiry() {
+        // The cache's whole purpose is bounding staleness, so pin the expiry
+        // side of the TTL boundary: once an entry is older than the TTL, the
+        // next lookup must re-query AND return the fresh state.
+        //
+        // TTL = 0 makes every cached entry instantly expired (elapsed() < 0 is
+        // never true), so the second lookup deterministically re-queries — no
+        // real `sleep` needed, no flakiness. The within-TTL no-refork case is
+        // covered by `service_health_cache_does_not_refork_within_ttl`.
+        let queries = AtomicUsize::new(0);
+        // Reports `active` on the first query, `failed` on every later one, so
+        // the test can observe that the re-query returned the FRESH state.
+        let q = || {
+            let n = queries.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(n == 0)
+        };
+
+        let cache = ServiceHealthCache::with_ttl(Duration::ZERO);
+
+        assert!(
+            cache.is_active_inner("freenet-gateway", q).await,
+            "first lookup reflects the active state"
+        );
+        // Entry is already expired (TTL = 0): the next lookup must re-query
+        // rather than serve the stale `true`, and pick up the fresh `failed`
+        // state (the vega case).
+        assert!(
+            !cache.is_active_inner("freenet-gateway", q).await,
+            "after TTL expiry the cache must re-query and return the fresh (failed) state"
+        );
+
+        assert_eq!(
+            queries.load(Ordering::SeqCst),
+            2,
+            "an expired entry must trigger a re-query"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_health_cache_is_active_with_forks_real_query() {
+        // Smoke-test the production wiring: `is_active_with` must actually call
+        // through to the real `systemctl` fork path (a stub here). The cache-
+        // behaviour assertions use the in-process closure above; this one keeps
+        // a single fork so the closure-vs-real seam can't silently diverge.
+        let dir = tempfile::tempdir().unwrap();
+        let systemctl = write_stub_systemctl(dir.path(), "active");
+        let cache = ServiceHealthCache::new();
+        assert!(cache.is_active_with(&systemctl, "freenet-gateway").await);
     }
 
     #[tokio::test]
@@ -398,8 +511,11 @@ mod tests {
         let bin_path = dir.path().join("fake-freenet");
 
         let write_stub = |contents: &str| {
-            let mut f = std::fs::File::create(&bin_path).unwrap();
-            writeln!(f, "{contents}").unwrap();
+            {
+                let mut f = std::fs::File::create(&bin_path).unwrap();
+                writeln!(f, "{contents}").unwrap();
+                f.flush().unwrap();
+            } // close before chmod/exec — see write_stub_systemctl re: ETXTBSY.
             let mut perms = std::fs::metadata(&bin_path).unwrap().permissions();
             perms.set_mode(0o755);
             std::fs::set_permissions(&bin_path, perms).unwrap();
