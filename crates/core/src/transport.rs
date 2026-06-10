@@ -346,6 +346,8 @@ pub enum TransportError {
     ProtocolVersionMismatch { expected: String, actual: String },
     #[error("send to {0} failed: {1}")]
     SendFailed(SocketAddr, std::io::ErrorKind),
+    #[error("outbound stream to {0} failed (stream-scoped, connection survives)")]
+    OutboundStreamFailed(SocketAddr),
     #[error(transparent)]
     IO(#[from] std::io::Error),
     #[error(transparent)]
@@ -357,11 +359,31 @@ pub enum TransportError {
 }
 
 impl TransportError {
-    /// Returns true if this error is a transient UDP send failure that should
-    /// not kill the connection. The idle timeout is the sole authority on
-    /// connection liveness.
+    /// Returns true if this error is a stream-scoped failure that must NOT
+    /// kill the connection. The idle timeout remains the sole authority on
+    /// connection liveness; a single stalled or failed stream only fails
+    /// that stream, and the operation layer times out and retries against
+    /// another candidate.
+    ///
+    /// Covers:
+    /// - [`TransportError::SendFailed`]: a transient UDP send error (e.g.
+    ///   ENETUNREACH) on a single packet.
+    /// - [`TransportError::OutboundStreamFailed`]: any stream-scoped failure
+    ///   in `outbound_stream::{send_stream, pipe_stream}` — the
+    ///   congestion-window wait exceeding `CWND_WAIT_TIMEOUT`, or (for the
+    ///   relay-pipe path) the upstream inbound feed stalling past
+    ///   `STREAM_INACTIVITY_TIMEOUT` or yielding an error. All three are
+    ///   problems with one transfer or its inbound feed, not with the
+    ///   downstream connection. Tearing down the whole connection here would
+    ///   kill every other operation multiplexed on it and force a
+    ///   re-handshake (#4345). The connection stays up and the idle timeout
+    ///   decides liveness instead; the op layer times out and retries against
+    ///   another candidate.
     pub fn is_transient_send_failure(&self) -> bool {
-        matches!(self, TransportError::SendFailed(..))
+        matches!(
+            self,
+            TransportError::SendFailed(..) | TransportError::OutboundStreamFailed(..)
+        )
     }
 }
 

@@ -1625,7 +1625,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 TransportError::ProtocolVersionMismatch { .. } => {
                                     tracing::warn!(%error);
                                 }
-                                TransportError::ChannelClosed | TransportError::ConnectionClosed(_) | TransportError::ConnectionEstablishmentFailure { .. } | TransportError::SendFailed(..) | TransportError::IO(_) | TransportError::Other(_) | TransportError::PubKeyDecryptionError(_) | TransportError::Serialization(_) => {
+                                TransportError::ChannelClosed | TransportError::ConnectionClosed(_) | TransportError::ConnectionEstablishmentFailure { .. } | TransportError::SendFailed(..) | TransportError::OutboundStreamFailed(_) | TransportError::IO(_) | TransportError::Other(_) | TransportError::PubKeyDecryptionError(_) | TransportError::Serialization(_) => {
                                     tracing::error!(error = %error, peer_addr = %remote_addr, "Failed NAT traversal");
                                 }
                             }
@@ -3668,6 +3668,7 @@ pub mod mock_transport {
             | TransportError::ConnectionClosed(_)
             | TransportError::ConnectionEstablishmentFailure { .. }
             | TransportError::SendFailed(..)
+            | TransportError::OutboundStreamFailed(_)
             | TransportError::IO(_)
             | TransportError::Other(_)
             | TransportError::PubKeyDecryptionError(_)
@@ -3683,6 +3684,7 @@ pub mod mock_transport {
             | TransportError::ConnectionClosed(_)
             | TransportError::ProtocolVersionMismatch { .. }
             | TransportError::SendFailed(..)
+            | TransportError::OutboundStreamFailed(_)
             | TransportError::IO(_)
             | TransportError::Other(_)
             | TransportError::PubKeyDecryptionError(_)
