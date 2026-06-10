@@ -2171,7 +2171,15 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
             );
             // Accumulate on-wire bytes across all packets of this multi-part
             // message so the Phase 1.6 class counters see the full cost,
-            // attributed to the primary payload's class.
+            // attributed to the primary payload's class. Two accepted
+            // accounting nits (observation-only, see shadow_demand.rs): the
+            // trailing NoOp confirm-receipt packets are counted under the
+            // primary class rather than as must-flow, and on a mid-burst
+            // `send_to` failure the `?` below returns before the
+            // `record_outbound` call, so the class split can undercount the
+            // already-sent bytes relative to `cumulative_bytes_sent` (which
+            // is incremented per packet at the socket layer). Both are tiny
+            // and only affect the rarely-hit multi-packet path.
             let mut sent_on_wire = 0usize;
             macro_rules! send {
                 ($packets:ident) => {{
@@ -2455,6 +2463,118 @@ mod tests {
             assert!(
                 !matches!(err, TransportError::ConnectionClosed(_)),
                 "should NOT be ConnectionClosed"
+            );
+        });
+    }
+
+    /// Phase 1.6 (#4074): the hot-path instrumentation must feed the
+    /// classified byte counters, and only on a successful send. A
+    /// `ShortMessage` advances `short`, a `StreamFragment` advances `bulk`,
+    /// and a failing send records nothing. The class counters are
+    /// process-global and monotonic, so the success assertions are framed
+    /// as lower bounds (delta ≥ payload) and the failure assertion as an
+    /// upper bound well below the payload size — both robust under
+    /// shared-process (`cargo test`) execution where another test might
+    /// also touch the same statics.
+    #[test]
+    fn packet_sending_feeds_classified_counters_on_success_only() {
+        use crate::transport::shadow_demand::outbound_counters_snapshot;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let outbound_key = {
+                use aes_gcm::KeyInit;
+                Aes128Gcm::new(&[0u8; 16].into())
+            };
+            let sent_tracker = Arc::new(parking_lot::Mutex::new(
+                crate::transport::sent_packet_tracker::tests::mock_sent_packet_tracker(),
+            ));
+            let remote_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+            // ---- success: ShortMessage advances `short` ----
+            let ok_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (tx, _rx) = mpsc::channel(16);
+            let socket = Arc::new(FailableTestSocket::new(tx, ok_flag));
+
+            let (_, short_before, bulk_before) = outbound_counters_snapshot();
+            packet_sending(
+                remote_addr,
+                &socket,
+                1,
+                &outbound_key,
+                vec![],
+                SymmetricMessagePayload::ShortMessage {
+                    payload: bytes::Bytes::from(vec![7u8; 200]),
+                },
+                &sent_tracker,
+                None,
+            )
+            .await
+            .expect("short send should succeed");
+            let (_, short_after, _) = outbound_counters_snapshot();
+            assert!(
+                short_after - short_before >= 200,
+                "ShortMessage send must add >= its 200-byte payload to `short` (delta {})",
+                short_after - short_before
+            );
+
+            // ---- success: StreamFragment advances `bulk` ----
+            packet_sending(
+                remote_addr,
+                &socket,
+                2,
+                &outbound_key,
+                vec![],
+                SymmetricMessagePayload::StreamFragment {
+                    stream_id: StreamId::next(),
+                    total_length_bytes: 300,
+                    fragment_number: 0,
+                    payload: bytes::Bytes::from(vec![9u8; 300]),
+                    metadata_bytes: None,
+                },
+                &sent_tracker,
+                None,
+            )
+            .await
+            .expect("stream fragment send should succeed");
+            let (_, _, bulk_after) = outbound_counters_snapshot();
+            assert!(
+                bulk_after - bulk_before >= 300,
+                "StreamFragment send must add >= its 300-byte payload to `bulk` (delta {})",
+                bulk_after - bulk_before
+            );
+
+            // ---- failure: a failing send records nothing ----
+            let fail_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let (tx2, _rx2) = mpsc::channel(16);
+            let failing = Arc::new(FailableTestSocket::new(tx2, fail_flag));
+            let (_, short_pre_fail, _) = outbound_counters_snapshot();
+            let res = packet_sending(
+                remote_addr,
+                &failing,
+                3,
+                &outbound_key,
+                vec![],
+                SymmetricMessagePayload::ShortMessage {
+                    payload: bytes::Bytes::from(vec![3u8; 600]),
+                },
+                &sent_tracker,
+                None,
+            )
+            .await;
+            assert!(res.is_err(), "failing socket must return Err");
+            let (_, short_post_fail, _) = outbound_counters_snapshot();
+            // A wrongly-recorded error path would jump `short` by >= 600;
+            // concurrent unit tests only add tiny amounts, so a delta well
+            // under 600 proves nothing was recorded on the failure path.
+            assert!(
+                short_post_fail - short_pre_fail < 600,
+                "failing send must not record its 600-byte payload (delta {})",
+                short_post_fail - short_pre_fail
             );
         });
     }

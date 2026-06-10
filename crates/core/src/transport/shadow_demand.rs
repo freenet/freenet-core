@@ -40,6 +40,41 @@
 //! path") applies here too. The hot path only *writes* the cheap
 //! counters; all reads happen in the aggregator tasks.
 //!
+//! ## What the class split covers — and what it does not
+//!
+//! The class counters are tagged at the data-path send choke point
+//! (`packet_sending`, which carries `ShortMessage` / `NoOp` /
+//! `StreamFragment`) plus the two bypass sites `send_pong` and the
+//! keep-alive `Ping`. They deliberately do **not** cover: retransmits
+//! (resent below `packet_sending`), the handshake / intro `AckConnection`
+//! sends, or standalone connection ACKs. Those bytes are still counted in
+//! the node total (`shadow_rate_demand.sent_bytes_per_sec`, derived from
+//! `TRANSPORT_METRICS.cumulative_bytes_sent` at the socket layer), so the
+//! split is a classified *subset* of the total, not the whole of it. The
+//! excluded paths are connection-establishment or recovery traffic, not
+//! steady-state data flow, so the #4074 floor lower bound (must-flow rate
+//! *when not bulk-transferring*) is essentially unaffected.
+//!
+//! Note for the analysis consumer: `must_flow` here is strictly
+//! transport-level liveness (`Ping` / `Pong` / `NoOp` / `AckConnection`).
+//! The issue's conceptual "must-flow" also includes subscription
+//! heartbeats and relay obligations, but those ride inside `ShortMessage`
+//! / `StreamFragment` at the transport layer and so land in the `short` /
+//! `bulk` buckets — the transport cannot see them. The `short` bucket
+//! therefore likely needs partial apportionment to must-flow during the
+//! offline analysis.
+//!
+//! ## Telemetry budget
+//!
+//! These two always-on emitters plus the Phase 1 RTT aggregator put three
+//! 1 Hz shadow events (and, on a gateway with reference-ping and iface-tx
+//! enabled, up to five) into an OTLP pipe rate-limited at 10 events/sec
+//! with no priority ordering (`tracing/telemetry.rs`). On a busy gateway
+//! some events — shadow or operational — may be dropped within a 1 s
+//! window. Acceptable as a statistical tradeoff for shadow telemetry; a
+//! shadow-event priority / sub-budget should land before Phase 2 adds
+//! more always-on streams (tracked separately).
+//!
 //! ## Process-wide, single-node-per-process
 //!
 //! The class counters and the broadcast gauge are process-global statics,
@@ -145,6 +180,17 @@ fn snapshot_outbound() -> OutboundSnapshot {
         short_bytes: OUTBOUND.short_bytes.load(Ordering::Relaxed),
         bulk_bytes: OUTBOUND.bulk_bytes.load(Ordering::Relaxed),
     }
+}
+
+/// Test-only accessor for the process-global class counters, returned as
+/// `(must_flow, short, bulk)` cumulative byte totals. Used by the
+/// send-path integration tests in `peer_connection.rs` to assert the
+/// hot-path hooks feed the right counter. Callers use delta assertions to
+/// stay robust against other tests touching these monotonic statics.
+#[cfg(test)]
+pub(crate) fn outbound_counters_snapshot() -> (u64, u64, u64) {
+    let s = snapshot_outbound();
+    (s.must_flow_bytes, s.short_bytes, s.bulk_bytes)
 }
 
 /// Bytes accumulated in each class between two snapshots.
@@ -426,7 +472,23 @@ mod tests {
     }
 
     #[test]
+    fn outbound_delta_is_zero_for_a_quiet_interval() {
+        // Equal prev/now snapshots (no traffic in the interval) must yield
+        // all-zero deltas, not a spurious value.
+        let snap = OutboundSnapshot {
+            must_flow_bytes: 12_345,
+            short_bytes: 67_890,
+            bulk_bytes: 1_000_000,
+        };
+        assert_eq!(outbound_delta(snap, snap), (0, 0, 0));
+    }
+
+    #[test]
     fn broadcast_queue_depth_gauge_round_trips() {
+        // Store-then-load is atomic and safe here: the only production
+        // writer (`broadcast_queue.rs`) is `#[cfg(not(feature =
+        // "simulation_tests"))]` and never instantiated in `--lib` unit
+        // tests, so no concurrent writer races this assertion.
         record_broadcast_queue_depth(42);
         assert_eq!(BROADCAST_QUEUE_DEPTH.load(Ordering::Relaxed), 42);
         record_broadcast_queue_depth(0);

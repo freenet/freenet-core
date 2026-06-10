@@ -151,8 +151,13 @@ by the 1Hz aggregator tasks:
   traffic), `ShortMessage` is `Short` (opaque serialized `NetMessage`
   — small contract op or control plane, unsplittable at the transport
   layer), and `Ping`/`Pong`/`NoOp`/`AckConnection` are `MustFlow`.
-  Tagged at `packet_sending` (covers short/noop/ack/stream) plus the
-  two bypass sites `send_pong` and the keep-alive `Ping`.
+  Tagged at `packet_sending` (covers `ShortMessage` / `NoOp` /
+  `StreamFragment`) plus the two bypass sites `send_pong` and the
+  keep-alive `Ping`. The split is a classified *subset* of the node
+  total: it excludes retransmits, handshake/intro `AckConnection`, and
+  standalone connection ACKs, which are still counted in
+  `cumulative_bytes_sent` (the `shadow_rate_demand` total) but not the
+  per-class breakdown.
 - **Broadcast-queue depth gauge** (`record_broadcast_queue_depth`):
   updated by `node/network_bridge/broadcast_queue.rs` under its own
   queue lock, so the shadow reader never contends on the queue mutex.

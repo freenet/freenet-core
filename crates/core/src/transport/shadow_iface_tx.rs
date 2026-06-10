@@ -38,6 +38,13 @@
 //! saturation-attribution question. `saturating_sub` keeps `op` at 0 in
 //! the rare case the two counters are read across a skewed window and
 //! `own` momentarily exceeds `total`.
+//!
+//! The probe also sums tx across *all* non-loopback interfaces, including
+//! virtual ones (docker/veth/bridge/bonded). On a container host a packet
+//! can traverse `docker0` → `eno1` and be counted on both, inflating
+//! `total` (and therefore `op`). The intended targets are bare-metal
+//! gateways where this is a non-issue; on container hosts treat `op` as an
+//! upper bound on competing traffic, not an exact figure.
 
 use std::time::Duration;
 
@@ -79,7 +86,7 @@ pub(crate) fn spawn_iface_tx_monitor(local_peer_id: String, monitor: &Background
             if let (Some(prev), Some(now)) = (prev_total, now_total) {
                 let total_delta = now.saturating_sub(prev);
                 let own_delta = now_own.saturating_sub(prev_own);
-                let op_delta = total_delta.saturating_sub(own_delta);
+                let op_delta = iface_op(total_delta, own_delta);
                 emit_iface_snapshot(&local_peer_id, total_delta, own_delta, op_delta);
             }
             // Advance the baseline only on a successful read so that a
@@ -141,6 +148,15 @@ fn parse_total_tx_bytes(contents: &str) -> Option<u64> {
         }
     }
     found.then_some(total)
+}
+
+/// `op = total_tx − freenet_own_tx`, the bytes attributable to traffic
+/// other than Freenet. `saturating_sub` keeps it at 0 when `own` exceeds
+/// `total` — which can happen across a skewed read window or because
+/// `own` counts UDP payload while the interface counter and Freenet's own
+/// header overhead interact (see the module-level accounting caveat).
+fn iface_op(total_delta: u64, own_delta: u64) -> u64 {
+    total_delta.saturating_sub(own_delta)
 }
 
 fn emit_iface_snapshot(
@@ -205,6 +221,40 @@ mod tests {
         // but must not crash or poison the sum.
         let input = "  eth0: 1 2 3\n  eth1: 1 2 3 4 5 6 7 8 4242 9\n";
         assert_eq!(parse_total_tx_bytes(input), Some(4242));
+    }
+
+    #[test]
+    fn parse_handles_colon_glued_to_first_counter() {
+        // On busy interfaces the kernel does not pad, so a large rx_bytes
+        // can abut the colon with no separating space, e.g.
+        // `eth0:123456789 ...`. `split_once(':')` removes the colon and
+        // `rest` then starts with rx_bytes, so field index 8 still lands
+        // on tx_bytes. Pin that the no-space-after-colon form parses
+        // identically to the spaced form.
+        let glued = "eth0:100 1 2 3 4 5 6 7 9999 10\n";
+        assert_eq!(parse_total_tx_bytes(glued), Some(9999));
+    }
+
+    #[test]
+    fn parse_handles_huge_counters_without_overflow() {
+        // 64-bit interface counters near u64::MAX must parse and sum
+        // without panicking (saturating_add guards the sum).
+        let big = u64::MAX - 1;
+        let input = format!("eth0: 1 2 3 4 5 6 7 8 {big} 9\neth1: 1 2 3 4 5 6 7 8 5 9\n");
+        assert_eq!(parse_total_tx_bytes(&input), Some(u64::MAX));
+    }
+
+    #[test]
+    fn iface_op_is_total_minus_own() {
+        assert_eq!(iface_op(10_000, 3_000), 7_000);
+        assert_eq!(iface_op(0, 0), 0);
+    }
+
+    #[test]
+    fn iface_op_saturates_when_own_exceeds_total() {
+        // The skewed-window case the module rustdoc promises to handle:
+        // own > total must clamp op to 0, never wrap.
+        assert_eq!(iface_op(1_000, 4_000), 0);
     }
 
     /// `spawn_iface_tx_monitor` must keep its task alive across ticks even
