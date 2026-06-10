@@ -22,6 +22,15 @@ rate_limit_seconds = 600
 # from the agent's clock. Defends against replay attacks.
 clock_skew_tolerance_seconds = 300
 
+# systemd unit name of the gateway service this agent manages, WITHOUT the
+# `.service` suffix. `GET /version` runs `systemctl is-active <managed_service>`
+# and reports the result as `service_active`, so the release workflow can tell a
+# successful binary swap apart from a gateway whose service failed to restart
+# (the vega v0.2.71 incident). `systemctl is-active` is read-only and needs no
+# sudo. Defaults to `freenet-gateway`; vega's secondary instance uses
+# `freenet-gateway-hector`.
+managed_service = "freenet-gateway"
+
 # River announcement endpoint. Set both to enable `POST /announce/river`.
 # Leave blank (default) on gateways that don't have a Freenet node + room
 # signing key (e.g. vega) — the endpoint will return 503 there.

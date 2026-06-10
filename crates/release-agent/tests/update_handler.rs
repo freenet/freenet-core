@@ -72,6 +72,7 @@ impl Harness {
             clock_skew_tolerance_seconds: 300,
             river_announce_command: std::path::PathBuf::new(),
             river_announce_user: String::new(),
+            managed_service: "freenet-gateway".into(),
         };
 
         let latest_source: Arc<dyn LatestSource> = Arc::new(StaticLatest(latest_on_github));
@@ -158,6 +159,7 @@ impl Harness {
             clock_skew_tolerance_seconds: 300,
             river_announce_command: std::path::PathBuf::new(),
             river_announce_user: String::new(),
+            managed_service: "freenet-gateway".into(),
         };
 
         let latest_source: Arc<dyn LatestSource> = Arc::new(StaticLatest(latest_on_github));
@@ -370,6 +372,20 @@ async fn version_endpoint_reads_stub_binary() {
     assert_eq!(resp.status(), 200);
     let j: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(j["version"], "0.2.55");
+
+    // Service-health fields must be present so the release workflow can
+    // distinguish a successful binary swap from a gateway whose service
+    // failed to restart (vega v0.2.71). `managed_service` is the configured
+    // unit name; `service_active` is a bool whose value depends on whether
+    // that unit happens to be active on the test host (the unit doesn't exist
+    // on CI runners, so it's typically false) — we assert presence + type, not
+    // the runtime value.
+    assert_eq!(j["managed_service"], "freenet-gateway");
+    assert!(
+        j["service_active"].is_boolean(),
+        "service_active must be a boolean field, got: {:?}",
+        j["service_active"]
+    );
 }
 
 #[tokio::test]
@@ -522,6 +538,7 @@ async fn build_with_announcer(announce_script: &str, record_file: &Path) -> Harn
         clock_skew_tolerance_seconds: 300,
         river_announce_command: announce_command.clone(),
         river_announce_user: "nobody".into(),
+        managed_service: "freenet-gateway".into(),
     };
     let latest_source: Arc<dyn LatestSource> = Arc::new(StaticLatest(Version::new(0, 2, 56)));
     let announcer = freenet_release_agent::announcer::Announcer {

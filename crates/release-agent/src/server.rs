@@ -51,8 +51,24 @@ pub struct AppState {
 
 #[derive(Serialize)]
 pub struct VersionResponse {
+    /// On-disk version of the freenet binary (`freenet --version`). This is
+    /// NOT proof the gateway service is running it — see `service_active`.
     pub version: String,
     pub binary_path: String,
+    /// Whether the managed gateway systemd unit is currently `active`
+    /// (`systemctl is-active <managed_service>`). Added after the v0.2.71
+    /// release, where vega's binary was swapped successfully but the service
+    /// failed to restart, leaving `/version` reporting the new version while
+    /// the gateway was DOWN. The release workflow MUST require this be `true`
+    /// before declaring an update successful.
+    ///
+    /// NOTE: backward compatibility — older release-agent builds omit this
+    /// field entirely, so consumers must treat its ABSENCE as "agent predates
+    /// the check" (fall back to the binary-only check) rather than a failure.
+    pub service_active: bool,
+    /// The systemd unit name whose state `service_active` reflects. Surfaced so
+    /// the workflow log records which unit was checked.
+    pub managed_service: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -107,11 +123,20 @@ pub fn build_router(state: AppState) -> Router {
 
 async fn version_handler(State(state): State<AppState>) -> Response {
     match state.version_cache.current(&state.config.binary_path).await {
-        Ok(v) => Json(VersionResponse {
-            version: v.to_string(),
-            binary_path: state.config.binary_path.display().to_string(),
-        })
-        .into_response(),
+        Ok(v) => {
+            // Report the SERVICE's health, not just the on-disk binary: a
+            // gateway whose binary was swapped but whose service failed to
+            // restart must NOT look like a successful update (vega v0.2.71).
+            let service_active =
+                crate::version::service_active(&state.config.managed_service).await;
+            Json(VersionResponse {
+                version: v.to_string(),
+                binary_path: state.config.binary_path.display().to_string(),
+                service_active,
+                managed_service: state.config.managed_service.clone(),
+            })
+            .into_response()
+        }
         Err(e) => {
             tracing::warn!(error = %e, "failed to read freenet --version");
             (

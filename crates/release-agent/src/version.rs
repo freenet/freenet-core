@@ -89,6 +89,64 @@ fn parse_version_output(out: &str) -> Result<Version> {
         .with_context(|| format!("could not parse version from {out:?}"))
 }
 
+/// Query whether the managed gateway service is running, via
+/// `systemctl is-active <service>`.
+///
+/// The `/version` endpoint reports the ON-DISK binary version. That is not
+/// the same question as "is the gateway actually running it": during the
+/// v0.2.71 release the vega gateway's binary was swapped to 0.2.71 but the
+/// service failed to restart (old process hung on shutdown → SIGKILL → unit
+/// left `failed`). `/version` still reported 0.2.71, so the release workflow
+/// reported success while the gateway was DOWN for ~5 minutes. Surfacing the
+/// service state lets the workflow tell those two cases apart.
+///
+/// Returns `Ok(true)` only when systemd reports the unit `active`. `inactive`,
+/// `failed`, `activating`, an unknown unit, or a missing/erroring `systemctl`
+/// all map to `Ok(false)` — never an error and never a panic. `systemctl
+/// is-active` is a read-only query that does not require root, so no sudo is
+/// involved.
+///
+/// Note: `is-active` exits non-zero for any non-active state, so we key on the
+/// printed state word (stdout) rather than the exit status.
+pub async fn service_active(service: &str) -> bool {
+    service_active_with(Path::new("systemctl"), service).await
+}
+
+/// Implementation of [`service_active`] with the `systemctl` binary path
+/// injected so tests can point at a stub without real systemd. Production
+/// callers use [`service_active`], which resolves `systemctl` via PATH.
+async fn service_active_with(systemctl: &Path, service: &str) -> bool {
+    let unit = if service.ends_with(".service") {
+        service.to_string()
+    } else {
+        format!("{service}.service")
+    };
+
+    let output = match tokio::time::timeout(
+        Duration::from_secs(5),
+        Command::new(systemctl).arg("is-active").arg(&unit).output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => {
+            // systemctl missing (non-systemd host) or otherwise unspawnable.
+            tracing::warn!(error = %e, unit, "could not spawn `systemctl is-active`");
+            return false;
+        }
+        Err(_) => {
+            tracing::warn!(unit, "`systemctl is-active` timed out");
+            return false;
+        }
+    };
+
+    // `is-active` prints exactly the active state on stdout (e.g. `active`,
+    // `inactive`, `failed`, `activating`). Match `active` precisely so
+    // `activating`/`inactive` are not counted as up.
+    let state = String::from_utf8_lossy(&output.stdout);
+    state.trim() == "active"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +177,60 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         assert!(parse_version_output("no version here").is_err());
+    }
+
+    /// Write a stub `systemctl` that prints `state` on stdout and exits 0 for
+    /// `active`, 3 otherwise — matching real `systemctl is-active` behaviour
+    /// (non-active states exit non-zero but still print the state word).
+    fn write_stub_systemctl(dir: &Path, state: &str) -> PathBuf {
+        let bin = dir.join("fake-systemctl");
+        let exit = if state == "active" { 0 } else { 3 };
+        let script = format!("#!/bin/sh\necho {state}\nexit {exit}\n");
+        let mut f = std::fs::File::create(&bin).unwrap();
+        f.write_all(script.as_bytes()).unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        bin
+    }
+
+    #[tokio::test]
+    async fn service_active_true_when_systemctl_reports_active() {
+        let dir = tempfile::tempdir().unwrap();
+        let systemctl = write_stub_systemctl(dir.path(), "active");
+        assert!(service_active_with(&systemctl, "freenet-gateway").await);
+    }
+
+    #[tokio::test]
+    async fn service_active_false_when_failed() {
+        // The vega v0.2.71 case: binary swapped, but the unit is `failed`.
+        let dir = tempfile::tempdir().unwrap();
+        let systemctl = write_stub_systemctl(dir.path(), "failed");
+        assert!(!service_active_with(&systemctl, "freenet-gateway").await);
+    }
+
+    #[tokio::test]
+    async fn service_active_false_when_inactive() {
+        let dir = tempfile::tempdir().unwrap();
+        let systemctl = write_stub_systemctl(dir.path(), "inactive");
+        assert!(!service_active_with(&systemctl, "freenet-gateway").await);
+    }
+
+    #[tokio::test]
+    async fn service_active_false_when_activating() {
+        // `activating` is not yet up; must not be counted as active.
+        let dir = tempfile::tempdir().unwrap();
+        let systemctl = write_stub_systemctl(dir.path(), "activating");
+        assert!(!service_active_with(&systemctl, "freenet-gateway").await);
+    }
+
+    #[tokio::test]
+    async fn service_active_false_when_systemctl_missing() {
+        // Non-systemd host (or systemctl not installed): never panic, never
+        // error — just report the service as not active.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist-systemctl");
+        assert!(!service_active_with(&missing, "freenet-gateway").await);
     }
 
     #[tokio::test]
