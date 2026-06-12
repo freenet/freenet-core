@@ -121,6 +121,17 @@ fn get_network_time_source(network_name: &str) -> Option<VirtualTime> {
     NETWORK_TIME_SOURCES.get(network_name).map(|r| r.clone())
 }
 
+/// Returns the simulation `VirtualTime` for the network that owns `addr`, if any.
+///
+/// Used by the transport's gateway admission rate limiter so its ramp-up advances
+/// with simulation time instead of real wall-clock (the connection handler is
+/// otherwise built with a `RealTime` source). Returns `None` outside simulation
+/// (no address/network registered), where real time is the correct clock.
+pub(crate) fn get_socket_virtual_time(addr: &SocketAddr) -> Option<VirtualTime> {
+    let network_name = get_address_network(addr)?;
+    get_network_time_source(&network_name)
+}
+
 /// Result of checking packet delivery through fault injection.
 #[derive(Debug)]
 pub enum PacketDeliveryDecision {
