@@ -6342,9 +6342,11 @@ async fn test_thundering_herd_connect_storm() {
     );
     // Note: The gateway rate limiter (GatewayConnectionRateLimiter) intentionally
     // throttles the thundering herd to 5 connections/sec initially, ramping up over
-    // 2 minutes. In simulation, RealTime-based rate limiting means fewer connections
-    // complete than the 20 peers attempting to reconnect. This is the desired behavior
-    // — the storm is prevented, not just survived.
+    // 2 minutes. Its admission ramp advances on the simulation clock
+    // (max(real_elapsed, virtual_elapsed); see GatewayConnectionRateLimiter), so the
+    // throttle still applies as virtual time advances but fewer connections complete
+    // per window than the 20 peers attempting to reconnect. This is the desired
+    // behavior: the storm is prevented, not just survived.
 
     // 6b: Verify network recovered (the actual regression check for #3207/#3208)
     sim.check_partial_connectivity(Duration::from_secs(20), 0.8)

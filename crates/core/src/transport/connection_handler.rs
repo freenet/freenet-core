@@ -41,7 +41,8 @@ use super::{
     symmetric_message::{SymmetricMessage, SymmetricMessagePayload},
     token_bucket::TokenBucket,
 };
-use crate::simulation::{RealTime, TimeSource};
+use crate::simulation::{RealTime, TimeSource, VirtualTime};
+use crate::transport::in_memory_socket::get_socket_virtual_time;
 
 // Constants for interval increase
 const INITIAL_INTERVAL: Duration = Duration::from_millis(50);
@@ -296,7 +297,16 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             global_bandwidth,
             ledbat_min_ssthresh,
             expected_non_gateway: expected_non_gateway.clone(),
-            gw_rate_limiter: GatewayConnectionRateLimiter::new(time_source.clone()),
+            // In simulation the admission ramp must advance with the network's
+            // VirtualTime, not only the RealTime source this handler is built with
+            // (see `GatewayConnectionRateLimiter::effective_elapsed_nanos`).
+            // `get_socket_virtual_time` returns `Some` only when a SimNetwork has
+            // registered a VirtualTime for this address, and `None` in production
+            // (where the ramp stays on real wall-clock exactly as before).
+            gw_rate_limiter: GatewayConnectionRateLimiter::new(
+                time_source.clone(),
+                get_socket_virtual_time(&socket_addr),
+            ),
             time_source,
             congestion_config: Some(congestion_config.unwrap_or_default()),
         };
@@ -495,7 +505,9 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             global_bandwidth,
             ledbat_min_ssthresh,
             expected_non_gateway: expected_non_gateway.clone(),
-            gw_rate_limiter: GatewayConnectionRateLimiter::new(time_source.clone()),
+            // This listener's `time_source` is already VirtualTime, so the admission
+            // clock needs no override.
+            gw_rate_limiter: GatewayConnectionRateLimiter::new(time_source.clone(), None),
             time_source,
             congestion_config,
         };
@@ -1124,32 +1136,74 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
 /// simultaneously. Uses a 1-second tumbling window to count accepted connections
 /// and compares against a rate that ramps up over time since gateway start.
 struct GatewayConnectionRateLimiter<T: TimeSource> {
-    /// Nanos timestamp when the gateway started listening.
-    start_nanos: u64,
-    /// Nanos timestamp of the current 1-second window start.
-    window_start_nanos: u64,
+    /// Real-clock timestamp (`time_source`) captured when the gateway started listening.
+    real_start_nanos: u64,
+    /// Simulation `VirtualTime` timestamp at gateway start, when a sim override clock is present.
+    virtual_start_nanos: Option<u64>,
+    /// Start of the current 1-second window, in effective-elapsed nanos
+    /// (see [`Self::effective_elapsed_nanos`]).
+    window_start_effective_nanos: u64,
     /// Number of connections accepted in the current window.
     window_count: u64,
     time_source: T,
+    /// Simulation override clock. See [`Self::effective_elapsed_nanos`] for why the
+    /// admission ramp uses `max(real_elapsed, virtual_elapsed)` rather than either clock alone.
+    ///
+    /// `Some` only in simulation (a `VirtualTime` is registered for this socket's
+    /// network — note `VirtualTime is now always enabled` for SimNetworks). `None` in
+    /// production, where the real `time_source` is the only and correct admission clock.
+    virtual_clock: Option<VirtualTime>,
 }
 
 impl<T: TimeSource> GatewayConnectionRateLimiter<T> {
-    fn new(time_source: T) -> Self {
-        let now = time_source.now_nanos();
+    fn new(time_source: T, virtual_clock: Option<VirtualTime>) -> Self {
+        let real_start_nanos = time_source.now_nanos();
+        let virtual_start_nanos = virtual_clock.as_ref().map(|v| v.now_nanos());
         Self {
-            start_nanos: now,
-            window_start_nanos: now,
+            real_start_nanos,
+            virtual_start_nanos,
+            window_start_effective_nanos: 0,
             window_count: 0,
             time_source,
+            virtual_clock,
         }
+    }
+
+    /// Nanoseconds of *simulation progress* since gateway start, defined as
+    /// `max(real_elapsed, virtual_elapsed)`.
+    ///
+    /// The admission ramp (5/s for 30s, 20/s to 2min, then unlimited) must advance with
+    /// whatever clock the simulation is actually progressing on, and the two SimNetwork
+    /// execution modes use different clocks:
+    /// - **Virtual-time-driven** (e.g. `test_thundering_herd_connect_storm` advances
+    ///   `VirtualTime` explicitly while spending only ~10ms real per 100ms virtual): the
+    ///   ramp must follow the virtual clock or it never progresses, leaving admission
+    ///   pinned at the throttled initial rate and nondeterministic in real-scheduler order
+    ///   (the root cause of that test's flakiness).
+    /// - **Real-time-driven** (the virtual clock is not advanced): the ramp must follow the
+    ///   real clock or the 1-second window never resets and the gateway permanently blocks
+    ///   new peers after the first burst, so the network never forms.
+    ///
+    /// `max()` advances at least as fast as either clock alone, so it is correct for both
+    /// modes and is **never more restrictive than the pre-existing real-clock behavior**
+    /// (it can only let the ramp complete sooner, never later). Both elapsed terms are
+    /// monotonic, so their max is monotonic. In production `virtual_clock` is `None`, so
+    /// this is exactly real-clock elapsed and behavior is unchanged.
+    fn effective_elapsed_nanos(&self) -> u64 {
+        let real_elapsed = self
+            .time_source
+            .now_nanos()
+            .saturating_sub(self.real_start_nanos);
+        let virtual_elapsed = match (&self.virtual_clock, self.virtual_start_nanos) {
+            (Some(virtual_time), Some(start)) => virtual_time.now_nanos().saturating_sub(start),
+            _ => 0,
+        };
+        real_elapsed.max(virtual_elapsed)
     }
 
     /// Returns the maximum connections/second allowed based on time since gateway start.
     fn current_rate_limit(&self) -> Option<u64> {
-        let elapsed = self
-            .time_source
-            .now_nanos()
-            .saturating_sub(self.start_nanos);
+        let elapsed = self.effective_elapsed_nanos();
         if elapsed < GW_RAMP_PHASE1_DURATION.as_nanos() as u64 {
             Some(GW_RAMP_PHASE1_RATE)
         } else if elapsed < GW_RAMP_PHASE2_DURATION.as_nanos() as u64 {
@@ -1165,12 +1219,12 @@ impl<T: TimeSource> GatewayConnectionRateLimiter<T> {
             return true; // Unlimited phase
         };
 
-        let now = self.time_source.now_nanos();
-        let window_elapsed = now.saturating_sub(self.window_start_nanos);
+        let now = self.effective_elapsed_nanos();
+        let window_elapsed = now.saturating_sub(self.window_start_effective_nanos);
 
         // Reset window every second
         if window_elapsed >= Duration::from_secs(1).as_nanos() as u64 {
-            self.window_start_nanos = now;
+            self.window_start_effective_nanos = now;
             self.window_count = 0;
         }
 
@@ -1444,7 +1498,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     continue;
                                 }
 
-                                // Rate limit intro attempts (per-IP)
+                                // Rate limit intro attempts (per-IP).
+                                // NOTE: this per-IP throttle is still measured on the real
+                                // wall-clock `time_source`, unlike the gateway admission ramp
+                                // below which uses the simulation clock. It is deliberately left
+                                // on RealTime here (out of scope for the #4383 fix); see #4384.
                                 if self.connections.is_rate_limited(&remote_addr) {
                                     tracing::trace!(peer_addr = %remote_addr, "Rate limiting gateway intro attempt");
                                     continue;
@@ -3209,7 +3267,8 @@ mod version_cmp {
         use std::time::Duration;
 
         let time = VirtualTime::new();
-        let mut limiter = GatewayConnectionRateLimiter::new(time.clone());
+        // `time_source` is itself VirtualTime here, so no separate override is needed.
+        let mut limiter = GatewayConnectionRateLimiter::new(time.clone(), None);
 
         // Phase 1: should allow GW_RAMP_PHASE1_RATE connections per second
         for _ in 0..GW_RAMP_PHASE1_RATE {
@@ -3259,6 +3318,95 @@ mod version_cmp {
         for _ in 0..1000 {
             assert!(limiter.try_accept(), "Should accept unlimited in phase 3");
         }
+    }
+
+    /// Regression test for the gateway admission clock used by
+    /// `test_thundering_herd_connect_storm` and every other SimNetwork test.
+    ///
+    /// In a SimNetwork the connection handler is built with a `RealTime` source
+    /// (`config_listener`) plus a simulation `VirtualTime` override. The admission
+    /// ramp must advance on `max(real_elapsed, virtual_elapsed)` so it is correct in
+    /// both execution modes:
+    /// - **Virtual-time-driven** (the thundering-herd test advances `VirtualTime`
+    ///   while real time barely moves): the ramp must follow the virtual clock or it
+    ///   never progresses and admission stalls nondeterministically.
+    /// - **Real-time-driven** (the virtual clock is never advanced): the ramp must
+    ///   follow the real clock or the 1-second window never resets and the gateway
+    ///   blocks every peer after the first burst, so the network never forms.
+    ///
+    /// The two halves below drive exactly one clock each (using two independently
+    /// controllable `VirtualTime` instances, one standing in for the real source).
+    /// A revert to either single clock fails one half: pure-virtual fails the
+    /// real-driven half, pure-real fails the virtual-driven half.
+    #[test]
+    fn test_gateway_rate_limiter_admission_clock_is_max_of_real_and_virtual() {
+        use super::{GW_RAMP_PHASE1_RATE, GW_RAMP_PHASE2_RATE, GatewayConnectionRateLimiter};
+        use crate::simulation::VirtualTime;
+        use std::time::Duration;
+
+        // Drives the ramp through phase 1 -> reset -> phase 2 by advancing only the
+        // named clock, asserting the OTHER clock staying frozen does not matter.
+        fn drive(advance: impl Fn(&mut GatewayConnectionRateLimiter<VirtualTime>)) {
+            let real = VirtualTime::new();
+            let virtual_clock = VirtualTime::new();
+            let mut limiter = GatewayConnectionRateLimiter::new(real, Some(virtual_clock));
+            // Phase 1: exactly GW_RAMP_PHASE1_RATE admits, then throttled.
+            for _ in 0..GW_RAMP_PHASE1_RATE {
+                assert!(limiter.try_accept(), "phase 1 admits within rate");
+            }
+            assert!(
+                !limiter.try_accept(),
+                "phase 1 rate exhausted (no clock advanced)"
+            );
+            advance(&mut limiter);
+        }
+
+        // Helpers to advance one clock of the limiter under test.
+        fn adv_virtual(l: &mut GatewayConnectionRateLimiter<VirtualTime>, d: Duration) {
+            l.virtual_clock.as_ref().unwrap().advance(d);
+        }
+        fn adv_real(l: &mut GatewayConnectionRateLimiter<VirtualTime>, d: Duration) {
+            l.time_source.advance(d);
+        }
+
+        // Virtual-time-driven: advancing ONLY the virtual clock ramps the limiter.
+        drive(|l| {
+            adv_virtual(l, Duration::from_millis(1001));
+            assert!(l.try_accept(), "virtual-clock advance resets the window");
+            adv_virtual(l, Duration::from_secs(31));
+            assert_eq!(
+                l.current_rate_limit(),
+                Some(GW_RAMP_PHASE2_RATE),
+                "virtual-clock advance ramps into phase 2"
+            );
+        });
+
+        // Real-time-driven (the case that regressed under a virtual-only clock):
+        // advancing ONLY the real clock, with the virtual clock frozen, ramps it too.
+        drive(|l| {
+            adv_real(l, Duration::from_millis(1001));
+            assert!(l.try_accept(), "real-clock advance resets the window");
+            adv_real(l, Duration::from_secs(31));
+            assert_eq!(
+                l.current_rate_limit(),
+                Some(GW_RAMP_PHASE2_RATE),
+                "real-clock advance ramps into phase 2"
+            );
+        });
+
+        // Pin max() vs a hypothetical sum: advancing BOTH clocks by 20s leaves
+        // effective elapsed at max(20s, 20s) = 20s, still phase 1. A sum would reach
+        // 40s and report phase 2, a min would report phase 1 only because one term is
+        // frozen — this both-clocks case distinguishes max from sum.
+        drive(|l| {
+            adv_real(l, Duration::from_secs(20));
+            adv_virtual(l, Duration::from_secs(20));
+            assert_eq!(
+                l.current_rate_limit(),
+                Some(GW_RAMP_PHASE1_RATE),
+                "effective elapsed is max(20s, 20s) = 20s (phase 1), not the 40s sum"
+            );
+        });
     }
 }
 
