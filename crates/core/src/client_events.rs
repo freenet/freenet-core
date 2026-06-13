@@ -2333,10 +2333,17 @@ pub(crate) mod test {
         // this test catches the mismatch via the variant-equality
         // assertion below.
         let err = OpError::NodeShuttingDown;
+        // The wildcard arm below intentionally absorbs every current (and any
+        // future) `OpError` variant the way production's `report_op_init_error`
+        // catch-all does; this test only pins the `NodeShuttingDown` arm, so an
+        // exhaustive listing would add churn without strengthening the
+        // assertion. Mirrors the documented `non_exhaustive` wildcard pattern in
+        // `.claude/rules/git-workflow.md`. The allow sits on the match
+        // expression because clippy reports `wildcard_enum_match_arm` at the
+        // match scrutinee, not the individual arm.
+        #[allow(clippy::wildcard_enum_match_arm)]
         let kind = match err {
             OpError::NodeShuttingDown => ErrorKind::Shutdown,
-            // All other variants fall into the catch-all in
-            // production — they're irrelevant to this test.
             _ => ErrorKind::OperationError {
                 cause: "irrelevant for this test".to_string().into(),
             },
@@ -2370,15 +2377,24 @@ pub(crate) mod test {
         let instance_id = ContractInstanceId::new([7u8; 32]);
         let err = OpError::ContractBanned { instance_id };
         let op_name = "PUT";
+        // The wildcard arms below intentionally absorb every other (and any
+        // future) `OpError` / `ErrorKind` variant the way production's
+        // catch-alls do; this test only pins the `ContractBanned` mapping, so an
+        // exhaustive listing would add churn without strengthening the
+        // assertion. Mirrors the documented non_exhaustive wildcard pattern in
+        // `.claude/rules/git-workflow.md`. The allows sit on the match
+        // expressions because clippy reports `wildcard_enum_match_arm` at the
+        // match scrutinee, not the individual arm.
+        #[allow(clippy::wildcard_enum_match_arm)]
         let kind = match err {
             OpError::ContractBanned { .. } => ErrorKind::OperationError {
                 cause: format!("{op_name} operation failed: {err}").into(),
             },
-            // Other variants are irrelevant to this test.
             _ => ErrorKind::Unhandled {
                 cause: "irrelevant for this test".to_string().into(),
             },
         };
+        #[allow(clippy::wildcard_enum_match_arm)]
         match kind {
             ErrorKind::OperationError { cause } => {
                 assert!(
