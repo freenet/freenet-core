@@ -1363,7 +1363,23 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 // still tracked, flight size is unchanged: it never left
                                 // flight (on_timeout did not decrement), so no on_send /
                                 // re-add runs. See refresh_sent_packet's rustdoc.
-                                self.remote_conn.sent_tracker.lock().refresh_sent_packet(idx, packet, None);
+                                //
+                                // `false` (the deliberate no-op-on-drop) is the
+                                // resurrection-safe path, not an error — surface it at
+                                // trace level rather than silently discarding the bool.
+                                let still_tracked = self
+                                    .remote_conn
+                                    .sent_tracker
+                                    .lock()
+                                    .refresh_sent_packet(idx, packet, None);
+                                if !still_tracked {
+                                    tracing::trace!(
+                                        peer_addr = %self.remote_conn.remote_addr,
+                                        packet_id = idx,
+                                        "Resent packet was dropped (stream aborted) before \
+                                         re-registration — refresh no-op (#4345)"
+                                    );
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -1376,7 +1392,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 // If a concurrent drop_stream already removed it, this
                                 // no-ops (the stream is being torn down anyway), avoiding
                                 // a resurrected zombie. See refresh_sent_packet's rustdoc.
-                                self.remote_conn
+                                // The bool is intentionally discarded: on this error path
+                                // we're breaking out regardless of whether the packet was
+                                // still tracked.
+                                let _ = self
+                                    .remote_conn
                                     .sent_tracker
                                     .lock()
                                     .refresh_sent_packet(idx, packet, None);

@@ -398,6 +398,34 @@ impl<T: TimeSource> SentPacketTracker<T> {
     ///
     /// The byte count is therefore released exactly once: here.
     ///
+    /// # Why the returned count is the *encrypted* stored-payload length
+    ///
+    /// `drop_stream` sums `pending_receipts[id].0.len()` — the ENCRYPTED
+    /// on-wire payload that was stored when the packet was sent — NOT the
+    /// plaintext fragment size that `on_send`/`on_send_with_token` added to
+    /// flight size. This is INTENTIONAL and is the same byte count the other two
+    /// release paths use:
+    ///
+    /// - ACK: `report_received_receipts` returns `payload.len()` (the stored
+    ///   encrypted length) and the recv loop passes it to `on_ack*`.
+    /// - Abandon: `ResendAction::Abandon { payload_len }` is `packet.len()` (the
+    ///   stored encrypted length) and the recv loop passes it to
+    ///   `release_flightsize`.
+    ///
+    /// So `drop_stream` releases EXACTLY what an ACK or Abandon for those same
+    /// packets would have released — it substitutes for the ACKs that will never
+    /// arrive. The plaintext-add / encrypted-release asymmetry is a pre-existing
+    /// convention across ALL three release paths (flight size is conservative —
+    /// it can read low because encrypted ≥ plaintext, and `release_flightsize`
+    /// saturates at 0); it is NOT introduced or worsened here.
+    ///
+    /// A future change MUST NOT "fix" one release path to plaintext bytes without
+    /// fixing `on_send` AND all three release paths together — switching only one
+    /// reintroduces an inconsistency. The plaintext-vs-encrypted accounting
+    /// convention is tracked separately in
+    /// <https://github.com/freenet/freenet-core/issues/4402> and is out of scope
+    /// for #4345.
+    ///
     /// Returns `0` for an unknown or already-drained stream, and never panics.
     ///
     /// Wired into the outbound-stream abort paths (`outbound_stream.rs`,
