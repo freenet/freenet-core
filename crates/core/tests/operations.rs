@@ -4491,3 +4491,152 @@ async fn test_repeated_get_with_unchanged_state_succeeds(ctx: &mut TestContext) 
 
     Ok(())
 }
+
+/// Regression test for issue #3357: a GET issued immediately after a
+/// successful UpdateResponse on the SAME client connection must observe
+/// the just-committed state, not the pre-update state.
+///
+/// The reported symptom was that a client which sent UPDATE, received
+/// UpdateResponse OK, then immediately GET on the same connection saw the
+/// PRE-update state for ~4-5s before it self-corrected. UPDATE commits
+/// state synchronously via the executor's state store before the
+/// UpdateResponse is returned, and a local GET reads that same store, so
+/// a single-node local round-trip must never see stale state.
+///
+/// This deliberately does NOT poll/retry the GET (unlike
+/// `test_update_contract`): the whole point is that the FIRST GET after
+/// UpdateResponse is already fresh. Retrying would mask the very lag this
+/// guards against.
+///
+/// Path note: this exercises the FULL-STATE `UpdateData::State` branch of
+/// the contract's `update_state` (the client sends a whole new todo-list,
+/// not a `UpdateData::Delta` op-list). The original #3357 report hit the
+/// delta path; the full-state path is the simpler oracle for the same
+/// stale-read ordering, so this test documents/covers it rather than
+/// adding a separate delta variant.
+///
+/// Version coupling: the post-update version is 1, but that +1 is NOT in
+/// the client payload (which keeps version 0). It is produced by the
+/// test-contract's `update_state` full-state-replacement branch: when
+/// `incoming.version == current.version` and the content changed it sets
+/// `received_delta = true` and bumps the version to 1
+/// (see tests/test-contract-integration/src/lib.rs, the
+/// `UpdateData::State` arm + the `received_delta` increment, ~lines
+/// 173-198). This coupling is real and invisible to a future reader, so
+/// the assertion below pins the literal expected version as an
+/// independent oracle.
+#[freenet_test(
+    health_check_readiness = true,
+    nodes = ["gateway"],
+    timeout_secs = 300,
+    startup_wait_secs = 30,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_get_after_update_observes_fresh_state_3357(ctx: &mut TestContext) -> TestResult {
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = test_utils::load_contract(TEST_CONTRACT, vec![].into())?;
+    let contract_key = contract.key();
+
+    // Initial state: empty todo list at version 0.
+    let initial_state = WrappedState::from(test_utils::create_empty_todo_list());
+
+    let gateway = ctx.gateway()?;
+    let uri = gateway.ws_url();
+    let (stream, _) = connect_async(&uri).await?;
+    let mut client = WebApi::start(stream);
+
+    // PUT the contract with its initial (empty) state.
+    make_put(&mut client, initial_state.clone(), contract.clone(), false).await?;
+    match tokio::time::timeout(Duration::from_secs(120), client.recv()).await {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::PutResponse { key }))) => {
+            assert_eq!(key, contract_key, "Contract key mismatch in PUT response");
+        }
+        Ok(Ok(other)) => bail!("unexpected response while waiting for put: {:?}", other),
+        Ok(Err(e)) => bail!("Error receiving put response: {}", e),
+        Err(_) => bail!("Timeout waiting for put response"),
+    }
+
+    // Build an updated state that visibly differs from the initial one:
+    // one task added, version bumped to 1. Stale vs fresh is unambiguous.
+    let mut todo_list: test_utils::TodoList =
+        serde_json::from_slice(initial_state.as_ref()).expect("initial state deserializes");
+    todo_list.tasks.push(test_utils::Task {
+        id: 1,
+        title: "Added by UPDATE".to_string(),
+        description: "issue #3357 regression".to_string(),
+        completed: false,
+        priority: 3,
+    });
+    let updated_state = WrappedState::from(serde_json::to_vec(&todo_list).unwrap());
+    // Independent oracle: the client payload above keeps version 0; the
+    // contract's full-state-replacement branch bumps it to 1 (see doc
+    // comment). Pin the literal rather than `todo_list.version + 1` so the
+    // assertion can't silently track a changed payload.
+    const EXPECTED_VERSION: u64 = 1;
+
+    // UPDATE and await the UpdateResponse on this connection.
+    make_update(&mut client, contract_key, updated_state.clone()).await?;
+    match tokio::time::timeout(Duration::from_secs(30), client.recv()).await {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateResponse {
+            key,
+            summary: _,
+        }))) => {
+            assert_eq!(
+                key, contract_key,
+                "Contract key mismatch in UPDATE response"
+            );
+        }
+        Ok(Ok(other)) => bail!("unexpected response while waiting for update: {:?}", other),
+        Ok(Err(e)) => bail!("Error receiving update response: {}", e),
+        Err(_) => bail!("Timeout waiting for update response"),
+    }
+
+    // IMMEDIATELY GET on the SAME connection — no retry, no polling. The
+    // single response we accept must already carry the post-update state.
+    make_get(&mut client, contract_key, false, false).await?;
+    let response_state = match tokio::time::timeout(Duration::from_secs(60), client.recv()).await {
+        Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
+            key,
+            state,
+            ..
+        }))) => {
+            assert_eq!(key, contract_key, "Contract key mismatch in GET response");
+            state
+        }
+        Ok(Ok(other)) => bail!("unexpected response while waiting for get: {:?}", other),
+        Ok(Err(e)) => bail!("Error receiving get response (GET never served): {}", e),
+        // A timeout here is GET-never-served (routing/caching), NOT the
+        // staleness bug; the staleness regression surfaces as a version
+        // assertion failure below, not as this branch.
+        Err(_) => bail!("Timeout waiting for get response (GET never served)"),
+    };
+
+    let observed: test_utils::TodoList =
+        serde_json::from_slice(response_state.as_ref()).expect("GET state deserializes");
+
+    // The crux of #3357: the GET must NOT return the pre-update state.
+    // NOTE on triage: a *timeout* on the GET above means the GET was never
+    // served (a different failure, e.g. routing/caching), not the staleness
+    // bug. An assertion failure HERE means the GET was served but returned
+    // stale state — that is the #3357 regression.
+    assert_eq!(
+        observed.version, EXPECTED_VERSION,
+        "stale GET after UpdateResponse: expected version {} (post-update), \
+         got {} — local GET lagged the synchronous UPDATE commit (#3357)",
+        EXPECTED_VERSION, observed.version
+    );
+    assert_eq!(
+        observed.tasks.len(),
+        1,
+        "stale GET after UpdateResponse: expected the task added by UPDATE \
+         to be present, got {} tasks (#3357)",
+        observed.tasks.len()
+    );
+    assert_eq!(
+        observed.tasks[0].title, "Added by UPDATE",
+        "GET returned a task, but not the one written by UPDATE (#3357)"
+    );
+
+    Ok(())
+}
