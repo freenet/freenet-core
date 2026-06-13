@@ -697,7 +697,7 @@ mod tests {
         sent_tracker.time_source.advance(effective_rto);
         for id in [2, 4] {
             match sent_tracker.get_resend() {
-                ResendAction::Resend(packet_id, packet) => {
+                ResendAction::Resend(packet_id, packet, _) => {
                     assert_eq!(packet_id, id);
                     // Simulate resending packet
                     sent_tracker.report_sent_packet(id, packet);

@@ -103,6 +103,51 @@ pinning flight size at cwnd and stalling every subsequent stream
   - Retransmissions MUST stay bounded. Do not make retransmit infinite again.
 ```
 
+### Atomic stream-abort drain (issue #4345, follow-up to #4353)
+
+```
+A THIRD flight-size release path exists alongside ACK and abandonment: when an
+outbound stream aborts before its packets reach MAX_PACKET_RETRANSMITS, the
+abort site MUST atomically remove the stream's in-flight packets from the
+tracker AND release their bytes from flight size, in that order. The
+per-packet abandonment path (#4353) takes ~6s (12 × 500ms RTO floor) — longer
+than CWND_WAIT_TIMEOUT (3s) — so a same-connection retry (PR #4367) opening a
+new stream before abandonment fires would inherit the wedge.
+
+Mechanism:
+  - Packets are tagged with Option<StreamId> at report_sent_packet_with_token.
+    Some(id) for StreamFragment payloads; None for handshake / short / no-op /
+    ping packets that have no owning stream (those are invisible to drop_stream).
+  - SentPacketTracker::drop_stream(stream_id) -> usize sweeps pending_receipts
+    for that stream and returns the byte total. It does NOT touch flight size.
+  - The caller (outbound_stream.rs abort sites) then calls
+    CongestionControl::release_flightsize(bytes) with that total.
+
+Why split tracker drain from flight-size release:
+  - Atomicity. Once a packet is removed from pending_receipts, any subsequent
+    ACK or abandon path finds it gone and becomes a no-op. This guarantees
+    each packet's bytes are decremented exactly once across its lifetime,
+    preventing the double-decrement that would otherwise silently under-count
+    live streams under saturating arithmetic.
+  - Decoupling. The tracker owns "what is in flight"; the controller owns
+    "the counter." No tracker code path touches flight size; no controller
+    code path touches tracker entries. This keeps the modules unit-testable
+    in isolation and makes the single-source-of-truth easy to audit.
+
+Abort sites in outbound_stream.rs that MUST drain (all use the
+drain_stream_from_tracker helper):
+  1. send_stream cwnd-wait timeout
+  2. pipe_stream cwnd-wait timeout
+  3. pipe_stream inactivity stall (upstream feed dry)
+  4. pipe_stream inbound-stream error (upstream cancelled)
+  5. send_stream post-packet_sending Err(e) propagation
+  6. pipe_stream post-packet_sending Err(e) propagation
+
+A new release path that touches flight size without also removing tracker
+entries is PROHIBITED — saturating arithmetic would mask the resulting
+under-count and corrupt live streams' accounting on lossy paths.
+```
+
 ### Shadow per-peer RTT registry (issue #4074, Phases 1 + 1.5)
 
 `transport/rolling_rtt_stats.rs` maintains a process-wide

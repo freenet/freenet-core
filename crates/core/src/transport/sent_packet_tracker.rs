@@ -1,13 +1,27 @@
 use super::PacketId;
 use super::bbr::DeliveryRateToken;
+use super::peer_connection::StreamId;
 #[cfg(test)]
 use crate::simulation::RealTime;
 use crate::simulation::TimeSource;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-/// Entry for pending packet receipts: (payload, sent_time_nanos, delivery_token)
-type PendingReceiptEntry = (Box<[u8]>, u64, Option<DeliveryRateToken>);
+/// Entry stored per in-flight packet awaiting ACK.
+///
+/// `stream_id` is `Some` when the packet carries a `StreamFragment` payload owned by a
+/// streaming transfer (so it can be drained atomically when the stream aborts — #4345);
+/// `None` for handshake / short / no-op / ping packets that have no stream owner.
+///
+/// Using a struct (rather than a positional tuple) means future per-packet metadata can
+/// be added without breaking every existing pattern match — destructuring matches use
+/// `..` to ignore unused fields, so additive evolution is free.
+struct PendingReceiptEntry {
+    payload: Box<[u8]>,
+    sent_time_nanos: u64,
+    token: Option<DeliveryRateToken>,
+    stream_id: Option<StreamId>,
+}
 
 /// Result of processing received receipts: (acked_packets_info, loss_proportion)
 /// Each acked packet contains: (rtt_option, bytes_acked, delivery_token)
@@ -120,7 +134,7 @@ const PACKET_LOSS_DECAY_FACTOR: f64 = 1.0 / 1000.0;
 ///      ResendAction::WaitUntil(wait_until) => {
 ///        sleep_until(wait_until).await;
 ///      }
-///      ResendAction::Resend(packet_id, packet) => {
+///      ResendAction::Resend(packet_id, packet, _) => {
 ///       // Send packet and then call report_sent_packet again with the same packet_id.
 ///      }
 ///   }
@@ -203,10 +217,17 @@ impl<T: TimeSource> SentPacketTracker<T> {
 
 impl<T: TimeSource> SentPacketTracker<T> {
     pub(super) fn report_sent_packet(&mut self, packet_id: PacketId, payload: Box<[u8]>) {
-        self.report_sent_packet_with_token(packet_id, payload, None);
+        self.report_sent_packet_with_token(packet_id, None, payload, None);
     }
 
-    /// Report a sent packet with an optional BBR delivery rate token.
+    /// Report a sent packet with an optional BBR delivery rate token and optional owning
+    /// stream id.
+    ///
+    /// `stream_id` is set by `packet_sending` for `StreamFragment` payloads so a
+    /// subsequent `drop_stream` call can sweep this packet out atomically when the stream
+    /// aborts (#4345). Pass `None` for handshake / short / no-op / ping packets that have
+    /// no owning stream — those entries are then invisible to `drop_stream` and survive
+    /// any stream-abort sweep.
     ///
     /// The token is used by BBR for accurate delivery rate estimation. When an ACK
     /// arrives, the token is returned alongside the RTT sample so it can be passed
@@ -214,14 +235,75 @@ impl<T: TimeSource> SentPacketTracker<T> {
     pub(super) fn report_sent_packet_with_token(
         &mut self,
         packet_id: PacketId,
+        stream_id: Option<StreamId>,
         payload: Box<[u8]>,
         token: Option<DeliveryRateToken>,
     ) {
         let sent_time_nanos = self.time_source.now_nanos();
-        self.pending_receipts
-            .insert(packet_id, (payload, sent_time_nanos, token));
+        self.pending_receipts.insert(
+            packet_id,
+            PendingReceiptEntry {
+                payload,
+                sent_time_nanos,
+                token,
+                stream_id,
+            },
+        );
         self.resend_queue.push_back(ResendQueueEntry { packet_id });
         self.total_packets_sent += 1;
+    }
+
+    /// Test-only accessor: number of in-flight packets currently tracked.
+    /// Used by transport-level tests in sibling modules (e.g. outbound_stream.rs).
+    #[cfg(test)]
+    pub(in crate::transport) fn pending_count(&self) -> usize {
+        self.pending_receipts.len()
+    }
+
+    /// Atomically drain all packets belonging to `stream_id` from the tracker and return
+    /// the sum of their payload bytes (#4345).
+    ///
+    /// The caller MUST pass the returned byte count to
+    /// `CongestionControl::release_flightsize(bytes)` so the connection's flight-size
+    /// counter reflects that those bytes are no longer in flight. This method intentionally
+    /// does NOT touch flight size itself — keeping the responsibilities split (tracker
+    /// owns "what is in flight"; controller owns "the counter") prevents double-decrement:
+    /// once a packet is removed from `pending_receipts`, any subsequent ACK or abandon
+    /// path finds the entry already gone and becomes a no-op, so its bytes are
+    /// decremented exactly once across the packet's lifetime.
+    ///
+    /// `resend_queue` is not eagerly compacted — `get_resend` already skips queue entries
+    /// whose packet_id is no longer in `pending_receipts`, so stale entries naturally
+    /// fall off as the queue drains.
+    pub(super) fn drop_stream(&mut self, stream_id: StreamId) -> usize {
+        let mut bytes_drained: usize = 0;
+        let to_remove: Vec<PacketId> = self
+            .pending_receipts
+            .iter()
+            .filter_map(|(pid, entry)| {
+                if entry.stream_id == Some(stream_id) {
+                    bytes_drained = bytes_drained.saturating_add(entry.payload.len());
+                    Some(*pid)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for pid in &to_remove {
+            self.pending_receipts.remove(pid);
+            self.retransmitted_packets.remove(pid);
+            self.tlp_sent_packets.remove(pid);
+            self.retransmit_counts.remove(pid);
+        }
+        if !to_remove.is_empty() {
+            tracing::debug!(
+                stream_id = %stream_id,
+                drained_packets = to_remove.len(),
+                bytes_drained,
+                "drop_stream swept tracker entries on stream abort (#4345)"
+            );
+        }
+        bytes_drained
     }
 
     /// Reports that receipts have been received for the given packet IDs.
@@ -247,7 +329,13 @@ impl<T: TimeSource> SentPacketTracker<T> {
             // Get packet info before removing
             let is_retransmitted = self.retransmitted_packets.contains(packet_id);
 
-            if let Some((payload, sent_time_nanos, token)) = self.pending_receipts.get(packet_id) {
+            if let Some(PendingReceiptEntry {
+                payload,
+                sent_time_nanos,
+                token,
+                ..
+            }) = self.pending_receipts.get(packet_id)
+            {
                 let packet_size = payload.len();
                 let token = *token; // Copy the token before removing
 
@@ -425,7 +513,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
             let sent_time_nanos = self
                 .pending_receipts
                 .get(&entry.packet_id)
-                .map(|(_, ts, _)| *ts)
+                .map(|e| e.sent_time_nanos)
                 .unwrap_or(0);
 
             // Calculate RTO deadline from current sent_time (not stored value)
@@ -447,8 +535,12 @@ impl<T: TimeSource> SentPacketTracker<T> {
             if let Some(tlp_at) = tlp_deadline {
                 if now_nanos >= tlp_at && now_nanos < rto_deadline {
                     // TLP fires! Clone packet data for the probe
-                    if let Some((packet, _, _)) = self.pending_receipts.get(&entry.packet_id) {
-                        let packet_clone = packet.clone();
+                    if let Some(PendingReceiptEntry {
+                        payload, stream_id, ..
+                    }) = self.pending_receipts.get(&entry.packet_id)
+                    {
+                        let packet_clone = payload.clone();
+                        let stream_id = *stream_id;
                         let packet_id = entry.packet_id;
 
                         // Mark TLP as sent for this packet (won't fire again)
@@ -461,15 +553,18 @@ impl<T: TimeSource> SentPacketTracker<T> {
                         self.mark_retransmitted(packet_id);
 
                         // TLP does NOT apply backoff - it's speculative
-                        return ResendAction::TlpProbe(packet_id, packet_clone);
+                        return ResendAction::TlpProbe(packet_id, packet_clone, stream_id);
                     }
                 }
             }
 
             // Check if RTO should fire
             if now_nanos >= rto_deadline {
-                if let Some((packet, _sent_time_nanos, _token)) =
-                    self.pending_receipts.remove(&entry.packet_id)
+                if let Some(PendingReceiptEntry {
+                    payload: packet,
+                    stream_id,
+                    ..
+                }) = self.pending_receipts.remove(&entry.packet_id)
                 {
                     // Update packet loss proportion for a lost packet
                     self.packet_loss_proportion = self.packet_loss_proportion
@@ -509,7 +604,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
                     // Clean up TLP tracking for this packet
                     self.tlp_sent_packets.remove(&entry.packet_id);
 
-                    return ResendAction::Resend(entry.packet_id, packet);
+                    return ResendAction::Resend(entry.packet_id, packet, stream_id);
                 }
             }
 
@@ -534,11 +629,14 @@ impl<T: TimeSource> SentPacketTracker<T> {
 pub enum ResendAction {
     /// Wait until the given deadline (nanoseconds since TimeSource epoch) before checking again.
     WaitUntil(u64),
-    /// Full RTO timeout - resend the packet and apply backoff
-    Resend(u32, Box<[u8]>),
+    /// Full RTO timeout - resend the packet and apply backoff. Carries the owning stream id
+    /// (if any) so the recv loop re-registers the packet preserving its stream tag — without
+    /// this, retransmissions would lose the tag and `drop_stream` would miss those bytes (#4345).
+    Resend(u32, Box<[u8]>, Option<StreamId>),
     /// TLP (Tail Loss Probe) - send a probe to detect tail loss earlier than RTO.
-    /// Unlike Resend, this doesn't apply backoff since it's speculative.
-    TlpProbe(u32, Box<[u8]>),
+    /// Unlike Resend, this doesn't apply backoff since it's speculative. Carries the
+    /// owning stream id for the same re-registration reason as `Resend`.
+    TlpProbe(u32, Box<[u8]>, Option<StreamId>),
     /// The packet has been retransmitted `MAX_PACKET_RETRANSMITS` times without
     /// an ACK and is declared permanently lost (issue #4345). It has been
     /// removed from tracking; the caller MUST release its `payload_len` bytes
@@ -574,6 +672,79 @@ pub(in crate::transport) mod tests {
     pub(in crate::transport) fn mock_sent_packet_tracker() -> SentPacketTracker<VirtualTime> {
         let time_source = VirtualTime::new();
         SentPacketTracker::new_with_time_source(time_source)
+    }
+
+    #[test]
+    fn test_issue_4345_drop_stream_filters_by_stream_id() {
+        let mut tracker = mock_sent_packet_tracker();
+        let stream_a = StreamId::next();
+        let stream_b = StreamId::next();
+
+        // Setup mixes three categories: two stream_a packets (must be drained),
+        // one stream_b packet (different stream — must survive), one untagged
+        // packet (None — handshake/ping/short-message, must survive).
+        tracker.report_sent_packet_with_token(1, Some(stream_a), vec![0; 100].into(), None);
+        tracker.report_sent_packet_with_token(2, Some(stream_a), vec![0; 250].into(), None);
+        tracker.report_sent_packet_with_token(3, Some(stream_b), vec![0; 999].into(), None);
+        tracker.report_sent_packet_with_token(4, None, vec![0; 50].into(), None);
+
+        let drained = tracker.drop_stream(stream_a);
+        assert_eq!(drained, 350);
+        assert!(!tracker.pending_receipts.contains_key(&1));
+        assert!(!tracker.pending_receipts.contains_key(&2));
+        assert!(tracker.pending_receipts.contains_key(&3));
+        assert!(tracker.pending_receipts.contains_key(&4));
+    }
+
+    #[test]
+    fn test_issue_4345_drop_stream_clears_per_packet_state() {
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+
+        // Seed the auxiliary per-packet maps directly instead of driving 12 RTOs
+        // + a TLP probe to populate them naturally — the assertion is about what
+        // drop_stream cleans up, not about how those maps get populated.
+        tracker.report_sent_packet_with_token(7, Some(stream), vec![0; 10].into(), None);
+        tracker.retransmit_counts.insert(7, 5);
+        tracker.retransmitted_packets.insert(7);
+        tracker.tlp_sent_packets.insert(7);
+
+        tracker.drop_stream(stream);
+        assert!(!tracker.retransmit_counts.contains_key(&7));
+        assert!(!tracker.retransmitted_packets.contains(&7));
+        assert!(!tracker.tlp_sent_packets.contains(&7));
+    }
+
+    #[test]
+    fn test_issue_4345_late_ack_after_drop_stream_is_noop() {
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+        tracker.report_sent_packet_with_token(11, Some(stream), vec![0; 200].into(), None);
+        tracker.drop_stream(stream);
+
+        let (ack_info, _) = tracker.report_received_receipts(&[11]);
+        assert!(
+            ack_info.is_empty(),
+            "issue #4345: a late ACK for a dropped packet must be a no-op \
+             so the caller does not decrement flightsize a second time"
+        );
+    }
+
+    #[test]
+    fn test_issue_4345_drop_stream_skips_stale_resend_queue_entries() {
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+        tracker.report_sent_packet_with_token(21, Some(stream), vec![0; 100].into(), None);
+        tracker.drop_stream(stream);
+
+        // Stale ResendQueueEntry remains; get_resend must skip it (would otherwise
+        // surface as Abandon and double-release flightsize via the #4353 path).
+        tracker.time_source.advance(Duration::from_secs(10));
+        let action = tracker.get_resend();
+        assert!(
+            matches!(action, ResendAction::WaitUntil(_)),
+            "issue #4345: stale resend_queue entry for a dropped packet must be skipped, got {action:?}"
+        );
     }
 
     #[rstest]
@@ -615,7 +786,10 @@ pub(in crate::transport) mod tests {
         // Packets now use effective_rto() which is 1s initially (not MESSAGE_CONFIRMATION_TIMEOUT)
         tracker.time_source.advance(tracker.effective_rto());
         let resend_action = tracker.get_resend();
-        assert_eq!(resend_action, ResendAction::Resend(1, vec![1, 2, 3].into()));
+        assert_eq!(
+            resend_action,
+            ResendAction::Resend(1, vec![1, 2, 3].into(), None)
+        );
         assert_eq!(tracker.pending_receipts.len(), 0);
         assert_eq!(tracker.resend_queue.len(), 0);
         assert_eq!(tracker.packet_loss_proportion, PACKET_LOSS_DECAY_FACTOR);
@@ -651,10 +825,10 @@ pub(in crate::transport) mod tests {
 
         // This should now trigger a TLP probe for packet 2
         match tracker.get_resend() {
-            ResendAction::TlpProbe(packet_id, _) => {
+            ResendAction::TlpProbe(packet_id, _, _) => {
                 assert_eq!(packet_id, 2)
             }
-            ResendAction::Resend(_, _) => panic!("Expected TlpProbe, got Resend"),
+            ResendAction::Resend(_, _, _) => panic!("Expected TlpProbe, got Resend"),
             ResendAction::WaitUntil(_) => panic!("Expected TlpProbe, got WaitUntil"),
             ResendAction::Abandon { .. } => panic!("Expected TlpProbe, got Abandon"),
         }
@@ -823,7 +997,7 @@ pub(in crate::transport) mod tests {
 
         // Get resend action
         match tracker.get_resend() {
-            ResendAction::Resend(packet_id, _) | ResendAction::TlpProbe(packet_id, _) => {
+            ResendAction::Resend(packet_id, _, _) | ResendAction::TlpProbe(packet_id, _, _) => {
                 assert_eq!(packet_id, 1);
                 // Packet should be marked as retransmitted
                 assert!(tracker.retransmitted_packets.contains(&1));
@@ -1029,10 +1203,10 @@ pub(in crate::transport) mod tests {
 
         // Get resend - this should trigger backoff (RTO, not TLP since no RTT samples)
         match tracker.get_resend() {
-            ResendAction::Resend(packet_id, _) => {
+            ResendAction::Resend(packet_id, _, _) => {
                 assert_eq!(packet_id, 1);
             }
-            ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
+            ResendAction::TlpProbe(_, _, _) => panic!("TLP shouldn't fire without RTT samples"),
             _ => panic!("Expected Resend action"),
         }
 
@@ -1052,11 +1226,11 @@ pub(in crate::transport) mod tests {
         // First timeout after 1s, resend triggers backoff to 2
         tracker.time_source.advance(Duration::from_secs(1));
         match tracker.get_resend() {
-            ResendAction::Resend(_, payload) => {
+            ResendAction::Resend(_, payload, _) => {
                 // Re-register the packet - now enqueued with effective_rto() = 2s
                 tracker.report_sent_packet(1, payload);
             }
-            ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
+            ResendAction::TlpProbe(_, _, _) => panic!("TLP shouldn't fire without RTT samples"),
             _ => panic!("Expected Resend"),
         }
         assert_eq!(tracker.rto_backoff(), 2);
@@ -1065,11 +1239,11 @@ pub(in crate::transport) mod tests {
         // Second timeout after 2s (not 1s!), resend triggers backoff to 4
         tracker.time_source.advance(Duration::from_secs(2));
         match tracker.get_resend() {
-            ResendAction::Resend(_, payload) => {
+            ResendAction::Resend(_, payload, _) => {
                 // Re-register - now enqueued with effective_rto() = 4s
                 tracker.report_sent_packet(1, payload);
             }
-            ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
+            ResendAction::TlpProbe(_, _, _) => panic!("TLP shouldn't fire without RTT samples"),
             _ => panic!("Expected Resend"),
         }
         assert_eq!(tracker.rto_backoff(), 4);
@@ -1078,8 +1252,8 @@ pub(in crate::transport) mod tests {
         // Third timeout after 4s (not 1s or 2s!), resend triggers backoff to 8
         tracker.time_source.advance(Duration::from_secs(4));
         match tracker.get_resend() {
-            ResendAction::Resend(_, _) => {}
-            ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
+            ResendAction::Resend(_, _, _) => {}
+            ResendAction::TlpProbe(_, _, _) => panic!("TLP shouldn't fire without RTT samples"),
             _ => panic!("Expected Resend"),
         }
         assert_eq!(tracker.rto_backoff(), 8);
@@ -1202,8 +1376,8 @@ pub(in crate::transport) mod tests {
         // At 41ms total, TLP should fire (faster than 500ms RTO!)
         tracker.time_source.advance(Duration::from_millis(2));
         match tracker.get_resend() {
-            ResendAction::TlpProbe(id, _) => assert_eq!(id, 2, "TLP should probe packet 2"),
-            ResendAction::Resend(id, _) => {
+            ResendAction::TlpProbe(id, _, _) => assert_eq!(id, 2, "TLP should probe packet 2"),
+            ResendAction::Resend(id, _, _) => {
                 assert_eq!(id, 2, "Or Resend if TLP not yet implemented")
             }
             ResendAction::WaitUntil(_) => panic!("Should have triggered TLP after 40ms"),
@@ -1226,19 +1400,19 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(999));
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {} // Expected
-            ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
-            ResendAction::Resend(_, _) => panic!("Should not resend before RTO expires"),
+            ResendAction::TlpProbe(_, _, _) => panic!("TLP shouldn't fire without RTT samples"),
+            ResendAction::Resend(_, _, _) => panic!("Should not resend before RTO expires"),
             ResendAction::Abandon { .. } => panic!("unexpected Abandon"),
         }
 
         // Advance 1 more ms to trigger timeout
         tracker.time_source.advance(Duration::from_millis(1));
         let payload = match tracker.get_resend() {
-            ResendAction::Resend(id, payload) => {
+            ResendAction::Resend(id, payload, _) => {
                 assert_eq!(id, 1);
                 payload
             }
-            ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
+            ResendAction::TlpProbe(_, _, _) => panic!("TLP shouldn't fire without RTT samples"),
             _ => panic!("Expected Resend after 1s"),
         };
 
@@ -1250,19 +1424,19 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(1999));
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {} // Expected
-            ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
-            ResendAction::Resend(_, _) => panic!("Should not resend before backed-off RTO (2s)"),
+            ResendAction::TlpProbe(_, _, _) => panic!("TLP shouldn't fire without RTT samples"),
+            ResendAction::Resend(_, _, _) => panic!("Should not resend before backed-off RTO (2s)"),
             ResendAction::Abandon { .. } => panic!("unexpected Abandon"),
         }
 
         // Advance 1 more ms to trigger timeout
         tracker.time_source.advance(Duration::from_millis(1));
         let payload = match tracker.get_resend() {
-            ResendAction::Resend(id, payload) => {
+            ResendAction::Resend(id, payload, _) => {
                 assert_eq!(id, 1);
                 payload
             }
-            ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
+            ResendAction::TlpProbe(_, _, _) => panic!("TLP shouldn't fire without RTT samples"),
             _ => panic!("Expected Resend after 2s"),
         };
 
@@ -1274,16 +1448,16 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(3999));
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {} // Expected
-            ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
-            ResendAction::Resend(_, _) => panic!("Should not resend before backed-off RTO (4s)"),
+            ResendAction::TlpProbe(_, _, _) => panic!("TLP shouldn't fire without RTT samples"),
+            ResendAction::Resend(_, _, _) => panic!("Should not resend before backed-off RTO (4s)"),
             ResendAction::Abandon { .. } => panic!("unexpected Abandon"),
         }
 
         // Advance 1 more ms to trigger timeout
         tracker.time_source.advance(Duration::from_millis(1));
         match tracker.get_resend() {
-            ResendAction::Resend(id, _) => assert_eq!(id, 1),
-            ResendAction::TlpProbe(_, _) => panic!("TLP shouldn't fire without RTT samples"),
+            ResendAction::Resend(id, _, None) => assert_eq!(id, 1),
+            ResendAction::TlpProbe(_, _, _) => panic!("TLP shouldn't fire without RTT samples"),
             _ => panic!("Expected Resend after 4s"),
         }
 
@@ -1332,8 +1506,8 @@ pub(in crate::transport) mod tests {
         // At 101ms, TLP should fire (not full RTO)
         tracker.time_source.advance(Duration::from_millis(2));
         match tracker.get_resend() {
-            ResendAction::TlpProbe(id, _) => assert_eq!(id, 2, "TLP should probe packet 2"),
-            ResendAction::Resend(_, _) => panic!("Should be TLP probe, not full RTO resend"),
+            ResendAction::TlpProbe(id, _, _) => assert_eq!(id, 2, "TLP should probe packet 2"),
+            ResendAction::Resend(_, _, _) => panic!("Should be TLP probe, not full RTO resend"),
             ResendAction::WaitUntil(_) => panic!("TLP should have fired at 2*SRTT"),
             ResendAction::Abandon { .. } => panic!("unexpected Abandon"),
         }
@@ -1355,7 +1529,7 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(101)); // Past PTO = 100ms
 
         match tracker.get_resend() {
-            ResendAction::TlpProbe(_, _) => {}
+            ResendAction::TlpProbe(_, _, _) => {}
             ResendAction::WaitUntil(_)
             | ResendAction::Resend(..)
             | ResendAction::Abandon { .. } => panic!("Expected TLP probe"),
@@ -1382,7 +1556,7 @@ pub(in crate::transport) mod tests {
         // TLP fires at ~100ms
         tracker.time_source.advance(Duration::from_millis(101));
         let payload = match tracker.get_resend() {
-            ResendAction::TlpProbe(id, payload) => {
+            ResendAction::TlpProbe(id, payload, _) => {
                 assert_eq!(id, 2);
                 payload
             }
@@ -1408,8 +1582,10 @@ pub(in crate::transport) mod tests {
 
         tracker.time_source.advance(Duration::from_millis(2));
         match tracker.get_resend() {
-            ResendAction::Resend(id, _) => assert_eq!(id, 2, "RTO should fire after TLP failed"),
-            ResendAction::TlpProbe(_, _) => panic!("Should be RTO, not another TLP"),
+            ResendAction::Resend(id, _, None) => {
+                assert_eq!(id, 2, "RTO should fire after TLP failed")
+            }
+            ResendAction::TlpProbe(_, _, _) => panic!("Should be RTO, not another TLP"),
             _ => panic!("RTO should have fired"),
         }
 
@@ -1438,8 +1614,8 @@ pub(in crate::transport) mod tests {
         // Now get_resend should just wait, not fire TLP
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {} // Good - no pending packets
-            ResendAction::TlpProbe(_, _) => panic!("TLP should be cancelled by ACK"),
-            ResendAction::Resend(_, _) => panic!("No resend needed, packet was ACKed"),
+            ResendAction::TlpProbe(_, _, _) => panic!("TLP should be cancelled by ACK"),
+            ResendAction::Resend(_, _, _) => panic!("No resend needed, packet was ACKed"),
             ResendAction::Abandon { .. } => panic!("unexpected Abandon"),
         }
     }
@@ -1471,7 +1647,7 @@ pub(in crate::transport) mod tests {
         // At 11ms, TLP should fire
         tracker.time_source.advance(Duration::from_millis(2));
         match tracker.get_resend() {
-            ResendAction::TlpProbe(id, _) => assert_eq!(id, 2),
+            ResendAction::TlpProbe(id, _, _) => assert_eq!(id, 2),
             ResendAction::WaitUntil(_)
             | ResendAction::Resend(..)
             | ResendAction::Abandon { .. } => {
@@ -1493,16 +1669,16 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(Duration::from_millis(500));
         match tracker.get_resend() {
             ResendAction::WaitUntil(_) => {}
-            ResendAction::TlpProbe(_, _) => panic!("TLP should not fire without RTT samples"),
-            ResendAction::Resend(_, _) => panic!("RTO is 1s, should not fire at 500ms"),
+            ResendAction::TlpProbe(_, _, _) => panic!("TLP should not fire without RTT samples"),
+            ResendAction::Resend(_, _, _) => panic!("RTO is 1s, should not fire at 500ms"),
             ResendAction::Abandon { .. } => panic!("unexpected Abandon"),
         }
 
         // At 1001ms, RTO fires (no TLP)
         tracker.time_source.advance(Duration::from_millis(501));
         match tracker.get_resend() {
-            ResendAction::Resend(id, _) => assert_eq!(id, 1),
-            ResendAction::TlpProbe(_, _) => panic!("Should be RTO, not TLP"),
+            ResendAction::Resend(id, _, None) => assert_eq!(id, 1),
+            ResendAction::TlpProbe(_, _, _) => panic!("Should be RTO, not TLP"),
             _ => panic!("RTO should fire at 1s"),
         }
     }
@@ -1524,7 +1700,7 @@ pub(in crate::transport) mod tests {
         // TLP fires once for the tail (last packet)
         tracker.time_source.advance(Duration::from_millis(101));
         match tracker.get_resend() {
-            ResendAction::TlpProbe(id, _) => {
+            ResendAction::TlpProbe(id, _, _) => {
                 // Should probe the oldest unacked packet
                 assert_eq!(id, 2, "TLP should probe oldest unacked packet");
             }
@@ -1552,7 +1728,7 @@ pub(in crate::transport) mod tests {
             // Jump past the (backed-off) RTO deadline.
             tracker.time_source.advance(Duration::from_secs(120));
             match tracker.get_resend() {
-                ResendAction::Resend(id, packet) => {
+                ResendAction::Resend(id, packet, _) => {
                     assert_eq!(id, 1);
                     // Re-register exactly as the production recv loop does.
                     tracker.report_sent_packet(id, packet);
@@ -1608,7 +1784,7 @@ pub(in crate::transport) mod tests {
         for _ in 0..(MAX_PACKET_RETRANSMITS - 2) {
             tracker.time_source.advance(Duration::from_secs(120));
             match tracker.get_resend() {
-                ResendAction::Resend(id, packet) => tracker.report_sent_packet(id, packet),
+                ResendAction::Resend(id, packet, _) => tracker.report_sent_packet(id, packet),
                 other => panic!("expected Resend, got {other:?}"),
             }
         }
@@ -1640,7 +1816,7 @@ pub(in crate::transport) mod tests {
         for cycle in 0..(MAX_PACKET_RETRANSMITS as usize * 5) {
             tracker.time_source.advance(Duration::from_secs(120));
             match tracker.get_resend() {
-                ResendAction::Resend(rid, packet) => {
+                ResendAction::Resend(rid, packet, _) => {
                     tracker.report_sent_packet(rid, packet);
                     // Every (MAX-1) retransmits, an ACK lands for this packet,
                     // resetting its count — then we "send" a fresh packet id so
@@ -1657,7 +1833,7 @@ pub(in crate::transport) mod tests {
                          cycle {cycle} — ACKs before the limit must keep it alive"
                     );
                 }
-                ResendAction::TlpProbe(_, _) | ResendAction::WaitUntil(_) => {}
+                ResendAction::TlpProbe(_, _, _) | ResendAction::WaitUntil(_) => {}
             }
         }
     }
@@ -1677,13 +1853,13 @@ pub(in crate::transport) mod tests {
         for _ in 0..1000 {
             tracker.time_source.advance(Duration::from_secs(120));
             match tracker.get_resend() {
-                ResendAction::Resend(id, packet) => tracker.report_sent_packet(id, packet),
+                ResendAction::Resend(id, packet, _) => tracker.report_sent_packet(id, packet),
                 ResendAction::Abandon { packet_id, .. } => {
                     assert_eq!(packet_id, 7);
                     abandoned = true;
                     break;
                 }
-                ResendAction::TlpProbe(_, _) | ResendAction::WaitUntil(_) => {}
+                ResendAction::TlpProbe(_, _, _) | ResendAction::WaitUntil(_) => {}
             }
         }
         assert!(abandoned, "packet should have been abandoned");

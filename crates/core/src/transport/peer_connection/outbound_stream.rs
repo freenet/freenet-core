@@ -52,6 +52,34 @@ pub(crate) type SerializedStream = Bytes;
 /// The extra byte vs. the original 40 comes from the Option discriminant of `metadata_bytes`.
 const MAX_DATA_SIZE: usize = packet_data::MAX_DATA_SIZE - 41;
 
+/// Drain `stream_id`'s in-flight packets from the tracker and release their bytes from
+/// flight size atomically (#4345). Used by every stream-terminating early return so the
+/// next stream on the same connection finds a clean flight size instead of inheriting
+/// the dead stream's wedge.
+///
+/// The order matters: `drop_stream` removes entries first (so a late ACK or the per-packet
+/// abandon path can't double-decrement), then `release_flightsize` adjusts the counter
+/// once with the returned byte total. The tracker lock is released before touching the
+/// congestion controller — the controller's `release_flightsize` is its own atomic, so
+/// we avoid holding both locks simultaneously.
+fn drain_stream_from_tracker<T: TimeSource>(
+    sent_packet_tracker: &parking_lot::Mutex<SentPacketTracker<T>>,
+    congestion_controller: &CongestionController<T>,
+    stream_id: StreamId,
+    site: &'static str,
+) {
+    let drained = sent_packet_tracker.lock().drop_stream(stream_id);
+    if drained > 0 {
+        congestion_controller.release_flightsize(drained);
+        tracing::debug!(
+            stream_id = %stream_id.0,
+            drained_bytes = drained,
+            site,
+            "drained stream from tracker + released flight size on abort (#4345)"
+        );
+    }
+}
+
 // TODO: unit test
 /// Handles sending a stream that is *not piped*. In the future this will be replaced by
 /// piped streams which start forwarding before the stream has been received.
@@ -190,6 +218,19 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                 // permit immediately. Do NOT "fix" this by adding a blocking
                 // `tx.send(())` here — a blocking send in this stream task is the
                 // backpressure pattern channel-safety.md warns against.
+                //
+                // Atomic drain (#4345): remove this stream's in-flight packets from
+                // the tracker AND release their bytes from flight size, in that order.
+                // Doing both atomically here is what prevents the next stream on this
+                // connection from inheriting a pinned flight size; relying on the
+                // per-packet abandon path alone takes ~6s (12 × 500ms RTO floor),
+                // which exceeds CWND_WAIT_TIMEOUT.
+                drain_stream_from_tracker(
+                    &sent_packet_tracker,
+                    &congestion_controller,
+                    stream_id,
+                    "send_stream cwnd-wait abort",
+                );
                 return Err(TransportError::OutboundStreamFailed(destination_addr));
             }
 
@@ -300,6 +341,16 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                 // Receiver may be dropped if queue timed out; ignore the error.
                 let _ignored = tx.send(());
             }
+            // Drain earlier fragments of THIS stream from tracker (#4345). The failing
+            // packet itself was never registered (`report_sent_packet` runs only on
+            // socket success), but successfully-sent prior fragments are still in flight.
+            // A same-connection retry would inherit their wedge without this drain.
+            drain_stream_from_tracker(
+                &sent_packet_tracker,
+                &congestion_controller,
+                stream_id,
+                "send_stream send-failed abort",
+            );
             return Err(e);
         }
 
@@ -466,6 +517,12 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                 // on the downstream connection survive (#4345). The op layer
                 // times out and retries; the idle timeout decides connection
                 // liveness.
+                drain_stream_from_tracker(
+                    &sent_packet_tracker,
+                    &congestion_controller,
+                    outbound_stream_id,
+                    "pipe_stream inactivity abort",
+                );
                 return Err(TransportError::OutboundStreamFailed(destination_addr));
             }
         };
@@ -484,6 +541,12 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                 // Error is on the UPSTREAM inbound stream, not the downstream
                 // connection — fail only this stream (#4345), same rationale as
                 // the inactivity-stall arm above.
+                drain_stream_from_tracker(
+                    &sent_packet_tracker,
+                    &congestion_controller,
+                    outbound_stream_id,
+                    "pipe_stream inbound-error abort",
+                );
                 return Err(TransportError::OutboundStreamFailed(destination_addr));
             }
         };
@@ -554,6 +617,12 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                 );
                 // Fail only this stream, not the connection (#4345). See the
                 // matching site in send_stream for the rationale.
+                drain_stream_from_tracker(
+                    &sent_packet_tracker,
+                    &congestion_controller,
+                    outbound_stream_id,
+                    "pipe_stream cwnd-wait abort",
+                );
                 return Err(TransportError::OutboundStreamFailed(destination_addr));
             }
 
@@ -630,6 +699,14 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                 e.to_string(),
                 elapsed.as_millis() as u64,
                 TransferDirection::Send,
+            );
+            // Drain earlier fragments of THIS stream (#4345); same rationale as the
+            // matching site in send_stream.
+            drain_stream_from_tracker(
+                &sent_packet_tracker,
+                &congestion_controller,
+                outbound_stream_id,
+                "pipe_stream send-failed abort",
             );
             return Err(e);
         }
@@ -1183,6 +1260,76 @@ mod tests {
             err.is_transient_send_failure(),
             "cwnd timeout must be classified transient so the connection survives: {err:?}"
         );
+
+        Ok(())
+    }
+
+    /// #4345 regression: after a stream aborts on CWND_WAIT_TIMEOUT, the same
+    /// tracker + congestion controller must be drained so a follow-up stream on
+    /// the SAME connection (the op-layer retry from PR #4367) does not inherit
+    /// the wedge. Pre-seed the tracker with stream A's in-flight bytes; with
+    /// cwnd=1, send_stream's cwnd-wait loop times out; assert tracker and
+    /// flightsize are clean and a fresh stream B can register.
+    #[tokio::test(start_paused = true)]
+    async fn cwnd_wait_abort_drains_tracker_and_unwedges_connection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (outbound_sender, _outbound_receiver) = mpsc::channel(100);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let cipher = {
+            let mut key = [0u8; 16];
+            crate::config::GlobalRng::fill_bytes(&mut key);
+            Aes128Gcm::new(&key.into())
+        };
+
+        let time_source = RealTime::new();
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1,
+            min_cwnd: 1,
+            max_cwnd: 1,
+            ..Default::default()
+        })
+        .build_arc();
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+        let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
+
+        // Stream A: pre-seeded in-flight bytes, will wedge on cwnd-wait.
+        let stream_a_id = StreamId::next();
+        {
+            let mut t = sent_tracker.lock();
+            t.report_sent_packet_with_token(201, Some(stream_a_id), vec![0u8; 1500].into(), None);
+            t.report_sent_packet_with_token(202, Some(stream_a_id), vec![0u8; 1500].into(), None);
+        }
+        congestion_controller.on_send(3000);
+
+        let send_a = GlobalExecutor::spawn(send_stream(
+            stream_a_id,
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            Bytes::from(vec![0u8; 10_000]),
+            cipher,
+            sent_tracker.clone(),
+            token_bucket,
+            congestion_controller.clone(),
+            time_source,
+            None,
+            None,
+        ));
+        let err_a = send_a.await.expect("join").expect_err("A must wedge");
+        assert!(matches!(err_a, TransportError::OutboundStreamFailed(_)));
+
+        assert_eq!(sent_tracker.lock().pending_count(), 0);
+        assert_eq!(congestion_controller.flightsize(), 0);
+
+        // Stream B registers on the same tracker — proves no state inherited from A.
+        let stream_b_id = StreamId::next();
+        sent_tracker.lock().report_sent_packet_with_token(
+            301,
+            Some(stream_b_id),
+            vec![0u8; 1].into(),
+            None,
+        );
+        assert_eq!(sent_tracker.lock().pending_count(), 1);
 
         Ok(())
     }

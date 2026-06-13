@@ -1294,7 +1294,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         // action-specific side effects (congestion notification, logging).
                         // Abandon releases flight size and is handled inline (it neither
                         // re-sends nor re-registers). See #4345.
-                        let (idx, packet) = match maybe_resend {
+                        let (idx, packet, stream_id) = match maybe_resend {
                             ResendAction::WaitUntil(deadline_nanos) => {
                                 resend_check_sleep = Some(self.time_source.sleep_until(deadline_nanos));
                                 break;
@@ -1322,15 +1322,15 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 }
                                 continue;
                             }
-                            ResendAction::Resend(idx, packet) => {
+                            ResendAction::Resend(idx, packet, stream_id) => {
                                 // Notify congestion controller of packet loss (timeout-based
                                 // retransmission). The packet stays in flight — it is
                                 // immediately re-sent and re-registered below — so flight size
                                 // is unchanged; on_timeout only applies the cwnd loss response.
                                 self.remote_conn.congestion_controller.on_timeout();
-                                (idx, packet)
+                                (idx, packet, stream_id)
                             }
-                            ResendAction::TlpProbe(idx, packet) => {
+                            ResendAction::TlpProbe(idx, packet, stream_id) => {
                                 // TLP (Tail Loss Probe) - send probe to detect tail loss earlier.
                                 // Unlike RTO, TLP does NOT call on_timeout() because it's speculative.
                                 // If the probe gets an ACK, no loss occurred. If not, RTO will fire later.
@@ -1339,7 +1339,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                     packet_id = idx,
                                     "Sending TLP probe"
                                 );
-                                (idx, packet)
+                                (idx, packet, stream_id)
                             }
                         };
 
@@ -1354,7 +1354,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 // Re-register packet for ACK/RTO tracking. Flight size is
                                 // unchanged: the packet never left flight (on_timeout did not
                                 // decrement), so neither on_send() nor a re-add is called.
-                                self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
+                                self.remote_conn.sent_tracker.lock().report_sent_packet_with_token(idx, stream_id, packet, None);
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -1365,11 +1365,12 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 );
                                 // Re-insert packet so RTO will retry it. Without this,
                                 // the packet would be permanently lost from tracking since
-                                // resend_check() already removed it.
+                                // resend_check() already removed it. Preserve stream_id tag
+                                // so `drop_stream` can still sweep it on a later abort (#4345).
                                 self.remote_conn
                                     .sent_tracker
                                     .lock()
-                                    .report_sent_packet(idx, packet);
+                                    .report_sent_packet_with_token(idx, stream_id, packet, None);
                                 break;
                             }
                         }
@@ -2090,6 +2091,22 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     }
 }
 
+/// Extract the owning stream id for tracker tagging (#4345).
+///
+/// Only `StreamFragment` payloads belong to a stream; everything else (`ShortMessage`,
+/// `NoOp`, `Ping`, `Pong`, `AckConnection`) is single-shot or control plane and has no
+/// stream owner. The tracker uses `None` to mean "not eligible for `drop_stream` sweeps".
+fn extract_stream_id_from_payload(payload: &SymmetricMessagePayload) -> Option<StreamId> {
+    match payload {
+        SymmetricMessagePayload::StreamFragment { stream_id, .. } => Some(*stream_id),
+        SymmetricMessagePayload::ShortMessage { .. }
+        | SymmetricMessagePayload::NoOp
+        | SymmetricMessagePayload::AckConnection { .. }
+        | SymmetricMessagePayload::Ping { .. }
+        | SymmetricMessagePayload::Pong { .. } => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
     remote_addr: SocketAddr,
@@ -2117,6 +2134,9 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
     // `transport/shadow_demand.rs` and `.claude/rules/transport.md`.
     let payload: SymmetricMessagePayload = payload.into();
     let outbound_class = super::shadow_demand::classify(&payload);
+    // Stream-id tag for tracker (#4345). `Some` only for `StreamFragment`; `None` for
+    // ShortMessage / NoOp / Ping / Pong / AckConnection. Drives `drop_stream` sweeps on abort.
+    let stream_id = extract_stream_id_from_payload(&payload);
 
     match SymmetricMessage::try_serialize_msg_to_packet_data(
         packet_id,
@@ -2147,6 +2167,7 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                     super::shadow_demand::record_outbound(outbound_class, packet_data.len());
                     sent_tracker.lock().report_sent_packet_with_token(
                         packet_id,
+                        stream_id,
                         packet_data,
                         delivery_token,
                     );
@@ -2192,6 +2213,7 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                         sent_on_wire += packet_data.len();
                         sent_tracker.lock().report_sent_packet_with_token(
                             packet_id,
+                            stream_id,
                             packet_data,
                             delivery_token,
                         );
@@ -2331,6 +2353,39 @@ mod tests {
     use crate::transport::packet_data::MAX_PACKET_SIZE;
     use crate::transport::received_packet_tracker::MAX_PENDING_RECEIPTS;
     use crate::transport::sent_packet_tracker::MAX_CONFIRMATION_DELAY;
+
+    #[test]
+    fn test_issue_4345_extract_stream_id_only_tags_stream_fragments() {
+        let stream_id = StreamId::next();
+        let frag = SymmetricMessagePayload::StreamFragment {
+            stream_id,
+            total_length_bytes: 4,
+            fragment_number: 1,
+            payload: bytes::Bytes::from_static(b"data"),
+            metadata_bytes: None,
+        };
+        assert_eq!(extract_stream_id_from_payload(&frag), Some(stream_id));
+
+        // Non-streaming payloads have no owning stream and must be invisible to
+        // drop_stream — sweeping a Ping or ShortMessage by mistake would break
+        // keep-alive / lose op requests.
+        let short = SymmetricMessagePayload::ShortMessage {
+            payload: bytes::Bytes::from_static(b"x"),
+        };
+        assert_eq!(extract_stream_id_from_payload(&short), None);
+        assert_eq!(
+            extract_stream_id_from_payload(&SymmetricMessagePayload::NoOp),
+            None
+        );
+        assert_eq!(
+            extract_stream_id_from_payload(&SymmetricMessagePayload::Ping { sequence: 0 }),
+            None
+        );
+        assert_eq!(
+            extract_stream_id_from_payload(&SymmetricMessagePayload::Pong { sequence: 0 }),
+            None
+        );
+    }
 
     /// Simple test socket that writes to a channel
     struct TestSocket {
@@ -2971,7 +3026,7 @@ mod tests {
         let mut resends = 0u32;
         for _ in 0..20_000 {
             match tracker.get_resend() {
-                ResendAction::Resend(id, packet) => {
+                ResendAction::Resend(id, packet, _) => {
                     // Production recv-loop Resend arm: cwnd loss response, re-send
                     // (succeeds here), re-register. Flight size unchanged.
                     congestion.on_timeout();
@@ -2983,7 +3038,7 @@ mod tests {
                     congestion.release_flightsize(payload_len);
                     abandoned += 1;
                 }
-                ResendAction::TlpProbe(_id, _packet) => {
+                ResendAction::TlpProbe(_id, _packet, _) => {
                     // Speculative probe — no flight-size effect.
                 }
                 ResendAction::WaitUntil(_) => {
