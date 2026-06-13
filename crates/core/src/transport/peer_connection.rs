@@ -3475,7 +3475,7 @@ mod tests {
 
         let samples_after = crate::transport::TRANSPORT_METRICS.rtt_sample_count();
         assert!(
-            samples_after >= samples_before + 1,
+            samples_after > samples_before,
             "Pong for a pending ping must record at least one RTT sample \
              (before={samples_before}, after={samples_after}). \
              The keep-alive RTT path (#4000) is not wired up."

@@ -195,6 +195,51 @@ impl WebApp {
     }
 }
 
+impl<'a> TryFrom<&'a [u8]> for WebApp {
+    type Error = WebContractError;
+
+    fn try_from(state: &'a [u8]) -> Result<Self, Self::Error> {
+        debug!(
+            "Attempting to create WebApp from {} bytes of state",
+            state.len()
+        );
+        const MAX_METADATA_SIZE: u64 = 1024;
+        const MAX_WEB_SIZE: u64 = 1024 * 1024 * 100;
+        // Decompose the state and extract the compressed web interface
+        let mut state = Cursor::new(state);
+
+        let metadata_size = state
+            .read_u64::<BigEndian>()
+            .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))?;
+        if metadata_size > MAX_METADATA_SIZE {
+            return Err(WebContractError::UnpackingError(anyhow::anyhow!(
+                "Exceeded metadata size of 1kB: {} bytes",
+                metadata_size
+            )));
+        }
+        let mut metadata = vec![0; metadata_size as usize];
+        state
+            .read_exact(&mut metadata)
+            .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))?;
+
+        let web_size = state
+            .read_u64::<BigEndian>()
+            .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))?;
+        if web_size > MAX_WEB_SIZE {
+            return Err(WebContractError::UnpackingError(anyhow::anyhow!(
+                "Exceeded packed web size of 100MB: {} bytes",
+                web_size
+            )));
+        }
+        let mut web = vec![0; web_size as usize];
+        state
+            .read_exact(&mut web)
+            .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))?;
+
+        Ok(Self { metadata, web })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,50 +386,5 @@ mod tests {
             std::fs::read(dst.path().join("assets/app.js")).unwrap(),
             b"console.log(1)"
         );
-    }
-}
-
-impl<'a> TryFrom<&'a [u8]> for WebApp {
-    type Error = WebContractError;
-
-    fn try_from(state: &'a [u8]) -> Result<Self, Self::Error> {
-        debug!(
-            "Attempting to create WebApp from {} bytes of state",
-            state.len()
-        );
-        const MAX_METADATA_SIZE: u64 = 1024;
-        const MAX_WEB_SIZE: u64 = 1024 * 1024 * 100;
-        // Decompose the state and extract the compressed web interface
-        let mut state = Cursor::new(state);
-
-        let metadata_size = state
-            .read_u64::<BigEndian>()
-            .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))?;
-        if metadata_size > MAX_METADATA_SIZE {
-            return Err(WebContractError::UnpackingError(anyhow::anyhow!(
-                "Exceeded metadata size of 1kB: {} bytes",
-                metadata_size
-            )));
-        }
-        let mut metadata = vec![0; metadata_size as usize];
-        state
-            .read_exact(&mut metadata)
-            .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))?;
-
-        let web_size = state
-            .read_u64::<BigEndian>()
-            .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))?;
-        if web_size > MAX_WEB_SIZE {
-            return Err(WebContractError::UnpackingError(anyhow::anyhow!(
-                "Exceeded packed web size of 100MB: {} bytes",
-                web_size
-            )));
-        }
-        let mut web = vec![0; web_size as usize];
-        state
-            .read_exact(&mut web)
-            .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))?;
-
-        Ok(Self { metadata, web })
     }
 }

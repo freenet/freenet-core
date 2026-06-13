@@ -567,6 +567,16 @@ impl SentPacketTracker<RealTime> {
 // Unit tests
 #[cfg(test)]
 pub(in crate::transport) mod tests {
+    // These tests assert that `get_resend()` returns a specific `ResendAction`
+    // variant and `panic!` on anything else (`match action { Expected => ..,
+    // _ => panic!() }`). That wildcard-with-panic is the intended assertion
+    // idiom — expanding it into a `pat | _` listing would only add churn and
+    // would still need updating for any new variant. Scope the allow to the
+    // test module rather than annotating each identical arm. Mirrors the
+    // documented non_exhaustive wildcard pattern in
+    // `.claude/rules/git-workflow.md`.
+    #![allow(clippy::wildcard_enum_match_arm)]
+
     use super::*;
     use crate::simulation::VirtualTime;
     use rstest::rstest;

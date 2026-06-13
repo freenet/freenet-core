@@ -2233,8 +2233,8 @@ mod opentelemetry_tracer {
 
     use dashmap::DashMap;
     use opentelemetry::{
-        KeyValue, global,
-        trace::{self, Span},
+        Context, KeyValue, global,
+        trace::{self, Span, TraceContextExt},
     };
 
     use super::*;
@@ -2253,17 +2253,31 @@ mod opentelemetry_tracer {
             let mut span_id = [0; 8];
             span_id.copy_from_slice(&tx_bytes[8..]);
             let start_time = transaction.started();
-            let inner = tracer.build(trace::SpanBuilder {
-                name: transaction.transaction_type().description().into(),
-                start_time: Some(start_time),
-                span_id: Some(trace::SpanId::from_bytes(span_id)),
-                trace_id: Some(trace::TraceId::from_bytes(tx_bytes)),
-                attributes: Some(vec![
-                    KeyValue::new("transaction", transaction.to_string()),
-                    KeyValue::new("tx_type", transaction.transaction_type().description()),
-                ]),
-                ..Default::default()
-            });
+            // opentelemetry 0.32 removed the `trace_id`/`span_id` fields from
+            // `SpanBuilder`; trace identity is now seeded from the parent
+            // `Context`. We anchor the span on a deterministic remote
+            // `SpanContext` derived from the transaction bytes so all events of
+            // a transaction continue to share a stable trace_id. The child span
+            // receives a fresh span_id from the SDK id generator (no longer
+            // settable through the public API), with our deterministic span_id
+            // recorded as the parent span_id.
+            let parent_span_context = trace::SpanContext::new(
+                trace::TraceId::from_bytes(tx_bytes),
+                trace::SpanId::from_bytes(span_id),
+                trace::TraceFlags::SAMPLED,
+                true,
+                trace::TraceState::default(),
+            );
+            let parent_cx = Context::current().with_remote_span_context(parent_span_context);
+            let builder = trace::SpanBuilder::from_name(
+                transaction.transaction_type().description().to_string(),
+            )
+            .with_start_time(start_time)
+            .with_attributes(vec![
+                KeyValue::new("transaction", transaction.to_string()),
+                KeyValue::new("tx_type", transaction.transaction_type().description()),
+            ]);
+            let inner = tracer.build_with_context(builder, &parent_cx);
             OTSpan {
                 inner,
                 last_log: SystemTime::now(),
