@@ -590,6 +590,37 @@ impl Socket for UdpSocket {
 
 use crate::message::NetMessage;
 
+/// Outcome carried by the broadcast-queue stream-completion oneshot.
+///
+/// The broadcast queue holds a semaphore permit while a streaming broadcast is
+/// in flight and releases it when the completion signal fires. Historically the
+/// signal was a bare `()` and the queue treated *any* signal as a successful
+/// delivery (issue #4235). That conflated two unrelated facts:
+///
+/// 1. **Permit release** — the permit MUST be released in every terminal case
+///    (delivered, dropped, timed out) so concurrency slots are never leaked.
+/// 2. **Delivery success** — only an actual transfer completion should refresh
+///    the peer's interest TTL and cache its summary.
+///
+/// Several drop paths (peer channel closed, congestion timeout per #4145,
+/// no connection, transport send error) fire the signal purely to release the
+/// permit. Carrying an explicit outcome lets the queue release the permit in
+/// all cases while only treating `Delivered` as a real send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BroadcastDeliveryOutcome {
+    /// All stream fragments were transmitted (the last fragment was handed to
+    /// the packet sender). Signaled after the final fragment leaves the sender,
+    /// NOT after a receiver ACK — this path has no end-to-end delivery
+    /// acknowledgement. It is the strongest "the send actually happened" signal
+    /// the broadcast queue can observe, as distinct from the message being
+    /// dropped before/while transmitting.
+    Delivered,
+    /// The stream fragment was dropped before/while transferring (channel
+    /// closed, congestion timeout, no connection, transport send error). The
+    /// permit is released but the message was NOT delivered.
+    Dropped,
+}
+
 /// Type-erased interface for peer connections.
 ///
 /// This trait provides the minimal interface needed by `peer_connection_listener`
@@ -634,14 +665,16 @@ pub(crate) trait PeerConnectionApi: Send {
     /// the legacy InboundStream decode path.
     ///
     /// If `completion_tx` is provided, it will be signaled when the stream transfer
-    /// completes (success or failure). Used by the broadcast queue to track when the
-    /// actual data transfer finishes, not just when the send is enqueued.
+    /// completes, carrying a [`BroadcastDeliveryOutcome`] that distinguishes an
+    /// actual delivery from a drop (see #4235). Used by the broadcast queue to
+    /// release its semaphore permit in all cases while only treating a real
+    /// delivery as a successful send.
     fn send_stream_data(
         &mut self,
         stream_id: crate::transport::peer_connection::StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
-        completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>>;
 
     /// Pipes an inbound stream to the remote peer, forwarding fragments as they arrive.

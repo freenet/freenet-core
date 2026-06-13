@@ -31,8 +31,8 @@ use crate::ring::Location;
 #[cfg(feature = "simulation_tests")]
 use crate::ring::PeerKey;
 use crate::transport::{
-    CongestionControlConfig, ExpectedInboundTracker, PeerConnectionApi, Socket, TransportError,
-    TransportKeypair, TransportPublicKey, create_connection_handler,
+    BroadcastDeliveryOutcome, CongestionControlConfig, ExpectedInboundTracker, PeerConnectionApi,
+    Socket, TransportError, TransportKeypair, TransportPublicKey, create_connection_handler,
     global_bandwidth::GlobalBandwidthManager, peer_connection::StreamId,
 };
 use crate::{
@@ -104,8 +104,10 @@ pub(crate) enum P2pBridgeEvent {
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
         /// Optional completion signal for broadcast queue concurrency control.
-        /// Signaled when the actual stream transfer finishes (not just enqueue).
-        completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        /// Signaled when the actual stream transfer finishes (not just enqueue),
+        /// carrying a [`BroadcastDeliveryOutcome`] so the queue distinguishes a
+        /// real delivery from a drop (#4235).
+        completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
     },
     /// Pipe an inbound stream to a target, forwarding fragments incrementally.
     PipeStream {
@@ -218,7 +220,7 @@ impl P2pBridge {
         stream_id: StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
-        completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
     ) -> super::ConnResult<()> {
         self.ev_listener_tx
             .send(P2pBridgeEvent::StreamSend {
@@ -1317,7 +1319,8 @@ impl P2pConnManager {
                                              cannot route stream fragment"
                                         );
                                         if let Some(tx) = completion_tx {
-                                            let _ignored = tx.send(());
+                                            let _ignored =
+                                                tx.send(BroadcastDeliveryOutcome::Dropped);
                                         }
                                     }
                                     Err(_timeout) => {
@@ -1330,7 +1333,8 @@ impl P2pConnManager {
                                              to keep event loop responsive"
                                         );
                                         if let Some(tx) = completion_tx {
-                                            let _ignored = tx.send(());
+                                            let _ignored =
+                                                tx.send(BroadcastDeliveryOutcome::Dropped);
                                         }
                                     }
                                 }
@@ -1342,9 +1346,10 @@ impl P2pConnManager {
                                     "No connection found for stream send target"
                                 );
                                 // Signal completion so the broadcast queue permit
-                                // is released immediately.
+                                // is released immediately. No connection means the
+                                // fragment was dropped, not delivered (#4235).
                                 if let Some(tx) = completion_tx {
-                                    let _ignored = tx.send(());
+                                    let _ignored = tx.send(BroadcastDeliveryOutcome::Dropped);
                                 }
                             }
                         }
@@ -4939,8 +4944,9 @@ pub(super) enum ConnEvent {
         stream_id: StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
-        /// Optional completion signal for broadcast queue concurrency control.
-        completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        /// Optional completion signal for broadcast queue concurrency control,
+        /// carrying a [`BroadcastDeliveryOutcome`] (#4235).
+        completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
     },
     /// Pipe an inbound stream to a peer, forwarding fragments as they arrive.
     /// Used for low-latency forwarding at intermediate nodes.
@@ -5958,16 +5964,19 @@ mod tests {
     /// a 120 s production stall.
     #[tokio::test]
     async fn stream_send_pattern_fires_completion_tx_on_timeout() {
+        use crate::transport::BroadcastDeliveryOutcome;
         const SEND_TIMEOUT: Duration = Duration::from_millis(100);
         let (tx, _rx) = mpsc::channel::<u32>(1);
         tx.try_send(0).expect("first send must succeed");
 
-        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<()>();
+        let (completion_tx, completion_rx) =
+            tokio::sync::oneshot::channel::<BroadcastDeliveryOutcome>();
 
         // Mirror the StreamSend dispatch pattern:
         //   reserve() → permit OR closed OR timeout
         // The timeout branch MUST signal completion_tx (we retain
-        // ownership because reserve() never consumed it).
+        // ownership because reserve() never consumed it). Post-#4235 the
+        // signal carries `Dropped` because the fragment was NOT delivered.
         match tokio::time::timeout(SEND_TIMEOUT, tx.reserve()).await {
             Ok(Ok(_permit)) => {
                 // Wouldn't happen in this test (channel saturated), but
@@ -5976,16 +5985,16 @@ mod tests {
                 panic!("reserve unexpectedly succeeded on saturated channel");
             }
             Ok(Err(_closed)) => {
-                let _ignored = completion_tx.send(());
+                let _ignored = completion_tx.send(BroadcastDeliveryOutcome::Dropped);
             }
             Err(_timeout) => {
-                let _ignored = completion_tx.send(());
+                let _ignored = completion_tx.send(BroadcastDeliveryOutcome::Dropped);
             }
         }
 
         let signal = timeout(Duration::from_millis(50), completion_rx).await;
         assert!(
-            matches!(signal, Ok(Ok(()))),
+            matches!(signal, Ok(Ok(BroadcastDeliveryOutcome::Dropped))),
             "completion_tx must be fired on the dispatch timeout path so the \
              broadcast queue releases its permit immediately (not after \
              120s STREAM_COMPLETION_TIMEOUT). Got {signal:?}"
@@ -6045,22 +6054,30 @@ mod tests {
         // timeout / no-connection) MUST signal `completion_tx` so the
         // broadcast queue's semaphore permit releases immediately.
         // Per-arm count instead of a single match: a refactor that
-        // drops just the timeout arm's fire (the one this PR added)
+        // drops just the timeout arm's fire (the one #4145 added)
         // would otherwise silently reintroduce the 120 s
-        // STREAM_COMPLETION_TIMEOUT stall. Pre-fix the StreamSend
-        // branch had ONE `tx.send(())` (channel-closed only); the
-        // current PR adds two more (timeout + no-connection).
-        // Tested behaviourally by
-        // `stream_send_pattern_fires_completion_tx_on_timeout`.
-        let fire_count = body.matches("tx.send(())").count();
+        // STREAM_COMPLETION_TIMEOUT stall.
+        //
+        // Post-#4235 the signal carries a `BroadcastDeliveryOutcome` instead
+        // of `()`, and every drop arm reports `Dropped` so the broadcast queue
+        // releases the permit WITHOUT treating the drop as a delivery. Counting
+        // `Dropped` fires here pins both invariants at once: a regression that
+        // dropped an arm OR that mislabeled a drop arm as `Delivered` (the
+        // exact conflation #4235 fixed) trips this assertion. Tested
+        // behaviourally by `stream_send_pattern_fires_completion_tx_on_timeout`.
+        let fire_count = body
+            .matches("tx.send(BroadcastDeliveryOutcome::Dropped)")
+            .count();
         assert_eq!(
             fire_count, 3,
-            "StreamSend dispatch must signal completion_tx in all three \
-             non-success arms (closed / timeout / no-connection) — found \
-             {fire_count} `tx.send(())` occurrences, expected exactly 3. \
-             If you REMOVED one, a refactor reintroduced the 120 s \
-             STREAM_COMPLETION_TIMEOUT stall (#4145). If you ADDED a new \
-             arm with its own fire, bump this count to match. Body:\n{body}"
+            "StreamSend dispatch must signal completion_tx with \
+             BroadcastDeliveryOutcome::Dropped in all three non-success arms \
+             (closed / timeout / no-connection) — found {fire_count} such \
+             occurrences, expected exactly 3. If you REMOVED one, a refactor \
+             reintroduced the 120 s STREAM_COMPLETION_TIMEOUT stall (#4145). \
+             If you relabeled a drop arm as Delivered, you reintroduced the \
+             delivery/permit conflation (#4235). If you ADDED a new arm with \
+             its own fire, bump this count to match. Body:\n{body}"
         );
     }
 
