@@ -16,7 +16,7 @@ use crate::{
         congestion_control::{CongestionControl, CongestionController},
         metrics::{emit_transfer_completed, emit_transfer_failed, emit_transfer_started},
         packet_data,
-        sent_packet_tracker::SentPacketTracker,
+        sent_packet_tracker::{PacketStream, SentPacketTracker},
         symmetric_message::{self},
     },
 };
@@ -282,6 +282,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             },
             sent_packet_tracker.as_ref(),
             token,
+            PacketStream::Stream(stream_id),
         )
         .await
         {
@@ -624,6 +625,7 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
             },
             sent_packet_tracker.as_ref(),
             token,
+            PacketStream::Stream(outbound_stream_id),
         )
         .await
         {

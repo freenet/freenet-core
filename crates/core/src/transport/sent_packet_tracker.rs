@@ -1,4 +1,5 @@
 use super::PacketId;
+use super::StreamId;
 use super::bbr::DeliveryRateToken;
 #[cfg(test)]
 use crate::simulation::RealTime;
@@ -8,6 +9,28 @@ use std::time::Duration;
 
 /// Entry for pending packet receipts: (payload, sent_time_nanos, delivery_token)
 type PendingReceiptEntry = (Box<[u8]>, u64, Option<DeliveryRateToken>);
+
+/// Identifies which outbound stream (if any) owns a sent packet's bytes.
+///
+/// Flight size is a single connection-wide counter, but a packet's bytes are
+/// only credited back to it on ACK or abandonment. When an outbound stream
+/// aborts (e.g. a cwnd-wait timeout in `outbound_stream.rs`), its in-flight
+/// fragments are still tracked here and pin flight size until each one ages out
+/// via `MAX_PACKET_RETRANSMITS` (~6s) — starving every later stream on the
+/// connection (issue #4345). Tagging each pending packet with its owning stream
+/// lets [`SentPacketTracker::drop_stream`] release that stranded flight size
+/// atomically when the stream aborts.
+///
+/// `Control` is the explicit "no owning stream" sentinel for handshake packets,
+/// keep-alive NoOps, short messages, and any other non-stream traffic;
+/// `drop_stream` never touches `Control` packets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PacketStream {
+    /// The packet carries a fragment of the given outbound stream.
+    Stream(StreamId),
+    /// The packet is not owned by any stream (handshake, NoOp, short message).
+    Control,
+}
 
 /// Result of processing received receipts: (acked_packets_info, loss_proportion)
 /// Each acked packet contains: (rtt_option, bytes_acked, delivery_token)
@@ -167,6 +190,21 @@ pub(super) struct SentPacketTracker<T: TimeSource> {
     /// cleared on ACK. An entry is removed when its packet is ACKed or
     /// abandoned, so this map tracks only currently-unacked packets.
     retransmit_counts: HashMap<PacketId, u32>,
+
+    /// Owning stream for each currently-tracked packet (issue #4345).
+    ///
+    /// Indexed by `PacketId`. Unlike `pending_receipts`, an entry here is NOT
+    /// removed when `get_resend` pops a packet for retransmission — it persists
+    /// across resends so the re-registration in the recv loop preserves the
+    /// packet's stream tag. An entry is removed only when the packet leaves
+    /// tracking for good: on ACK (`report_received_receipts`), on abandonment
+    /// (`get_resend` Abandon), or when its stream is dropped (`drop_stream`).
+    ///
+    /// This is what makes `drop_stream` double-decrement-safe: after it removes
+    /// a stream's packets from BOTH this map and `pending_receipts`, no later
+    /// ACK or abandon can find those packets, so their bytes are released
+    /// exactly once.
+    packet_streams: HashMap<PacketId, PacketStream>,
 }
 
 impl<T: TimeSource> SentPacketTracker<T> {
@@ -187,6 +225,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
             rto_backoff: 1, // No backoff initially
             tlp_sent_packets: HashSet::new(),
             retransmit_counts: HashMap::new(),
+            packet_streams: HashMap::new(),
         }
     }
 
@@ -211,17 +250,138 @@ impl<T: TimeSource> SentPacketTracker<T> {
     /// The token is used by BBR for accurate delivery rate estimation. When an ACK
     /// arrives, the token is returned alongside the RTT sample so it can be passed
     /// to `BbrController::on_ack_with_token`.
+    ///
+    /// The packet's stream tag is **preserved if already known** and otherwise
+    /// defaults to [`PacketStream::Control`]. This is exactly the behaviour the
+    /// recv loop's resend re-registration needs: `get_resend` removes the packet
+    /// from `pending_receipts` but NOT from `packet_streams`, so re-sending a
+    /// stream fragment through this method keeps its original stream tag. A
+    /// genuinely new packet (monotonic `packet_id`, never colliding with an old
+    /// tag) has no entry yet and is correctly tagged `Control`. First sends of
+    /// stream fragments must use [`Self::report_sent_stream_packet`] instead so
+    /// they are tagged with their owning stream.
     pub(super) fn report_sent_packet_with_token(
         &mut self,
         packet_id: PacketId,
         payload: Box<[u8]>,
         token: Option<DeliveryRateToken>,
     ) {
+        let stream = self
+            .packet_streams
+            .get(&packet_id)
+            .copied()
+            .unwrap_or(PacketStream::Control);
+        self.report_sent_packet_inner(packet_id, payload, token, stream);
+    }
+
+    /// Report a sent packet that carries bytes owned by `stream`.
+    ///
+    /// Used for the first send of a `StreamFragment`. The packet is tagged with
+    /// its owning stream so that, when the stream aborts, [`Self::drop_stream`]
+    /// can release the packet's flight-size bytes atomically (issue #4345).
+    /// Resends of the same packet re-register through
+    /// [`Self::report_sent_packet_with_token`], which preserves this tag.
+    pub(super) fn report_sent_stream_packet(
+        &mut self,
+        packet_id: PacketId,
+        payload: Box<[u8]>,
+        token: Option<DeliveryRateToken>,
+        stream_id: StreamId,
+    ) {
+        self.report_sent_packet_inner(packet_id, payload, token, PacketStream::Stream(stream_id));
+    }
+
+    fn report_sent_packet_inner(
+        &mut self,
+        packet_id: PacketId,
+        payload: Box<[u8]>,
+        token: Option<DeliveryRateToken>,
+        stream: PacketStream,
+    ) {
         let sent_time_nanos = self.time_source.now_nanos();
         self.pending_receipts
             .insert(packet_id, (payload, sent_time_nanos, token));
+        self.packet_streams.insert(packet_id, stream);
         self.resend_queue.push_back(ResendQueueEntry { packet_id });
         self.total_packets_sent += 1;
+    }
+
+    /// Remove every currently-tracked packet owned by `stream_id` and return the
+    /// total payload byte count removed (issue #4345).
+    ///
+    /// Called when an outbound stream aborts (e.g. a cwnd-wait timeout) so the
+    /// caller can release the aborted stream's stranded bytes from the
+    /// congestion controller's flight size in one shot, instead of waiting for
+    /// each fragment to age out via `MAX_PACKET_RETRANSMITS` (~6s) or be ACKed.
+    /// The returned byte count is exactly what the caller must pass to
+    /// `CongestionControl::release_flightsize`.
+    ///
+    /// # Double-decrement safety
+    ///
+    /// This removes the stream's packets from **all** tracking structures —
+    /// `pending_receipts`, `packet_streams`, `retransmit_counts`,
+    /// `retransmitted_packets`, `tlp_sent_packets`, and the `resend_queue`. Once
+    /// removed, those packets cannot be released a second time by any other
+    /// path:
+    ///
+    /// - A subsequent ACK in `report_received_receipts` finds no entry in
+    ///   `pending_receipts`, so it produces no ack-info tuple and the caller
+    ///   never subtracts its bytes again.
+    /// - `get_resend` skips packet ids absent from `pending_receipts`, so it can
+    ///   never emit a `Resend`/`TlpProbe`/`Abandon` for a dropped packet — in
+    ///   particular it cannot `Abandon` it and trigger a second
+    ///   `release_flightsize`.
+    ///
+    /// The byte count is therefore released exactly once: here.
+    ///
+    /// Returns `0` for an unknown or already-drained stream, and never panics.
+    ///
+    /// NOTE (stage 1, #4345): this mechanism is intentionally NOT yet wired into
+    /// the abort paths in `outbound_stream.rs`; calling it has no effect on
+    /// flight size until the caller passes the returned count to
+    /// `release_flightsize`. It is added and tested in isolation first because
+    /// the double-decrement hazard is the riskiest part of the fix. The
+    /// `allow(dead_code)` is removed in stage 2 when the abort paths call it.
+    #[allow(dead_code)]
+    pub(super) fn drop_stream(&mut self, stream_id: StreamId) -> u64 {
+        let target = PacketStream::Stream(stream_id);
+
+        // Identify the owned packet ids first (one pass over the small
+        // per-connection stream map), then remove from every structure.
+        let owned: Vec<PacketId> = self
+            .packet_streams
+            .iter()
+            .filter_map(|(&pid, &stream)| (stream == target).then_some(pid))
+            .collect();
+
+        if owned.is_empty() {
+            return 0;
+        }
+
+        let mut released_bytes: u64 = 0;
+        for pid in &owned {
+            // Sum the payload bytes still pending (i.e. counted in flight size).
+            // A packet whose tag is present but that is absent from
+            // `pending_receipts` cannot occur: the tag is removed in lockstep on
+            // ACK and abandon. The `if let` is a defensive no-panic guard.
+            if let Some((payload, _, _)) = self.pending_receipts.remove(pid) {
+                released_bytes = released_bytes.saturating_add(payload.len() as u64);
+            }
+            self.packet_streams.remove(pid);
+            self.retransmit_counts.remove(pid);
+            self.retransmitted_packets.remove(pid);
+            self.tlp_sent_packets.remove(pid);
+        }
+
+        // Drop the dropped packets' resend-queue entries. `get_resend` already
+        // skips ids missing from `pending_receipts`, so this is not strictly
+        // required for correctness, but it keeps the queue from growing with
+        // dead entries across many stream drops.
+        let dropped: HashSet<PacketId> = owned.into_iter().collect();
+        self.resend_queue
+            .retain(|entry| !dropped.contains(&entry.packet_id));
+
+        released_bytes
     }
 
     /// Reports that receipts have been received for the given packet IDs.
@@ -285,11 +445,16 @@ impl<T: TimeSource> SentPacketTracker<T> {
                 }
             }
 
-            // Remove from pending, retransmitted, TLP, and retransmit-count tracking
+            // Remove from pending, retransmitted, TLP, retransmit-count, and
+            // stream tracking. Dropping the stream tag here is what keeps
+            // `drop_stream` double-decrement-safe: once a packet is ACKed it is
+            // no longer associated with any stream, so a later `drop_stream`
+            // for that stream cannot release its bytes a second time (#4345).
             self.pending_receipts.remove(packet_id);
             self.retransmitted_packets.remove(packet_id);
             self.tlp_sent_packets.remove(packet_id);
             self.retransmit_counts.remove(packet_id);
+            self.packet_streams.remove(packet_id);
         }
 
         let loss_rate = if self.total_packets_sent > 0 {
@@ -485,9 +650,15 @@ impl<T: TimeSource> SentPacketTracker<T> {
                         let payload_len = packet.len();
                         // Drop all tracking for this packet — it will NOT be
                         // re-queued, so the recv loop stops retransmitting it.
+                        // Removing the stream tag here keeps `drop_stream`
+                        // double-decrement-safe: an abandoned packet's bytes are
+                        // released once (by the recv loop, via the Abandon
+                        // action), so a later `drop_stream` must not release
+                        // them again (#4345).
                         self.retransmit_counts.remove(&entry.packet_id);
                         self.retransmitted_packets.remove(&entry.packet_id);
                         self.tlp_sent_packets.remove(&entry.packet_id);
+                        self.packet_streams.remove(&entry.packet_id);
                         tracing::debug!(
                             packet_id = entry.packet_id,
                             retransmits = MAX_PACKET_RETRANSMITS,

@@ -44,7 +44,7 @@ use super::{
     packet_data::{self, PacketData},
     received_packet_tracker::ReceivedPacketTracker,
     received_packet_tracker::ReportResult,
-    sent_packet_tracker::{ResendAction, SentPacketTracker},
+    sent_packet_tracker::{PacketStream, ResendAction, SentPacketTracker},
     symmetric_message::{self, SymmetricMessage, SymmetricMessagePayload},
     token_bucket::TokenBucket,
 };
@@ -1822,6 +1822,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             (),
             &self.remote_conn.sent_tracker,
             token,
+            PacketStream::Control,
         )
         .await
     }
@@ -1898,6 +1899,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             symmetric_message::ShortMessage(data.into()),
             &self.remote_conn.sent_tracker,
             token,
+            PacketStream::Control,
         )
         .await?;
         Ok(())
@@ -2077,6 +2079,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             },
             &self.remote_conn.sent_tracker,
             token,
+            PacketStream::Stream(fragment.stream_id),
         )
         .await?;
 
@@ -2091,6 +2094,30 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     }
 }
 
+/// Register a freshly-sent packet with the tracker, tagging it with its owning
+/// stream for flight-size accounting (issue #4345).
+///
+/// `Stream(id)` first sends route to `report_sent_stream_packet` (which records
+/// the tag); `Control` sends route to `report_sent_packet_with_token` (which
+/// preserves any existing tag, so resend re-registration of a stream fragment
+/// keeps its stream, and genuinely-new control packets stay `Control`).
+fn report_sent_tagged<T: crate::simulation::TimeSource>(
+    tracker: &mut SentPacketTracker<T>,
+    packet_id: u32,
+    payload: Box<[u8]>,
+    delivery_token: Option<DeliveryRateToken>,
+    stream: PacketStream,
+) {
+    match stream {
+        PacketStream::Stream(stream_id) => {
+            tracker.report_sent_stream_packet(packet_id, payload, delivery_token, stream_id);
+        }
+        PacketStream::Control => {
+            tracker.report_sent_packet_with_token(packet_id, payload, delivery_token);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
     remote_addr: SocketAddr,
@@ -2101,6 +2128,11 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
     payload: impl Into<SymmetricMessagePayload>,
     sent_tracker: &parking_lot::Mutex<SentPacketTracker<T>>,
     delivery_token: Option<DeliveryRateToken>,
+    // Owning stream for flight-size accounting (issue #4345). `Stream(id)` for
+    // `StreamFragment` sends so an aborted stream's bytes can be released
+    // atomically via `SentPacketTracker::drop_stream`; `Control` for everything
+    // else (handshake, NoOp, short message).
+    stream: PacketStream,
 ) -> Result<()> {
     let start_time = tokio::time::Instant::now();
     tracing::trace!(
@@ -2146,10 +2178,12 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                     // Record the classified on-wire bytes once the packet
                     // is actually sent (not on the error path).
                     super::shadow_demand::record_outbound(outbound_class, packet_data.len());
-                    sent_tracker.lock().report_sent_packet_with_token(
+                    report_sent_tagged(
+                        &mut sent_tracker.lock(),
                         packet_id,
                         packet_data,
                         delivery_token,
+                        stream,
                     );
                     Ok(())
                 }
@@ -2191,10 +2225,12 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                             .await
                             .map_err(|e| TransportError::SendFailed(remote_addr, e.kind()))?;
                         sent_on_wire += packet_data.len();
-                        sent_tracker.lock().report_sent_packet_with_token(
+                        report_sent_tagged(
+                            &mut sent_tracker.lock(),
                             packet_id,
                             packet_data,
                             delivery_token,
+                            stream,
                         );
                     }
                 }};
@@ -2453,6 +2489,7 @@ mod tests {
                 (),
                 &sent_tracker,
                 None,
+                PacketStream::Control,
             )
             .await;
 
@@ -2513,6 +2550,7 @@ mod tests {
                 },
                 &sent_tracker,
                 None,
+                PacketStream::Control,
             )
             .await
             .expect("short send should succeed");
@@ -2524,6 +2562,7 @@ mod tests {
             );
 
             // ---- success: StreamFragment advances `bulk` ----
+            let frag_stream_id = StreamId::next();
             packet_sending(
                 remote_addr,
                 &socket,
@@ -2531,7 +2570,7 @@ mod tests {
                 &outbound_key,
                 vec![],
                 SymmetricMessagePayload::StreamFragment {
-                    stream_id: StreamId::next(),
+                    stream_id: frag_stream_id,
                     total_length_bytes: 300,
                     fragment_number: 0,
                     payload: bytes::Bytes::from(vec![9u8; 300]),
@@ -2539,6 +2578,7 @@ mod tests {
                 },
                 &sent_tracker,
                 None,
+                PacketStream::Stream(frag_stream_id),
             )
             .await
             .expect("stream fragment send should succeed");
@@ -2565,6 +2605,7 @@ mod tests {
                 },
                 &sent_tracker,
                 None,
+                PacketStream::Control,
             )
             .await;
             assert!(res.is_err(), "failing socket must return Err");
