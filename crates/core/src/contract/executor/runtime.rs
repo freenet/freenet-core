@@ -561,6 +561,10 @@ impl ContractExecutor for RuntimePool {
         })
     }
 
+    fn op_manager_handle(&self) -> Option<Arc<crate::node::OpManager>> {
+        Some(self.op_manager.clone())
+    }
+
     async fn fetch_contract(
         &mut self,
         key: ContractKey,
@@ -773,6 +777,26 @@ impl ContractExecutor for RuntimePool {
             .upsert_contract_state(key, update, related_contracts, code)
             .await;
         self.return_checked(executor, "upsert_contract_state").await;
+        self.track_contract_return(&key);
+        result
+    }
+
+    async fn upsert_contract_state_deferrable(
+        &mut self,
+        key: ContractKey,
+        update: Either<WrappedState, StateDelta<'static>>,
+        related_contracts: RelatedContracts<'static>,
+        code: Option<ContractContainer>,
+    ) -> Result<UpsertOutcome, ExecutorError> {
+        self.track_contract_checkout(&key);
+        let mut executor = self.pop_executor().await;
+        let result = bridged_upsert_outcome(
+            executor
+                .bridged_upsert_contract_state_inner(key, update, related_contracts, code, true)
+                .await,
+        );
+        self.return_checked(executor, "upsert_contract_state_deferrable")
+            .await;
         self.track_contract_return(&key);
         result
     }
@@ -1041,6 +1065,29 @@ where
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
     ) -> Result<UpsertResult, ExecutorError> {
+        self.bridged_upsert_contract_state_inner(key, update, related_contracts, code, false)
+            .await
+    }
+
+    /// Inner implementation of [`bridged_upsert_contract_state`].
+    ///
+    /// `defer_related_fetch` controls what happens when validation/merge needs
+    /// a related contract that is not held locally:
+    /// - `false` (the default, used by `upsert_contract_state`): fetch it from
+    ///   the network inline, awaiting the GET (legacy behavior).
+    /// - `true` (used by `upsert_contract_state_deferrable`): do NOT fetch
+    ///   inline. Roll back any partial work via the normal error path and
+    ///   return [`ExecutorError::defer_related_fetch`] carrying the missing ids,
+    ///   so the caller can off-load the GET from the serial event loop and
+    ///   re-run the upsert with the states supplied. See issue #4391.
+    pub(super) async fn bridged_upsert_contract_state_inner(
+        &mut self,
+        key: ContractKey,
+        update: Either<WrappedState, StateDelta<'static>>,
+        related_contracts: RelatedContracts<'static>,
+        code: Option<ContractContainer>,
+        defer_related_fetch: bool,
+    ) -> Result<UpsertResult, ExecutorError> {
         // CRITICAL: When a ContractContainer is provided, use its key instead of the passed-in key.
         let key = if let Some(ref container) = code {
             let container_key = container.key();
@@ -1279,6 +1326,7 @@ where
                         &params,
                         &incoming_state,
                         &related_contracts,
+                        defer_related_fetch,
                     )
                     .await
                     .inspect_err(|_| {
@@ -1632,6 +1680,29 @@ where
                     }));
                 }
 
+                // In deferrable mode, resolve related contracts LOCAL-ONLY
+                // first. If any are missing locally, surface them to the
+                // caller for an off-loop network fetch instead of awaiting
+                // the network GET inline on the serial event loop (#4391).
+                // When everything is local this is a no-op and we fall
+                // through to the normal merge below.
+                if defer_related_fetch {
+                    let mut missing = Vec::new();
+                    for id in &unique_ids {
+                        let local = if let Some(full_key) = self.bridged_lookup_key(id) {
+                            self.state_store.get(&full_key).await.is_ok()
+                        } else {
+                            false
+                        };
+                        if !local {
+                            missing.push(*id);
+                        }
+                    }
+                    if !missing.is_empty() {
+                        return Err(ExecutorError::defer_related_fetch(missing));
+                    }
+                }
+
                 // Parallel fetch: each related contract goes through its
                 // own GET sub-op concurrently. Previously this loop ran
                 // serially under a single 10s wall-clock budget, so a
@@ -1818,7 +1889,13 @@ where
         }
 
         let result = self
-            .fetch_related_for_validation(&key, &params, &updated_state, &related_contracts)
+            .fetch_related_for_validation(
+                &key,
+                &params,
+                &updated_state,
+                &related_contracts,
+                defer_related_fetch,
+            )
             .await?;
 
         if result != ValidateResult::Valid {
@@ -2560,6 +2637,7 @@ where
         params: &Parameters<'_>,
         state: &WrappedState,
         initial_related: &RelatedContracts<'_>,
+        defer_related_fetch: bool,
     ) -> Result<ValidateResult, ExecutorError> {
         let result = self
             .runtime
@@ -2616,6 +2694,34 @@ where
                 )
                 .into(),
             }));
+        }
+
+        // In deferrable mode, resolve related contracts LOCAL-ONLY first
+        // (caller-supplied `initial_related` states count as local). If any
+        // are missing locally, surface them so the caller can fetch them
+        // off-loop instead of awaiting the network GET inline on the serial
+        // event loop (#4391). When everything is already local this is a
+        // no-op and we fall through to the normal fetch+revalidate below.
+        if defer_related_fetch {
+            let initial_owned = initial_related.clone().into_owned();
+            let mut missing = Vec::new();
+            for id in &unique_ids {
+                let supplied = initial_owned
+                    .states()
+                    .any(|(rid, s)| rid == id && s.is_some());
+                let local = supplied
+                    || if let Some(full_key) = self.bridged_lookup_key(id) {
+                        self.state_store.get(&full_key).await.is_ok()
+                    } else {
+                        false
+                    };
+                if !local {
+                    missing.push(*id);
+                }
+            }
+            if !missing.is_empty() {
+                return Err(ExecutorError::defer_related_fetch(missing));
+            }
         }
 
         tracing::debug!(
@@ -3049,6 +3155,10 @@ impl ContractExecutor for Executor<Runtime> {
         self.bridged_lookup_key(instance_id)
     }
 
+    fn op_manager_handle(&self) -> Option<Arc<crate::node::OpManager>> {
+        self.op_manager.clone()
+    }
+
     async fn fetch_contract(
         &mut self,
         key: ContractKey,
@@ -3066,6 +3176,19 @@ impl ContractExecutor for Executor<Runtime> {
     ) -> Result<UpsertResult, ExecutorError> {
         self.bridged_upsert_contract_state(key, update, related_contracts, code)
             .await
+    }
+
+    async fn upsert_contract_state_deferrable(
+        &mut self,
+        key: ContractKey,
+        update: Either<WrappedState, StateDelta<'static>>,
+        related_contracts: RelatedContracts<'static>,
+        code: Option<ContractContainer>,
+    ) -> Result<UpsertOutcome, ExecutorError> {
+        bridged_upsert_outcome(
+            self.bridged_upsert_contract_state_inner(key, update, related_contracts, code, true)
+                .await,
+        )
     }
 
     fn register_contract_notifier(
@@ -4299,6 +4422,24 @@ async fn fetch_related_via_network(
     }
 }
 
+/// Map the result of a deferrable `bridged_upsert_contract_state_inner` call
+/// into an [`UpsertOutcome`].
+///
+/// A clean completion becomes [`UpsertOutcome::Completed`]; the typed
+/// [`ExecutorError::defer_related_fetch`] signal becomes
+/// [`UpsertOutcome::DeferRelated`]; any other error propagates unchanged.
+pub(super) fn bridged_upsert_outcome(
+    result: Result<UpsertResult, ExecutorError>,
+) -> Result<UpsertOutcome, ExecutorError> {
+    match result {
+        Ok(res) => Ok(UpsertOutcome::Completed(res)),
+        Err(err) => match err.into_defer_related_fetch() {
+            Ok(missing) => Ok(UpsertOutcome::DeferRelated(missing)),
+            Err(other) => Err(other),
+        },
+    }
+}
+
 #[cfg(test)]
 pub(crate) type NetworkFetchStub =
     std::rc::Rc<dyn Fn(ContractInstanceId) -> Result<WrappedState, ExecutorError>>;
@@ -4583,14 +4724,21 @@ mod executor_pin_tests {
                 "{name} must call futures::future::join_all — serial fetch \
                  regressed in freenet/freenet-core#4077; do not revert"
             );
-            // Spot-check the loop construct doesn't reappear: a plain
-            // `for id in &unique_ids` inside the function body almost
-            // certainly means the parallel fan-out is gone.
-            let serial_needle = ["for ", "id in &unique_ids"].concat();
+            // Spot-check the NETWORK fetch doesn't regress to a serial
+            // `for id in &unique_ids { ... fetch_related_via_network ... await }`
+            // loop (the exact pre-#4077 shape). NOTE: the deferrable-mode block
+            // (#4391) legitimately iterates `&unique_ids` to do a LOCAL-ONLY
+            // presence check that contains NO `fetch_related_via_network`, so
+            // the bare `for id in &unique_ids` form is no longer a reliable
+            // signal. Anchor instead on a serial `for` segment that calls the
+            // network helper — that is the actual #4077 regression shape.
+            let serial_network_fetch = body.split("for ").skip(1).any(|seg| {
+                seg.contains("id in &unique_ids") && seg.contains("fetch_related_via_network")
+            });
             assert!(
-                !body.contains(&serial_needle),
-                "{name} must not iterate serially over &unique_ids — \
-                 regressed to pre-#4077 behavior"
+                !serial_network_fetch,
+                "{name} must not iterate serially over &unique_ids to call \
+                 fetch_related_via_network — regressed to pre-#4077 behavior"
             );
         }
 

@@ -274,6 +274,10 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         self.bridged_lookup_key(instance_id)
     }
 
+    fn op_manager_handle(&self) -> Option<std::sync::Arc<crate::node::OpManager>> {
+        self.op_manager.clone()
+    }
+
     async fn fetch_contract(
         &mut self,
         key: ContractKey,
@@ -291,6 +295,19 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
     ) -> Result<UpsertResult, ExecutorError> {
         self.bridged_upsert_contract_state(key, update, related_contracts, code)
             .await
+    }
+
+    async fn upsert_contract_state_deferrable(
+        &mut self,
+        key: ContractKey,
+        update: Either<WrappedState, StateDelta<'static>>,
+        related_contracts: RelatedContracts<'static>,
+        code: Option<ContractContainer>,
+    ) -> Result<UpsertOutcome, ExecutorError> {
+        super::runtime::bridged_upsert_outcome(
+            self.bridged_upsert_contract_state_inner(key, update, related_contracts, code, true)
+                .await,
+        )
     }
 
     fn register_contract_notifier(
@@ -359,5 +376,14 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             op_manager,
         )
         .await
+    }
+
+    /// Mutable access to the inner `MockWasmRuntime` so tests can install
+    /// per-contract `validate_overrides` / `update_overrides` after the
+    /// executor is wrapped in a handler. The `runtime` field is private to
+    /// the `executor` module, so this accessor exists to surface it.
+    #[cfg(test)]
+    pub(crate) fn mock_runtime_mut(&mut self) -> &mut MockWasmRuntime {
+        &mut self.runtime
     }
 }

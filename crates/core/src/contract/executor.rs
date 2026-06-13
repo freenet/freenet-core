@@ -117,6 +117,37 @@ impl std::fmt::Display for ContractQueueFull {
 
 impl std::error::Error for ContractQueueFull {}
 
+/// Typed marker carried by an [`ExecutorError`] when an upsert was invoked
+/// in *deferrable* mode (see [`ContractExecutor::upsert_contract_state_deferrable`])
+/// and discovered it needs to fetch related contracts from the network to
+/// finish validation/merge.
+///
+/// Instead of awaiting that network GET inline — which would pin the serial
+/// `contract_handling` loop for up to `RELATED_FETCH_TIMEOUT`, blocking every
+/// queued event behind it (including local-store-hit GETs) — the executor
+/// aborts the upsert cleanly (running the same init-tracker/contract-store
+/// rollback the error paths use) and surfaces the missing related ids here.
+/// The caller off-loads the GET to a background task and re-runs the upsert
+/// once the states arrive. See issue #4391.
+#[derive(Debug, Clone)]
+pub struct DeferRelatedFetch {
+    /// Related contract instance ids that are not held locally and must be
+    /// fetched from the network before the upsert can complete.
+    pub missing: Vec<ContractInstanceId>,
+}
+
+impl std::fmt::Display for DeferRelatedFetch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "upsert needs {} related contract(s) fetched from the network",
+            self.missing.len()
+        )
+    }
+}
+
+impl std::error::Error for DeferRelatedFetch {}
+
 #[derive(Debug)]
 pub struct ExecutorError {
     inner: Either<Box<RequestError>, anyhow::Error>,
@@ -312,6 +343,42 @@ impl ExecutorError {
         }
     }
 
+    /// Construct a `MissingRelated` request error for `id`. Used by the
+    /// off-loop related-fetch path (#4391) to surface a fetch failure to the
+    /// client with the same error shape the inline path produces.
+    pub(crate) fn missing_related(id: ContractInstanceId) -> Self {
+        Self::request(StdContractError::MissingRelated { key: id })
+    }
+
+    /// Construct the typed [`DeferRelatedFetch`] signal. Only produced by the
+    /// deferrable-upsert path when the missing related contracts must be
+    /// fetched from the network. See `DeferRelatedFetch`.
+    pub(crate) fn defer_related_fetch(missing: Vec<ContractInstanceId>) -> Self {
+        Self {
+            inner: Either::Right(anyhow::Error::new(DeferRelatedFetch { missing })),
+            fatal: false,
+        }
+    }
+
+    /// If this error is the typed [`DeferRelatedFetch`] signal, return the
+    /// missing related contract ids; otherwise `None`. Consuming the error so
+    /// the caller can re-run the upsert with the fetched states.
+    pub(crate) fn into_defer_related_fetch(self) -> Result<Vec<ContractInstanceId>, Self> {
+        match self.inner {
+            Either::Right(err) => match err.downcast::<DeferRelatedFetch>() {
+                Ok(defer) => Ok(defer.missing),
+                Err(err) => Err(Self {
+                    inner: Either::Right(err),
+                    fatal: self.fatal,
+                }),
+            },
+            inner @ Either::Left(_) => Err(Self {
+                inner,
+                fatal: self.fatal,
+            }),
+        }
+    }
+
     pub fn is_fatal(&self) -> bool {
         self.fatal
     }
@@ -413,6 +480,26 @@ pub(crate) enum UpsertResult {
     CurrentWon(WrappedState),
 }
 
+/// Outcome of a *deferrable* upsert (see
+/// [`ContractExecutor::upsert_contract_state_deferrable`]).
+///
+/// A normal upsert either completes (`Completed`) or, when it needs related
+/// contracts that aren't held locally, signals that the network fetch should
+/// be off-loaded from the serial event loop (`DeferRelated`) instead of being
+/// awaited inline. See issue #4391 for why the inline wait is harmful.
+#[derive(Debug)]
+pub(crate) enum UpsertOutcome {
+    /// The upsert ran to completion (all related contracts were resolvable
+    /// locally, or none were needed). Carries the same result a plain
+    /// `upsert_contract_state` would return.
+    Completed(UpsertResult),
+    /// The upsert needs these related contracts fetched from the network
+    /// before it can finish. No state was committed and any in-progress
+    /// initialization was rolled back; the caller must fetch the listed
+    /// contracts off-loop and re-run the upsert with them supplied.
+    DeferRelated(Vec<ContractInstanceId>),
+}
+
 pub(crate) trait ContractExecutor: Send + 'static {
     /// Look up the full ContractKey from a ContractInstanceId.
     /// Returns None if the contract is not known to this node.
@@ -440,6 +527,33 @@ pub(crate) trait ContractExecutor: Send + 'static {
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
     ) -> impl Future<Output = Result<UpsertResult, ExecutorError>> + Send;
+
+    /// Like [`upsert_contract_state`](Self::upsert_contract_state), but when the
+    /// upsert needs related contracts that are not held locally, it does NOT
+    /// await the network GET inline. Instead it rolls back any partial work and
+    /// returns [`UpsertOutcome::DeferRelated`] with the missing ids so the
+    /// caller can off-load the fetch from the serial event loop and re-run the
+    /// upsert once the states are available.
+    ///
+    /// The default implementation never defers — it simply forwards to
+    /// `upsert_contract_state` and wraps the result in
+    /// [`UpsertOutcome::Completed`]. Only executors that perform network
+    /// related-contract fetches (the production `RuntimePool` / `Executor<Runtime>`
+    /// and the `MockWasmRuntime` test executor) override it to defer. Local-only
+    /// and mock executors keep their existing inline behavior. See issue #4391.
+    fn upsert_contract_state_deferrable(
+        &mut self,
+        key: ContractKey,
+        update: Either<WrappedState, StateDelta<'static>>,
+        related_contracts: RelatedContracts<'static>,
+        code: Option<ContractContainer>,
+    ) -> impl Future<Output = Result<UpsertOutcome, ExecutorError>> + Send {
+        async move {
+            self.upsert_contract_state(key, update, related_contracts, code)
+                .await
+                .map(UpsertOutcome::Completed)
+        }
+    }
 
     fn register_contract_notifier(
         &mut self,
@@ -527,6 +641,17 @@ pub(crate) trait ContractExecutor: Send + 'static {
     /// notifications. Returns `None` for mock/test executors.
     /// This can only be called once — subsequent calls return `None`.
     fn take_delegate_notification_rx(&mut self) -> Option<DelegateNotificationReceiver> {
+        None
+    }
+
+    /// Clone the executor's [`OpManager`] handle, if it has one.
+    ///
+    /// The `contract_handling` loop uses this to drive an off-loop related-
+    /// contract GET (via `start_sub_op_get`) when a PUT/UPDATE deferred its
+    /// network fetch (#4391): the loop cannot move the `&mut` executor into a
+    /// background task, but it can clone this `Arc<OpManager>` into one.
+    /// Returns `None` for local-only / mock executors with no network.
+    fn op_manager_handle(&self) -> Option<Arc<OpManager>> {
         None
     }
 }
