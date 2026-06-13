@@ -937,8 +937,17 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_send_stream_without_bandwidth_limit() -> Result<(), Box<dyn std::error::Error>> {
+    /// Run a single 10KB stream transfer with the given token-bucket
+    /// (burst capacity, rate bytes/s) and return the wall-clock duration plus
+    /// the number of packets the receiver observed.
+    ///
+    /// Shared between the rate-limited and unlimited measurements in
+    /// [`test_send_stream_without_bandwidth_limit`] so both paths run through
+    /// identical setup; only the token-bucket parameters differ.
+    async fn measure_stream_transfer(
+        burst_capacity: usize,
+        rate_bytes_per_sec: usize,
+    ) -> Result<(Duration, usize), Box<dyn std::error::Error>> {
         let (outbound_sender, mut outbound_receiver) = mpsc::channel(100);
         let destination_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1234));
         let key = Aes128Gcm::new_from_slice(&[0u8; 16])?;
@@ -948,13 +957,11 @@ mod tests {
         // Create a large message (10KB)
         let message = vec![0u8; 10_000];
 
-        // Use real time for integration testing without bandwidth limiting
         let time_source = RealTime::new();
         let sent_tracker = Arc::new(parking_lot::Mutex::new(
             SentPacketTracker::new_with_time_source(time_source.clone()),
         ));
 
-        // Initialize congestion controller and TokenBucket with very high rate (effectively unlimited)
         // Use large cwnd since unit tests don't simulate ACKs to reduce flightsize
         let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
             initial_cwnd: 1_000_000,
@@ -964,8 +971,8 @@ mod tests {
         })
         .build_arc();
         let token_bucket = Arc::new(TokenBucket::new_with_time_source(
-            100_000,       // 100 KB burst capacity
-            1_000_000_000, // 1 GB/s rate (effectively unlimited)
+            burst_capacity,
+            rate_bytes_per_sec,
             time_source.clone(),
         ));
 
@@ -1014,10 +1021,45 @@ mod tests {
         let expected_packets = message.len().div_ceil(MAX_DATA_SIZE);
         assert_eq!(packet_count, expected_packets);
 
-        // Without rate limiting, should complete very quickly (< 50ms)
+        Ok((elapsed, packet_count))
+    }
+
+    #[tokio::test]
+    async fn test_send_stream_without_bandwidth_limit() -> Result<(), Box<dyn std::error::Error>> {
+        // The unlimited path is bounded ABOVE by the rate-limited path, so we
+        // co-measure both transfers and assert a RATIO rather than an absolute
+        // wall-clock cap. An absolute cap (the old `< 50ms`) is inherently
+        // flaky: under CI/CPU pressure the same unthrottled transfer can take
+        // 60-70ms+ even though it is still far faster than a throttled one.
+        // Comparing the two measurements in the same process cancels out that
+        // shared scheduling noise.
+
+        // Rate-limited: 10KB over 100KB/s with a 1KB burst. The first 1KB goes
+        // out immediately, the remaining 9KB is paced at 100KB/s (~90ms).
+        let (limited_elapsed, _) = measure_stream_transfer(1_000, 100_000).await?;
+
+        // Unlimited: 100KB burst + 1GB/s rate means the token bucket never
+        // throttles; the transfer is bounded only by per-packet processing.
+        let (unlimited_elapsed, _) = measure_stream_transfer(100_000, 1_000_000_000).await?;
+
+        // Sanity floor: rate limiting must actually have an observable effect.
+        // Without this, a regression that silently disabled throttling could
+        // make both timings ~0 and still satisfy the ratio below.
         assert!(
-            elapsed.as_millis() < 50,
-            "Transfer took too long without rate limit: {elapsed:?}"
+            limited_elapsed.as_millis() >= 50,
+            "Rate-limited transfer completed too quickly to be a meaningful \
+             baseline: {limited_elapsed:?}"
+        );
+
+        // Core invariant: the unlimited transfer must be dramatically faster
+        // than the rate-limited one. Use a 4x safety margin so the assertion
+        // tolerates wide platform/scheduling variance while still failing if
+        // the unlimited path ever approaches rate-limited timings.
+        assert!(
+            unlimited_elapsed * 4 < limited_elapsed,
+            "Unlimited transfer ({unlimited_elapsed:?}) was not meaningfully \
+             faster than the rate-limited transfer ({limited_elapsed:?}); \
+             expected unlimited * 4 < rate-limited"
         );
 
         Ok(())
