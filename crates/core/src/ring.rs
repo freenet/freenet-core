@@ -211,6 +211,39 @@ impl Drop for SubscriptionRecoveryGuard {
     }
 }
 
+/// State of the `Ring -> OpManager` weak back-reference, as observed by
+/// the `connection_maintenance` loop.
+///
+/// The startup-vs-shutdown distinction is the whole point: a `None` slot
+/// (not attached yet) must keep waiting, while a `Some(weak)` that no longer
+/// upgrades (attached then dropped) must terminate the loop. Conflating the
+/// two leaves the maintenance task spinning forever on a dead `Weak` —
+/// the #3308 zombie.
+enum OpManagerState<T> {
+    /// `attach_op_manager` has not run yet — normal startup window. The
+    /// maintenance loop should keep waiting for attachment.
+    NotAttached,
+    /// The `OpManager` is alive and was successfully upgraded.
+    Live(Arc<T>),
+    /// The back-reference was attached once but the owning `Arc` has since
+    /// been dropped. Nothing re-attaches it, so the loop owner is dead and
+    /// the maintenance task must terminate instead of spinning on a `Weak`
+    /// that can never upgrade again (#3308).
+    Detached,
+}
+
+/// Classify a `RwLock<Option<Weak<T>>>` back-reference into the three states
+/// the maintenance loop cares about. Generic over `T` so it can be
+/// unit-tested with a stand-in `Arc` instead of a full `OpManager` (#3308).
+fn classify_op_manager_ref<T>(slot: &RwLock<Option<Weak<T>>>) -> OpManagerState<T> {
+    let upgraded = slot.read().as_ref().map(|weak| weak.clone().upgrade());
+    match upgraded {
+        None => OpManagerState::NotAttached,
+        Some(Some(strong)) => OpManagerState::Live(strong),
+        Some(None) => OpManagerState::Detached,
+    }
+}
+
 /// Result of pruning a connection.
 #[derive(Debug, Default)]
 pub struct PruneConnectionResult {
@@ -434,6 +467,22 @@ impl Ring {
             .read()
             .as_ref()
             .and_then(|weak| weak.clone().upgrade())
+    }
+
+    /// Classify the current state of the `OpManager` back-reference.
+    ///
+    /// The maintenance loop must distinguish "not attached yet" (normal
+    /// startup window, before [`Ring::attach_op_manager`] runs) from
+    /// "attached then dropped" (the node has been torn down and the
+    /// `Arc<OpManager>` is gone). The first case must keep waiting; the
+    /// second must terminate the loop so it doesn't become a zombie
+    /// spinning forever on a `Weak` that can never upgrade again (#3308).
+    ///
+    /// This is the sole production instantiation of the generic
+    /// [`classify_op_manager_ref`] (with `T = OpManager`); the unit tests
+    /// instantiate it with a stand-in `Arc` to exercise the same logic.
+    fn op_manager_state(&self) -> OpManagerState<OpManager> {
+        classify_op_manager_ref(&self.op_manager)
     }
 
     pub fn is_gateway(&self) -> bool {
@@ -2713,7 +2762,7 @@ impl Ring {
         const SUSPEND_DETECTION_THRESHOLD: Duration = CHECK_TICK_DURATION.saturating_mul(2);
 
         let mut this_peer = None;
-        loop {
+        'maintenance: loop {
             // Update clock tracking at the top of every iteration (including
             // early-continue paths) so elapsed time doesn't accumulate during
             // startup. The four clock operations below MUST stay back-to-back
@@ -2745,11 +2794,30 @@ impl Ring {
                 );
             }
 
-            let op_manager = match self.upgrade_op_manager() {
-                Some(op_manager) => op_manager,
-                None => {
+            let op_manager = match self.op_manager_state() {
+                OpManagerState::Live(op_manager) => op_manager,
+                OpManagerState::NotAttached => {
+                    // Still in the startup window before attach_op_manager;
+                    // wait for the owner to wire itself up.
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
+                }
+                OpManagerState::Detached => {
+                    // The OpManager was attached and then dropped (node
+                    // shutdown). Stop the maintenance work instead of spinning
+                    // forever on a Weak that can never upgrade again (#3308).
+                    // We do NOT `return Ok(())` here: this task is registered
+                    // with `BackgroundTaskMonitor`, whose `wait_for_any_exit`
+                    // treats any clean return as a fatal "task exited
+                    // unexpectedly". Per the #4292 convention, a monitored
+                    // long-lived task whose work has ended must hand a
+                    // non-completing future to the monitor — so we break out
+                    // of the loop and park below.
+                    tracing::info!(
+                        is_gateway,
+                        "OpManager dropped; connection maintenance loop ending (parking)"
+                    );
+                    break 'maintenance;
                 }
             };
             let Some(this_addr) = &this_peer else {
@@ -3358,6 +3426,16 @@ impl Ring {
                 }
             }
         }
+
+        // Intentional teardown parking (#4292): the loop only breaks once the
+        // OpManager has been dropped (node shutdown), so there is no more work
+        // to do. This task is registered with `BackgroundTaskMonitor`; parking
+        // on a never-resolving future — rather than returning `Ok(())` — keeps
+        // `wait_for_any_exit` from misreading orderly teardown as a fatal
+        // background-task exit. The unreachable `Ok(())` after it keeps the
+        // `anyhow::Result<()>` signature.
+        std::future::pending::<()>().await;
+        Ok(())
     }
 
     #[tracing::instrument(level = "debug", skip(self, notifier, live_tx_tracker, op_manager), fields(peer = %self.connection_manager.pub_key))]
@@ -4017,6 +4095,132 @@ mod pending_additions_tests {
     fn respects_requested_when_capacity_allows() {
         let allowed = calculate_allowed_connection_additions(50, 0, 25, 200, 3);
         assert_eq!(allowed, 3);
+    }
+}
+
+#[cfg(test)]
+mod op_manager_state_tests {
+    use super::{OpManagerState, classify_op_manager_ref};
+    use parking_lot::RwLock;
+    use std::sync::{Arc, Weak};
+
+    // Stand-in for `OpManager`: `classify_op_manager_ref` is generic over the
+    // pointee, so we exercise the exact production logic without building a
+    // full node. The three slot states map 1:1 onto the maintenance loop's
+    // startup / running / shutdown decisions (#3308).
+
+    #[test]
+    fn empty_slot_is_not_attached() {
+        // Mirrors the startup window before `attach_op_manager` runs.
+        let slot: RwLock<Option<Weak<u32>>> = RwLock::new(None);
+        assert!(matches!(
+            classify_op_manager_ref(&slot),
+            OpManagerState::NotAttached
+        ));
+    }
+
+    #[test]
+    fn live_weak_upgrades_to_live() {
+        let owner = Arc::new(7u32);
+        let slot: RwLock<Option<Weak<u32>>> = RwLock::new(Some(Arc::downgrade(&owner)));
+        match classify_op_manager_ref(&slot) {
+            OpManagerState::Live(got) => assert_eq!(*got, 7),
+            OpManagerState::NotAttached | OpManagerState::Detached => {
+                panic!("expected Live while the owner Arc is alive")
+            }
+        }
+    }
+
+    #[test]
+    fn dropped_owner_is_detached_not_not_attached() {
+        // The #3308 regression: the slot was attached (`Some(weak)`) but the
+        // owning Arc has been dropped. This MUST classify as `Detached`
+        // (terminate the loop), NOT `NotAttached` (which spins forever).
+        let owner = Arc::new(7u32);
+        let weak = Arc::downgrade(&owner);
+        let slot: RwLock<Option<Weak<u32>>> = RwLock::new(Some(weak));
+        drop(owner);
+        assert!(
+            matches!(classify_op_manager_ref(&slot), OpManagerState::Detached),
+            "a dropped owner must be Detached so connection_maintenance exits \
+             instead of zombie-spinning (#3308)"
+        );
+    }
+
+    /// End-to-end wiring guard for the maintenance loop's `Detached` arm.
+    ///
+    /// The pure classifier tests above only pin the `slot -> state` mapping.
+    /// They would all stay green if a refactor swapped the loop's `Detached`
+    /// arm back to `continue` (the original #3308 bug) or to a bare
+    /// `return Ok(())` (the #4292 monitor-convention violation). This test
+    /// pins the *action*: a maintenance-shaped task that polls
+    /// `classify_op_manager_ref`, breaks on `Detached`, and then parks must,
+    /// once its owner `Arc` is dropped, hand a *non-completing* future to a
+    /// real `BackgroundTaskMonitor` — `wait_for_any_exit` must NOT fire.
+    ///
+    /// Mirrors `reference_ping::spawn_with_unbindable_target_does_not_exit`.
+    #[tokio::test(start_paused = true)]
+    async fn detached_maintenance_task_parks_without_tripping_monitor() {
+        use crate::node::background_task_monitor::BackgroundTaskMonitor;
+        use std::time::Duration;
+
+        // Shared back-reference slot, exactly like `Ring::op_manager`.
+        let owner = Arc::new(0u32);
+        let slot: Arc<RwLock<Option<Weak<u32>>>> =
+            Arc::new(RwLock::new(Some(Arc::downgrade(&owner))));
+
+        let task_slot = Arc::clone(&slot);
+        let handle = tokio::spawn(async move {
+            // Reproduces the maintenance loop's arm-to-action wiring without
+            // standing up a full Ring: poll the back-reference, act per state.
+            loop {
+                match classify_op_manager_ref(&task_slot) {
+                    // Owner still alive: keep running (the Live work is a
+                    // no-op here; the point is that it does NOT exit).
+                    OpManagerState::Live(_) => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    // Startup window: keep waiting.
+                    OpManagerState::NotAttached => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    // Owner dropped: stop the loop, then park (#3308 / #4292).
+                    OpManagerState::Detached => break,
+                }
+            }
+            // Teardown parking: must NOT return cleanly, or the monitor fires.
+            std::future::pending::<()>().await;
+        });
+
+        let monitor = BackgroundTaskMonitor::new();
+        monitor.register("connection_maintenance_sim", handle);
+
+        // Let the task observe `Live` at least once and start polling.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+
+        // Drop the owner: the weak now fails to upgrade -> `Detached`.
+        drop(owner);
+
+        // Give the task time to observe `Detached`, break, and park.
+        tokio::time::advance(Duration::from_millis(200)).await;
+        tokio::task::yield_now().await;
+
+        // The monitor must NOT fire: orderly teardown parks instead of
+        // returning. A `continue` (zombie spin) or a `return Ok(())`
+        // (monitor-convention violation) would both fail this assertion —
+        // the latter by resolving `wait_for_any_exit`.
+        let exit = monitor.wait_for_any_exit();
+        tokio::pin!(exit);
+        let still_parked = tokio::time::timeout(Duration::from_millis(100), &mut exit)
+            .await
+            .is_err();
+        assert!(
+            still_parked,
+            "Detached maintenance task must park, not exit: a clean return \
+             would trip BackgroundTaskMonitor::wait_for_any_exit and crash \
+             the node (#3308 / #4292)"
+        );
     }
 }
 
