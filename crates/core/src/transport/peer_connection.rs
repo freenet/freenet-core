@@ -1352,13 +1352,18 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         {
                             Ok(_) => {
                                 // Refresh the packet's send timestamp to the actual
-                                // post-send instant. Since #4345, get_resend KEEPS the
+                                // post-send instant. Since #4345 get_resend KEEPS the
                                 // packet in the tracker across a resend, so this is an
-                                // idempotent in-place refresh (NOT a re-insert) that
-                                // preserves the packet's stream tag. Flight size is
-                                // unchanged: the packet never left flight (on_timeout did
-                                // not decrement), so neither on_send() nor a re-add runs.
-                                self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
+                                // in-place refresh — BUT only if the packet is still
+                                // tracked. A concurrent drop_stream (spawned abort task)
+                                // may have removed and released it while we were awaiting
+                                // send_to; refresh_sent_packet then no-ops instead of
+                                // resurrecting it as a Control zombie (which a later
+                                // ACK/abandon would double-release). When the packet IS
+                                // still tracked, flight size is unchanged: it never left
+                                // flight (on_timeout did not decrement), so no on_send /
+                                // re-add runs. See refresh_sent_packet's rustdoc.
+                                self.remote_conn.sent_tracker.lock().refresh_sent_packet(idx, packet, None);
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -1367,13 +1372,14 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                     error = %e,
                                     "Resend send failed, will retry on next RTO"
                                 );
-                                // The packet is still tracked (get_resend keeps it since
-                                // #4345), so RTO will retry it. This refresh is harmless;
-                                // we keep it so the send-time reflects this attempt.
+                                // Refresh only if still tracked — RTO then retries it.
+                                // If a concurrent drop_stream already removed it, this
+                                // no-ops (the stream is being torn down anyway), avoiding
+                                // a resurrected zombie. See refresh_sent_packet's rustdoc.
                                 self.remote_conn
                                     .sent_tracker
                                     .lock()
-                                    .report_sent_packet(idx, packet);
+                                    .refresh_sent_packet(idx, packet, None);
                                 break;
                             }
                         }

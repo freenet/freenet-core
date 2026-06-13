@@ -291,6 +291,55 @@ impl<T: TimeSource> SentPacketTracker<T> {
         self.report_sent_packet_inner(packet_id, payload, token, PacketStream::Stream(stream_id));
     }
 
+    /// Refresh an already-tracked packet's payload / send-time / token in place
+    /// after a resend, WITHOUT resurrecting it if it has been removed.
+    ///
+    /// Returns `true` if the packet was still tracked and was refreshed, `false`
+    /// if it had already left `pending_receipts` (ACKed, abandoned, or dropped by
+    /// [`Self::drop_stream`]) — in which case this is a no-op and `payload` is
+    /// dropped.
+    ///
+    /// # Why this exists (issue #4345 — resurrection-safety)
+    ///
+    /// The recv loop's resend cycle releases the tracker lock across the UDP
+    /// `send_to().await`, then re-registers the packet. A concurrent
+    /// `drop_stream` (from the spawned outbound-stream abort task) can remove the
+    /// packet in that window and release its bytes. If re-registration went
+    /// through an insert-on-absent path (`report_sent_packet_*`), it would
+    /// RESURRECT the packet as a `Control`-tagged zombie; a later ACK/abandon of
+    /// that zombie would then release its bytes a SECOND time (flight-size
+    /// under-count) and violate the "in `pending_receipts` iff in flight"
+    /// invariant. This method only ever UPDATES an existing entry, never inserts,
+    /// so a dropped packet stays dropped and its bytes are released exactly once.
+    ///
+    /// The recv loop MUST use this (not `report_sent_packet*`) for resend
+    /// re-registration. `report_sent_packet*` remain insert-capable for first
+    /// sends (and for test re-registration, which never races a `drop_stream`).
+    pub(super) fn refresh_sent_packet(
+        &mut self,
+        packet_id: PacketId,
+        payload: Box<[u8]>,
+        token: Option<DeliveryRateToken>,
+    ) -> bool {
+        let sent_time_nanos = self.time_source.now_nanos();
+        match self.pending_receipts.get_mut(&packet_id) {
+            Some(slot) => {
+                // In-place refresh. The packet is still tracked, still queued for
+                // resend (get_resend re-queued it), and its stream tag in
+                // `packet_streams` is untouched — so it is preserved across the
+                // resend. `payload` is the same bytes the caller just sent.
+                *slot = (payload, sent_time_nanos, token);
+                true
+            }
+            None => {
+                // Already removed (ACK / Abandon / drop_stream). Do NOT
+                // re-insert — that would resurrect a dropped packet and enable a
+                // double-release. Drop the payload and report the no-op.
+                false
+            }
+        }
+    }
+
     fn report_sent_packet_inner(
         &mut self,
         packet_id: PacketId,
@@ -300,19 +349,17 @@ impl<T: TimeSource> SentPacketTracker<T> {
     ) {
         let sent_time_nanos = self.time_source.now_nanos();
 
-        // Resend re-registration (issue #4345): since `get_resend` now KEEPS a
-        // resent packet in `pending_receipts`, a re-register for an
-        // already-tracked packet is an idempotent in-place refresh — update the
-        // payload / send-time / token, do NOT push a duplicate resend-queue
-        // entry, and do NOT bump `total_packets_sent`. The stream tag is
-        // preserved (the existing entry's tag stays); the `stream` argument from
-        // a `Control`-default re-register is intentionally ignored so a resent
-        // stream fragment keeps its stream. (First sends never hit this branch
-        // because packet ids are monotonic per connection.)
+        // NOTE (issue #4345 resurrection-safety): production resend
+        // re-registration does NOT come through here — the recv loop uses
+        // `refresh_sent_packet`, which never inserts, so a packet removed by a
+        // concurrent `drop_stream` cannot be resurrected. This insert-or-refresh
+        // path serves first sends (packet_sending / handshake) and test
+        // re-registration (which never races a `drop_stream`). The refresh
+        // branch keeps an already-present re-register idempotent (no duplicate
+        // resend-queue entry, no `total_packets_sent` bump, stream tag
+        // preserved); the `stream` argument is ignored when the entry exists.
         if let Some(slot) = self.pending_receipts.get_mut(&packet_id) {
             *slot = (payload, sent_time_nanos, token);
-            // packet_streams entry already exists and is left untouched so the
-            // owning stream is preserved across resends.
             return;
         }
 
@@ -398,6 +445,16 @@ impl<T: TimeSource> SentPacketTracker<T> {
             .retain(|entry| !dropped.contains(&entry.packet_id));
 
         released_bytes
+    }
+
+    /// Whether `packet_id` is currently tracked (present in `pending_receipts`,
+    /// i.e. in flight). Used by the mid-send-failure abort sites to
+    /// `debug_assert` that a packet whose send failed was never registered
+    /// before they explicitly release its `on_send` bytes (issue #4345) — which
+    /// would otherwise double-release if a future multi-packet send path
+    /// registered the packet and then failed.
+    pub(super) fn contains_packet(&self, packet_id: PacketId) -> bool {
+        self.pending_receipts.contains_key(&packet_id)
     }
 
     /// Reports that receipts have been received for the given packet IDs.
@@ -2320,6 +2377,114 @@ pub(in crate::transport) mod tests {
         assert!(
             ack_info.is_empty(),
             "a late ACK after the gap-drop must not release bytes again"
+        );
+    }
+
+    /// MUST-FIX regression (issue #4345, stage-2 review): the MIRROR of the
+    /// resend-gap test. The recv loop's resend re-registration, when it runs
+    /// AFTER a concurrent `drop_stream` already removed and released the packet,
+    /// must NOT resurrect it — otherwise a later ACK/abandon of the resurrected
+    /// "zombie" releases its bytes a SECOND time (flight-size under-count) and
+    /// breaks the "in pending_receipts iff in flight" invariant.
+    ///
+    /// Models the race tail: get_resend hands the packet out, the abort task
+    /// runs drop_stream (releases the bytes once), THEN the recv loop resumes and
+    /// re-registers via `refresh_sent_packet` — which must be a no-op because the
+    /// entry is gone.
+    ///
+    /// Asserts (a) the packet is NOT resurrected into any tracking structure, and
+    /// (b) a later ACK and a later abandon attempt each release ZERO.
+    ///
+    /// This FAILS without the fix: the old recv-loop path called
+    /// `report_sent_packet`, whose insert-on-absent branch resurrects the packet
+    /// as a `Control` zombie (see `test_report_sent_packet_resurrects_*` which
+    /// pins that footgun). `refresh_sent_packet` closes it.
+    #[test]
+    fn test_refresh_after_drop_stream_does_not_resurrect() {
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+
+        tracker.report_sent_stream_packet(1, vec![0u8; 13].into(), None, stream);
+
+        // get_resend hands the packet out for resend (recv loop now "awaiting
+        // send_to"). Capture the payload as the recv loop would.
+        tracker.time_source.advance(tracker.effective_rto());
+        let resent_payload = match tracker.get_resend() {
+            ResendAction::Resend(id, packet) => {
+                assert_eq!(id, 1);
+                packet
+            }
+            other => panic!("expected Resend, got {other:?}"),
+        };
+
+        // Concurrent abort task drops the stream — releases the 13 bytes ONCE.
+        assert_eq!(tracker.drop_stream(stream), 13);
+        assert!(!tracker.pending_receipts.contains_key(&1));
+
+        // recv loop resumes and re-registers via the production path. Must no-op.
+        let refreshed = tracker.refresh_sent_packet(1, resent_payload, None);
+        assert!(
+            !refreshed,
+            "refresh_sent_packet must report no-op for a dropped packet"
+        );
+
+        // (a) NOT resurrected into any structure.
+        assert!(
+            !tracker.pending_receipts.contains_key(&1),
+            "dropped packet must NOT be resurrected into pending_receipts"
+        );
+        assert!(!tracker.packet_streams.contains_key(&1));
+        assert!(!tracker.retransmit_counts.contains_key(&1));
+
+        // (b1) A later ACK releases ZERO (no ack-info entry → caller decrements
+        // nothing).
+        let (ack_info, _) = tracker.report_received_receipts(&[1]);
+        assert!(
+            ack_info.is_empty(),
+            "ACK of a dropped-then-refreshed packet must release zero bytes; got {ack_info:?}"
+        );
+
+        // (b2) A later abandon attempt also releases ZERO: the packet is absent
+        // from the resend queue / pending, so get_resend never emits Abandon for
+        // it no matter how long we wait.
+        for _ in 0..(MAX_PACKET_RETRANSMITS + 5) {
+            tracker.time_source.advance(Duration::from_secs(120));
+            match tracker.get_resend() {
+                ResendAction::WaitUntil(_) => {}
+                other => panic!(
+                    "dropped packet must never resend/abandon after refresh no-op; got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// Pins the FOOTGUN that `refresh_sent_packet` exists to avoid: the
+    /// insert-capable `report_sent_packet` DOES resurrect a dropped packet. This
+    /// documents why the recv loop must NOT use `report_sent_packet` for resend
+    /// re-registration (issue #4345 stage-2 review). It is the "without the fix"
+    /// behavior, asserted directly so a future refactor that points the recv loop
+    /// back at `report_sent_packet` is caught by `test_refresh_after_drop_stream_
+    /// does_not_resurrect` failing.
+    #[test]
+    fn test_report_sent_packet_resurrects_dropped_packet_footgun() {
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+        tracker.report_sent_stream_packet(1, vec![0u8; 13].into(), None, stream);
+        assert_eq!(tracker.drop_stream(stream), 13);
+
+        // The insert-on-absent path resurrects the packet (as Control) — exactly
+        // the bug. refresh_sent_packet is what the production recv loop uses to
+        // avoid this; report_sent_packet remains insert-capable for first sends.
+        tracker.report_sent_packet(1, vec![0u8; 13].into());
+        assert!(
+            tracker.pending_receipts.contains_key(&1),
+            "report_sent_packet IS insert-capable (resurrects) — this is why the \
+             recv loop must use refresh_sent_packet instead"
+        );
+        assert_eq!(
+            tracker.packet_streams.get(&1),
+            Some(&PacketStream::Control),
+            "the resurrected packet is mis-tagged Control (the double-release footgun)"
         );
     }
 }

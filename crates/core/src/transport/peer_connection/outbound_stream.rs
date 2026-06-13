@@ -352,6 +352,22 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             //     just above (`on_send_with_token`) but the send failed, so the
             //     packet was never registered in the tracker — drop_stream can't
             //     see it. Release packet_size explicitly so those bytes don't leak.
+            //
+            // CORRECTNESS GUARD: step (2) is correct ONLY because a failed send
+            // never registers the packet. `packet_sending` registers per
+            // successfully-sent packet; with the empty `confirm_receipt` used
+            // here it takes the single-packet path, so a send error means ZERO
+            // registrations and drop_stream cannot have already released this
+            // packet_id. If a future caller passes non-empty receipts (multi-
+            // packet path) some sub-packets could register before a later one
+            // fails — then drop_stream would release them AND this explicit call
+            // would double-count. The debug_assert pins the invariant so that
+            // change trips tests.
+            debug_assert!(
+                !sent_packet_tracker.lock().contains_packet(packet_id),
+                "mid-send failure: failed packet {packet_id} must be absent from \
+                 the tracker before explicit release (else double-release, #4345)"
+            );
             release_aborted_stream_flightsize(
                 stream_id,
                 sent_packet_tracker.as_ref(),
@@ -721,6 +737,19 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
             // already-forwarded tracked fragments, plus packet_size for the
             // CURRENT fragment whose on_send bytes were added just above but
             // whose send failed (so it was never registered in the tracker).
+            //
+            // CORRECTNESS GUARD (same as send_stream's mid-send site): the
+            // explicit packet_size release is correct ONLY because a failed send
+            // never registers the packet — the empty `confirm_receipt` here
+            // forces the single-packet path, so a send error means ZERO
+            // registrations and drop_stream cannot have already released this
+            // packet_id. A future multi-packet wiring would break this; the
+            // debug_assert pins the invariant.
+            debug_assert!(
+                !sent_packet_tracker.lock().contains_packet(packet_id),
+                "mid-send failure: failed packet {packet_id} must be absent from \
+                 the tracker before explicit release (else double-release, #4345)"
+            );
             release_aborted_stream_flightsize(
                 outbound_stream_id,
                 sent_packet_tracker.as_ref(),
@@ -1590,6 +1619,7 @@ mod tests {
         ));
 
         let (completion_tx, completion_rx) = oneshot::channel();
+        let cc_handle = congestion_controller.clone();
         let background_task = GlobalExecutor::spawn(send_stream(
             StreamId::next(),
             Arc::new(AtomicU32::new(0)),
@@ -1614,6 +1644,90 @@ mod tests {
             completion_rx.await,
             Ok(crate::transport::BroadcastDeliveryOutcome::Dropped),
             "a mid-flight send failure MUST signal Dropped (#4235)"
+        );
+        // #4345 mid-send-failure release: the first fragment's on_send bytes were
+        // added to flight size, then its send failed (so it was NEVER registered
+        // in the tracker). The mid-send error path must release exactly those
+        // bytes — once, via the explicit release_flightsize(packet_size) — so
+        // flight size returns to 0. A double-release would saturate to 0 too, but
+        // a future multi-packet wiring (non-empty confirm_receipt) could register
+        // a packet AND hit this path, so the dedicated single-packet guard at the
+        // call site (debug_assert) protects against that; here we pin the net-0.
+        assert_eq!(
+            cc_handle.flightsize(),
+            0,
+            "send_stream mid-send failure must release the failed fragment's bytes (net 0)"
+        );
+        Ok(())
+    }
+
+    /// #4345 mid-send-failure release for the PIPE path (outbound_stream.rs:692).
+    /// Mirror of `send_stream_failure_signals_dropped`'s flight-size assertion
+    /// but driving `pipe_stream`: a fragment is buffered, the socket fails on
+    /// send, and the mid-send error path must release the failed fragment's
+    /// on_send bytes exactly once so flight size returns to 0.
+    #[tokio::test]
+    async fn pipe_stream_mid_send_failure_releases_flightsize()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::transport::peer_connection::streaming::StreamHandle;
+
+        let (outbound_sender, outbound_receiver) = mpsc::channel(1);
+        // Drop the receiver so TestSocket::send_to returns ConnectionAborted on
+        // the first send — the mid-send error path runs.
+        drop(outbound_receiver);
+
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let cipher = {
+            let mut key = [0u8; 16];
+            crate::config::GlobalRng::fill_bytes(&mut key);
+            Aes128Gcm::new(&key.into())
+        };
+
+        let time_source = RealTime::new();
+
+        // One buffered fragment (<= FRAGMENT_PAYLOAD_SIZE, 1130 bytes).
+        let stream_id = StreamId::next();
+        let handle = StreamHandle::new(stream_id, 1000);
+        handle
+            .push_fragment(1, Bytes::from(vec![0u8; 1000]))
+            .unwrap();
+
+        // Large cwnd so the cwnd wait passes immediately and we reach
+        // packet_sending (which then fails on the dead socket).
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1_000_000,
+            min_cwnd: 1_000_000,
+            max_cwnd: 1_000_000_000,
+            ..Default::default()
+        })
+        .build_arc();
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+        let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
+
+        let cc_handle = congestion_controller.clone();
+        let pipe_task = GlobalExecutor::spawn(pipe_stream(
+            handle,
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            cipher,
+            sent_tracker,
+            token_bucket,
+            congestion_controller,
+            time_source,
+            None,
+        ));
+
+        let result = pipe_task.await.expect("join error");
+        assert!(
+            result.is_err(),
+            "pipe_stream should fail when the socket is closed: {result:?}"
+        );
+        assert_eq!(
+            cc_handle.flightsize(),
+            0,
+            "pipe_stream mid-send failure must release the failed fragment's bytes (net 0)"
         );
         Ok(())
     }
@@ -1752,6 +1866,7 @@ mod tests {
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
         let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
 
+        let cc_handle = congestion_controller.clone();
         let pipe_task = GlobalExecutor::spawn(pipe_stream(
             handle,
             StreamId::next(),
@@ -1771,6 +1886,14 @@ mod tests {
             matches!(result, Err(TransportError::OutboundStreamFailed(_))),
             "Expected OutboundStreamFailed after pipe_stream cwnd wait timeout, got: {:?}",
             result
+        );
+        // #4345: the abort must leave flight size released. Here a 1-byte cwnd
+        // means no fragment ever went out, so this guards that the abort's
+        // drop_stream is a clean no-op (0) rather than mis-releasing or panicking.
+        assert_eq!(
+            cc_handle.flightsize(),
+            0,
+            "pipe_stream cwnd-wait abort must leave flight size at 0"
         );
 
         Ok(())
@@ -1813,6 +1936,7 @@ mod tests {
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
         let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
 
+        let cc_handle = congestion_controller.clone();
         let pipe_task = GlobalExecutor::spawn(pipe_stream(
             handle,
             StreamId::next(),
@@ -1843,6 +1967,13 @@ mod tests {
         assert!(
             err.is_transient_send_failure(),
             "inactivity stall must be classified transient so the connection survives: {err:?}"
+        );
+        // #4345: the stall fires before any fragment is sent, so the abort's
+        // drop_stream is a clean no-op and flight size stays 0.
+        assert_eq!(
+            cc_handle.flightsize(),
+            0,
+            "pipe_stream inactivity-stall abort must leave flight size at 0"
         );
 
         Ok(())
@@ -1887,6 +2018,7 @@ mod tests {
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
         let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
 
+        let cc_handle = congestion_controller.clone();
         let pipe_task = GlobalExecutor::spawn(pipe_stream(
             handle,
             StreamId::next(),
@@ -1917,6 +2049,13 @@ mod tests {
         assert!(
             err.is_transient_send_failure(),
             "inbound error must be classified transient so the connection survives: {err:?}"
+        );
+        // #4345: the inbound error fires before any fragment is sent, so the
+        // abort's drop_stream is a clean no-op and flight size stays 0.
+        assert_eq!(
+            cc_handle.flightsize(),
+            0,
+            "pipe_stream inbound-error abort must leave flight size at 0"
         );
 
         Ok(())
