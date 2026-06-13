@@ -1878,4 +1878,330 @@ pub(in crate::transport) mod tests {
              (no double release of flight size); got {ack_info:?}"
         );
     }
+
+    // =========================================================================
+    // Tests for drop_stream (issue #4345, stage 1)
+    // =========================================================================
+    //
+    // drop_stream releases the in-flight bytes of an aborted outbound stream in
+    // one shot. The defining safety property is NO DOUBLE-DECREMENT: after a
+    // stream's packets are dropped, no later ACK or abandon may release their
+    // bytes a second time. These tests pin both the exact byte total and the
+    // absence of any second release path.
+
+    /// Drive the tracker through RTOs (re-registering each resent packet, as the
+    /// production recv loop does) until `packet_id` is abandoned. Any OTHER
+    /// packet that resends is re-registered too; if any other packet is
+    /// abandoned first the helper panics, since callers rely on the target being
+    /// the one that ages out.
+    fn drive_to_abandon(tracker: &mut SentPacketTracker<VirtualTime>, packet_id: PacketId) {
+        for _ in 0..1000 {
+            tracker.time_source.advance(Duration::from_secs(120));
+            match tracker.get_resend() {
+                ResendAction::Resend(id, packet) => {
+                    // Re-register exactly as the production recv loop does. The
+                    // Control-default path must preserve a stream packet's tag.
+                    tracker.report_sent_packet(id, packet);
+                }
+                ResendAction::Abandon { packet_id: id, .. } => {
+                    assert_eq!(
+                        id, packet_id,
+                        "an unexpected packet ({id}) abandoned before the target ({packet_id})"
+                    );
+                    return;
+                }
+                ResendAction::TlpProbe(..) | ResendAction::WaitUntil(_) => {}
+            }
+        }
+        panic!("packet {packet_id} was never abandoned");
+    }
+
+    /// drop_stream returns the EXACT byte total of the dropped stream's packets
+    /// and removes them from every tracking structure.
+    #[test]
+    fn test_drop_stream_returns_exact_byte_total() {
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+
+        // Three fragments of distinct sizes: 3 + 5 + 7 = 15 bytes.
+        tracker.report_sent_stream_packet(1, vec![0u8; 3].into(), None, stream);
+        tracker.report_sent_stream_packet(2, vec![0u8; 5].into(), None, stream);
+        tracker.report_sent_stream_packet(3, vec![0u8; 7].into(), None, stream);
+
+        let released = tracker.drop_stream(stream);
+        assert_eq!(
+            released, 15,
+            "must return the sum of dropped payload lengths"
+        );
+
+        // Every tracking structure is now empty for those packets.
+        assert!(tracker.pending_receipts.is_empty());
+        assert!(tracker.packet_streams.is_empty());
+        assert!(tracker.retransmit_counts.is_empty());
+        // resend_queue entries for the dropped packets are gone.
+        assert!(
+            tracker.resend_queue.is_empty(),
+            "dropped packets must be purged from the resend queue"
+        );
+    }
+
+    /// After drop_stream, a later ACK for a dropped packet does NOT produce an
+    /// ack entry — so the caller never subtracts its bytes from flight size a
+    /// second time (no double-credit on the ACK path).
+    #[test]
+    fn test_drop_stream_then_ack_is_noop() {
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+
+        tracker.report_sent_stream_packet(10, vec![1, 2, 3, 4].into(), None, stream);
+        tracker.report_sent_stream_packet(11, vec![5, 6].into(), None, stream);
+
+        let released = tracker.drop_stream(stream);
+        assert_eq!(released, 6);
+
+        // A late ACK for both dropped packets must yield NO ack-info entries.
+        let (ack_info, _) = tracker.report_received_receipts(&[10, 11]);
+        assert!(
+            ack_info.is_empty(),
+            "issue #4345: ACK after drop_stream must not release bytes again; got {ack_info:?}"
+        );
+    }
+
+    /// After drop_stream, a dropped packet can never reach the Abandon path
+    /// (get_resend skips ids absent from pending_receipts), so abandonment can
+    /// not release its bytes a second time (no double-credit on the abandon
+    /// path).
+    #[test]
+    fn test_drop_stream_then_abandon_path_is_noop() {
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+
+        tracker.report_sent_stream_packet(20, vec![0u8; 8].into(), None, stream);
+
+        let released = tracker.drop_stream(stream);
+        assert_eq!(released, 8);
+
+        // The dropped packet is gone from pending_receipts, so get_resend never
+        // re-emits it (no Resend, no Abandon) no matter how long we wait.
+        for _ in 0..(MAX_PACKET_RETRANSMITS + 5) {
+            tracker.time_source.advance(Duration::from_secs(120));
+            match tracker.get_resend() {
+                ResendAction::WaitUntil(_) => {}
+                other => {
+                    panic!("issue #4345: a dropped packet must never resend/abandon; got {other:?}")
+                }
+            }
+        }
+    }
+
+    /// Interleaving: dropping stream A leaves stream B's accounting fully
+    /// intact — B's bytes are still pending, still ACKable, and B's byte total
+    /// is unaffected by A's drop.
+    #[test]
+    fn test_drop_stream_leaves_other_stream_intact() {
+        let mut tracker = mock_sent_packet_tracker();
+        let stream_a = StreamId::next();
+        let stream_b = StreamId::next();
+
+        // Interleave A and B packets in send order.
+        tracker.report_sent_stream_packet(1, vec![0u8; 3].into(), None, stream_a);
+        tracker.report_sent_stream_packet(2, vec![0u8; 100].into(), None, stream_b);
+        tracker.report_sent_stream_packet(3, vec![0u8; 3].into(), None, stream_a);
+        tracker.report_sent_stream_packet(4, vec![0u8; 200].into(), None, stream_b);
+
+        // Dropping A releases only A's 6 bytes.
+        assert_eq!(tracker.drop_stream(stream_a), 6);
+
+        // B's two packets are untouched.
+        assert!(tracker.pending_receipts.contains_key(&2));
+        assert!(tracker.pending_receipts.contains_key(&4));
+        assert_eq!(
+            tracker.packet_streams.get(&2),
+            Some(&PacketStream::Stream(stream_b))
+        );
+        assert_eq!(
+            tracker.packet_streams.get(&4),
+            Some(&PacketStream::Stream(stream_b))
+        );
+        // A's packets are gone.
+        assert!(!tracker.pending_receipts.contains_key(&1));
+        assert!(!tracker.pending_receipts.contains_key(&3));
+
+        // B can still be ACKed normally and reports its full size.
+        let (ack_info, _) = tracker.report_received_receipts(&[2, 4]);
+        let acked_bytes: usize = ack_info.iter().map(|(_, size, _)| *size).sum();
+        assert_eq!(
+            acked_bytes, 300,
+            "stream B's bytes must still be ACK-creditable"
+        );
+
+        // Dropping B now releases exactly B's 300 bytes (nothing double-counted).
+        assert_eq!(
+            tracker.drop_stream(stream_b),
+            0,
+            "stream B was already fully ACKed, so nothing left to release"
+        );
+    }
+
+    /// Dropping a stream does NOT touch control (non-stream) packets that share
+    /// the connection.
+    #[test]
+    fn test_drop_stream_leaves_control_packets_intact() {
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+
+        // A control packet (e.g. a NoOp/handshake) and a stream fragment.
+        tracker.report_sent_packet(1, vec![0u8; 50].into()); // Control (default)
+        tracker.report_sent_stream_packet(2, vec![0u8; 9].into(), None, stream);
+
+        assert_eq!(tracker.drop_stream(stream), 9);
+
+        // The control packet survives and is still ACKable.
+        assert!(tracker.pending_receipts.contains_key(&1));
+        assert_eq!(tracker.packet_streams.get(&1), Some(&PacketStream::Control));
+        let (ack_info, _) = tracker.report_received_receipts(&[1]);
+        assert_eq!(ack_info.len(), 1);
+        assert_eq!(ack_info[0].1, 50);
+    }
+
+    /// Empty / unknown stream id → returns 0, no panic. Also covers a stream
+    /// whose packets were all already ACKed (drained).
+    #[test]
+    fn test_drop_stream_unknown_or_drained_returns_zero() {
+        let mut tracker = mock_sent_packet_tracker();
+
+        // Never-seen stream → 0.
+        assert_eq!(tracker.drop_stream(StreamId::next()), 0);
+
+        // A stream whose only packet was already ACKed → 0 (already drained).
+        let stream = StreamId::next();
+        tracker.report_sent_stream_packet(1, vec![0u8; 5].into(), None, stream);
+        tracker.report_received_receipts(&[1]);
+        assert_eq!(
+            tracker.drop_stream(stream),
+            0,
+            "a fully-ACKed stream has no bytes left to release"
+        );
+
+        // Dropping again is still a no-op (idempotent, no panic).
+        assert_eq!(tracker.drop_stream(stream), 0);
+    }
+
+    /// Boundary: a single-packet stream releases exactly that packet's bytes.
+    #[test]
+    fn test_drop_stream_single_packet() {
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+        tracker.report_sent_stream_packet(1, vec![0u8; 42].into(), None, stream);
+        assert_eq!(tracker.drop_stream(stream), 42);
+        assert!(tracker.pending_receipts.is_empty());
+        assert!(tracker.packet_streams.is_empty());
+    }
+
+    /// Boundary: many packets in one stream are all released in a single call.
+    #[test]
+    fn test_drop_stream_many_packets() {
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+        let n = 500u32;
+        let per_packet = 4usize;
+        for id in 0..n {
+            tracker.report_sent_stream_packet(id, vec![0u8; per_packet].into(), None, stream);
+        }
+        assert_eq!(
+            tracker.drop_stream(stream),
+            (n as u64) * (per_packet as u64)
+        );
+        assert!(tracker.pending_receipts.is_empty());
+        assert!(tracker.packet_streams.is_empty());
+        assert!(tracker.resend_queue.is_empty());
+    }
+
+    /// drop_stream sweeps packets that have already been retransmitted (so their
+    /// resend-queue entry was re-pushed and their Karn/retransmit/TLP state is
+    /// populated) as well as fresh pending packets — i.e. packets in BOTH the
+    /// pending set and the resend machinery.
+    #[test]
+    fn test_drop_stream_sweeps_retransmitted_and_pending() {
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+
+        // Packet 1: send, let it RTO once, and re-register (as the recv loop
+        // does). The resend re-registration goes through report_sent_packet,
+        // which must PRESERVE the stream tag.
+        tracker.report_sent_stream_packet(1, vec![0u8; 10].into(), None, stream);
+        tracker.time_source.advance(Duration::from_secs(2));
+        match tracker.get_resend() {
+            ResendAction::Resend(id, packet) => {
+                assert_eq!(id, 1);
+                // Re-register exactly as production does (Control-default path),
+                // which must keep packet 1 tagged with `stream`.
+                tracker.report_sent_packet(id, packet);
+            }
+            other => panic!("expected Resend for packet 1, got {other:?}"),
+        }
+        assert_eq!(
+            tracker.packet_streams.get(&1),
+            Some(&PacketStream::Stream(stream)),
+            "resend re-registration must preserve the stream tag"
+        );
+        assert!(tracker.retransmitted_packets.contains(&1));
+
+        // Packet 2: fresh, never retransmitted.
+        tracker.report_sent_stream_packet(2, vec![0u8; 20].into(), None, stream);
+
+        // Drop the stream: both the retransmitted packet 1 and the fresh
+        // packet 2 are released, 10 + 20 = 30 bytes.
+        assert_eq!(tracker.drop_stream(stream), 30);
+        assert!(tracker.pending_receipts.is_empty());
+        assert!(tracker.packet_streams.is_empty());
+        assert!(
+            tracker.retransmitted_packets.is_empty(),
+            "retransmitted-packet state for dropped packets must be cleared"
+        );
+        assert!(tracker.retransmit_counts.is_empty());
+    }
+
+    /// A packet that was ABANDONED (its bytes already released via the Abandon
+    /// action) is gone from tracking, so a subsequent drop_stream of its stream
+    /// must NOT release those bytes again — the abandon and drop_stream paths
+    /// don't double-credit each other.
+    #[test]
+    fn test_drop_stream_does_not_double_release_abandoned_packet() {
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+
+        // Abandon packet 1 first (its 4 bytes are released by the Abandon
+        // action). Sending packet 2 only AFTER abandonment keeps it out of the
+        // shared RTO timeline, so the only abandonment is packet 1's.
+        tracker.report_sent_stream_packet(1, vec![0u8; 4].into(), None, stream);
+        drive_to_abandon(&mut tracker, 1);
+
+        // Packet 1 is gone from tracking after abandonment.
+        assert!(!tracker.packet_streams.contains_key(&1));
+        assert!(!tracker.pending_receipts.contains_key(&1));
+
+        // Now a fresh fragment of the SAME stream is still in flight.
+        tracker.report_sent_stream_packet(2, vec![0u8; 6].into(), None, stream);
+
+        // drop_stream now releases ONLY packet 2's 6 bytes, NOT packet 1's
+        // already-released 4 bytes.
+        assert_eq!(
+            tracker.drop_stream(stream),
+            6,
+            "issue #4345: drop_stream must not re-release bytes already released by Abandon"
+        );
+    }
+
+    /// Saturating-arithmetic / zero correctness: dropping a stream whose only
+    /// packet is empty returns 0 and removes the packet (no panic, no underflow).
+    #[test]
+    fn test_drop_stream_zero_length_packet() {
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+        tracker.report_sent_stream_packet(1, Box::from(&[][..]), None, stream);
+        assert_eq!(tracker.drop_stream(stream), 0);
+        assert!(tracker.pending_receipts.is_empty());
+        assert!(tracker.packet_streams.is_empty());
+    }
 }
