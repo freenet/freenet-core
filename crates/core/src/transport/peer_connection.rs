@@ -1351,9 +1351,13 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             .await
                         {
                             Ok(_) => {
-                                // Re-register packet for ACK/RTO tracking. Flight size is
-                                // unchanged: the packet never left flight (on_timeout did not
-                                // decrement), so neither on_send() nor a re-add is called.
+                                // Refresh the packet's send timestamp to the actual
+                                // post-send instant. Since #4345, get_resend KEEPS the
+                                // packet in the tracker across a resend, so this is an
+                                // idempotent in-place refresh (NOT a re-insert) that
+                                // preserves the packet's stream tag. Flight size is
+                                // unchanged: the packet never left flight (on_timeout did
+                                // not decrement), so neither on_send() nor a re-add runs.
                                 self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
                             }
                             Err(e) => {
@@ -1363,9 +1367,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                     error = %e,
                                     "Resend send failed, will retry on next RTO"
                                 );
-                                // Re-insert packet so RTO will retry it. Without this,
-                                // the packet would be permanently lost from tracking since
-                                // resend_check() already removed it.
+                                // The packet is still tracked (get_resend keeps it since
+                                // #4345), so RTO will retry it. This refresh is harmless;
+                                // we keep it so the send-time reflects this attempt.
                                 self.remote_conn
                                     .sent_tracker
                                     .lock()

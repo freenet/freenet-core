@@ -36,6 +36,47 @@ use super::streaming::StreamHandle;
 /// to fail and report before the receiver's inactivity timeout fires.
 const CWND_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Release the in-flight bytes of an aborting outbound stream from the
+/// connection's flight size (issue #4345).
+///
+/// When a stream aborts (cwnd-wait timeout, upstream stall/error, or a mid-send
+/// `packet_sending` failure) its already-sent, unacked fragments are still
+/// counted in the connection-wide flight size. Without this they stay pinned
+/// until each fragment is independently ACKed or ages out via
+/// `MAX_PACKET_RETRANSMITS` (~6s) — and FixedRate's loss-pause caps cwnd at the
+/// frozen flight size, so a single aborted stream starves every subsequent
+/// stream on the connection (the #4345 symptom). `drop_stream` removes the
+/// stream's packets from the tracker and returns their exact byte total, which
+/// we hand to `release_flightsize` so the next stream sees an open cwnd.
+///
+/// # Locking
+///
+/// Mirrors the ACK path's ordering (`peer_connection.rs`): the tracker lock is
+/// dropped BEFORE calling into the congestion controller, so the tracker mutex
+/// is never held across a `release_flightsize` call (and never across an
+/// `.await` — neither call awaits). This avoids any tracker↔controller
+/// lock-ordering hazard.
+///
+/// Idempotent and cheap on the common path: a stream with no in-flight packets
+/// (already fully ACKed, or zero fragments sent) drops nothing and releases 0.
+fn release_aborted_stream_flightsize<T: TimeSource>(
+    stream_id: StreamId,
+    sent_packet_tracker: &parking_lot::Mutex<SentPacketTracker<T>>,
+    congestion_controller: &CongestionController<T>,
+) {
+    let released = sent_packet_tracker.lock().drop_stream(stream_id);
+    if released > 0 {
+        // u64 -> usize: a connection's in-flight bytes never approach usize::MAX
+        // on any supported platform; saturate defensively rather than wrap.
+        congestion_controller.release_flightsize(released.min(usize::MAX as u64) as usize);
+        tracing::debug!(
+            stream_id = %stream_id.0,
+            released_bytes = released,
+            "Released aborted stream's in-flight bytes from flight size (#4345)"
+        );
+    }
+}
+
 // Compile-time guard: sender must fail before receiver so the failure is diagnostic.
 const _: () = assert!(
     CWND_WAIT_TIMEOUT.as_secs() < super::streaming::STREAM_INACTIVITY_TIMEOUT.as_secs(),
@@ -183,6 +224,14 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                 // multiplexed on it. The op layer times out and retries against
                 // another candidate; the idle timeout decides connection liveness.
                 //
+                // Release this stream's already-sent in-flight bytes so the
+                // frozen flight size doesn't starve the next stream (#4345).
+                release_aborted_stream_flightsize(
+                    stream_id,
+                    sent_packet_tracker.as_ref(),
+                    congestion_controller.as_ref(),
+                );
+                //
                 // NOTE: `completion_tx` is intentionally NOT signaled here — it
                 // is dropped by this early return. broadcast_queue awaits it with
                 // a timeout and treats the resulting oneshot RecvError as a
@@ -297,6 +346,18 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                 elapsed.as_millis() as u64,
                 TransferDirection::Send,
             );
+            // Release this stream's in-flight bytes (#4345). Two parts:
+            // (1) drop_stream releases the already-sent, tracked fragments;
+            // (2) the CURRENT fragment's on_send bytes were added to flight size
+            //     just above (`on_send_with_token`) but the send failed, so the
+            //     packet was never registered in the tracker — drop_stream can't
+            //     see it. Release packet_size explicitly so those bytes don't leak.
+            release_aborted_stream_flightsize(
+                stream_id,
+                sent_packet_tracker.as_ref(),
+                congestion_controller.as_ref(),
+            );
+            congestion_controller.release_flightsize(packet_size);
             // Signal completion (error path) so broadcast queue can release the
             // permit. The transfer failed mid-flight, so report a drop (#4235):
             // the queue must NOT treat this as a delivery.
@@ -471,7 +532,13 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                 // connection — fail only this stream so other ops multiplexed
                 // on the downstream connection survive (#4345). The op layer
                 // times out and retries; the idle timeout decides connection
-                // liveness.
+                // liveness. Release the bytes already forwarded for this stream
+                // so the frozen flight size doesn't starve the next stream.
+                release_aborted_stream_flightsize(
+                    outbound_stream_id,
+                    sent_packet_tracker.as_ref(),
+                    congestion_controller.as_ref(),
+                );
                 return Err(TransportError::OutboundStreamFailed(destination_addr));
             }
         };
@@ -489,7 +556,12 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                 );
                 // Error is on the UPSTREAM inbound stream, not the downstream
                 // connection — fail only this stream (#4345), same rationale as
-                // the inactivity-stall arm above.
+                // the inactivity-stall arm above. Release already-forwarded bytes.
+                release_aborted_stream_flightsize(
+                    outbound_stream_id,
+                    sent_packet_tracker.as_ref(),
+                    congestion_controller.as_ref(),
+                );
                 return Err(TransportError::OutboundStreamFailed(destination_addr));
             }
         };
@@ -559,7 +631,14 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                     TransferDirection::Send,
                 );
                 // Fail only this stream, not the connection (#4345). See the
-                // matching site in send_stream for the rationale.
+                // matching site in send_stream for the rationale. Release the
+                // bytes already forwarded for this stream so the frozen flight
+                // size doesn't starve the next stream.
+                release_aborted_stream_flightsize(
+                    outbound_stream_id,
+                    sent_packet_tracker.as_ref(),
+                    congestion_controller.as_ref(),
+                );
                 return Err(TransportError::OutboundStreamFailed(destination_addr));
             }
 
@@ -638,6 +717,16 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                 elapsed.as_millis() as u64,
                 TransferDirection::Send,
             );
+            // Release this stream's in-flight bytes (#4345): drop_stream for the
+            // already-forwarded tracked fragments, plus packet_size for the
+            // CURRENT fragment whose on_send bytes were added just above but
+            // whose send failed (so it was never registered in the tracker).
+            release_aborted_stream_flightsize(
+                outbound_stream_id,
+                sent_packet_tracker.as_ref(),
+                congestion_controller.as_ref(),
+            );
+            congestion_controller.release_flightsize(packet_size);
             return Err(e);
         }
 
@@ -1233,6 +1322,158 @@ mod tests {
             "cwnd timeout must be classified transient so the connection survives: {err:?}"
         );
 
+        Ok(())
+    }
+
+    /// Core regression for issue #4345: when an outbound stream aborts on a
+    /// cwnd-wait timeout, the fragments it already put in flight MUST be released
+    /// from the connection's flight size immediately — not left pinned until each
+    /// ages out via `MAX_PACKET_RETRANSMITS` (~6s).
+    ///
+    /// Reproduces the stranded-flightsize symptom: a cwnd just large enough for a
+    /// couple of fragments, a socket that accepts sends but NO ACKs ever arrive,
+    /// so flight size climbs to ~cwnd and the next fragment's cwnd wait times out.
+    /// Before the stage-2 wiring, `send_stream` returned the error while leaving
+    /// those bytes in flight; FixedRate/LEDBAT then keep cwnd pinned at the frozen
+    /// flight size and every subsequent stream starves. This test asserts:
+    ///   1. flight size is > 0 at the moment of abort (fragments are stranded),
+    ///   2. flight size is back to 0 once `send_stream` returns (abort released
+    ///      the stream's in-flight bytes via drop_stream + release_flightsize).
+    #[tokio::test(start_paused = true)]
+    async fn cwnd_wait_timeout_releases_stranded_flightsize()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Generous channel + a drain task so sends never block; we never ACK.
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(1024);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        // ~7 fragments worth of data, but cwnd only admits a couple.
+        let message = vec![0u8; 10_000];
+        let cipher = {
+            let mut key = [0u8; 16];
+            crate::config::GlobalRng::fill_bytes(&mut key);
+            Aes128Gcm::new(&key.into())
+        };
+
+        let time_source = RealTime::new();
+
+        // cwnd admits ~2 fragments (2 * MAX_DATA_SIZE), so a few fragments go out
+        // and fill flight size, then the next fragment's cwnd wait times out.
+        let cwnd = 2 * MAX_DATA_SIZE;
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: cwnd,
+            min_cwnd: cwnd,
+            max_cwnd: cwnd,
+            ..Default::default()
+        })
+        .build_arc();
+
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+        let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
+
+        // Drain the socket so send_to never blocks; deliberately never ACK, so
+        // flight size only ever grows until the abort releases it.
+        let drain =
+            GlobalExecutor::spawn(async move { while outbound_receiver.recv().await.is_some() {} });
+
+        let cc_for_send = congestion_controller.clone();
+        let send_task = GlobalExecutor::spawn(send_stream(
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            Bytes::from(message),
+            cipher,
+            sent_tracker,
+            token_bucket,
+            cc_for_send,
+            time_source,
+            None,
+            None,
+        ));
+
+        let err = send_task
+            .await
+            .expect("join error")
+            .expect_err("cwnd wait should time out");
+        assert!(
+            matches!(err, TransportError::OutboundStreamFailed(addr) if addr == remote_addr),
+            "expected OutboundStreamFailed, got: {err:?}"
+        );
+
+        // The stranded fragments must have been released on abort. With no ACKs,
+        // the ONLY release path is the #4345 abort wiring; without it this reads
+        // ~cwnd (pinned) instead of 0.
+        assert_eq!(
+            congestion_controller.flightsize(),
+            0,
+            "issue #4345: aborting the stream must release its in-flight bytes \
+             (flight size should be drained, was {})",
+            congestion_controller.flightsize()
+        );
+
+        drain.abort();
+        Ok(())
+    }
+
+    /// Issue #4345 (stage 2): aborting a stream that has NO in-flight packets
+    /// (cwnd too small for even the first fragment, so nothing was ever sent)
+    /// must be a clean no-op — drop_stream releases 0 and flight size stays 0.
+    /// Guards against the abort wiring panicking or mis-releasing on the empty
+    /// case.
+    #[tokio::test(start_paused = true)]
+    async fn cwnd_wait_timeout_zero_inflight_is_noop() -> Result<(), Box<dyn std::error::Error>> {
+        let (outbound_sender, _outbound_receiver) = mpsc::channel(100);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let message = vec![0u8; 10_000];
+        let cipher = {
+            let mut key = [0u8; 16];
+            crate::config::GlobalRng::fill_bytes(&mut key);
+            Aes128Gcm::new(&key.into())
+        };
+
+        let time_source = RealTime::new();
+
+        // 1-byte cwnd: no fragment ever fits, so the FIRST cwnd wait times out
+        // before anything is sent. Flight size is 0 the whole time.
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1,
+            min_cwnd: 1,
+            max_cwnd: 1,
+            ..Default::default()
+        })
+        .build_arc();
+
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+        let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
+
+        let cc_for_send = congestion_controller.clone();
+        let send_task = GlobalExecutor::spawn(send_stream(
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            Bytes::from(message),
+            cipher,
+            sent_tracker,
+            token_bucket,
+            cc_for_send,
+            time_source,
+            None,
+            None,
+        ));
+
+        let err = send_task
+            .await
+            .expect("join error")
+            .expect_err("cwnd wait should time out");
+        assert!(
+            matches!(err, TransportError::OutboundStreamFailed(_)),
+            "expected OutboundStreamFailed, got: {err:?}"
+        );
+        assert_eq!(
+            congestion_controller.flightsize(),
+            0,
+            "aborting a stream with zero in-flight packets must keep flight size 0"
+        );
         Ok(())
     }
 

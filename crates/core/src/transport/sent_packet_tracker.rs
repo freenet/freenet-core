@@ -299,6 +299,23 @@ impl<T: TimeSource> SentPacketTracker<T> {
         stream: PacketStream,
     ) {
         let sent_time_nanos = self.time_source.now_nanos();
+
+        // Resend re-registration (issue #4345): since `get_resend` now KEEPS a
+        // resent packet in `pending_receipts`, a re-register for an
+        // already-tracked packet is an idempotent in-place refresh — update the
+        // payload / send-time / token, do NOT push a duplicate resend-queue
+        // entry, and do NOT bump `total_packets_sent`. The stream tag is
+        // preserved (the existing entry's tag stays); the `stream` argument from
+        // a `Control`-default re-register is intentionally ignored so a resent
+        // stream fragment keeps its stream. (First sends never hit this branch
+        // because packet ids are monotonic per connection.)
+        if let Some(slot) = self.pending_receipts.get_mut(&packet_id) {
+            *slot = (payload, sent_time_nanos, token);
+            // packet_streams entry already exists and is left untouched so the
+            // owning stream is preserved across resends.
+            return;
+        }
+
         self.pending_receipts
             .insert(packet_id, (payload, sent_time_nanos, token));
         self.packet_streams.insert(packet_id, stream);
@@ -336,13 +353,12 @@ impl<T: TimeSource> SentPacketTracker<T> {
     ///
     /// Returns `0` for an unknown or already-drained stream, and never panics.
     ///
-    /// NOTE (stage 1, #4345): this mechanism is intentionally NOT yet wired into
-    /// the abort paths in `outbound_stream.rs`; calling it has no effect on
-    /// flight size until the caller passes the returned count to
-    /// `release_flightsize`. It is added and tested in isolation first because
-    /// the double-decrement hazard is the riskiest part of the fix. The
-    /// `allow(dead_code)` is removed in stage 2 when the abort paths call it.
-    #[allow(dead_code)]
+    /// Wired into the outbound-stream abort paths (`outbound_stream.rs`,
+    /// `release_aborted_stream_flightsize`): on a cwnd-wait timeout, upstream
+    /// stall/error, or mid-send failure, the abort calls this and passes the
+    /// returned count to `CongestionControl::release_flightsize` so the aborted
+    /// stream's stranded bytes are freed immediately instead of waiting out
+    /// `MAX_PACKET_RETRANSMITS`.
     pub(super) fn drop_stream(&mut self, stream_id: StreamId) -> u64 {
         let target = PacketStream::Stream(stream_id);
 
@@ -569,8 +585,31 @@ impl<T: TimeSource> SentPacketTracker<T> {
     }
 
     /// Either get a packet that needs to be resent, or how long the caller should wait until
-    /// calling this function again. If a packet is resent you **must** call
-    /// `report_sent_packet` again with the same packet_id.
+    /// calling this function again.
+    ///
+    /// On `Resend`/`TlpProbe` the packet **stays in `pending_receipts`** — the
+    /// returned `Box<[u8]>` is a clone of the still-tracked payload, and the
+    /// packet's RTO timer is refreshed to "now" in place. The caller sends the
+    /// bytes; it MAY call `report_sent_packet` again with the same packet_id to
+    /// refresh the send timestamp to the post-`send_to` instant, but this is an
+    /// idempotent in-place refresh, not a re-insert (issue #4345).
+    ///
+    /// WHY keep the packet across resend (issue #4345): `drop_stream` runs
+    /// concurrently from the spawned outbound-stream abort path while the
+    /// per-connection recv loop drives resends. If `get_resend` removed the
+    /// packet from `pending_receipts` and relied on the caller to re-insert it
+    /// after an `await`ed UDP send, a `drop_stream` landing in that gap would
+    /// see no `pending_receipts` entry (release 0 bytes for a genuinely in-flight
+    /// packet) and strip its stream tag — leaving the fragment's bytes pinned in
+    /// flight size, the exact #4345 symptom. Keeping the entry makes the
+    /// invariant total: a packet is in `pending_receipts` iff it is in flight, so
+    /// `drop_stream` always sees and releases it. This is the same keep-the-entry
+    /// shape the TLP branch below already uses.
+    ///
+    /// NOTE: this does NOT touch flight size. Flight size lives in the congestion
+    /// controller; keeping the packet here is pure resend bookkeeping and does
+    /// not reintroduce the forbidden decrement-on-RTO + re-add-on-resend pair
+    /// (see `.claude/rules/transport.md` flight-size release invariant).
     ///
     /// TLP (Tail Loss Probe) fires before RTO to detect tail loss earlier.
     /// - TLP returns TlpProbe action (no backoff applied, speculative)
@@ -631,57 +670,76 @@ impl<T: TimeSource> SentPacketTracker<T> {
                 }
             }
 
-            // Check if RTO should fire
-            if now_nanos >= rto_deadline {
-                if let Some((packet, _sent_time_nanos, _token)) =
-                    self.pending_receipts.remove(&entry.packet_id)
-                {
-                    // Update packet loss proportion for a lost packet
-                    self.packet_loss_proportion = self.packet_loss_proportion
-                        * (1.0 - PACKET_LOSS_DECAY_FACTOR)
-                        + PACKET_LOSS_DECAY_FACTOR;
+            // Check if RTO should fire (only for a still-tracked packet —
+            // get_resend keeps resent packets in pending_receipts since #4345).
+            if now_nanos >= rto_deadline && self.pending_receipts.contains_key(&entry.packet_id) {
+                // Update packet loss proportion for a lost packet
+                self.packet_loss_proportion = self.packet_loss_proportion
+                    * (1.0 - PACKET_LOSS_DECAY_FACTOR)
+                    + PACKET_LOSS_DECAY_FACTOR;
 
-                    // Count this RTO. After MAX_PACKET_RETRANSMITS with no ACK,
-                    // abandon the packet so its bytes are released from flight
-                    // size instead of being retransmitted forever (issue #4345).
-                    let count = self.retransmit_counts.entry(entry.packet_id).or_insert(0);
-                    *count += 1;
-                    if *count > MAX_PACKET_RETRANSMITS {
-                        let payload_len = packet.len();
-                        // Drop all tracking for this packet — it will NOT be
-                        // re-queued, so the recv loop stops retransmitting it.
-                        // Removing the stream tag here keeps `drop_stream`
-                        // double-decrement-safe: an abandoned packet's bytes are
-                        // released once (by the recv loop, via the Abandon
-                        // action), so a later `drop_stream` must not release
-                        // them again (#4345).
-                        self.retransmit_counts.remove(&entry.packet_id);
-                        self.retransmitted_packets.remove(&entry.packet_id);
-                        self.tlp_sent_packets.remove(&entry.packet_id);
-                        self.packet_streams.remove(&entry.packet_id);
-                        tracing::debug!(
-                            packet_id = entry.packet_id,
-                            retransmits = MAX_PACKET_RETRANSMITS,
-                            payload_len,
-                            "Abandoning packet after max retransmits — releasing flight size (#4345)"
-                        );
-                        return ResendAction::Abandon {
-                            packet_id: entry.packet_id,
-                            payload_len,
-                        };
-                    }
-
-                    // Mark as retransmitted for Karn's algorithm
-                    self.mark_retransmitted(entry.packet_id);
-
-                    // RFC 6298 Section 5.5: Back off the timer on retransmission
-                    self.on_timeout();
-
-                    // Clean up TLP tracking for this packet
+                // Count this RTO. After MAX_PACKET_RETRANSMITS with no ACK,
+                // abandon the packet so its bytes are released from flight
+                // size instead of being retransmitted forever (issue #4345).
+                let count = self.retransmit_counts.entry(entry.packet_id).or_insert(0);
+                *count += 1;
+                if *count > MAX_PACKET_RETRANSMITS {
+                    // Abandonment is terminal: NOW remove the packet from
+                    // every tracking structure (including pending_receipts).
+                    // It will NOT be re-queued, so the recv loop stops
+                    // retransmitting it. Removing the stream tag here keeps
+                    // `drop_stream` double-decrement-safe: an abandoned
+                    // packet's bytes are released once (by the recv loop, via
+                    // the Abandon action), so a later `drop_stream` must not
+                    // release them again (#4345).
+                    let payload_len = self
+                        .pending_receipts
+                        .remove(&entry.packet_id)
+                        .map(|(payload, _, _)| payload.len())
+                        .unwrap_or(0);
+                    self.retransmit_counts.remove(&entry.packet_id);
+                    self.retransmitted_packets.remove(&entry.packet_id);
                     self.tlp_sent_packets.remove(&entry.packet_id);
-
-                    return ResendAction::Resend(entry.packet_id, packet);
+                    self.packet_streams.remove(&entry.packet_id);
+                    tracing::debug!(
+                        packet_id = entry.packet_id,
+                        retransmits = MAX_PACKET_RETRANSMITS,
+                        payload_len,
+                        "Abandoning packet after max retransmits — releasing flight size (#4345)"
+                    );
+                    return ResendAction::Abandon {
+                        packet_id: entry.packet_id,
+                        payload_len,
+                    };
                 }
+
+                // Resend: KEEP the packet in pending_receipts (issue #4345 —
+                // see the rustdoc above). Clone the payload for the caller,
+                // refresh the send timestamp to now so the next RTO is
+                // measured from this resend, and push the entry back so the
+                // packet stays tracked for the next timeout.
+                let packet = {
+                    let slot = self
+                        .pending_receipts
+                        .get_mut(&entry.packet_id)
+                        .expect("checked contains_key above");
+                    slot.1 = now_nanos;
+                    slot.0.clone()
+                };
+                self.resend_queue.push_back(ResendQueueEntry {
+                    packet_id: entry.packet_id,
+                });
+
+                // Mark as retransmitted for Karn's algorithm
+                self.mark_retransmitted(entry.packet_id);
+
+                // RFC 6298 Section 5.5: Back off the timer on retransmission
+                self.on_timeout();
+
+                // Clean up TLP tracking for this packet
+                self.tlp_sent_packets.remove(&entry.packet_id);
+
+                return ResendAction::Resend(entry.packet_id, packet);
             }
 
             // Neither TLP nor RTO fired yet - calculate when to wake up
@@ -797,8 +855,12 @@ pub(in crate::transport) mod tests {
         tracker.time_source.advance(tracker.effective_rto());
         let resend_action = tracker.get_resend();
         assert_eq!(resend_action, ResendAction::Resend(1, vec![1, 2, 3].into()));
-        assert_eq!(tracker.pending_receipts.len(), 0);
-        assert_eq!(tracker.resend_queue.len(), 0);
+        // Since #4345, a resent packet STAYS tracked (get_resend keeps it in
+        // pending_receipts and re-queues it) so it remains visible to a
+        // concurrent drop_stream; it is no longer removed on Resend. The payload
+        // is returned as a clone.
+        assert_eq!(tracker.pending_receipts.len(), 1);
+        assert_eq!(tracker.resend_queue.len(), 1);
         assert_eq!(tracker.packet_loss_proportion, PACKET_LOSS_DECAY_FACTOR);
     }
 
@@ -2203,5 +2265,61 @@ pub(in crate::transport) mod tests {
         assert_eq!(tracker.drop_stream(stream), 0);
         assert!(tracker.pending_receipts.is_empty());
         assert!(tracker.packet_streams.is_empty());
+    }
+
+    /// Resend-gap race (issue #4345, stage 2): a packet that `get_resend` has
+    /// just handed out for retransmission — but that the recv loop has NOT yet
+    /// re-registered (it is mid `send_to().await`) — must STILL be released by a
+    /// concurrent `drop_stream`.
+    ///
+    /// `drop_stream` runs from the spawned outbound-stream abort task while the
+    /// per-connection recv loop drives resends; both share the tracker mutex.
+    /// Before the keep-the-entry-on-resend fix, `get_resend` removed the packet
+    /// from `pending_receipts` and relied on the recv loop to re-insert it after
+    /// the await. A `drop_stream` landing in that window would see no
+    /// `pending_receipts` entry — release 0 bytes for a genuinely in-flight
+    /// packet AND strip its stream tag — leaving the fragment pinned in flight
+    /// size (partial defeat of the fix). Now the packet stays in
+    /// `pending_receipts` across the resend, so this test asserts it is released.
+    ///
+    /// This is the exact interleaving the gap describes: Resend handed out, NO
+    /// re-registration yet, then drop_stream.
+    #[test]
+    fn test_drop_stream_releases_packet_out_for_resend() {
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+
+        tracker.report_sent_stream_packet(1, vec![0u8; 13].into(), None, stream);
+
+        // Fire the RTO so the packet is "out for resend": get_resend returns it
+        // to the (recv-loop) caller. We deliberately do NOT re-register it,
+        // modelling the recv task being suspended on its UDP send_to().await.
+        tracker.time_source.advance(tracker.effective_rto());
+        match tracker.get_resend() {
+            ResendAction::Resend(id, _packet) => assert_eq!(id, 1),
+            other => panic!("expected Resend for the out-for-resend packet, got {other:?}"),
+        }
+
+        // The packet is still tracked (keep-the-entry fix) and still tagged with
+        // its stream, so a concurrent drop_stream in this gap releases its bytes.
+        assert!(tracker.pending_receipts.contains_key(&1));
+        assert_eq!(
+            tracker.packet_streams.get(&1),
+            Some(&PacketStream::Stream(stream))
+        );
+        assert_eq!(
+            tracker.drop_stream(stream),
+            13,
+            "issue #4345: a packet out-for-resend must still be released by drop_stream"
+        );
+
+        // And it is fully gone afterwards (no later double-release).
+        assert!(tracker.pending_receipts.is_empty());
+        assert!(tracker.packet_streams.is_empty());
+        let (ack_info, _) = tracker.report_received_receipts(&[1]);
+        assert!(
+            ack_info.is_empty(),
+            "a late ACK after the gap-drop must not release bytes again"
+        );
     }
 }
