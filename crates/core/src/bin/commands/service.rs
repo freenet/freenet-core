@@ -2855,6 +2855,52 @@ fn install_service(system: bool) -> Result<()> {
     install_macos_service()
 }
 
+/// Derive the path of the macOS auto-update wrapper script from a home
+/// directory. Single source of truth shared by the install path (which
+/// writes the script), the update path, and the uninstall path (which
+/// removes it). Keep this in sync with `update.rs`'s wrapper derivation.
+#[cfg(target_os = "macos")]
+fn wrapper_script_path(home_dir: &Path) -> PathBuf {
+    home_dir.join(".local/bin/freenet-service-wrapper.sh")
+}
+
+/// Remove the wrapper script and its sidecar/backup files written by the
+/// install (`*.sh`, `*.sh.hash`) and update (`*.sh.bak`) paths.
+///
+/// Idempotent: a missing file is not an error, so uninstalling twice (or
+/// uninstalling an install that never ran an update) succeeds cleanly.
+/// Returns an error only if a present file cannot be removed.
+///
+/// Regression target for #4290: install wrote three files, uninstall
+/// removed zero, leaving stale wrapper artifacts in `~/.local/bin`.
+#[cfg(target_os = "macos")]
+fn remove_wrapper_files(wrapper_path: &Path) -> Result<()> {
+    use std::fs;
+
+    // `.sh` itself, plus the `.sh.hash` sidecar (#4286) and any `.sh.bak`
+    // backup left by `freenet update`. Derived via `with_extension` so they
+    // track the wrapper path rather than being independently hardcoded.
+    let targets = [
+        wrapper_path.to_path_buf(),
+        wrapper_path.with_extension("sh.hash"),
+        wrapper_path.with_extension("sh.bak"),
+    ];
+
+    for target in &targets {
+        match fs::remove_file(target) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("Failed to remove wrapper file {}", target.display())
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn install_macos_service() -> Result<()> {
     use std::fs;
@@ -2873,9 +2919,11 @@ fn install_macos_service() -> Result<()> {
     // Create wrapper script for auto-update support.
     // launchd doesn't have ExecStopPost like systemd, so we use a wrapper
     // that checks exit code 42 (update needed) and runs update before restart.
-    let wrapper_dir = home_dir.join(".local/bin");
-    fs::create_dir_all(&wrapper_dir).context("Failed to create wrapper directory")?;
-    let wrapper_path = wrapper_dir.join("freenet-service-wrapper.sh");
+    let wrapper_path = wrapper_script_path(&home_dir);
+    let wrapper_dir = wrapper_path
+        .parent()
+        .context("wrapper path has no parent directory")?;
+    fs::create_dir_all(wrapper_dir).context("Failed to create wrapper directory")?;
     let wrapper_content = generate_wrapper_script(&exe_path);
     fs::write(&wrapper_path, &wrapper_content).context("Failed to write wrapper script")?;
     fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))
@@ -3073,11 +3121,27 @@ fn check_no_system_flag(system: bool) -> Result<()> {
 /// Returns true if a service was found and removed.
 #[cfg(target_os = "macos")]
 pub fn stop_and_remove_service(_system: bool) -> Result<bool> {
+    let home_dir = dirs::home_dir().context("Failed to get home directory")?;
+    stop_and_remove_service_at(&home_dir)
+}
+
+/// Core of macOS uninstall, parametrized on the home directory so the
+/// cleanup-ordering invariant is unit-testable without touching the real
+/// `$HOME` or shelling out to `launchctl` (which only runs when the plist is
+/// present).
+#[cfg(target_os = "macos")]
+fn stop_and_remove_service_at(home_dir: &Path) -> Result<bool> {
     use std::fs;
 
-    let plist_path = dirs::home_dir()
-        .context("Failed to get home directory")?
-        .join("Library/LaunchAgents/org.freenet.node.plist");
+    let plist_path = home_dir.join("Library/LaunchAgents/org.freenet.node.plist");
+
+    // Remove the auto-update wrapper script and its sidecar/backup files
+    // (#4290). install writes `*.sh` + `*.sh.hash`; `freenet update` may
+    // leave a `*.sh.bak`. Missing files are not an error (idempotent), so we
+    // run this BEFORE the plist early-return: a partial or repeated uninstall
+    // can leave the plist already gone while the wrapper artifacts remain, and
+    // those must still be cleaned up.
+    remove_wrapper_files(&wrapper_script_path(home_dir))?;
 
     if !plist_path.exists() {
         return Ok(false);
@@ -5227,5 +5291,115 @@ mod tests {
                 pattern
             );
         }
+    }
+
+    /// Regression test for #4290: macOS uninstall must remove the wrapper
+    /// script plus its `.sh.hash` sidecar (#4286) and any `.sh.bak` backup
+    /// left by `freenet update`. Previously install wrote three files and
+    /// uninstall removed zero, leaving stale artifacts in `~/.local/bin`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn remove_wrapper_files_removes_script_sidecar_and_backup() {
+        use std::fs;
+
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let home = tmp.path();
+
+        let wrapper_path = wrapper_script_path(home);
+        let bin_dir = wrapper_path.parent().unwrap();
+        fs::create_dir_all(bin_dir).expect("create .local/bin");
+
+        let hash_path = wrapper_path.with_extension("sh.hash");
+        let bak_path = wrapper_path.with_extension("sh.bak");
+
+        // Stand-in for the launchd plist that the wrapper cleanup must NOT touch.
+        let plist_path = home.join("org.freenet.node.plist");
+
+        for path in [&wrapper_path, &hash_path, &bak_path, &plist_path] {
+            fs::write(path, b"x").expect("write fixture file");
+            assert!(path.exists(), "fixture {} should exist", path.display());
+        }
+
+        remove_wrapper_files(&wrapper_path).expect("cleanup should succeed");
+
+        assert!(!wrapper_path.exists(), "wrapper script must be removed");
+        assert!(!hash_path.exists(), "hash sidecar must be removed");
+        assert!(!bak_path.exists(), "bak backup must be removed");
+        // The cleanup helper is scoped to wrapper artifacts only.
+        assert!(
+            plist_path.exists(),
+            "unrelated files (plist) must be left untouched"
+        );
+    }
+
+    /// Edge case for #4290: missing files are not an error — uninstalling
+    /// twice, or uninstalling an install that never ran an update (no
+    /// `.sh.bak`), must still succeed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn remove_wrapper_files_is_idempotent_when_files_absent() {
+        use std::fs;
+
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let home = tmp.path();
+
+        let wrapper_path = wrapper_script_path(home);
+        let bin_dir = wrapper_path.parent().unwrap();
+        fs::create_dir_all(bin_dir).expect("create .local/bin");
+
+        // Only the script exists; no sidecar, no backup.
+        fs::write(&wrapper_path, b"x").expect("write wrapper");
+
+        // First removal clears the script.
+        remove_wrapper_files(&wrapper_path).expect("first cleanup should succeed");
+        assert!(!wrapper_path.exists());
+
+        // Second removal with every target already gone is still Ok.
+        remove_wrapper_files(&wrapper_path).expect("second cleanup should be a no-op");
+    }
+
+    /// Regression test for the #4290 bug *site* (not just the leaf helper):
+    /// `stop_and_remove_service` must clean up the wrapper artifacts even when
+    /// the launchd plist is already gone. The original bug was a missing call
+    /// at the uninstall edge; a follow-up review found the cleanup was placed
+    /// AFTER an early `return Ok(false)` taken when the plist is absent, so a
+    /// partial or repeated uninstall still leaked the wrapper files. This test
+    /// drives the actual uninstall entry point (via the home-parametrized core)
+    /// with the plist absent and asserts the artifacts are removed anyway.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stop_and_remove_service_cleans_wrapper_when_plist_absent() {
+        use std::fs;
+
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let home = tmp.path();
+
+        let wrapper_path = wrapper_script_path(home);
+        let bin_dir = wrapper_path.parent().unwrap();
+        fs::create_dir_all(bin_dir).expect("create .local/bin");
+
+        let hash_path = wrapper_path.with_extension("sh.hash");
+        let bak_path = wrapper_path.with_extension("sh.bak");
+        for path in [&wrapper_path, &hash_path, &bak_path] {
+            fs::write(path, b"x").expect("write fixture file");
+        }
+
+        // No plist exists under this home: the uninstall hits the early-return
+        // path. Pre-fix, that returned before wrapper cleanup ran.
+        let plist_path = home.join("Library/LaunchAgents/org.freenet.node.plist");
+        assert!(!plist_path.exists(), "plist must be absent for this case");
+
+        let found = stop_and_remove_service_at(home).expect("uninstall should succeed");
+
+        assert!(
+            !found,
+            "no service was present, so it must report not-found"
+        );
+        assert!(
+            !wrapper_path.exists(),
+            "wrapper script must be removed even when the plist is already gone"
+        );
+        assert!(!hash_path.exists(), "hash sidecar must be removed");
+        assert!(!bak_path.exists(), "bak backup must be removed");
     }
 }
