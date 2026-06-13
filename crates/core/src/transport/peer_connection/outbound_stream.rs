@@ -71,7 +71,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     congestion_controller: Arc<CongestionController<T>>,
     time_source: T,
     metadata: Option<Bytes>,
-    completion_tx: Option<oneshot::Sender<()>>,
+    completion_tx: Option<oneshot::Sender<crate::transport::BroadcastDeliveryOutcome>>,
 ) -> Result<TransferStats, TransportError> {
     let start_time = time_source.now();
     let bytes_to_send = stream_to_send.len() as u64;
@@ -185,10 +185,11 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                 //
                 // NOTE: `completion_tx` is intentionally NOT signaled here — it
                 // is dropped by this early return. broadcast_queue awaits it with
-                // a timeout and treats the resulting oneshot RecvError as
-                // completion (broadcast_queue.rs: `Ok(Err(_))` arm), releasing the
-                // permit immediately. Do NOT "fix" this by adding a blocking
-                // `tx.send(())` here — a blocking send in this stream task is the
+                // a timeout and treats the resulting oneshot RecvError as a
+                // *drop, not a delivery* (broadcast_queue.rs: `Ok(Err(_))` arm,
+                // #4235), releasing the permit immediately without refreshing
+                // peer interest. Do NOT "fix" this by adding a blocking
+                // `tx.send(..)` here — a blocking send in this stream task is the
                 // backpressure pattern channel-safety.md warns against.
                 return Err(TransportError::OutboundStreamFailed(destination_addr));
             }
@@ -295,10 +296,12 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                 elapsed.as_millis() as u64,
                 TransferDirection::Send,
             );
-            // Signal completion (error path) so broadcast queue can release permit
+            // Signal completion (error path) so broadcast queue can release the
+            // permit. The transfer failed mid-flight, so report a drop (#4235):
+            // the queue must NOT treat this as a delivery.
             if let Some(tx) = completion_tx {
                 // Receiver may be dropped if queue timed out; ignore the error.
-                let _ignored = tx.send(());
+                let _ignored = tx.send(crate::transport::BroadcastDeliveryOutcome::Dropped);
             }
             return Err(e);
         }
@@ -347,10 +350,12 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         TransferDirection::Send,
     );
 
-    // Signal completion (success path) so broadcast queue can release permit
+    // Signal completion (success path) so broadcast queue can release the
+    // permit. The transfer completed end-to-end, so report a real delivery
+    // (#4235) — only this case refreshes peer interest / caches the summary.
     if let Some(tx) = completion_tx {
         // Receiver may be dropped if queue timed out; ignore the error.
-        let _ignored = tx.send(());
+        let _ignored = tx.send(crate::transport::BroadcastDeliveryOutcome::Delivered);
     }
 
     Ok(TransferStats {
@@ -1226,6 +1231,147 @@ mod tests {
             "cwnd timeout must be classified transient so the connection survives: {err:?}"
         );
 
+        Ok(())
+    }
+
+    /// Issue #4235 — producer-side emission: a `send_stream` that runs to a
+    /// successful completion MUST signal `BroadcastDeliveryOutcome::Delivered`
+    /// on its `completion_tx`.
+    ///
+    /// The broadcast queue gates interest-refresh / summary-cache on this exact
+    /// outcome. If the success arm regressed to emit `Dropped` (or stopped
+    /// emitting), the queue would suppress interest refresh on real deliveries —
+    /// the inverse of #4235's symptom — and silently stop re-converging peers.
+    #[tokio::test]
+    async fn send_stream_success_signals_delivered() -> Result<(), Box<dyn std::error::Error>> {
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(1);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let mut message = vec![0u8; 100_000];
+        crate::config::GlobalRng::fill_bytes(&mut message);
+        let cipher = {
+            let mut key = [0u8; 16];
+            crate::config::GlobalRng::fill_bytes(&mut key);
+            Aes128Gcm::new(&key.into())
+        };
+
+        // VirtualTime + a cwnd/token bucket large enough that no sleeping or
+        // cwnd waiting is needed (mirrors test_send_stream_success).
+        let time_source = VirtualTime::new();
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(
+            SentPacketTracker::new_with_time_source(time_source.clone()),
+        ));
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1_000_000,
+            min_cwnd: 1_000_000,
+            max_cwnd: 1_000_000_000,
+            ..Default::default()
+        })
+        .build_arc_with_time_source(time_source.clone());
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            1_000_000,
+            10_000_000,
+            time_source.clone(),
+        ));
+
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let background_task = GlobalExecutor::spawn(send_stream(
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            Bytes::from(message.clone()),
+            cipher.clone(),
+            sent_tracker,
+            token_bucket,
+            congestion_controller,
+            time_source,
+            None,
+            Some(completion_tx),
+        ));
+
+        // Drain the socket so the stream can run to completion.
+        while outbound_receiver.recv().await.is_some() {}
+
+        let result = background_task.await?;
+        assert!(result.is_ok(), "send_stream should succeed: {result:?}");
+        assert_eq!(
+            completion_rx.await,
+            Ok(crate::transport::BroadcastDeliveryOutcome::Delivered),
+            "a successful stream MUST signal Delivered (#4235)"
+        );
+        Ok(())
+    }
+
+    /// Issue #4235 — producer-side emission: a `send_stream` that fails mid-flight
+    /// (a `packet_sending` error) MUST signal `BroadcastDeliveryOutcome::Dropped`
+    /// on its `completion_tx`, so the broadcast queue releases the permit WITHOUT
+    /// refreshing interest or caching the summary.
+    ///
+    /// The failure is induced by dropping the outbound socket receiver before the
+    /// stream starts: `TestSocket::send_to` then returns `ConnectionAborted`, so
+    /// the first `packet_sending` call errors and the error arm runs. A large
+    /// cwnd ensures the cwnd-wait early return (which drops the oneshot instead
+    /// of signaling) is NOT taken — we want the explicit `Dropped` send.
+    #[tokio::test]
+    async fn send_stream_failure_signals_dropped() -> Result<(), Box<dyn std::error::Error>> {
+        let (outbound_sender, outbound_receiver) = mpsc::channel(1);
+        // Drop the receiver: every TestSocket::send_to now fails with
+        // ConnectionAborted, so the first packet_sending() errors out.
+        drop(outbound_receiver);
+
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let message = vec![0u8; 10_000];
+        let cipher = {
+            let mut key = [0u8; 16];
+            crate::config::GlobalRng::fill_bytes(&mut key);
+            Aes128Gcm::new(&key.into())
+        };
+
+        let time_source = VirtualTime::new();
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(
+            SentPacketTracker::new_with_time_source(time_source.clone()),
+        ));
+        // Large cwnd so we reach packet_sending immediately rather than the
+        // cwnd-wait early return (which would drop the oneshot, not send Dropped).
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1_000_000,
+            min_cwnd: 1_000_000,
+            max_cwnd: 1_000_000_000,
+            ..Default::default()
+        })
+        .build_arc_with_time_source(time_source.clone());
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            1_000_000,
+            10_000_000,
+            time_source.clone(),
+        ));
+
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let background_task = GlobalExecutor::spawn(send_stream(
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            Bytes::from(message),
+            cipher,
+            sent_tracker,
+            token_bucket,
+            congestion_controller,
+            time_source,
+            None,
+            Some(completion_tx),
+        ));
+
+        let result = background_task.await?;
+        assert!(
+            result.is_err(),
+            "send_stream should fail when the socket is closed: {result:?}"
+        );
+        assert_eq!(
+            completion_rx.await,
+            Ok(crate::transport::BroadcastDeliveryOutcome::Dropped),
+            "a mid-flight send failure MUST signal Dropped (#4235)"
+        );
         Ok(())
     }
 
