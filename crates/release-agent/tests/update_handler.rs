@@ -652,6 +652,15 @@ async fn spawn_failure_does_not_consume_rate_limit_window() {
             429,
             "rate-limit window must not be consumed by a failed spawn"
         );
+        // Also exclude 409: a failed spawn must release the InFlightGuard (Rust
+        // move semantics drop it when `run` returns Err), so the retry must not
+        // see the slot still held. Without this, a future leak of the guard on
+        // the Err path would surface as 409 (not 429) and slip past the check above.
+        assert_ne!(
+            r2.status(),
+            409,
+            "failed spawn must release the in-flight guard, so the retry is not 409"
+        );
         // Drain both spawned children before the TempDir drops.
         poll_done_count(&done_log, spawns).await;
         break;
