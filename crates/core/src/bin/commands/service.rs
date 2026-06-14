@@ -2605,6 +2605,31 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Stale-orphan self-heal (issue #3967): RestartPreventExitStatus=43 below
+# means an exit 43 ("another instance already running") never restarts the
+# unit. That is correct for a legitimate second instance, but if the port
+# holder is an ORPHANED `freenet network` (PPID=1) still running an OLD
+# binary, the unit would stand down and the orphan would serve stale assets
+# forever. This pre-flight runs before every start: it finds the port
+# holder, and kills it ONLY when it is an init-adopted orphan (PPID==1) whose
+# `Freenet version:` line differs from the binary this unit would launch (or
+# whose version can't be read). A user-run `freenet network` (parented by a
+# shell, PPID!=1) is always left alone, as is a current-version orphan.
+#
+# systemd performs its own $VAR/${{VAR}} expansion on Exec* lines BEFORE handing
+# the string to /bin/sh, so every dollar the SHELL must see is written as $$
+# here (systemd collapses $$ -> a single $ for sh). Self-match guards: the
+# pre-flight sh's OWN argv contains the literal "freenet network" (it is the
+# substring `pgrep -f` matches), so the pre-flight excludes its own PID ($$$$ ->
+# the sh's $$) and PID 1 from the holder loop. We deliberately do NOT anchor on
+# the holder's exe equalling THIS unit's on-disk binary: a #3967 orphan is, by
+# definition, running an OLD/DIFFERENT binary, so an `exe == on-disk binary`
+# guard would skip exactly the orphan we must kill. The PPID==1 + version-line
+# checks below are what distinguish a stale orphan from a legitimate holder.
+# PPID is read after the final ')' in /proc/PID/stat (comm is parenthesized) so
+# a comm containing whitespace can't shift the field. The '-' prefix means a
+# failure here never blocks the start.
+ExecStartPre=-/bin/sh -c 'self=$$$$; ondisk=$$(timeout 5 {binary} --version 2>/dev/null | grep "^Freenet version:"); for pid in $$(pgrep -f -u "$$(id -u)" "freenet network" 2>/dev/null); do [ "$$pid" = "$$self" ] && continue; [ "$$pid" = "1" ] && continue; exe=$$(readlink -f /proc/$$pid/exe 2>/dev/null); hv=""; [ -x "$$exe" ] && hv=$$(timeout 5 "$$exe" --version 2>/dev/null | grep "^Freenet version:"); ppid=$$(sed "s/.*) //" /proc/$$pid/stat 2>/dev/null | awk "{{print \$$2}}"); mismatch=1; [ -n "$$ondisk" ] && [ -n "$$hv" ] && [ "$$hv" != "$$ondisk" ] && mismatch=0; if [ "$$ppid" = "1" ] && {{ [ "$$mismatch" = "0" ] || [ -z "$$hv" ]; }}; then kill -TERM "$$pid" 2>/dev/null || true; w=0; while kill -0 "$$pid" 2>/dev/null && [ $$w -lt 12 ]; do sleep 1; w=$$((w+1)); done; kill -0 "$$pid" 2>/dev/null && kill -KILL "$$pid" 2>/dev/null || true; fi; done'
 ExecStart={binary} network
 Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops
@@ -2624,8 +2649,10 @@ TimeoutStopSec=45
 
 # Auto-update: if peer exits with code 42 (version mismatch with gateway),
 # run update before systemd restarts the service. The '-' prefix means
-# ExecStopPost failure won't affect service restart.
-ExecStopPost=-/bin/sh -c '[ "$EXIT_STATUS" = "42" ] && {binary} update --quiet || true'
+# ExecStopPost failure won't affect service restart. $$EXIT_STATUS is doubled
+# so systemd passes a literal $EXIT_STATUS through to sh (which systemd itself
+# sets in the ExecStopPost environment).
+ExecStopPost=-/bin/sh -c '[ "$$EXIT_STATUS" = "42" ] && {binary} update --quiet || true'
 # Treat exit code 42 as success so it doesn't count against StartLimitBurst.
 # Without this, rapid update cycles (exit 42 → ExecStopPost → restart) can
 # exhaust the burst limit and permanently kill the service.
@@ -2683,6 +2710,19 @@ Wants=network-online.target
 Type=simple
 User={username}
 Environment=HOME={home}
+# Stale-orphan self-heal (issue #3967): see the matching comment in the user
+# unit (including the systemd $$-escaping, the PPID-after-final-')' parse, and
+# why we do NOT anchor on the holder's exe equalling this unit's on-disk binary
+# — a #3967 orphan runs an OLD/DIFFERENT binary, so that anchor would skip the
+# very process we must kill). The self-PID and PID-1 skips exclude the
+# pre-flight's own sh (whose argv contains the literal "freenet network").
+# RestartPreventExitStatus=43 means an exit 43 never restarts the unit, so an
+# init-adopted orphan (PPID==1) running an OLD binary would hold the port
+# forever. This pre-flight kills the holder ONLY when it is such an orphan whose
+# `Freenet version:` differs from (or can't be read against) the binary this
+# unit launches; a user-run instance (PPID!=1) is always left alone. The '-'
+# prefix means a failure here never blocks the start.
+ExecStartPre=-/bin/sh -c 'self=$$$$; ondisk=$$(timeout 5 {binary} --version 2>/dev/null | grep "^Freenet version:"); for pid in $$(pgrep -f -u "$$(id -u)" "freenet network" 2>/dev/null); do [ "$$pid" = "$$self" ] && continue; [ "$$pid" = "1" ] && continue; exe=$$(readlink -f /proc/$$pid/exe 2>/dev/null); hv=""; [ -x "$$exe" ] && hv=$$(timeout 5 "$$exe" --version 2>/dev/null | grep "^Freenet version:"); ppid=$$(sed "s/.*) //" /proc/$$pid/stat 2>/dev/null | awk "{{print \$$2}}"); mismatch=1; [ -n "$$ondisk" ] && [ -n "$$hv" ] && [ "$$hv" != "$$ondisk" ] && mismatch=0; if [ "$$ppid" = "1" ] && {{ [ "$$mismatch" = "0" ] || [ -z "$$hv" ]; }}; then kill -TERM "$$pid" 2>/dev/null || true; w=0; while kill -0 "$$pid" 2>/dev/null && [ $$w -lt 12 ]; do sleep 1; w=$$((w+1)); done; kill -0 "$$pid" 2>/dev/null && kill -KILL "$$pid" 2>/dev/null || true; fi; done'
 ExecStart={binary} network
 Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops
@@ -2702,8 +2742,10 @@ TimeoutStopSec=45
 
 # Auto-update: if peer exits with code 42 (version mismatch with gateway),
 # run update before systemd restarts the service. The '-' prefix means
-# ExecStopPost failure won't affect service restart.
-ExecStopPost=-/bin/sh -c '[ "$EXIT_STATUS" = "42" ] && {binary} update --quiet || true'
+# ExecStopPost failure won't affect service restart. $$EXIT_STATUS is doubled
+# so systemd passes a literal $EXIT_STATUS through to sh (which systemd itself
+# sets in the ExecStopPost environment).
+ExecStopPost=-/bin/sh -c '[ "$$EXIT_STATUS" = "42" ] && {binary} update --quiet || true'
 # Treat exit code 42 as success so it doesn't count against StartLimitBurst.
 # Without this, rapid update cycles (exit 42 → ExecStopPost → restart) can
 # exhaust the burst limit and permanently kill the service.
@@ -2986,6 +3028,110 @@ log_event() {{
     logger -t freenet "$1"
 }}
 
+# Print a binary's full version identity line, e.g.
+#   Freenet version: 0.2.71 (abc1234)
+# Bounded by a 5s timeout so a wedged binary can't stall the whole self-heal
+# before ExecStart. `timeout` may be absent on a bare macOS box, so fall back
+# to invoking the binary directly when it isn't on PATH.
+version_line() {{
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 5 "$1" --version 2>/dev/null | grep '^Freenet version:'
+    else
+        "$1" --version 2>/dev/null | grep '^Freenet version:'
+    fi
+}}
+
+# Print the on-disk binary's full version identity line. Used on the exit-43
+# self-heal path to tell a stale orphan apart from a legitimate second
+# instance running the SAME binary we would launch.
+ondisk_version() {{
+    version_line "{binary}"
+}}
+
+# Enumerate PIDs of `freenet network` processes owned by the current user.
+holder_pids() {{
+    pgrep -f -u "$(id -u)" "freenet network" 2>/dev/null
+}}
+
+# Resolve a PID's executable path on macOS. `ps -o command=` yields the full
+# argv. The wrapper launches the node as `<binary> network`, so the image path
+# is everything up to the trailing ` network` argument. We strip that suffix
+# rather than `awk '{{print $1}}'`-splitting on whitespace, because an install
+# path that contains a space (e.g. `/Users/Some User/bin/freenet`) would be
+# re-truncated by whitespace splitting — the exact regression that switching
+# from `ps -o comm=` to `-o command=` was meant to avoid. Empty if the process
+# is gone. (If the holder's argv ever stops ending in ` network` this yields the
+# full command line, which still drives the version comparison correctly.)
+holder_exe() {{
+    ps -o command= -p "$1" 2>/dev/null | sed 's/ network$//'
+}}
+
+# Stale-orphan self-heal for exit 43.
+#
+# WHY this exists: the binary returns exit 43 ("another instance is already
+# running") whenever it cleanly detects something already holding the
+# service port. launchd's plist sets KeepAlive.SuccessfulExit=false, so if
+# this wrapper responds with `exit 0`, launchd treats it as an intentional
+# stop and NEVER respawns us. (systemd has the same trap via
+# RestartPreventExitStatus=43.) That is correct for a real second instance,
+# but catastrophic when the port holder is an ORPHANED `freenet network`
+# (PPID=1, detached from any wrapper) still running a STALE OLD binary: every
+# new spawn detects it, exits 43, we stand down, and the orphan serves stale
+# assets forever (issue #3967).
+#
+# So before deferring, decide per holder. We ONLY kill a process that is an
+# ORPHAN (PPID==1, adopted by launchd/init and not this wrapper's own child) —
+# a deliberately hand-run `freenet network` is parented by a user shell, so its
+# PPID != 1 and we always defer to it (never SIGKILL a developer's instance or
+# truncate a supervised upgrade's drain). Among orphans we kill when EITHER:
+#   * its version line differs from the binary we would launch (stale binary),
+#     but only when we can actually read our own on-disk version (a non-empty
+#     ondisk); if ondisk is unreadable mid-update we must NOT treat "differs"
+#     as a kill signal, or we'd cull a healthy current node, OR
+#   * we cannot read the holder's own version at all (binary gone/unreadable),
+#     in which case an init-adopted orphan is presumed stale.
+# Kill is SIGTERM, then SIGKILL (the original incident's orphan ignored SIGTERM
+# for >11s). Returns 0 = killed a stale orphan, relaunch; 1 = defer.
+heal_stale_orphan_or_defer() {{
+    local ondisk pid exe holder_ver ppid version_mismatch killed=1
+    ondisk="$(ondisk_version)"
+    for pid in $(holder_pids); do
+        # Never touch our own child (the instance we just ran in this loop).
+        [ "$pid" = "$WRAPPER_CHILD_PID" ] && continue
+        ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+        exe="$(holder_exe "$pid")"
+        holder_ver=""
+        if [ -n "$exe" ] && [ -x "$exe" ]; then
+            holder_ver="$(version_line "$exe")"
+        fi
+        # Orphan-only: a non-init-adopted holder is a real second instance (or a
+        # user-run node) and is always deferred to, regardless of version.
+        version_mismatch=1
+        if [ -n "$ondisk" ] && [ -n "$holder_ver" ] && [ "$holder_ver" != "$ondisk" ]; then
+            version_mismatch=0
+        fi
+        if [ "$ppid" = "1" ] && {{ [ "$version_mismatch" = "0" ] || [ -z "$holder_ver" ]; }}; then
+            log_event "Exit 43: port holder PID $pid is a STALE orphan (holder='$holder_ver' ondisk='$ondisk' ppid=$ppid). Killing and relaunching."
+            kill -TERM "$pid" 2>/dev/null || true
+            # Wait up to ~12s for graceful exit, then escalate to SIGKILL.
+            local waited=0
+            while kill -0 "$pid" 2>/dev/null && [ $waited -lt 12 ]; do
+                sleep 1
+                waited=$((waited + 1))
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+                log_event "Exit 43: stale orphan PID $pid ignored SIGTERM after ${{waited}}s, sending SIGKILL"
+                kill -KILL "$pid" 2>/dev/null || true
+                sleep 1
+            fi
+            killed=0
+        else
+            log_event "Exit 43: deferring to port holder PID $pid (holder='$holder_ver' ondisk='$ondisk' ppid=$ppid) — current version, user-supervised, or version undeterminable"
+        fi
+    done
+    return $killed
+}}
+
 # Kill any stale freenet network processes before starting.
 # This handles the case where a previous launch daemon restart left a child
 # process still holding the port (e.g. port 7509).
@@ -2995,9 +3141,31 @@ if pkill -f -u "$(id -u)" "freenet network" 2>/dev/null; then
     sleep 2
 fi
 
+# Forward a SIGTERM (sent by launchd on stop / restart) to the node so it can
+# run its graceful drain, rather than relying solely on launchd group-signaling
+# the whole process group. The node handles SIGTERM by draining in-flight
+# client drivers before closing peer connections. Harmless if launchd already
+# group-signals — the child just receives a (deduplicated) TERM either way.
+forward_term() {{
+    [ -n "$WRAPPER_CHILD_PID" ] && kill -TERM "$WRAPPER_CHILD_PID" 2>/dev/null || true
+}}
+trap forward_term TERM
+
 while true; do
-    "{binary}" network 2>"$HOME/Library/Logs/freenet/freenet.error.log.last"
+    # Launch in the background so we know our own child's PID. This lets the
+    # exit-43 self-heal path avoid mistaking our just-exited child for a
+    # stale orphan still holding the port, and lets the TERM trap above forward
+    # launchd's stop signal to the node for a graceful drain.
+    "{binary}" network 2>"$HOME/Library/Logs/freenet/freenet.error.log.last" &
+    WRAPPER_CHILD_PID=$!
+    # `wait` is interrupted by the trapped TERM; re-wait so we collect the
+    # child's real exit status after it finishes draining.
+    wait $WRAPPER_CHILD_PID
     EXIT_CODE=$?
+    while kill -0 "$WRAPPER_CHILD_PID" 2>/dev/null; do
+        wait $WRAPPER_CHILD_PID
+        EXIT_CODE=$?
+    done
 
     if [ $EXIT_CODE -eq 42 ]; then
         log_event "Update needed, running freenet update..."
@@ -3016,7 +3184,19 @@ while true; do
         fi
         continue
     elif [ $EXIT_CODE -eq 43 ]; then
-        log_event "Another instance is already running, exiting cleanly"
+        # Another instance holds the port. Before standing down (which under
+        # launchd SuccessfulExit=false would stop us forever), check whether
+        # the holder is a stale orphan running an old binary and, if so, kill
+        # it and relaunch instead of deferring. See heal_stale_orphan_or_defer.
+        if heal_stale_orphan_or_defer; then
+            log_event "Killed stale orphan holding the port on exit 43, relaunching"
+            CONSECUTIVE_FAILURES=0
+            PORT_CONFLICT_KILLS=0
+            BACKOFF=10
+            sleep 2
+            continue
+        fi
+        log_event "Another instance (current version) is already running, exiting cleanly"
         exit 0
     elif [ $EXIT_CODE -eq 0 ]; then
         log_event "Normal shutdown"
@@ -4261,14 +4441,36 @@ mod tests {
         assert!(service_content.contains("StartLimitBurst=5"));
         assert!(service_content.contains("StartLimitIntervalSec=120"));
 
-        // Verify auto-update support via ExecStopPost
-        assert!(service_content.contains("ExecStopPost="));
+        // Verify auto-update support via ExecStopPost. The `$EXIT_STATUS` systemd
+        // sets in the ExecStopPost environment must reach /bin/sh as a literal
+        // `$EXIT_STATUS`, so it is written doubled (`$$EXIT_STATUS`) in the unit —
+        // systemd collapses `$$` -> `$`. A single-`$` revert silently breaks
+        // auto-update (systemd eats the bare var before sh sees it) with no other
+        // signal, so assert the doubled form, not just the directive's presence.
+        assert!(
+            service_content.contains("ExecStopPost=")
+                && service_content.contains("\"$$EXIT_STATUS\""),
+            "ExecStopPost must use the doubled $$EXIT_STATUS so systemd passes a \
+             literal $EXIT_STATUS to sh (a single-$ revert silently breaks auto-update)"
+        );
 
         // Verify exit code 42 is treated as success (doesn't count against StartLimitBurst)
         assert!(service_content.contains("SuccessExitStatus=42 43"));
 
         // Verify exit code 43 prevents restart (another instance already running)
         assert!(service_content.contains("RestartPreventExitStatus=43"));
+
+        // Regression for #3967: stale-orphan self-heal pre-flight. Because
+        // RestartPreventExitStatus=43 blocks restart on exit 43, the
+        // version-compare-and-kill must run as an ExecStartPre before the main
+        // ExecStart so a stale orphan can't hold the port forever.
+        assert!(
+            service_content.contains("ExecStartPre=")
+                && service_content.contains("Freenet version:")
+                && service_content.contains("kill -TERM")
+                && service_content.contains("kill -KILL"),
+            "systemd unit must run a stale-orphan version-compare-and-kill pre-flight (#3967)"
+        );
 
         // Verify graceful shutdown timeout is set. 45s = 30s drain
         // (default `shutdown-drain-secs`) + 15s peer-teardown headroom.
@@ -4309,13 +4511,28 @@ mod tests {
         assert!(service_content.contains("StartLimitBurst=5"));
         assert!(service_content.contains("StartLimitIntervalSec=120"));
         assert!(service_content.contains("LimitNOFILE=65536"));
-        assert!(service_content.contains("ExecStopPost="));
+        // ExecStopPost must double the env var (`$$EXIT_STATUS`) so systemd passes a
+        // literal `$EXIT_STATUS` to sh; a single-`$` revert silently breaks auto-update.
+        assert!(
+            service_content.contains("ExecStopPost=")
+                && service_content.contains("\"$$EXIT_STATUS\""),
+            "ExecStopPost must use the doubled $$EXIT_STATUS (single-$ revert breaks auto-update)"
+        );
 
         // Verify exit code 42 is treated as success (doesn't count against StartLimitBurst)
         assert!(service_content.contains("SuccessExitStatus=42 43"));
 
         // Verify exit code 43 prevents restart (another instance already running)
         assert!(service_content.contains("RestartPreventExitStatus=43"));
+
+        // Regression for #3967: stale-orphan self-heal pre-flight (system unit).
+        assert!(
+            service_content.contains("ExecStartPre=")
+                && service_content.contains("Freenet version:")
+                && service_content.contains("kill -TERM")
+                && service_content.contains("kill -KILL"),
+            "system systemd unit must run a stale-orphan version-compare-and-kill pre-flight (#3967)"
+        );
 
         // Logging routes to journal (same reasoning as the user-unit test).
         assert!(service_content.contains("StandardOutput=journal"));
@@ -4396,6 +4613,668 @@ mod tests {
             script.contains("EXIT_CODE -eq 42"),
             "wrapper must handle exit code 42 for auto-update"
         );
+    }
+
+    /// Regression for issue #3967: on exit 43 the wrapper must self-heal a
+    /// STALE ORPHAN holding the service port instead of unconditionally
+    /// standing down. Standing down (`exit 0`) under launchd
+    /// SuccessfulExit=false means launchd never respawns us, so an orphaned
+    /// `freenet network` running an OLD binary would serve stale assets
+    /// forever. The fix compares the holder's `Freenet version:` line against
+    /// the on-disk binary and kills a stale orphan (SIGTERM→SIGKILL) before
+    /// relaunching, while still deferring to a genuine current-version
+    /// instance.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_macos_wrapper_exit43_self_heals_stale_orphan() {
+        let binary_path = PathBuf::from("/usr/local/bin/freenet");
+        let script = generate_wrapper_script(&binary_path);
+
+        // The exit-43 branch must invoke the self-heal routine BEFORE the
+        // polite `exit 0`. Without the fix the branch was just a log + exit 0.
+        assert!(
+            script.contains("heal_stale_orphan_or_defer"),
+            "exit-43 path must call the stale-orphan self-heal routine"
+        );
+
+        // It must detect the port holder. We reuse the existing user-scoped
+        // `freenet network` detection rather than needing the port plumbed in.
+        assert!(
+            script.contains("holder_pids")
+                && script.contains("pgrep -f -u \"$(id -u)\" \"freenet network\""),
+            "self-heal must enumerate the port holder process(es)"
+        );
+
+        // It must compare versions: query the holder binary's --version and
+        // the on-disk binary's --version, matching the `Freenet version:` line.
+        assert!(
+            script.contains("--version") && script.contains("Freenet version:"),
+            "self-heal must compare holder vs on-disk `Freenet version:` lines"
+        );
+        assert!(
+            script.contains("ondisk_version"),
+            "self-heal must compute the on-disk binary version for comparison"
+        );
+
+        // MUST-FIX #3: the kill is gated on the holder being an init-adopted
+        // ORPHAN (PPID==1). A user-run `freenet network` (PPID!=1) is never
+        // killed even on a version mismatch. The decision is `[ "$ppid" = "1" ]
+        // && { mismatch || no-holder-version }`, so PPID==1 is a REQUIRED
+        // conjunct, not a mere fallback.
+        assert!(
+            script.contains("[ \"$ppid\" = \"1\" ] && {"),
+            "self-heal must REQUIRE PPID==1 (orphan) before killing, not just as a fallback"
+        );
+
+        // MUST-FIX #4: an unreadable on-disk version ($ondisk empty) must NOT
+        // make every holder look mismatched. version_mismatch is only set when
+        // ondisk is non-empty AND holder_ver is non-empty AND they differ.
+        assert!(
+            script.contains(
+                "[ -n \"$ondisk\" ] && [ -n \"$holder_ver\" ] && [ \"$holder_ver\" != \"$ondisk\" ]"
+            ),
+            "version-mismatch kill signal must require a readable on-disk version (#4 guard)"
+        );
+
+        // Escalation: SIGTERM, wait, then SIGKILL (the incident's orphan
+        // ignored SIGTERM for >11s and needed -9).
+        assert!(
+            script.contains("kill -TERM") && script.contains("kill -KILL"),
+            "self-heal must escalate SIGTERM -> SIGKILL"
+        );
+        assert!(
+            script.contains("kill -0"),
+            "self-heal must poll for liveness between SIGTERM and SIGKILL"
+        );
+
+        // On a detected stale orphan it must RELAUNCH (continue), not exit 0.
+        assert!(
+            script.contains("if heal_stale_orphan_or_defer; then"),
+            "exit-43 path must branch on the self-heal result"
+        );
+        let exit43_idx = script
+            .find("EXIT_CODE -eq 43")
+            .expect("exit-43 branch must exist");
+        let exit43_block = &script[exit43_idx..];
+        let continue_idx = exit43_block
+            .find("continue")
+            .expect("exit-43 path must relaunch (continue) on a killed stale orphan");
+        let exit0_idx = exit43_block
+            .find("exit 0")
+            .expect("exit-43 path must still defer (exit 0) for a current-version instance");
+        assert!(
+            continue_idx < exit0_idx,
+            "relaunch (continue) must come before the polite exit 0 in the exit-43 branch"
+        );
+
+        // Negative assertion (polite path preserved): a current-version holder,
+        // a user-supervised holder, or one whose version can't be determined
+        // still defers. The routine logs a defer and the branch falls through
+        // to `exit 0`.
+        assert!(
+            script.contains("deferring to port holder PID"),
+            "a current-version / user-supervised holder must still be deferred to (polite path preserved)"
+        );
+
+        // The own-child guard prevents mistaking our just-exited child for an
+        // orphan: the wrapper tracks WRAPPER_CHILD_PID and skips it.
+        assert!(
+            script.contains("WRAPPER_CHILD_PID"),
+            "self-heal must skip the wrapper's own child to avoid false positives"
+        );
+
+        // Load-bearing: the generated script must be syntactically valid bash.
+        // If our heredoc escaping is wrong this catches it.
+        let tmp = tempfile::tempdir().unwrap();
+        let script_path = tmp.path().join("wrapper.sh");
+        std::fs::write(&script_path, &script).unwrap();
+        let status = std::process::Command::new("bash")
+            .arg("-n")
+            .arg(&script_path)
+            .status()
+            .expect("failed to run bash -n");
+        assert!(
+            status.success(),
+            "generated wrapper script must be syntactically valid bash"
+        );
+    }
+
+    /// MUST-FIX #1 regression: systemd performs its OWN `$VAR`/`${VAR}`
+    /// expansion on `Exec*` lines BEFORE handing the string to `/bin/sh`, so
+    /// every dollar the SHELL must see has to be written as `$$` in the unit
+    /// file (systemd collapses `$$` -> `$`). A single `$ident` is silently
+    /// eaten to empty and the whole self-heal becomes a no-op that LOOKS
+    /// installed (the `-` prefix swallows the failure). The old
+    /// `.contains("Freenet version:")` smoke tests could not catch that. This
+    /// test renders BOTH units and asserts the on-disk `ExecStartPre` text uses
+    /// the `$$`-doubled form and contains NO bare single-`$` shell identifier
+    /// that systemd would strip, then collapses `$$` -> `$` (emulating systemd)
+    /// and runs `sh -n` on the resulting script body.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_systemd_execstartpre_doubles_shell_dollars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary_path = PathBuf::from("/usr/local/bin/freenet");
+        let log_dir = PathBuf::from("/home/test/.local/state/freenet");
+        let username = "test";
+        let home_dir = PathBuf::from("/home/test");
+
+        let units = [
+            ("user", generate_user_service_file(&binary_path, &log_dir)),
+            (
+                "system",
+                generate_system_service_file(&binary_path, &log_dir, username, &home_dir),
+            ),
+        ];
+
+        for (which, unit) in units {
+            let pre = unit
+                .lines()
+                .find(|l| l.starts_with("ExecStartPre=-/bin/sh -c "))
+                .unwrap_or_else(|| panic!("{which} unit must have a self-heal ExecStartPre"));
+
+            // Post-render the file on disk MUST carry the systemd-level `$$`
+            // form for the shell identifiers the pre-flight relies on.
+            for needle in ["$$pid", "$$exe", "$$ondisk", "$$self", "$$(id -u)"] {
+                assert!(
+                    pre.contains(needle),
+                    "{which} ExecStartPre must double shell dollars (missing `{needle}`); \
+                     a single `$` is eaten by systemd's own expansion and the self-heal \
+                     silently no-ops (#3967 MUST-FIX 1)"
+                );
+            }
+
+            // And it must NOT contain the bare single-`$` forms that systemd
+            // would strip to empty. These are the exact identifiers from the
+            // pre-flight; if any appears single-`$` the escaping regressed.
+            // NB: we cannot blanket-assert absence of `$(id -u)` because the
+            // VALID doubled form `$$(id -u)` contains it as a substring; the
+            // `$$(id -u)` presence check above covers that identifier instead.
+            for bad in [
+                "/proc/$pid/",
+                "\"$pid\"",
+                "\"$exe\"",
+                "\"$ondisk\"",
+                "\"$self\"",
+            ] {
+                assert!(
+                    !pre.contains(bad),
+                    "{which} ExecStartPre contains bare single-`$` `{bad}` that systemd \
+                     would strip; it must be doubled to `$$` (#3967 MUST-FIX 1)"
+                );
+            }
+
+            // MUST-FIX #6: PPID is parsed after the FINAL ')' of
+            // /proc/PID/stat, not as a fixed awk field of the raw line (a comm
+            // with whitespace would shift fields).
+            assert!(
+                pre.contains("sed \"s/.*) //\""),
+                "{which} ExecStartPre must parse PPID after the final ')' in \
+                 /proc/PID/stat, not by fixed field index (#3967 MUST-FIX 6)"
+            );
+
+            // MUST-FIX #5: the pre-flight must exclude its own sh PID (`$$$$`
+            // -> the sh's `$$`) and PID 1. The pre-flight's own argv contains
+            // the literal "freenet network" (the substring `pgrep -f` matches),
+            // so the self-PID + PID-1 skips are what keep it from killing
+            // itself.
+            assert!(
+                pre.contains("self=$$$$") && pre.contains("[ \"$$pid\" = \"$$self\" ] && continue"),
+                "{which} ExecStartPre must skip its own sh PID (#3967 MUST-FIX 5)"
+            );
+            assert!(
+                pre.contains("[ \"$$pid\" = \"1\" ] && continue"),
+                "{which} ExecStartPre must skip PID 1 (#3967 MUST-FIX 5)"
+            );
+            // MUST-FIX (round-2 RE-REVIEW): the pre-flight must NOT anchor on
+            // the holder's exe equalling this unit's on-disk binary. A #3967
+            // orphan is by definition running an OLD/DIFFERENT binary, so an
+            // `exe == on-disk binary` guard skips exactly the process we must
+            // kill — defeating the whole self-heal. The earlier round-1 form
+            // `[ -n "$$bin" ] && [ "$$exe" != "$$bin" ] && continue` is the
+            // broken guard and must never come back.
+            assert!(
+                !pre.contains("[ \"$$exe\" != \"$$bin\" ]"),
+                "{which} ExecStartPre must NOT anchor on exe == current on-disk \
+                 binary; that guard skips the old-binary orphan it must kill \
+                 (#3967 round-2 RE-REVIEW)"
+            );
+
+            // MUST-FIX #3/#4: kill is gated on PPID==1 AND (readable-version
+            // mismatch OR unreadable holder version). Render-level check.
+            assert!(
+                pre.contains("[ \"$$ppid\" = \"1\" ] &&"),
+                "{which} ExecStartPre must require PPID==1 before killing (#3967 MUST-FIX 3)"
+            );
+
+            // Now emulate systemd's `$$` -> `$` collapse and confirm the body
+            // is valid POSIX sh. This is the load-bearing end-to-end check that
+            // the escaping produces a runnable script (the bug shipped because
+            // nothing rendered + lexed the post-systemd form).
+            let on_disk = pre
+                .strip_prefix("ExecStartPre=-/bin/sh -c '")
+                .and_then(|s| s.strip_suffix('\''))
+                .unwrap_or_else(|| panic!("{which} ExecStartPre quoting unexpected"));
+            let sh_body = on_disk.replace("$$", "$");
+
+            let body_path = tmp.path().join(format!("{which}_execstartpre.sh"));
+            std::fs::write(&body_path, &sh_body).unwrap();
+            let status = std::process::Command::new("sh")
+                .arg("-n")
+                .arg(&body_path)
+                .status()
+                .expect("failed to run sh -n");
+            assert!(
+                status.success(),
+                "{which} ExecStartPre body must be valid POSIX sh after systemd \
+                 collapses `$$` -> `$` (#3967 MUST-FIX 1)"
+            );
+        }
+    }
+
+    /// Behavioral regression for the exit-43 self-heal DECISION (#3967). The
+    /// render/`sh -n` tests prove the script PARSES; this proves it DECIDES
+    /// correctly. We extract the heal routine from the generated wrapper, point
+    /// it at a REAL on-disk fake binary (so `ondisk_version` is non-empty), and
+    /// shim `pgrep`/`ps`/`kill`/`readlink`/`timeout` plus a separate holder
+    /// binary via PATH. Cases:
+    ///   (a) version-mismatched PPID==1 orphan      -> KILLED (relaunch),
+    ///   (b) same-version PPID==1 holder            -> DEFERRED (polite path),
+    ///   (c) version-mismatched but PPID!=1 holder  -> DEFERRED (MUST-FIX #3:
+    ///       never SIGKILL a hand-run / supervised node),
+    ///   (d) version-mismatched orphan but UNREADABLE on-disk version
+    ///       -> DEFERRED (MUST-FIX #4: don't cull a healthy node mid-update),
+    ///   (e) the holder pid == our own child       -> SKIPPED / DEFERRED.
+    ///
+    /// macOS-only because it extracts the heal helpers from the macOS wrapper
+    /// (`generate_wrapper_script`); the systemd inline path is covered by the
+    /// render + `sh -n` test above.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_exit43_heal_decision_behavior() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        let chmod_x = |p: &std::path::Path| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+
+        // Real on-disk binary baked into the wrapper. Prints a FIXED version.
+        // Its readability is toggled per-case via the ONDISK_READABLE env that
+        // the script consults (see wrapper-version override below); when the
+        // file itself is non-executable, ondisk_version() returns empty.
+        let ondisk_bin = dir.join("freenet");
+        std::fs::write(
+            &ondisk_bin,
+            "#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo \"Freenet version: 1.0.0 (current)\"\nexit 0\n",
+        )
+        .unwrap();
+        chmod_x(&ondisk_bin);
+
+        // Holder binary: a DIFFERENT path whose version is env-controlled, so
+        // we can drive match vs mismatch independently of the on-disk binary.
+        let holder_bin = dir.join("holder-freenet");
+        std::fs::write(
+            &holder_bin,
+            "#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo \"Freenet version: ${HOLDER_VER}\"\nexit 0\n",
+        )
+        .unwrap();
+        chmod_x(&holder_bin);
+
+        // Extract the heal helpers from the REAL generated wrapper so the test
+        // exercises rendered logic, not a copy. The wrapper bakes in the
+        // on-disk binary path, so ondisk_version() points at `ondisk_bin`.
+        let wrapper = generate_wrapper_script(&ondisk_bin);
+        let start = wrapper
+            .find("version_line() {")
+            .expect("wrapper must define version_line");
+        let end_marker = "# Kill any stale freenet network processes before starting.";
+        let end = wrapper.find(end_marker).expect("wrapper layout changed");
+        let helpers = &wrapper[start..end];
+
+        // `kill` and `sleep` are shell builtins, so a PATH shim wouldn't be
+        // consulted. Override them as shell FUNCTIONS (functions beat builtins)
+        // so we can observe the kill and skip the real up-to-12s wait. `kill`
+        // records SIGTERM/SIGKILL to a marker; `kill -0` reports the holder
+        // alive until that marker exists (so the TERM->poll->KILL loop ends).
+        let killed_marker = dir.join("killed");
+        let harness = format!(
+            r#"#!/bin/sh
+log_event() {{ :; }}
+sleep() {{ :; }}
+kill() {{
+  sig=""
+  case "$1" in -*) sig="$1"; shift;; esac
+  case "$sig" in
+    -0) [ -f "{marker}" ] && return 1; return 0;;
+    -TERM|-15|-KILL|-9) : > "{marker}"; return 0;;
+    *) return 0;;
+  esac
+}}
+WRAPPER_CHILD_PID=999999
+{helpers}
+heal_stale_orphan_or_defer
+echo "RC=$?"
+"#,
+            marker = killed_marker.display()
+        );
+        let harness_path = dir.join("harness.sh");
+        std::fs::write(&harness_path, harness).unwrap();
+        chmod_x(&harness_path);
+
+        // PATH shims. Holder pid fixed at 4242 (unless overridden by PGREP_PID).
+        let bin = dir.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let write_shim = |name: &str, body: String| {
+            let p = bin.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
+            chmod_x(&p);
+        };
+
+        // pgrep: emit the holder pid (env-overridable to test self-exclusion).
+        write_shim("pgrep", "echo \"${PGREP_PID:-4242}\"\n".to_string());
+        // ps: -o ppid= -> $HOLDER_PPID ; -o command=/comm= -> the holder's full
+        // argv, which (like the real wrapper) is `<binary> network`. The
+        // $HOLDER_BIN env lets a case drive a spaced install path so the
+        // holder_exe sed-strip (not awk whitespace-split) is exercised. We emit
+        // the ` network` suffix so the strip has something to remove, mirroring
+        // production argv.
+        write_shim(
+            "ps",
+            "for a in \"$@\"; do case \"$a\" in \
+             ppid=) echo \"$HOLDER_PPID\"; exit 0;; \
+             command=|comm=) echo \"$HOLDER_BIN network\"; exit 0;; esac; done\nexit 0\n"
+                .to_string(),
+        );
+        // readlink -f: map any /proc/PID/exe to the holder binary; passthrough.
+        write_shim(
+            "readlink",
+            format!(
+                "last=\"\"; for a in \"$@\"; do last=\"$a\"; done; \
+                 case \"$last\" in */proc/*/exe) echo \"{}\";; *) echo \"$last\";; esac\n",
+                holder_bin.display()
+            ),
+        );
+        // timeout: drop the leading duration arg and exec the rest.
+        write_shim("timeout", "shift\nexec \"$@\"\n".to_string());
+
+        let path_env = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+
+        // Returns (stdout, holder_was_killed). `holder_bin_override` lets a case
+        // point the holder at a DIFFERENT (e.g. space-containing) install path
+        // so we exercise `holder_exe`'s suffix-strip; defaults to `holder_bin`.
+        let default_holder_bin = holder_bin.display().to_string();
+        let run = |holder_ver: &str,
+                   holder_ppid: &str,
+                   pgrep_pid: Option<&str>,
+                   holder_bin_override: Option<&str>|
+         -> (String, bool) {
+            std::fs::remove_file(&killed_marker).ok();
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg(&harness_path)
+                .env("PATH", &path_env)
+                .env("HOLDER_VER", holder_ver)
+                .env("HOLDER_PPID", holder_ppid)
+                .env(
+                    "HOLDER_BIN",
+                    holder_bin_override.unwrap_or(&default_holder_bin),
+                );
+            if let Some(p) = pgrep_pid {
+                cmd.env("PGREP_PID", p);
+            }
+            let out = cmd.output().expect("failed to run heal harness");
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            (stdout, killed_marker.exists())
+        };
+
+        // (a) orphan (PPID==1) on an OLD version vs the current on-disk 1.0.0.
+        // NOTE: holder_bin is a DIFFERENT path from the on-disk binary, so this
+        // also locks the round-2 RE-REVIEW invariant: a holder whose resolved
+        // exe path differs from the unit's on-disk binary is STILL a kill target
+        // when it is an old-version PPID==1 orphan (the systemd exe==bin anchor
+        // wrongly skipped exactly this case).
+        let (out_a, killed_a) = run("0.9.0 (old)", "1", None, None);
+        assert!(
+            out_a.contains("RC=0") && killed_a,
+            "version-mismatched PPID==1 orphan must be KILLED + relaunch (RC=0), got: {out_a}"
+        );
+
+        // (b) orphan (PPID==1) running the SAME current version -> defer.
+        let (out_b, killed_b) = run("1.0.0 (current)", "1", None, None);
+        assert!(
+            out_b.contains("RC=1") && !killed_b,
+            "same-version holder must be DEFERRED, not killed (polite path), got: {out_b}"
+        );
+
+        // (c) MUST-FIX #3: version-mismatched but USER-parented (PPID!=1) -> defer.
+        let (out_c, killed_c) = run("0.9.0 (old)", "4321", None, None);
+        assert!(
+            out_c.contains("RC=1") && !killed_c,
+            "version-mismatched but user-parented (PPID!=1) holder must be DEFERRED (#3967 MUST-FIX 3), got: {out_c}"
+        );
+
+        // (d) MUST-FIX #4: same mismatch + orphan, but on-disk version UNREADABLE.
+        // Make the baked-in binary non-executable so ondisk_version() is empty;
+        // the mismatch signal must then be suppressed and a readable holder
+        // deferred to (don't cull a healthy node mid-update).
+        std::fs::set_permissions(&ondisk_bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (out_d, killed_d) = run("0.9.0 (old)", "1", None, None);
+        assert!(
+            out_d.contains("RC=1") && !killed_d,
+            "unreadable on-disk version must suppress the mismatch kill signal (#3967 MUST-FIX 4), got: {out_d}"
+        );
+        chmod_x(&ondisk_bin); // restore
+
+        // (e) self-exclusion: the only holder pid IS our own child -> skip/defer.
+        let (out_e, killed_e) = run("0.9.0 (old)", "1", Some("999999"), None);
+        assert!(
+            out_e.contains("RC=1") && !killed_e,
+            "the routine must never target its own child PID (#3967), got: {out_e}"
+        );
+
+        // (f) NIT 2 regression: an install path that contains a SPACE must still
+        // resolve cleanly so version comparison works. `holder_exe` strips the
+        // trailing ` network` argv rather than awk-splitting on whitespace; the
+        // old `awk '{print $1}'` would have truncated this to `/Some` and made
+        // the holder version unreadable. We place a real old-version binary at a
+        // spaced path and assert the orphan is still KILLED (its version is read
+        // and seen to differ), proving the path was recovered intact.
+        let spaced_dir = dir.join("Some User").join("bin");
+        std::fs::create_dir_all(&spaced_dir).unwrap();
+        let spaced_holder = spaced_dir.join("freenet");
+        std::fs::write(
+            &spaced_holder,
+            "#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo \"Freenet version: 0.9.0 (old)\"\nexit 0\n",
+        )
+        .unwrap();
+        chmod_x(&spaced_holder);
+        let (out_f, killed_f) = run(
+            "ignored-uses-real-binary",
+            "1",
+            None,
+            Some(&spaced_holder.display().to_string()),
+        );
+        assert!(
+            out_f.contains("RC=0") && killed_f,
+            "old-version PPID==1 orphan at a space-containing install path must be \
+             KILLED — holder_exe must recover the full path, not truncate at the \
+             first space (NIT 2), got: {out_f}"
+        );
+    }
+
+    /// Behavioral regression for the SYSTEMD inline self-heal DECISION (#3967,
+    /// round-2 RE-REVIEW). The render + `sh -n` test proves the inline body
+    /// PARSES; this proves it DECIDES correctly. Crucially it locks the round-2
+    /// fix: the round-1 unit anchored the holder loop on
+    /// `[ "$exe" != "$bin" ] && continue`, which skipped every holder whose exe
+    /// differed from the unit's on-disk binary — i.e. exactly the stale orphan
+    /// (running an OLD binary) the self-heal exists to kill. Here the fake
+    /// holder's exe path is DIFFERENT from the on-disk binary, and we assert it
+    /// IS killed.
+    ///
+    /// We extract the `ExecStartPre` `/bin/sh -c '...'` body from the rendered
+    /// unit, collapse systemd's `$$` -> `$`, and run it under `sh` with
+    /// PATH-shimmed `pgrep`/`readlink`/`timeout` and a `kill` shell function
+    /// (functions beat the builtin) that records targets to a marker.
+    ///
+    /// Linux-only because it exercises the `/proc`-based systemd inline path
+    /// and the unit generators are `#[cfg(target_os = "linux")]`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_systemd_execstartpre_heal_decision_behavior() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let chmod_x = |p: &std::path::Path| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+
+        // On-disk binary baked into the unit (the binary the unit would launch).
+        // Prints a FIXED current version. Lives at one path...
+        let ondisk_bin = dir.join("freenet");
+        std::fs::write(
+            &ondisk_bin,
+            "#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo \"Freenet version: 1.0.0 (current)\"\nexit 0\n",
+        )
+        .unwrap();
+        chmod_x(&ondisk_bin);
+
+        // ...the holder binary lives at a DIFFERENT path (this is the whole
+        // point: a #3967 orphan runs an old/different binary). Its version is
+        // env-controlled so we can drive match vs mismatch.
+        let holder_bin = dir.join("old").join("freenet");
+        std::fs::create_dir_all(holder_bin.parent().unwrap()).unwrap();
+        std::fs::write(
+            &holder_bin,
+            "#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo \"Freenet version: ${HOLDER_VER}\"\nexit 0\n",
+        )
+        .unwrap();
+        chmod_x(&holder_bin);
+
+        // Render the user unit and carve out the ExecStartPre `/bin/sh -c '...'`
+        // body, then collapse `$$` -> `$` exactly as systemd does before exec.
+        let log_dir = dir.join("logs");
+        let unit = generate_user_service_file(&ondisk_bin, &log_dir);
+        let pre = unit
+            .lines()
+            .find(|l| l.starts_with("ExecStartPre=-/bin/sh -c "))
+            .expect("unit must have a self-heal ExecStartPre");
+        let body = pre
+            .strip_prefix("ExecStartPre=-/bin/sh -c '")
+            .and_then(|s| s.strip_suffix('\''))
+            .expect("ExecStartPre quoting unexpected")
+            .replace("$$", "$");
+
+        // PATH shims. `pgrep` emits the holder pid; `readlink -f /proc/PID/exe`
+        // maps to the holder binary; `timeout` drops the duration and execs the
+        // rest. `kill`/`sleep` are overridden as shell FUNCTIONS in the harness.
+        let bin = dir.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let write_shim = |name: &str, src: String| {
+            let p = bin.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{src}")).unwrap();
+            chmod_x(&p);
+        };
+        write_shim("pgrep", "echo \"${PGREP_PID:-4242}\"\n".to_string());
+        // readlink: -f <on-disk binary path> passes through (so `bin=` would
+        // resolve if it existed); /proc/PID/exe -> the holder binary; otherwise
+        // echo the last arg. The exe!=bin path is what the round-1 anchor broke.
+        write_shim(
+            "readlink",
+            format!(
+                "last=\"\"; for a in \"$@\"; do last=\"$a\"; done; \
+                 case \"$last\" in */proc/*/exe) echo \"{}\";; *) echo \"$last\";; esac\n",
+                holder_bin.display()
+            ),
+        );
+        write_shim("timeout", "shift\nexec \"$@\"\n".to_string());
+
+        // `sed`/`awk`/`grep`/`id` come from the real PATH; the /proc/PID/stat
+        // read is shimmed via a fake stat file the body reads. Replace the
+        // `/proc/$pid/stat` literal with our fixture so PPID is controllable.
+        let stat_file = dir.join("stat");
+        // Format mirrors /proc/PID/stat: "PID (comm) STATE PPID ...". The body
+        // does `sed "s/.*) //"` then `awk '{print $2}'`, so PPID must be field 2
+        // AFTER the final ')'. We park a comm WITH spaces to also keep the
+        // round-1 MUST-FIX 6 (whitespace-comm) honest.
+        let body = body.replace("/proc/$pid/stat", &stat_file.display().to_string());
+        // The readlink call also references /proc/$pid/exe; leave it so the
+        // shim's */proc/*/exe arm fires.
+
+        let killed_marker = dir.join("killed");
+        let path_env = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+
+        // Returns (holder_was_killed). HOLDER_PPID drives the fake stat file's
+        // PPID field; HOLDER_VER drives the holder binary's version.
+        let run = |holder_ver: &str, holder_ppid: &str, pgrep_pid: Option<&str>| -> bool {
+            std::fs::remove_file(&killed_marker).ok();
+            std::fs::write(
+                &stat_file,
+                format!("4242 (freenet network) S {holder_ppid} 1 1 0 -1\n"),
+            )
+            .unwrap();
+            let harness = format!(
+                "#!/bin/sh\nkill() {{ sig=\"\"; case \"$1\" in -*) sig=\"$1\"; shift;; esac; \
+                 case \"$sig\" in -0) [ -f \"{marker}\" ] && return 1; return 0;; \
+                 -TERM|-15|-KILL|-9) : > \"{marker}\"; return 0;; *) return 0;; esac; }}\n\
+                 sleep() {{ :; }}\n{body}\n",
+                marker = killed_marker.display(),
+                body = body,
+            );
+            let harness_path = dir.join("harness.sh");
+            std::fs::write(&harness_path, harness).unwrap();
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg(&harness_path)
+                .env("PATH", &path_env)
+                .env("HOLDER_VER", holder_ver);
+            if let Some(p) = pgrep_pid {
+                cmd.env("PGREP_PID", p);
+            }
+            cmd.output().expect("failed to run systemd heal harness");
+            killed_marker.exists()
+        };
+
+        // (a) ROUND-2 CORE: orphan (PPID==1) running an OLD version at a
+        // DIFFERENT exe path than the on-disk binary -> MUST be KILLED. The
+        // round-1 `exe != bin` anchor skipped exactly this case.
+        assert!(
+            run("0.9.0 (old)", "1", None),
+            "systemd self-heal must KILL an old-version PPID==1 orphan whose exe \
+             path differs from the on-disk binary (round-2 RE-REVIEW: the \
+             exe==bin anchor wrongly skipped it)"
+        );
+
+        // (b) orphan (PPID==1) running the SAME current version -> DEFER.
+        assert!(
+            !run("1.0.0 (current)", "1", None),
+            "systemd self-heal must DEFER to a same-version holder (polite path)"
+        );
+
+        // (c) version-mismatched but USER-parented (PPID!=1) -> DEFER.
+        assert!(
+            !run("0.9.0 (old)", "4321", None),
+            "systemd self-heal must DEFER to a user-parented (PPID!=1) holder (#3967 MUST-FIX 3)"
+        );
+
+        // (d) on-disk binary version UNREADABLE (`$ondisk` empty) -> DEFER even for
+        // a PPID==1 orphan whose own version IS readable. With no trustworthy
+        // baseline we must not version-compare; killing here would reap a healthy
+        // current node during an update window when the binary is momentarily
+        // unreadable. Mirrors the macOS test's chmod-644 case (#3967 MUST-FIX 4),
+        // which the systemd path's `[ -n "$$ondisk" ]` guard implements but had no
+        // behavioral coverage on Linux (rule-review Info on #4408).
+        std::fs::set_permissions(&ondisk_bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            !run("0.9.0 (old)", "1", None),
+            "systemd self-heal must DEFER when the on-disk version is unreadable, even \
+             for a readable-version PPID==1 orphan (#3967 MUST-FIX 4: empty $ondisk \
+             must not drive a kill)"
+        );
+        chmod_x(&ondisk_bin); // restore for any later use
     }
 
     #[test]
