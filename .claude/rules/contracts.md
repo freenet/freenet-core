@@ -273,14 +273,18 @@ MUST:
     `handle_deferred_resume`). This keeps the single-threaded loop from
     stalling on the 10s fetch while other contracts' events (including
     cached GETs) drain. WASM validate/store still runs serially on the
-    loop; only the network WAIT moves off-loop. While a contract has an
-    in-flight deferral the loop HOLDS that contract's later events to
-    preserve per-contract FIFO; the block is released (and held events
-    re-queued at the FRONT) by the deferral's resume. The off-loop waiter
+    loop; only the network WAIT moves off-loop. The off-loop waiter
     delivers EXACTLY ONE resume via an RAII `ResumeGuard` (Drop delivers a
     MissingRelated resume if the task is dropped before sending), so every
-    deferral terminates with exactly one client answer — no TTL sweep or
-    stale-resume guard is needed.
+    deferral terminates with exactly one client answer.
+    There is NO per-contract ordering/blocking: a GET/UPDATE for a contract
+    whose PUT is mid-deferral runs immediately in normal fair-queue order and
+    may observe the pre-deferral state — this reordering is intended (the
+    per-contract-FIFO machinery was removed in #4391 round 5). The deferring
+    op's own response is still delivered only on commit (its responder is
+    parked by `deferral_id`), and the resume re-reads CURRENT state, so
+    concurrent same-key deferrals reconcile via the contract's CRDT merge
+    exactly as two concurrent same-key UPDATEs would — no lost update.
 ```
 
 ### WHEN a contract's validate_state returns RequestRelated

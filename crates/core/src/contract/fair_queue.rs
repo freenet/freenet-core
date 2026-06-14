@@ -146,98 +146,6 @@ impl FairEventQueue {
         Ok(())
     }
 
-    /// Re-enqueue events at the FRONT of their per-contract bucket, preserving
-    /// the given FIFO order (`events[0]` ends up first to be popped).
-    ///
-    /// Used by the #4391 deferral machinery to restore events that were held
-    /// behind an in-flight deferral: those events arrived BEFORE any fresh
-    /// same-key event still sitting in the bucket, so per-contract FIFO requires
-    /// them to run first. `try_push` (back-append) would wrongly order them
-    /// after fresh events.
-    ///
-    /// On overflow (the queue can't fit all of `events`), the OLDEST prefix is
-    /// accepted and the NEWEST suffix is rejected — we must never re-queue a
-    /// newer same-key event while rejecting an older one (that would itself
-    /// violate the per-contract FIFO this machinery exists to provide). The
-    /// reachable cap here is the GLOBAL one (`MAX_TOTAL_FAIR_QUEUE`): held events
-    /// from one deferral are all for the same contract key and number at most
-    /// `MAX_HELD_PER_DEFERRAL == MAX_QUEUED_PER_CONTRACT`, so the per-contract
-    /// bucket cannot overflow from this call alone, but the global total can
-    /// under load.
-    ///
-    /// Returns the rejected events in their original FIFO order so the caller
-    /// can answer those clients with backpressure rather than silently dropping
-    /// them.
-    ///
-    /// # Assumption
-    /// All `events` are expected to share one `extract_contract_id` (the loop
-    /// only holds events for the single deferred key), so capacity can be
-    /// computed once against that one bucket. A `debug_assert` enforces this;
-    /// in release builds a stray differing key is still handled correctly (it
-    /// just lands in its own bucket via the per-event routing below).
-    pub(super) fn requeue_front(
-        &mut self,
-        events: std::collections::VecDeque<(EventId, ContractHandlerEvent)>,
-    ) -> Vec<(EventId, ContractHandlerEvent)> {
-        if events.is_empty() {
-            return Vec::new();
-        }
-
-        // Determine the single target bucket (all held events share one key).
-        let target_id = extract_contract_id(&events[0].1);
-        debug_assert!(
-            events
-                .iter()
-                .all(|(_, e)| extract_contract_id(e) == target_id),
-            "requeue_front assumes all held events share one contract id"
-        );
-
-        // Compute capacity ONCE so we accept the oldest prefix and reject the
-        // newest suffix, never the reverse. Bound by both the global cap and the
-        // target bucket's per-contract cap.
-        let global_free = MAX_TOTAL_FAIR_QUEUE.saturating_sub(self.total_queued);
-        let bucket_len = match target_id {
-            Some(id) => self.contract_queues.get(&id).map_or(0, |q| q.len()),
-            None => self.default_queue.len(),
-        };
-        let bucket_free = MAX_QUEUED_PER_CONTRACT.saturating_sub(bucket_len);
-        let capacity = global_free.min(bucket_free);
-
-        let mut events: Vec<(EventId, ContractHandlerEvent)> = events.into_iter().collect();
-        // Reject the NEWEST suffix (events[capacity..]); the split_off keeps the
-        // rejected list in original FIFO order for the caller.
-        let rejected = if events.len() > capacity {
-            events.split_off(capacity)
-        } else {
-            Vec::new()
-        };
-
-        // Front-push the accepted prefix in REVERSE so that after all
-        // push_fronts the bucket front holds events[0], events[1], ... in order
-        // (events[0] pops first).
-        for (id, event) in events.into_iter().rev() {
-            match extract_contract_id(&event) {
-                Some(contract_id) => {
-                    let queue = self.contract_queues.entry(contract_id).or_default();
-                    if queue.is_empty() {
-                        self.round_robin.push_back(QueueKey::Contract(contract_id));
-                    }
-                    queue.push_front((id, event));
-                    self.total_queued += 1;
-                }
-                None => {
-                    if self.default_queue.is_empty() {
-                        self.round_robin.push_back(QueueKey::Default);
-                    }
-                    self.default_queue.push_front((id, event));
-                    self.total_queued += 1;
-                }
-            }
-        }
-
-        rejected
-    }
-
     /// Pop one event in round-robin order.
     ///
     /// Takes the front key from the round-robin, pops one event from that queue.
@@ -303,7 +211,7 @@ impl FairEventQueue {
 ///
 /// Returns `Some(ContractInstanceId)` for events associated with a specific contract,
 /// or `None` for events with no contract identity (delegate requests, disconnects, etc.).
-pub(super) fn extract_contract_id(event: &ContractHandlerEvent) -> Option<ContractInstanceId> {
+fn extract_contract_id(event: &ContractHandlerEvent) -> Option<ContractInstanceId> {
     match event {
         ContractHandlerEvent::PutQuery { key, .. }
         | ContractHandlerEvent::UpdateQuery { key, .. }

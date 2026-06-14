@@ -86,15 +86,6 @@ const MAX_INFLIGHT_DEFERRALS: usize = 256;
 /// bounded-batch rationale.
 const MAX_RESUME_DRAIN_BATCH: usize = 16;
 
-/// Maximum same-key events held behind a single in-flight deferral before the
-/// loop rejects further same-key events with backpressure.
-///
-/// While a contract's PUT/UPDATE defers, later same-key events are held to
-/// preserve per-contract FIFO (#4391). This bounds that held buffer so a
-/// contract flooded with events during a long deferral can't grow it without
-/// limit — matching the spirit of the fair queue's per-contract cap.
-const MAX_HELD_PER_DEFERRAL: usize = 100;
-
 /// A PUT/UPDATE that deferred its related-contract fetch off the serial loop,
 /// carrying everything needed to re-run the upsert once the fetch resolves.
 ///
@@ -225,49 +216,29 @@ impl Drop for ResumeGuard {
     }
 }
 
-/// Outcome of attempting to hold a same-key event behind an in-flight deferral.
-enum HoldOutcome {
-    /// The event was held behind the deferral (FIFO).
-    Held,
-    /// The key isn't deferred (raced a release) — the caller should run the event.
-    NotDeferred(handler::EventId, ContractHandlerEvent),
-    /// The per-deferral held buffer is full — the caller must reject the event
-    /// with backpressure rather than hold it.
-    Full(handler::EventId, ContractHandlerEvent),
-}
-
-/// Bookkeeping for one contract whose PUT/UPDATE has an in-flight off-loop
-/// related-contract fetch. While this entry exists, the loop HOLDS every other
-/// event for the same contract (per-contract FIFO), releasing them only when
-/// the deferral's (guaranteed exactly-one) resume runs. See issue #4391.
-struct DeferralEntry {
-    /// `deferral_id` of the in-flight op (links to the stashed responder).
-    /// Used to assert the resume is for this live deferral (#4391 invariant).
-    deferral_id: u64,
-    /// Same-key events that arrived while this contract was deferred, kept in
-    /// FIFO arrival order. Re-queued ahead of fresh events when the deferral
-    /// releases.
-    held: std::collections::VecDeque<(handler::EventId, ContractHandlerEvent)>,
-}
-
 /// Loop-side state for off-loading deferred related-contract fetches (#4391).
 ///
 /// Owned by `contract_handling`; passed by `&mut` into `handle_contract_event`
 /// so the PUT/UPDATE arms can defer. When this context is absent (e.g. the
 /// delegate-driven PUT path, or direct unit-test calls to
 /// `handle_contract_event`), the arms keep the legacy inline-fetch behavior.
+///
+/// NOTE: there is deliberately NO per-contract ordering/blocking here. A GET or
+/// UPDATE for a contract whose PUT is mid-deferral runs immediately in normal
+/// fair-queue order and may observe the pre-PUT state; the PUT issuer's own
+/// response is still delivered only on commit (via its stashed responder), so
+/// its causality holds. Two same-key ops can also defer concurrently (bounded
+/// globally by `MAX_INFLIGHT_DEFERRALS`); each resumes independently and
+/// re-runs its upsert against CURRENT state, so the contract's CRDT merge
+/// reconciles them exactly as it would two concurrent same-key UPDATEs — no
+/// lost update. This reordering is the intended, accepted behavior (the
+/// per-contract-FIFO machinery was removed in #4391 round 5).
 struct DeferralCtx {
     /// Off-loop waiters send completed [`DeferredResume`]s back to the loop here.
     resume_tx: tokio::sync::mpsc::UnboundedSender<DeferredResume>,
     /// Client responders parked while their op's related fetch runs off-loop,
     /// keyed by `deferral_id`. Drained by the loop when the resume arrives.
     stashed: std::collections::HashMap<u64, StashedResponder>,
-    /// Contracts with an in-flight deferral, keyed by `ContractInstanceId`.
-    /// While a key is present here, the loop holds that contract's subsequent
-    /// events (per-contract FIFO) instead of running them before the deferred
-    /// upsert commits — see [`DeferralEntry`]. Keyed by the same id the fair
-    /// queue uses (`extract_contract_id`).
-    deferred_keys: std::collections::HashMap<ContractInstanceId, DeferralEntry>,
     /// Monotonic id generator for `deferral_id`.
     next_deferral_id: u64,
 }
@@ -277,7 +248,6 @@ impl DeferralCtx {
         Self {
             resume_tx,
             stashed: std::collections::HashMap::new(),
-            deferred_keys: std::collections::HashMap::new(),
             next_deferral_id: 0,
         }
     }
@@ -286,57 +256,6 @@ impl DeferralCtx {
     /// defer (it falls back to surfacing `MissingRelated`).
     fn at_capacity(&self) -> bool {
         self.stashed.len() >= MAX_INFLIGHT_DEFERRALS
-    }
-
-    /// `true` if `contract_id` currently has an in-flight deferral, meaning its
-    /// other events must be held rather than processed.
-    fn is_key_deferred(&self, contract_id: &ContractInstanceId) -> bool {
-        self.deferred_keys.contains_key(contract_id)
-    }
-
-    /// Park a same-key event behind an in-flight deferral, preserving FIFO.
-    /// See [`HoldOutcome`] for the three outcomes.
-    fn hold_event(
-        &mut self,
-        contract_id: ContractInstanceId,
-        id: handler::EventId,
-        event: ContractHandlerEvent,
-    ) -> HoldOutcome {
-        match self.deferred_keys.get_mut(&contract_id) {
-            Some(entry) => {
-                // Bound the held buffer so a contract that keeps receiving
-                // events during a long deferral can't grow it without limit.
-                // Mirrors the fair queue's per-contract cap.
-                if entry.held.len() >= MAX_HELD_PER_DEFERRAL {
-                    return HoldOutcome::Full(id, event);
-                }
-                entry.held.push_back((id, event));
-                HoldOutcome::Held
-            }
-            None => HoldOutcome::NotDeferred(id, event),
-        }
-    }
-
-    /// Mark `contract_id` as having an in-flight deferral so its later events
-    /// are held until the deferral resolves.
-    fn block_key(&mut self, contract_id: ContractInstanceId, deferral_id: u64) {
-        self.deferred_keys.insert(
-            contract_id,
-            DeferralEntry {
-                deferral_id,
-                held: std::collections::VecDeque::new(),
-            },
-        );
-    }
-
-    /// Release a contract's deferral block, returning the held same-key events
-    /// (FIFO) so the loop can re-enqueue them. Returns `None` if the key wasn't
-    /// blocked.
-    fn release_key(
-        &mut self,
-        contract_id: &ContractInstanceId,
-    ) -> Option<std::collections::VecDeque<(handler::EventId, ContractHandlerEvent)>> {
-        self.deferred_keys.remove(contract_id).map(|e| e.held)
     }
 }
 
@@ -1092,13 +1011,8 @@ where
         for _ in 0..MAX_RESUME_DRAIN_BATCH {
             match resume_rx.try_recv() {
                 Ok(resume) => {
-                    handle_deferred_resume(
-                        &mut contract_handler,
-                        &mut deferral_ctx,
-                        &mut fair_queue,
-                        resume,
-                    )
-                    .await?;
+                    handle_deferred_resume(&mut contract_handler, &mut deferral_ctx, resume)
+                        .await?;
                 }
                 Err(_) => break,
             }
@@ -1144,38 +1058,27 @@ where
             }
         }
 
-        // Process one RUNNABLE event from the fair queue. Events for a contract
-        // that currently has an in-flight deferral are HELD (not run) so the
-        // deferred upsert commits before any later same-key op — preserving
-        // per-contract FIFO (#4391). Other contracts keep draining: that is the
-        // whole point of off-loading the fetch.
-        match pop_runnable_event(&mut fair_queue, &mut deferral_ctx) {
-            RunnableEvent::Run(id, event) => {
-                handle_contract_event(
-                    &mut contract_handler,
-                    id,
-                    event,
-                    &prompter,
-                    Some(&mut deferral_ctx),
-                )
-                .await?;
-                continue;
-            }
-            RunnableEvent::RejectFull(id, event) => {
-                // A deferred contract's held buffer is full: reject this event
-                // with backpressure rather than hold it unboundedly.
-                let rejected = Box::new(fair_queue::RejectedEvent { id, event });
-                track_pending_reclamation_if_evict(&mut contract_handler, &rejected);
-                send_queue_full_response(contract_handler.channel(), rejected).await;
-                continue;
-            }
-            RunnableEvent::None => {}
+        // Process one event from the fair queue in normal round-robin order.
+        // There is NO per-contract holding: an event for a contract whose
+        // PUT/UPDATE is mid-deferral runs immediately and may observe the
+        // pre-deferral state. The deferring op's own response is still delivered
+        // only on commit (its responder is parked in `deferral_ctx.stashed`), so
+        // its causality is preserved; concurrent same-key ops reconcile via the
+        // contract's CRDT merge on resume. This reordering is intended (#4391).
+        if let Some((id, event)) = fair_queue.pop() {
+            handle_contract_event(
+                &mut contract_handler,
+                id,
+                event,
+                &prompter,
+                Some(&mut deferral_ctx),
+            )
+            .await?;
+            continue;
         }
 
-        // Nothing runnable (queue empty, or every queued event is held behind a
-        // deferral). Block-wait for a new event, a resumed deferral, or a
-        // delegate notification. A resume releases its key's held events, so
-        // progress always resumes once an off-loop fetch reports.
+        // Fair queue is empty. Block-wait for a new event, a resumed deferral,
+        // or a delegate notification.
         tokio::select! {
             result = contract_handler.channel().recv_from_sender() => {
                 let (id, event) = result?;
@@ -1185,102 +1088,12 @@ where
                 }
             }
             Some(resume) = resume_rx.recv() => {
-                handle_deferred_resume(
-                    &mut contract_handler,
-                    &mut deferral_ctx,
-                    &mut fair_queue,
-                    resume,
-                )
-                .await?;
+                handle_deferred_resume(&mut contract_handler, &mut deferral_ctx, resume).await?;
             }
             notification = recv_delegate_notification(&mut delegate_rx) => {
                 handle_delegate_notification(&mut contract_handler, notification, &prompter).await;
             }
         }
-    }
-}
-
-/// What the loop should do with the next fair-queue event, accounting for
-/// per-contract deferral blocks (#4391).
-enum RunnableEvent {
-    /// Run this event now.
-    Run(handler::EventId, ContractHandlerEvent),
-    /// This event belongs to a deferred contract whose held buffer is full —
-    /// reject it with backpressure rather than hold it.
-    RejectFull(handler::EventId, ContractHandlerEvent),
-    /// Nothing runnable (queue empty, or everything is held behind deferrals).
-    None,
-}
-
-/// Pop the next event the loop may run right now: events for a contract with an
-/// in-flight deferral are moved to that deferral's held buffer (FIFO) and
-/// skipped, so the deferred upsert commits before any later same-key op
-/// (per-contract FIFO, #4391). Returns `None` when the fair queue holds nothing
-/// runnable (empty, or everything is held behind deferrals).
-fn pop_runnable_event(
-    fair_queue: &mut fair_queue::FairEventQueue,
-    deferral_ctx: &mut DeferralCtx,
-) -> RunnableEvent {
-    while let Some((id, event)) = fair_queue.pop() {
-        match fair_queue::extract_contract_id(&event) {
-            Some(contract_id) if deferral_ctx.is_key_deferred(&contract_id) => {
-                // Hold this same-key event behind the in-flight deferral.
-                match deferral_ctx.hold_event(contract_id, id, event) {
-                    HoldOutcome::Held => {} // Try the next queued event.
-                    HoldOutcome::NotDeferred(id, event) => {
-                        // Race: key was released between the check and the hold.
-                        return RunnableEvent::Run(id, event);
-                    }
-                    HoldOutcome::Full(id, event) => {
-                        return RunnableEvent::RejectFull(id, event);
-                    }
-                }
-            }
-            _ => return RunnableEvent::Run(id, event),
-        }
-    }
-    RunnableEvent::None
-}
-
-/// Re-enqueue the events that were held behind a now-released deferral, at the
-/// FRONT of their per-contract bucket in original FIFO order (so they run
-/// before any fresh same-key event that arrived during the deferral — the
-/// per-contract FIFO guarantee of #4391).
-///
-/// Returns the events that could NOT be re-enqueued (fair queue full); the
-/// caller MUST answer each with a queue-full response so its
-/// `waiting_response` slot is not leaked and the client doesn't hang for the
-/// full 300s `CH_EV_RESPONSE_TIME_OUT`. (#4391 round-3 leak fix.)
-#[must_use = "rejected held events must be answered with send_queue_full_response \
-              or their waiting_response slot leaks and the client hangs"]
-fn requeue_released_events(
-    held: Option<std::collections::VecDeque<(handler::EventId, ContractHandlerEvent)>>,
-    fair_queue: &mut fair_queue::FairEventQueue,
-) -> Vec<(handler::EventId, ContractHandlerEvent)> {
-    match held {
-        Some(held) => fair_queue.requeue_front(held),
-        None => Vec::new(),
-    }
-}
-
-/// Answer every event that `requeue_released_events` could not re-enqueue with a
-/// queue-full response (drops its `waiting_response` slot — no leak, no 300s
-/// client hang). Mirrors the normal drain-path rejection handling, including the
-/// `EvictContract` pending-reclamation hook so a rejected held `EvictContract`
-/// doesn't silently leak on-disk storage (the #4212 disk-leak class).
-async fn answer_rejected_held_events<CH>(
-    contract_handler: &mut CH,
-    rejected: Vec<(handler::EventId, ContractHandlerEvent)>,
-) where
-    CH: ContractHandler + Send + 'static,
-{
-    for (id, event) in rejected {
-        let rejected = Box::new(fair_queue::RejectedEvent { id, event });
-        // Mirror the normal drain path: an EvictContract dropped here loses its
-        // hosting-cache entry, so register it for pending-reclamation retry
-        // BEFORE answering, or its disk storage leaks. (#4212)
-        track_pending_reclamation_if_evict(contract_handler, &rejected);
-        send_queue_full_response(contract_handler.channel(), rejected).await;
     }
 }
 
@@ -1294,14 +1107,14 @@ async fn answer_rejected_held_events<CH>(
 /// — the second `DeferRelated` is converted to `MissingRelated` (the depth=1 /
 /// one-deferral cap of #4391).
 ///
-/// After the resumed upsert commits, the contract's per-contract block is
-/// released and any events held behind it (per-contract FIFO) are re-enqueued
-/// ahead of fresh events for the same key — so a same-key GET/UPDATE that
-/// arrived during the deferral now sees the committed state.
+/// The upsert re-reads CURRENT state, so concurrent same-key deferrals (or any
+/// same-key op that ran while this one was deferred) are reconciled by the
+/// contract's CRDT merge — there is no lost update. The client is answered
+/// exactly once via its stashed responder (the `ResumeGuard` guarantees this
+/// resume runs exactly once per deferral, even if the waiter was dropped).
 async fn handle_deferred_resume<CH>(
     contract_handler: &mut CH,
     deferral_ctx: &mut DeferralCtx,
-    fair_queue: &mut fair_queue::FairEventQueue,
     resume: DeferredResume,
 ) -> Result<(), ContractError>
 where
@@ -1317,26 +1130,9 @@ where
         fetched,
     } = resume;
 
-    // INVARIANT (#4391 round-4): every deferral receives EXACTLY ONE resume (the
-    // `ResumeGuard` guarantees delivery even if the waiter is dropped), and a
-    // contract's per-contract block is released ONLY by its own resume here. A
-    // second deferral for the same key cannot form while the key is blocked,
-    // because `pop_runnable_event` HOLDS that key's events instead of running
-    // them (so no new PUT/UPDATE for the key reaches `maybe_defer_upsert` to
-    // create one). Therefore, when this resume arrives, `deferred_keys[key]` is
-    // present and is THIS deferral's entry — there is no swept case and no
-    // newer-deferral case, so no stale-resume guard is needed.
-    //
-    // The stashed responder may legitimately be `None` only if the client
-    // disconnected (its receiver dropped); we still run the upsert for its side
-    // effects and release the block below.
-    debug_assert!(
-        deferral_ctx
-            .deferred_keys
-            .get(key.id())
-            .is_some_and(|e| e.deferral_id == deferral_id),
-        "resume must be for the live, still-blocked deferral (#4391 invariant)"
-    );
+    // Reclaim the parked client responder. It may legitimately be `None` only if
+    // the client disconnected (its receiver dropped); we still run the upsert for
+    // its side effects.
     let responder = deferral_ctx.stashed.remove(&deferral_id);
     if responder.is_none() {
         tracing::debug!(contract = %key, "Deferred resume has no stashed responder");
@@ -1417,17 +1213,8 @@ where
         }
     };
 
-    // The resumed upsert has now committed (or errored). Release THIS
-    // deferral's block (we verified above it still owns the key) and re-enqueue
-    // any same-key events held during the deferral at the FRONT of the bucket,
-    // in FIFO order, so they observe the committed state. Events that don't fit
-    // are answered with backpressure so their waiting_response slots aren't
-    // leaked. The released events land in the fair queue and are popped by
-    // `pop_runnable_event` after the resume-drain batch finishes (later in this
-    // same loop iteration, or a subsequent one) — never before the upsert above
-    // committed, since this runs synchronously on the loop.
-    let rejected = requeue_released_events(deferral_ctx.release_key(key.id()), fair_queue);
-
+    // The resumed upsert has committed (or errored). Answer the parked client
+    // exactly once.
     if let Some(responder) = responder {
         if let Err(error) = responder.respond(event_result) {
             tracing::debug!(
@@ -1437,8 +1224,6 @@ where
             );
         }
     }
-
-    answer_rejected_held_events(contract_handler, rejected).await;
     Ok(())
 }
 
@@ -1539,15 +1324,13 @@ where
         );
     };
 
+    // Park the client responder keyed by deferral_id; the (exactly-once) resume
+    // answers it on commit. There is NO per-contract block: same-key events keep
+    // running in normal fair-queue order and reconcile via CRDT merge on resume
+    // (see DeferralCtx docs). (#4391 round 5: per-contract-FIFO machinery removed.)
     let deferral_id = deferral.next_deferral_id;
     deferral.next_deferral_id = deferral.next_deferral_id.wrapping_add(1);
     deferral.stashed.insert(deferral_id, responder);
-    // Block this contract's subsequent events until the deferral resolves, so a
-    // later same-key GET/UPDATE can't run (and see MissingContract/stale state)
-    // before the deferred upsert commits. The block is released ONLY by this
-    // deferral's resume in `handle_deferred_resume`, which is guaranteed to run
-    // exactly once by the `ResumeGuard` below. (#4391 per-contract FIFO.)
-    deferral.block_key(*key.id(), deferral_id);
 
     let op_manager = contract_handler.executor().op_manager_handle();
     let resume_tx = deferral.resume_tx.clone();
@@ -2543,36 +2326,6 @@ mod tests {
         );
     }
 
-    /// Pin: `answer_rejected_held_events` must call `track_pending_reclamation_if_evict`
-    /// before `send_queue_full_response`, so a held `EvictContract` rejected on
-    /// requeue doesn't silently leak its on-disk storage (the #4212 disk-leak
-    /// class). The other three reject sites already do this; this helper is the
-    /// fourth and must match.
-    #[test]
-    fn answer_rejected_held_events_tracks_evict_reclamation_pin_test() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/contract.rs");
-        let source = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("must read own source at {}: {e}", path.display()));
-        let body = source
-            .split("async fn answer_rejected_held_events")
-            .nth(1)
-            .expect("answer_rejected_held_events must exist")
-            .split("\n}\n")
-            .next()
-            .expect("function body");
-        let track_idx = body
-            .find("track_pending_reclamation_if_evict")
-            .expect("must call track_pending_reclamation_if_evict (EvictContract disk-leak #4212)");
-        let send_idx = body
-            .find("send_queue_full_response")
-            .expect("must answer with send_queue_full_response");
-        assert!(
-            track_idx < send_idx,
-            "reclamation tracking must run BEFORE the queue-full response, \
-             mirroring the normal drain path"
-        );
-    }
-
     fn make_contract_key() -> ContractKey {
         let code = ContractCode::from(vec![42u8; 32]);
         let params = Parameters::from(vec![7u8; 8]);
@@ -3520,6 +3273,99 @@ mod hol_4391_tests {
         handle.abort();
     }
 
+    /// Round 5 (accepted reordering): a SAME-KEY GET issued while a PUT for that
+    /// key is mid-deferral runs PROMPTLY — it is NOT held behind the deferring
+    /// PUT. This is the intended behavior after the per-contract-FIFO machinery
+    /// was removed: the GET observes the pre-PUT state (here: not-found, since
+    /// the contract was never stored before the deferring PUT), while the PUT's
+    /// own response is still delivered only on commit. The point of this test is
+    /// the absence of holding — the GET must not wait for the gated fetch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn same_key_get_during_deferred_put_runs_promptly() {
+        let _guard = TEST_GUARD.lock().await;
+
+        // Contract A requests related B (never local); its off-loop fetch hangs
+        // on the gate, so A's PUT stays mid-deferral.
+        let contract_a = make_contract(b"reorder_a");
+        let key_a = contract_a.key();
+        let id_b = *make_contract(b"reorder_b").key().id();
+
+        let (handler, send) = build_handler(vec![(
+            *key_a.id(),
+            ValidateOverride::RequestRelated(vec![id_b]),
+        )])
+        .await;
+
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let gate_for_stub = gate.clone();
+        set_off_loop_fetch_override(Some(Arc::new(move |missing| {
+            let gate = gate_for_stub.clone();
+            Box::pin(async move {
+                gate.notified().await;
+                Err(ExecutorError::missing_related(missing[0]))
+            })
+        })));
+
+        let send = Arc::new(send);
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            crate::contract::user_input::AutoApprovePrompter,
+        ));
+
+        // Fire A's related-needing PUT in the background: it defers and parks.
+        let send_a = send.clone();
+        let a_task: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
+            GlobalExecutor::spawn(async move {
+                send_a
+                    .send_to_handler(ContractHandlerEvent::PutQuery {
+                        key: key_a,
+                        state: WrappedState::new(b"a_state".to_vec()),
+                        related_contracts: RelatedContracts::default(),
+                        contract: Some(contract_a),
+                    })
+                    .await
+            });
+
+        // Let the loop pick up A's PUT and enter the deferral path.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // A SAME-KEY GET for A must resolve PROMPTLY (NOT held behind the gated
+        // PUT). With no holding, it runs immediately and observes the pre-PUT
+        // state — the contract isn't stored yet, so a not-found GetResponse.
+        let get_a = tokio::time::timeout(
+            Duration::from_secs(2),
+            send.send_to_handler(ContractHandlerEvent::GetQuery {
+                instance_id: *key_a.id(),
+                return_contract_code: false,
+            }),
+        )
+        .await
+        .expect("same-key GET must NOT be held behind the deferring PUT (#4391 round 5)")
+        .expect("GET for A must respond");
+        match get_a {
+            ContractHandlerEvent::GetResponse { .. } => {
+                // Either a not-found response (contract not stored yet) — the
+                // expected pre-PUT observation. We only assert it RAN promptly.
+            }
+            other => panic!("expected GetResponse for A, got {other}"),
+        }
+
+        // Release the gate so A's PUT resolves and its client is answered.
+        gate.notify_one();
+        let a_resp = tokio::time::timeout(Duration::from_secs(5), a_task)
+            .await
+            .expect("A's PUT must resolve after the fetch completes")
+            .expect("A task join")
+            .expect("A's PUT must respond");
+        assert!(
+            matches!(a_resp, ContractHandlerEvent::PutResponse { .. }),
+            "A's PUT must still receive its own response on resume"
+        );
+
+        set_off_loop_fetch_override(None);
+        handle.abort();
+    }
+
     /// Happy path: a deferred PUT whose off-loop fetch SUCCEEDS resumes and
     /// stores the contract, answering the original client.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3772,309 +3618,6 @@ mod hol_4391_tests {
     }
 
     // ========================================================================
-    // MUST-FIX #1: per-contract FIFO is preserved across a deferral
-    // ========================================================================
-
-    /// While contract K's PUT is deferred (off-loop fetch gated), a later
-    /// SAME-KEY GET must NOT run before the PUT commits — it must wait and then
-    /// observe the committed state (not MissingContract / not-found). At the
-    /// same time, a GET for a DIFFERENT contract K2 must return PROMPTLY (the
-    /// whole point of #4391: only the deferred key is held, not the loop).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn deferred_put_holds_same_key_get_but_not_other_key() {
-        let _guard = TEST_GUARD.lock().await;
-
-        // Contract K requests related B; B is supplied off-loop on release so
-        // K's PUT ultimately COMMITS (so the held same-key GET sees real state).
-        let contract_k = make_contract(b"fifo_k");
-        let key_k = contract_k.key();
-        let id_b = *make_contract(b"fifo_k_related").key().id();
-
-        let (handler, send) = build_handler(vec![(
-            *key_k.id(),
-            ValidateOverride::RequestRelated(vec![id_b]),
-        )])
-        .await;
-
-        // Off-loop fetch hangs on the gate, then SUCCEEDS (supplies B) so K's
-        // PUT commits when released.
-        let gate = Arc::new(tokio::sync::Notify::new());
-        let gate_stub = gate.clone();
-        let _override =
-            OverrideGuard::install(Arc::new(move |missing: Vec<ContractInstanceId>| {
-                let gate = gate_stub.clone();
-                Box::pin(async move {
-                    gate.notified().await;
-                    Ok(missing
-                        .into_iter()
-                        .map(|id| (id, WrappedState::new(b"b_state".to_vec())))
-                        .collect())
-                })
-            }));
-
-        // A locally-stored, unrelated contract K2 for the cross-key prompt check.
-        let contract_k2 = make_contract(b"fifo_k2_cached");
-        let key_k2 = contract_k2.key();
-
-        let send = Arc::new(send);
-        let handle = GlobalExecutor::spawn(contract_handling(
-            handler,
-            crate::contract::user_input::AutoApprovePrompter,
-        ));
-
-        // Seed K2 so a GET for it is a pure local hit.
-        let put_k2 = put_local(
-            send.as_ref(),
-            contract_k2,
-            WrappedState::new(b"k2_state".to_vec()),
-        )
-        .await;
-        assert!(
-            matches!(
-                put_k2,
-                ContractHandlerEvent::PutResponse {
-                    new_value: Ok(_),
-                    ..
-                }
-            ),
-            "seed PUT for K2 must succeed"
-        );
-
-        // Fire K's related-needing PUT in the background: it defers and parks.
-        let send_k = send.clone();
-        let k_state = WrappedState::new(br#"{"committed":true}"#.to_vec());
-        let k_state_expect = k_state.clone();
-        let k_put: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
-            GlobalExecutor::spawn(async move {
-                send_k
-                    .send_to_handler(ContractHandlerEvent::PutQuery {
-                        key: key_k,
-                        state: k_state,
-                        related_contracts: RelatedContracts::default(),
-                        contract: Some(contract_k),
-                    })
-                    .await
-            });
-
-        // Let the loop pick up K's PUT and enter the deferral path.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        // Fire a SAME-KEY GET for K in the background. It must NOT resolve while
-        // K's PUT is still deferred (held behind the per-contract block).
-        let send_k_get = send.clone();
-        let k_get: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
-            GlobalExecutor::spawn(async move {
-                send_k_get
-                    .send_to_handler(ContractHandlerEvent::GetQuery {
-                        instance_id: *key_k.id(),
-                        return_contract_code: false,
-                    })
-                    .await
-            });
-
-        // Give the same-key GET a chance to (wrongly) resolve if FIFO is broken.
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(
-            !k_get.is_finished(),
-            "same-key GET for K must be HELD until K's deferred PUT commits \
-             (per-contract FIFO, #4391 MUST-FIX #1)"
-        );
-
-        // Cross-key: a GET for K2 must return PROMPTLY despite K being deferred.
-        let k2_get = tokio::time::timeout(
-            Duration::from_secs(2),
-            send.send_to_handler(ContractHandlerEvent::GetQuery {
-                instance_id: *key_k2.id(),
-                return_contract_code: false,
-            }),
-        )
-        .await
-        .expect("GET for unrelated K2 must NOT be blocked by K's deferral")
-        .expect("K2 GET must respond");
-        match k2_get {
-            ContractHandlerEvent::GetResponse { response, .. } => {
-                let store = response.expect("K2 GET ok");
-                assert_eq!(store.state.expect("K2 has state").as_ref(), b"k2_state");
-            }
-            other => panic!("expected GetResponse for K2, got {other}"),
-        }
-
-        // Release the gate: K's PUT commits, then the held same-key GET runs.
-        gate.notify_one();
-
-        let k_put_resp = tokio::time::timeout(Duration::from_secs(5), k_put)
-            .await
-            .expect("K PUT resolves after release")
-            .expect("K put join")
-            .expect("K PUT responds");
-        match k_put_resp {
-            ContractHandlerEvent::PutResponse { new_value, .. } => {
-                new_value.expect("K PUT must commit once B is supplied");
-            }
-            other => panic!("expected PutResponse for K, got {other}"),
-        }
-
-        // The previously-held same-key GET must now resolve AND observe the
-        // committed state (proving it ran AFTER the PUT, not before).
-        let k_get_resp = tokio::time::timeout(Duration::from_secs(5), k_get)
-            .await
-            .expect("held same-key GET resolves after PUT commits")
-            .expect("K get join")
-            .expect("K GET responds");
-        match k_get_resp {
-            ContractHandlerEvent::GetResponse { response, .. } => {
-                let store = response.expect("K GET ok after commit");
-                assert_eq!(
-                    store.state.expect("K has committed state").as_ref(),
-                    k_state_expect.as_ref(),
-                    "held same-key GET must observe the committed PUT state, \
-                     not a stale/missing value"
-                );
-            }
-            other => panic!("expected GetResponse for K, got {other}"),
-        }
-
-        handle.abort();
-    }
-
-    /// An UPDATE that arrives for a contract whose PUT is still deferred must be
-    /// applied AFTER the deferred PUT commits (per-contract FIFO across op
-    /// types). We assert the UPDATE succeeds and its result reflects the
-    /// post-PUT state.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn deferred_put_then_same_key_update_is_ordered_after_commit() {
-        let _guard = TEST_GUARD.lock().await;
-
-        let contract_k = make_contract(b"fifo_upd_k");
-        let key_k = contract_k.key();
-        let id_b = *make_contract(b"fifo_upd_related").key().id();
-
-        let (handler, send) = build_handler(vec![(
-            *key_k.id(),
-            ValidateOverride::RequestRelated(vec![id_b]),
-        )])
-        .await;
-
-        // A "release all" gate: once `released` is set, every stub invocation
-        // (the PUT's deferral AND any re-deferral by the held UPDATE) proceeds.
-        // Poll the flag (no `Notify` race where a late waiter misses a one-shot
-        // wake) — see the design note in the test body.
-        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let released_stub = released.clone();
-        let _override =
-            OverrideGuard::install(Arc::new(move |missing: Vec<ContractInstanceId>| {
-                let released = released_stub.clone();
-                Box::pin(async move {
-                    while !released.load(std::sync::atomic::Ordering::SeqCst) {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                    }
-                    Ok(missing
-                        .into_iter()
-                        .map(|id| (id, WrappedState::new(b"b_state".to_vec())))
-                        .collect())
-                })
-            }));
-
-        let send = Arc::new(send);
-        let handle = GlobalExecutor::spawn(contract_handling(
-            handler,
-            crate::contract::user_input::AutoApprovePrompter,
-        ));
-
-        // Deferred PUT for K (seeds the initial state once it commits).
-        let send_k = send.clone();
-        let k_put: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
-            GlobalExecutor::spawn(async move {
-                send_k
-                    .send_to_handler(ContractHandlerEvent::PutQuery {
-                        key: key_k,
-                        state: WrappedState::new(vec![1, 2, 3]),
-                        related_contracts: RelatedContracts::default(),
-                        contract: Some(contract_k),
-                    })
-                    .await
-            });
-
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        // Same-key UPDATE arrives while K's PUT is deferred. The mock applies a
-        // delta by concatenation; this must NOT MissingContract (which it would
-        // if it ran before the PUT committed).
-        //
-        // NOTE: contract K's `ValidateOverride::RequestRelated` fires on the
-        // UPDATE's post-merge validate too, and the off-loop-fetched B is only
-        // injected into the upsert's related_contracts (not persisted to the
-        // state_store) — exactly as the inline path behaves. So the held UPDATE
-        // legitimately RE-DEFERS once. The "release all" gate handles that
-        // second deferral; the ordering invariant under test (UPDATE applies
-        // against the committed PUT state, never MissingContract) still holds.
-        let send_u = send.clone();
-        let k_update: tokio::task::JoinHandle<Result<ContractHandlerEvent, ContractError>> =
-            GlobalExecutor::spawn(async move {
-                send_u
-                    .send_to_handler(ContractHandlerEvent::UpdateQuery {
-                        key: key_k,
-                        data: freenet_stdlib::prelude::UpdateData::Delta(StateDelta::from(vec![
-                            4, 5,
-                        ])),
-                        related_contracts: RelatedContracts::default(),
-                    })
-                    .await
-            });
-
-        tokio::time::sleep(Duration::from_millis(150)).await;
-        assert!(
-            !k_update.is_finished(),
-            "same-key UPDATE must be held until the deferred PUT commits"
-        );
-
-        // Release all deferrals (the PUT's, plus the held UPDATE's re-deferral).
-        released.store(true, std::sync::atomic::Ordering::SeqCst);
-
-        let put_resp = tokio::time::timeout(Duration::from_secs(5), k_put)
-            .await
-            .expect("PUT resolves")
-            .expect("join")
-            .expect("PUT responds");
-        assert!(
-            matches!(
-                put_resp,
-                ContractHandlerEvent::PutResponse {
-                    new_value: Ok(_),
-                    ..
-                }
-            ),
-            "deferred PUT must commit"
-        );
-
-        let upd_resp = tokio::time::timeout(Duration::from_secs(5), k_update)
-            .await
-            .expect("UPDATE resolves after PUT commits")
-            .expect("join")
-            .expect("UPDATE responds");
-        match upd_resp {
-            ContractHandlerEvent::UpdateResponse { new_value, .. } => {
-                // Must NOT be a MissingContract error: the UPDATE ran after the
-                // PUT installed the contract.
-                let stored = new_value.expect(
-                    "UPDATE must apply against the committed PUT state, not \
-                     MissingContract (per-contract FIFO, #4391)",
-                );
-                assert!(
-                    stored.as_ref().ends_with(&[4, 5]),
-                    "UPDATE delta must have been applied on top of the PUT state"
-                );
-            }
-            ContractHandlerEvent::UpdateNoChange { .. } => {
-                panic!("UPDATE should have changed state, got NoChange")
-            }
-            other => panic!("expected UpdateResponse, got {other}"),
-        }
-
-        handle.abort();
-    }
-
-    // ========================================================================
     // SHOULD-FIX #5: UPDATE-path deferral, real off-loop fetch, cap, disconnect
     // ========================================================================
 
@@ -4241,11 +3784,10 @@ mod hol_4391_tests {
     }
 
     /// A client that disconnects mid-deferral (drops its response receiver) must
-    /// NOT leak the stashed responder and MUST release the contract's block.
-    /// Proven by: after the client drops, a fresh same-key PUT eventually
-    /// resolves (the contract wasn't permanently wedged).
+    /// NOT leak the stashed responder or wedge the contract. Proven by: after the
+    /// client drops, a fresh same-key op resolves promptly.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn client_disconnect_during_deferral_releases_block() {
+    async fn client_disconnect_during_deferral_does_not_wedge() {
         let _guard = TEST_GUARD.lock().await;
 
         let contract_k = make_contract(b"disc_k");
@@ -4297,14 +3839,11 @@ mod hol_4391_tests {
         });
         let _ = disconnect_task.await;
 
-        // Let the deferral resume (and discover the dropped responder) and the
-        // block be released.
+        // Let the deferral resume and discover the dropped responder.
         tokio::time::sleep(Duration::from_millis(400)).await;
 
-        // A fresh same-key PUT must eventually resolve — proving the contract
-        // wasn't permanently wedged by the disconnected deferral. This second
-        // PUT supplies B inline (related already cached from the resume) OR
-        // re-defers and resolves; either way it must not hang.
+        // A fresh same-key GET must resolve promptly — proving the disconnected
+        // deferral didn't wedge the contract or leak its responder.
         let resp = tokio::time::timeout(
             DEFERRED_RELATED_FETCH_TIMEOUT + Duration::from_secs(2),
             send.send_to_handler(ContractHandlerEvent::GetQuery {
@@ -4313,14 +3852,11 @@ mod hol_4391_tests {
             }),
         )
         .await
-        .expect(
-            "same-key op after a disconnected deferral must not hang \
-                 (block was released)",
-        )
+        .expect("same-key op after a disconnected deferral must not hang")
         .expect("GET responds");
         assert!(
             matches!(resp, ContractHandlerEvent::GetResponse { .. }),
-            "expected a GetResponse after the block released"
+            "expected a GetResponse"
         );
 
         handle.abort();
@@ -4434,207 +3970,34 @@ mod hol_4391_tests {
     }
 
     // ========================================================================
-    // Round-3 fixes: requeue leak/FIFO, stale-resume guard, sweep, held cap
+    // ResumeGuard exactly-once delivery + off-loop fetch mapping (unit)
     // ========================================================================
 
     fn instance_id(seed: &[u8]) -> ContractInstanceId {
         *make_contract(seed).key().id()
     }
 
-    fn get_event(id: ContractInstanceId) -> ContractHandlerEvent {
-        ContractHandlerEvent::GetQuery {
-            instance_id: id,
-            return_contract_code: false,
-        }
-    }
-
-    /// MUST-FIX #2 (unit): held events re-queue at the FRONT of the per-contract
-    /// bucket in FIFO order, ahead of a fresh same-key event already queued.
-    #[test]
-    fn requeue_front_orders_held_before_fresh_same_key() {
-        let mut fq = fair_queue::FairEventQueue::new();
-        let k = instance_id(b"front_k");
-
-        // A FRESH same-key event is already queued (arrived "after" the held
-        // ones in wall-clock, but reached the fair queue first because the held
-        // ones were diverted into the deferral buffer).
-        fq.try_push(handler::EventId { id: 99 }, get_event(k))
-            .expect("fresh push");
-
-        // Two held events (ids 1, 2) re-queued at the front, FIFO order.
-        let mut held = std::collections::VecDeque::new();
-        held.push_back((handler::EventId { id: 1 }, get_event(k)));
-        held.push_back((handler::EventId { id: 2 }, get_event(k)));
-        let rejected = fq.requeue_front(held);
-        assert!(rejected.is_empty(), "nothing should be rejected under cap");
-
-        // Pop order must be 1, 2 (held FIFO), THEN 99 (fresh) — proving the held
-        // older events run before the fresh one.
-        let order: Vec<u64> = std::iter::from_fn(|| fq.pop().map(|(id, _)| id.id)).collect();
-        assert_eq!(
-            order,
-            vec![1, 2, 99],
-            "held events must run in FIFO order before the fresh same-key event"
-        );
-    }
-
-    /// MUST-FIX #2 + #1 (unit): when the per-contract bucket is at capacity,
-    /// `requeue_front` returns the events it could not enqueue, in FIFO order,
-    /// so the caller can answer them with backpressure (no silent drop / leak).
-    #[test]
-    fn requeue_front_returns_overflow_in_fifo_order() {
-        let mut fq = fair_queue::FairEventQueue::new();
-        let k = instance_id(b"overflow_k");
-
-        // Saturate the per-contract bucket via normal pushes.
-        for i in 0..fair_queue::MAX_QUEUED_PER_CONTRACT as u64 {
-            fq.try_push(handler::EventId { id: 1000 + i }, get_event(k))
-                .expect("fill bucket");
-        }
-
-        // Now try to re-queue 3 held events at the front — all should be rejected
-        // (bucket full), returned in original FIFO order.
-        let mut held = std::collections::VecDeque::new();
-        held.push_back((handler::EventId { id: 1 }, get_event(k)));
-        held.push_back((handler::EventId { id: 2 }, get_event(k)));
-        held.push_back((handler::EventId { id: 3 }, get_event(k)));
-        let rejected = fq.requeue_front(held);
-        let rejected_ids: Vec<u64> = rejected.iter().map(|(id, _)| id.id).collect();
-        assert_eq!(
-            rejected_ids,
-            vec![1, 2, 3],
-            "overflow held events must be returned in FIFO order for backpressure"
-        );
-    }
-
-    /// Round-3.2 (unit): on GLOBAL-cap overflow, `requeue_front` must accept the
-    /// OLDEST held event (which pops first) and reject the NEWEST ones — never
-    /// the reverse. With held `[e1,e2,e3]` and exactly ONE global slot free, e1
-    /// must be re-queued (and pop first) while e2,e3 are returned as overflow in
-    /// FIFO order. The previous reverse-iterate-with-per-event-cap code accepted
-    /// e3 (newest) and rejected e1,e2 — a per-contract FIFO violation. (Codex.)
-    #[test]
-    fn requeue_front_global_overflow_keeps_oldest_rejects_newest() {
-        let mut fq = fair_queue::FairEventQueue::new();
-
-        // Saturate the GLOBAL queue to MAX_TOTAL_FAIR_QUEUE - 1 (one slot free),
-        // spread across distinct contract keys so no single per-contract bucket
-        // overflows (each key holds at most MAX_QUEUED_PER_CONTRACT).
-        let target = fair_queue::MAX_TOTAL_FAIR_QUEUE - 1;
-        let mut pushed = 0u64;
-        let mut filler = 0u64;
-        while (pushed as usize) < target {
-            let key = instance_id(format!("filler_{filler}").as_bytes());
-            filler += 1;
-            let room = (target - pushed as usize).min(fair_queue::MAX_QUEUED_PER_CONTRACT);
-            for _ in 0..room {
-                fq.try_push(
-                    handler::EventId {
-                        id: 10_000 + pushed,
-                    },
-                    get_event(key),
-                )
-                .expect("filler push under caps");
-                pushed += 1;
-            }
-        }
-        assert_eq!(fq.total_queued(), target, "exactly one global slot free");
-
-        // Held events for a FRESH key (its bucket is empty → bucket_free=100, so
-        // the binding constraint is the single free GLOBAL slot → capacity 1).
-        let held_key = instance_id(b"held_global_overflow");
-        let mut held = std::collections::VecDeque::new();
-        held.push_back((handler::EventId { id: 1 }, get_event(held_key)));
-        held.push_back((handler::EventId { id: 2 }, get_event(held_key)));
-        held.push_back((handler::EventId { id: 3 }, get_event(held_key)));
-
-        let rejected = fq.requeue_front(held);
-
-        // e2, e3 (newest) rejected, in FIFO order.
-        let rejected_ids: Vec<u64> = rejected.iter().map(|(id, _)| id.id).collect();
-        assert_eq!(
-            rejected_ids,
-            vec![2, 3],
-            "on global overflow, the NEWEST events must be rejected (in FIFO order), \
-             keeping the oldest — got {rejected_ids:?}"
-        );
-
-        // e1 (oldest) was accepted and, for its key, pops first. Drain the
-        // held_key bucket and confirm e1 is the only/first event from it.
-        let mut from_held_key = Vec::new();
-        while let Some((id, ev)) = fq.pop() {
-            if fair_queue::extract_contract_id(&ev) == Some(held_key) {
-                from_held_key.push(id.id);
-            }
-        }
-        assert_eq!(
-            from_held_key,
-            vec![1],
-            "the OLDEST held event (e1) must be the one accepted on overflow"
-        );
-    }
-
-    /// SHOULD-FIX (unit): the per-deferral held buffer caps at
-    /// MAX_HELD_PER_DEFERRAL — the (cap+1)th hold returns `Full` carrying the
-    /// event back.
-    #[test]
-    fn hold_event_caps_at_max_held_per_deferral() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut ctx = DeferralCtx::new(tx);
-        let k = instance_id(b"held_cap_k");
-        ctx.block_key(k, 1);
-
-        for i in 0..MAX_HELD_PER_DEFERRAL as u64 {
-            match ctx.hold_event(k, handler::EventId { id: i }, get_event(k)) {
-                HoldOutcome::Held => {}
-                other => panic!("expected Held within cap, got {:?}", DbgHold(&other)),
-            }
-        }
-        // The (cap+1)th must be Full and hand the event back.
-        match ctx.hold_event(k, handler::EventId { id: 9999 }, get_event(k)) {
-            HoldOutcome::Full(id, _ev) => assert_eq!(id.id, 9999),
-            other => panic!("expected Full at cap, got {:?}", DbgHold(&other)),
-        }
-    }
-
-    // Small debug helper for HoldOutcome (it intentionally has no Debug derive
-    // to avoid requiring ContractHandlerEvent: Debug in non-test code paths).
-    struct DbgHold<'a>(&'a HoldOutcome);
-    impl std::fmt::Debug for DbgHold<'_> {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self.0 {
-                HoldOutcome::Held => write!(f, "Held"),
-                HoldOutcome::NotDeferred(..) => write!(f, "NotDeferred"),
-                HoldOutcome::Full(..) => write!(f, "Full"),
-            }
-        }
-    }
-
     /// Round-4 (unit): the `ResumeGuard` delivers a terminal MissingRelated
     /// resume when the off-loop waiter is DROPPED before sending (task
     /// cancelled / panicked). Driving that resume through `handle_deferred_resume`
-    /// must answer the client (MissingRelated), release the per-contract block,
-    /// and re-queue the held same-key events — i.e. the wedge-prevention now
-    /// comes from the drop-guard, NOT a TTL sweep.
+    /// must answer the parked client with MissingRelated — the wedge-prevention
+    /// comes from the drop-guard's exactly-once delivery.
     #[tokio::test]
-    async fn dropped_waiter_guard_answers_client_and_releases_block() {
+    async fn dropped_waiter_guard_answers_client_missing_related() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DeferredResume>();
         let mut ctx = DeferralCtx::new(tx.clone());
         let mut handler =
             MockWasmContractHandler::new_test(handler::contract_handler_channel().1, None, "drop")
                 .await;
-        let mut fq = fair_queue::FairEventQueue::new();
 
         let contract = make_contract(b"drop_guard_k");
         let key = contract.key();
 
-        // Set up the loop-side state for an in-flight deferral: stash the client
-        // responder, block the key, and hold a same-key event.
-        ctx.block_key(*key.id(), 7);
+        // Stash the client responder (as `maybe_defer_upsert` would) for an
+        // in-flight deferral whose waiter is about to be dropped.
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         ctx.stashed
             .insert(7, StashedResponder::for_test(7, resp_tx));
-        let _ = ctx.hold_event(*key.id(), handler::EventId { id: 50 }, get_event(*key.id()));
 
         // Build the waiter's guard and DROP it WITHOUT calling `send` (simulating
         // the waiter task being cancelled/dropped before the fetch reports).
@@ -4660,21 +4023,15 @@ mod hol_4391_tests {
         );
         assert!(rx.try_recv().is_err(), "exactly one resume — no extra");
 
-        // Process it on the loop: client answered (PUT error), block released,
-        // held event re-queued.
-        handle_deferred_resume(&mut handler, &mut ctx, &mut fq, resume)
+        // Process it on the loop: the parked client is answered with a PUT error.
+        handle_deferred_resume(&mut handler, &mut ctx, resume)
             .await
             .expect("resume handled");
-
         assert!(
-            !ctx.is_key_deferred(key.id()),
-            "the dropped deferral's block must be released"
+            !ctx.stashed.contains_key(&7),
+            "the stashed responder must be consumed (no leak)"
         );
-        assert_eq!(
-            fq.pop().map(|(id, _)| id.id),
-            Some(50),
-            "the held same-key event must be re-queued"
-        );
+
         let (_id, ev) = resp_rx.await.expect("client must be answered");
         match ev {
             ContractHandlerEvent::PutResponse { new_value, .. } => {
@@ -4732,48 +4089,5 @@ mod hol_4391_tests {
             result.is_err(),
             "no op_manager must surface MissingRelated, got {result:?}"
         );
-    }
-
-    /// MUST-FIX #1 (e2e): a held event that can't be re-queued (fair queue full)
-    /// must be ANSWERED with a queue-full response — NOT silently dropped (which
-    /// would leak its waiting_response slot and hang the client 300s). Drives a
-    /// real GetQuery through the channel, then rejects it via the same path the
-    /// sweep/resume use, and asserts the client gets a prompt QueueFull error.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rejected_held_event_is_answered_not_leaked() {
-        let (send, rcv_halve, _wait) = handler::contract_handler_channel();
-        let mut handler = MockWasmContractHandler::new_test(rcv_halve, None, "leak").await;
-        let k = instance_id(b"leak_k");
-
-        // Client sends a GetQuery and awaits the response.
-        let client = GlobalExecutor::spawn(async move { send.send_to_handler(get_event(k)).await });
-
-        // Handler side receives it (registers the waiting_response slot).
-        let (id, event) = handler
-            .channel()
-            .recv_from_sender()
-            .await
-            .expect("event received");
-
-        // Simulate the requeue-overflow path: this event couldn't be re-queued,
-        // so the loop must answer it with backpressure.
-        answer_rejected_held_events(&mut handler, vec![(id, event)]).await;
-
-        // The client must receive a prompt queue-full error, NOT hang.
-        let resp = tokio::time::timeout(Duration::from_secs(2), client)
-            .await
-            .expect("client must be answered promptly, not leaked/hung")
-            .expect("join")
-            .expect("client receives a response");
-        match resp {
-            ContractHandlerEvent::GetResponse { response, .. } => {
-                let err = response.expect_err("rejected held GET must be an error");
-                assert!(
-                    err.is_contract_queue_full(),
-                    "rejected held event must surface ContractQueueFull, got {err}"
-                );
-            }
-            other => panic!("expected GetResponse(queue-full), got {other}"),
-        }
     }
 }
