@@ -4441,8 +4441,18 @@ mod tests {
         assert!(service_content.contains("StartLimitBurst=5"));
         assert!(service_content.contains("StartLimitIntervalSec=120"));
 
-        // Verify auto-update support via ExecStopPost
-        assert!(service_content.contains("ExecStopPost="));
+        // Verify auto-update support via ExecStopPost. The `$EXIT_STATUS` systemd
+        // sets in the ExecStopPost environment must reach /bin/sh as a literal
+        // `$EXIT_STATUS`, so it is written doubled (`$$EXIT_STATUS`) in the unit —
+        // systemd collapses `$$` -> `$`. A single-`$` revert silently breaks
+        // auto-update (systemd eats the bare var before sh sees it) with no other
+        // signal, so assert the doubled form, not just the directive's presence.
+        assert!(
+            service_content.contains("ExecStopPost=")
+                && service_content.contains("\"$$EXIT_STATUS\""),
+            "ExecStopPost must use the doubled $$EXIT_STATUS so systemd passes a \
+             literal $EXIT_STATUS to sh (a single-$ revert silently breaks auto-update)"
+        );
 
         // Verify exit code 42 is treated as success (doesn't count against StartLimitBurst)
         assert!(service_content.contains("SuccessExitStatus=42 43"));
@@ -4501,7 +4511,13 @@ mod tests {
         assert!(service_content.contains("StartLimitBurst=5"));
         assert!(service_content.contains("StartLimitIntervalSec=120"));
         assert!(service_content.contains("LimitNOFILE=65536"));
-        assert!(service_content.contains("ExecStopPost="));
+        // ExecStopPost must double the env var (`$$EXIT_STATUS`) so systemd passes a
+        // literal `$EXIT_STATUS` to sh; a single-`$` revert silently breaks auto-update.
+        assert!(
+            service_content.contains("ExecStopPost=")
+                && service_content.contains("\"$$EXIT_STATUS\""),
+            "ExecStopPost must use the doubled $$EXIT_STATUS (single-$ revert breaks auto-update)"
+        );
 
         // Verify exit code 42 is treated as success (doesn't count against StartLimitBurst)
         assert!(service_content.contains("SuccessExitStatus=42 43"));
@@ -5243,6 +5259,22 @@ echo "RC=$?"
             !run("0.9.0 (old)", "4321", None),
             "systemd self-heal must DEFER to a user-parented (PPID!=1) holder (#3967 MUST-FIX 3)"
         );
+
+        // (d) on-disk binary version UNREADABLE (`$ondisk` empty) -> DEFER even for
+        // a PPID==1 orphan whose own version IS readable. With no trustworthy
+        // baseline we must not version-compare; killing here would reap a healthy
+        // current node during an update window when the binary is momentarily
+        // unreadable. Mirrors the macOS test's chmod-644 case (#3967 MUST-FIX 4),
+        // which the systemd path's `[ -n "$$ondisk" ]` guard implements but had no
+        // behavioral coverage on Linux (rule-review Info on #4408).
+        std::fs::set_permissions(&ondisk_bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            !run("0.9.0 (old)", "1", None),
+            "systemd self-heal must DEFER when the on-disk version is unreadable, even \
+             for a readable-version PPID==1 orphan (#3967 MUST-FIX 4: empty $ondisk \
+             must not drive a kill)"
+        );
+        chmod_x(&ondisk_bin); // restore for any later use
     }
 
     #[test]
