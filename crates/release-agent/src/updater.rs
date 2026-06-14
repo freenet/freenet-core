@@ -313,6 +313,155 @@ mod tests {
         );
     }
 
+    /// Write an executable stub that, when invoked, signals via `started_marker`
+    /// that `/bin/sh` is already running the script body, then becomes a real
+    /// subprocess which sleeps far past `MAX_UPDATE_HOLD` so the spawned child
+    /// NEVER exits within the hold window. Returns the stub's path (used as
+    /// `sudo_command`).
+    ///
+    /// The wall-clock sleep is intentional: under `start_paused` a real OS
+    /// child's sleep does NOT honour virtual time, so the child stays alive
+    /// across `tokio::time::advance`. That is exactly the condition the
+    /// MAX_UPDATE_HOLD timeout arm exists for — the tokio timer fires on the
+    /// virtual-time advance while the child is still running.
+    ///
+    /// The `started_marker` write is the teardown-noise guard: once it exists,
+    /// `/bin/sh` has already opened and read this (tiny) script into memory and
+    /// `exec`'d into `sleep`, so the test can drop its TempDir without the
+    /// detached child (`kill_on_drop=false`) ever re-opening the now-deleted
+    /// script and logging `No such file or directory` to stderr.
+    fn write_never_exiting_stub(
+        dir: &std::path::Path,
+        started_marker: &std::path::Path,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("fake-sudo-sleep");
+        // The agent always prepends `--non-interactive`; ignore argv. Touch the
+        // started marker, then exec `sleep` for 30 REAL wall-clock seconds. The
+        // test advances virtual time instantly and finishes in milliseconds of
+        // wall-clock, so 30s keeps the child alive across the (instant) virtual
+        // MAX_UPDATE_HOLD = 300s advance, yet self-reaps shortly after so the
+        // detached child doesn't linger as a long-lived orphan.
+        let script = format!(
+            "#!/bin/sh\n: > {}\nexec sleep 30\n",
+            started_marker.display()
+        );
+        std::fs::write(&bin, script).unwrap();
+        let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&bin, perms).unwrap();
+        bin
+    }
+
+    /// The MAX_UPDATE_HOLD timeout arm in [`Updater::run`] frees the in-flight
+    /// slot even while the spawned child is STILL running — the documented
+    /// "residual re-open window". This is the only path that releases the guard
+    /// without the child exiting, and the comment itself flags it as the spot
+    /// that can re-enable the #4271 overlap bug, so it must be covered.
+    ///
+    /// Virtual time (`start_paused`) lets us fire the timeout deterministically:
+    /// the stub child sleeps in real wall-clock (a real subprocess does NOT
+    /// honour paused time), so it never exits during the test, while
+    /// `tokio::time::advance(MAX_UPDATE_HOLD + …)` trips the `tokio::time::timeout`
+    /// that wraps `child.wait()` in the background task — exactly the
+    /// `Err(_elapsed)` arm under test.
+    ///
+    /// LOAD-BEARING: the assertion is that the flag returns to `false` AFTER the
+    /// advance. If the timeout-release were removed (the guard held until the
+    /// child exits, which never happens here), the flag would stay `true` and
+    /// this test would hang at the poll deadline and fail — proving the arm is
+    /// what frees the slot.
+    #[tokio::test(start_paused = true)]
+    async fn max_update_hold_timeout_releases_in_flight_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let started_marker = tmp.path().join("child-started");
+        let sudo = write_never_exiting_stub(tmp.path(), &started_marker);
+
+        let updater = Updater {
+            // `command` is only ever an argv element here (the stub ignores it),
+            // so any path works; the never-exiting behaviour comes from `sudo`.
+            command: tmp.path().join("update.sh"),
+            dry_run: false,
+            sudo_command: sudo,
+        };
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let guard = InFlightGuard::try_acquire(&flag).expect("slot is free");
+
+        // run() spawns the real (sleeping) child. The 1s EARLY_EXIT_PROBE timer
+        // auto-fires under paused time (the child never exits, so the only
+        // pending work is the timer), so run() takes the "still running" branch:
+        // it moves the guard into the background wait task and returns Ok.
+        updater
+            .run(&Version::new(0, 2, 56), guard)
+            .await
+            .expect("spawn of the sleeping stub must succeed");
+
+        // The slot is still claimed: the background task holds the guard while
+        // it waits (bounded by MAX_UPDATE_HOLD) for the child that never exits.
+        assert!(
+            flag.load(Ordering::Acquire),
+            "slot must stay claimed while the update is in flight"
+        );
+
+        // Let the background wait task get scheduled and park on its
+        // `tokio::time::timeout(MAX_UPDATE_HOLD, child.wait())` so its timer is
+        // registered before we advance virtual time.
+        tokio::task::yield_now().await;
+
+        // Fire the MAX_UPDATE_HOLD timeout: advance virtual time just past the
+        // hold. The real child keeps sleeping (wall-clock), so the only way the
+        // slot can free is the `Err(_elapsed)` timeout arm dropping the guard.
+        tokio::time::advance(MAX_UPDATE_HOLD + Duration::from_millis(1)).await;
+
+        // Let the background task observe the elapsed timeout and drop the guard.
+        // Bounded poll so the test fails (rather than hangs forever) if the
+        // timeout-release is ever removed. `sleep` cooperates with paused-time
+        // auto-advance and yields to the background task between checks.
+        let mut released = false;
+        for _ in 0..1_000 {
+            if !flag.load(Ordering::Acquire) {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            released,
+            "MAX_UPDATE_HOLD timeout arm must release the in-flight slot even \
+             though the child is still running (residual re-open window, #4271)"
+        );
+
+        // And the slot is now genuinely free: a fresh acquire succeeds, i.e. a
+        // follow-up update would be accepted rather than 409-rejected.
+        assert!(
+            InFlightGuard::try_acquire(&flag).is_some(),
+            "after the timeout fires the slot must be re-acquirable"
+        );
+
+        // Teardown-noise guard: wait until the stub child has `exec`'d into
+        // `sleep` (it writes `started_marker` immediately before doing so) so
+        // dropping `tmp` below doesn't delete the script out from under a child
+        // that hasn't opened it yet — which would log `No such file or
+        // directory` to stderr. The child runs on the OS independently of the
+        // paused runtime; a busy `yield_now` poll lets it make progress without
+        // depending on (paused) tokio time. Bounded so a genuinely stuck child
+        // fails the test rather than hanging.
+        let mut child_running = false;
+        for _ in 0..100_000 {
+            if started_marker.exists() {
+                child_running = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            child_running,
+            "stub child should have started (and written its marker) by now"
+        );
+        drop(tmp);
+    }
+
     // Live-spawn coverage lives in the integration test
     // `tests/update_handler.rs`, which exercises the full request →
     // validation → spawn pipeline against a stub script (no sudo).
