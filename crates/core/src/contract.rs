@@ -4521,6 +4521,73 @@ mod hol_4391_tests {
         );
     }
 
+    /// Round-3.2 (unit): on GLOBAL-cap overflow, `requeue_front` must accept the
+    /// OLDEST held event (which pops first) and reject the NEWEST ones — never
+    /// the reverse. With held `[e1,e2,e3]` and exactly ONE global slot free, e1
+    /// must be re-queued (and pop first) while e2,e3 are returned as overflow in
+    /// FIFO order. The previous reverse-iterate-with-per-event-cap code accepted
+    /// e3 (newest) and rejected e1,e2 — a per-contract FIFO violation. (Codex.)
+    #[test]
+    fn requeue_front_global_overflow_keeps_oldest_rejects_newest() {
+        let mut fq = fair_queue::FairEventQueue::new();
+
+        // Saturate the GLOBAL queue to MAX_TOTAL_FAIR_QUEUE - 1 (one slot free),
+        // spread across distinct contract keys so no single per-contract bucket
+        // overflows (each key holds at most MAX_QUEUED_PER_CONTRACT).
+        let target = fair_queue::MAX_TOTAL_FAIR_QUEUE - 1;
+        let mut pushed = 0u64;
+        let mut filler = 0u64;
+        while (pushed as usize) < target {
+            let key = instance_id(format!("filler_{filler}").as_bytes());
+            filler += 1;
+            let room = (target - pushed as usize).min(fair_queue::MAX_QUEUED_PER_CONTRACT);
+            for _ in 0..room {
+                fq.try_push(
+                    handler::EventId {
+                        id: 10_000 + pushed,
+                    },
+                    get_event(key),
+                )
+                .expect("filler push under caps");
+                pushed += 1;
+            }
+        }
+        assert_eq!(fq.total_queued(), target, "exactly one global slot free");
+
+        // Held events for a FRESH key (its bucket is empty → bucket_free=100, so
+        // the binding constraint is the single free GLOBAL slot → capacity 1).
+        let held_key = instance_id(b"held_global_overflow");
+        let mut held = std::collections::VecDeque::new();
+        held.push_back((handler::EventId { id: 1 }, get_event(held_key)));
+        held.push_back((handler::EventId { id: 2 }, get_event(held_key)));
+        held.push_back((handler::EventId { id: 3 }, get_event(held_key)));
+
+        let rejected = fq.requeue_front(held);
+
+        // e2, e3 (newest) rejected, in FIFO order.
+        let rejected_ids: Vec<u64> = rejected.iter().map(|(id, _)| id.id).collect();
+        assert_eq!(
+            rejected_ids,
+            vec![2, 3],
+            "on global overflow, the NEWEST events must be rejected (in FIFO order), \
+             keeping the oldest — got {rejected_ids:?}"
+        );
+
+        // e1 (oldest) was accepted and, for its key, pops first. Drain the
+        // held_key bucket and confirm e1 is the only/first event from it.
+        let mut from_held_key = Vec::new();
+        while let Some((id, ev)) = fq.pop() {
+            if fair_queue::extract_contract_id(&ev) == Some(held_key) {
+                from_held_key.push(id.id);
+            }
+        }
+        assert_eq!(
+            from_held_key,
+            vec![1],
+            "the OLDEST held event (e1) must be the one accepted on overflow"
+        );
+    }
+
     /// SHOULD-FIX (unit): the per-deferral held buffer caps at
     /// MAX_HELD_PER_DEFERRAL — the (cap+1)th hold returns `Full` carrying the
     /// event back.
