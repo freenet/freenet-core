@@ -9645,3 +9645,289 @@ fn test_hop_count_populated_on_terminal_get_events() {
         RING_MAX_HTL
     );
 }
+
+/// Verifies the contract-placement migration (#4404): a contract held only by a
+/// peer FAR from its key migrates onto the cluster of peers CLOSEST to the key,
+/// resolving the GET dead-end.
+///
+/// Setup (peer ring locations controlled via `new_with_node_locations`):
+///   - a dense cluster of peers sits right on the contract's key location;
+///   - exactly one peer, far from the key, initially hosts the contract (seeded
+///     into its store AND Ring hosting manager, with no network propagation);
+///   - a requester, also far from the key, issues a GET.
+///
+/// GET is single-path greedy (k=1), so it routes toward the key and reaches the
+/// close cluster. WITHOUT the migration that cluster lacks the state, so the GET
+/// dead-ends with NotFound (the far host is never on the greedy path toward the
+/// key) — that is the placement gap #4404 describes. The migration nudges the
+/// contract from the far host toward the key: each hosting peer, on gaining a
+/// connected neighbor strictly closer to the key, sends a `SubscribeHint` so
+/// that neighbor directed-subscribes through the holder and begins hosting. The
+/// contract therefore climbs onto the close cluster, and a key-routed GET now
+/// lands on a host. (The dead-end itself is not asserted separately here; the
+/// migration trigger is always-on, so this test pins the resolved state.)
+///
+/// Asserts the migration outcome directly via each node's live Ring: the far
+/// host still hosts the contract, and at least one close-cluster peer (the peers
+/// a key-routed GET actually reaches) ends up hosting it via migration.
+#[test_log::test]
+fn test_contract_migrates_to_close_cluster_resolving_get_dead_end() {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    const SEED: u64 = 0xDEAD_F00D_0001;
+    const NETWORK_NAME: &str = "get-placement-deadend";
+    setup_deterministic_state(SEED);
+
+    // Pick a contract and read its ring location; place peers relative to it.
+    let contract = SimOperation::create_test_contract(0xBE);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+
+    // Six peers clustered tightly around the key (none will host it), then one
+    // far host (seeded) and one far requester. `rem_euclid` wraps onto the ring.
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    let cluster: Vec<f64> = [-0.010, -0.006, -0.003, 0.003, 0.006, 0.010]
+        .iter()
+        .map(|o| wrap(key_loc + o))
+        .collect();
+    let host_loc = wrap(key_loc + 0.40); // far from the key
+    let requester_loc = wrap(key_loc + 0.70); // far from the key, other side
+    let mut node_locations = cluster.clone();
+    node_locations.push(host_loc); // regular-node order 6 -> node_no 7
+    node_locations.push(requester_loc); // regular-node order 7 -> node_no 8
+    let num_nodes = node_locations.len(); // 8
+
+    let rt = create_runtime();
+    let mut sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            NETWORK_NAME,
+            1,         // 1 gateway
+            num_nodes, // 8 regular nodes
+            10,        // ring_max_htl
+            7,         // rnd_if_htl_above
+            8,         // max_connections
+            3,         // min_connections
+            SEED,
+            &node_locations,
+        )
+        .await
+    });
+    // Opt this simulation into the placement-migration cascade (off by default in
+    // sim so it can't perturb unrelated tests, e.g. the streaming assembly-retry
+    // test). This lowers the per-node SubscribeHint version floor to (0,0,0).
+    sim.enable_placement_migration();
+
+    // Regular nodes are node_no = 1..=8 (gateway is node 0); node_locations[i]
+    // maps to node_no i+1.
+    let host_label = NodeLabel::node(NETWORK_NAME, 7); // host_loc
+    let requester_label = NodeLabel::node(NETWORK_NAME, 8); // requester_loc
+
+    // Setup sanity: a cluster node must be strictly closer to the key than the
+    // host, so a key-routed GET genuinely lands in the (non-hosting) cluster
+    // rather than near the holder. get_peer_locations() is [gateway, node1..8].
+    let locs = sim.get_peer_locations();
+    let ring_dist = |a: f64, b: f64| {
+        let d = (a - b).abs();
+        d.min(1.0 - d)
+    };
+    let host_dist = ring_dist(locs[7], key_loc);
+    let cluster_min = (1..=6)
+        .map(|i| ring_dist(locs[i], key_loc))
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        cluster_min < host_dist,
+        "scenario setup wrong: a cluster node must be closer to the key than the host \
+         (cluster_min={cluster_min}, host_dist={host_dist})"
+    );
+
+    let operations = vec![
+        // Only the far host holds the contract initially — seeded into both its
+        // store and Ring hosting manager (no network propagation), so it is a
+        // genuine migration source (`ring.is_hosting_contract` is true).
+        ScheduledOperation::new(
+            host_label.clone(),
+            SimOperation::SeedHostedContract {
+                contract: contract.clone(),
+                state: vec![10, 20, 30, 40],
+            },
+        ),
+        // The far requester asks for it (greedy GET toward the key).
+        ScheduledOperation::new(
+            requester_label.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(180),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // The far host still hosts the seeded contract (it remains a source).
+    assert!(
+        result.is_node_hosting(&host_label, &contract_key),
+        "host should still host the seeded contract after the simulation"
+    );
+
+    // CORE OF THE FIX: the contract migrated onto the close cluster. At least
+    // one of the peers a key-routed GET actually reaches (node_no 1..=6) now
+    // hosts it. Before the migration NONE of them did — this test previously
+    // asserted exactly that dead-end (see git history). With the contract now
+    // present on a peer the greedy path lands on, the dead-end is resolved.
+    let migrated: Vec<usize> = (1..=6usize)
+        .filter(|n| result.is_node_hosting(&NodeLabel::node(NETWORK_NAME, *n), &contract_key))
+        .collect();
+    let requester_has_state = result
+        .node_storages
+        .get(&requester_label)
+        .is_some_and(|s| s.get_stored_state(&contract_key).is_some());
+    assert!(
+        !migrated.is_empty(),
+        "placement migration FAILED: no close-cluster peer (node_no 1..=6) hosts the \
+         contract after the simulation. The contract never migrated from the far host \
+         toward the key, so a key-routed GET would still dead-end. \
+         host_hosting={}, requester_has_state={requester_has_state}",
+        result.is_node_hosting(&host_label, &contract_key),
+    );
+
+    // End-to-end payoff: with the contract migrated onto the close cluster, the
+    // requester's greedy GET toward the key now lands on a host instead of
+    // dead-ending, so it obtains the state. This is the user-visible symptom
+    // from the original telemetry (a web GET that needed several retries before
+    // the contract had migrated onto the key-close peers).
+    assert!(
+        requester_has_state,
+        "requester GET should now succeed: with the contract migrated onto the close \
+         cluster, the greedy GET toward the key lands on a host instead of dead-ending \
+         (migrated cluster nodes: {migrated:?})"
+    );
+
+    tracing::info!(
+        migrated_cluster_nodes = ?migrated,
+        requester_has_state,
+        "placement migration converged onto the close cluster"
+    );
+}
+
+/// Negative control for `test_contract_migrates_to_close_cluster_resolving_get_dead_end`.
+///
+/// IDENTICAL scenario, but WITHOUT `enable_placement_migration()` — so the
+/// SubscribeHint cascade stays off (sim peers report a build version below the
+/// production floor). This reproduces the #4404 dead-end and, paired with the
+/// positive test, proves that the migration cascade (not some incidental GET
+/// caching path) is what makes the close cluster host the contract: same seed,
+/// same topology, the ONLY difference is whether migration is enabled.
+#[test_log::test]
+fn test_get_dead_ends_at_close_cluster_without_migration() {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    const SEED: u64 = 0xDEAD_F00D_0001;
+    const NETWORK_NAME: &str = "get-placement-deadend-control";
+    setup_deterministic_state(SEED);
+
+    let contract = SimOperation::create_test_contract(0xBE);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    let cluster: Vec<f64> = [-0.010, -0.006, -0.003, 0.003, 0.006, 0.010]
+        .iter()
+        .map(|o| wrap(key_loc + o))
+        .collect();
+    let host_loc = wrap(key_loc + 0.40);
+    let requester_loc = wrap(key_loc + 0.70);
+    let mut node_locations = cluster.clone();
+    node_locations.push(host_loc);
+    node_locations.push(requester_loc);
+    let num_nodes = node_locations.len();
+
+    let rt = create_runtime();
+    // NOTE: deliberately NO `enable_placement_migration()` — that is the whole
+    // point of this control.
+    let sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            NETWORK_NAME,
+            1,
+            num_nodes,
+            10,
+            7,
+            8,
+            3,
+            SEED,
+            &node_locations,
+        )
+        .await
+    });
+
+    let host_label = NodeLabel::node(NETWORK_NAME, 7);
+    let requester_label = NodeLabel::node(NETWORK_NAME, 8);
+
+    let operations = vec![
+        ScheduledOperation::new(
+            host_label.clone(),
+            SimOperation::SeedHostedContract {
+                contract: contract.clone(),
+                state: vec![10, 20, 30, 40],
+            },
+        ),
+        ScheduledOperation::new(
+            requester_label.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(180),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // The far host still hosts the seeded contract.
+    assert!(
+        result.is_node_hosting(&host_label, &contract_key),
+        "host should hold the seeded contract"
+    );
+
+    // DEAD-END (expected without migration): no close-cluster peer hosts the
+    // contract, so a key-routed GET dead-ends and the requester gets nothing.
+    let migrated: Vec<usize> = (1..=6usize)
+        .filter(|n| result.is_node_hosting(&NodeLabel::node(NETWORK_NAME, *n), &contract_key))
+        .collect();
+    assert!(
+        migrated.is_empty(),
+        "without migration, no close-cluster peer should host the contract, but these do: \
+         {migrated:?} (cascade leaked into a migration-disabled sim?)"
+    );
+    let requester_has_state = result
+        .node_storages
+        .get(&requester_label)
+        .is_some_and(|s| s.get_stored_state(&contract_key).is_some());
+    assert!(
+        !requester_has_state,
+        "without migration the requester GET must dead-end at the close non-hosting cluster \
+         and obtain NO state (the far host is off the greedy path toward the key)"
+    );
+}

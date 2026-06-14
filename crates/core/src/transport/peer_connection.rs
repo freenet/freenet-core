@@ -2340,6 +2340,10 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         self.remote_conn.remote_addr
     }
 
+    fn remote_version(&self) -> Option<(u8, u8, u16)> {
+        PeerConnection::remote_version(self)
+    }
+
     fn send_message(
         &mut self,
         msg: crate::message::NetMessage,

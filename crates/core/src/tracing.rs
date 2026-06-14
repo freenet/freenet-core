@@ -1480,7 +1480,8 @@ impl<'a> NetEventLog<'a> {
             | NetMessageV1::Aborted(_)
             | NetMessageV1::NeighborHosting { .. }
             | NetMessageV1::InterestSync { .. }
-            | NetMessageV1::ReadyState { .. } => EventKind::Ignored,
+            | NetMessageV1::ReadyState { .. }
+            | NetMessageV1::SubscribeHint(_) => EventKind::Ignored,
         };
         let own_loc = op_manager.ring.connection_manager.own_location();
         let Some(own_addr) = own_loc.socket_addr() else {

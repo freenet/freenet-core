@@ -70,6 +70,23 @@ requests, Metadata) and `workflow` scopes. See AGENTS.md → "Release Workflow
 workflow-triggering events as an anti-recursion safeguard, so PAT is
 required for the cascade to fire automatically).
 
+### Wire-gated feature floors (one-time, per feature)
+
+Some features that add a new `NetMessageV1` wire variant are version-gated:
+a node only sends the new variant to peers whose negotiated protocol version
+is at or above a hardcoded floor, so older peers never receive a variant they
+can't deserialize (they'd drop the connection). When you cut the release that
+**first** ships such a feature, set its floor to **exactly that release
+version**, then leave it frozen — do NOT bump it on later releases (raising it
+above the first-shipping version would silently stop sending to fully-capable
+peers).
+
+Current wire-gated floors to set at first ship:
+
+- `SUBSCRIBE_HINT_MIN_VERSION` in `crates/core/src/node/network_bridge/p2p_protoc.rs`
+  (SubscribeHint placement migration, #4404). Must equal the first release that
+  includes it.
+
 ## What fires when
 
 ```

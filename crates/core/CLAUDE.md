@@ -64,6 +64,7 @@ Driver entry points:
                               start_relay_request_update_streaming,
                               start_relay_broadcast_to_streaming
   subscribe/op_ctx_task.rs  → start_client_subscribe,
+                              start_directed_subscribe,
                               run_executor_subscribe,
                               run_renewal_subscribe,
                               start_relay_subscribe

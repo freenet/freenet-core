@@ -137,6 +137,94 @@ pub(crate) async fn start_client_subscribe(
     Ok(client_tx)
 }
 
+/// Start a node-initiated **directed** subscribe toward a specific first hop.
+///
+/// Used by the directed-subscribe placement path (#4404): on receiving a
+/// [`SubscribeHint`](crate::message::NetMessageV1::SubscribeHint), the
+/// recipient subscribes to `key` routed THROUGH `holder` (the hint sender,
+/// the current holder) rather than via greedy ring selection — a plain
+/// greedy subscribe would route away from the holder. Fetching the contract
+/// as part of the subscribe causes the recipient to host it, migrating the
+/// contract toward its ideal ring location.
+///
+/// Fire-and-forget: there is no client waiter. Like `start_client_subscribe`,
+/// failures are swallowed inside the spawned driver (no result delivery).
+/// Mirrors `start_client_subscribe`'s admission/ban guards but threads
+/// `first_hop = Some(holder)` into the driver.
+pub(crate) fn start_directed_subscribe(
+    op_manager: Arc<OpManager>,
+    key: freenet_stdlib::prelude::ContractKey,
+    holder: PeerKeyLocation,
+) {
+    let instance_id = *key.id();
+
+    // Egress self-block (#4300): refuse to originate a directed subscribe for
+    // a contract this node has banned, mirroring `start_client_subscribe`.
+    if crate::operations::reject_if_contract_banned(&op_manager, &instance_id).is_err() {
+        tracing::debug!(
+            contract = %instance_id,
+            "directed subscribe: contract banned, ignoring hint"
+        );
+        return;
+    }
+
+    let inflight_guard = match op_manager.admit_client_op() {
+        Some(g) => g,
+        None => return,
+    };
+    let directed_tx = Transaction::new::<SubscribeMsg>();
+    tracing::debug!(
+        tx = %directed_tx,
+        contract = %instance_id,
+        holder = ?holder.socket_addr(),
+        "directed subscribe: spawning hint-initiated task"
+    );
+    GlobalExecutor::spawn(async move {
+        let _inflight_guard = inflight_guard;
+        let outcome = drive_client_subscribe(
+            op_manager.clone(),
+            instance_id,
+            directed_tx,
+            /* is_renewal */ false,
+            /* first_hop */ Some(holder),
+        )
+        .await;
+        // Internal (migration) subscribe: there is NO client waiter. The
+        // hosting side effects (host_contract, announce) already ran inside the
+        // driver's `finalize_originator_subscribe`, so completion is just a log
+        // here. Deliberately NOT routed through `deliver_outcome`: that would
+        // count this toward the user-facing SUBSCRIBE op-stats and push a result
+        // into `result_router_tx` that no client consumes (skewing stats and
+        // occupying router capacity during a migration cascade). Best-effort:
+        // a failed directed subscribe is retried on the next migration trigger.
+        match outcome {
+            DriverOutcome::Publish(Ok(_)) | DriverOutcome::SkipAlreadyDelivered => {
+                tracing::debug!(
+                    tx = %directed_tx,
+                    contract = %instance_id,
+                    "directed subscribe: completed (now hosting/subscribed)"
+                );
+            }
+            DriverOutcome::Publish(Err(e)) => {
+                tracing::debug!(
+                    tx = %directed_tx,
+                    contract = %instance_id,
+                    error = ?e,
+                    "directed subscribe: did not complete (best-effort; will retry on next trigger)"
+                );
+            }
+            DriverOutcome::InfrastructureError(err) => {
+                tracing::debug!(
+                    tx = %directed_tx,
+                    contract = %instance_id,
+                    error = %err,
+                    "directed subscribe: infrastructure error (best-effort)"
+                );
+            }
+        }
+    });
+}
+
 /// Drive a client-initiated subscribe to completion and publish the result
 /// to `result_router_tx` keyed by `client_tx`.
 ///
@@ -162,6 +250,7 @@ pub(crate) async fn run_client_subscribe(
         instance_id,
         client_tx,
         /* is_renewal */ false,
+        /* first_hop */ None,
     )
     .await;
     deliver_outcome(&op_manager, client_tx, instance_id, outcome);
@@ -248,6 +337,7 @@ pub(crate) async fn run_renewal_subscribe(
         instance_id,
         renewal_tx,
         /* is_renewal */ true,
+        /* first_hop */ None,
     )
     .await;
     classify_renewal_result(result)
@@ -342,6 +432,7 @@ pub(crate) async fn run_executor_subscribe(
         executor_tx,
         instance_id,
         /* is_renewal */ false,
+        /* first_hop */ None,
     )
     .await
     {
@@ -393,6 +484,7 @@ pub(crate) async fn run_executor_subscribe(
         instance_id,
         executor_tx,
         /* is_renewal */ false,
+        /* first_hop */ None,
     )
     .await;
     classify_executor_subscribe_result(result)
@@ -469,8 +561,11 @@ async fn drive_client_subscribe(
     instance_id: ContractInstanceId,
     client_tx: Transaction,
     is_renewal: bool,
+    first_hop: Option<PeerKeyLocation>,
 ) -> DriverOutcome {
-    match drive_client_subscribe_inner(&op_manager, instance_id, client_tx, is_renewal).await {
+    match drive_client_subscribe_inner(&op_manager, instance_id, client_tx, is_renewal, first_hop)
+        .await
+    {
         Ok(outcome) => outcome,
         Err(err) => DriverOutcome::InfrastructureError(err),
     }
@@ -481,6 +576,7 @@ async fn drive_client_subscribe_inner(
     instance_id: ContractInstanceId,
     client_tx: Transaction,
     is_renewal: bool,
+    first_hop: Option<PeerKeyLocation>,
 ) -> Result<DriverOutcome, OpError> {
     // Decide: local-completion, give up, or send to the network.
     // `prepare_initial_request` uses `client_tx` for its visited-peers
@@ -488,7 +584,14 @@ async fn drive_client_subscribe_inner(
     // filter is per-attempt-first-peer only and telemetry correlates on
     // the client-visible tx (matching legacy behaviour for the first
     // attempt).
-    let initial = prepare_initial_request(op_manager, client_tx, instance_id, is_renewal).await?;
+    // Retain the directed holder (if any) so the post-Subscribed body fetch can
+    // be routed THROUGH it rather than greedily. A greedy sub-op GET toward the
+    // key could dead-end at the same close non-hosting cluster the migration is
+    // resolving, leaving this peer subscribed-but-bodyless. `None` for ordinary
+    // (non-directed) subscribes, which keep the greedy fetch.
+    let directed_holder = first_hop.clone();
+    let initial =
+        prepare_initial_request(op_manager, client_tx, instance_id, is_renewal, first_hop).await?;
 
     let (target_peer, target_addr, mut visited, mut alternatives, htl) = match initial {
         InitialRequest::LocallyComplete { key } => {
@@ -783,6 +886,7 @@ async fn drive_client_subscribe_inner(
                     key,
                     current_target_addr,
                     is_renewal,
+                    directed_holder.clone(),
                 )
                 .await;
                 return Ok(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
@@ -1768,6 +1872,49 @@ mod tests {
              before GlobalExecutor::spawn so a banned contract's SUBSCRIBE \
              is rejected with a typed error instead of registering interest \
              (#4300 egress self-block)."
+        );
+    }
+
+    /// `start_directed_subscribe` (the SubscribeHint receive path) MUST keep
+    /// the same ban + admission guards as `start_client_subscribe` before it
+    /// spawns a driver — a network-triggered directed subscribe must not bypass
+    /// the egress ban check (#4300) or the inflight admission gate. And it must
+    /// NOT route its outcome through `deliver_outcome` (the client result path):
+    /// there is no client waiter, so doing so would skew the user-facing
+    /// SUBSCRIBE op-stats and push an unconsumed result into result_router_tx
+    /// during a migration cascade (Codex r2).
+    #[test]
+    fn start_directed_subscribe_guards_and_completes_internally() {
+        let src = include_str!("op_ctx_task.rs");
+        let entry = src
+            .find("pub(crate) fn start_directed_subscribe(")
+            .expect("start_directed_subscribe must exist");
+        let after_spawn_off = src[entry..]
+            .find("GlobalExecutor::spawn(")
+            .expect("start_directed_subscribe must spawn a driver task");
+        let before_spawn = &src[entry..entry + after_spawn_off];
+        assert!(
+            before_spawn.contains("reject_if_contract_banned"),
+            "start_directed_subscribe must call reject_if_contract_banned() before spawn"
+        );
+        assert!(
+            before_spawn.contains("op_manager.admit_client_op()"),
+            "start_directed_subscribe must acquire the inflight admission guard before spawn"
+        );
+        // Bound the spawned-block scan to this function (up to the next fn).
+        let rest = &src[entry + after_spawn_off..];
+        let block_end = rest.find("\npub(crate) async fn ").unwrap_or(rest.len());
+        let spawn_block = &rest[..block_end];
+        assert!(
+            spawn_block.contains("let _inflight_guard = inflight_guard;"),
+            "the inflight guard must be moved into the spawned directed-subscribe future"
+        );
+        // Check for the CALL form `deliver_outcome(` — the explanatory comment in
+        // the function mentions the name without a paren, so this won't false-trip.
+        assert!(
+            !spawn_block.contains("deliver_outcome("),
+            "start_directed_subscribe must complete internally (log only), NOT via \
+             deliver_outcome() — there is no client waiter for a migration subscribe"
         );
     }
 

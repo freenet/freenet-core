@@ -631,6 +631,13 @@ pub(crate) trait PeerConnectionApi: Send {
     /// Returns the remote peer's socket address.
     fn remote_addr(&self) -> SocketAddr;
 
+    /// Returns the remote peer's negotiated protocol version, if known.
+    ///
+    /// `None` when the version was not exchanged (e.g. the joiner->gateway
+    /// path whose `AckConnection` carries no version). Callers must treat
+    /// `None` as "unsupported" when gating version-dependent message types.
+    fn remote_version(&self) -> Option<(u8, u8, u16)>;
+
     /// Sends a network message to the remote peer.
     ///
     /// The message is serialized and sent over the transport connection.
