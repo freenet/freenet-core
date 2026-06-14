@@ -1693,6 +1693,17 @@ where
                     // `requires()` no longer lists it), OR — if a misbehaving
                     // contract keeps requiring it — hits the one-deferral cap →
                     // MissingRelated, never an inline network GET. See #4391.
+                    //
+                    // Asymmetry with the validate-side deferrable block (which
+                    // ALSO consults the caller-supplied `initial_related`) is
+                    // INTENTIONAL: here, any related state the caller supplied
+                    // was already folded into `updates` as `UpdateData::RelatedState`
+                    // before `update_state` ran, so a well-behaved contract's
+                    // `requires()` never lists a supplied id. A misbehaving one
+                    // that re-requires it defers once, then the one-deferral cap
+                    // converts the second `DeferRelated` to `MissingRelated`.
+                    // Either way the no-inline-fetch invariant holds, so checking
+                    // only the state_store here is sufficient.
                     let mut missing = Vec::new();
                     for id in &unique_ids {
                         let resolved = if let Some(full_key) = self.bridged_lookup_key(id) {
