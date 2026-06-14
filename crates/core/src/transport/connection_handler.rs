@@ -1808,28 +1808,36 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     .map_err(|_| TransportError::ConnectionEstablishmentFailure {
                         cause: "Protocol version field wrong size".into(),
                     })?;
-            match version_cmp::is_compatible(&PROTOC_VERSION, &protoc_bytes) {
-                Ok(remote_info) => {
-                    crate::transport::report_peer_version(remote_info.version);
-                }
-                Err(reason) => {
-                    // Track version even on incompatible peers — aids version discovery.
-                    let remote_info = version_cmp::parse_version_bytes(&protoc_bytes);
-                    crate::transport::report_peer_version(remote_info.version);
-                    if version_cmp::remote_requires_newer_than_us(&PROTOC_VERSION, &protoc_bytes) {
-                        crate::transport::signal_urgent_update();
+            // Capture the negotiated version so it can be stored on the
+            // RemoteConnection below (only set on the compatible-peer path; the
+            // Err arm returns before we ever build a connection).
+            let remote_protoc_version =
+                match version_cmp::is_compatible(&PROTOC_VERSION, &protoc_bytes) {
+                    Ok(remote_info) => {
+                        crate::transport::report_peer_version(remote_info.version);
+                        Some(remote_info.version)
                     }
-                    let packet = SymmetricMessage::ack_error(&outbound_key)?;
-                    socket
-                        .send_to(&packet.prepared_send(), remote_addr)
-                        .await
-                        .map_err(|_| TransportError::ChannelClosed)?;
-                    return Err(TransportError::ProtocolVersionMismatch {
-                        expected: PCK_VERSION.to_string(),
-                        actual: reason.to_string(),
-                    });
-                }
-            }
+                    Err(reason) => {
+                        // Track version even on incompatible peers — aids version discovery.
+                        let remote_info = version_cmp::parse_version_bytes(&protoc_bytes);
+                        crate::transport::report_peer_version(remote_info.version);
+                        if version_cmp::remote_requires_newer_than_us(
+                            &PROTOC_VERSION,
+                            &protoc_bytes,
+                        ) {
+                            crate::transport::signal_urgent_update();
+                        }
+                        let packet = SymmetricMessage::ack_error(&outbound_key)?;
+                        socket
+                            .send_to(&packet.prepared_send(), remote_addr)
+                            .await
+                            .map_err(|_| TransportError::ChannelClosed)?;
+                        return Err(TransportError::ProtocolVersionMismatch {
+                            expected: PCK_VERSION.to_string(),
+                            actual: reason.to_string(),
+                        });
+                    }
+                };
 
             let inbound_key = Aes128Gcm::new(&inbound_key_bytes.into());
             let outbound_ack_packet =
@@ -1955,6 +1963,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 inbound_symmetric_key_bytes: inbound_key_bytes,
                 global_bandwidth: global_bandwidth.clone(),
                 my_address: None,
+                remote_protoc_version,
                 transport_secret_key: secret,
                 congestion_controller,
                 token_bucket,
@@ -2007,6 +2016,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             transport_secret_key: &TransportSecretKey,
             outbound_sym_key: &mut Option<Aes128Gcm>,
             state: &mut HandshakePhase,
+            remote_protoc_version: &mut Option<(u8, u8, u16)>,
         ) -> Result<(), ()> {
             if let Ok(decrypted_intro_packet) = packet.try_decrypt_asym(transport_secret_key) {
                 tracing::debug!(
@@ -2019,6 +2029,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     match version_cmp::is_compatible(&PROTOC_VERSION, &protoc_bytes) {
                         Ok(remote_info) => {
                             crate::transport::report_peer_version(remote_info.version);
+                            *remote_protoc_version = Some(remote_info.version);
                         }
                         Err(reason) => {
                             // Track version even on incompatible peers — aids version discovery.
@@ -2091,6 +2102,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             let inbound_sym_key = Aes128Gcm::new(&inbound_sym_key_bytes.into());
 
             let mut outbound_sym_key: Option<Aes128Gcm> = None;
+            // Remote peer's negotiated protocol version, captured by decrypt_asym
+            // on the hole-punch (RemoteInbound) path. Stays None on the
+            // AckConnection (joiner->gateway) path, whose payload has no version.
+            let mut remote_protoc_version: Option<(u8, u8, u16)> = None;
             let outbound_intro_packet = {
                 let mut data = [0u8; { 16 + PROTOC_VERSION.len() }];
                 data[..PROTOC_VERSION.len()].copy_from_slice(&PROTOC_VERSION);
@@ -2276,6 +2291,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                     inbound_symmetric_key_bytes:
                                                         inbound_sym_key_bytes,
                                                     my_address: Some(my_address),
+                                                    // AckConnection (joiner->gateway) payload
+                                                    // carries no protocol version.
+                                                    remote_protoc_version: None,
                                                     transport_secret_key: transport_secret_key
                                                         .clone(),
                                                     congestion_controller,
@@ -2317,6 +2335,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     &transport_secret_key,
                                     &mut outbound_sym_key,
                                     &mut state,
+                                    &mut remote_protoc_version,
                                 )
                                 .is_ok()
                                 {
@@ -2394,6 +2413,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                         inbound_symmetric_key: inbound_sym_key,
                                         inbound_symmetric_key_bytes: inbound_sym_key_bytes,
                                         my_address: None,
+                                        remote_protoc_version,
                                         transport_secret_key: transport_secret_key.clone(),
                                         congestion_controller,
                                         token_bucket,
@@ -4505,21 +4525,38 @@ pub mod mock_transport {
         let (peer_b_pub, mut peer_b, peer_b_addr) =
             create_mock_peer(Default::default(), channels).await?;
 
+        // Expected negotiated version is our own compiled PROTOC_VERSION, since
+        // both mock peers run the same build.
+        let expected_version = version_cmp::parse_version_bytes(&PROTOC_VERSION).version;
+
         let peer_b = GlobalExecutor::spawn(async move {
             let peer_a_conn = peer_b.connect(peer_a_pub, peer_a_addr).await;
-            let _conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
-            Ok::<_, anyhow::Error>(())
+            let conn = tokio::time::timeout(Duration::from_secs(500), peer_a_conn).await??;
+            Ok::<_, anyhow::Error>(conn.remote_version())
         });
 
         let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(peer_b_pub, peer_b_addr).await;
-            let _conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
-            Ok::<_, anyhow::Error>(())
+            let conn = tokio::time::timeout(Duration::from_secs(500), peer_b_conn).await??;
+            Ok::<_, anyhow::Error>(conn.remote_version())
         });
 
         let (a, b) = tokio::try_join!(peer_a, peer_b)?;
-        a?;
-        b?;
+        let a_version = a?;
+        let b_version = b?;
+
+        // This is a symmetric peer-to-peer hole-punch (no gateway), so each side
+        // captures the remote version while parsing the other's intro packet on
+        // the RemoteInbound path. Whichever side races ahead to the AckConnection
+        // path instead would report None (that payload carries no version), so we
+        // require any captured version to match and at least one side to capture it.
+        for v in [a_version, b_version].into_iter().flatten() {
+            assert_eq!(v, expected_version);
+        }
+        assert!(
+            a_version.is_some() || b_version.is_some(),
+            "at least one side should capture the remote protocol version on the RemoteInbound path"
+        );
         Ok(())
     }
 
@@ -4697,23 +4734,34 @@ pub mod mock_transport {
         let (gw_pub, (_oc, mut gw_conn), gw_addr) =
             create_mock_gateway(Default::default(), channels).await?;
 
+        let expected_version = version_cmp::parse_version_bytes(&PROTOC_VERSION).version;
+
         let gw = GlobalExecutor::spawn(async move {
             let gw_conn = gw_conn.recv();
-            let _gw = tokio::time::timeout(Duration::from_secs(10), gw_conn)
+            let gw = tokio::time::timeout(Duration::from_secs(10), gw_conn)
                 .await?
                 .ok_or(anyhow::anyhow!("no connection"))?;
-            Ok::<_, anyhow::Error>(())
+            // Gateway/acceptor side captures the joiner's version from its intro packet.
+            Ok::<_, anyhow::Error>(gw.remote_version())
         });
 
         let peer_a = GlobalExecutor::spawn(async move {
             let peer_b_conn = peer_a.connect(gw_pub, gw_addr).await;
-            let _conn = tokio::time::timeout(Duration::from_secs(60), peer_b_conn).await??;
-            Ok::<_, anyhow::Error>(())
+            let conn = tokio::time::timeout(Duration::from_secs(60), peer_b_conn).await??;
+            // Joiner->gateway side: the gateway's AckConnection payload carries no version.
+            Ok::<_, anyhow::Error>(conn.remote_version())
         });
 
-        let (a, b) = tokio::try_join!(peer_a, gw)?;
-        a?;
-        b?;
+        let (joiner_view, gw_view) = tokio::try_join!(peer_a, gw)?;
+        assert_eq!(
+            gw_view?,
+            Some(expected_version),
+            "gateway should capture the joiner's protocol version"
+        );
+        assert_eq!(
+            joiner_view?, None,
+            "joiner->gateway connection has no remote version (AckConnection carries none)"
+        );
         Ok(())
     }
 

@@ -105,6 +105,10 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTim
     pub(super) inbound_symmetric_key_bytes: [u8; 16],
     #[allow(dead_code)]
     pub(super) my_address: Option<SocketAddr>,
+    /// Remote peer's negotiated protocol version, captured during the handshake.
+    /// `None` on the joiner->gateway path (the gateway's AckConnection payload
+    /// carries no version) — see connection_handler.rs traverse_nat AckConnection arm.
+    pub(super) remote_protoc_version: Option<(u8, u8, u16)>,
     pub(super) transport_secret_key: TransportSecretKey,
     /// Congestion controller (BBR by default) - adapts to network conditions
     pub(super) congestion_controller: Arc<CongestionController<T>>,
@@ -1514,6 +1518,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote_conn.remote_addr
+    }
+
+    /// Remote peer's negotiated protocol version, if known (None on joiner->gateway connections).
+    pub fn remote_version(&self) -> Option<(u8, u8, u16)> {
+        self.remote_conn.remote_protoc_version
     }
 
     /// Returns a handle for accessing an inbound stream incrementally.
@@ -3266,6 +3275,7 @@ mod tests {
             inbound_symmetric_key: cipher,
             inbound_symmetric_key_bytes: key,
             my_address: None,
+            remote_protoc_version: None,
             transport_secret_key: keypair.secret,
             congestion_controller,
             token_bucket,
@@ -3358,6 +3368,7 @@ mod tests {
             inbound_symmetric_key: cipher.clone(),
             inbound_symmetric_key_bytes: key,
             my_address: None,
+            remote_protoc_version: None,
             transport_secret_key: keypair.secret,
             congestion_controller,
             token_bucket,
@@ -3488,6 +3499,7 @@ mod tests {
             inbound_symmetric_key: cipher.clone(),
             inbound_symmetric_key_bytes: key,
             my_address: None,
+            remote_protoc_version: None,
             transport_secret_key: keypair.secret,
             congestion_controller,
             token_bucket,
