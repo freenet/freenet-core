@@ -257,6 +257,26 @@ MUST:
   and the local-only path forced wasted ResyncRequest round trips
   on every send. The escalation is bounded by RELATED_FETCH_TIMEOUT.
   See PR #4006 / freenet/mail#80.
+
+- Off-loop deferral (#4391): there are now TWO entry points into the
+  bridged upsert.
+  * The NON-deferrable path (`upsert_contract_state`, used by
+    delegate-driven PUTs and direct callers) keeps the INLINE
+    `start_sub_op_get` escalation described above — it awaits the
+    network GET in place, bounded by RELATED_FETCH_TIMEOUT.
+  * The DEFERRABLE path (`upsert_contract_state_deferrable`, used by the
+    serial `contract_handling` loop) resolves related contracts
+    LOCAL-ONLY first. On a local miss it does NOT await the network GET
+    inline — it returns `UpsertOutcome::DeferRelated(missing)`, and the
+    loop off-loads the fetch to a background task and re-enqueues a
+    continuation (`contract.rs::maybe_defer_upsert` /
+    `handle_deferred_resume`). This keeps the single-threaded loop from
+    stalling on the 10s fetch while other contracts' events (including
+    cached GETs) drain. WASM validate/store still runs serially on the
+    loop; only the network WAIT moves off-loop. While a contract has an
+    in-flight deferral the loop HOLDS that contract's later events to
+    preserve per-contract FIFO; the block is released (and held events
+    re-queued at the FRONT) on resume or on a TTL sweep.
 ```
 
 ### WHEN a contract's validate_state returns RequestRelated

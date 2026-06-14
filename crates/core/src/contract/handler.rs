@@ -228,6 +228,18 @@ impl StashedResponder {
             .send((EventId { id: self.id }, ev))
             .map_err(|_| ContractError::NoEvHandlerResponse)
     }
+
+    /// Construct a `StashedResponder` directly from a oneshot sender, for unit
+    /// tests of the deferral machinery (e.g. the TTL sweep) that need to
+    /// observe the response a stranded client receives without standing up the
+    /// full channel + loop.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        id: u64,
+        sender: tokio::sync::oneshot::Sender<(EventId, ContractHandlerEvent)>,
+    ) -> Self {
+        Self { id, sender }
+    }
 }
 
 pub(crate) struct SenderHalve {

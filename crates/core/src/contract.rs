@@ -996,12 +996,18 @@ where
 
     loop {
         // Sweep deferrals whose off-loop fetch never reported (waiter task
-        // wedged/dropped): answer their stranded clients with MissingRelated
-        // and release their per-contract block so the contract isn't wedged
-        // forever. TTL-bounded per AGENTS.md "cleanup exemptions MUST be
-        // time-bounded". Responses go straight to the stashed oneshot, so this
-        // needs neither the handler nor `.await`.
-        sweep_stale_deferrals(&mut deferral_ctx, &mut fair_queue);
+        // wedged/dropped): answer their stranded clients with MissingRelated,
+        // release their per-contract block, and re-queue / backpressure their
+        // held events so the contract isn't wedged forever. TTL-bounded per
+        // AGENTS.md "cleanup exemptions MUST be time-bounded".
+        let now = executor::now_nanos();
+        sweep_stale_deferrals(
+            &mut deferral_ctx,
+            &mut fair_queue,
+            contract_handler.channel(),
+            now,
+        )
+        .await;
 
         // Drain resumed (deferred) upserts so a completed off-loop fetch is
         // applied promptly and its client answered, ahead of new queued work —
@@ -1170,21 +1176,25 @@ fn pop_runnable_event(
 /// `at_capacity()` is permanently true and the off-loading silently disables
 /// itself. See issue #4391 and AGENTS.md (cleanup exemptions must be
 /// time-bounded).
-fn sweep_stale_deferrals(
+/// `now_nanos` is injected (rather than read from `executor::now_nanos()`
+/// internally) so the sweep is deterministically unit-testable. The loop call
+/// site passes `executor::now_nanos()`.
+async fn sweep_stale_deferrals(
     deferral_ctx: &mut DeferralCtx,
     fair_queue: &mut fair_queue::FairEventQueue,
+    channel: &mut handler::ContractHandlerChannel<handler::ContractHandlerHalve>,
+    now_nanos: u64,
 ) {
     if deferral_ctx.deferred_keys.is_empty() {
         return;
     }
-    let now = executor::now_nanos();
     let ttl_nanos = DEFERRED_RELATED_FETCH_TIMEOUT.as_nanos() as u64;
     // Stale if it has out-lived 2× the fetch timeout — well past when the
     // waiter should have reported (the waiter itself times out at 1×).
     let stale: Vec<(ContractInstanceId, u64, bool)> = deferral_ctx
         .deferred_keys
         .iter()
-        .filter(|(_, e)| now.saturating_sub(e.started_nanos) >= ttl_nanos.saturating_mul(2))
+        .filter(|(_, e)| now_nanos.saturating_sub(e.started_nanos) >= ttl_nanos.saturating_mul(2))
         .map(|(k, e)| (*k, e.deferral_id, e.is_put))
         .collect();
     for (contract_id, deferral_id, is_put) in stale {
@@ -1219,27 +1229,44 @@ fn sweep_stale_deferrals(
                 );
             }
         }
-        requeue_released_events(deferral_ctx.release_key(&contract_id), fair_queue);
+        // Release the swept deferral's block and re-queue its held events at the
+        // FRONT (per-contract FIFO); answer any that don't fit with backpressure
+        // so their waiting_response slots aren't leaked.
+        let rejected = requeue_released_events(deferral_ctx.release_key(&contract_id), fair_queue);
+        answer_rejected_held_events(channel, rejected).await;
     }
 }
 
-/// Re-enqueue the events that were held behind a now-released deferral, in
-/// their original FIFO order, ahead of fresh events for the same key.
+/// Re-enqueue the events that were held behind a now-released deferral, at the
+/// FRONT of their per-contract bucket in original FIFO order (so they run
+/// before any fresh same-key event that arrived during the deferral — the
+/// per-contract FIFO guarantee of #4391).
+///
+/// Returns the events that could NOT be re-enqueued (fair queue full); the
+/// caller MUST answer each with a queue-full response so its
+/// `waiting_response` slot is not leaked and the client doesn't hang for the
+/// full 300s `CH_EV_RESPONSE_TIME_OUT`. (#4391 round-3 leak fix.)
+#[must_use = "rejected held events must be answered with send_queue_full_response \
+              or their waiting_response slot leaks and the client hangs"]
 fn requeue_released_events(
     held: Option<std::collections::VecDeque<(handler::EventId, ContractHandlerEvent)>>,
     fair_queue: &mut fair_queue::FairEventQueue,
+) -> Vec<(handler::EventId, ContractHandlerEvent)> {
+    match held {
+        Some(held) => fair_queue.requeue_front(held),
+        None => Vec::new(),
+    }
+}
+
+/// Answer every event that `requeue_released_events` could not re-enqueue with a
+/// queue-full response (drops its `waiting_response` slot — no leak, no 300s
+/// client hang). Mirrors the normal drain-path rejection handling.
+async fn answer_rejected_held_events(
+    channel: &mut handler::ContractHandlerChannel<handler::ContractHandlerHalve>,
+    rejected: Vec<(handler::EventId, ContractHandlerEvent)>,
 ) {
-    let Some(held) = held else { return };
-    for (id, event) in held {
-        if let Err(rejected) = fair_queue.try_push(id, event) {
-            // Queue full: drop the held event's response slot rather than leak
-            // it. This is the same backpressure the normal drain path applies;
-            // the client times out (rare — only under sustained saturation).
-            tracing::debug!(
-                event = %rejected.event,
-                "Held deferred-key event dropped on re-enqueue (fair queue full)"
-            );
-        }
+    for (id, event) in rejected {
+        send_queue_full_response(channel, Box::new(fair_queue::RejectedEvent { id, event })).await;
     }
 }
 
@@ -1276,9 +1303,36 @@ where
         fetched,
     } = resume;
 
-    // Reclaim the parked client responder. If it's gone the loop is shutting
-    // down or the entry was already consumed — still release the per-contract
-    // block below so the contract isn't wedged.
+    // STALE-RESUME GUARD (#4391 round-3): only act if THIS deferral still owns
+    // the contract's block. Two stale cases must be skipped entirely:
+    //   * The entry is absent → the TTL sweep already answered this client and
+    //     released the block. Acting now would re-run a stale upsert and (since
+    //     `release_key` is keyed by contract, not deferral_id) is a no-op on the
+    //     map but the upsert/commit would still be stale.
+    //   * The entry exists but a DIFFERENT deferral_id owns it → a newer
+    //     deferral D2 took the key after this one (D1) was swept and a held
+    //     event re-deferred. Running D1's stale upsert would commit older data,
+    //     and `release_key` would remove D2's LIVE block (breaking FIFO).
+    // In both cases the client was already answered by the sweep, so we drop
+    // D1's resume without touching the executor, the block, or held events.
+    let owns_block = deferral_ctx
+        .deferred_keys
+        .get(key.id())
+        .is_some_and(|e| e.deferral_id == deferral_id);
+    if !owns_block {
+        tracing::debug!(
+            contract = %key,
+            deferral_id,
+            "Dropping stale deferred resume — its block was swept or a newer \
+             deferral owns the key (#4391)"
+        );
+        // The stashed responder, if any, was already removed+answered by the
+        // sweep; remove defensively in case of an unexpected duplicate.
+        deferral_ctx.stashed.remove(&deferral_id);
+        return Ok(());
+    }
+
+    // We own the block; reclaim the parked client responder.
     let responder = deferral_ctx.stashed.remove(&deferral_id);
     if responder.is_none() {
         tracing::debug!(contract = %key, "Deferred resume has no stashed responder");
@@ -1359,12 +1413,16 @@ where
         }
     };
 
-    // The resumed upsert has now committed (or errored). Release the
-    // per-contract block and re-enqueue any same-key events that were held
-    // during the deferral, in FIFO order, so they observe the committed state.
-    // This MUST happen after the upsert above and before answering the client,
-    // so the released events can't be popped until the next loop iteration.
-    requeue_released_events(deferral_ctx.release_key(key.id()), fair_queue);
+    // The resumed upsert has now committed (or errored). Release THIS
+    // deferral's block (we verified above it still owns the key) and re-enqueue
+    // any same-key events held during the deferral at the FRONT of the bucket,
+    // in FIFO order, so they observe the committed state. Events that don't fit
+    // are answered with backpressure so their waiting_response slots aren't
+    // leaked. The released events land in the fair queue and are popped by
+    // `pop_runnable_event` after the resume-drain batch finishes (later in this
+    // same loop iteration, or a subsequent one) — never before the upsert above
+    // committed, since this runs synchronously on the loop.
+    let rejected = requeue_released_events(deferral_ctx.release_key(key.id()), fair_queue);
 
     if let Some(responder) = responder {
         if let Err(error) = responder.respond(event_result) {
@@ -1375,6 +1433,8 @@ where
             );
         }
     }
+
+    answer_rejected_held_events(contract_handler.channel(), rejected).await;
     Ok(())
 }
 
@@ -4344,5 +4404,270 @@ mod hol_4391_tests {
             let _ = tokio::time::timeout(Duration::from_secs(10), t).await;
         }
         handle.abort();
+    }
+
+    // ========================================================================
+    // Round-3 fixes: requeue leak/FIFO, stale-resume guard, sweep, held cap
+    // ========================================================================
+
+    fn instance_id(seed: &[u8]) -> ContractInstanceId {
+        *make_contract(seed).key().id()
+    }
+
+    fn get_event(id: ContractInstanceId) -> ContractHandlerEvent {
+        ContractHandlerEvent::GetQuery {
+            instance_id: id,
+            return_contract_code: false,
+        }
+    }
+
+    /// MUST-FIX #2 (unit): held events re-queue at the FRONT of the per-contract
+    /// bucket in FIFO order, ahead of a fresh same-key event already queued.
+    #[test]
+    fn requeue_front_orders_held_before_fresh_same_key() {
+        let mut fq = fair_queue::FairEventQueue::new();
+        let k = instance_id(b"front_k");
+
+        // A FRESH same-key event is already queued (arrived "after" the held
+        // ones in wall-clock, but reached the fair queue first because the held
+        // ones were diverted into the deferral buffer).
+        fq.try_push(handler::EventId { id: 99 }, get_event(k))
+            .expect("fresh push");
+
+        // Two held events (ids 1, 2) re-queued at the front, FIFO order.
+        let mut held = std::collections::VecDeque::new();
+        held.push_back((handler::EventId { id: 1 }, get_event(k)));
+        held.push_back((handler::EventId { id: 2 }, get_event(k)));
+        let rejected = fq.requeue_front(held);
+        assert!(rejected.is_empty(), "nothing should be rejected under cap");
+
+        // Pop order must be 1, 2 (held FIFO), THEN 99 (fresh) — proving the held
+        // older events run before the fresh one.
+        let order: Vec<u64> = std::iter::from_fn(|| fq.pop().map(|(id, _)| id.id)).collect();
+        assert_eq!(
+            order,
+            vec![1, 2, 99],
+            "held events must run in FIFO order before the fresh same-key event"
+        );
+    }
+
+    /// MUST-FIX #2 + #1 (unit): when the per-contract bucket is at capacity,
+    /// `requeue_front` returns the events it could not enqueue, in FIFO order,
+    /// so the caller can answer them with backpressure (no silent drop / leak).
+    #[test]
+    fn requeue_front_returns_overflow_in_fifo_order() {
+        let mut fq = fair_queue::FairEventQueue::new();
+        let k = instance_id(b"overflow_k");
+
+        // Saturate the per-contract bucket via normal pushes.
+        for i in 0..fair_queue::MAX_QUEUED_PER_CONTRACT as u64 {
+            fq.try_push(handler::EventId { id: 1000 + i }, get_event(k))
+                .expect("fill bucket");
+        }
+
+        // Now try to re-queue 3 held events at the front — all should be rejected
+        // (bucket full), returned in original FIFO order.
+        let mut held = std::collections::VecDeque::new();
+        held.push_back((handler::EventId { id: 1 }, get_event(k)));
+        held.push_back((handler::EventId { id: 2 }, get_event(k)));
+        held.push_back((handler::EventId { id: 3 }, get_event(k)));
+        let rejected = fq.requeue_front(held);
+        let rejected_ids: Vec<u64> = rejected.iter().map(|(id, _)| id.id).collect();
+        assert_eq!(
+            rejected_ids,
+            vec![1, 2, 3],
+            "overflow held events must be returned in FIFO order for backpressure"
+        );
+    }
+
+    /// SHOULD-FIX (unit): the per-deferral held buffer caps at
+    /// MAX_HELD_PER_DEFERRAL — the (cap+1)th hold returns `Full` carrying the
+    /// event back.
+    #[test]
+    fn hold_event_caps_at_max_held_per_deferral() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctx = DeferralCtx::new(tx);
+        let k = instance_id(b"held_cap_k");
+        ctx.block_key(k, 1, true, 0);
+
+        for i in 0..MAX_HELD_PER_DEFERRAL as u64 {
+            match ctx.hold_event(k, handler::EventId { id: i }, get_event(k)) {
+                HoldOutcome::Held => {}
+                other => panic!("expected Held within cap, got {:?}", DbgHold(&other)),
+            }
+        }
+        // The (cap+1)th must be Full and hand the event back.
+        match ctx.hold_event(k, handler::EventId { id: 9999 }, get_event(k)) {
+            HoldOutcome::Full(id, _ev) => assert_eq!(id.id, 9999),
+            other => panic!("expected Full at cap, got {:?}", DbgHold(&other)),
+        }
+    }
+
+    // Small debug helper for HoldOutcome (it intentionally has no Debug derive
+    // to avoid requiring ContractHandlerEvent: Debug in non-test code paths).
+    struct DbgHold<'a>(&'a HoldOutcome);
+    impl std::fmt::Debug for DbgHold<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self.0 {
+                HoldOutcome::Held => write!(f, "Held"),
+                HoldOutcome::NotDeferred(..) => write!(f, "NotDeferred"),
+                HoldOutcome::Full(..) => write!(f, "Full"),
+            }
+        }
+    }
+
+    /// MUST-FIX #4 (unit): the TTL sweep answers a stale deferral's client with
+    /// the correct response variant, releases its block, re-queues its held
+    /// event, and does NOT sweep a fresh (age < 2×TTL) entry.
+    #[tokio::test]
+    async fn sweep_releases_stale_answers_client_and_requeues_held() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctx = DeferralCtx::new(tx);
+        let (_send, mut handler_half, _wait) = handler::contract_handler_channel();
+        let mut fq = fair_queue::FairEventQueue::new();
+
+        let ttl = DEFERRED_RELATED_FETCH_TIMEOUT.as_nanos() as u64;
+
+        // STALE deferral (started at t=0), an UPDATE op, with one held event.
+        let stale_key = instance_id(b"sweep_stale");
+        ctx.block_key(stale_key, 1, /* is_put */ false, 0);
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        ctx.stashed
+            .insert(1, StashedResponder::for_test(1, resp_tx));
+        let _ = ctx.hold_event(stale_key, handler::EventId { id: 50 }, get_event(stale_key));
+
+        // FRESH deferral (started recently) — must NOT be swept.
+        let fresh_key = instance_id(b"sweep_fresh");
+        let fresh_started = ttl * 2; // so at now below, age = 1 < 2*ttl
+        ctx.block_key(fresh_key, 2, true, fresh_started);
+
+        // Sweep at now = 2*ttl + 1: the stale entry (age 2*ttl+1) is swept; the
+        // fresh entry (age 1) is not.
+        let now = ttl * 2 + 1;
+        sweep_stale_deferrals(&mut ctx, &mut fq, &mut handler_half, now).await;
+
+        // (a) stale key released; (b) its held event requeued.
+        assert!(
+            !ctx.is_key_deferred(&stale_key),
+            "stale deferral must be released"
+        );
+        assert_eq!(
+            fq.pop().map(|(id, _)| id.id),
+            Some(50),
+            "the stale deferral's held event must be re-queued"
+        );
+
+        // (c) client answered with an UpdateResponse error (matching is_put=false).
+        let (_id, ev) = resp_rx.await.expect("stale client must be answered");
+        match ev {
+            ContractHandlerEvent::UpdateResponse { new_value, .. } => {
+                assert!(new_value.is_err(), "swept UPDATE must surface an error");
+            }
+            other => panic!("expected UpdateResponse for swept UPDATE op, got {other}"),
+        }
+
+        // (d) fresh entry survives.
+        assert!(
+            ctx.is_key_deferred(&fresh_key),
+            "a fresh deferral (age < 2×TTL) must NOT be swept"
+        );
+    }
+
+    /// MUST-FIX #3 (unit): a stale resume whose deferral_id no longer owns the
+    /// key (a newer deferral took over) is DROPPED — it must not release the
+    /// newer deferral's block.
+    #[tokio::test]
+    async fn stale_resume_does_not_release_newer_deferral_block() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctx = DeferralCtx::new(tx);
+        let mut fq = fair_queue::FairEventQueue::new();
+        let mut handler =
+            MockWasmContractHandler::new_test(handler::contract_handler_channel().1, None, "stale")
+                .await;
+
+        let contract = make_contract(b"stale_resume_k");
+        let key = contract.key();
+
+        // D2 (the LIVE deferral) currently owns the key, deferral_id = 2.
+        ctx.block_key(*key.id(), 2, true, 0);
+
+        // D1's late resume arrives with deferral_id = 1 (already swept/superseded).
+        let stale_resume = DeferredResume {
+            deferral_id: 1,
+            key,
+            update: Either::Left(WrappedState::new(vec![1])),
+            related_contracts: RelatedContracts::default(),
+            code: Some(contract),
+            is_put: true,
+            fetched: Ok(vec![]),
+        };
+
+        handle_deferred_resume(&mut handler, &mut ctx, &mut fq, stale_resume)
+            .await
+            .expect("stale resume handled");
+
+        // D2's block must SURVIVE (the stale D1 resume must not release it).
+        assert!(
+            ctx.is_key_deferred(key.id()),
+            "stale resume must NOT release the newer deferral's block (#4391 MUST-FIX #3)"
+        );
+        let entry = ctx.deferred_keys.get(key.id()).expect("D2 still present");
+        assert_eq!(entry.deferral_id, 2, "the live deferral (D2) must remain");
+    }
+
+    /// SHOULD-FIX (unit): with no op_manager, the real `fetch_related_off_loop`
+    /// (override cleared) surfaces MissingRelated for the missing ids — covers
+    /// the orchestration's `op_manager.is_none()` branch.
+    #[tokio::test]
+    async fn fetch_related_off_loop_no_op_manager_is_missing_related() {
+        let _guard = TEST_GUARD.lock().await;
+        set_off_loop_fetch_override(None);
+        let id = instance_id(b"off_loop_none");
+        let result = fetch_related_off_loop(None, vec![id]).await;
+        assert!(
+            result.is_err(),
+            "no op_manager must surface MissingRelated, got {result:?}"
+        );
+    }
+
+    /// MUST-FIX #1 (e2e): a held event that can't be re-queued (fair queue full)
+    /// must be ANSWERED with a queue-full response — NOT silently dropped (which
+    /// would leak its waiting_response slot and hang the client 300s). Drives a
+    /// real GetQuery through the channel, then rejects it via the same path the
+    /// sweep/resume use, and asserts the client gets a prompt QueueFull error.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rejected_held_event_is_answered_not_leaked() {
+        let (send, mut handler_half, _wait) = handler::contract_handler_channel();
+        let k = instance_id(b"leak_k");
+
+        // Client sends a GetQuery and awaits the response.
+        let client = GlobalExecutor::spawn(async move { send.send_to_handler(get_event(k)).await });
+
+        // Handler side receives it (registers the waiting_response slot).
+        let (id, event) = handler_half
+            .recv_from_sender()
+            .await
+            .expect("event received");
+
+        // Simulate the requeue-overflow path: this event couldn't be re-queued,
+        // so the loop must answer it with backpressure.
+        answer_rejected_held_events(&mut handler_half, vec![(id, event)]).await;
+
+        // The client must receive a prompt queue-full error, NOT hang.
+        let resp = tokio::time::timeout(Duration::from_secs(2), client)
+            .await
+            .expect("client must be answered promptly, not leaked/hung")
+            .expect("join")
+            .expect("client receives a response");
+        match resp {
+            ContractHandlerEvent::GetResponse { response, .. } => {
+                let err = response.expect_err("rejected held GET must be an error");
+                assert!(
+                    err.is_contract_queue_full(),
+                    "rejected held event must surface ContractQueueFull, got {err}"
+                );
+            }
+            other => panic!("expected GetResponse(queue-full), got {other}"),
+        }
     }
 }

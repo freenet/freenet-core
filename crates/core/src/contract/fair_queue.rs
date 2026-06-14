@@ -146,6 +146,68 @@ impl FairEventQueue {
         Ok(())
     }
 
+    /// Re-enqueue events at the FRONT of their per-contract bucket, preserving
+    /// the given FIFO order (`events[0]` ends up first to be popped).
+    ///
+    /// Used by the #4391 deferral machinery to restore events that were held
+    /// behind an in-flight deferral: those events arrived BEFORE any fresh
+    /// same-key event still sitting in the bucket, so per-contract FIFO requires
+    /// them to run first. `try_push` (back-append) would wrongly order them
+    /// after fresh events.
+    ///
+    /// Returns any events that could not be re-enqueued (per-contract or total
+    /// cap reached), in their original order, so the caller can answer those
+    /// clients with backpressure rather than silently dropping them.
+    pub(super) fn requeue_front(
+        &mut self,
+        events: std::collections::VecDeque<(EventId, ContractHandlerEvent)>,
+    ) -> Vec<(EventId, ContractHandlerEvent)> {
+        let mut rejected = Vec::new();
+        // Insert in REVERSE so that after all push_fronts the bucket front holds
+        // events[0], events[1], ... in order. Reverse-iterate but keep rejected
+        // in original order by reversing the rejected list at the end.
+        for (id, event) in events.into_iter().rev() {
+            // Global cap.
+            if self.total_queued >= MAX_TOTAL_FAIR_QUEUE {
+                rejected.push((id, event));
+                continue;
+            }
+            match extract_contract_id(&event) {
+                Some(contract_id) => {
+                    let queue = self.contract_queues.entry(contract_id).or_default();
+                    if queue.len() >= MAX_QUEUED_PER_CONTRACT {
+                        // Drop the empty bucket we may have just inserted.
+                        if queue.is_empty() {
+                            self.contract_queues.remove(&contract_id);
+                        }
+                        rejected.push((id, event));
+                        continue;
+                    }
+                    if queue.is_empty() {
+                        self.round_robin.push_back(QueueKey::Contract(contract_id));
+                    }
+                    queue.push_front((id, event));
+                    self.total_queued += 1;
+                }
+                None => {
+                    if self.default_queue.len() >= MAX_QUEUED_PER_CONTRACT {
+                        rejected.push((id, event));
+                        continue;
+                    }
+                    if self.default_queue.is_empty() {
+                        self.round_robin.push_back(QueueKey::Default);
+                    }
+                    self.default_queue.push_front((id, event));
+                    self.total_queued += 1;
+                }
+            }
+        }
+        // We iterated in reverse, so `rejected` is in reverse order; restore the
+        // original FIFO order for the caller.
+        rejected.reverse();
+        rejected
+    }
+
     /// Pop one event in round-robin order.
     ///
     /// Takes the front key from the round-robin, pops one event from that queue.
