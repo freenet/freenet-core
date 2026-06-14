@@ -29,7 +29,7 @@ use freenet_stdlib::prelude::*;
 
 use crate::client_events::HostResult;
 use crate::config::{GlobalExecutor, OPERATION_TTL};
-use crate::message::{NetMessage, NetMessageV1, Transaction};
+use crate::message::{NetMessage, NetMessageV1, NodeEvent, Transaction};
 use crate::node::NetworkBridge;
 use crate::node::OpManager;
 use crate::node::WaiterReply;
@@ -1565,6 +1565,16 @@ async fn relay_put_store_locally(
             .evicted;
 
         crate::operations::announce_contract_hosted(op_manager, &key).await;
+
+        // Directed-subscribe placement (#4404): best-effort nudge the node to
+        // consider migrating this freshly-hosted contract toward a closer
+        // neighbor. Dropped silently if the event channel is full — the next
+        // hosting/peer event re-triggers consideration.
+        if let Err(err) =
+            op_manager.try_notify_node_event(NodeEvent::ConsiderContractMigration { key })
+        {
+            tracing::debug!(%key, %err, "ConsiderContractMigration emit dropped (PUT)");
+        }
 
         let mut removed_contracts = Vec::new();
         for (evicted_key, expected_generation) in evicted {

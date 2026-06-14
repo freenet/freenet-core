@@ -299,6 +299,19 @@ pub struct NodeConfig {
     /// `Option` is simply always `None` outside tests.
     #[serde(skip)]
     pub(crate) governance_config_override: Option<crate::contract::governance::GovernanceConfig>,
+    /// Test-only override for the placement-migration version floor
+    /// (`SUBSCRIBE_HINT_MIN_VERSION`). Simulation peers all report the current
+    /// build version, which is below the production floor until release, so the
+    /// `SubscribeHint` gate would never fire in a sim. A test that exercises the
+    /// migration cascade sets this to `Some((0,0,0))` for its own nodes, leaving
+    /// every other sim (and production) at the real floor — so the cascade is
+    /// opt-in and cannot perturb unrelated simulations.
+    ///
+    /// `None` in production. Not cfg-gated for the same reason as
+    /// `governance_config_override`: `node::testing_impl` sets it and is compiled
+    /// unconditionally. `#[serde(skip)]`; never serialized.
+    #[serde(skip)]
+    pub(crate) subscribe_hint_floor_override: Option<(u8, u8, u16)>,
 }
 
 impl NodeConfig {
@@ -435,6 +448,7 @@ impl NodeConfig {
                 Some(3) // Production: require 3 relay-ready upstream peers
             },
             governance_config_override: None,
+            subscribe_hint_floor_override: None,
         })
     }
 
@@ -1670,6 +1684,50 @@ where
                 ready,
                 "Processed ReadyState from peer"
             );
+            return Ok(());
+        }
+        NetMessageV1::SubscribeHint(hint) => {
+            // Directed-subscribe placement (#4404): a holder is nudging us to
+            // host `hint.key` because we are closer to it in the ring. If we
+            // already host it there is nothing to do. Otherwise start a
+            // fire-and-forget directed subscribe routed THROUGH the holder
+            // (`hint.holder`), which fetches and thereby hosts the contract.
+            if op_manager.ring.is_hosting_contract(&hint.key) {
+                tracing::debug!(
+                    key = %hint.key,
+                    ?source_addr,
+                    "Received SubscribeHint for an already-hosted contract — ignoring"
+                );
+                return Ok(());
+            }
+            // `hint.holder` is network-sourced. A legitimate sender always sets
+            // `holder = its own location`, so the holder's address must equal the
+            // address this hint actually arrived from. Requiring that:
+            //   - drops an address-less holder (the directed-subscribe driver
+            //     routes through the holder's socket address and would otherwise
+            //     panic), and
+            //   - prevents a peer from redirecting us to directed-subscribe
+            //     through an arbitrary THIRD party (a cheap 1-packet → 1-spawned-
+            //     -op amplification / SSRF-style vector). A peer can still nudge
+            //     us toward ITSELF, which is exactly a legitimate hint.
+            // Fail-safe: a dropped legitimate hint is re-sent on the next
+            // migration trigger, so being strict here costs nothing.
+            if hint.holder.socket_addr() != source_addr {
+                tracing::debug!(
+                    key = %hint.key,
+                    holder = ?hint.holder.socket_addr(),
+                    ?source_addr,
+                    "Received SubscribeHint whose holder is not the sender — ignoring"
+                );
+                return Ok(());
+            }
+            tracing::debug!(
+                key = %hint.key,
+                holder = %hint.holder,
+                ?source_addr,
+                "Received SubscribeHint — starting directed subscribe to holder"
+            );
+            subscribe::start_directed_subscribe(op_manager.clone(), hint.key, hint.holder);
             return Ok(());
         }
         NetMessageV1::Aborted(tx) => {

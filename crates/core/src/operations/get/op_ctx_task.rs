@@ -43,7 +43,7 @@ use freenet_stdlib::prelude::*;
 use crate::client_events::HostResult;
 use crate::config::{GlobalExecutor, OPERATION_TTL};
 use crate::contract::{ContractHandlerEvent, StoreResponse};
-use crate::message::{NetMessage, NetMessageV1, Transaction};
+use crate::message::{NetMessage, NetMessageV1, NodeEvent, Transaction};
 use crate::node::NetworkBridge;
 use crate::node::OpManager;
 #[rustfmt::skip]
@@ -1312,6 +1312,15 @@ async fn cache_contract_locally(
     // persistence there's nothing to announce hosting for.
     if access_result.is_new && put_persisted {
         crate::operations::announce_contract_hosted(op_manager, &key).await;
+        // Directed-subscribe placement (#4404): best-effort nudge the node to
+        // consider migrating this freshly-hosted contract toward a closer
+        // neighbor. Dropped silently if the event channel is full — the next
+        // hosting/peer event re-triggers consideration.
+        if let Err(err) =
+            op_manager.try_notify_node_event(NodeEvent::ConsiderContractMigration { key })
+        {
+            tracing::debug!(%key, %err, "ConsiderContractMigration emit dropped (GET)");
+        }
         let became_interested = op_manager.interest_manager.register_local_hosting(&key);
         let added = if became_interested { vec![key] } else { vec![] };
         if !added.is_empty() || !removed_contracts.is_empty() {

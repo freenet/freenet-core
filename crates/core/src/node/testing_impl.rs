@@ -177,6 +177,25 @@ pub enum SimOperation {
         /// Initial state bytes
         state: Vec<u8>,
     },
+    /// Seed a contract into a node's local store AND register the node as
+    /// genuinely HOSTING it (state + `host_contract` + active subscription),
+    /// without any network propagation.
+    ///
+    /// Unlike [`SeedContract`](Self::SeedContract) — which only writes the raw
+    /// state/params into `MockStateStorage` — this routes the contract through
+    /// the node's startup `append_contracts` path with `subscription = true`,
+    /// so `ring.is_hosting_contract` / `ring.hosting_contract_keys` report it.
+    /// That is what makes the node a valid migration source: the
+    /// placement-migration trigger only nudges contracts the node actually
+    /// hosts. Use this when a test needs a node to be the authoritative holder
+    /// of a contract that was never PUT through the network (e.g. reproducing
+    /// the GET-dead-end placement gap, #4404).
+    SeedHostedContract {
+        /// The contract container (code + parameters)
+        contract: ContractContainer,
+        /// Initial state bytes
+        state: Vec<u8>,
+    },
     /// Simulate a client disconnecting from this node.
     ///
     /// Emits `ClientRequest::Disconnect` through the same
@@ -304,6 +323,12 @@ impl SimOperation {
                      by run_controlled_simulation before event dispatch"
                 )
             }
+            SimOperation::SeedHostedContract { .. } => {
+                panic!(
+                    "SeedHostedContract is not a client request — it must be handled \
+                     by run_controlled_simulation before event dispatch"
+                )
+            }
             SimOperation::Disconnect => ClientRequest::Disconnect { cause: None },
         }
     }
@@ -350,6 +375,23 @@ pub struct ControlledSimulationResult {
     #[cfg(any(test, feature = "testing"))]
     #[allow(dead_code)]
     pub(crate) node_rings: HashMap<NodeLabel, Arc<crate::ring::Ring>>,
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl ControlledSimulationResult {
+    /// Whether `label`'s node was hosting `key` in its live Ring at the end of
+    /// the simulation.
+    ///
+    /// Reads the per-node `Ring` captured via the `shared_ring` slots, so it
+    /// reflects `ring.is_hosting_contract` exactly (not a storage proxy). Used
+    /// by placement/migration tests to assert a contract has migrated onto a
+    /// given peer. Returns `false` if the node never started or never published
+    /// its Ring.
+    pub fn is_node_hosting(&self, label: &NodeLabel, key: &ContractKey) -> bool {
+        self.node_rings
+            .get(label)
+            .is_some_and(|ring| ring.is_hosting_contract(key))
+    }
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, PartialOrd, Ord, Debug)]
@@ -824,6 +866,49 @@ impl Default for ChurnConfig {
     }
 }
 
+/// For each target ring location, find a distinct IPv6-loopback port whose
+/// `Location::from_address((::1, port))` is closest (in ring distance) to that
+/// target. Used by [`SimNetwork::new_with_node_locations`] to place nodes at
+/// chosen locations without decoupling a peer's advertised location from its
+/// address-derived one.
+///
+/// Ports are unique across the returned vector (a port already chosen for an
+/// earlier target is skipped for later targets), so the resulting peers occupy
+/// distinct addresses. The achieved location for each target is the closest
+/// available port's location — approximate (ports are discrete) but fully
+/// deterministic. Read the achieved locations back with
+/// [`SimNetwork::get_peer_locations`].
+///
+/// The search range excludes the `50000..=59999` band used by
+/// `derive_deterministic_port`, so explicit ports never collide with the
+/// default-path derived ports.
+pub fn loopback_ports_for_locations(targets: &[f64]) -> Vec<u16> {
+    use std::collections::HashSet;
+    const SEARCH_RANGE: std::ops::RangeInclusive<u16> = 1024..=49999;
+    let mut used: HashSet<u16> = HashSet::new();
+    let mut out = Vec::with_capacity(targets.len());
+    for &target in targets {
+        let mut best_port = *SEARCH_RANGE.start();
+        let mut best_dist = f64::INFINITY;
+        for port in SEARCH_RANGE {
+            if used.contains(&port) {
+                continue;
+            }
+            let addr: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
+            let loc = Location::from_address(&addr).as_f64();
+            let raw = (loc - target).abs();
+            let dist = raw.min(1.0 - raw); // ring distance
+            if dist < best_dist {
+                best_dist = dist;
+                best_port = port;
+            }
+        }
+        used.insert(best_port);
+        out.push(best_port);
+    }
+    out
+}
+
 /// A simulated in-memory network topology.
 pub struct SimNetwork {
     name: String,
@@ -871,6 +956,13 @@ pub struct SimNetwork {
     /// Pair with `use_mock_wasm = true` so the production cost-reporting
     /// path actually feeds the detector. See #4301.
     governance_config_override: Option<crate::contract::governance::GovernanceConfig>,
+    /// Per-node placement-migration version-floor override (see
+    /// [`SimNetwork::enable_placement_migration`]). `None` leaves the production
+    /// floor, so the `SubscribeHint` cascade stays OFF in sim (its peers report a
+    /// version below the floor) — only a test that explicitly enables migration
+    /// gets the cascade. Keeps the migration feature from perturbing unrelated
+    /// simulations.
+    subscribe_hint_floor_override: Option<(u8, u8, u16)>,
     /// Per-node capture slots for the live `Arc<Ring>`, populated by
     /// `run_controlled_simulation` so governance sim tests can read each
     /// node's `contract_ban_list` after the simulation completes. Keyed by
@@ -884,6 +976,15 @@ pub struct SimNetwork {
     /// as write-only.
     #[allow(dead_code)]
     shared_rings: HashMap<NodeLabel, Arc<parking_lot::Mutex<Option<Arc<crate::ring::Ring>>>>>,
+    /// Optional explicit loopback ports for regular nodes, indexed by
+    /// regular-node order (i.e. `node_no - number_of_gateways`). When present,
+    /// `config_nodes` uses these instead of `derive_deterministic_port`, which
+    /// lets a test place nodes at chosen ring locations: a peer's location is
+    /// `Location::from_address(&addr)`, a pure function of the loopback port, so
+    /// choosing the port chooses the location *consistently* (the address-derived
+    /// location and the advertised `own_location` stay equal, exactly as the
+    /// default port path keeps them). Build via `new_with_node_locations`.
+    node_port_override: Option<Vec<u16>>,
 }
 
 impl SimNetwork {
@@ -900,6 +1001,74 @@ impl SimNetwork {
         max_connections: usize,
         min_connections: usize,
         seed: u64,
+    ) -> Self {
+        Self::new_inner(
+            name,
+            gateways,
+            nodes,
+            ring_max_htl,
+            rnd_if_htl_above,
+            max_connections,
+            min_connections,
+            seed,
+            None,
+        )
+        .await
+    }
+
+    /// Like [`new`](Self::new), but places each regular node at (approximately)
+    /// a chosen ring location. `node_target_locations` is matched to regular
+    /// nodes in order and must have exactly `nodes` entries.
+    ///
+    /// Locations are realised by choosing, for each target, a distinct loopback
+    /// port whose `Location::from_address` is closest to the target (see
+    /// [`loopback_ports_for_locations`]). The achieved locations are therefore
+    /// approximate (discrete ports); read them back with [`get_peer_locations`]
+    /// (gateways first, then regular nodes in order) and build the scenario
+    /// around the actual values. Gateways keep their derived locations.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_node_locations(
+        name: &str,
+        gateways: usize,
+        nodes: usize,
+        ring_max_htl: usize,
+        rnd_if_htl_above: usize,
+        max_connections: usize,
+        min_connections: usize,
+        seed: u64,
+        node_target_locations: &[f64],
+    ) -> Self {
+        assert_eq!(
+            node_target_locations.len(),
+            nodes,
+            "node_target_locations must have exactly `nodes` entries"
+        );
+        let ports = loopback_ports_for_locations(node_target_locations);
+        Self::new_inner(
+            name,
+            gateways,
+            nodes,
+            ring_max_htl,
+            rnd_if_htl_above,
+            max_connections,
+            min_connections,
+            seed,
+            Some(ports),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn new_inner(
+        name: &str,
+        gateways: usize,
+        nodes: usize,
+        ring_max_htl: usize,
+        rnd_if_htl_above: usize,
+        max_connections: usize,
+        min_connections: usize,
+        seed: u64,
+        node_port_override: Option<Vec<u16>>,
     ) -> Self {
         assert!(nodes > 0);
 
@@ -944,7 +1113,9 @@ impl SimNetwork {
             use_mock_wasm: false,
             churn_config: None,
             governance_config_override: None,
+            subscribe_hint_floor_override: None,
             shared_rings: HashMap::new(),
+            node_port_override,
         };
         net.config_gateways(
             gateways
@@ -1068,6 +1239,29 @@ impl SimNetwork {
         }
         for (builder, _) in self.nodes.iter_mut() {
             builder.config.governance_config_override = Some(config.clone());
+        }
+        self
+    }
+
+    /// Enable the placement-migration (`SubscribeHint`) cascade for this
+    /// simulation by lowering the version floor to `(0,0,0)` on every node.
+    ///
+    /// The cascade is OFF by default in sim: its peers report the current build
+    /// version, which is below the production `SUBSCRIBE_HINT_MIN_VERSION`, so
+    /// the gate never fires. A test that specifically exercises migration calls
+    /// this; every other sim is left untouched (so an unrelated test cannot be
+    /// perturbed by hosting migrating mid-run). Like `with_governance_config`,
+    /// this patches the already-built node/gateway configs (config_* ran during
+    /// construction when the override was still `None`).
+    #[allow(dead_code)]
+    pub fn enable_placement_migration(&mut self) -> &mut Self {
+        const TEST_FLOOR: (u8, u8, u16) = (0, 0, 0);
+        self.subscribe_hint_floor_override = Some(TEST_FLOOR);
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.subscribe_hint_floor_override = Some(TEST_FLOOR);
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.subscribe_hint_floor_override = Some(TEST_FLOOR);
         }
         self
     }
@@ -1590,6 +1784,7 @@ impl SimNetwork {
                 .await
                 .unwrap();
             config.governance_config_override = self.governance_config_override.clone();
+            config.subscribe_hint_floor_override = self.subscribe_hint_floor_override;
             config.key_pair = keypair;
             config.network_listener_ip = Ipv6Addr::LOCALHOST.into();
             config.network_listener_port = port;
@@ -1681,6 +1876,7 @@ impl SimNetwork {
                 .await
                 .unwrap();
             config.governance_config_override = self.governance_config_override.clone();
+            config.subscribe_hint_floor_override = self.subscribe_hint_floor_override;
             for GatewayConfig {
                 peer_key_location,
                 location,
@@ -1689,7 +1885,15 @@ impl SimNetwork {
             {
                 config.add_gateway(InitPeerNode::new(peer_key_location.clone(), *location));
             }
-            let port = self.derive_deterministic_port(node_no);
+            // Use an explicit per-node port when the test requested specific
+            // ring locations (see `new_with_node_locations`); otherwise the
+            // deterministic derived port. Either way location is computed from
+            // the address below, so it stays consistent with what other peers
+            // compute from this peer's address.
+            let port = match &self.node_port_override {
+                Some(ports) => ports[node_no - self.number_of_gateways],
+                None => self.derive_deterministic_port(node_no),
+            };
             let addr: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
             // Use location computed from address for consistency with PeerKeyLocation::location().
             // This ensures the stored location matches what other peers compute when looking at our address.
@@ -3498,6 +3702,11 @@ impl SimNetwork {
         // Separate SeedContract operations (pre-simulation storage seeding)
         // from event operations (dispatched during simulation).
         let mut seed_ops: Vec<(NodeLabel, ContractContainer, Vec<u8>)> = Vec::new();
+        // SeedHostedContract operations: like seed_ops, but the contract is
+        // injected into the owning node's `contracts` list (below, before the
+        // nodes are drained into Turmoil host closures) so startup
+        // `append_contracts` registers genuine hosting + subscription.
+        let mut seed_hosted_ops: Vec<(NodeLabel, ContractContainer, Vec<u8>)> = Vec::new();
         let mut event_ops: Vec<ScheduledOperation> = Vec::new();
         for scheduled_op in operations {
             match scheduled_op.operation {
@@ -3507,12 +3716,46 @@ impl SimNetwork {
                 } => {
                     seed_ops.push((scheduled_op.node, contract.clone(), state.clone()));
                 }
+                SimOperation::SeedHostedContract {
+                    ref contract,
+                    ref state,
+                } => {
+                    seed_hosted_ops.push((scheduled_op.node, contract.clone(), state.clone()));
+                }
                 SimOperation::Put { .. }
                 | SimOperation::Get { .. }
                 | SimOperation::Subscribe { .. }
                 | SimOperation::Update { .. }
                 | SimOperation::Disconnect => event_ops.push(scheduled_op),
             }
+        }
+
+        // Inject SeedHostedContract contracts into the owning node's `contracts`
+        // list BEFORE the gateway/node Vecs are drained into Turmoil host
+        // closures. At startup `append_contracts` runs a local PutQuery (no
+        // network propagation) and, for `subscription = true`, registers the
+        // contract in the Ring hosting manager (`host_contract` + `subscribe`)
+        // so the node genuinely HOSTS it and the placement-migration trigger
+        // (`ring.hosting_contract_keys`) sees it.
+        for (target_label, contract, state) in seed_hosted_ops {
+            let wrapped = WrappedState::new(state);
+            let injected = self
+                .nodes
+                .iter_mut()
+                .find(|(_, label)| *label == target_label)
+                .map(|(node, _)| &mut node.contracts)
+                .or_else(|| {
+                    self.gateways
+                        .iter_mut()
+                        .find(|(_, cfg)| cfg.label == target_label)
+                        .map(|(node, _)| &mut node.contracts)
+                })
+                .map(|contracts| contracts.push((contract, wrapped, true)))
+                .is_some();
+            assert!(
+                injected,
+                "SeedHostedContract: node {target_label:?} not found among gateways/nodes"
+            );
         }
 
         // Build a map of label -> list of (event_id, operation)

@@ -367,6 +367,24 @@ pub(crate) enum NetMessageV1 {
     ReadyState {
         ready: bool,
     },
+    /// Fire-and-forget hint nudging the recipient to host a contract.
+    ///
+    /// A host sends this to a connected neighbor that is closer to the
+    /// contract's key but isn't hosting it. The recipient should subscribe to
+    /// `key` directed through `holder` (the sender), thereby fetching and
+    /// hosting it. There is no reply: the recipient may act on it or ignore it.
+    SubscribeHint(SubscribeHintMsg),
+}
+
+/// Payload for [`NetMessageV1::SubscribeHint`]: a directed nudge to host a contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscribeHintMsg {
+    /// The contract the recipient is being nudged to host.
+    pub key: ContractKey,
+    /// The peer that currently holds (hosts) the contract — the sender of this
+    /// hint. The recipient subscribes to `key` directed through `holder` (a
+    /// plain greedy subscribe would route away from it), thereby hosting it.
+    pub holder: PeerKeyLocation,
 }
 
 /// Messages for the neighbor hosting protocol.
@@ -584,6 +602,7 @@ impl Versioned for NetMessageV1 {
             // Version 1.1.0 for delta-based interest sync
             NetMessageV1::InterestSync { .. } => semver::Version::new(1, 1, 0),
             NetMessageV1::ReadyState { .. } => semver::Version::new(1, 2, 0),
+            NetMessageV1::SubscribeHint(_) => semver::Version::new(1, 3, 0),
         }
     }
 }
@@ -717,6 +736,13 @@ pub(crate) enum NodeEvent {
         new_state: WrappedState,
         target: SocketAddr,
     },
+    /// Nudge the node to consider migrating a contract we host toward a
+    /// closer, non-hosting neighbor (directed-subscribe placement). Emitted
+    /// best-effort when we begin hosting a contract or gain a new neighbor;
+    /// handled in `p2p_protoc` where the connection table and version gate live.
+    ConsiderContractMigration {
+        key: ContractKey,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -849,6 +875,9 @@ impl Display for NodeEvent {
             NodeEvent::SyncStateToPeer { key, target, .. } => {
                 write!(f, "SyncStateToPeer (contract: {key}, target: {target})")
             }
+            NodeEvent::ConsiderContractMigration { key } => {
+                write!(f, "ConsiderContractMigration (contract: {key})")
+            }
         }
     }
 }
@@ -879,6 +908,7 @@ impl MessageStats for NetMessageV1 {
             NetMessageV1::NeighborHosting { .. } => Transaction::NULL,
             NetMessageV1::InterestSync { .. } => Transaction::NULL,
             NetMessageV1::ReadyState { .. } => Transaction::NULL,
+            NetMessageV1::SubscribeHint(_) => Transaction::NULL,
         }
     }
 
@@ -893,6 +923,7 @@ impl MessageStats for NetMessageV1 {
             NetMessageV1::NeighborHosting { .. } => None,
             NetMessageV1::InterestSync { .. } => None,
             NetMessageV1::ReadyState { .. } => None,
+            NetMessageV1::SubscribeHint(_) => None,
         }
     }
 }
@@ -917,6 +948,9 @@ impl Display for NetMessage {
                 }
                 ReadyState { ready } => {
                     write!(f, "ReadyState {{ ready: {ready} }}")?;
+                }
+                SubscribeHint(msg) => {
+                    write!(f, "SubscribeHint(key: {}, holder: {})", msg.key, msg.holder)?;
                 }
             },
         };
@@ -957,6 +991,34 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscribe_hint_wire_roundtrip_and_version() {
+        use freenet_stdlib::prelude::CodeHash;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([7u8; 32]),
+            CodeHash::new([8u8; 32]),
+        );
+        let holder = PeerKeyLocation::random();
+        // `ContractKey` is `Copy`; `holder` is not, so it is cloned.
+        let msg = NetMessageV1::SubscribeHint(SubscribeHintMsg {
+            key,
+            holder: holder.clone(),
+        });
+        let bytes = bincode::serialize(&msg).expect("serialize SubscribeHint");
+        let decoded: NetMessageV1 =
+            bincode::deserialize(&bytes).expect("deserialize SubscribeHint");
+        // `matches!` with a guard avoids a wildcard match arm over NetMessageV1.
+        assert!(
+            matches!(&decoded, NetMessageV1::SubscribeHint(m) if m.key == key && m.holder == holder),
+            "SubscribeHint did not round-trip: {decoded:?}"
+        );
+        // Pin the per-variant entry in the NetMessageV1 version map so an
+        // accidental reorder/bump is caught. (This map has no production
+        // consumer today; the live wire-compat gate is the negotiated build
+        // version vs SUBSCRIBE_HINT_MIN_VERSION.)
+        assert_eq!(msg.version(), semver::Version::new(1, 3, 0));
+    }
 
     #[test]
     fn pack_transaction_type() {

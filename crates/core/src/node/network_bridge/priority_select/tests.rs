@@ -2782,6 +2782,10 @@ impl crate::transport::PeerConnectionApi for MockPeerConnection {
         self.addr
     }
 
+    fn remote_version(&self) -> Option<(u8, u8, u16)> {
+        None
+    }
+
     fn send_message(
         &mut self,
         _msg: crate::message::NetMessage,

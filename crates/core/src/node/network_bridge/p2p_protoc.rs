@@ -27,9 +27,9 @@ use crate::node::network_bridge::handshake::{
 };
 use crate::node::network_bridge::priority_select;
 use crate::operations::connect::ConnectMsg;
-use crate::ring::Location;
 #[cfg(feature = "simulation_tests")]
 use crate::ring::PeerKey;
+use crate::ring::{Distance, Location};
 use crate::transport::{
     BroadcastDeliveryOutcome, CongestionControlConfig, ExpectedInboundTracker, PeerConnectionApi,
     Socket, TransportError, TransportKeypair, TransportPublicKey, create_connection_handler,
@@ -396,6 +396,10 @@ struct ConnectionEntry {
     /// Used for zombie detection: connections not promoted to the ring
     /// within a timeout are considered zombies and dropped.
     created_at: Instant,
+    /// The remote peer's negotiated protocol version, if known.
+    /// `None` when the version wasn't exchanged (e.g. joiner->gateway path).
+    /// Used to gate version-dependent message types (e.g. SubscribeHint).
+    remote_version: Option<(u8, u8, u16)>,
 }
 
 /// Check whether a transport connection is a zombie: old enough but not
@@ -599,7 +603,338 @@ pub(in crate::node) struct P2pConnManager {
     broadcast_queue: super::broadcast_queue::BroadcastQueue,
 }
 
+/// Minimum negotiated protocol version a peer must report before we send it a
+/// [`SubscribeHint`](crate::message::NetMessageV1::SubscribeHint).
+///
+/// MUST equal the release version that first ships SubscribeHint. A peer is only
+/// sent SubscribeHint if its negotiated version is >= this; older peers cannot
+/// deserialize the new wire variant and would drop the connection. None (unknown,
+/// e.g. joiner->gateway) is treated as unsupported.
+///
+/// UPDATE AT RELEASE TIME, then FREEZE: set this to the exact release version
+/// that first ships SubscribeHint and do NOT keep bumping it afterward to track
+/// the crate version. Once shipped in release R, peers running R can deserialize
+/// the variant, so the floor must stay at R forever — raising it above R would
+/// silently stop sending hints to fully-capable R peers. (This is why there is
+/// no `floor` vs `CARGO_PKG_VERSION` unit test; see docs/RELEASING.md.)
+///
+/// This is a single non-cfg constant: deliberately NOT lowered under any test
+/// feature, because `testing` is pulled into the SHIPPED release binary (`fdev`
+/// depends on `freenet` with `features = ["testing"]` and the release builds
+/// `-p freenet -p fdev` together, unifying `testing` onto the freenet binary),
+/// so a cfg-gated test floor would defeat the wire-compat gate in production.
+/// Simulation tests that want the cascade lower the floor per-node at runtime via
+/// `NodeConfig::subscribe_hint_floor_override` (set by
+/// `SimNetwork::enable_placement_migration`), which never touches production.
+const SUBSCRIBE_HINT_MIN_VERSION: (u8, u8, u16) = (0, 2, 73);
+
+/// Pure version-gate decision, factored out so the comparison and the
+/// fail-closed-on-unknown-version (`None`) behavior are unit-testable with an
+/// explicit floor rather than the production [`SUBSCRIBE_HINT_MIN_VERSION`].
+///
+/// Returns `true` iff `remote` is known (`Some`) and at least `floor`. An
+/// unknown remote version is treated as unsupported: an older peer that cannot
+/// deserialize the appended `SubscribeHint` wire variant would drop the
+/// connection, so when in doubt we do not send the hint.
+fn version_supports_subscribe_hint(remote: Option<(u8, u8, u16)>, floor: (u8, u8, u16)) -> bool {
+    remote.is_some_and(|v| v >= floor)
+}
+
+/// Upper bound on the number of hosted contracts examined per new-peer
+/// migration trigger. Each examined contract may emit a best-effort
+/// non-blocking `try_send` (the SubscribeHint nudge), so an unbounded scan
+/// would still put O(hosted-contracts) work inline on the connection-handling
+/// path per connection (see `.claude/rules/channel-safety.md`). 32 keeps the
+/// per-event work bounded; remaining contracts are reconsidered on the next
+/// hosting/peer event.
+const MIGRATION_SCAN_CAP_PER_NEW_PEER: usize = 32;
+
+/// Pure selection core for directed-subscribe placement (#4404).
+///
+/// Given the contract's ring location, OUR distance to it (`my_dist`), the set
+/// of peers already known to host it, and an iterator over candidate
+/// neighbors, return the single best neighbor to nudge — or `None`.
+///
+/// A candidate qualifies iff it has a known socket address, a known ring
+/// location, is not already hosting (per `hosting`), and is STRICTLY closer to
+/// the contract than we are (`dist < my_dist`). Among qualifying candidates the
+/// closest wins; ties are broken deterministically by public-key bytes
+/// (`TransportPublicKey: Ord` compares `as_bytes()`), so the choice is
+/// reproducible regardless of iteration order.
+///
+/// Factored out of [`P2pConnManager::select_migration_target`] so the decision
+/// logic is unit-testable without constructing a full connection manager.
+fn pick_closest_migration_target<'a, I>(
+    contract_loc: Location,
+    my_dist: Distance,
+    hosting: &HashSet<TransportPublicKey>,
+    candidates: I,
+) -> Option<PeerKeyLocation>
+where
+    I: IntoIterator<Item = &'a PeerKeyLocation>,
+{
+    let mut best: Option<(Distance, &'a TransportPublicKey, &'a PeerKeyLocation)> = None;
+    for pkl in candidates {
+        if pkl.socket_addr().is_none() {
+            continue;
+        }
+        if hosting.contains(pkl.pub_key()) {
+            continue;
+        }
+        let Some(pkl_loc) = pkl.location() else {
+            continue;
+        };
+        let dist = contract_loc.distance(pkl_loc);
+        if dist >= my_dist {
+            continue;
+        }
+        let candidate_pk = pkl.pub_key();
+        let replace = match &best {
+            None => true,
+            Some((best_dist, best_pk, _)) => {
+                dist < *best_dist || (dist == *best_dist && candidate_pk < *best_pk)
+            }
+        };
+        if replace {
+            best = Some((dist, candidate_pk, pkl));
+        }
+    }
+    best.map(|(_, _, pkl)| pkl.clone())
+}
+
 impl P2pConnManager {
+    /// Whether the peer at `addr` reports a negotiated protocol version new
+    /// enough to understand [`SubscribeHint`](crate::message::NetMessageV1::SubscribeHint).
+    ///
+    /// `None` (unknown version) is treated as unsupported, since an older peer
+    /// would fail to deserialize the new wire variant and drop the connection.
+    fn peer_supports_subscribe_hint(&self, addr: &SocketAddr) -> bool {
+        let remote = self.connections.get(addr).and_then(|e| e.remote_version);
+        // Production floor, unless a sim test opted into the cascade by setting a
+        // per-node override (never set in production — see NodeConfig).
+        let floor = self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .subscribe_hint_floor_override()
+            .unwrap_or(SUBSCRIBE_HINT_MIN_VERSION);
+        version_supports_subscribe_hint(remote, floor)
+    }
+
+    /// Pick the single best peer to nudge into hosting `key`, or `None`.
+    ///
+    /// Directed-subscribe placement (#4404): we host `key` but a connected
+    /// neighbor may be strictly closer to the contract's key in the ring than
+    /// we are. Nudging that neighbor to subscribe-and-host migrates the
+    /// contract toward its ideal location. We pick ONLY the single closest
+    /// qualifying neighbor (not a fan-out), and ONLY when it is strictly
+    /// closer than us and not already hosting.
+    ///
+    /// A candidate qualifies iff it has a known socket address, a known ring
+    /// location, is not already hosting `key` (per neighbor-hosting state),
+    /// reports a protocol version new enough to understand `SubscribeHint`, and
+    /// is strictly closer to the contract location than we are. Returns the
+    /// qualifying candidate with the smallest distance to the contract, breaking
+    /// ties deterministically by public-key bytes.
+    ///
+    /// The version filter is applied HERE (before the pure selection core) so
+    /// that an old/unknown-version peer that happens to be closest does not
+    /// suppress migration: we fall through to the next-closest peer that CAN
+    /// receive the hint. This matters during a mixed-version rolling upgrade.
+    fn select_migration_target(
+        &self,
+        key: &freenet_stdlib::prelude::ContractKey,
+    ) -> Option<PeerKeyLocation> {
+        let contract_loc = Location::from(key);
+        let me = self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .own_location();
+        let my_dist = contract_loc.distance(me.location()?);
+
+        let hosting: HashSet<TransportPublicKey> = self
+            .bridge
+            .op_manager
+            .neighbor_hosting
+            .neighbors_with_contract(key)
+            .into_iter()
+            .collect();
+
+        let connections = self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .get_connections_by_location();
+
+        pick_closest_migration_target(
+            contract_loc,
+            my_dist,
+            &hosting,
+            connections
+                .values()
+                .flatten()
+                .map(|conn| &conn.location)
+                // Only peers that can understand the appended wire variant are
+                // eligible; a closer but too-old peer is skipped so the next
+                // eligible peer is chosen (mixed-version safety).
+                .filter(|pkl| {
+                    pkl.socket_addr()
+                        .is_some_and(|addr| self.peer_supports_subscribe_hint(&addr))
+                }),
+        )
+    }
+
+    /// Best-effort nudge for a single contract we host: if there is a closer,
+    /// non-hosting neighbor that understands `SubscribeHint`, tell it we are
+    /// the current holder so it can directed-subscribe and host `key`.
+    ///
+    /// No-op if we do not host `key` or if there is no qualifying target
+    /// (closer, non-hosting, AND version-supported — the selection skips peers
+    /// too old to understand the hint). Fire-and-forget and
+    /// NON-BLOCKING: the nudge is dispatched with `try_send`, so a congested
+    /// bridge channel drops the hint (logged at debug) rather than stalling the
+    /// connection-handling event loop — see `.claude/rules/channel-safety.md`.
+    /// Migration is reconsidered on the next hosting/peer event, so a dropped
+    /// hint is self-healing.
+    fn consider_contract_migration(&self, key: freenet_stdlib::prelude::ContractKey) {
+        if !self.bridge.op_manager.ring.is_hosting_contract(&key) {
+            return;
+        }
+        let Some(target) = self.select_migration_target(&key) else {
+            return;
+        };
+        let Some(addr) = target.socket_addr() else {
+            return;
+        };
+        // Defense-in-depth: `select_migration_target` already filters to
+        // version-supported peers, but re-gate here so a SubscribeHint can NEVER
+        // be sent to a peer too old to deserialize it (which would drop the
+        // connection) even if the selection path changes.
+        if !self.peer_supports_subscribe_hint(&addr) {
+            return;
+        }
+        // The migration target is a connected neighbor we just looked up and
+        // version-checked, so it resolves via `get_peer_by_addr`.
+        let Some(target_pkl) = self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .get_peer_by_addr(addr)
+        else {
+            return;
+        };
+        let me = self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .own_location();
+        let msg = NetMessage::V1(NetMessageV1::SubscribeHint(
+            crate::message::SubscribeHintMsg { key, holder: me },
+        ));
+        self.bridge
+            .op_manager
+            .sending_transaction(&target_pkl, &msg);
+        // Non-blocking dispatch: never `.send().await` from the event loop.
+        if let Err(e) = self
+            .bridge
+            .ev_listener_tx
+            .try_send(P2pBridgeEvent::Message(target_pkl, Box::new(msg)))
+        {
+            tracing::debug!(%addr, %key, error = %e, "SubscribeHint nudge dropped (bridge busy or closed)");
+        }
+    }
+
+    /// On gaining a new neighbor, reconsider migrating each contract we host.
+    ///
+    /// The new peer may be the closest non-hosting neighbor for some of our
+    /// contracts; `consider_contract_migration` recomputes the single best
+    /// target per contract, so we do not special-case `peer_addr` here beyond
+    /// an early skip when the new peer is not even closer than us. The number
+    /// of contracts examined per call is capped at
+    /// [`MIGRATION_SCAN_CAP_PER_NEW_PEER`] so we never do an unbounded inline
+    /// scan + nudge fan-out from the event loop (channel-safety).
+    fn consider_migration_for_new_peer(&self, peer_addr: SocketAddr) {
+        let new_peer_loc = self
+            .connections
+            .get(&peer_addr)
+            .and_then(|e| e.pub_key.as_ref())
+            .and_then(|pk| {
+                self.bridge
+                    .op_manager
+                    .ring
+                    .connection_manager
+                    .get_peer_by_addr(peer_addr)
+                    .filter(|p| p.pub_key() == pk)
+                    .and_then(|p| p.location())
+            })
+            .or_else(|| {
+                self.bridge
+                    .op_manager
+                    .ring
+                    .connection_manager
+                    .get_peer_by_addr(peer_addr)
+                    .and_then(|p| p.location())
+            });
+        let my_loc = self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .own_location()
+            .location();
+
+        let keys = self.bridge.op_manager.ring.hosting_contract_keys();
+        let total = keys.len();
+        if total == 0 {
+            return;
+        }
+        // Bound the per-event scan: examine at most
+        // MIGRATION_SCAN_CAP_PER_NEW_PEER keys even when most of them skip the
+        // cheap test below, so a node hosting thousands of contracts can't walk
+        // its entire hosting set on every new connection (unbounded work on the
+        // connection-handling path). A rotating start offset (the
+        // `migration_scan_cursor`) makes successive events cover different
+        // windows, so contracts past the cap are reached on later events rather
+        // than being starved in a fixed prefix.
+        let window = MIGRATION_SCAN_CAP_PER_NEW_PEER;
+        let start = self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .next_migration_scan_offset(window)
+            % total;
+        if total > window {
+            tracing::debug!(
+                cap = window,
+                total,
+                start,
+                %peer_addr,
+                "Capping migration scan for new peer; rotating window covers the rest on later events"
+            );
+        }
+        for i in 0..window.min(total) {
+            let key = keys[(start + i) % total];
+            // Optimization: if we know both locations and the new peer isn't
+            // strictly closer to this contract than we are, it can't become
+            // the migration target this contract gained from the new peer, so
+            // skip the full selection join.
+            if let (Some(new_loc), Some(my_loc)) = (new_peer_loc, my_loc) {
+                let contract_loc = Location::from(&key);
+                if contract_loc.distance(new_loc) >= contract_loc.distance(my_loc) {
+                    continue;
+                }
+            }
+            self.consider_contract_migration(key);
+        }
+    }
+
     pub(in crate::node) fn listening_port(&self) -> u16 {
         self.listening_port
     }
@@ -1161,6 +1496,7 @@ impl P2pConnManager {
                                             }
                                             NetMessageV1::InterestSync { .. } => "InterestSync",
                                             NetMessageV1::ReadyState { .. } => "ReadyState",
+                                            NetMessageV1::SubscribeHint(_) => "SubscribeHint",
                                         },
                                     };
                                     match tokio::time::timeout(
@@ -2272,6 +2608,9 @@ impl P2pConnManager {
                                 ctx.handle_sync_state_to_peer(&op_manager, key, new_state, target)
                                     .await;
                             }
+                            NodeEvent::ConsiderContractMigration { key } => {
+                                ctx.consider_contract_migration(key);
+                            }
                         },
                     }
                 }
@@ -2812,6 +3151,10 @@ impl P2pConnManager {
                         );
                     }
                 }
+
+                // Directed-subscribe placement (#4404): the new neighbor may be
+                // the closest non-hosting peer for some contracts we host.
+                self.consider_migration_for_new_peer(peer_addr);
 
                 // Broadcast readiness if we just crossed the threshold
                 if just_became_ready {
@@ -3452,6 +3795,10 @@ impl P2pConnManager {
             }
         }
         let conn_id = next_connection_id();
+        // Capture the remote's negotiated protocol version BEFORE the connection
+        // is moved into the spawned listener task below. Used to gate
+        // version-dependent message types (e.g. SubscribeHint).
+        let remote_version = connection.remote_version();
         let (tx, rx) = mpsc::channel(10);
         tracing::debug!(
             self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key,
@@ -3470,6 +3817,7 @@ impl P2pConnManager {
                 pub_key: peer_id.as_ref().map(|p| p.pub_key().clone()),
                 connection_id: conn_id,
                 created_at: Instant::now(),
+                remote_version,
             },
         );
         // Only add to reverse lookup if we know the pub_key
@@ -3633,6 +3981,10 @@ impl P2pConnManager {
                         );
                     }
                 }
+
+                // Directed-subscribe placement (#4404): the new neighbor may be
+                // the closest non-hosting peer for some contracts we host.
+                self.consider_migration_for_new_peer(peer_addr);
 
                 // Broadcast readiness if we just crossed the threshold (deferred)
                 if just_became_ready {
@@ -5466,7 +5818,8 @@ fn extract_sender_from_message(msg: &NetMessage) -> Option<PeerKeyLocation> {
             NetMessageV1::Aborted(_)
             | NetMessageV1::NeighborHosting { .. }
             | NetMessageV1::InterestSync { .. }
-            | NetMessageV1::ReadyState { .. } => None,
+            | NetMessageV1::ReadyState { .. }
+            | NetMessageV1::SubscribeHint(_) => None,
         },
     }
 }
@@ -5484,7 +5837,8 @@ fn extract_sender_from_message_mut(msg: &mut NetMessage) -> Option<&mut PeerKeyL
             NetMessageV1::Aborted(_)
             | NetMessageV1::NeighborHosting { .. }
             | NetMessageV1::InterestSync { .. }
-            | NetMessageV1::ReadyState { .. } => None,
+            | NetMessageV1::ReadyState { .. }
+            | NetMessageV1::SubscribeHint(_) => None,
         },
     }
 }
@@ -5599,6 +5953,199 @@ mod tests {
         );
         assert!(states.contains_key(&a.to_string()));
         assert!(states.contains_key(&b.to_string()));
+    }
+
+    mod version_gate {
+        use super::super::version_supports_subscribe_hint;
+
+        const FLOOR: (u8, u8, u16) = (0, 2, 73);
+
+        // NOTE: there is deliberately NO test asserting the floor relative to
+        // CARGO_PKG_VERSION. The floor must be set to the EXACT release that
+        // first ships SubscribeHint and then FROZEN; the crate version keeps
+        // climbing afterward, so any `floor >= crate_version` / `floor <=
+        // crate_version` assertion would false-fail on a later release and
+        // invite the wrong "fix" (bumping the floor above the ship version,
+        // silently cutting off capable peers). The release coupling is enforced
+        // by docs/RELEASING.md + the const's "UPDATE AT RELEASE TIME" doc, not a
+        // unit test.
+
+        #[test]
+        fn unknown_remote_version_fails_closed() {
+            // A peer whose negotiated version we never captured (e.g. the
+            // joiner->gateway path) must NOT be sent the appended wire variant.
+            assert!(!version_supports_subscribe_hint(None, FLOOR));
+        }
+
+        #[test]
+        fn older_remote_version_is_rejected() {
+            assert!(!version_supports_subscribe_hint(Some((0, 2, 72)), FLOOR));
+            assert!(!version_supports_subscribe_hint(Some((0, 1, 99)), FLOOR));
+        }
+
+        #[test]
+        fn equal_or_newer_remote_version_is_accepted() {
+            // Exactly at the floor qualifies.
+            assert!(version_supports_subscribe_hint(Some((0, 2, 73)), FLOOR));
+            // Strictly newer (patch, minor, major) qualifies.
+            assert!(version_supports_subscribe_hint(Some((0, 2, 74)), FLOOR));
+            assert!(version_supports_subscribe_hint(Some((0, 3, 0)), FLOOR));
+            assert!(version_supports_subscribe_hint(Some((1, 0, 0)), FLOOR));
+        }
+
+        #[test]
+        fn tuple_ordering_is_major_then_minor_then_patch() {
+            // (0,3,0) >= (0,2,73) even though its patch is smaller: minor wins.
+            assert!(version_supports_subscribe_hint(Some((0, 3, 0)), FLOOR));
+            // A zero floor accepts any known version but still fails closed on None
+            // (this is the simulation/test floor behavior).
+            assert!(version_supports_subscribe_hint(Some((0, 0, 0)), (0, 0, 0)));
+            assert!(!version_supports_subscribe_hint(None, (0, 0, 0)));
+        }
+    }
+
+    mod migration_selection {
+        use super::super::pick_closest_migration_target;
+        use crate::ring::{Location, PeerKeyLocation};
+        use crate::transport::TransportPublicKey;
+        use std::collections::HashSet;
+        use std::net::SocketAddr;
+
+        /// Build a `PeerKeyLocation` with a deterministic public key (so the
+        /// tie-break is reproducible) and the given socket address (which
+        /// determines its ring `location()`).
+        fn pkl(pk_byte: u8, addr: &str) -> PeerKeyLocation {
+            let pub_key = TransportPublicKey::from_bytes([pk_byte; 32]);
+            let addr: SocketAddr = addr.parse().expect("valid socket addr");
+            PeerKeyLocation::new(pub_key, addr)
+        }
+
+        /// Distance from the contract location to a candidate's ring location.
+        fn dist_to(contract: Location, p: &PeerKeyLocation) -> crate::ring::Distance {
+            contract.distance(p.location().expect("known location"))
+        }
+
+        #[test]
+        fn picks_strictly_closest_non_hosting_candidate() {
+            let contract = Location::new(0.5);
+            // Three candidates at distinct ring locations.
+            let a = pkl(1, "10.0.0.1:1000");
+            let b = pkl(2, "10.0.0.2:1000");
+            let c = pkl(3, "10.0.0.3:1000");
+            let candidates = [a.clone(), b.clone(), c.clone()];
+
+            // Identify which candidate is actually closest to `contract`.
+            let closest = candidates
+                .iter()
+                .min_by_key(|p| dist_to(contract, p))
+                .unwrap()
+                .clone();
+
+            // `my_dist` is larger than every candidate's distance, so all
+            // qualify and the single closest must be chosen.
+            let my_dist = candidates
+                .iter()
+                .map(|p| dist_to(contract, p))
+                .max()
+                .unwrap();
+            // Make `my_dist` strictly larger than all candidates so each is
+            // strictly closer than us.
+            let my_dist = crate::ring::Distance::new(my_dist.as_f64() + 0.01);
+
+            let hosting = HashSet::new();
+            let chosen = pick_closest_migration_target(contract, my_dist, &hosting, &candidates)
+                .expect("a qualifying candidate exists");
+            assert_eq!(
+                chosen.pub_key(),
+                closest.pub_key(),
+                "must pick the candidate closest to the contract location"
+            );
+        }
+
+        #[test]
+        fn excludes_candidates_not_closer_than_us() {
+            let contract = Location::new(0.5);
+            let a = pkl(1, "10.0.0.1:1000");
+            let candidates = [a.clone()];
+            // `my_dist` smaller than the candidate's distance → it does NOT
+            // qualify (not strictly closer than us).
+            let my_dist = crate::ring::Distance::new(dist_to(contract, &a).as_f64() - 0.0001);
+            let hosting = HashSet::new();
+            assert!(
+                pick_closest_migration_target(contract, my_dist, &hosting, &candidates).is_none(),
+                "a candidate no closer than us must be excluded"
+            );
+        }
+
+        #[test]
+        fn excludes_already_hosting_candidates() {
+            let contract = Location::new(0.5);
+            let a = pkl(1, "10.0.0.1:1000");
+            let candidates = [a.clone()];
+            let my_dist = crate::ring::Distance::new(dist_to(contract, &a).as_f64() + 0.01);
+            let mut hosting = HashSet::new();
+            hosting.insert(a.pub_key().clone());
+            assert!(
+                pick_closest_migration_target(contract, my_dist, &hosting, &candidates).is_none(),
+                "a candidate already hosting the contract must be excluded"
+            );
+        }
+
+        #[test]
+        fn excludes_unknown_address_candidates() {
+            let contract = Location::new(0.5);
+            let unknown =
+                PeerKeyLocation::with_unknown_addr(TransportPublicKey::from_bytes([7; 32]));
+            let candidates = [unknown];
+            let my_dist = crate::ring::Distance::new(1.0);
+            let hosting = HashSet::new();
+            assert!(
+                pick_closest_migration_target(contract, my_dist, &hosting, &candidates).is_none(),
+                "a candidate without a known socket address must be excluded"
+            );
+        }
+
+        #[test]
+        fn breaks_ties_deterministically_by_pubkey() {
+            // Two candidates at the SAME ring location (same address) but
+            // different pub keys: the smaller pub-key bytes must win,
+            // regardless of input order.
+            let contract = Location::new(0.5);
+            let low = pkl(1, "10.0.0.9:1000");
+            let high = pkl(9, "10.0.0.9:1000");
+            assert_eq!(
+                dist_to(contract, &low),
+                dist_to(contract, &high),
+                "test setup: both candidates must be equidistant"
+            );
+            let my_dist = crate::ring::Distance::new(dist_to(contract, &low).as_f64() + 0.01);
+            let hosting = HashSet::new();
+
+            let forward = [low.clone(), high.clone()];
+            let reverse = [high.clone(), low.clone()];
+            let chosen_fwd =
+                pick_closest_migration_target(contract, my_dist, &hosting, &forward).unwrap();
+            let chosen_rev =
+                pick_closest_migration_target(contract, my_dist, &hosting, &reverse).unwrap();
+            assert_eq!(chosen_fwd.pub_key(), low.pub_key());
+            assert_eq!(chosen_rev.pub_key(), low.pub_key());
+        }
+
+        #[test]
+        fn returns_none_when_no_candidates() {
+            let contract = Location::new(0.5);
+            let candidates: [PeerKeyLocation; 0] = [];
+            let hosting = HashSet::new();
+            assert!(
+                pick_closest_migration_target(
+                    contract,
+                    crate::ring::Distance::new(1.0),
+                    &hosting,
+                    &candidates
+                )
+                .is_none()
+            );
+        }
     }
 
     /// Regression test for message loss during shutdown.
@@ -5861,6 +6408,7 @@ mod tests {
                 pub_key: None,
                 connection_id: 10,
                 created_at: Instant::now(),
+                remote_version: None,
             },
         );
         let (tx2, _rx2) = mpsc::channel(1);
@@ -5871,6 +6419,7 @@ mod tests {
                 pub_key: None,
                 connection_id: 20,
                 created_at: Instant::now(),
+                remote_version: None,
             },
         );
 
