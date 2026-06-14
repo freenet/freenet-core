@@ -1911,8 +1911,25 @@ impl P2pConnManager {
                                     }
                                 } else {
                                     for contract_key in &config.contract_keys {
+                                        let is_hosting =
+                                            op_manager.ring.is_hosting_contract(contract_key);
                                         let is_subscribed =
                                             op_manager.ring.is_subscribed(contract_key);
+                                        // Only report a state entry for a contract the
+                                        // node actually has local presence for (hosts in
+                                        // its store, or holds an active subscription
+                                        // lease for). Previously this branch inserted an
+                                        // entry for EVERY requested key unconditionally,
+                                        // which made `contract_states` claim the node
+                                        // hosted contracts it had never seen — and made
+                                        // the response useless as a local-presence
+                                        // signal. The web subresource DoS gate (#3945)
+                                        // relies on this being an accurate "do we know
+                                        // this contract locally" answer, so absence here
+                                        // must mean "not locally present".
+                                        if !is_hosting && !is_subscribed {
+                                            continue;
+                                        }
                                         let subscriber_count = if is_subscribed { 1 } else { 0 };
                                         response.contract_states.insert(
                                             contract_key.to_string(),
