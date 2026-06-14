@@ -216,6 +216,14 @@ static BROADCAST_QUEUE_DEPTH: AtomicUsize = AtomicUsize::new(0);
 /// mutation, so the gauge tracks the real depth while the shadow reader
 /// (the demand aggregator) reads it lock-free and never contends on the
 /// queue's async mutex.
+///
+/// The only production caller (`broadcast_queue.rs`) is gated
+/// `#[cfg(not(feature = "simulation_tests"))]`, so under `simulation_tests`
+/// the fn has no production caller and clippy's `-D warnings` would promote
+/// the resulting `dead_code` warning to a hard error. The `cfg(test)` gauge
+/// round-trip test below still exercises it; the `allow` only suppresses the
+/// non-test simulation_tests build, leaving default-feature builds unchanged.
+#[cfg_attr(feature = "simulation_tests", allow(dead_code))]
 pub(crate) fn record_broadcast_queue_depth(depth: usize) {
     BROADCAST_QUEUE_DEPTH.store(depth, Ordering::Relaxed);
 }
