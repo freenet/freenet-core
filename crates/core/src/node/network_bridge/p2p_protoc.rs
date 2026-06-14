@@ -462,6 +462,95 @@ fn next_connection_id() -> u64 {
     NEXT_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The local-presence questions the `QueryNodeDiagnostics` handler asks the
+/// ring when building `contract_states`. Abstracted into a trait so the
+/// presence-filter logic in [`collect_contract_states`] can be unit-tested
+/// without standing up a full `Ring`/`OpManager` — the production handler
+/// passes `&op_manager.ring`, tests pass a fake oracle.
+trait ContractPresenceOracle {
+    fn is_hosting_contract(&self, key: &freenet_stdlib::prelude::ContractKey) -> bool;
+    fn is_subscribed(&self, key: &freenet_stdlib::prelude::ContractKey) -> bool;
+    fn hosting_contract_keys(&self) -> Vec<freenet_stdlib::prelude::ContractKey>;
+    fn hosting_contract_size(&self, key: &freenet_stdlib::prelude::ContractKey) -> u64;
+}
+
+impl ContractPresenceOracle for crate::ring::Ring {
+    fn is_hosting_contract(&self, key: &freenet_stdlib::prelude::ContractKey) -> bool {
+        crate::ring::Ring::is_hosting_contract(self, key)
+    }
+    fn is_subscribed(&self, key: &freenet_stdlib::prelude::ContractKey) -> bool {
+        crate::ring::Ring::is_subscribed(self, key)
+    }
+    fn hosting_contract_keys(&self) -> Vec<freenet_stdlib::prelude::ContractKey> {
+        crate::ring::Ring::hosting_contract_keys(self)
+    }
+    fn hosting_contract_size(&self, key: &freenet_stdlib::prelude::ContractKey) -> u64 {
+        crate::ring::Ring::hosting_contract_size(self, key)
+    }
+}
+
+/// Build the `contract_states` map for a `NodeDiagnostics` response.
+///
+/// When `contract_keys` is empty, returns ALL hosting contracts. When specific
+/// keys are provided, returns ONLY those the node has local presence for —
+/// hosts in its store, or holds an active subscription lease for. A requested
+/// key with neither is omitted (the `if !is_hosting && !is_subscribed`
+/// guard): the explicit-keys branch must NOT echo every requested key back as
+/// "present", or the response is useless as a local-presence signal and the
+/// web-subresource DoS gate (#3945, see `path_handlers::is_locally_known`)
+/// would treat every queried key as locally known. Absence here MUST mean
+/// "not locally present".
+fn collect_contract_states<O: ContractPresenceOracle + ?Sized>(
+    oracle: &O,
+    contract_keys: &[freenet_stdlib::prelude::ContractKey],
+) -> std::collections::HashMap<String, freenet_stdlib::client_api::ContractState> {
+    use freenet_stdlib::client_api::ContractState;
+
+    let mut states = std::collections::HashMap::new();
+    // stdlib 0.8.0 keyed contract_states by String
+    // (`fix!: stringify NodeDiagnosticsResponse.contract_states keys`).
+    if contract_keys.is_empty() {
+        for contract_key in oracle.hosting_contract_keys() {
+            let is_subscribed = oracle.is_subscribed(&contract_key);
+            let subscriber_count = if is_subscribed { 1 } else { 0 };
+            states.insert(
+                contract_key.to_string(),
+                ContractState {
+                    subscribers: subscriber_count as u32,
+                    subscriber_peer_ids: Vec::new(),
+                    size_bytes: oracle.hosting_contract_size(&contract_key),
+                },
+            );
+        }
+    } else {
+        for contract_key in contract_keys {
+            let is_hosting = oracle.is_hosting_contract(contract_key);
+            let is_subscribed = oracle.is_subscribed(contract_key);
+            // Only report a state entry for a contract the node actually has
+            // local presence for. Previously this branch inserted an entry for
+            // EVERY requested key unconditionally, which made `contract_states`
+            // claim the node hosted contracts it had never seen — and made the
+            // response useless as a local-presence signal. The web subresource
+            // DoS gate (#3945) relies on this being an accurate "do we know
+            // this contract locally" answer, so absence here must mean "not
+            // locally present".
+            if !is_hosting && !is_subscribed {
+                continue;
+            }
+            let subscriber_count = if is_subscribed { 1 } else { 0 };
+            states.insert(
+                contract_key.to_string(),
+                ContractState {
+                    subscribers: subscriber_count as u32,
+                    subscriber_peer_ids: Vec::new(),
+                    size_bytes: oracle.hosting_contract_size(contract_key),
+                },
+            );
+        }
+    }
+    states
+}
+
 pub(in crate::node) struct P2pConnManager {
     pub(in crate::node) gateways: Vec<PeerKeyLocation>,
     pub(in crate::node) bridge: P2pBridge,
@@ -1784,8 +1873,7 @@ impl P2pConnManager {
                             }
                             NodeEvent::QueryNodeDiagnostics { config, callback } => {
                                 use freenet_stdlib::client_api::{
-                                    ContractState, NetworkInfo, NodeDiagnosticsResponse, NodeInfo,
-                                    SystemMetrics,
+                                    NetworkInfo, NodeDiagnosticsResponse, NodeInfo, SystemMetrics,
                                 };
                                 use std::collections::HashMap;
 
@@ -1887,45 +1975,15 @@ impl P2pConnManager {
 
                                 // Collect contract states.
                                 // When contract_keys is empty, return ALL hosting contracts.
-                                // When specific keys are provided, return only those.
+                                // When specific keys are provided, return only those the
+                                // node has local presence for (see `collect_contract_states`
+                                // for the #3945 presence-filter rationale).
                                 // Note: subscriber_peer_ids is always empty because we use
                                 // lease-based subscriptions rather than explicit subscriber tracking.
-                                if config.contract_keys.is_empty() {
-                                    let hosting_contracts = op_manager.ring.hosting_contract_keys();
-                                    for contract_key in hosting_contracts {
-                                        let is_subscribed =
-                                            op_manager.ring.is_subscribed(&contract_key);
-                                        let subscriber_count = if is_subscribed { 1 } else { 0 };
-                                        // stdlib 0.8.0 keyed contract_states by String
-                                        // (`fix!: stringify NodeDiagnosticsResponse.contract_states keys`).
-                                        response.contract_states.insert(
-                                            contract_key.to_string(),
-                                            ContractState {
-                                                subscribers: subscriber_count as u32,
-                                                subscriber_peer_ids: Vec::new(),
-                                                size_bytes: op_manager
-                                                    .ring
-                                                    .hosting_contract_size(&contract_key),
-                                            },
-                                        );
-                                    }
-                                } else {
-                                    for contract_key in &config.contract_keys {
-                                        let is_subscribed =
-                                            op_manager.ring.is_subscribed(contract_key);
-                                        let subscriber_count = if is_subscribed { 1 } else { 0 };
-                                        response.contract_states.insert(
-                                            contract_key.to_string(),
-                                            ContractState {
-                                                subscribers: subscriber_count as u32,
-                                                subscriber_peer_ids: Vec::new(),
-                                                size_bytes: op_manager
-                                                    .ring
-                                                    .hosting_contract_size(contract_key),
-                                            },
-                                        );
-                                    }
-                                }
+                                response.contract_states = collect_contract_states(
+                                    op_manager.ring.as_ref(),
+                                    &config.contract_keys,
+                                );
 
                                 // Collect topology-backed connection info (exclude transient transports).
                                 let cm = &op_manager.ring.connection_manager;
@@ -5440,6 +5498,108 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
     use tokio::time::{Duration, Instant, sleep, timeout};
+
+    /// A fake [`super::ContractPresenceOracle`] for testing
+    /// [`super::collect_contract_states`] without standing up a real `Ring`.
+    /// `hosting` and `subscribed` are the sets the node "knows"; everything
+    /// else is locally unknown.
+    struct FakePresence {
+        hosting: std::collections::HashSet<freenet_stdlib::prelude::ContractKey>,
+        subscribed: std::collections::HashSet<freenet_stdlib::prelude::ContractKey>,
+    }
+
+    impl super::ContractPresenceOracle for FakePresence {
+        fn is_hosting_contract(&self, key: &freenet_stdlib::prelude::ContractKey) -> bool {
+            self.hosting.contains(key)
+        }
+        fn is_subscribed(&self, key: &freenet_stdlib::prelude::ContractKey) -> bool {
+            self.subscribed.contains(key)
+        }
+        fn hosting_contract_keys(&self) -> Vec<freenet_stdlib::prelude::ContractKey> {
+            self.hosting.iter().copied().collect()
+        }
+        fn hosting_contract_size(&self, _key: &freenet_stdlib::prelude::ContractKey) -> u64 {
+            42
+        }
+    }
+
+    fn contract_key_from_seed(seed: u8) -> freenet_stdlib::prelude::ContractKey {
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        ContractKey::from_id_and_code(ContractInstanceId::new(bytes), CodeHash::new([0u8; 32]))
+    }
+
+    /// Regression for the `QueryNodeDiagnostics` explicit-`contract_keys`
+    /// presence filter (companion to the #3945 web-subresource DoS gate).
+    ///
+    /// When the handler is asked about specific keys, `contract_states` must
+    /// contain ONLY the keys the node actually has local presence for (hosts
+    /// or subscribes) and must OMIT a requested key it neither hosts nor
+    /// subscribes to. This is the `if !is_hosting && !is_subscribed { continue }`
+    /// guard inside [`super::collect_contract_states`], which
+    /// `path_handlers::is_locally_known` depends on: without it the handler
+    /// would echo EVERY requested key back as "present", so the gate would
+    /// treat every queried key as locally known and the DoS protection would
+    /// be defeated. Load-bearing: reverting the guard to an unconditional
+    /// insert makes the `unknown` assertion below fail.
+    #[test]
+    fn collect_contract_states_filters_unknown_explicit_keys() {
+        let hosted = contract_key_from_seed(0x01);
+        let subscribed = contract_key_from_seed(0x02);
+        let unknown = contract_key_from_seed(0x03);
+
+        let oracle = FakePresence {
+            hosting: std::iter::once(hosted).collect(),
+            subscribed: std::iter::once(subscribed).collect(),
+        };
+
+        // Ask explicitly about all three: one hosted, one subscribed, one
+        // neither. The neither-key must be filtered out of the response.
+        let states = super::collect_contract_states(&oracle, &[hosted, subscribed, unknown]);
+
+        assert!(
+            states.contains_key(&hosted.to_string()),
+            "a hosted key must be reported as present (positive control)"
+        );
+        assert!(
+            states.contains_key(&subscribed.to_string()),
+            "a subscribed key must be reported as present (positive control)"
+        );
+        assert!(
+            !states.contains_key(&unknown.to_string()),
+            "a key the node neither hosts nor subscribes to MUST be omitted — \
+             reporting it would defeat the #3945 local-presence gate"
+        );
+        assert_eq!(
+            states.len(),
+            2,
+            "only the two locally-present keys may appear in contract_states"
+        );
+    }
+
+    /// The empty-`contract_keys` branch of [`super::collect_contract_states`]
+    /// still enumerates ALL hosting contracts (the pre-existing "dump
+    /// everything" behavior the presence filter must NOT regress). Guards
+    /// against a fix that over-filters and drops the empty-query enumeration.
+    #[test]
+    fn collect_contract_states_empty_query_returns_all_hosting() {
+        let a = contract_key_from_seed(0x11);
+        let b = contract_key_from_seed(0x12);
+        let oracle = FakePresence {
+            hosting: [a, b].into_iter().collect(),
+            subscribed: std::collections::HashSet::new(),
+        };
+
+        let states = super::collect_contract_states(&oracle, &[]);
+        assert_eq!(
+            states.len(),
+            2,
+            "empty query must dump all hosting contracts"
+        );
+        assert!(states.contains_key(&a.to_string()));
+        assert!(states.contains_key(&b.to_string()));
+    }
 
     /// Regression test for message loss during shutdown.
     ///
