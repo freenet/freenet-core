@@ -2605,6 +2605,18 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Stale-orphan self-heal (issue #3967): RestartPreventExitStatus=43 below
+# means an exit 43 ("another instance already running") never restarts the
+# unit. That is correct for a legitimate second instance, but if the port
+# holder is an ORPHANED `freenet network` (PPID=1) still running an OLD
+# binary, the unit would stand down and the orphan would serve stale assets
+# forever. This pre-flight runs before every start: it finds the port
+# holder, compares its `Freenet version:` line against the binary this unit
+# would launch, and kills a stale orphan (SIGTERM, then SIGKILL) so the
+# main ExecStart can bind the port with the current binary. The '-' prefix
+# means a failure here never blocks the start. Genuine current-version
+# holders are left alone — ExecStart then exits 43 and we defer as before.
+ExecStartPre=-/bin/sh -c 'ondisk=$({binary} --version 2>/dev/null | grep "^Freenet version:"); for pid in $(pgrep -f -u "$(id -u)" "freenet network" 2>/dev/null); do exe=$(readlink -f /proc/$pid/exe 2>/dev/null); hv=""; [ -x "$exe" ] && hv=$("$exe" --version 2>/dev/null | grep "^Freenet version:"); ppid=$(awk "{{print \$4}}" /proc/$pid/stat 2>/dev/null); if {{ [ -n "$hv" ] && [ "$hv" != "$ondisk" ]; }} || {{ [ -z "$hv" ] && [ "$ppid" = "1" ]; }}; then kill -TERM "$pid" 2>/dev/null || true; w=0; while kill -0 "$pid" 2>/dev/null && [ $w -lt 12 ]; do sleep 1; w=$((w+1)); done; kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true; fi; done'
 ExecStart={binary} network
 Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops
@@ -2683,6 +2695,15 @@ Wants=network-online.target
 Type=simple
 User={username}
 Environment=HOME={home}
+# Stale-orphan self-heal (issue #3967): see the matching comment in the user
+# unit. RestartPreventExitStatus=43 means an exit 43 never restarts the unit,
+# so an orphaned `freenet network` (PPID=1) running an OLD binary would hold
+# the port forever. This pre-flight finds the holder, compares its
+# `Freenet version:` line against the binary this unit launches, and kills a
+# stale orphan (SIGTERM, then SIGKILL) before ExecStart. The '-' prefix means
+# a failure here never blocks the start; current-version holders are left
+# alone so ExecStart exits 43 and we defer as before.
+ExecStartPre=-/bin/sh -c 'ondisk=$({binary} --version 2>/dev/null | grep "^Freenet version:"); for pid in $(pgrep -f -u "$(id -u)" "freenet network" 2>/dev/null); do exe=$(readlink -f /proc/$pid/exe 2>/dev/null); hv=""; [ -x "$exe" ] && hv=$("$exe" --version 2>/dev/null | grep "^Freenet version:"); ppid=$(awk "{{print \$4}}" /proc/$pid/stat 2>/dev/null); if {{ [ -n "$hv" ] && [ "$hv" != "$ondisk" ]; }} || {{ [ -z "$hv" ] && [ "$ppid" = "1" ]; }}; then kill -TERM "$pid" 2>/dev/null || true; w=0; while kill -0 "$pid" 2>/dev/null && [ $w -lt 12 ]; do sleep 1; w=$((w+1)); done; kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true; fi; done'
 ExecStart={binary} network
 Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops
@@ -2986,6 +3007,82 @@ log_event() {{
     logger -t freenet "$1"
 }}
 
+# Print the on-disk binary's full version identity line, e.g.
+#   Freenet version: 0.2.71 (abc1234)
+# Used on the exit-43 self-heal path to tell a stale orphan apart from a
+# legitimate second instance running the SAME binary we would launch.
+ondisk_version() {{
+    "{binary}" --version 2>/dev/null | grep '^Freenet version:'
+}}
+
+# Enumerate PIDs of `freenet network` processes owned by the current user.
+holder_pids() {{
+    pgrep -f -u "$(id -u)" "freenet network" 2>/dev/null
+}}
+
+# Resolve a PID's executable path on macOS (`ps -o comm=` yields the full
+# path of the running image). Empty if the process is gone.
+holder_exe() {{
+    ps -o comm= -p "$1" 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}}
+
+# Stale-orphan self-heal for exit 43.
+#
+# WHY this exists: the binary returns exit 43 ("another instance is already
+# running") whenever it cleanly detects something already holding the
+# service port. launchd's plist sets KeepAlive.SuccessfulExit=false, so if
+# this wrapper responds with `exit 0`, launchd treats it as an intentional
+# stop and NEVER respawns us. (systemd has the same trap via
+# RestartPreventExitStatus=43.) That is correct for a real second instance,
+# but catastrophic when the port holder is an ORPHANED `freenet network`
+# (PPID=1, detached from any wrapper) still running a STALE OLD binary: every
+# new spawn detects it, exits 43, we stand down, and the orphan serves stale
+# assets forever (issue #3967).
+#
+# So before deferring, compare the holder's version against the binary we
+# would launch. If the holder is stale (version line differs) OR it is an
+# orphan (PPID==1 and not this wrapper's own child), kill it (SIGTERM, then
+# SIGKILL — the original incident's orphan ignored SIGTERM for >11s) and
+# signal the caller to relaunch. Returns 0 = killed a stale orphan, relaunch;
+# 1 = genuine current-version instance, defer.
+heal_stale_orphan_or_defer() {{
+    local ondisk pid exe holder_ver ppid killed=1
+    ondisk="$(ondisk_version)"
+    for pid in $(holder_pids); do
+        # Never touch our own child (the instance we just ran in this loop).
+        [ "$pid" = "$WRAPPER_CHILD_PID" ] && continue
+        ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+        exe="$(holder_exe "$pid")"
+        holder_ver=""
+        if [ -n "$exe" ] && [ -x "$exe" ]; then
+            holder_ver="$("$exe" --version 2>/dev/null | grep '^Freenet version:')"
+        fi
+        # Stale if the version line differs from the binary we would launch,
+        # or (fallback) it's an orphan adopted by init and not our child.
+        if {{ [ -n "$holder_ver" ] && [ "$holder_ver" != "$ondisk" ]; }} || \
+           {{ [ -z "$holder_ver" ] && [ "$ppid" = "1" ]; }} || \
+           {{ [ -n "$ondisk" ] && [ -z "$holder_ver" ] && [ "$ppid" = "1" ]; }}; then
+            log_event "Exit 43: port holder PID $pid is a STALE orphan (holder='$holder_ver' ondisk='$ondisk' ppid=$ppid). Killing and relaunching."
+            kill -TERM "$pid" 2>/dev/null || true
+            # Wait up to ~12s for graceful exit, then escalate to SIGKILL.
+            local waited=0
+            while kill -0 "$pid" 2>/dev/null && [ $waited -lt 12 ]; do
+                sleep 1
+                waited=$((waited + 1))
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+                log_event "Exit 43: stale orphan PID $pid ignored SIGTERM after ${{waited}}s, sending SIGKILL"
+                kill -KILL "$pid" 2>/dev/null || true
+                sleep 1
+            fi
+            killed=0
+        else
+            log_event "Exit 43: port holder PID $pid runs the current version ('$holder_ver'); deferring to it"
+        fi
+    done
+    return $killed
+}}
+
 # Kill any stale freenet network processes before starting.
 # This handles the case where a previous launch daemon restart left a child
 # process still holding the port (e.g. port 7509).
@@ -2996,7 +3093,12 @@ if pkill -f -u "$(id -u)" "freenet network" 2>/dev/null; then
 fi
 
 while true; do
-    "{binary}" network 2>"$HOME/Library/Logs/freenet/freenet.error.log.last"
+    # Launch in the background so we know our own child's PID. This lets the
+    # exit-43 self-heal path avoid mistaking our just-exited child for a
+    # stale orphan still holding the port.
+    "{binary}" network 2>"$HOME/Library/Logs/freenet/freenet.error.log.last" &
+    WRAPPER_CHILD_PID=$!
+    wait $WRAPPER_CHILD_PID
     EXIT_CODE=$?
 
     if [ $EXIT_CODE -eq 42 ]; then
@@ -3016,7 +3118,19 @@ while true; do
         fi
         continue
     elif [ $EXIT_CODE -eq 43 ]; then
-        log_event "Another instance is already running, exiting cleanly"
+        # Another instance holds the port. Before standing down (which under
+        # launchd SuccessfulExit=false would stop us forever), check whether
+        # the holder is a stale orphan running an old binary and, if so, kill
+        # it and relaunch instead of deferring. See heal_stale_orphan_or_defer.
+        if heal_stale_orphan_or_defer; then
+            log_event "Killed stale orphan holding the port on exit 43, relaunching"
+            CONSECUTIVE_FAILURES=0
+            PORT_CONFLICT_KILLS=0
+            BACKOFF=10
+            sleep 2
+            continue
+        fi
+        log_event "Another instance (current version) is already running, exiting cleanly"
         exit 0
     elif [ $EXIT_CODE -eq 0 ]; then
         log_event "Normal shutdown"
@@ -4270,6 +4384,18 @@ mod tests {
         // Verify exit code 43 prevents restart (another instance already running)
         assert!(service_content.contains("RestartPreventExitStatus=43"));
 
+        // Regression for #3967: stale-orphan self-heal pre-flight. Because
+        // RestartPreventExitStatus=43 blocks restart on exit 43, the
+        // version-compare-and-kill must run as an ExecStartPre before the main
+        // ExecStart so a stale orphan can't hold the port forever.
+        assert!(
+            service_content.contains("ExecStartPre=")
+                && service_content.contains("Freenet version:")
+                && service_content.contains("kill -TERM")
+                && service_content.contains("kill -KILL"),
+            "systemd unit must run a stale-orphan version-compare-and-kill pre-flight (#3967)"
+        );
+
         // Verify graceful shutdown timeout is set. 45s = 30s drain
         // (default `shutdown-drain-secs`) + 15s peer-teardown headroom.
         assert!(service_content.contains("TimeoutStopSec=45"));
@@ -4316,6 +4442,15 @@ mod tests {
 
         // Verify exit code 43 prevents restart (another instance already running)
         assert!(service_content.contains("RestartPreventExitStatus=43"));
+
+        // Regression for #3967: stale-orphan self-heal pre-flight (system unit).
+        assert!(
+            service_content.contains("ExecStartPre=")
+                && service_content.contains("Freenet version:")
+                && service_content.contains("kill -TERM")
+                && service_content.contains("kill -KILL"),
+            "system systemd unit must run a stale-orphan version-compare-and-kill pre-flight (#3967)"
+        );
 
         // Logging routes to journal (same reasoning as the user-unit test).
         assert!(service_content.contains("StandardOutput=journal"));
@@ -4395,6 +4530,115 @@ mod tests {
         assert!(
             script.contains("EXIT_CODE -eq 42"),
             "wrapper must handle exit code 42 for auto-update"
+        );
+    }
+
+    /// Regression for issue #3967: on exit 43 the wrapper must self-heal a
+    /// STALE ORPHAN holding the service port instead of unconditionally
+    /// standing down. Standing down (`exit 0`) under launchd
+    /// SuccessfulExit=false means launchd never respawns us, so an orphaned
+    /// `freenet network` running an OLD binary would serve stale assets
+    /// forever. The fix compares the holder's `Freenet version:` line against
+    /// the on-disk binary and kills a stale orphan (SIGTERM→SIGKILL) before
+    /// relaunching, while still deferring to a genuine current-version
+    /// instance.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_macos_wrapper_exit43_self_heals_stale_orphan() {
+        let binary_path = PathBuf::from("/usr/local/bin/freenet");
+        let script = generate_wrapper_script(&binary_path);
+
+        // The exit-43 branch must invoke the self-heal routine BEFORE the
+        // polite `exit 0`. Without the fix the branch was just a log + exit 0.
+        assert!(
+            script.contains("heal_stale_orphan_or_defer"),
+            "exit-43 path must call the stale-orphan self-heal routine"
+        );
+
+        // It must detect the port holder. We reuse the existing user-scoped
+        // `freenet network` detection rather than needing the port plumbed in.
+        assert!(
+            script.contains("holder_pids")
+                && script.contains("pgrep -f -u \"$(id -u)\" \"freenet network\""),
+            "self-heal must enumerate the port holder process(es)"
+        );
+
+        // It must compare versions: query the holder binary's --version and
+        // the on-disk binary's --version, matching the `Freenet version:` line.
+        assert!(
+            script.contains("--version") && script.contains("Freenet version:"),
+            "self-heal must compare holder vs on-disk `Freenet version:` lines"
+        );
+        assert!(
+            script.contains("ondisk_version"),
+            "self-heal must compute the on-disk binary version for comparison"
+        );
+
+        // PPID==1 orphan fallback signal (orphan adopted by init).
+        assert!(
+            script.contains("ppid") && script.contains("\"$ppid\" = \"1\""),
+            "self-heal must treat a PPID==1 process as an orphan signal"
+        );
+
+        // Escalation: SIGTERM, wait, then SIGKILL (the incident's orphan
+        // ignored SIGTERM for >11s and needed -9).
+        assert!(
+            script.contains("kill -TERM") && script.contains("kill -KILL"),
+            "self-heal must escalate SIGTERM -> SIGKILL"
+        );
+        assert!(
+            script.contains("kill -0"),
+            "self-heal must poll for liveness between SIGTERM and SIGKILL"
+        );
+
+        // On a detected stale orphan it must RELAUNCH (continue), not exit 0.
+        assert!(
+            script.contains("if heal_stale_orphan_or_defer; then"),
+            "exit-43 path must branch on the self-heal result"
+        );
+        let exit43_idx = script
+            .find("EXIT_CODE -eq 43")
+            .expect("exit-43 branch must exist");
+        let exit43_block = &script[exit43_idx..];
+        let continue_idx = exit43_block
+            .find("continue")
+            .expect("exit-43 path must relaunch (continue) on a killed stale orphan");
+        let exit0_idx = exit43_block
+            .find("exit 0")
+            .expect("exit-43 path must still defer (exit 0) for a current-version instance");
+        assert!(
+            continue_idx < exit0_idx,
+            "relaunch (continue) must come before the polite exit 0 in the exit-43 branch"
+        );
+
+        // Negative assertion (polite path preserved): a genuine current-version
+        // holder still defers. The routine logs a defer and the branch falls
+        // through to `exit 0`.
+        assert!(
+            script.contains("runs the current version") && script.contains("deferring to it"),
+            "a current-version holder must still be deferred to (polite path preserved)"
+        );
+
+        // The own-child guard prevents mistaking our just-exited child for an
+        // orphan: the wrapper tracks WRAPPER_CHILD_PID and skips it.
+        assert!(
+            script.contains("WRAPPER_CHILD_PID"),
+            "self-heal must skip the wrapper's own child to avoid false positives"
+        );
+
+        // Load-bearing: the generated script must be syntactically valid bash.
+        // If our heredoc escaping is wrong this catches it.
+        let tmp = tempfile::tempdir().unwrap();
+        let script_path = tmp.path().join("wrapper.sh");
+        std::fs::write(&script_path, &script).unwrap();
+        let status = std::process::Command::new("bash")
+            .arg("-n")
+            .arg(&script_path)
+            .status()
+            .expect("failed to run bash -n");
+        assert!(
+            status.success(),
+            "generated wrapper script must be syntactically valid bash"
         );
     }
 
