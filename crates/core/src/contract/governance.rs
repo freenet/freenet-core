@@ -317,11 +317,13 @@ impl ContractScore {
     }
 }
 
-/// Operating mode for the governance system. Plan defaults to
-/// `DryRun` for one release after Phase 4 lands — operators see what
-/// would be evicted, dashboards reflect intended actions, but no
-/// contracts are actually evicted. After calibration, the operator
-/// (or release default) flips to `Enforce`.
+/// Operating mode for the governance system. Defaults to `Off`: the
+/// cost/benefit MAD detector proved miscalibrated in production DryRun
+/// (it false-flagged popular contracts, including the official River
+/// room — see [`GovernanceConfig::default`] and #4296), so it is
+/// disabled pending the demand-weighted, contention-only redesign.
+/// `DryRun` computes and surfaces `WouldEvict` / `Evicted` states
+/// without acting; `Enforce` additionally evicts/bans. Flip explicitly.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum GovernanceMode {
     /// Disabled. No state computation, no transitions.
@@ -414,7 +416,22 @@ pub(crate) struct GovernanceConfig {
 impl Default for GovernanceConfig {
     fn default() -> Self {
         Self {
-            mode: GovernanceMode::DryRun,
+            // Default OFF. The cost/benefit MAD detector is miscalibrated:
+            // in production DryRun on the gateways it flagged popular
+            // contracts (including the official River room) as WouldEvict
+            // — ~47% of active contracts on nova. Root cause: cost accrues
+            // on every hosted merge while benefit under-credits relay
+            // demand (FORWARDED_DEMAND_WEIGHT = 0.1), and the MAD detector
+            // has no absolute floor, so the busiest relay-hosted contract
+            // is definitionally the population's cost/benefit outlier. It
+            // is being replaced by demand-weighted, contention-only
+            // throttling (#4296); until that lands the detector stays Off
+            // so it cannot mislabel a contract on the dashboard or — under
+            // any future Enforce flip — evict a legitimate one. Off keeps
+            // the data model and Meter infrastructure in place but dormant;
+            // flip to DryRun/Enforce explicitly to exercise the detector.
+            // Reversible.
+            mode: GovernanceMode::Off,
             outlier: OutlierConfig::default(),
             ramp_up: Duration::from_secs(15 * 60), // 15 minutes
             decay_half_life: Duration::from_secs(60 * 60), // 1 hour
@@ -609,6 +626,15 @@ impl GovernanceManager {
     /// Meter wiring (subsequent commit) on every per-contract resource
     /// report. If the contract is new, creates a `Normal`-state score.
     pub(crate) fn ingest_cost(&self, key: ContractInstanceId, amount: f64) {
+        // When governance is Off the subsystem is fully dormant: cost is
+        // not accumulated, so the score map cannot grow. This matters
+        // because the reaper `tick` that would otherwise decay and prune
+        // the map is also a no-op under Off (see `tick`); without this
+        // gate, a default-Off node would accumulate one never-pruned
+        // score per contract it ever hosts. Keeps default-Off leak-free.
+        if matches!(self.config.mode, GovernanceMode::Off) {
+            return;
+        }
         if !amount.is_finite() || amount < 0.0 {
             return;
         }
@@ -1375,6 +1401,38 @@ mod tests {
         let result = mgr.tick(Duration::from_secs(1), &benefits(&[(k, 0.1)]));
         assert!(result.decisions.is_empty());
         assert_eq!(result.sample_size, 0);
+    }
+
+    /// Regression for the production false-positive (#4296): the DryRun
+    /// cost/benefit detector flagged popular contracts — including the
+    /// official River room, ~47% of active contracts on nova — as
+    /// `WouldEvict`. The detector is miscalibrated, so the default mode is
+    /// now `Off` until the demand-weighted redesign lands. Verify (1) the
+    /// default really is `Off`, and (2) `Off` is fully dormant: even the
+    /// abuser signature (large cost, zero live benefit) accumulates no
+    /// score and yields no decisions, so nothing can be mislabeled on the
+    /// dashboard or evicted under a future Enforce flip.
+    #[test]
+    fn default_governance_is_off_and_dormant() {
+        assert_eq!(
+            GovernanceConfig::default().mode,
+            GovernanceMode::Off,
+            "governance must default to Off until the detector is recalibrated (#4296)"
+        );
+
+        let ts = SharedTs::new();
+        let ts_dyn: Arc<dyn TimeSource + Send + Sync> = ts.clone();
+        let mgr = GovernanceManager::new(GovernanceConfig::default(), ts_dyn);
+        let k = mk_key(1);
+
+        // Abuser signature: large cost, never any beneficiaries.
+        mgr.ingest_cost(k, 1_000_000.0);
+        assert_eq!(mgr.len(), 0, "Off must not accumulate cost scores");
+
+        ts.advance(Duration::from_secs(60));
+        let result = mgr.tick(Duration::from_secs(1), &benefits(&[]));
+        assert!(result.decisions.is_empty(), "Off must produce no decisions");
+        assert!(mgr.score_snapshot(&k).is_none());
     }
 
     /// New abuser signature under the live-snapshot model: a contract
