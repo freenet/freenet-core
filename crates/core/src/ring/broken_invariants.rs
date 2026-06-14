@@ -324,6 +324,12 @@ impl BrokenInvariantsTracker {
     /// on node shutdown to help free the on-disk file lock (issue #4401). The
     /// in-memory flags are left intact — only the persistence backing is
     /// dropped, since the node is going away.
+    ///
+    /// Runs on the shutdown thread (`run_node`'s teardown) while `record` /
+    /// `remove_from_storage` run on the detached executor task. The write lock
+    /// taken here may briefly wait on an in-flight redb write held by those
+    /// readers, but cannot deadlock: the `RwLock` is non-reentrant and the
+    /// writer/readers are distinct tasks.
     pub(crate) fn clear_storage(&self) {
         *self.storage.write() = None;
     }

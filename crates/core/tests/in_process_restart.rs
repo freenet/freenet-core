@@ -6,7 +6,9 @@
 //! running. Those tasks kept holding the redb on-disk file lock and kept
 //! serving on the node's bound ports after the node had "shut down". As a
 //! result an in-process restart against the same data dir would either:
-//!   1. deadlock — node 2's redb open blocks on the lock node 1 still holds, OR
+//!   1. fail — node 2's redb open returns `DatabaseAlreadyOpen` in-process (the
+//!      surviving process still holds the lock); cross-process the same condition
+//!      surfaces as an OS file-lock block. Either way the restart can't proceed, OR
 //!   2. silently pass — node 1's still-live WS server answers the GET, so the
 //!      "restart" validated nothing.
 //!
@@ -131,7 +133,13 @@ macro_rules! recv_until {
     }};
 }
 
+// Runtime-ignore under sqlite (mirrors `tests/redb_migration.rs`): this test
+// probes the redb on-disk layout (`<data_dir>/db/db`) and opens `redb::Database`
+// directly. Under `--no-default-features --features sqlite` the node writes a
+// sqlite DB instead, so the probe would mis-target. Kept as a runtime `#[ignore]`
+// (not a file-level `#![cfg]`) so the file still compiles under sqlite.
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+#[cfg_attr(not(feature = "redb"), ignore)]
 async fn test_in_process_restart_releases_redb_lock() -> anyhow::Result<()> {
     freenet::test_utils::ensure_contract_compiled(TEST_CONTRACT)?;
 
@@ -194,9 +202,11 @@ async fn test_in_process_restart_releases_redb_lock() -> anyhow::Result<()> {
     // ---- Negative control: the redb lock must be released promptly ----
     //
     // Before the fix the detached executor task survives shutdown and keeps the
-    // redb `Database` open, so this direct open blocks indefinitely and the
-    // bounded loop below fails. With the fix the lock is released within a
-    // fraction of a second of the run loop returning.
+    // redb `Database` open, so this direct open returns `DatabaseAlreadyOpen`
+    // in-process (and the bounded loop below fails). With the fix the lock is
+    // released shortly after the run loop returns — "shortly" rather than
+    // "instantly" because abort only signals the executor task; its redb clones
+    // drop when the runtime next polls it to completion, hence the 10s bound.
     let lock_deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match try_open_redb(&db_path) {
