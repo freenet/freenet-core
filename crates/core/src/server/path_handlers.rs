@@ -74,6 +74,13 @@ async fn acquire_cache_lock(instance_id: &ContractInstanceId) -> tokio::sync::Ow
 /// bounding the GET rate to at most one per contract per window.
 const CONTRACT_CACHE_REFRESH_TTL: Duration = Duration::from_secs(30);
 
+/// Per-step timeout for the local presence query in `is_locally_known`.
+/// Bounds how long a subresource request waits on the node for the
+/// connection-id assignment and the diagnostics answer. On elapse the gate
+/// fails closed (treats the contract as unknown), so a wedged or spammed node
+/// can't pin request tasks open under a spray of unknown keys.
+const PRESENCE_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Last time each contract's cache was reconciled against the network via
 /// `ensure_contract_cached`. Used to gate the TTL refresh so the sandbox and
 /// subresource paths don't issue a network GET on every request.
@@ -185,7 +192,7 @@ async fn is_locally_known(
     // Fail closed if the node never assigns an id (e.g. it accepted the
     // connection but is wedged): bound the wait so a non-responsive node
     // can't pin the request task open under a spray of unknown keys.
-    let client_id = match tokio::time::timeout(Duration::from_secs(5), response_recv.recv()).await {
+    let client_id = match tokio::time::timeout(PRESENCE_QUERY_TIMEOUT, response_recv.recv()).await {
         Ok(Some(HostCallbackResult::NewId { id })) => id,
         _ => return false,
     };
@@ -222,7 +229,7 @@ async fn is_locally_known(
         .await
         .is_ok()
     {
-        let recv_result = tokio::time::timeout(Duration::from_secs(5), response_recv.recv()).await;
+        let recv_result = tokio::time::timeout(PRESENCE_QUERY_TIMEOUT, response_recv.recv()).await;
         if let Ok(Some(HostCallbackResult::Result {
             result: Ok(HostResponse::QueryResponse(QueryResponse::NodeDiagnostics(info))),
             ..
@@ -2338,7 +2345,8 @@ mod tests {
             .await
             .expect("handler must send the NodeDiagnostics query")
             .expect("channel must remain open");
-        tokio::time::advance(Duration::from_secs(6)).await;
+        // Advance past PRESENCE_QUERY_TIMEOUT so the query recv times out → fail closed.
+        tokio::time::advance(PRESENCE_QUERY_TIMEOUT + Duration::from_secs(1)).await;
 
         let result = tokio::time::timeout(std::time::Duration::from_secs(5), handler)
             .await
