@@ -115,6 +115,104 @@ fn cache_reconciled_recently(instance_id: &ContractInstanceId) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the local node already knows / subscribes to `instance_id`.
+///
+/// # Why this gate exists (DoS amplification — #3945)
+///
+/// #3942 made `variable_content` issue a cold-cache network GET so a
+/// subresource (`<img src>`) pointing at a contract resolves instead of
+/// 404ing (#3940). That widened the attack surface: an unauthenticated
+/// request to `/v1/contract/web/<KEY>/...` for a *random* 32-byte `KEY`
+/// no longer 404s from the local cache check — it triggers a full network
+/// GET (fan-out to remote peers) + unpack. Subresource URLs are
+/// machine-fetchable, so an attacker can spray random keys and force the
+/// node to issue outbound GETs it would never otherwise issue. Per-key rate
+/// is bounded by the 30s fetch timeout but the parallel fan-out is not.
+///
+/// Gating the cold fetch on local-presence closes that vector while keeping
+/// the #3940 scenario working: in #3940 the user has already visited /
+/// subscribed both contracts, so the source contract's instance is in the
+/// node's application-subscription set and this check passes. A random
+/// never-seen key is not, so it gets the pre-#3942 404.
+///
+/// # Signal & mechanism
+///
+/// The HTTP layer has no direct handle on `op_manager`/`ring`; it only
+/// reaches the node over the existing `ClientConnection` channel. So we
+/// reuse the same transient-connection pattern as `ensure_contract_cached`
+/// and ask the node the *local* `NodeQuery::SubscriptionInfo` query (no
+/// network GET), then check whether `instance_id` appears in the returned
+/// application subscriptions. Those entries are the executor's
+/// `update_notifications`, populated when a client GETs the contract with
+/// `subscribe = true` (which the web shell-root handler does) — i.e. the
+/// "this node already knows / receives updates for this contract" signal.
+///
+/// On any error or timeout this returns `false` (fail closed): an attacker
+/// must not be able to turn a transient node hiccup into an open fetch.
+async fn is_locally_known(
+    instance_id: ContractInstanceId,
+    request_sender: &HttpClientApiRequest,
+) -> bool {
+    use freenet_stdlib::client_api::{NodeQuery, QueryResponse};
+
+    let (response_sender, mut response_recv) = mpsc::unbounded_channel();
+    if request_sender
+        .send(ClientConnection::NewConnection {
+            callbacks: response_sender,
+            assigned_token: None,
+        })
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    let client_id = match response_recv.recv().await {
+        Some(HostCallbackResult::NewId { id }) => id,
+        _ => return false,
+    };
+
+    let mut known = false;
+    if request_sender
+        .send(ClientConnection::Request {
+            client_id,
+            req: Box::new(ClientRequest::NodeQueries(NodeQuery::SubscriptionInfo)),
+            auth_token: None,
+            origin_contract: None,
+            api_version: Default::default(),
+        })
+        .await
+        .is_ok()
+    {
+        let recv_result = tokio::time::timeout(Duration::from_secs(5), response_recv.recv()).await;
+        if let Ok(Some(HostCallbackResult::Result {
+            result: Ok(HostResponse::QueryResponse(QueryResponse::NetworkDebug(info))),
+            ..
+        })) = recv_result
+        {
+            known = info
+                .subscriptions
+                .iter()
+                .any(|sub| sub.contract_key == instance_id);
+        }
+    }
+
+    // Reap the transient client registration regardless of outcome.
+    if let Err(err) = request_sender
+        .send(ClientConnection::Request {
+            client_id,
+            req: Box::new(ClientRequest::Disconnect { cause: None }),
+            auth_token: None,
+            origin_contract: None,
+            api_version: Default::default(),
+        })
+        .await
+    {
+        tracing::warn!("is_locally_known: disconnect send failed: {err}");
+    }
+
+    known
+}
+
 /// Ensures the contract's webapp cache is populated and not stale before it is
 /// served from disk.
 ///
@@ -122,6 +220,13 @@ fn cache_reconciled_recently(instance_id: &ContractInstanceId) -> bool {
 /// - the cache is cold (no `{key}.hash` file on disk), or
 /// - more than `CONTRACT_CACHE_REFRESH_TTL` has elapsed since the last
 ///   reconciliation for this contract.
+///
+/// **and** the contract is locally KNOWN (see `is_locally_known`). A cold cache
+/// for a contract the node neither subscribes to nor stores is the random-key
+/// DoS amplification vector #3942 opened; for those, this returns `Ok(())`
+/// without issuing the network GET, so the caller serves a 404 from the empty
+/// cache directory (the pre-#3942 behaviour). See #3945. The warm-and-fresh
+/// fast path never reaches the gate, so steady-state requests pay nothing.
 ///
 /// On a successful refresh the per-contract timer is reset. This is what makes
 /// the `?__sandbox=1` and subresource paths pick up a republished bundle
@@ -171,6 +276,17 @@ async fn refresh_cache_if_due(
     // timer means there is nothing left to do even if our snapshot saw the
     // cache as cold.
     if cache_reconciled_recently(&instance_id) {
+        return Ok(());
+    }
+
+    // DoS amplification gate (#3945): only issue the cold/stale-refresh GET for
+    // a contract the node already knows about. A cold cache for a contract the
+    // node does NOT subscribe to is exactly the random-key enumeration vector
+    // #3942 opened — skip the network GET and let the caller serve a 404 from
+    // the empty cache directory (the pre-#3942 behavior). A KNOWN instance (the
+    // #3940 cross-contract `<img src>` case, where the user already subscribed
+    // both contracts) falls through and refreshes as before.
+    if !is_locally_known(instance_id, request_sender).await {
         return Ok(());
     }
 
@@ -450,6 +566,11 @@ pub(super) async fn variable_content(
     // The TTL-gated staleness refresh additionally picks up a republished
     // bundle on this path without requiring a prior hit on the shell root.
     // See #3977.
+    //
+    // The cold-cache GET is gated on the contract being locally KNOWN (see
+    // `refresh_cache_if_due` / `is_locally_known`): an unknown random key 404s
+    // from the empty cache below instead of triggering an outbound network GET,
+    // closing the DoS amplification #3942 opened. See #3945.
     refresh_cache_if_due(instance_id, &request_sender)
         .await
         .map_err(Box::new)?;
@@ -1959,16 +2080,20 @@ mod tests {
         CONTRACT_REFRESH_LOCKS.remove(instance_id);
     }
 
-    /// Regression test for #3940. `variable_content` must trigger a network
-    /// fetch when the contract's webapp cache is cold. Prior to the fix, a
-    /// cold-cache subpath request (e.g. an `<img src>` pointing at a contract
-    /// that was never loaded at its root) returned 404 because the handler
-    /// only served pre-cached files.
+    /// Regression test for #3940, updated for the #3945 known-instance gate.
+    /// `variable_content` must trigger a network fetch when the contract's
+    /// webapp cache is cold **and** the contract is locally KNOWN (the #3940
+    /// scenario: a cross-contract `<img src>` whose source contract the user
+    /// has already visited/subscribed). Prior to #3942 a cold-cache subpath
+    /// request returned 404; #3942 made it fetch; #3945 narrows that fetch to
+    /// known instances only — so this test now answers the local-known query
+    /// as "subscribed" before asserting the fetch.
     ///
-    /// Verifies the handler emits the `NewConnection` + `Request(Get)` pair
-    /// on the client-connection channel when the cache is cold. The fetch is
-    /// cancelled mid-flight (we don't deliver a response) so the test stays
-    /// bounded.
+    /// Verifies the handler emits the `NewConnection` + `Request(Get)` fetch
+    /// pair on the client-connection channel for the known instance. The fetch
+    /// is cancelled mid-flight (we don't deliver a response) so the test stays
+    /// bounded. See `variable_content_skips_fetch_for_unknown_instance` for the
+    /// security side of the gate.
     #[tokio::test]
     async fn variable_content_triggers_fetch_on_cache_miss() {
         // Unique 32-byte seed so the resulting contract key does not collide
@@ -1996,48 +2121,135 @@ mod tests {
             })
         };
 
-        // Expect a NewConnection first. The handler then blocks on a
-        // `HostCallbackResult::NewId` reply, so we stash the callback and
-        // reply with a synthetic client id — otherwise the handler never
-        // progresses to the Get request and the second recv below would
-        // hang until the 30s fetch timeout.
-        let new_conn = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .expect("handler must send NewConnection on cold cache")
-            .expect("channel must remain open for the duration of the send");
-        let callbacks = match new_conn {
-            ClientConnection::NewConnection { callbacks, .. } => callbacks,
-            other => panic!("first message must be NewConnection, got: {other:?}"),
-        };
-        callbacks
-            .send(HostCallbackResult::NewId {
-                id: crate::client_events::ClientId::next(),
-            })
-            .expect("callback receiver must be live while handler awaits NewId");
-
-        // Next must be the Get request for our contract key.
-        let get_req = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
-            .await
-            .expect("handler must follow up with a Get request")
-            .expect("channel must remain open");
-        match get_req {
-            ClientConnection::Request { req, .. } => {
-                assert!(
-                    matches!(
-                        req.as_ref(),
-                        ClientRequest::ContractOp(ContractRequest::Get { key: k, .. })
-                            if *k == instance_id
-                    ),
-                    "second message must be Get({instance_id}), got: {req:?}"
-                );
-            }
-            other => panic!("expected ClientConnection::Request, got: {other:?}"),
-        }
+        // `expect_fetch_pair` first answers the #3945 local-known query as
+        // "known", then asserts the resulting `NewConnection` + `Get` fetch
+        // pair for our contract key.
+        expect_fetch_pair(&mut rx, instance_id).await;
 
         handler.abort();
         // Clean up after the test — handler was aborted mid-fetch, so no
         // cache was written, but clear defensively to avoid accumulating
         // state in the shared XDG cache dir across runs.
+        clear_cache(&instance_id).await;
+    }
+
+    /// Security regression for #3945. A cold-cache subresource request for an
+    /// UNKNOWN contract (never subscribed, not in the store) must NOT issue a
+    /// network GET — that is the random-key DoS amplification vector #3942
+    /// opened. The handler must answer the local-known query as "not known"
+    /// and then serve a 404 from the empty cache directory (pre-#3942
+    /// behaviour), issuing no `Get` on the channel.
+    ///
+    /// Load-bearing: without the gate the handler would fall straight through
+    /// to `ensure_contract_cached` and emit a `NewConnection` + `Get`, which
+    /// this test's "no Get" assertion would catch.
+    #[tokio::test]
+    async fn variable_content_skips_fetch_for_unknown_instance() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x47;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = instance_id.to_string();
+        clear_cache(&instance_id).await;
+
+        let (sender, mut rx) = request_channel();
+        let handler = {
+            let key = key.clone();
+            tokio::spawn(async move {
+                variable_content(
+                    key.clone(),
+                    format!("/v1/contract/web/{key}/image.jpg"),
+                    ApiVersion::V1,
+                    sender,
+                )
+                .await
+                .map(|r| r.into_response())
+            })
+        };
+
+        // First message is the local-known query's NewConnection.
+        let new_conn = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("handler must send NewConnection for the local-known query")
+            .expect("channel must remain open");
+        let callbacks = match new_conn {
+            ClientConnection::NewConnection { callbacks, .. } => callbacks,
+            other => panic!("local-known query must open with NewConnection, got: {other:?}"),
+        };
+        callbacks
+            .send(HostCallbackResult::NewId {
+                id: crate::client_events::ClientId::next(),
+            })
+            .expect("callback receiver live for query NewId");
+
+        // The handler asks SubscriptionInfo; we answer with an EMPTY
+        // subscription list → the instance is NOT locally known.
+        let query = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("handler must send the SubscriptionInfo query")
+            .expect("channel must remain open");
+        let query_id = match query {
+            ClientConnection::Request { req, client_id, .. } => {
+                assert!(
+                    matches!(
+                        req.as_ref(),
+                        ClientRequest::NodeQueries(
+                            freenet_stdlib::client_api::NodeQuery::SubscriptionInfo
+                        )
+                    ),
+                    "expected SubscriptionInfo query, got: {req:?}"
+                );
+                client_id
+            }
+            other => panic!("expected SubscriptionInfo request, got: {other:?}"),
+        };
+        callbacks
+            .send(HostCallbackResult::Result {
+                id: query_id,
+                result: Ok(HostResponse::QueryResponse(
+                    freenet_stdlib::client_api::QueryResponse::NetworkDebug(
+                        freenet_stdlib::client_api::NetworkDebugInfo {
+                            subscriptions: Vec::new(),
+                            connected_peers: Vec::new(),
+                        },
+                    ),
+                )),
+            })
+            .expect("callback receiver live for NetworkDebug reply");
+
+        // The handler must finish and return a 404 — NO further Get may appear.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handler)
+            .await
+            .expect("handler must finish without issuing a network fetch")
+            .expect("handler must not panic")
+            .expect("unknown-instance request must still resolve to a response");
+        assert_eq!(
+            result.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "an unknown cold-cache subresource must 404, not fetch"
+        );
+
+        // The only traffic after the query's Disconnect must be that Disconnect
+        // (drained below) — never another NewConnection/Get for a fetch.
+        let mut saw_fetch = false;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                ClientConnection::NewConnection { .. } => saw_fetch = true,
+                ClientConnection::Request { req, .. } => {
+                    if matches!(
+                        req.as_ref(),
+                        ClientRequest::ContractOp(ContractRequest::Get { .. })
+                    ) {
+                        saw_fetch = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            !saw_fetch,
+            "unknown-instance request must NOT issue a network fetch (#3945 DoS gate)"
+        );
+
         clear_cache(&instance_id).await;
     }
 
@@ -2091,10 +2303,85 @@ mod tests {
         clear_cache(&instance_id).await;
     }
 
+    /// Services the `is_locally_known` (#3945) handshake that now precedes every
+    /// cold/stale-refresh GET: a `NewConnection`, then a
+    /// `NodeQueries(SubscriptionInfo)` request, answered with a
+    /// `QueryResponse::NetworkDebug` whose `subscriptions` list contains
+    /// `instance_id` (so the gate treats the contract as locally KNOWN), then a
+    /// trailing `Disconnect` which is drained. Returns once the query has been
+    /// answered, leaving the channel positioned at the handler's next message
+    /// (the real fetch's `NewConnection`, if the gate let it through).
+    ///
+    /// Tests that expect a fetch call this first; it is what keeps the #3940
+    /// fetch behaviour exercised for the case the fix preserves — a KNOWN
+    /// instance.
+    async fn answer_subscription_query_known(
+        rx: &mut tokio::sync::mpsc::Receiver<ClientConnection>,
+        instance_id: ContractInstanceId,
+    ) {
+        let new_conn = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("handler must send NewConnection for the local-known query")
+            .expect("channel must remain open");
+        let callbacks = match new_conn {
+            ClientConnection::NewConnection { callbacks, .. } => callbacks,
+            other => panic!("local-known query must open with NewConnection, got: {other:?}"),
+        };
+        callbacks
+            .send(HostCallbackResult::NewId {
+                id: crate::client_events::ClientId::next(),
+            })
+            .expect("callback receiver live for query NewId");
+
+        let query = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("handler must send the SubscriptionInfo query")
+            .expect("channel must remain open");
+        let query_id = match query {
+            ClientConnection::Request { req, client_id, .. } => {
+                assert!(
+                    matches!(
+                        req.as_ref(),
+                        ClientRequest::NodeQueries(
+                            freenet_stdlib::client_api::NodeQuery::SubscriptionInfo
+                        )
+                    ),
+                    "local-known query must be NodeQueries(SubscriptionInfo), got: {req:?}"
+                );
+                client_id
+            }
+            other => panic!("expected the SubscriptionInfo request, got: {other:?}"),
+        };
+        // Report the instance as locally subscribed so the gate lets the fetch
+        // through. The reply rides the SAME `callbacks` sender the handler reads.
+        callbacks
+            .send(HostCallbackResult::Result {
+                id: query_id,
+                result: Ok(HostResponse::QueryResponse(
+                    freenet_stdlib::client_api::QueryResponse::NetworkDebug(
+                        freenet_stdlib::client_api::NetworkDebugInfo {
+                            subscriptions: vec![freenet_stdlib::client_api::SubscriptionInfo {
+                                contract_key: instance_id,
+                                client_id: query_id.into(),
+                            }],
+                            connected_peers: Vec::new(),
+                        },
+                    ),
+                )),
+            })
+            .expect("callback receiver live for NetworkDebug reply");
+        // Drain the trailing Disconnect the query helper sends on its way out.
+        let _ = rx.recv().await;
+    }
+
     /// Drives `serve_sandbox_content` (or `variable_content`) to the point
     /// where it has emitted its `NewConnection` + `Get` pair on the channel,
     /// asserting the contract key on the `Get`, then aborts the in-flight
     /// fetch. Returns once both messages have been observed.
+    ///
+    /// Absorbs the preceding `is_locally_known` (#3945) handshake first — the
+    /// gate now runs before any cold/stale GET — answering it as "known" so the
+    /// real fetch proceeds.
     ///
     /// Replies to the `NewConnection` callback with a synthetic client id so
     /// the handler progresses past its blocking `NewId` recv to the `Get`.
@@ -2102,6 +2389,9 @@ mod tests {
         rx: &mut tokio::sync::mpsc::Receiver<ClientConnection>,
         instance_id: ContractInstanceId,
     ) {
+        // The #3945 gate runs first: answer the local-known query as "known".
+        answer_subscription_query_known(rx, instance_id).await;
+
         let new_conn = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
             .await
             .expect("handler must send NewConnection when a refresh is due")
@@ -2358,6 +2648,11 @@ mod tests {
         }
         drop(sender); // channel closes once all 8 handlers finish.
 
+        // The #3945 gate runs once (the leader's): answer its local-known query
+        // as "known". Followers coalesce on the refresh lock and re-check the
+        // fresh timer before reaching the gate, so only the leader queries.
+        answer_subscription_query_known(&mut rx, instance_id).await;
+
         // Service exactly one GET (the leader's). Every follower coalesces.
         serve_one_get(&mut rx, &contract, &state).await;
 
@@ -2410,6 +2705,10 @@ mod tests {
 
         let (sender, mut rx) = request_channel();
         let handler = tokio::spawn(async move { refresh_cache_if_due(instance_id, &sender).await });
+
+        // The #3945 gate runs first: answer the local-known query as "known"
+        // so the failure-path GET below is actually reached.
+        answer_subscription_query_known(&mut rx, instance_id).await;
 
         // Service the GET with a contract: None GetResponse → MissingContract.
         let msg = rx.recv().await.expect("must issue NewConnection");
