@@ -86,20 +86,44 @@ BEFORE changing LEDBAT++ parameters:
 ### Flight-size release invariant (issue #4345)
 
 ```
-Flight size MUST have a release path other than ACK. A packet whose ACKs
-never arrive (lossy path / starved reverse-ACK channel) is retransmitted up
-to MAX_PACKET_RETRANSMITS times, then SentPacketTracker returns
-ResendAction::Abandon and the recv loop calls
-CongestionControl::release_flightsize(len). Without this, a never-ACKed
-packet's on_send bytes stay in flight size for the connection's life,
-pinning flight size at cwnd and stalling every subsequent stream
-(the #4345 "cwnd wait timeout" / "no fragments received" failure).
+Flight size has THREE release paths. ACK is the normal one; the other two
+exist so a stream whose ACKs never arrive (lossy path / starved reverse-ACK
+channel) cannot pin flight size at cwnd and stall every subsequent stream
+(the #4345 "cwnd wait timeout" / "no fragments received" failure):
+
+  1. ACK — report_received_receipts returns the packet size; the recv loop
+     calls on_ack* which decrements flight size.
+  2. ABANDON — after MAX_PACKET_RETRANSMITS with no ACK, SentPacketTracker
+     returns ResendAction::Abandon and the recv loop calls
+     CongestionControl::release_flightsize(len). Bounds the worst case for a
+     black-holed individual packet.
+  3. STREAM ABORT (drop_stream) — when an outbound stream aborts (cwnd-wait
+     timeout, upstream stall/error, or mid-send failure in
+     outbound_stream.rs), release_aborted_stream_flightsize() calls
+     SentPacketTracker::drop_stream(stream_id), which removes ALL of that
+     stream's still-tracked packets and returns their byte total; the abort
+     then release_flightsize(total). This frees the stranded bytes in one
+     shot instead of waiting ~6s for each fragment to abandon individually.
+
+Each in-flight packet is released EXACTLY ONCE across these paths, because
+drop_stream / Abandon / ACK each REMOVE the packet from pending_receipts; a
+packet absent from pending_receipts yields no ack-info and cannot abandon.
 
   - on_timeout() applies the cwnd loss response only; it MUST NOT change
     flight size (the timed-out packet is immediately re-sent and stays in
     flight). Do NOT reintroduce a decrement-on-RTO + re-add-on-resend pair —
     the recv loop always re-sends on RTO, so that is net-zero and does not
     drain a never-ACKed packet.
+  - get_resend KEEPS a resent packet in pending_receipts (clones the payload,
+    refreshes send-time in place). This is what lets a concurrent drop_stream
+    (spawned abort task) still see and release an in-flight-being-resent
+    packet. Pure tracker bookkeeping — it does NOT touch flight size.
+  - The recv loop's resend re-registration MUST use refresh_sent_packet
+    (update-only, no-op if the packet was already removed), NOT
+    report_sent_packet (insert-capable). Using the insert path would
+    RESURRECT a packet that a concurrent drop_stream just removed+released,
+    and a later ACK/abandon of that zombie would release its bytes a SECOND
+    time (flight-size under-count). See #4345 stage-2 review.
   - Retransmissions MUST stay bounded. Do not make retransmit infinite again.
 ```
 

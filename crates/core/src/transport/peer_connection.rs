@@ -44,7 +44,7 @@ use super::{
     packet_data::{self, PacketData},
     received_packet_tracker::ReceivedPacketTracker,
     received_packet_tracker::ReportResult,
-    sent_packet_tracker::{ResendAction, SentPacketTracker},
+    sent_packet_tracker::{PacketStream, ResendAction, SentPacketTracker},
     symmetric_message::{self, SymmetricMessage, SymmetricMessagePayload},
     token_bucket::TokenBucket,
 };
@@ -1351,10 +1351,35 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             .await
                         {
                             Ok(_) => {
-                                // Re-register packet for ACK/RTO tracking. Flight size is
-                                // unchanged: the packet never left flight (on_timeout did not
-                                // decrement), so neither on_send() nor a re-add is called.
-                                self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
+                                // Refresh the packet's send timestamp to the actual
+                                // post-send instant. Since #4345 get_resend KEEPS the
+                                // packet in the tracker across a resend, so this is an
+                                // in-place refresh — BUT only if the packet is still
+                                // tracked. A concurrent drop_stream (spawned abort task)
+                                // may have removed and released it while we were awaiting
+                                // send_to; refresh_sent_packet then no-ops instead of
+                                // resurrecting it as a Control zombie (which a later
+                                // ACK/abandon would double-release). When the packet IS
+                                // still tracked, flight size is unchanged: it never left
+                                // flight (on_timeout did not decrement), so no on_send /
+                                // re-add runs. See refresh_sent_packet's rustdoc.
+                                //
+                                // `false` (the deliberate no-op-on-drop) is the
+                                // resurrection-safe path, not an error — surface it at
+                                // trace level rather than silently discarding the bool.
+                                let still_tracked = self
+                                    .remote_conn
+                                    .sent_tracker
+                                    .lock()
+                                    .refresh_sent_packet(idx, packet, None);
+                                if !still_tracked {
+                                    tracing::trace!(
+                                        peer_addr = %self.remote_conn.remote_addr,
+                                        packet_id = idx,
+                                        "Resent packet was dropped (stream aborted) before \
+                                         re-registration — refresh no-op (#4345)"
+                                    );
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -1363,13 +1388,18 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                     error = %e,
                                     "Resend send failed, will retry on next RTO"
                                 );
-                                // Re-insert packet so RTO will retry it. Without this,
-                                // the packet would be permanently lost from tracking since
-                                // resend_check() already removed it.
-                                self.remote_conn
+                                // Refresh only if still tracked — RTO then retries it.
+                                // If a concurrent drop_stream already removed it, this
+                                // no-ops (the stream is being torn down anyway), avoiding
+                                // a resurrected zombie. See refresh_sent_packet's rustdoc.
+                                // The bool is intentionally discarded: on this error path
+                                // we're breaking out regardless of whether the packet was
+                                // still tracked.
+                                let _ = self
+                                    .remote_conn
                                     .sent_tracker
                                     .lock()
-                                    .report_sent_packet(idx, packet);
+                                    .refresh_sent_packet(idx, packet, None);
                                 break;
                             }
                         }
@@ -1822,6 +1852,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             (),
             &self.remote_conn.sent_tracker,
             token,
+            PacketStream::Control,
         )
         .await
     }
@@ -1898,6 +1929,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             symmetric_message::ShortMessage(data.into()),
             &self.remote_conn.sent_tracker,
             token,
+            PacketStream::Control,
         )
         .await?;
         Ok(())
@@ -2077,6 +2109,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             },
             &self.remote_conn.sent_tracker,
             token,
+            PacketStream::Stream(fragment.stream_id),
         )
         .await?;
 
@@ -2091,6 +2124,30 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     }
 }
 
+/// Register a freshly-sent packet with the tracker, tagging it with its owning
+/// stream for flight-size accounting (issue #4345).
+///
+/// `Stream(id)` first sends route to `report_sent_stream_packet` (which records
+/// the tag); `Control` sends route to `report_sent_packet_with_token` (which
+/// preserves any existing tag, so resend re-registration of a stream fragment
+/// keeps its stream, and genuinely-new control packets stay `Control`).
+fn report_sent_tagged<T: crate::simulation::TimeSource>(
+    tracker: &mut SentPacketTracker<T>,
+    packet_id: u32,
+    payload: Box<[u8]>,
+    delivery_token: Option<DeliveryRateToken>,
+    stream: PacketStream,
+) {
+    match stream {
+        PacketStream::Stream(stream_id) => {
+            tracker.report_sent_stream_packet(packet_id, payload, delivery_token, stream_id);
+        }
+        PacketStream::Control => {
+            tracker.report_sent_packet_with_token(packet_id, payload, delivery_token);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
     remote_addr: SocketAddr,
@@ -2101,6 +2158,11 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
     payload: impl Into<SymmetricMessagePayload>,
     sent_tracker: &parking_lot::Mutex<SentPacketTracker<T>>,
     delivery_token: Option<DeliveryRateToken>,
+    // Owning stream for flight-size accounting (issue #4345). `Stream(id)` for
+    // `StreamFragment` sends so an aborted stream's bytes can be released
+    // atomically via `SentPacketTracker::drop_stream`; `Control` for everything
+    // else (handshake, NoOp, short message).
+    stream: PacketStream,
 ) -> Result<()> {
     let start_time = tokio::time::Instant::now();
     tracing::trace!(
@@ -2146,10 +2208,12 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                     // Record the classified on-wire bytes once the packet
                     // is actually sent (not on the error path).
                     super::shadow_demand::record_outbound(outbound_class, packet_data.len());
-                    sent_tracker.lock().report_sent_packet_with_token(
+                    report_sent_tagged(
+                        &mut sent_tracker.lock(),
                         packet_id,
                         packet_data,
                         delivery_token,
+                        stream,
                     );
                     Ok(())
                 }
@@ -2191,10 +2255,12 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                             .await
                             .map_err(|e| TransportError::SendFailed(remote_addr, e.kind()))?;
                         sent_on_wire += packet_data.len();
-                        sent_tracker.lock().report_sent_packet_with_token(
+                        report_sent_tagged(
+                            &mut sent_tracker.lock(),
                             packet_id,
                             packet_data,
                             delivery_token,
+                            stream,
                         );
                     }
                 }};
@@ -2453,6 +2519,7 @@ mod tests {
                 (),
                 &sent_tracker,
                 None,
+                PacketStream::Control,
             )
             .await;
 
@@ -2513,6 +2580,7 @@ mod tests {
                 },
                 &sent_tracker,
                 None,
+                PacketStream::Control,
             )
             .await
             .expect("short send should succeed");
@@ -2524,6 +2592,7 @@ mod tests {
             );
 
             // ---- success: StreamFragment advances `bulk` ----
+            let frag_stream_id = StreamId::next();
             packet_sending(
                 remote_addr,
                 &socket,
@@ -2531,7 +2600,7 @@ mod tests {
                 &outbound_key,
                 vec![],
                 SymmetricMessagePayload::StreamFragment {
-                    stream_id: StreamId::next(),
+                    stream_id: frag_stream_id,
                     total_length_bytes: 300,
                     fragment_number: 0,
                     payload: bytes::Bytes::from(vec![9u8; 300]),
@@ -2539,6 +2608,7 @@ mod tests {
                 },
                 &sent_tracker,
                 None,
+                PacketStream::Stream(frag_stream_id),
             )
             .await
             .expect("stream fragment send should succeed");
@@ -2565,6 +2635,7 @@ mod tests {
                 },
                 &sent_tracker,
                 None,
+                PacketStream::Control,
             )
             .await;
             assert!(res.is_err(), "failing socket must return Err");

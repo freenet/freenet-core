@@ -244,10 +244,17 @@ flowchart TB
 2. Decrypt + deserialize
 3. **RTT update**: If ACK, update smoothed RTT and cwnd (LEDBAT feedback)
 4. **Rate update**: Recalculate `min(ledbat_rate, global_pool_rate)` (RTT-adaptive timing)
-5. **Flightsize update**: Decrement flightsize on ACK. Flightsize is also
-   released when a packet is permanently abandoned after
-   `MAX_PACKET_RETRANSMITS` (via `CongestionControl::release_flightsize`), so a
-   never-ACKed packet cannot pin flightsize for the connection's life (#4345).
+5. **Flightsize update**: Decrement flightsize on ACK. Flightsize has two
+   additional release paths so a stream whose ACKs never arrive cannot pin
+   flightsize for the connection's life (#4345): (a) when a packet is
+   permanently abandoned after `MAX_PACKET_RETRANSMITS`, and (b) when an
+   outbound stream aborts (cwnd-wait timeout, upstream stall/error, or mid-send
+   failure) — `SentPacketTracker::drop_stream(stream_id)` removes all of the
+   aborted stream's still-tracked packets and the abort releases their byte
+   total in one shot. All three paths go through
+   `CongestionControl::release_flightsize`, and each in-flight packet is
+   released exactly once (ACK / abandon / drop_stream each remove it from
+   tracking).
 6. Deliver to application
 
 ## Development History
