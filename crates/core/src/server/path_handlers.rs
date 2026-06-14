@@ -2383,6 +2383,99 @@ mod tests {
         clear_cache(&instance_id).await;
     }
 
+    /// Fail-closed regression for #3945: when the node accepts the transient
+    /// `NewConnection` (so the SEND succeeds) but never replies with the
+    /// `NewId` connection-id assignment, the FIRST `is_locally_known` recv
+    /// timeout must fire and read as NOT known — so the cold-cache request 404s
+    /// and issues NO network GET. This is the wedged-node case distinct from
+    /// `variable_content_fails_closed_when_presence_query_unanswered` (which
+    /// DELIVERS the `NewId` and then times out the SECOND, diagnostics-answer,
+    /// recv) and from `variable_content_fails_closed_when_node_channel_closed`
+    /// (where the `NewConnection` SEND itself fails). Here the gap is between a
+    /// successful `NewConnection` send and a missing `NewId`: the first
+    /// `tokio::time::timeout(PRESENCE_QUERY_TIMEOUT, recv())` whose `_ => return
+    /// false` arm must hold the gate closed. If that arm returned true (fail
+    /// open) the handler would proceed to fetch and this test would see a GET.
+    ///
+    /// Uses paused time so the 5s presence-query timeout elapses via
+    /// `advance()` rather than wall-clock, keeping the test fast and
+    /// deterministic.
+    #[tokio::test(start_paused = true)]
+    async fn variable_content_fails_closed_when_newid_never_arrives() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x4c;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = instance_id.to_string();
+        clear_cache(&instance_id).await;
+
+        let (sender, mut rx) = request_channel();
+        let handler = {
+            let key = key.clone();
+            tokio::spawn(async move {
+                variable_content(
+                    key.clone(),
+                    format!("/v1/contract/web/{key}/image.jpg"),
+                    ApiVersion::V1,
+                    sender,
+                )
+                .await
+                .map(|r| r.into_response())
+            })
+        };
+
+        // Accept the presence query's NewConnection so the SEND succeeds, but
+        // NEVER reply with NewId. Hold `callbacks` alive so the channel stays
+        // open (a closed channel would short-circuit the recv with `None` and
+        // exercise a different path); we want the TIMEOUT branch of the FIRST
+        // recv specifically.
+        let new_conn = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("handler must send NewConnection for the presence query")
+            .expect("channel must remain open");
+        let _callbacks = match new_conn {
+            ClientConnection::NewConnection { callbacks, .. } => callbacks,
+            other => panic!("presence query must open with NewConnection, got: {other:?}"),
+        };
+
+        // The handler is now blocked on its NewId recv-with-timeout. Advance
+        // past PRESENCE_QUERY_TIMEOUT so that recv times out → fail closed.
+        tokio::time::advance(PRESENCE_QUERY_TIMEOUT + Duration::from_secs(1)).await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), handler)
+            .await
+            .expect("handler must finish once the NewId wait times out")
+            .expect("handler must not panic")
+            .expect("request must still resolve to a response");
+        assert_eq!(
+            result.status(),
+            axum::http::StatusCode::NOT_FOUND,
+            "a missing NewId must fail closed → 404, not fetch"
+        );
+
+        // Nothing emitted after the unanswered presence query may be a fetch.
+        let mut saw_fetch = false;
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                ClientConnection::NewConnection { .. } => saw_fetch = true,
+                ClientConnection::Request { req, .. } => {
+                    if matches!(
+                        req.as_ref(),
+                        ClientRequest::ContractOp(ContractRequest::Get { .. })
+                    ) {
+                        saw_fetch = true;
+                    }
+                }
+            }
+        }
+        assert!(
+            !saw_fetch,
+            "a missing NewId must NOT issue a network fetch (#3945 fail-closed)"
+        );
+
+        clear_cache(&instance_id).await;
+    }
+
     /// Fail-closed regression for #3945: if the node is gone entirely (the
     /// `ClientConnection` receiver is dropped, so even the presence query's
     /// `NewConnection` send fails), the cold-cache request must 404 and issue
