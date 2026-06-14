@@ -107,6 +107,14 @@ pub(crate) struct OpManager {
     /// UPDATE log sites to DEBUG (issue #4281).
     pub(crate) update_propagation_stats:
         Arc<crate::operations::update::propagation_stats::UpdatePropagationStats>,
+    /// Deferred re-broadcast store for fresh-contract PUTs whose initial
+    /// broadcast found no targets and exhausted its retry budget. Stashed by
+    /// the fan-out handler on give-up and drained by the subscribe path when
+    /// the first interested peer for the contract appears, so a never-before-
+    /// seen id that lost the broadcast/interest-resolve race still reaches the
+    /// network instead of landing locally-hosted only (issue #4359).
+    pub(crate) pending_broadcasts:
+        Arc<crate::operations::update::pending_broadcast::PendingBroadcastStore>,
     /// Request router for client request deduplication.
     ///
     /// This is initialized lazily from `client_event_handling` because the router is only
@@ -221,6 +229,7 @@ impl Clone for OpManager {
             interest_manager: self.interest_manager.clone(),
             broadcast_dedup_cache: self.broadcast_dedup_cache.clone(),
             update_propagation_stats: self.update_propagation_stats.clone(),
+            pending_broadcasts: self.pending_broadcasts.clone(),
             request_router: self.request_router.clone(),
             orphan_stream_registry: self.orphan_stream_registry.clone(),
             streaming_threshold: self.streaming_threshold,
@@ -404,6 +413,9 @@ impl OpManager {
             interest_manager,
             broadcast_dedup_cache: Arc::new(crate::operations::update::BroadcastDedupCache::new()),
             update_propagation_stats,
+            pending_broadcasts: Arc::new(
+                crate::operations::update::pending_broadcast::PendingBroadcastStore::new(),
+            ),
             request_router,
             orphan_stream_registry,
             streaming_threshold,
@@ -639,6 +651,30 @@ impl OpManager {
     // has already consumed a one-shot transition). See
     // `try_notify_node_event` and `.claude/rules/channel-safety.md` for
     // the broader pattern.
+
+    /// Re-broadcast a fresh-contract state that earlier found no targets, now
+    /// that the first interested peer/subscriber for `key` has appeared.
+    ///
+    /// Issue #4359: a never-before-seen contract id loses the race between the
+    /// broadcast give-up window (~6 s) and the much slower interest/
+    /// subscription resolve. When the broadcast handler gives up it stashes the
+    /// state in [`Self::pending_broadcasts`]; the subscribe path calls this on
+    /// the *first* new interest for the contract so the deferred state is
+    /// re-emitted as a fresh `BroadcastStateChange` (`is_retry: false`), which
+    /// now finds the just-registered target and propagates.
+    ///
+    /// Best-effort via [`Self::try_notify_node_event`]: if the channel is full
+    /// the state is re-stashed for the next interest signal. No-op when there
+    /// is no pending broadcast for the contract (the common case).
+    pub(crate) fn flush_pending_broadcast_on_interest(&self, key: &ContractKey) {
+        flush_pending_broadcast_on(
+            self.to_event_listener.notifications_sender(),
+            self.to_event_listener.notification_channel_pending(),
+            self.to_event_listener.notifications_sender().capacity(),
+            &self.pending_broadcasts,
+            key,
+        );
+    }
 
     /// Get all active subscriptions.
     /// In the simplified lease-based model, this returns contracts we're actively subscribed to.
@@ -1191,6 +1227,60 @@ fn try_notify_node_event_on(
     }
 }
 
+/// Drain a deferred fresh-contract broadcast for `key` (if one is stashed) and
+/// re-emit it as a fresh `BroadcastStateChange` on the event-loop notification
+/// channel. Extracted as a free function so it can be unit-tested against a raw
+/// notifier + store without building a full `OpManager` (same pattern as
+/// [`release_pending_op_slot_on`] / [`try_notify_node_event_on`]).
+///
+/// Issue #4359: when the broadcast handler gives up on a never-before-seen id
+/// (no targets), it stashes the state in `pending`. This is called from the
+/// subscribe path on the *first* new interest for the contract — the deferred
+/// state is re-emitted (`is_retry: false`) so the now-present target receives
+/// it instead of the state staying locally-hosted only.
+///
+/// Best-effort: if the channel is full the state is re-stashed so a later
+/// interest signal retries it (losing it would re-open the bug). No-op (and no
+/// emission) when nothing is pending for the contract.
+fn flush_pending_broadcast_on(
+    notifications_sender: &mpsc::Sender<Either<NetMessage, NodeEvent>>,
+    channel_pending: usize,
+    channel_remaining: usize,
+    pending: &crate::operations::update::pending_broadcast::PendingBroadcastStore,
+    key: &ContractKey,
+) {
+    let Some(state) = pending.take(key.id()) else {
+        return;
+    };
+    tracing::debug!(
+        contract = %key,
+        phase = "pending_broadcast_flush",
+        "Re-broadcasting deferred fresh-contract state now that an interested peer appeared (#4359)"
+    );
+    let msg = NodeEvent::BroadcastStateChange {
+        key: *key,
+        new_state: state.clone(),
+        is_retry: false,
+    };
+    if try_notify_node_event_on(
+        notifications_sender,
+        channel_pending,
+        channel_remaining,
+        msg,
+    )
+    .is_err()
+    {
+        // Re-emit dropped (channel full / closed). Put the state back so a
+        // later interest signal can retry — losing it here would re-open the
+        // locally-hosted-only failure this fix closes.
+        pending.stash(*key.id(), state);
+        tracing::debug!(
+            contract = %key,
+            "flush_pending_broadcast_on: re-emit dropped; re-stashed for the next interest signal"
+        );
+    }
+}
+
 /// Notify the event loop about a timed-out transaction without blocking.
 ///
 /// Uses `try_send` instead of `.send().await` to avoid blocking the garbage
@@ -1518,6 +1608,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
 mod tests {
     use super::super::network_bridge::event_loop_notification_channel;
     use super::*;
+    use crate::config::GlobalSimulationTime;
     use crate::node::network_bridge::EventLoopNotificationsReceiver;
     use either::Either;
     use tokio::time::{Duration, Instant, timeout};
@@ -1720,6 +1811,172 @@ mod tests {
             result.is_ok(),
             "helper must return promptly on closed channel"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // Regression tests for #4359: a fresh-contract PUT whose initial
+    // broadcast found no targets must be re-emitted (not permanently
+    // abandoned) once the first interested peer/subscriber appears.
+    // These exercise `flush_pending_broadcast_on` — the helper the
+    // subscribe path calls on a new interest — directly against a raw
+    // notifier + store, the same way the `release_pending_op_slot_on`
+    // tests above avoid building a full OpManager.
+    // ──────────────────────────────────────────────────────────
+
+    fn test_contract_key(seed: u8) -> ContractKey {
+        ContractKey::from_id_and_code(
+            ContractInstanceId::new([seed; 32]),
+            freenet_stdlib::prelude::CodeHash::new([seed.wrapping_add(1); 32]),
+        )
+    }
+
+    /// Load-bearing: a stashed broadcast (the give-up outcome) is re-emitted as
+    /// a fresh `BroadcastStateChange { is_retry: false }` carrying the stashed
+    /// state when interest resolves. WITHOUT the #4359 fix the give-up path
+    /// drops the state permanently and nothing is ever re-broadcast — this
+    /// emission is exactly the behavior the fix adds.
+    #[tokio::test]
+    async fn flush_pending_broadcast_reemits_stashed_state_on_interest() {
+        use crate::operations::update::pending_broadcast::PendingBroadcastStore;
+
+        GlobalSimulationTime::set_time_ms(0);
+        let (receiver, notifier) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut notifications_receiver,
+            ..
+        } = receiver;
+
+        let store = PendingBroadcastStore::new();
+        let key = test_contract_key(7);
+        let stashed = freenet_stdlib::prelude::WrappedState::new(vec![0xCD; 16]);
+        // Simulate the fan-out handler giving up with no targets.
+        store.stash(*key.id(), stashed.clone());
+
+        // Interest resolves → flush. Must re-emit the stashed state.
+        super::flush_pending_broadcast_on(
+            notifier.notifications_sender(),
+            notifier.notification_channel_pending(),
+            notifier.notifications_sender().capacity(),
+            &store,
+            &key,
+        );
+
+        let received = timeout(Duration::from_millis(200), notifications_receiver.recv())
+            .await
+            .expect("timed out waiting for re-broadcast emission")
+            .expect("notification channel closed");
+
+        match received {
+            Either::Right(NodeEvent::BroadcastStateChange {
+                key: observed_key,
+                new_state,
+                is_retry,
+            }) => {
+                assert_eq!(observed_key, key, "re-broadcast must target the contract");
+                assert_eq!(
+                    new_state.as_ref(),
+                    stashed.as_ref(),
+                    "re-broadcast must carry the stashed state"
+                );
+                assert!(
+                    !is_retry,
+                    "the deferred flush is a fresh logical broadcast, not a retry re-emission"
+                );
+            }
+            other @ Either::Left(_) | other @ Either::Right(_) => {
+                panic!("expected BroadcastStateChange, got {other:?}")
+            }
+        }
+        GlobalSimulationTime::clear_time();
+    }
+
+    /// No pending broadcast for the contract ⇒ flush is a silent no-op (no
+    /// spurious re-broadcasts on every subscribe for already-propagated
+    /// contracts, which is the overwhelmingly common case).
+    #[tokio::test]
+    async fn flush_pending_broadcast_noop_when_nothing_stashed() {
+        use crate::operations::update::pending_broadcast::PendingBroadcastStore;
+
+        GlobalSimulationTime::set_time_ms(0);
+        let (receiver, notifier) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut notifications_receiver,
+            ..
+        } = receiver;
+
+        let store = PendingBroadcastStore::new();
+        let key = test_contract_key(9);
+
+        super::flush_pending_broadcast_on(
+            notifier.notifications_sender(),
+            notifier.notification_channel_pending(),
+            notifier.notifications_sender().capacity(),
+            &store,
+            &key,
+        );
+
+        let got = timeout(Duration::from_millis(50), notifications_receiver.recv()).await;
+        assert!(
+            got.is_err(),
+            "no emission expected when nothing is stashed, got {got:?}"
+        );
+        GlobalSimulationTime::clear_time();
+    }
+
+    /// If the notification channel is saturated, the flush must re-stash the
+    /// state rather than dropping it — otherwise a transiently-full channel
+    /// would re-open the locally-hosted-only failure the fix closes.
+    #[tokio::test]
+    async fn flush_pending_broadcast_restashes_when_channel_full() {
+        use crate::operations::update::pending_broadcast::PendingBroadcastStore;
+
+        GlobalSimulationTime::set_time_ms(0);
+        let (receiver, notifier) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            notifications_receiver,
+            ..
+        } = receiver;
+
+        // Saturate the channel so the re-emit's try_send fails.
+        let filler_tx = Transaction::ttl_transaction();
+        let mut pre_filled = 0usize;
+        loop {
+            match notifier
+                .notifications_sender()
+                .try_send(Either::Right(NodeEvent::TransactionCompleted(filler_tx)))
+            {
+                Ok(()) => pre_filled += 1,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => break,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    panic!("channel unexpectedly closed while pre-filling")
+                }
+            }
+            if pre_filled > 4096 {
+                panic!("channel did not backpressure after 4096 entries");
+            }
+        }
+
+        let store = PendingBroadcastStore::new();
+        let key = test_contract_key(11);
+        let stashed = freenet_stdlib::prelude::WrappedState::new(vec![0xEF; 8]);
+        store.stash(*key.id(), stashed.clone());
+
+        super::flush_pending_broadcast_on(
+            notifier.notifications_sender(),
+            notifier.notification_channel_pending(),
+            notifier.notifications_sender().capacity(),
+            &store,
+            &key,
+        );
+
+        // State must still be present (re-stashed) for a later retry.
+        let recovered = store
+            .take(key.id())
+            .expect("state must be re-stashed after a full-channel drop, not lost");
+        assert_eq!(recovered.as_ref(), stashed.as_ref());
+
+        drop(notifications_receiver);
+        GlobalSimulationTime::clear_time();
     }
 
     // ──────────────────────────────────────────────────────────

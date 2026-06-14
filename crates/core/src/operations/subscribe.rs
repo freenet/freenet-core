@@ -539,6 +539,12 @@ pub(crate) async fn register_downstream_subscriber(
             // both new and renewed peers, so use register_peer_interest's
             // is_new return to avoid over-counting on renewal cycles.
             if is_new_peer {
+                // #4359: a fresh-contract PUT whose initial broadcast found no
+                // targets is stashed by the fan-out handler. This new
+                // downstream subscriber is the first viable target — flush the
+                // deferred state to it so the never-before-seen id reaches the
+                // network instead of staying locally-hosted only.
+                op_manager.flush_pending_broadcast_on_interest(key);
                 let became_interested = op_manager.interest_manager.add_downstream_subscriber(key);
                 if became_interested {
                     super::broadcast_change_interests(op_manager, vec![*key], vec![]).await;

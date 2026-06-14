@@ -4397,6 +4397,21 @@ impl P2pConnManager {
                 // suppress repetitive WARN logging after the first occurrence.
                 self.broadcast_retries.remove(&key);
 
+                // Issue #4359: a fresh contract id loses the race between this
+                // broadcast give-up (~6 s) and the much slower interest/
+                // subscription resolve for a never-before-seen key. Instead of
+                // permanently abandoning the state — which silently leaves it
+                // locally-hosted only while every other node GETs NotFound —
+                // stash it. When the first interested peer/subscriber for this
+                // contract appears later, the subscribe path drains the stash
+                // and re-emits a single BroadcastStateChange, which then finds
+                // the freshly-registered target and propagates. The store is
+                // bounded by size and TTL so a churn of fresh ids that never
+                // gain a subscriber cannot pin memory.
+                op_manager
+                    .pending_broadcasts
+                    .stash(*key.id(), new_state.clone());
+
                 // Evict oldest entry if at capacity to prevent unbounded growth.
                 if !self.broadcast_no_target_streak.contains_key(&key)
                     && self.broadcast_no_target_streak.len() >= Self::MAX_BROADCAST_STREAK_ENTRIES
@@ -4457,6 +4472,10 @@ impl P2pConnManager {
         // Targets found - clear any pending retry and streak state for this contract
         self.broadcast_retries.remove(&key);
         self.broadcast_no_target_streak.remove(&key);
+        // Also drop any deferred re-broadcast stash (#4359): this fan-out is
+        // reaching targets now, so a previously-abandoned state for this
+        // contract is superseded and must not be re-emitted later as stale.
+        let _ = op_manager.pending_broadcasts.take(key.id());
 
         // Record a successful fan-out for the #4281 propagation summary. Fires
         // whether targets were found on the initial attempt or on a healing
