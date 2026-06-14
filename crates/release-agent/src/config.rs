@@ -72,6 +72,31 @@ impl Config {
         toml::from_str(&raw).context("parse config TOML")
     }
 
+    /// Warn (at load time) if `rate_limit_seconds` is configured below the
+    /// updater's `MAX_UPDATE_HOLD`. The rate-limit window is the second
+    /// backstop for the in-flight overlap guard: if a real update runs past
+    /// `MAX_UPDATE_HOLD`, the guard frees the slot while the child is still
+    /// running, and only the rate-limiter then stops a second POST from racing
+    /// the in-flight restart (the #4271 double-stop). With the prod default
+    /// (`rate_limit_seconds = 600 > 300`) that backstop holds; a misconfig that
+    /// sets it lower silently removes it. Surface that to the operator rather
+    /// than failing closed — the agent still functions, it's just lost a
+    /// defense-in-depth layer.
+    pub fn warn_if_rate_limit_below_max_hold(&self) {
+        let max_hold = crate::updater::MAX_UPDATE_HOLD.as_secs();
+        if self.rate_limit_seconds < max_hold {
+            tracing::warn!(
+                rate_limit_seconds = self.rate_limit_seconds,
+                max_update_hold_seconds = max_hold,
+                "rate_limit_seconds is below the updater max-hold; the rate-limit \
+                 backstop for the in-flight overlap guard is disabled. If an update \
+                 runs longer than {max_hold}s, a second update could race its \
+                 restart and trigger the #4271 double-stop. Set rate_limit_seconds \
+                 >= {max_hold} (prod default is 600)."
+            );
+        }
+    }
+
     /// Load the HMAC secret. The file is always parsed as hex (matching
     /// `install.sh`'s `openssl rand -hex 32` output); any whitespace is
     /// trimmed. The previous heuristic of "hex with fallback to raw" was

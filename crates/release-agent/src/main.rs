@@ -39,6 +39,9 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let config = Config::from_path(&cli.config)?;
+    // Surface a misconfig that would disable the rate-limit backstop for the
+    // in-flight overlap guard (see Config::warn_if_rate_limit_below_max_hold).
+    config.warn_if_rate_limit_below_max_hold();
     let secret = config.load_secret()?;
 
     let http = HttpClient::builder()
@@ -69,6 +72,7 @@ async fn main() -> Result<()> {
         systemctl_path: PathBuf::from("systemctl"),
         last_update_attempt: Arc::new(Mutex::new(None)),
         last_announce_attempt: Arc::new(Mutex::new(None)),
+        update_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     serve(listen_addr, build_router(state)).await

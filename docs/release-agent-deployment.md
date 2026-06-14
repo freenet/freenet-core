@@ -284,6 +284,8 @@ agent and is used by the existing release flow.
 | `401` only on slow runners | `clock_skew_tolerance_seconds` too tight. Default 300s should be safe; bump to 600 if the runner's clock drifts. |
 | `403` from `/update` with `"reason":"downgrade"` | Workflow targeted an older version than what's installed. Expected if a hotfix landed out-of-order. |
 | `403` with `"reason":"not_github_latest"` | GitHub release wasn't tagged `latest` yet (pre-release flag still set). Wait for the `release.yml` workflow to finalize. |
+| `409` from `/update` | An update is already in flight on this gateway (overlapping/duplicate POST). The in-flight guard rejected the duplicate to prevent the #4271 double-stop. NOT a failure — the in-progress update is the one that applies; `gateway-update.yml` logs a `::notice::` and proceeds to the verify step. |
+| `429` from `/update` | Rate-limited: another update was accepted within `rate_limit_seconds` (default 600). The recent update is in effect; the workflow treats this as non-fatal and proceeds to verify. |
 | `502` | GitHub API unreachable from gateway. Transient — workflow will retry. |
 | `500` after flipping `dry_run=false` | `sudo -n` rejected the invocation. `sudo -l -U freenet-update` should show the sudoers entry. If not, re-run `visudo -c -f /etc/sudoers.d/freenet-release-agent`. |
 | Caddy can't get a cert | DNS A record not propagated yet, or Caddy not reachable on 80/tcp for the ACME HTTP-01 challenge. |

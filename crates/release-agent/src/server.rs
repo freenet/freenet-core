@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -20,7 +21,7 @@ use crate::announcer::Announcer;
 use crate::auth::{HEADER_SIGNATURE, check_clock_skew, verify_signature};
 use crate::config::Config;
 use crate::github::LatestSource;
-use crate::updater::Updater;
+use crate::updater::{InFlightGuard, Updater};
 use crate::version::{ServiceHealthCache, VersionCache};
 
 /// Cap on the request body for `POST /update`. The legitimate body is ~60
@@ -56,6 +57,14 @@ pub struct AppState {
     pub systemctl_path: PathBuf,
     pub last_update_attempt: Arc<Mutex<Option<Instant>>>,
     pub last_announce_attempt: Arc<Mutex<Option<Instant>>>,
+    /// In-flight guard for `POST /update`. `true` while an update's
+    /// stop/restart of the gateway service is in progress. A second update
+    /// POST that arrives during that window is rejected with `409 Conflict`
+    /// rather than spawning a racing `systemctl stop/restart` that could
+    /// SIGKILL the freshly started process (the nova 0.2.65 outage; issue
+    /// #4271). This is ADDITIONAL to `last_update_attempt`, which only
+    /// rate-limits *timing*, not concurrent *overlap*.
+    pub update_in_flight: Arc<AtomicBool>,
 }
 
 #[derive(Serialize)]
@@ -284,8 +293,35 @@ async fn update_handler(
         }
     }
 
-    if let Err(e) = state.updater.run(&target).await {
+    // 10. In-flight guard. The rate-limit window above only bounds how OFTEN
+    //     updates may start; it does not stop a second update from racing a
+    //     restart already in progress. During the nova 0.2.65 rollout two
+    //     updates landed ~1s apart: the second's `systemctl stop` SIGKILLed
+    //     the process the first had just started, leaving the gateway DOWN.
+    //     Claim the in-flight slot here (held across the whole restart window
+    //     by `Updater::run`, bounded by a max-hold timeout) and reject any
+    //     overlapping update with 409 instead of spawning a racing restart.
+    //     See issue #4271.
+    let in_flight = match InFlightGuard::try_acquire(&state.update_in_flight) {
+        Some(g) => g,
+        None => {
+            tracing::warn!(
+                target = %target,
+                "rejecting overlapping update: an update is already in progress"
+            );
+            return (
+                StatusCode::CONFLICT,
+                "update already in progress; retry after it completes",
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(e) = state.updater.run(&target, in_flight).await {
         tracing::error!(error = %e, "updater spawn failed");
+        // `in_flight` was moved into `run` and dropped there on the failure
+        // path, so the slot is already free for a retry.
+        //
         // Deliberately do NOT update last_update_attempt — the caller
         // should be able to retry once the underlying problem is fixed,
         // without waiting out the full rate-limit window.
