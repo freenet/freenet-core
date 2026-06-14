@@ -51,6 +51,33 @@ async fn poll_file_nonempty(path: &Path) -> String {
     }
 }
 
+/// Poll `path` until it contains at least `expected` lines. Used to drain
+/// lingering stub children before a test drops its Harness (and the TempDir
+/// holding the stub script): each spawned stub appends one line to a shared
+/// marker file on EXIT, so once the line count reaches the number of children
+/// we spawned, every child has finished and teardown won't delete a script out
+/// from under a still-running process. Bounded deadline so a genuinely stuck
+/// child fails the test rather than hanging.
+async fn poll_done_count(path: &Path, expected: usize) {
+    if expected == 0 {
+        return;
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let count = std::fs::read_to_string(path)
+            .map(|c| c.lines().filter(|l| !l.trim().is_empty()).count())
+            .unwrap_or(0);
+        if count >= expected {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected {expected} stub child(ren) to finish (found {count}) within the deadline"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 fn write_stub_freenet(dir: &Path, version: &str) -> std::path::PathBuf {
     let bin = dir.join("fake-freenet");
     let script = format!("#!/bin/sh\necho freenet {version}\n");
@@ -562,16 +589,29 @@ async fn spawn_failure_does_not_consume_rate_limit_window() {
         attempt += 1;
         let tmp = tempfile::tempdir().unwrap();
         let argv_record = tmp.path().join("argv.log");
-        // Update script exits 1 immediately. Surface as 500 to the caller.
+        let done_log = tmp.path().join("done.log");
+        // Update script records its exit then exits 1 immediately (surfaced as
+        // 500 to the caller). The `echo done` lets us drain every spawned child
+        // before this iteration's TempDir drops — under load the fast `exit 1`
+        // can miss the 1s probe and be handed to the background wait task, whose
+        // `Command::spawn` of fake-sudo would otherwise race the TempDir rmdir
+        // and log `No such file or directory` to stderr.
+        let update_script = format!("#!/bin/sh\necho done >> {}\nexit 1\n", done_log.display());
         let h = Harness::build_live(
             "0.2.55",
             Version::new(0, 2, 56),
             600, // 10 min window — long enough that a second successful spawn
             // within seconds proves the window WAS NOT consumed.
-            "#!/bin/sh\nexit 1\n",
+            &update_script,
             &argv_record,
         )
         .await;
+
+        // Count spawned children so we can drain all of them before dropping
+        // this iteration's TempDir. Any POST that passes validation spawns the
+        // update child (500 = caught fast exit, 202 = probe-miss handed to the
+        // background task); both append a `done` line on exit.
+        let mut spawns = 0usize;
 
         let (body, sig) = h.signed_body("0.2.56", now_secs());
         let r1 = reqwest::Client::new()
@@ -581,10 +621,13 @@ async fn spawn_failure_does_not_consume_rate_limit_window() {
             .send()
             .await
             .unwrap();
+        spawns += 1;
         if r1.status() != 500 {
             // Probe missed the fast exit under load (got 202); retry on a fresh
             // harness so this stays deterministic. Bounded to avoid a hang if
-            // the 500 path were genuinely broken.
+            // the 500 path were genuinely broken. Drain the spawned child first
+            // so its fake-sudo exec doesn't race this TempDir's deletion.
+            poll_done_count(&done_log, spawns).await;
             assert!(
                 attempt < 20,
                 "spawn failure never surfaced as 500 across {attempt} attempts; got {}",
@@ -603,11 +646,14 @@ async fn spawn_failure_does_not_consume_rate_limit_window() {
             .send()
             .await
             .unwrap();
+        spawns += 1;
         assert_ne!(
             r2.status(),
             429,
             "rate-limit window must not be consumed by a failed spawn"
         );
+        // Drain both spawned children before the TempDir drops.
+        poll_done_count(&done_log, spawns).await;
         break;
     }
 }
@@ -629,14 +675,19 @@ async fn concurrent_updates_only_spawn_once() {
     let tmp = tempfile::tempdir().unwrap();
     let argv_record = tmp.path().join("argv.log");
     let spawn_count = tmp.path().join("spawns.log");
+    let done_marker = tmp.path().join("done.log");
     // Each spawn appends a line, then sleeps just past the 1s early-exit probe
     // so it is still running when the second POST arrives (1s probe < 1.5s
     // sleep). Kept as short as possible so the stub child doesn't linger after
     // the HTTP responses land and add scheduler contention to sibling tests
-    // running in parallel.
+    // running in parallel. The final `echo done` lets the test drain the
+    // in-flight child before dropping the Harness (and its TempDir) — otherwise
+    // the still-sleeping child's script would vanish out from under it and emit
+    // a `No such file or directory` to stderr during teardown.
     let update_script = format!(
-        "#!/bin/sh\necho spawned >> {}\nsleep 1.5\n",
-        spawn_count.display()
+        "#!/bin/sh\necho spawned >> {}\nsleep 1.5\necho done > {}\n",
+        spawn_count.display(),
+        done_marker.display(),
     );
     // rate_limit_seconds = 0 so the rate-limiter never fires: this test
     // isolates the in-flight guard (429 vs 409 are different mechanisms, and
@@ -728,6 +779,13 @@ async fn concurrent_updates_only_spawn_once() {
         1,
         "exactly one update may spawn while another is in flight, got: {spawns:?}"
     );
+
+    // Drain the in-flight stub child before the Harness (and its TempDir) drops.
+    // The accepted update's stub sleeps 1.5s; if we returned now the TempDir
+    // would be deleted out from under the still-running script, which then logs
+    // `No such file or directory` to stderr. Polling its `done` marker makes
+    // teardown deterministic and noise-free.
+    poll_file_nonempty(&done_marker).await;
 }
 
 #[tokio::test]
@@ -738,16 +796,29 @@ async fn update_after_in_flight_completes_is_accepted() {
     // the rate-limiter doesn't mask the in-flight behaviour being tested.
     let tmp = tempfile::tempdir().unwrap();
     let argv_record = tmp.path().join("argv.log");
+    let done_log = tmp.path().join("done.log");
+    // Sleep just past the 1s early-exit probe; kept minimal so the stub child
+    // doesn't linger and add scheduler contention to parallel tests. Each
+    // invocation appends a line to `done.log` on EXIT, so the test can drain
+    // every accepted-and-spawned child before dropping the Harness (and its
+    // TempDir) — otherwise a still-sleeping child's script would vanish out
+    // from under it and emit `No such file or directory` to stderr at teardown.
+    let update_script = format!(
+        "#!/bin/sh\nsleep 1.5\necho done >> {}\n",
+        done_log.display()
+    );
     let h = Harness::build_live(
         "0.2.55",
         Version::new(0, 2, 56),
         0, // no rate-limit, so we isolate the in-flight guard
-        // Sleep just past the 1s early-exit probe; kept minimal so the stub
-        // child doesn't linger and add scheduler contention to parallel tests.
-        "#!/bin/sh\nsleep 1.5\n",
+        &update_script,
         &argv_record,
     )
     .await;
+
+    // Count the children we actually spawn so teardown can wait for all of them
+    // to exit (the first accepted update plus the second accepted follow-up).
+    let mut spawned = 0u32;
 
     let (body1, sig1) = h.signed_body("0.2.56", now_secs());
     let r1 = reqwest::Client::new()
@@ -758,6 +829,7 @@ async fn update_after_in_flight_completes_is_accepted() {
         .await
         .unwrap();
     assert!(r1.status() == 200 || r1.status() == 202);
+    spawned += 1;
 
     // While still in flight, a second update is 409.
     let (body2, sig2) = h.signed_body("0.2.56", now_secs());
@@ -790,6 +862,7 @@ async fn update_after_in_flight_completes_is_accepted() {
             .unwrap();
         let last_status = r3.status().as_u16();
         if last_status == 200 || last_status == 202 {
+            spawned += 1;
             break last_status;
         }
         assert_eq!(
@@ -805,6 +878,11 @@ async fn update_after_in_flight_completes_is_accepted() {
         last_status == 200 || last_status == 202,
         "guard must be released after the update completes; got {last_status}"
     );
+
+    // Drain every child we spawned (the initial accepted update and the final
+    // accepted follow-up) before the Harness/TempDir drops. Each child appends
+    // one line to `done.log` on exit; wait until all of them have.
+    poll_done_count(&done_log, spawned as usize).await;
 }
 
 #[tokio::test]
@@ -817,15 +895,23 @@ async fn sudoers_argv_matches_allowlist() {
     // wrapper and asserts it lines up with the sudoers allowlist.
     let tmp = tempfile::tempdir().unwrap();
     let argv_record = tmp.path().join("argv.log");
+    let done_marker = tmp.path().join("done.log");
     // Update script does nothing; we only care about the argv sudo sees. Sleep
     // just past the 1s early-exit probe (so the handler returns 202, not a
     // probe-window failure) and no longer — a lingering stub child only adds
-    // scheduler contention to the parallel suite.
+    // scheduler contention to the parallel suite. The final `echo done` lets the
+    // test drain the child before the TempDir drops, so the still-sleeping
+    // script isn't deleted out from under it (which logs `No such file or
+    // directory` to stderr at teardown).
+    let update_script = format!(
+        "#!/bin/sh\n# noop — wait long enough that the 1s probe times out\nsleep 1.5\necho done > {}\n",
+        done_marker.display(),
+    );
     let h = Harness::build_live(
         "0.2.55",
         Version::new(0, 2, 56),
         600,
-        "#!/bin/sh\n# noop — wait long enough that the 1s probe times out\nsleep 1.5\n",
+        &update_script,
         &argv_record,
     )
     .await;
@@ -855,6 +941,10 @@ async fn sudoers_argv_matches_allowlist() {
         argv.ends_with("--force --target-version v0.2.56"),
         "argv suffix must match sudoers allowlist (got: {argv:?})"
     );
+
+    // Drain the in-flight stub child before the Harness/TempDir drops, so the
+    // still-sleeping script isn't deleted out from under it at teardown.
+    poll_file_nonempty(&done_marker).await;
 }
 
 /// Build a Harness whose announcer points at a stub announce script.
@@ -1002,9 +1092,17 @@ async fn announce_disabled_still_requires_signature() {
 async fn announce_happy_path() {
     let tmp = tempfile::tempdir().unwrap();
     let record = tmp.path().join("argv.log");
+    let done_marker = tmp.path().join("done.log");
     // Sleep just past the 1s probe so the handler returns 202; kept short so
-    // the stub child doesn't linger and contend with the parallel suite.
-    let h = build_with_announcer("#!/bin/sh\nsleep 1.5\n", &record).await;
+    // the stub child doesn't linger and contend with the parallel suite. The
+    // final `echo done` lets the test drain the child before its TempDir drops,
+    // so the still-sleeping script isn't deleted out from under it (which logs
+    // `No such file or directory` to stderr at teardown).
+    let announce_script = format!(
+        "#!/bin/sh\nsleep 1.5\necho done > {}\n",
+        done_marker.display()
+    );
+    let h = build_with_announcer(&announce_script, &record).await;
     let (body, sig) = signed_announce(&h.secret, "Freenet v0.2.57 released", now_secs());
     let resp = reqwest::Client::new()
         .post(format!("{}/announce/river", h.base))
@@ -1043,6 +1141,10 @@ async fn announce_happy_path() {
         full.ends_with(" Freenet v0.2.57 released"),
         "full argv must end with the message, got: {full:?}"
     );
+
+    // Drain the in-flight stub child before the Harness/TempDir drops, so the
+    // still-sleeping announce script isn't deleted out from under it.
+    poll_file_nonempty(&done_marker).await;
 }
 
 #[tokio::test]
@@ -1107,8 +1209,20 @@ async fn announce_spawn_failure_does_not_consume_rate_limit() {
         attempt += 1;
         let tmp = tempfile::tempdir().unwrap();
         let record = tmp.path().join("argv.log");
-        // Script exits 1 immediately → 500 + window NOT consumed.
-        let h = build_with_announcer("#!/bin/sh\nexit 1\n", &record).await;
+        let done_log = tmp.path().join("done.log");
+        // Script records its exit then exits 1 immediately → 500 + window NOT
+        // consumed. The `echo done` lets us drain every spawned child before
+        // this iteration's TempDir drops — a probe-miss (202) hands the fast
+        // `exit 1` child to the background wait task, whose fake-sudo exec would
+        // otherwise race the TempDir rmdir and log `No such file or directory`.
+        let announce_script = format!("#!/bin/sh\necho done >> {}\nexit 1\n", done_log.display());
+        let h = build_with_announcer(&announce_script, &record).await;
+
+        // Every POST that passes validation spawns the announce child (500 =
+        // caught fast exit, 202 = probe-miss handed to the background task);
+        // both append a `done` line on exit. Count them so we can drain all.
+        let mut spawns = 0usize;
+
         let (body, sig) = signed_announce(&h.secret, "first", now_secs());
         let r1 = reqwest::Client::new()
             .post(format!("{}/announce/river", h.base))
@@ -1117,9 +1231,13 @@ async fn announce_spawn_failure_does_not_consume_rate_limit() {
             .send()
             .await
             .unwrap();
+        spawns += 1;
         if r1.status() != 500 {
             // Probe missed the fast exit under load (got 202); retry on a fresh
             // harness. Bounded to avoid hanging if the 500 path were broken.
+            // Drain the spawned child first so its fake-sudo exec doesn't race
+            // this TempDir's deletion.
+            poll_done_count(&done_log, spawns).await;
             assert!(
                 attempt < 20,
                 "announce spawn failure never surfaced as 500 across {attempt} attempts; got {}",
@@ -1136,11 +1254,14 @@ async fn announce_spawn_failure_does_not_consume_rate_limit() {
             .send()
             .await
             .unwrap();
+        spawns += 1;
         assert_ne!(
             r2.status(),
             429,
             "failed spawn must not consume the announce rate-limit window"
         );
+        // Drain both spawned children before the TempDir drops.
+        poll_done_count(&done_log, spawns).await;
         break;
     }
 }
@@ -1209,9 +1330,17 @@ async fn announce_exactly_at_message_limit_is_accepted() {
     // so 4096 passes. One-over (4097) goes 413 — see next test.
     let tmp = tempfile::tempdir().unwrap();
     let record = tmp.path().join("argv.log");
+    let done_marker = tmp.path().join("done.log");
     // Sleep just past the 1s probe so the handler returns 202; kept short so
-    // the stub child doesn't linger and contend with the parallel suite.
-    let h = build_with_announcer("#!/bin/sh\nsleep 1.5\n", &record).await;
+    // the stub child doesn't linger and contend with the parallel suite. The
+    // final `echo done` lets the test drain the child before its TempDir drops,
+    // so the still-sleeping script isn't deleted out from under it (which logs
+    // `No such file or directory` to stderr at teardown).
+    let announce_script = format!(
+        "#!/bin/sh\nsleep 1.5\necho done > {}\n",
+        done_marker.display()
+    );
+    let h = build_with_announcer(&announce_script, &record).await;
     let exact = "x".repeat(4096);
     let (body, sig) = signed_announce(&h.secret, &exact, now_secs());
     let resp = reqwest::Client::new()
@@ -1226,6 +1355,10 @@ async fn announce_exactly_at_message_limit_is_accepted() {
         "exactly-at-limit must pass; got {}",
         resp.status()
     );
+
+    // Drain the in-flight stub child before the Harness/TempDir drops, so the
+    // still-sleeping announce script isn't deleted out from under it.
+    poll_file_nonempty(&done_marker).await;
 }
 
 #[tokio::test]
@@ -1250,7 +1383,13 @@ async fn announce_rate_limit_kicks_in_after_first_success() {
     // 1-minute window: two back-to-back announces, second must 429.
     let tmp = tempfile::tempdir().unwrap();
     let record = tmp.path().join("argv.log");
-    let h = build_with_announcer("#!/bin/sh\nexit 0\n", &record).await;
+    let done_log = tmp.path().join("done.log");
+    // The first announce spawns a child; record its exit so we can drain it
+    // before the TempDir drops. Under load the fast `exit 0` can miss the 1s
+    // probe and be handed to the background wait task, whose fake-sudo exec
+    // would otherwise race the TempDir rmdir and log `No such file or directory`.
+    let announce_script = format!("#!/bin/sh\necho done >> {}\nexit 0\n", done_log.display());
+    let h = build_with_announcer(&announce_script, &record).await;
 
     let (b1, s1) = signed_announce(&h.secret, "first", now_secs());
     let r1 = reqwest::Client::new()
@@ -1271,6 +1410,10 @@ async fn announce_rate_limit_kicks_in_after_first_success() {
         .await
         .unwrap();
     assert_eq!(r2.status(), 429);
+
+    // Only the first announce spawned (the second was rate-limited). Drain it
+    // before the TempDir drops so its fake-sudo exec doesn't race the deletion.
+    poll_done_count(&done_log, 1).await;
 }
 
 #[tokio::test]
