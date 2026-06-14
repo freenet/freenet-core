@@ -211,7 +211,7 @@ impl FairEventQueue {
 ///
 /// Returns `Some(ContractInstanceId)` for events associated with a specific contract,
 /// or `None` for events with no contract identity (delegate requests, disconnects, etc.).
-fn extract_contract_id(event: &ContractHandlerEvent) -> Option<ContractInstanceId> {
+pub(super) fn extract_contract_id(event: &ContractHandlerEvent) -> Option<ContractInstanceId> {
     match event {
         ContractHandlerEvent::PutQuery { key, .. }
         | ContractHandlerEvent::UpdateQuery { key, .. }

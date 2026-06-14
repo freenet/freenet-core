@@ -79,8 +79,18 @@ On a relay driver's response path, any operation that enqueues on the
 single-threaded `contract_handling` event loop (GetQuery, PutQuery,
 validate_state, `RequestRelated` recursion, etc.) MUST be sequenced
 AFTER the upstream forward. Reversing this puts WASM `validate_state`
-and the 10s `RELATED_FETCH_TIMEOUT` directly on the upstream-visible
-critical path, where they stack across multi-hop traversals.
+directly on the upstream-visible critical path, where it stacks across
+multi-hop traversals.
+
+Note (#4391): the related-contract NETWORK fetch's 10s
+`RELATED_FETCH_TIMEOUT` is no longer awaited inline on the
+`contract_handling` loop — a PUT/UPDATE that needs a related contract
+not held locally now off-loads that fetch to a background task and
+re-enqueues a continuation (see `contract.rs::maybe_defer_upsert`), so
+the loop no longer stalls for that 10s window. WASM
+`validate_state`/`update_state`/store still run serially on the loop,
+so this invariant still holds for the WASM work; only the related-fetch
+WAIT no longer contributes to the stall.
 
 ```
 RIGHT (issue #4155 fix):
