@@ -174,15 +174,18 @@ impl FairEventQueue {
             }
             match extract_contract_id(&event) {
                 Some(contract_id) => {
-                    let queue = self.contract_queues.entry(contract_id).or_default();
-                    if queue.len() >= MAX_QUEUED_PER_CONTRACT {
-                        // Drop the empty bucket we may have just inserted.
-                        if queue.is_empty() {
-                            self.contract_queues.remove(&contract_id);
-                        }
+                    // Check the bucket length WITHOUT `or_default()`, so a
+                    // rejected push for a brand-new id doesn't leave an empty
+                    // bucket behind (which would otherwise need cleanup).
+                    let cur_len = self
+                        .contract_queues
+                        .get(&contract_id)
+                        .map_or(0, |q| q.len());
+                    if cur_len >= MAX_QUEUED_PER_CONTRACT {
                         rejected.push((id, event));
                         continue;
                     }
+                    let queue = self.contract_queues.entry(contract_id).or_default();
                     if queue.is_empty() {
                         self.round_robin.push_back(QueueKey::Contract(contract_id));
                     }

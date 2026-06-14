@@ -1002,9 +1002,9 @@ where
         // AGENTS.md "cleanup exemptions MUST be time-bounded".
         let now = executor::now_nanos();
         sweep_stale_deferrals(
+            &mut contract_handler,
             &mut deferral_ctx,
             &mut fair_queue,
-            contract_handler.channel(),
             now,
         )
         .await;
@@ -1179,12 +1179,14 @@ fn pop_runnable_event(
 /// `now_nanos` is injected (rather than read from `executor::now_nanos()`
 /// internally) so the sweep is deterministically unit-testable. The loop call
 /// site passes `executor::now_nanos()`.
-async fn sweep_stale_deferrals(
+async fn sweep_stale_deferrals<CH>(
+    contract_handler: &mut CH,
     deferral_ctx: &mut DeferralCtx,
     fair_queue: &mut fair_queue::FairEventQueue,
-    channel: &mut handler::ContractHandlerChannel<handler::ContractHandlerHalve>,
     now_nanos: u64,
-) {
+) where
+    CH: ContractHandler + Send + 'static,
+{
     if deferral_ctx.deferred_keys.is_empty() {
         return;
     }
@@ -1233,7 +1235,7 @@ async fn sweep_stale_deferrals(
         // FRONT (per-contract FIFO); answer any that don't fit with backpressure
         // so their waiting_response slots aren't leaked.
         let rejected = requeue_released_events(deferral_ctx.release_key(&contract_id), fair_queue);
-        answer_rejected_held_events(channel, rejected).await;
+        answer_rejected_held_events(contract_handler, rejected).await;
     }
 }
 
@@ -1260,13 +1262,22 @@ fn requeue_released_events(
 
 /// Answer every event that `requeue_released_events` could not re-enqueue with a
 /// queue-full response (drops its `waiting_response` slot — no leak, no 300s
-/// client hang). Mirrors the normal drain-path rejection handling.
-async fn answer_rejected_held_events(
-    channel: &mut handler::ContractHandlerChannel<handler::ContractHandlerHalve>,
+/// client hang). Mirrors the normal drain-path rejection handling, including the
+/// `EvictContract` pending-reclamation hook so a rejected held `EvictContract`
+/// doesn't silently leak on-disk storage (the #4212 disk-leak class).
+async fn answer_rejected_held_events<CH>(
+    contract_handler: &mut CH,
     rejected: Vec<(handler::EventId, ContractHandlerEvent)>,
-) {
+) where
+    CH: ContractHandler + Send + 'static,
+{
     for (id, event) in rejected {
-        send_queue_full_response(channel, Box::new(fair_queue::RejectedEvent { id, event })).await;
+        let rejected = Box::new(fair_queue::RejectedEvent { id, event });
+        // Mirror the normal drain path: an EvictContract dropped here loses its
+        // hosting-cache entry, so register it for pending-reclamation retry
+        // BEFORE answering, or its disk storage leaks. (#4212)
+        track_pending_reclamation_if_evict(contract_handler, &rejected);
+        send_queue_full_response(contract_handler.channel(), rejected).await;
     }
 }
 
@@ -1434,7 +1445,7 @@ where
         }
     }
 
-    answer_rejected_held_events(contract_handler.channel(), rejected).await;
+    answer_rejected_held_events(contract_handler, rejected).await;
     Ok(())
 }
 
@@ -2543,6 +2554,36 @@ mod tests {
         assert!(
             update_arm.contains("maybe_defer_upsert"),
             "UPDATE arm must route its upsert through maybe_defer_upsert (#4391)"
+        );
+    }
+
+    /// Pin: `answer_rejected_held_events` must call `track_pending_reclamation_if_evict`
+    /// before `send_queue_full_response`, so a held `EvictContract` rejected on
+    /// requeue doesn't silently leak its on-disk storage (the #4212 disk-leak
+    /// class). The other three reject sites already do this; this helper is the
+    /// fourth and must match.
+    #[test]
+    fn answer_rejected_held_events_tracks_evict_reclamation_pin_test() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/contract.rs");
+        let source = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("must read own source at {}: {e}", path.display()));
+        let body = source
+            .split("async fn answer_rejected_held_events")
+            .nth(1)
+            .expect("answer_rejected_held_events must exist")
+            .split("\n}\n")
+            .next()
+            .expect("function body");
+        let track_idx = body
+            .find("track_pending_reclamation_if_evict")
+            .expect("must call track_pending_reclamation_if_evict (EvictContract disk-leak #4212)");
+        let send_idx = body
+            .find("send_queue_full_response")
+            .expect("must answer with send_queue_full_response");
+        assert!(
+            track_idx < send_idx,
+            "reclamation tracking must run BEFORE the queue-full response, \
+             mirroring the normal drain path"
         );
     }
 
@@ -4523,7 +4564,9 @@ mod hol_4391_tests {
     async fn sweep_releases_stale_answers_client_and_requeues_held() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut ctx = DeferralCtx::new(tx);
-        let (_send, mut handler_half, _wait) = handler::contract_handler_channel();
+        let mut handler =
+            MockWasmContractHandler::new_test(handler::contract_handler_channel().1, None, "sweep")
+                .await;
         let mut fq = fair_queue::FairEventQueue::new();
 
         let ttl = DEFERRED_RELATED_FETCH_TIMEOUT.as_nanos() as u64;
@@ -4544,7 +4587,7 @@ mod hol_4391_tests {
         // Sweep at now = 2*ttl + 1: the stale entry (age 2*ttl+1) is swept; the
         // fresh entry (age 1) is not.
         let now = ttl * 2 + 1;
-        sweep_stale_deferrals(&mut ctx, &mut fq, &mut handler_half, now).await;
+        sweep_stale_deferrals(&mut handler, &mut ctx, &mut fq, now).await;
 
         // (a) stale key released; (b) its held event requeued.
         assert!(
@@ -4637,21 +4680,23 @@ mod hol_4391_tests {
     /// sweep/resume use, and asserts the client gets a prompt QueueFull error.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn rejected_held_event_is_answered_not_leaked() {
-        let (send, mut handler_half, _wait) = handler::contract_handler_channel();
+        let (send, rcv_halve, _wait) = handler::contract_handler_channel();
+        let mut handler = MockWasmContractHandler::new_test(rcv_halve, None, "leak").await;
         let k = instance_id(b"leak_k");
 
         // Client sends a GetQuery and awaits the response.
         let client = GlobalExecutor::spawn(async move { send.send_to_handler(get_event(k)).await });
 
         // Handler side receives it (registers the waiting_response slot).
-        let (id, event) = handler_half
+        let (id, event) = handler
+            .channel()
             .recv_from_sender()
             .await
             .expect("event received");
 
         // Simulate the requeue-overflow path: this event couldn't be re-queued,
         // so the loop must answer it with backpressure.
-        answer_rejected_held_events(&mut handler_half, vec![(id, event)]).await;
+        answer_rejected_held_events(&mut handler, vec![(id, event)]).await;
 
         // The client must receive a prompt queue-full error, NOT hang.
         let resp = tokio::time::timeout(Duration::from_secs(2), client)

@@ -1680,86 +1680,96 @@ where
                     }));
                 }
 
-                // In deferrable mode, resolve related contracts LOCAL-ONLY
-                // first. If any are missing locally, surface them to the
-                // caller for an off-loop network fetch instead of awaiting
-                // the network GET inline on the serial event loop (#4391).
-                // When everything is local this is a no-op and we fall
-                // through to the normal merge below.
+                let mut fetched_updates = updates.clone();
+
                 if defer_related_fetch {
+                    // DEFERRABLE mode (serial `contract_handling` loop): resolve
+                    // LOCAL-ONLY. This path MUST NEVER call
+                    // `fetch_related_via_network` (an inline network GET on the
+                    // serial loop). Resolve each id from the local state_store;
+                    // anything missing is surfaced via `DeferRelated` so the
+                    // caller off-loads the fetch. On resume this re-enters with
+                    // the state supplied as a `RelatedState` update entry (so
+                    // `requires()` no longer lists it), OR — if a misbehaving
+                    // contract keeps requiring it — hits the one-deferral cap →
+                    // MissingRelated, never an inline network GET. See #4391.
                     let mut missing = Vec::new();
                     for id in &unique_ids {
-                        let local = if let Some(full_key) = self.bridged_lookup_key(id) {
-                            self.state_store.get(&full_key).await.is_ok()
+                        let resolved = if let Some(full_key) = self.bridged_lookup_key(id) {
+                            self.state_store.get(&full_key).await.ok()
                         } else {
-                            false
+                            None
                         };
-                        if !local {
-                            missing.push(*id);
+                        match resolved {
+                            Some(state) => fetched_updates.push(UpdateData::RelatedState {
+                                related_to: *id,
+                                state: State::from(state.as_ref().to_vec()),
+                            }),
+                            None => missing.push(*id),
                         }
                     }
                     if !missing.is_empty() {
                         return Err(ExecutorError::defer_related_fetch(missing));
                     }
-                }
-
-                // Parallel fetch: each related contract goes through its
-                // own GET sub-op concurrently. Previously this loop ran
-                // serially under a single 10s wall-clock budget, so a
-                // contract requesting N>1 related ids could time out at
-                // ~10s/N effective per fetch. Fan-out via `join_all`
-                // turns the budget back into 10s _per id_ in the common
-                // case (network bandwidth, not CPU, is the constraint).
-                // See freenet/freenet-core#4077.
-                let mut fetched_updates = updates.clone();
-                let fetch_results: Vec<(
-                    ContractInstanceId,
-                    Result<State<'static>, ExecutorError>,
-                )> = {
-                    // Reborrow as `&Self` so the per-id futures all share
-                    // an immutable borrow; this releases the outer
-                    // `&mut self` only for the duration of `fetch_all`,
-                    // which is fully awaited before the next `&mut self`
-                    // call (`attempt_state_update` below).
-                    let this: &Self = &*self;
-                    futures::future::join_all(unique_ids.iter().map(|id| {
-                        let id = *id;
-                        async move {
-                            if let Some(full_key) = this.bridged_lookup_key(&id) {
-                                if let Ok(state) = this.state_store.get(&full_key).await {
-                                    return (id, Ok(State::from(state.as_ref().to_vec())));
+                } else {
+                    // NON-deferrable mode: parallel fetch — each related contract
+                    // goes through its own GET sub-op concurrently. Previously
+                    // serial under a single 10s wall-clock budget, so a contract
+                    // requesting N>1 related ids could time out at ~10s/N
+                    // effective per fetch. Fan-out via `join_all` turns the
+                    // budget back into 10s _per id_ in the common case (network
+                    // bandwidth, not CPU, is the constraint). See
+                    // freenet/freenet-core#4077.
+                    let fetch_results: Vec<(
+                        ContractInstanceId,
+                        Result<State<'static>, ExecutorError>,
+                    )> = {
+                        // Reborrow as `&Self` so the per-id futures all share
+                        // an immutable borrow; this releases the outer
+                        // `&mut self` only for the duration of `fetch_all`,
+                        // which is fully awaited before the next `&mut self`
+                        // call (`attempt_state_update` below).
+                        let this: &Self = &*self;
+                        futures::future::join_all(unique_ids.iter().map(|id| {
+                            let id = *id;
+                            async move {
+                                if let Some(full_key) = this.bridged_lookup_key(&id) {
+                                    if let Ok(state) = this.state_store.get(&full_key).await {
+                                        return (id, Ok(State::from(state.as_ref().to_vec())));
+                                    }
                                 }
+                                let outcome =
+                                    fetch_related_via_network(this.op_manager.as_ref(), &id)
+                                        .await
+                                        .map(|state| State::from(state.as_ref().to_vec()));
+                                (id, outcome)
                             }
-                            let outcome = fetch_related_via_network(this.op_manager.as_ref(), &id)
-                                .await
-                                .map(|state| State::from(state.as_ref().to_vec()));
-                            (id, outcome)
-                        }
-                    }))
-                    .await
-                };
-                let mut failed_id: Option<ContractInstanceId> = None;
-                for (id, res) in fetch_results {
-                    match res {
-                        Ok(state) => fetched_updates.push(UpdateData::RelatedState {
-                            related_to: id,
-                            state,
-                        }),
-                        Err(err) => {
-                            tracing::warn!(
-                                contract = %key,
-                                related_id = %id,
-                                error = %err,
-                                "Failed to fetch related contract for update_state requires()"
-                            );
-                            failed_id.get_or_insert(id);
+                        }))
+                        .await
+                    };
+                    let mut failed_id: Option<ContractInstanceId> = None;
+                    for (id, res) in fetch_results {
+                        match res {
+                            Ok(state) => fetched_updates.push(UpdateData::RelatedState {
+                                related_to: id,
+                                state,
+                            }),
+                            Err(err) => {
+                                tracing::warn!(
+                                    contract = %key,
+                                    related_id = %id,
+                                    error = %err,
+                                    "Failed to fetch related contract for update_state requires()"
+                                );
+                                failed_id.get_or_insert(id);
+                            }
                         }
                     }
-                }
-                if let Some(id) = failed_id {
-                    return Err(ExecutorError::request(StdContractError::MissingRelated {
-                        key: id,
-                    }));
+                    if let Some(id) = failed_id {
+                        return Err(ExecutorError::request(StdContractError::MissingRelated {
+                            key: id,
+                        }));
+                    }
                 }
                 match self
                     .attempt_state_update(&params, &current_state, &key, &fetched_updates)
@@ -2696,116 +2706,129 @@ where
             }));
         }
 
-        // In deferrable mode, resolve related contracts LOCAL-ONLY first
-        // (caller-supplied `initial_related` states count as local). If any
-        // are missing locally, surface them so the caller can fetch them
-        // off-loop instead of awaiting the network GET inline on the serial
-        // event loop (#4391). When everything is already local this is a
-        // no-op and we fall through to the normal fetch+revalidate below.
+        let initial_owned = initial_related.clone().into_owned();
+
+        // `related_map` is the populated set fed to the second validate_state
+        // call. It is built differently per mode (see below), but both modes
+        // end at the same `populated_related` / re-validate.
+        let mut related_map: HashMap<ContractInstanceId, Option<State<'static>>> =
+            HashMap::with_capacity(unique_ids.len());
+
         if defer_related_fetch {
-            let initial_owned = initial_related.clone().into_owned();
+            // DEFERRABLE mode (serial `contract_handling` loop): resolve
+            // LOCAL-ONLY — caller-supplied `initial_related` states OR the local
+            // `state_store`. This path MUST NEVER call `fetch_related_via_network`
+            // (which awaits a network GET inline on the serial loop). Anything
+            // still unresolved is surfaced via `DeferRelated` so the caller
+            // off-loads the fetch; on resume that re-enters here with the state
+            // supplied, OR (if a misbehaving contract re-requests something never
+            // supplied) hits the one-deferral cap → MissingRelated — never an
+            // inline network GET. See #4391.
             let mut missing = Vec::new();
             for id in &unique_ids {
-                let supplied = initial_owned
+                if let Some(s) = initial_owned
                     .states()
-                    .any(|(rid, s)| rid == id && s.is_some());
-                let local = supplied
-                    || if let Some(full_key) = self.bridged_lookup_key(id) {
-                        self.state_store.get(&full_key).await.is_ok()
-                    } else {
-                        false
-                    };
-                if !local {
-                    missing.push(*id);
+                    .find_map(|(rid, s)| if rid == id { s.as_ref() } else { None })
+                {
+                    related_map.insert(*id, Some(s.clone().into_owned()));
+                    continue;
                 }
+                if let Some(full_key) = self.bridged_lookup_key(id) {
+                    if let Ok(state) = self.state_store.get(&full_key).await {
+                        related_map.insert(*id, Some(State::from(state.as_ref().to_vec())));
+                        continue;
+                    }
+                }
+                missing.push(*id);
             }
             if !missing.is_empty() {
                 return Err(ExecutorError::defer_related_fetch(missing));
             }
-        }
+        } else {
+            tracing::debug!(
+                contract = %key,
+                related_count = unique_ids.len(),
+                "Fetching related contracts for validation"
+            );
 
-        tracing::debug!(
-            contract = %key,
-            related_count = unique_ids.len(),
-            "Fetching related contracts for validation"
-        );
-
-        // Fetch each related contract: try local state_store first, escalate
-        // to network GET when the executor has an `op_manager` attached. The
-        // previous version was local-only, which silently failed cross-node
-        // UPDATE flows where the validating node was a fresh receiver that
-        // hadn't yet cached the related contract (see freenet/mail#80 — the
-        // recipient's inbox UPDATE always carried `RequestRelated` for the
-        // sender's AFT record, which the receiver hadn't seen before).
-        let mut related_map: HashMap<ContractInstanceId, Option<State<'static>>> =
-            HashMap::with_capacity(unique_ids.len());
-
-        // Parallel fetch via `join_all`: previously serial under a single
-        // 10s wall-clock budget, so N related ids each got ~10s/N
-        // effective. Each id now races its own sub-op GET, so the budget
-        // is per-id in the common case. See freenet/freenet-core#4077.
-        //
-        // Reborrow as `&Self` so the per-id futures share an immutable
-        // borrow; the outer `&mut self` is reclaimed once `fetch_all`
-        // is awaited.
-        let this: &Self = &*self;
-        let fetch_all = async {
-            let results: Vec<(ContractInstanceId, Result<State<'static>, ExecutorError>)> =
-                futures::future::join_all(unique_ids.iter().map(|id| {
-                    let id = *id;
-                    async move {
-                        if let Some(full_key) = this.bridged_lookup_key(&id) {
-                            if let Ok(state) = this.state_store.get(&full_key).await {
-                                return (id, Ok(State::from(state.as_ref().to_vec())));
+            // NON-deferrable mode (delegate-driven PUTs, direct callers): fetch
+            // each related contract — try the local state_store first, escalate
+            // to a network GET when the executor has an `op_manager` attached.
+            // The previous version was local-only, which silently failed
+            // cross-node UPDATE flows where the validating node was a fresh
+            // receiver that hadn't yet cached the related contract (see
+            // freenet/mail#80 — the recipient's inbox UPDATE always carried
+            // `RequestRelated` for the sender's AFT record, which the receiver
+            // hadn't seen before).
+            //
+            // Parallel fetch via `join_all`: previously serial under a single
+            // 10s wall-clock budget, so N related ids each got ~10s/N effective.
+            // Each id now races its own sub-op GET, so the budget is per-id in
+            // the common case. See freenet/freenet-core#4077.
+            //
+            // Reborrow as `&Self` so the per-id futures share an immutable
+            // borrow; the outer `&mut self` is reclaimed once `fetch_all`
+            // is awaited.
+            let this: &Self = &*self;
+            let fetch_all = async {
+                let results: Vec<(ContractInstanceId, Result<State<'static>, ExecutorError>)> =
+                    futures::future::join_all(unique_ids.iter().map(|id| {
+                        let id = *id;
+                        async move {
+                            if let Some(full_key) = this.bridged_lookup_key(&id) {
+                                if let Ok(state) = this.state_store.get(&full_key).await {
+                                    return (id, Ok(State::from(state.as_ref().to_vec())));
+                                }
                             }
+                            // Local lookup miss → escalate via the
+                            // network-fallback helper (factored out so the
+                            // per-id branch logic is testable with a stubbed
+                            // fetcher). Mock executors that lack an
+                            // `op_manager` get the legacy MissingRelated.
+                            let outcome = fetch_related_via_network(this.op_manager.as_ref(), &id)
+                                .await
+                                .map(|state| State::from(state.as_ref().to_vec()));
+                            (id, outcome)
                         }
-                        // Local lookup miss → escalate via the
-                        // network-fallback helper (factored out so the
-                        // per-id branch logic is testable with a stubbed
-                        // fetcher). Mock executors that lack an
-                        // `op_manager` get the legacy MissingRelated.
-                        let outcome = fetch_related_via_network(this.op_manager.as_ref(), &id)
-                            .await
-                            .map(|state| State::from(state.as_ref().to_vec()));
-                        (id, outcome)
-                    }
-                }))
-                .await;
-            for (id, res) in results {
-                related_map.insert(id, Some(res?));
-            }
-            Ok::<(), ExecutorError>(())
-        };
+                    }))
+                    .await;
+                for (id, res) in results {
+                    related_map.insert(id, Some(res?));
+                }
+                Ok::<(), ExecutorError>(())
+            };
 
-        match tokio::time::timeout(RELATED_FETCH_TIMEOUT, fetch_all).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    contract = %key,
-                    error = %e,
-                    "Failed to fetch related contracts"
-                );
-                return Err(e);
-            }
-            Err(_elapsed) => {
-                tracing::warn!(
-                    contract = %key,
-                    timeout_secs = RELATED_FETCH_TIMEOUT.as_secs(),
-                    fetched = related_map.len(),
-                    total = unique_ids.len(),
-                    "Timed out fetching related contracts"
-                );
-                return Err(ExecutorError::request(StdContractError::Put {
-                    key: *key,
-                    cause: "timed out fetching related contracts".into(),
-                }));
+            match tokio::time::timeout(RELATED_FETCH_TIMEOUT, fetch_all).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        contract = %key,
+                        error = %e,
+                        "Failed to fetch related contracts"
+                    );
+                    return Err(e);
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        contract = %key,
+                        timeout_secs = RELATED_FETCH_TIMEOUT.as_secs(),
+                        fetched = related_map.len(),
+                        total = unique_ids.len(),
+                        "Timed out fetching related contracts"
+                    );
+                    return Err(ExecutorError::request(StdContractError::Put {
+                        key: *key,
+                        cause: "timed out fetching related contracts".into(),
+                    }));
+                }
             }
         }
 
-        // Merge initial_related (caller-provided) with newly fetched states.
-        // The contract's first call saw initial_related; the second call should see
-        // both the original entries and the newly fetched ones.
-        let initial_owned = initial_related.clone().into_owned();
+        // Merge initial_related (caller-provided) with the resolved states.
+        // The contract's first call saw initial_related; the second call should
+        // see both the original entries and the resolved ones. (Deferrable mode
+        // already inserted supplied states above; `or_insert` makes this a no-op
+        // there and only fills gaps for the non-deferrable fetch path.)
         for (id, state) in initial_owned.states() {
             if let Some(s) = state {
                 related_map
