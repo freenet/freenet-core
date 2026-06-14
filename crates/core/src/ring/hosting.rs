@@ -363,6 +363,12 @@ impl HostingManager {
         *self.storage.write() = Some(storage);
     }
 
+    /// Drop the storage reference so its redb `Database` clone is released.
+    /// Called on node shutdown to help free the on-disk file lock (issue #4401).
+    pub(crate) fn clear_storage(&self) {
+        *self.storage.write() = None;
+    }
+
     // =========================================================================
     // Pending Reclamation Retry Queue
     // =========================================================================

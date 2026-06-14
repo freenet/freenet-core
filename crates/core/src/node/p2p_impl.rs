@@ -39,6 +39,15 @@ pub(crate) struct NodeP2P {
     should_try_connect: bool,
     client_events_task: BoxFuture<'static, anyhow::Error>,
     contract_executor_task: BoxFuture<'static, anyhow::Error>,
+    /// Abort handles for the detached client-events and contract-executor tasks.
+    /// `run_node` selects on the tasks' result futures (which only *observe*
+    /// completion); aborting via these handles on the way out is what actually
+    /// stops the tasks, dropping their `op_manager` clones, the client
+    /// combinator (and with it the WebSocket server), and the contract
+    /// executor's redb `Database` handle. Without this, those tasks keep
+    /// running — and holding the redb file lock — after a graceful shutdown.
+    /// See issue #4401.
+    detached_task_aborts: Vec<tokio::task::AbortHandle>,
     initial_join_task: Option<JoinHandle<()>>,
     session_actor_task: JoinHandle<()>,
     result_router_task: JoinHandle<()>,
@@ -300,6 +309,27 @@ impl NodeP2P {
         session_abort.abort();
         router_abort.abort();
 
+        // Tear down the detached executor + client-events tasks (issue #4401).
+        //
+        // `deterministic_select!` above only *observed* one of these futures
+        // completing — the other detached tasks are still running on the
+        // process-wide `GlobalExecutor`. Until they stop they keep their
+        // `op_manager` clones, the client combinator (and the WebSocket
+        // `axum::serve` server it owns), and the contract executor's redb
+        // `Database` handle alive — so a graceful shutdown would leave the
+        // on-disk redb file locked and a stale WS server answering requests.
+        // Aborting them here, and clearing the ring's own redb references
+        // below, lets the file lock release once this node is dropped, which is
+        // what makes an in-process restart against the same data dir possible.
+        for abort in &self.detached_task_aborts {
+            abort.abort();
+        }
+        // Drop the ring's clones of the redb `Storage` handle so the only
+        // remaining references live in the (now-aborted) executor task. These
+        // are the hosting-metadata and broken-invariants persistence handles
+        // wired in `NetworkContractHandler::build`.
+        self.op_manager.ring.clear_redb_storage();
+
         // Emit peer shutdown event
         let (graceful, reason) = match &result {
             Ok(_) => (true, None),
@@ -475,7 +505,7 @@ impl NodeP2P {
             P2pConnManager::build(&config, op_manager.clone(), event_register).await?;
 
         let parent_span = tracing::Span::current();
-        let contract_executor_task = GlobalExecutor::spawn({
+        let contract_executor_handle = GlobalExecutor::spawn({
             let task = async move {
                 tracing::info!("Contract executor task starting");
                 let result = contract::contract_handling(
@@ -492,20 +522,24 @@ impl NodeP2P {
                 result
             };
             task.instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling"))
-        })
-        .map(|r| match r {
-            Ok(Err(e)) => anyhow::anyhow!("Error in contract handling task: {e}"),
-            Ok(Ok(_)) => anyhow::anyhow!("Contract handling task exited unexpectedly"),
-            Err(e) => anyhow::anyhow!(e),
-        })
-        .boxed();
+        });
+        // Retain the abort handle so shutdown can stop the executor task and
+        // drop its redb `Database` clone (issue #4401).
+        let contract_executor_abort = contract_executor_handle.abort_handle();
+        let contract_executor_task = contract_executor_handle
+            .map(|r| match r {
+                Ok(Err(e)) => anyhow::anyhow!("Error in contract handling task: {e}"),
+                Ok(Ok(_)) => anyhow::anyhow!("Contract handling task exited unexpectedly"),
+                Err(e) => anyhow::anyhow!(e),
+            })
+            .boxed();
         // Slot 0 = HTTP client API, Slot 1 = WebSocket proxy (from serve_client_api).
         let clients = ClientEventsCombinator::new(clients).with_slot_names(&["http", "websocket"]);
         // Create node controller channel with capacity for shutdown signal
         // We clone the sender to return it for external shutdown triggering
         let (node_controller_tx, node_controller_rx) = tokio::sync::mpsc::channel(1);
         let shutdown_tx = node_controller_tx.clone();
-        let client_events_task = GlobalExecutor::spawn({
+        let client_events_handle = GlobalExecutor::spawn({
             let op_manager_clone = op_manager.clone();
             let task = async move {
                 tracing::info!("Client events task starting");
@@ -520,12 +554,17 @@ impl NodeP2P {
                 result
             };
             task.instrument(tracing::info_span!(parent: parent_span, "client_event_handling"))
-        })
-        .map(|r| match r {
-            Ok(_) => anyhow::anyhow!("Client event handling task exited unexpectedly"),
-            Err(e) => anyhow::anyhow!(e),
-        })
-        .boxed();
+        });
+        // Retain the abort handle so shutdown can stop this task and drop the
+        // client combinator it owns — which in turn drops the WebSocket proxy
+        // and tears down the detached `axum::serve` server (issue #4401).
+        let client_events_abort = client_events_handle.abort_handle();
+        let client_events_task = client_events_handle
+            .map(|r| match r {
+                Ok(_) => anyhow::anyhow!("Client event handling task exited unexpectedly"),
+                Err(e) => anyhow::anyhow!(e),
+            })
+            .boxed();
 
         Ok((
             NodeP2P {
@@ -540,6 +579,7 @@ impl NodeP2P {
                 location: config.location,
                 client_events_task,
                 contract_executor_task,
+                detached_task_aborts: vec![client_events_abort, contract_executor_abort],
                 initial_join_task: None,
                 session_actor_task,
                 result_router_task,

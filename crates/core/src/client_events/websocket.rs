@@ -452,6 +452,15 @@ impl std::ops::Deref for WebSocketRequest {
 pub struct WebSocketProxy {
     proxy_server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
+    /// Abort guard for the detached `axum::serve` server task(s) and the
+    /// token-cleanup loop spawned by `serve_client_api_in_impl`. Held here so
+    /// that when the node tears down its client-events task (which owns this
+    /// proxy via the client combinator) those server tasks are aborted too,
+    /// freeing the bound ports on shutdown. See issue #4401.
+    ///
+    /// `None` for proxies created directly via `create_router*` in tests, where
+    /// no server task is spawned.
+    server_aborts: Option<crate::util::AbortOnDrop>,
 }
 
 /// Channel capacity for WebSocket client connections to the node event loop.
@@ -501,9 +510,17 @@ impl WebSocketProxy {
             WebSocketProxy {
                 proxy_server_request,
                 response_channels: HashMap::new(),
+                server_aborts: None,
             },
             router,
         )
+    }
+
+    /// Attach the abort guard for the detached server tasks so they are torn
+    /// down when this proxy is dropped (issue #4401).
+    pub(crate) fn with_server_aborts(mut self, aborts: crate::util::AbortOnDrop) -> Self {
+        self.server_aborts = Some(aborts);
+        self
     }
 
     /// Sets up a subscription notification channel and builds the `OpenRequest`.

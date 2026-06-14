@@ -286,6 +286,44 @@ where
     }
 }
 
+/// Aborts a set of spawned tasks when dropped.
+///
+/// Holds the [`AbortHandle`](tokio::task::AbortHandle)s of detached
+/// `GlobalExecutor::spawn` tasks (e.g. the WebSocket `axum::serve` server and
+/// its companion socket, plus the token-cleanup loop) so they are torn down
+/// when the owner is dropped, rather than leaking past a node's shutdown.
+///
+/// This is what makes graceful shutdown actually release resources held by
+/// fire-and-forget server tasks: the tasks keep their own `op_manager` /
+/// listener / redb references alive for as long as they run, so dropping their
+/// only handle is not enough — the handle does not abort the task on drop.
+/// Aborting on drop does. See issue #4401.
+#[derive(Default)]
+pub(crate) struct AbortOnDrop {
+    handles: Vec<tokio::task::AbortHandle>,
+}
+
+impl AbortOnDrop {
+    pub(crate) fn new() -> Self {
+        Self {
+            handles: Vec::new(),
+        }
+    }
+
+    /// Track a task's abort handle so it is aborted when `self` is dropped.
+    pub(crate) fn push(&mut self, handle: tokio::task::AbortHandle) {
+        self.handles.push(handle);
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use tempfile::TempDir;
