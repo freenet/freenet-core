@@ -64,7 +64,17 @@ const MAX_DELEGATE_DRAIN_BATCH: usize = 16;
 /// (The separate 120s `SUB_OP_FETCH_TIMEOUT` in `local_state_or_from_network`
 /// is on the `OperationMode::Local`-only GET path, NOT on the serial loop's
 /// `upsert_contract_state` path, so it is unrelated to this fix and unchanged.)
-const DEFERRED_RELATED_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Upper bound on the OFF-LOOP related-contract fetch. The fetch runs in a
+/// spawned waiter task (NOT on the serial `contract_handling` loop), so it does
+/// not block other contract ops — there is therefore no reason to cut it shorter
+/// than the GET sub-op's own budget. `start_sub_op_get` self-terminates at
+/// `OPERATION_TTL` (60s); this is that budget plus a small margin so the GET's
+/// own outcome (including a successful late Found) wins over this backstop. An
+/// earlier 10s value (inherited from the inline-fetch era, where a shorter cap
+/// kept the loop from stalling) prematurely failed slow-but-successful related
+/// GETs on lossy/cross-node paths — the exact #4391 / freenet-mail scenario.
+const DEFERRED_RELATED_FETCH_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(crate::config::OPERATION_TTL.as_secs() + 2);
 
 /// Maximum number of PUT/UPDATE operations that may have an in-flight
 /// off-loop related-contract fetch at once.
@@ -94,7 +104,8 @@ const MAX_RESUME_DRAIN_BATCH: usize = 16;
 /// WASM stays serial) with `fetched` supplied, then answers the stashed client
 /// responder. See issue #4391.
 struct DeferredResume {
-    /// Key into the loop's stashed-responder map (and the inflight set).
+    /// Key into the loop's stashed-responder map (which doubles as the
+    /// in-flight-deferral accounting for the `MAX_INFLIGHT_DEFERRALS` cap).
     deferral_id: u64,
     /// The contract being PUT/UPDATEd.
     key: ContractKey,
@@ -119,14 +130,15 @@ struct DeferredResume {
 /// This is the load-bearing invariant of the #4391 deferral lifecycle: because
 /// every deferral is answered by exactly one resume, the loop never needs a TTL
 /// sweep to recover a wedged waiter, and `handle_deferred_resume` never needs a
-/// stale-resume guard (a resume is always for the live, still-blocked deferral).
+/// stale-resume guard (a resume is always for the live deferral identified by
+/// its unique `deferral_id`).
 ///
 /// - On the success path the waiter calls [`send`](Self::send) with the real
 ///   fetch result; this takes the payload so `Drop` becomes a no-op.
 /// - On any early exit (drop / panic / cancellation) before `send`, `Drop`
 ///   delivers a terminal resume carrying a `MissingRelated` fetch error, which
-///   `handle_deferred_resume` surfaces to the client and uses to release the
-///   contract's per-contract block.
+///   `handle_deferred_resume` surfaces to the client (answering the parked
+///   responder exactly once).
 ///
 /// Exactly once: never zero (Drop covers the early-exit path), never twice (the
 /// success send `take`s the payload, so Drop sees `None` and does nothing).
@@ -202,14 +214,15 @@ impl Drop for ResumeGuard {
     fn drop(&mut self) {
         // Early exit before `send` (waiter dropped / panicked / cancelled):
         // deliver a terminal MissingRelated resume so the deferral is still
-        // answered exactly once and its per-contract block is released.
+        // answered exactly once (the parked client responder gets a response
+        // instead of hanging).
         if let Some(p) = self.payload.take() {
             let key_id = *p.key.id();
             tracing::warn!(
                 contract = %p.key,
                 deferral_id = p.deferral_id,
                 "Off-loop waiter dropped before sending — delivering MissingRelated \
-                 resume so the deferral terminates and its block is released (#4391)"
+                 resume so the deferral terminates and the client is answered (#4391)"
             );
             Self::deliver(p, Err(ExecutorError::missing_related(key_id)));
         }
@@ -3268,6 +3281,124 @@ mod hol_4391_tests {
             }
             other => panic!("expected PutResponse for A, got {other}"),
         }
+
+        set_off_loop_fetch_override(None);
+        handle.abort();
+    }
+
+    /// The OFF-LOOP related fetch must not be cut shorter than the GET sub-op's
+    /// own budget. The fetch runs in a spawned waiter (not on the serial loop),
+    /// so a short cap no longer serves a "don't stall the loop" purpose; an
+    /// inline-era 10s value prematurely failed slow-but-successful related GETs
+    /// on lossy/cross-node paths — the exact #4391 / freenet-mail scenario.
+    #[test]
+    fn off_loop_related_fetch_budget_is_at_least_operation_ttl() {
+        assert!(
+            DEFERRED_RELATED_FETCH_TIMEOUT >= crate::config::OPERATION_TTL,
+            "off-loop related-fetch budget {:?} must be >= GET OPERATION_TTL {:?} \
+             so a slow-but-successful related GET is not failed prematurely (#4391)",
+            DEFERRED_RELATED_FETCH_TIMEOUT,
+            crate::config::OPERATION_TTL,
+        );
+    }
+
+    /// Round 5 (no FIFO block): TWO same-key PUTs can both defer CONCURRENTLY
+    /// (the stash is keyed by unique `deferral_id`, not by contract key), and
+    /// BOTH clients must receive their own response — neither responder is lost
+    /// or evicted by the other. This is the headline behavior the per-contract
+    /// FIFO deletion enables; the deleted machinery used to serialize same-key
+    /// ops, which would have masked a lost-responder bug class. (#4391)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_same_key_deferrals_both_clients_answered() {
+        let _guard = TEST_GUARD.lock().await;
+
+        let key_seed = b"concurrent_a";
+        let key_a = make_contract(key_seed).key();
+        let id_b = *make_contract(b"concurrent_b").key().id();
+        let b_state = WrappedState::new(b"concurrent_b_state".to_vec());
+
+        let (handler, send) = build_handler(vec![(
+            *key_a.id(),
+            ValidateOverride::RequestRelated(vec![id_b]),
+        )])
+        .await;
+
+        // Off-loop fetch returns B's state, gated by a semaphore so BOTH PUTs
+        // park before either resumes — two same-key deferrals live at once.
+        // (A semaphore avoids the Notify registration race for two waiters.)
+        let sem = Arc::new(tokio::sync::Semaphore::new(0));
+        let sem_for_stub = sem.clone();
+        let b_for_stub = b_state.clone();
+        set_off_loop_fetch_override(Some(Arc::new(move |missing| {
+            let sem = sem_for_stub.clone();
+            let b = b_for_stub.clone();
+            Box::pin(async move {
+                let _permit = sem.acquire_owned().await.expect("sem open");
+                Ok(vec![(missing[0], b.clone())])
+            })
+        })));
+
+        let send = Arc::new(send);
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            crate::contract::user_input::AutoApprovePrompter,
+        ));
+
+        // Fire TWO same-key PUTs; each defers and parks its own responder.
+        let send1 = send.clone();
+        let contract1 = make_contract(key_seed);
+        let put1 = GlobalExecutor::spawn(async move {
+            send1
+                .send_to_handler(ContractHandlerEvent::PutQuery {
+                    key: contract1.key(),
+                    state: WrappedState::new(b"a_state_1".to_vec()),
+                    related_contracts: RelatedContracts::default(),
+                    contract: Some(contract1),
+                })
+                .await
+        });
+        let send2 = send.clone();
+        let contract2 = make_contract(key_seed);
+        let put2 = GlobalExecutor::spawn(async move {
+            send2
+                .send_to_handler(ContractHandlerEvent::PutQuery {
+                    key: contract2.key(),
+                    state: WrappedState::new(b"a_state_2".to_vec()),
+                    related_contracts: RelatedContracts::default(),
+                    contract: Some(contract2),
+                })
+                .await
+        });
+
+        // Let the loop pick up both PUTs and enter the deferral path for each.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Release BOTH parked fetches at once.
+        sem.add_permits(2);
+
+        // BOTH clients must be answered (neither responder lost) — the core
+        // invariant of deferral_id-keyed stashing. (We assert each gets a
+        // PutResponse, not a specific Ok/Err, so the test is robust to the
+        // mock's merge semantics; the lost-responder failure class would show
+        // up as one of these hanging.)
+        let r1 = tokio::time::timeout(Duration::from_secs(5), put1)
+            .await
+            .expect("put1 must not hang")
+            .expect("put1 join")
+            .expect("put1 responds");
+        let r2 = tokio::time::timeout(Duration::from_secs(5), put2)
+            .await
+            .expect("put2 must not hang")
+            .expect("put2 join")
+            .expect("put2 responds");
+        assert!(
+            matches!(r1, ContractHandlerEvent::PutResponse { .. }),
+            "put1 client must get its own PutResponse, got {r1}"
+        );
+        assert!(
+            matches!(r2, ContractHandlerEvent::PutResponse { .. }),
+            "put2 client must get its own PutResponse, got {r2}"
+        );
 
         set_off_loop_fetch_override(None);
         handle.abort();

@@ -230,9 +230,9 @@ impl StashedResponder {
     }
 
     /// Construct a `StashedResponder` directly from a oneshot sender, for unit
-    /// tests of the deferral machinery (e.g. the TTL sweep) that need to
-    /// observe the response a stranded client receives without standing up the
-    /// full channel + loop.
+    /// tests of the deferral machinery (e.g. the drop-guard delivering a
+    /// `MissingRelated` resume) that need to observe the response a stranded
+    /// client receives without standing up the full channel + loop.
     #[cfg(test)]
     pub(crate) fn for_test(
         id: u64,
