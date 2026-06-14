@@ -20,7 +20,7 @@ The Freenet transport layer provides low-level network communication over UDP wi
 | cwnd Enforcement | ✅ Complete | Week 4 |
 | Bandwidth Configuration | ✅ Complete | Week 4 |
 | Global Bandwidth Pool | ✅ Complete | Week 5 |
-| Streaming Infrastructure (Phase 1) | ✅ Complete | Week 6 |
+| Streaming Infrastructure | ✅ Complete | Week 6 |
 | LEDBAT++ (draft-irtf-iccrg-ledbat-plus-plus) | ✅ Complete | Week 7 |
 
 ## Document Map
