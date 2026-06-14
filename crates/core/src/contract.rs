@@ -121,6 +121,110 @@ struct DeferredResume {
     fetched: Result<Vec<(ContractInstanceId, WrappedState)>, ExecutorError>,
 }
 
+/// RAII guard that guarantees the off-loop waiter delivers EXACTLY ONE terminal
+/// [`DeferredResume`] for its deferral — whether the fetch completes, or the
+/// waiter task is dropped/panics/cancelled before sending.
+///
+/// This is the load-bearing invariant of the #4391 deferral lifecycle: because
+/// every deferral is answered by exactly one resume, the loop never needs a TTL
+/// sweep to recover a wedged waiter, and `handle_deferred_resume` never needs a
+/// stale-resume guard (a resume is always for the live, still-blocked deferral).
+///
+/// - On the success path the waiter calls [`send`](Self::send) with the real
+///   fetch result; this takes the payload so `Drop` becomes a no-op.
+/// - On any early exit (drop / panic / cancellation) before `send`, `Drop`
+///   delivers a terminal resume carrying a `MissingRelated` fetch error, which
+///   `handle_deferred_resume` surfaces to the client and uses to release the
+///   contract's per-contract block.
+///
+/// Exactly once: never zero (Drop covers the early-exit path), never twice (the
+/// success send `take`s the payload, so Drop sees `None` and does nothing).
+///
+/// The resume channel is unbounded, so both sends are non-blocking
+/// `unbounded_send` (no `.await`, no back-pressure). A send failure means the
+/// loop has shut down — nothing left to answer.
+struct ResumeGuard {
+    /// `None` once a resume has been sent (success or drop). Holds everything a
+    /// [`DeferredResume`] needs except its `fetched` result.
+    payload: Option<ResumePayload>,
+}
+
+struct ResumePayload {
+    resume_tx: tokio::sync::mpsc::UnboundedSender<DeferredResume>,
+    deferral_id: u64,
+    key: ContractKey,
+    update: Either<WrappedState, StateDelta<'static>>,
+    related_contracts: RelatedContracts<'static>,
+    code: Option<ContractContainer>,
+    is_put: bool,
+}
+
+impl ResumeGuard {
+    fn new(payload: ResumePayload) -> Self {
+        Self {
+            payload: Some(payload),
+        }
+    }
+
+    /// Deliver the terminal resume with the real fetch result. Consumes the
+    /// payload so a subsequent `Drop` is a no-op (exactly-once).
+    fn send(mut self, fetched: Result<Vec<(ContractInstanceId, WrappedState)>, ExecutorError>) {
+        if let Some(p) = self.payload.take() {
+            Self::deliver(p, fetched);
+        }
+    }
+
+    fn deliver(
+        p: ResumePayload,
+        fetched: Result<Vec<(ContractInstanceId, WrappedState)>, ExecutorError>,
+    ) {
+        let ResumePayload {
+            resume_tx,
+            deferral_id,
+            key,
+            update,
+            related_contracts,
+            code,
+            is_put,
+        } = p;
+        if resume_tx
+            .send(DeferredResume {
+                deferral_id,
+                key,
+                update,
+                related_contracts,
+                code,
+                is_put,
+                fetched,
+            })
+            .is_err()
+        {
+            tracing::debug!(
+                contract = %key,
+                "Deferred resume channel closed; contract-handling loop gone"
+            );
+        }
+    }
+}
+
+impl Drop for ResumeGuard {
+    fn drop(&mut self) {
+        // Early exit before `send` (waiter dropped / panicked / cancelled):
+        // deliver a terminal MissingRelated resume so the deferral is still
+        // answered exactly once and its per-contract block is released.
+        if let Some(p) = self.payload.take() {
+            let key_id = *p.key.id();
+            tracing::warn!(
+                contract = %p.key,
+                deferral_id = p.deferral_id,
+                "Off-loop waiter dropped before sending — delivering MissingRelated \
+                 resume so the deferral terminates and its block is released (#4391)"
+            );
+            Self::deliver(p, Err(ExecutorError::missing_related(key_id)));
+        }
+    }
+}
+
 /// Outcome of attempting to hold a same-key event behind an in-flight deferral.
 enum HoldOutcome {
     /// The event was held behind the deferral (FIFO).
@@ -135,17 +239,11 @@ enum HoldOutcome {
 /// Bookkeeping for one contract whose PUT/UPDATE has an in-flight off-loop
 /// related-contract fetch. While this entry exists, the loop HOLDS every other
 /// event for the same contract (per-contract FIFO), releasing them only when
-/// the deferral commits, fails, or times out. See issue #4391.
+/// the deferral's (guaranteed exactly-one) resume runs. See issue #4391.
 struct DeferralEntry {
     /// `deferral_id` of the in-flight op (links to the stashed responder).
+    /// Used to assert the resume is for this live deferral (#4391 invariant).
     deferral_id: u64,
-    /// `true` if the deferred op was a PUT (build `PutResponse` on timeout),
-    /// `false` for UPDATE (`UpdateResponse`). Carried so the TTL sweep answers
-    /// the stranded client with the correct response variant.
-    is_put: bool,
-    /// `init_tracker::now_nanos()` (deterministic `tokio::time::Instant`) when
-    /// the deferral started — drives the TTL sweep.
-    started_nanos: u64,
     /// Same-key events that arrived while this contract was deferred, kept in
     /// FIFO arrival order. Re-queued ahead of fresh events when the deferral
     /// releases.
@@ -221,19 +319,11 @@ impl DeferralCtx {
 
     /// Mark `contract_id` as having an in-flight deferral so its later events
     /// are held until the deferral resolves.
-    fn block_key(
-        &mut self,
-        contract_id: ContractInstanceId,
-        deferral_id: u64,
-        is_put: bool,
-        now_nanos: u64,
-    ) {
+    fn block_key(&mut self, contract_id: ContractInstanceId, deferral_id: u64) {
         self.deferred_keys.insert(
             contract_id,
             DeferralEntry {
                 deferral_id,
-                is_put,
-                started_nanos: now_nanos,
                 held: std::collections::VecDeque::new(),
             },
         );
@@ -995,20 +1085,6 @@ where
     let mut deferral_ctx = DeferralCtx::new(resume_tx);
 
     loop {
-        // Sweep deferrals whose off-loop fetch never reported (waiter task
-        // wedged/dropped): answer their stranded clients with MissingRelated,
-        // release their per-contract block, and re-queue / backpressure their
-        // held events so the contract isn't wedged forever. TTL-bounded per
-        // AGENTS.md "cleanup exemptions MUST be time-bounded".
-        let now = executor::now_nanos();
-        sweep_stale_deferrals(
-            &mut contract_handler,
-            &mut deferral_ctx,
-            &mut fair_queue,
-            now,
-        )
-        .await;
-
         // Drain resumed (deferred) upserts so a completed off-loop fetch is
         // applied promptly and its client answered, ahead of new queued work —
         // but cap the batch (each resume is a full WASM upsert) and interleave
@@ -1120,9 +1196,6 @@ where
             notification = recv_delegate_notification(&mut delegate_rx) => {
                 handle_delegate_notification(&mut contract_handler, notification, &prompter).await;
             }
-            // A held deferral could time out while we're otherwise idle; wake
-            // periodically to run the TTL sweep even when no events arrive.
-            _ = tokio::time::sleep(DEFERRED_RELATED_FETCH_TIMEOUT), if !deferral_ctx.deferred_keys.is_empty() => {}
         }
     }
 }
@@ -1167,76 +1240,6 @@ fn pop_runnable_event(
         }
     }
     RunnableEvent::None
-}
-
-/// Answer and release any deferral whose off-loop fetch never reported within
-/// [`DEFERRED_RELATED_FETCH_TIMEOUT`]. Without this, a waiter task that wedged
-/// or was dropped would leak its stashed responder (client hangs) AND leave the
-/// contract permanently blocked; once `MAX_INFLIGHT_DEFERRALS` leak,
-/// `at_capacity()` is permanently true and the off-loading silently disables
-/// itself. See issue #4391 and AGENTS.md (cleanup exemptions must be
-/// time-bounded).
-/// `now_nanos` is injected (rather than read from `executor::now_nanos()`
-/// internally) so the sweep is deterministically unit-testable. The loop call
-/// site passes `executor::now_nanos()`.
-async fn sweep_stale_deferrals<CH>(
-    contract_handler: &mut CH,
-    deferral_ctx: &mut DeferralCtx,
-    fair_queue: &mut fair_queue::FairEventQueue,
-    now_nanos: u64,
-) where
-    CH: ContractHandler + Send + 'static,
-{
-    if deferral_ctx.deferred_keys.is_empty() {
-        return;
-    }
-    let ttl_nanos = DEFERRED_RELATED_FETCH_TIMEOUT.as_nanos() as u64;
-    // Stale if it has out-lived 2× the fetch timeout — well past when the
-    // waiter should have reported (the waiter itself times out at 1×).
-    let stale: Vec<(ContractInstanceId, u64, bool)> = deferral_ctx
-        .deferred_keys
-        .iter()
-        .filter(|(_, e)| now_nanos.saturating_sub(e.started_nanos) >= ttl_nanos.saturating_mul(2))
-        .map(|(k, e)| (*k, e.deferral_id, e.is_put))
-        .collect();
-    for (contract_id, deferral_id, is_put) in stale {
-        tracing::warn!(
-            contract = %contract_id,
-            deferral_id,
-            "Deferred related-contract fetch never reported within TTL — \
-             answering client with MissingRelated and releasing the contract"
-        );
-        if let Some(responder) = deferral_ctx.stashed.remove(&deferral_id) {
-            let err = ExecutorError::missing_related(contract_id);
-            // Answer with the variant matching the original op so the client
-            // sees a well-formed terminal response (not a PUT response for an
-            // UPDATE op). A wedged waiter is a node-internal fault, not a
-            // normal path; the client surfaces an error and may retry.
-            let response = if is_put {
-                ContractHandlerEvent::PutResponse {
-                    new_value: Err(err),
-                    state_changed: false,
-                }
-            } else {
-                ContractHandlerEvent::UpdateResponse {
-                    new_value: Err(err),
-                    state_changed: false,
-                }
-            };
-            // Client may have disconnected; non-fatal.
-            if responder.respond(response).is_err() {
-                tracing::debug!(
-                    contract = %contract_id,
-                    "Stale-deferral client already disconnected"
-                );
-            }
-        }
-        // Release the swept deferral's block and re-queue its held events at the
-        // FRONT (per-contract FIFO); answer any that don't fit with backpressure
-        // so their waiting_response slots aren't leaked.
-        let rejected = requeue_released_events(deferral_ctx.release_key(&contract_id), fair_queue);
-        answer_rejected_held_events(contract_handler, rejected).await;
-    }
 }
 
 /// Re-enqueue the events that were held behind a now-released deferral, at the
@@ -1314,36 +1317,26 @@ where
         fetched,
     } = resume;
 
-    // STALE-RESUME GUARD (#4391 round-3): only act if THIS deferral still owns
-    // the contract's block. Two stale cases must be skipped entirely:
-    //   * The entry is absent → the TTL sweep already answered this client and
-    //     released the block. Acting now would re-run a stale upsert and (since
-    //     `release_key` is keyed by contract, not deferral_id) is a no-op on the
-    //     map but the upsert/commit would still be stale.
-    //   * The entry exists but a DIFFERENT deferral_id owns it → a newer
-    //     deferral D2 took the key after this one (D1) was swept and a held
-    //     event re-deferred. Running D1's stale upsert would commit older data,
-    //     and `release_key` would remove D2's LIVE block (breaking FIFO).
-    // In both cases the client was already answered by the sweep, so we drop
-    // D1's resume without touching the executor, the block, or held events.
-    let owns_block = deferral_ctx
-        .deferred_keys
-        .get(key.id())
-        .is_some_and(|e| e.deferral_id == deferral_id);
-    if !owns_block {
-        tracing::debug!(
-            contract = %key,
-            deferral_id,
-            "Dropping stale deferred resume — its block was swept or a newer \
-             deferral owns the key (#4391)"
-        );
-        // The stashed responder, if any, was already removed+answered by the
-        // sweep; remove defensively in case of an unexpected duplicate.
-        deferral_ctx.stashed.remove(&deferral_id);
-        return Ok(());
-    }
-
-    // We own the block; reclaim the parked client responder.
+    // INVARIANT (#4391 round-4): every deferral receives EXACTLY ONE resume (the
+    // `ResumeGuard` guarantees delivery even if the waiter is dropped), and a
+    // contract's per-contract block is released ONLY by its own resume here. A
+    // second deferral for the same key cannot form while the key is blocked,
+    // because `pop_runnable_event` HOLDS that key's events instead of running
+    // them (so no new PUT/UPDATE for the key reaches `maybe_defer_upsert` to
+    // create one). Therefore, when this resume arrives, `deferred_keys[key]` is
+    // present and is THIS deferral's entry — there is no swept case and no
+    // newer-deferral case, so no stale-resume guard is needed.
+    //
+    // The stashed responder may legitimately be `None` only if the client
+    // disconnected (its receiver dropped); we still run the upsert for its side
+    // effects and release the block below.
+    debug_assert!(
+        deferral_ctx
+            .deferred_keys
+            .get(key.id())
+            .is_some_and(|e| e.deferral_id == deferral_id),
+        "resume must be for the live, still-blocked deferral (#4391 invariant)"
+    );
     let responder = deferral_ctx.stashed.remove(&deferral_id);
     if responder.is_none() {
         tracing::debug!(contract = %key, "Deferred resume has no stashed responder");
@@ -1551,10 +1544,10 @@ where
     deferral.stashed.insert(deferral_id, responder);
     // Block this contract's subsequent events until the deferral resolves, so a
     // later same-key GET/UPDATE can't run (and see MissingContract/stale state)
-    // before the deferred upsert commits. The block's lifetime is tied to the
-    // stashed responder: released on resume (`handle_deferred_resume`) or on TTL
-    // timeout (`sweep_stale_deferrals`). (#4391 per-contract FIFO.)
-    deferral.block_key(*key.id(), deferral_id, is_put, executor::now_nanos());
+    // before the deferred upsert commits. The block is released ONLY by this
+    // deferral's resume in `handle_deferred_resume`, which is guaranteed to run
+    // exactly once by the `ResumeGuard` below. (#4391 per-contract FIFO.)
+    deferral.block_key(*key.id(), deferral_id);
 
     let op_manager = contract_handler.executor().op_manager_handle();
     let resume_tx = deferral.resume_tx.clone();
@@ -1566,34 +1559,27 @@ where
         "Off-loading related-contract fetch from the contract-handling loop (#4391)"
     );
 
-    // Spawn the off-loop waiter. It drives the related GET(s), then sends a
-    // DeferredResume back to the loop. Fire-and-forget is acceptable per
-    // code-style.md ("short-lived work"): the task is bounded by
-    // MAX_INFLIGHT_DEFERRALS, self-terminates at DEFERRED_RELATED_FETCH_TIMEOUT,
-    // and the loop's `sweep_stale_deferrals` answers + releases any deferral
-    // whose waiter never reports — so a dropped/wedged waiter cannot leak the
-    // stashed responder or permanently wedge the contract.
+    // Spawn the off-loop waiter. It drives the related GET(s), then delivers a
+    // DeferredResume back to the loop via the `ResumeGuard`. Fire-and-forget is
+    // acceptable per code-style.md ("short-lived work"): the task is bounded by
+    // MAX_INFLIGHT_DEFERRALS and self-terminates at DEFERRED_RELATED_FETCH_TIMEOUT.
+    // The `ResumeGuard` guarantees EXACTLY ONE terminal resume even if the task
+    // is dropped/panics before sending (its Drop delivers a MissingRelated
+    // resume) — so a wedged/dropped waiter cannot leak the stashed responder or
+    // permanently wedge the contract. This exactly-once delivery is what lets
+    // the loop omit the old TTL sweep and the stale-resume guard entirely.
+    let guard = ResumeGuard::new(ResumePayload {
+        resume_tx,
+        deferral_id,
+        key,
+        update,
+        related_contracts,
+        code,
+        is_put,
+    });
     GlobalExecutor::spawn(async move {
         let fetched = fetch_related_off_loop(op_manager, missing).await;
-        // Non-blocking send on an unbounded channel; if it fails the loop has
-        // shut down and the client will time out (same as the legacy path).
-        if resume_tx
-            .send(DeferredResume {
-                deferral_id,
-                key,
-                update,
-                related_contracts,
-                code,
-                is_put,
-                fetched,
-            })
-            .is_err()
-        {
-            tracing::debug!(
-                contract = %key,
-                "Deferred resume channel closed; contract-handling loop gone"
-            );
-        }
+        guard.send(fetched);
     });
 
     DeferStep::Deferred
@@ -4596,7 +4582,7 @@ mod hol_4391_tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut ctx = DeferralCtx::new(tx);
         let k = instance_id(b"held_cap_k");
-        ctx.block_key(k, 1, true, 0);
+        ctx.block_key(k, 1);
 
         for i in 0..MAX_HELD_PER_DEFERRAL as u64 {
             match ctx.hold_event(k, handler::EventId { id: i }, get_event(k)) {
@@ -4624,105 +4610,113 @@ mod hol_4391_tests {
         }
     }
 
-    /// MUST-FIX #4 (unit): the TTL sweep answers a stale deferral's client with
-    /// the correct response variant, releases its block, re-queues its held
-    /// event, and does NOT sweep a fresh (age < 2×TTL) entry.
+    /// Round-4 (unit): the `ResumeGuard` delivers a terminal MissingRelated
+    /// resume when the off-loop waiter is DROPPED before sending (task
+    /// cancelled / panicked). Driving that resume through `handle_deferred_resume`
+    /// must answer the client (MissingRelated), release the per-contract block,
+    /// and re-queue the held same-key events — i.e. the wedge-prevention now
+    /// comes from the drop-guard, NOT a TTL sweep.
     #[tokio::test]
-    async fn sweep_releases_stale_answers_client_and_requeues_held() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut ctx = DeferralCtx::new(tx);
+    async fn dropped_waiter_guard_answers_client_and_releases_block() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DeferredResume>();
+        let mut ctx = DeferralCtx::new(tx.clone());
         let mut handler =
-            MockWasmContractHandler::new_test(handler::contract_handler_channel().1, None, "sweep")
+            MockWasmContractHandler::new_test(handler::contract_handler_channel().1, None, "drop")
                 .await;
         let mut fq = fair_queue::FairEventQueue::new();
 
-        let ttl = DEFERRED_RELATED_FETCH_TIMEOUT.as_nanos() as u64;
+        let contract = make_contract(b"drop_guard_k");
+        let key = contract.key();
 
-        // STALE deferral (started at t=0), an UPDATE op, with one held event.
-        let stale_key = instance_id(b"sweep_stale");
-        ctx.block_key(stale_key, 1, /* is_put */ false, 0);
+        // Set up the loop-side state for an in-flight deferral: stash the client
+        // responder, block the key, and hold a same-key event.
+        ctx.block_key(*key.id(), 7);
         let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         ctx.stashed
-            .insert(1, StashedResponder::for_test(1, resp_tx));
-        let _ = ctx.hold_event(stale_key, handler::EventId { id: 50 }, get_event(stale_key));
+            .insert(7, StashedResponder::for_test(7, resp_tx));
+        let _ = ctx.hold_event(*key.id(), handler::EventId { id: 50 }, get_event(*key.id()));
 
-        // FRESH deferral (started recently) — must NOT be swept.
-        let fresh_key = instance_id(b"sweep_fresh");
-        let fresh_started = ttl * 2; // so at now below, age = 1 < 2*ttl
-        ctx.block_key(fresh_key, 2, true, fresh_started);
+        // Build the waiter's guard and DROP it WITHOUT calling `send` (simulating
+        // the waiter task being cancelled/dropped before the fetch reports).
+        {
+            let guard = ResumeGuard::new(ResumePayload {
+                resume_tx: tx,
+                deferral_id: 7,
+                key,
+                update: Either::Left(WrappedState::new(vec![1])),
+                related_contracts: RelatedContracts::default(),
+                code: Some(contract),
+                is_put: true,
+            });
+            drop(guard);
+        }
 
-        // Sweep at now = 2*ttl + 1: the stale entry (age 2*ttl+1) is swept; the
-        // fresh entry (age 1) is not.
-        let now = ttl * 2 + 1;
-        sweep_stale_deferrals(&mut handler, &mut ctx, &mut fq, now).await;
-
-        // (a) stale key released; (b) its held event requeued.
+        // The guard's Drop must have delivered exactly one terminal resume.
+        let resume = rx.try_recv().expect("Drop must deliver one resume");
+        assert_eq!(resume.deferral_id, 7);
         assert!(
-            !ctx.is_key_deferred(&stale_key),
-            "stale deferral must be released"
+            resume.fetched.is_err(),
+            "dropped-waiter resume must carry a MissingRelated fetch error"
+        );
+        assert!(rx.try_recv().is_err(), "exactly one resume — no extra");
+
+        // Process it on the loop: client answered (PUT error), block released,
+        // held event re-queued.
+        handle_deferred_resume(&mut handler, &mut ctx, &mut fq, resume)
+            .await
+            .expect("resume handled");
+
+        assert!(
+            !ctx.is_key_deferred(key.id()),
+            "the dropped deferral's block must be released"
         );
         assert_eq!(
             fq.pop().map(|(id, _)| id.id),
             Some(50),
-            "the stale deferral's held event must be re-queued"
+            "the held same-key event must be re-queued"
         );
-
-        // (c) client answered with an UpdateResponse error (matching is_put=false).
-        let (_id, ev) = resp_rx.await.expect("stale client must be answered");
+        let (_id, ev) = resp_rx.await.expect("client must be answered");
         match ev {
-            ContractHandlerEvent::UpdateResponse { new_value, .. } => {
-                assert!(new_value.is_err(), "swept UPDATE must surface an error");
+            ContractHandlerEvent::PutResponse { new_value, .. } => {
+                assert!(
+                    new_value.is_err(),
+                    "dropped-waiter PUT must surface MissingRelated"
+                );
             }
-            other => panic!("expected UpdateResponse for swept UPDATE op, got {other}"),
+            other => panic!("expected PutResponse error, got {other}"),
         }
-
-        // (d) fresh entry survives.
-        assert!(
-            ctx.is_key_deferred(&fresh_key),
-            "a fresh deferral (age < 2×TTL) must NOT be swept"
-        );
     }
 
-    /// MUST-FIX #3 (unit): a stale resume whose deferral_id no longer owns the
-    /// key (a newer deferral took over) is DROPPED — it must not release the
-    /// newer deferral's block.
+    /// Round-4 (unit): the success path delivers EXACTLY ONE resume — the
+    /// explicit `send` consumes the payload, so the guard's `Drop` is a no-op
+    /// (never a double-send).
     #[tokio::test]
-    async fn stale_resume_does_not_release_newer_deferral_block() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut ctx = DeferralCtx::new(tx);
-        let mut fq = fair_queue::FairEventQueue::new();
-        let mut handler =
-            MockWasmContractHandler::new_test(handler::contract_handler_channel().1, None, "stale")
-                .await;
+    async fn resume_guard_success_sends_exactly_one_resume() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DeferredResume>();
+        let key = make_contract(b"once_k").key();
 
-        let contract = make_contract(b"stale_resume_k");
-        let key = contract.key();
-
-        // D2 (the LIVE deferral) currently owns the key, deferral_id = 2.
-        ctx.block_key(*key.id(), 2, true, 0);
-
-        // D1's late resume arrives with deferral_id = 1 (already swept/superseded).
-        let stale_resume = DeferredResume {
-            deferral_id: 1,
+        let guard = ResumeGuard::new(ResumePayload {
+            resume_tx: tx,
+            deferral_id: 3,
             key,
             update: Either::Left(WrappedState::new(vec![1])),
             related_contracts: RelatedContracts::default(),
-            code: Some(contract),
-            is_put: true,
-            fetched: Ok(vec![]),
-        };
+            code: None,
+            is_put: false,
+        });
+        // Success send, then the guard is dropped at end of scope.
+        guard.send(Ok(vec![]));
 
-        handle_deferred_resume(&mut handler, &mut ctx, &mut fq, stale_resume)
-            .await
-            .expect("stale resume handled");
-
-        // D2's block must SURVIVE (the stale D1 resume must not release it).
+        let resume = rx.try_recv().expect("success path must deliver one resume");
+        assert_eq!(resume.deferral_id, 3);
         assert!(
-            ctx.is_key_deferred(key.id()),
-            "stale resume must NOT release the newer deferral's block (#4391 MUST-FIX #3)"
+            resume.fetched.is_ok(),
+            "success resume must carry the real fetch result"
         );
-        let entry = ctx.deferred_keys.get(key.id()).expect("D2 still present");
-        assert_eq!(entry.deferral_id, 2, "the live deferral (D2) must remain");
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly one resume — Drop must NOT send again after a success send"
+        );
     }
 
     /// SHOULD-FIX (unit): with no op_manager, the real `fetch_related_off_loop`

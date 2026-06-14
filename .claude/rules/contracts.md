@@ -276,7 +276,11 @@ MUST:
     loop; only the network WAIT moves off-loop. While a contract has an
     in-flight deferral the loop HOLDS that contract's later events to
     preserve per-contract FIFO; the block is released (and held events
-    re-queued at the FRONT) on resume or on a TTL sweep.
+    re-queued at the FRONT) by the deferral's resume. The off-loop waiter
+    delivers EXACTLY ONE resume via an RAII `ResumeGuard` (Drop delivers a
+    MissingRelated resume if the task is dropped before sending), so every
+    deferral terminates with exactly one client answer — no TTL sweep or
+    stale-resume guard is needed.
 ```
 
 ### WHEN a contract's validate_state returns RequestRelated
