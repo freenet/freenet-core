@@ -10,6 +10,7 @@
 //! drivers consume them.
 
 pub(crate) mod op_ctx_task;
+pub(crate) mod pending_broadcast;
 pub(crate) mod propagation_stats;
 
 use freenet_stdlib::prelude::*;

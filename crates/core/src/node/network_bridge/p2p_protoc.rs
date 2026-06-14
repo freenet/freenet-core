@@ -2255,12 +2255,14 @@ impl P2pConnManager {
                                 key,
                                 new_state,
                                 is_retry,
+                                is_reemit,
                             } => {
                                 ctx.handle_broadcast_state_change(
                                     &op_manager,
                                     key,
                                     new_state,
                                     is_retry,
+                                    is_reemit,
                                 )
                                 .await;
                             }
@@ -4332,6 +4334,12 @@ impl P2pConnManager {
         // no-target retry re-emission this handler scheduled. Used only to
         // count fresh logical broadcasts once for the #4281 summary.
         is_retry: bool,
+        // `true` when this is a deferred re-emission of a stashed fresh-contract
+        // broadcast (issue #4359). Suppresses re-recording a `no_targets`
+        // propagation-summary event on give-up (the originating PUT already
+        // counted one when it first gave up) so a flush per interested peer
+        // does not inflate the #4281 stats.
+        is_reemit: bool,
     ) {
         tracing::debug!(
             contract = %key,
@@ -4395,7 +4403,14 @@ impl P2pConnManager {
             // double-count. If a later retry heals (finds targets), the
             // targets-found path below additionally records that success — both
             // the initial miss and the eventual propagation are surfaced.
-            if !is_retry {
+            //
+            // `is_reemit` (issue #4359) is also excluded: a deferred re-emission
+            // of a stashed fresh-contract broadcast that STILL finds no targets
+            // must not re-record a `no_targets` event — the originating PUT
+            // already counted one when it first gave up, and counting again per
+            // interested-peer flush would inflate the #4281 no_targets/targets_avg
+            // stats.
+            if !is_retry && !is_reemit {
                 op_manager.update_propagation_stats.record_broadcast(
                     *key.id(),
                     0,
@@ -4440,6 +4455,7 @@ impl P2pConnManager {
                             key,
                             new_state,
                             is_retry: true,
+                            is_reemit: false,
                         })
                         .await
                     {
@@ -4454,6 +4470,65 @@ impl P2pConnManager {
                 // Retries exhausted. Track consecutive no-target cycles to
                 // suppress repetitive WARN logging after the first occurrence.
                 self.broadcast_retries.remove(&key);
+
+                // Issue #4359: a fresh contract id loses the race between this
+                // broadcast give-up (~6 s) and the much slower interest/
+                // subscription resolve for a never-before-seen key. Instead of
+                // permanently abandoning the state — which silently leaves it
+                // locally-hosted only while every other node GETs NotFound —
+                // stash it. When the first interested peer/subscriber for this
+                // contract appears later, the interest path drains the stash
+                // and re-emits a single BroadcastStateChange, which then finds
+                // the freshly-registered target and propagates. The store is
+                // bounded by size and TTL so a churn of fresh ids that never
+                // gain a subscriber cannot pin memory.
+                op_manager
+                    .pending_broadcasts
+                    .stash(*key.id(), new_state.clone());
+
+                // Lost-wakeup guard (#4359 re-review): stash() runs here on the
+                // event-loop task while the interest-resolve flush runs on the
+                // subscribe/op driver task — they are concurrent with no
+                // happens-before. An interested peer could have registered (and
+                // already flushed → found nothing to take) in the window between
+                // `get_broadcast_targets_update` above and this stash. That would
+                // leave the state stashed with the only interested peer already
+                // past its flush, draining nothing until the NEXT subscriber or
+                // the TTL. Re-resolve targets now that the stash is in place: if a
+                // target has appeared, take the stash back and re-emit
+                // immediately rather than waiting on a future flush.
+                let recheck = op_manager.get_broadcast_targets_update(&key, &self_addr);
+                if !recheck.targets.is_empty() {
+                    if let Some(stashed) = op_manager.pending_broadcasts.take(key.id()) {
+                        tracing::debug!(
+                            contract = %key,
+                            target_count = recheck.targets.len(),
+                            phase = "pending_broadcast_stash_recheck",
+                            "A target appeared while giving up; re-emitting the deferred \
+                             fresh-contract broadcast immediately instead of leaving it \
+                             stashed for a future flush (#4359)"
+                        );
+                        if let Err(e) = op_manager.try_notify_node_event(
+                            crate::message::NodeEvent::BroadcastStateChange {
+                                key,
+                                new_state: stashed.clone(),
+                                is_retry: false,
+                                is_reemit: true,
+                            },
+                        ) {
+                            // Channel full/closed: re-stash so the next interest
+                            // flush still recovers it. Losing it would re-open the
+                            // locally-hosted-only failure this fix closes.
+                            op_manager.pending_broadcasts.stash(*key.id(), stashed);
+                            tracing::debug!(
+                                contract = %key,
+                                error = %e,
+                                "pending_broadcast_stash_recheck: immediate re-emit dropped; \
+                                 re-stashed for the next interest signal"
+                            );
+                        }
+                    }
+                }
 
                 // Evict oldest entry if at capacity to prevent unbounded growth.
                 if !self.broadcast_no_target_streak.contains_key(&key)
@@ -4515,6 +4590,10 @@ impl P2pConnManager {
         // Targets found - clear any pending retry and streak state for this contract
         self.broadcast_retries.remove(&key);
         self.broadcast_no_target_streak.remove(&key);
+        // Also drop any deferred re-broadcast stash (#4359): this fan-out is
+        // reaching targets now, so a previously-abandoned state for this
+        // contract is superseded and must not be re-emitted later as stale.
+        let _ = op_manager.pending_broadcasts.take(key.id());
 
         // Record a successful fan-out for the #4281 propagation summary. Fires
         // whether targets were found on the initial attempt or on a healing
@@ -6370,6 +6449,306 @@ mod tests {
             "banned-egress skip must clear broadcast_no_target_streak for the \
              contract so a ban mid-retry-cycle doesn't leave a stale entry. \
              Branch:\n{banned_branch}"
+        );
+    }
+
+    /// #4359 wiring pin (MUST-FIX 2). The only behavioral unit tests for the
+    /// deferred-broadcast feature exercise the emit-core in isolation; they do
+    /// NOT drive `handle_broadcast_state_change`, so deleting the production
+    /// stash/take calls would re-open the bug with zero failing behavioral
+    /// tests. This source-grep pin (mirroring
+    /// `handle_broadcast_state_change_gates_banned_egress`) locks the wiring:
+    /// the give-up (retries-exhausted) branch MUST stash, and the targets-found
+    /// branch MUST take. Driving the full async handler needs a complete
+    /// OpManager + contract handler, hence the grep floor.
+    #[test]
+    fn handle_broadcast_state_change_stashes_on_giveup_and_takes_on_targets() {
+        const SOURCE: &str = include_str!("p2p_protoc.rs");
+
+        let fn_anchor = "async fn handle_broadcast_state_change(";
+        let fn_start = SOURCE
+            .find(fn_anchor)
+            .expect("handle_broadcast_state_change renamed or removed (#4359 wiring pin)");
+        let after_header = &SOURCE[fn_start + fn_anchor.len()..];
+        let body_end = after_header
+            .find("\n    async fn ")
+            .map(|p| fn_start + fn_anchor.len() + p)
+            .unwrap_or(SOURCE.len());
+        let body = &SOURCE[fn_start..body_end];
+
+        // The targets-empty branch (`if target_result.targets.is_empty() {`)
+        // ends at the `return;` that precedes the targets-found code. Everything
+        // after that return is the targets-found path.
+        let empty_branch_anchor = "if target_result.targets.is_empty() {";
+        let empty_start = body.find(empty_branch_anchor).expect(
+            "#4359: targets-empty branch anchor missing — give-up stash wiring cannot be located",
+        );
+        let empty_branch = &body[empty_start..];
+        let empty_return = empty_branch
+            .find("\n            return;")
+            .expect("#4359: targets-empty branch must early-return before the targets-found path");
+        let giveup_branch = &empty_branch[..empty_return];
+        let targets_found_branch = &empty_branch[empty_return..];
+
+        assert!(
+            giveup_branch.contains("pending_broadcasts\n                    .stash(")
+                || giveup_branch.contains("pending_broadcasts.stash("),
+            "#4359: the broadcast give-up (retries-exhausted) branch MUST stash the state in \
+             op_manager.pending_broadcasts — otherwise a fresh-contract PUT that loses the \
+             broadcast/interest-resolve race is permanently abandoned (locally-hosted only). \
+             Give-up branch:\n{giveup_branch}"
+        );
+        assert!(
+            giveup_branch.contains("pending_broadcast_stash_recheck"),
+            "#4359: the give-up branch MUST re-resolve targets after stashing (the \
+             pending_broadcast_stash_recheck guard) to close the stash-after-flush \
+             lost-wakeup race. Give-up branch:\n{giveup_branch}"
+        );
+        assert!(
+            targets_found_branch.contains("pending_broadcasts.take("),
+            "#4359: the targets-found branch MUST take()/clear any stashed deferred broadcast \
+             so a recovered contract is not later re-emitted with superseded state. \
+             Targets-found branch:\n{targets_found_branch}"
+        );
+    }
+
+    /// Strip every `#[cfg(test)]` region (single item *or* brace-delimited
+    /// module/block) from a Rust source string, leaving only production code.
+    ///
+    /// This is deliberately a small ad-hoc scanner rather than a real parser:
+    /// it only needs to be precise enough that test-only
+    /// `register_peer_interest(` calls (which all live under `#[cfg(test)]`)
+    /// don't count toward the production tally walked by
+    /// `pending_broadcast_flush_wired_at_all_interest_sites`. It handles the
+    /// two cfg(test) shapes that occur in this crate:
+    ///
+    /// * single item — `#[cfg(test)]\npub(crate) use ...;` / `mod foo;`
+    ///   (removed up to and including the terminating `;`), and
+    /// * block — `#[cfg(test)]\nmod tests { ... }` (removed with brace
+    ///   balancing, so nested `{}` inside the block don't end it early).
+    ///
+    /// Braces inside string/char literals or comments are ignored well enough
+    /// for this purpose because the only thing we measure afterward is the
+    /// count of two specific identifiers, and those never appear inside a
+    /// literal in production source.
+    fn strip_cfg_test_regions(src: &str) -> String {
+        const MARKER: &str = "#[cfg(test)]";
+        let bytes = src.as_bytes();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0usize;
+        while i < src.len() {
+            if src[i..].starts_with(MARKER) {
+                // Advance past the marker and any following attributes/whitespace
+                // until the first significant token of the gated item.
+                let mut j = i + MARKER.len();
+                // Skip whitespace and additional `#[...]` attribute lines.
+                loop {
+                    while j < src.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if src[j..].starts_with("#[") {
+                        // Skip a balanced `#[ ... ]` attribute.
+                        let mut depth = 0i32;
+                        while j < src.len() {
+                            match bytes[j] {
+                                b'[' => depth += 1,
+                                b']' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        j += 1;
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            j += 1;
+                        }
+                        continue;
+                    }
+                    break;
+                }
+                // From `j`, find the end of this gated item: either the matching
+                // `}` of the first `{ ... }` block, or the terminating `;`.
+                let mut k = j;
+                let mut found_brace = false;
+                while k < src.len() {
+                    match bytes[k] {
+                        b'{' => {
+                            found_brace = true;
+                            break;
+                        }
+                        b';' => break,
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                if found_brace {
+                    // Brace-balance to the matching close.
+                    let mut depth = 0i32;
+                    while k < src.len() {
+                        match bytes[k] {
+                            b'{' => depth += 1,
+                            b'}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    k += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        k += 1;
+                    }
+                } else if k < src.len() {
+                    // Consume the terminating `;`.
+                    k += 1;
+                }
+                i = k;
+                continue;
+            }
+            // Copy one byte of production source. `src` is valid UTF-8 and we
+            // only ever split on ASCII boundaries (markers/braces/`;`), so
+            // pushing the char at this index is safe.
+            let ch = src[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        out
+    }
+
+    /// Recursively collect every `*.rs` file under `dir`.
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// #4359 trigger-completeness pin (MUST-FIX 1). The deferred broadcast only
+    /// drains when a viable target appears, signalled by
+    /// `flush_pending_broadcast_on_interest`. The interest-manager (Source 2)
+    /// path makes a peer a target via `register_peer_interest`; EVERY such call
+    /// site that can be the first viable target for a never-seen id must flush.
+    ///
+    /// Rather than trusting a static allow-list of files (the brittle shape the
+    /// re-review flagged — a NEW production `register_peer_interest` added in
+    /// some other module would silently escape the pin and re-open the
+    /// unflushed-target bug), this pin WALKS the entire crate source tree
+    /// (`$CARGO_MANIFEST_DIR/src/**/*.rs`), strips `#[cfg(test)]` regions, and
+    /// asserts that:
+    ///
+    ///   1. the SET of production files that contain a `register_peer_interest(`
+    ///      call equals the known-wired set (so a brand-new file with such a
+    ///      call trips the pin even before we reach the per-file count), and
+    ///   2. within each such file, production
+    ///      `flush_pending_broadcast_on_interest(` calls >= production
+    ///      `register_peer_interest(` calls (the pairing convention the fix
+    ///      established).
+    ///
+    /// Source 1 (proximity) is guarded by the node.rs assertion at the end.
+    #[test]
+    fn pending_broadcast_flush_wired_at_all_interest_sites() {
+        // The set of production files (relative to `src/`) that are known to
+        // make a peer a first-viable-target via `register_peer_interest` and
+        // are correctly flush-paired. A NEW production call site in any other
+        // file must FAIL this pin — see the set-equality assertion below.
+        let known_wired: std::collections::BTreeSet<&str> = [
+            "node.rs",
+            "operations.rs",
+            "operations/subscribe.rs",
+            "operations/get/op_ctx_task.rs",
+        ]
+        .into_iter()
+        .collect();
+
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs_files(&src_root, &mut files);
+        assert!(
+            !files.is_empty(),
+            "#4359 MUST-FIX 1: source walk found no .rs files under {} — the pin cannot \
+             guarantee completeness if it can't read the crate source.",
+            src_root.display()
+        );
+
+        let mut found_with_register: std::collections::BTreeSet<String> = Default::default();
+        // Per-file pairing failures: (relative path, reg_count, flush_count).
+        let mut pairing_failures: Vec<(String, usize, usize)> = Vec::new();
+
+        for path in &files {
+            let rel = path
+                .strip_prefix(&src_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let src = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let prod = strip_cfg_test_regions(&src);
+            let reg_count = prod.matches("register_peer_interest(").count();
+            if reg_count == 0 {
+                continue;
+            }
+            // The interest-manager method *definition* itself lives in
+            // ring/interest.rs and is not a call site; ignore it. Detect by the
+            // presence of the `pub fn register_peer_interest` definition.
+            if prod.contains("fn register_peer_interest(") {
+                continue;
+            }
+            found_with_register.insert(rel.clone());
+            let flush_count = prod.matches("flush_pending_broadcast_on_interest(").count();
+            if flush_count < reg_count {
+                pairing_failures.push((rel, reg_count, flush_count));
+            }
+        }
+
+        // (1) Set equality: no NEW production file may carry a
+        // register_peer_interest call without being deliberately wired here.
+        let found_refs: std::collections::BTreeSet<&str> =
+            found_with_register.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            found_refs, known_wired,
+            "#4359 MUST-FIX 1: the set of production files that call \
+             register_peer_interest changed. Found {found_refs:?}, expected {known_wired:?}. \
+             A NEW register_peer_interest call site can be the first viable broadcast target \
+             for a cold id; it MUST flush the deferred broadcast (call \
+             flush_pending_broadcast_on_interest) or the #4359 fix silently fails for that \
+             path. Wire the flush, then add the file to `known_wired` in this pin. If the new \
+             site genuinely cannot be a first viable target, document why and adjust this pin."
+        );
+
+        // (2) Per-file pairing: every wired file's flush count covers its
+        // register count.
+        assert!(
+            pairing_failures.is_empty(),
+            "#4359 MUST-FIX 1: interest registration without a paired broadcast flush: \
+             {pairing_failures:?} (file, register_peer_interest count, \
+             flush_pending_broadcast_on_interest count). Every interest registration that can \
+             be the first viable broadcast target for a cold id must flush the deferred \
+             broadcast, or the fix silently fails for that path."
+        );
+
+        // Source 1 (proximity): the NeighborHosting overlap path must flush too,
+        // since a neighbor newly announcing it hosts our contract is a viable
+        // target with no interest_manager entry.
+        let node_path = src_root.join("node.rs");
+        let node_src = std::fs::read_to_string(&node_path).expect("node.rs must be readable");
+        let node_prod = strip_cfg_test_regions(&node_src);
+        assert!(
+            node_prod.contains("Source 1 / proximity")
+                && node_prod.contains("flush_pending_broadcast_on_interest(&key)"),
+            "#4359 MUST-FIX 1: the NeighborHosting proximity overlap path in node.rs must flush \
+             the deferred broadcast (Source 1 first-viable-target signal), or a cold-id PUT whose \
+             first target arrives via proximity announcement never drains."
         );
     }
 }

@@ -730,10 +730,11 @@ mod tests {
     ///
     /// The handler records each fresh logical broadcast's outcome exactly
     /// once: a NO_TARGETS record on the fresh-broadcast path (gated on
-    /// `!is_retry`, so retry re-emissions never record a miss), and a success
-    /// record on the targets-found path. That's two call sites; this pins both
-    /// so neither outcome arm is dropped, and pins the `!is_retry` gate so a
-    /// refactor can't start counting retry re-emissions as fresh misses.
+    /// `!is_retry && !is_reemit`, so neither retry re-emissions nor #4359
+    /// deferred-broadcast re-emissions record a miss), and a success record on
+    /// the targets-found path. That's two call sites; this pins both so neither
+    /// outcome arm is dropped, and pins the gate so a refactor can't start
+    /// counting retry / deferred re-emissions as fresh misses.
     #[test]
     fn broadcast_path_feeds_propagation_stats_pin_test() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -753,12 +754,14 @@ mod tests {
              dropped (silent telemetry rot) or recording leaked elsewhere."
         );
 
-        // The no-target record must be gated on `!is_retry` so retry
-        // re-emissions don't get counted as fresh misses (Codex P2).
+        // The no-target record must be gated on `!is_retry && !is_reemit` so
+        // neither retry re-emissions (Codex P2) nor #4359 deferred-broadcast
+        // re-emissions get counted as fresh misses (re-review SHOULD-FIX 5:
+        // a flush per interested peer must not inflate no_targets).
         assert!(
-            source.contains("if !is_retry {"),
-            "the fresh-no-target record must be gated on `!is_retry` so retry \
-             re-emissions are not counted as fresh broadcasts."
+            source.contains("if !is_retry && !is_reemit {"),
+            "the fresh-no-target record must be gated on `!is_retry && !is_reemit` so retry \
+             and #4359 deferred re-emissions are not counted as fresh broadcasts."
         );
     }
 }

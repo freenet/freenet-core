@@ -708,6 +708,16 @@ pub(crate) enum NodeEvent {
         /// re-counting (or being confused by) retries that share the
         /// per-contract `broadcast_retries` state.
         is_retry: bool,
+        /// `true` when this broadcast is a deferred re-emission of a
+        /// fresh-contract state that earlier found no targets and was stashed
+        /// in `PendingBroadcastStore`, now re-driven because an interested
+        /// peer appeared (issue #4359). The handler treats it like a fresh
+        /// broadcast for fan-out, but must NOT re-record a `no_targets`
+        /// propagation-summary event for it: the originating PUT already
+        /// counted one `no_targets` when it first gave up, and counting again
+        /// per flush would inflate the #4281 stats. `false` for executor-fresh
+        /// and retry re-emissions.
+        is_reemit: bool,
     },
     /// Send state to a specific peer that reported a stale summary.
     /// Unlike BroadcastStateChange (which fans out to ALL subscribers),
