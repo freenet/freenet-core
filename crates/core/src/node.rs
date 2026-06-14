@@ -1595,6 +1595,17 @@ where
                 if let Some((key, state)) =
                     get_contract_state_by_id(&op_manager, &instance_id).await
                 {
+                    // #4359 (MUST-FIX 1, Source 1 / proximity): this neighbor
+                    // just announced it hosts a contract we also host, so it is
+                    // now a `neighbors_with_contract` broadcast target. If a
+                    // fresh-contract PUT gave up with no targets and is stashed,
+                    // flush it here — this is the proximity first-viable-target
+                    // signal, distinct from the interest-manager (Source 2)
+                    // signals. Must run BEFORE the receiving-updates/downstream
+                    // gate below, which `continue`s for exactly the
+                    // locally-hosted-only fresh-PUT case this fix targets.
+                    op_manager.flush_pending_broadcast_on_interest(&key).await;
+
                     if !op_manager.ring.is_receiving_updates(&key)
                         && !op_manager.ring.has_downstream_subscribers(&key)
                     {
@@ -1765,12 +1776,21 @@ async fn handle_interest_sync_message(
                             .interest_manager
                             .refresh_peer_interest(&contract, pk);
                     } else {
-                        op_manager.interest_manager.register_peer_interest(
+                        let is_new = op_manager.interest_manager.register_peer_interest(
                             &contract,
                             pk.clone(),
                             None, // New entry; summary arrives in their Summaries response
                             false,
                         );
+                        if is_new {
+                            // #4359 (MUST-FIX 1): an Interests-sync registration
+                            // makes this peer a viable broadcast target. Flush
+                            // any deferred fresh-contract broadcast so a cold-id
+                            // PUT that gave up with no targets reaches it.
+                            op_manager
+                                .flush_pending_broadcast_on_interest(&contract)
+                                .await;
+                        }
                     }
                 }
             }
@@ -1954,12 +1974,21 @@ async fn handle_interest_sync_message(
                         }
 
                         // Register their interest
-                        op_manager.interest_manager.register_peer_interest(
+                        let is_new = op_manager.interest_manager.register_peer_interest(
                             &contract,
                             pk.clone(),
                             None,
                             false,
                         );
+                        if is_new {
+                            // #4359 (MUST-FIX 1): a ChangeInterests addition
+                            // makes this peer a viable broadcast target. Flush
+                            // any deferred fresh-contract broadcast so a cold-id
+                            // PUT that gave up with no targets reaches it.
+                            op_manager
+                                .flush_pending_broadcast_on_interest(&contract)
+                                .await;
+                        }
 
                         // Get our summary to send back
                         let summary = get_contract_summary(op_manager, &contract).await;

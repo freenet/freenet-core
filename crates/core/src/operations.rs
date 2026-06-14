@@ -369,9 +369,15 @@ pub(crate) async fn complete_piggyback_subscription(
 
     if let Some(upstream_pkl) = sender_from_addr.as_ref() {
         let peer_key = crate::ring::interest::PeerKey::from(upstream_pkl.pub_key.clone());
-        op_manager
+        let is_new = op_manager
             .interest_manager
             .register_peer_interest(key, peer_key, None, true);
+        if is_new {
+            // #4359 (MUST-FIX 1): the piggyback upstream is now a viable
+            // broadcast target — flush any deferred fresh-contract broadcast so
+            // a cold-id PUT that gave up with no targets reaches the network.
+            op_manager.flush_pending_broadcast_on_interest(key).await;
+        }
         tracing::debug!(tx = %tx, contract = %key, "Subscription completed via GET piggyback");
     } else {
         // sender_from_addr can be None for transient connections not yet in the ring.

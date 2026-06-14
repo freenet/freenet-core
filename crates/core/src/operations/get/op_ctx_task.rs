@@ -2702,9 +2702,16 @@ where
             .get_peer_by_addr(upstream_addr)
         {
             let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key);
-            op_manager
+            let is_new = op_manager
                 .interest_manager
                 .register_peer_interest(&key, peer_key, None, false);
+            if is_new {
+                // #4359 (MUST-FIX 1): a remote GET with subscribe=false still
+                // registers the requester's interest, making them a viable
+                // broadcast target. Flush any deferred fresh-contract broadcast
+                // so a cold-id PUT that gave up reaches this requester.
+                op_manager.flush_pending_broadcast_on_interest(&key).await;
+            }
         }
 
         // Forward upstream FIRST to keep cache work off the critical

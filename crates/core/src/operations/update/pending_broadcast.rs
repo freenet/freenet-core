@@ -16,10 +16,30 @@
 //!
 //! Rather than lengthen the give-up timeout (a band-aid that still races), this
 //! store keeps the last broadcast state for a contract that exhausted its retry
-//! budget with no targets. When the *first* interested peer / subscriber for
-//! that contract appears later (`register_peer_interest` returns "new"), the
-//! subscribe path drains the stash and re-emits a single `BroadcastStateChange`
-//! — which now finds the freshly-registered target and propagates.
+//! budget with no targets. When the *first viable broadcast target* for that
+//! contract appears later, the deferred state is drained and re-emitted as a
+//! single `BroadcastStateChange { is_reemit: true }` — which now finds the
+//! freshly-appeared target and propagates.
+//!
+//! ## First-viable-target signal set (issue #4359 re-review, MUST-FIX 1)
+//!
+//! `get_broadcast_targets_update` resolves targets from two sources, so the
+//! flush must fire from BOTH:
+//!
+//! * **Source 2 — interest manager**: every `register_peer_interest` call that
+//!   returns "new" (downstream subscriber, originator upstream, GET-piggyback,
+//!   remote GET `subscribe=false`, and the Interests/ChangeInterests sync
+//!   handlers) calls [`OpManager::flush_pending_broadcast_on_interest`].
+//! * **Source 1 — proximity cache**: when a neighbor newly announces it hosts a
+//!   contract we also host (`NeighborHosting` overlap path), it becomes a
+//!   `neighbors_with_contract` target and the same flush fires.
+//!
+//! That set is complete: a never-seen id can only gain a broadcast target by a
+//! peer expressing interest (Source 2) or a connected neighbor announcing it
+//! hosts the id (Source 1). The give-up path additionally re-checks targets
+//! immediately after stashing to close the stash-after-flush lost-wakeup race.
+//! The flush re-reads the *current* local state (not the stale give-up-time
+//! bytes) so a newer locally-applied UPDATE is never clobbered.
 //!
 //! ## Bounding (per `.claude/rules/code-style.md` per-key-collection rule and
 //! the AGENTS.md "cleanup exemptions must be time-bounded" rule)
@@ -35,6 +55,26 @@
 //!
 //! Timestamps come from [`GlobalSimulationTime`](crate::config::GlobalSimulationTime)
 //! so the TTL is deterministic under the simulation clock (DST).
+//!
+//! ## Cross-thread clock consistency (issue #4359 re-review, SHOULD-FIX 5)
+//!
+//! `stash` records `inserted_at_ms` on the event-loop task while `take`'s TTL
+//! check reads the clock on the subscribe/op-driver task. `GlobalSimulationTime`
+//! is *thread-local*, so in principle those two reads could come from different
+//! clock bases. This is benign for both run modes:
+//!
+//! * **Production**: no simulation time is set, so both reads fall back to the
+//!   process-global, monotonic `SystemTime` — a single shared clock.
+//! * **DST**: the deterministic/turmoil harness runs on a
+//!   `new_current_thread()` single-threaded paused-time runtime
+//!   (`simulation_integration.rs::create_runtime`), so the event loop and the
+//!   subscribe driver — and any `tokio::spawn`ed give-up retry / flush task —
+//!   all execute on the SAME thread and therefore share one thread-local
+//!   simulation clock. The clocks cannot diverge.
+//!
+//! The TTL is a coarse 5-minute liveness bound, not a fine-grained deadline, so
+//! even a hypothetical small skew could only shift an eviction by a tolerance
+//! far below the window. No shared/atomic clock is needed here.
 
 use dashmap::DashMap;
 use freenet_stdlib::prelude::{ContractInstanceId, WrappedState};
@@ -96,6 +136,15 @@ impl PendingBroadcastStore {
                 inserted_at_ms: now_ms,
             },
         );
+    }
+
+    /// Whether a (possibly expired) entry exists for `contract`. Used as a
+    /// cheap fast-path guard so the flush can skip an async contract-handler
+    /// read on the common case where nothing is stashed. Does not prune; a
+    /// stale entry returning `true` here is then dropped by the subsequent
+    /// [`Self::take`] (which enforces the TTL and returns `None`).
+    pub(crate) fn contains(&self, contract: &ContractInstanceId) -> bool {
+        self.entries.contains_key(contract)
     }
 
     /// Remove and return the pending broadcast state for `contract`, if any and
@@ -160,6 +209,21 @@ mod tests {
         assert_eq!(taken.as_ref(), &[0xAA; 8]);
         assert_eq!(store.len(), 0, "take must remove the entry");
         assert!(store.take(&cid(1)).is_none(), "second take yields nothing");
+        GlobalSimulationTime::clear_time();
+    }
+
+    #[test]
+    fn contains_reflects_membership_without_removing() {
+        GlobalSimulationTime::set_time_ms(0);
+        let store = PendingBroadcastStore::new();
+        assert!(!store.contains(&cid(1)), "absent before stash");
+        store.stash(cid(1), state(0xAA));
+        assert!(store.contains(&cid(1)), "present after stash");
+        // contains must NOT remove — the flush fast-path relies on this so a
+        // subsequent take() still finds the entry.
+        assert!(store.contains(&cid(1)), "contains is non-destructive");
+        assert!(store.take(&cid(1)).is_some(), "take still finds it");
+        assert!(!store.contains(&cid(1)), "absent after take");
         GlobalSimulationTime::clear_time();
     }
 

@@ -2443,6 +2443,7 @@ where
                     key: *key,
                     new_state: new_state.clone(),
                     is_retry: false,
+                    is_reemit: false,
                 })
             {
                 // Non-blocking emit: a 30-second `notify_node_event(...).await`
@@ -2807,6 +2808,7 @@ where
                     key,
                     new_state,
                     is_retry: false,
+                    is_reemit: false,
                 })
             {
                 // Best-effort by design — see #4145 and the sibling

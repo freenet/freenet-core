@@ -2197,12 +2197,14 @@ impl P2pConnManager {
                                 key,
                                 new_state,
                                 is_retry,
+                                is_reemit,
                             } => {
                                 ctx.handle_broadcast_state_change(
                                     &op_manager,
                                     key,
                                     new_state,
                                     is_retry,
+                                    is_reemit,
                                 )
                                 .await;
                             }
@@ -4274,6 +4276,12 @@ impl P2pConnManager {
         // no-target retry re-emission this handler scheduled. Used only to
         // count fresh logical broadcasts once for the #4281 summary.
         is_retry: bool,
+        // `true` when this is a deferred re-emission of a stashed fresh-contract
+        // broadcast (issue #4359). Suppresses re-recording a `no_targets`
+        // propagation-summary event on give-up (the originating PUT already
+        // counted one when it first gave up) so a flush per interested peer
+        // does not inflate the #4281 stats.
+        is_reemit: bool,
     ) {
         tracing::debug!(
             contract = %key,
@@ -4337,7 +4345,14 @@ impl P2pConnManager {
             // double-count. If a later retry heals (finds targets), the
             // targets-found path below additionally records that success — both
             // the initial miss and the eventual propagation are surfaced.
-            if !is_retry {
+            //
+            // `is_reemit` (issue #4359) is also excluded: a deferred re-emission
+            // of a stashed fresh-contract broadcast that STILL finds no targets
+            // must not re-record a `no_targets` event — the originating PUT
+            // already counted one when it first gave up, and counting again per
+            // interested-peer flush would inflate the #4281 no_targets/targets_avg
+            // stats.
+            if !is_retry && !is_reemit {
                 op_manager.update_propagation_stats.record_broadcast(
                     *key.id(),
                     0,
@@ -4382,6 +4397,7 @@ impl P2pConnManager {
                             key,
                             new_state,
                             is_retry: true,
+                            is_reemit: false,
                         })
                         .await
                     {
@@ -4403,7 +4419,7 @@ impl P2pConnManager {
                 // permanently abandoning the state — which silently leaves it
                 // locally-hosted only while every other node GETs NotFound —
                 // stash it. When the first interested peer/subscriber for this
-                // contract appears later, the subscribe path drains the stash
+                // contract appears later, the interest path drains the stash
                 // and re-emits a single BroadcastStateChange, which then finds
                 // the freshly-registered target and propagates. The store is
                 // bounded by size and TTL so a churn of fresh ids that never
@@ -4411,6 +4427,50 @@ impl P2pConnManager {
                 op_manager
                     .pending_broadcasts
                     .stash(*key.id(), new_state.clone());
+
+                // Lost-wakeup guard (#4359 re-review): stash() runs here on the
+                // event-loop task while the interest-resolve flush runs on the
+                // subscribe/op driver task — they are concurrent with no
+                // happens-before. An interested peer could have registered (and
+                // already flushed → found nothing to take) in the window between
+                // `get_broadcast_targets_update` above and this stash. That would
+                // leave the state stashed with the only interested peer already
+                // past its flush, draining nothing until the NEXT subscriber or
+                // the TTL. Re-resolve targets now that the stash is in place: if a
+                // target has appeared, take the stash back and re-emit
+                // immediately rather than waiting on a future flush.
+                let recheck = op_manager.get_broadcast_targets_update(&key, &self_addr);
+                if !recheck.targets.is_empty() {
+                    if let Some(stashed) = op_manager.pending_broadcasts.take(key.id()) {
+                        tracing::debug!(
+                            contract = %key,
+                            target_count = recheck.targets.len(),
+                            phase = "pending_broadcast_stash_recheck",
+                            "A target appeared while giving up; re-emitting the deferred \
+                             fresh-contract broadcast immediately instead of leaving it \
+                             stashed for a future flush (#4359)"
+                        );
+                        if let Err(e) = op_manager.try_notify_node_event(
+                            crate::message::NodeEvent::BroadcastStateChange {
+                                key,
+                                new_state: stashed.clone(),
+                                is_retry: false,
+                                is_reemit: true,
+                            },
+                        ) {
+                            // Channel full/closed: re-stash so the next interest
+                            // flush still recovers it. Losing it would re-open the
+                            // locally-hosted-only failure this fix closes.
+                            op_manager.pending_broadcasts.stash(*key.id(), stashed);
+                            tracing::debug!(
+                                contract = %key,
+                                error = %e,
+                                "pending_broadcast_stash_recheck: immediate re-emit dropped; \
+                                 re-stashed for the next interest signal"
+                            );
+                        }
+                    }
+                }
 
                 // Evict oldest entry if at capacity to prevent unbounded growth.
                 if !self.broadcast_no_target_streak.contains_key(&key)
@@ -6229,6 +6289,126 @@ mod tests {
             "banned-egress skip must clear broadcast_no_target_streak for the \
              contract so a ban mid-retry-cycle doesn't leave a stale entry. \
              Branch:\n{banned_branch}"
+        );
+    }
+
+    /// #4359 wiring pin (MUST-FIX 2). The only behavioral unit tests for the
+    /// deferred-broadcast feature exercise the emit-core in isolation; they do
+    /// NOT drive `handle_broadcast_state_change`, so deleting the production
+    /// stash/take calls would re-open the bug with zero failing behavioral
+    /// tests. This source-grep pin (mirroring
+    /// `handle_broadcast_state_change_gates_banned_egress`) locks the wiring:
+    /// the give-up (retries-exhausted) branch MUST stash, and the targets-found
+    /// branch MUST take. Driving the full async handler needs a complete
+    /// OpManager + contract handler, hence the grep floor.
+    #[test]
+    fn handle_broadcast_state_change_stashes_on_giveup_and_takes_on_targets() {
+        const SOURCE: &str = include_str!("p2p_protoc.rs");
+
+        let fn_anchor = "async fn handle_broadcast_state_change(";
+        let fn_start = SOURCE
+            .find(fn_anchor)
+            .expect("handle_broadcast_state_change renamed or removed (#4359 wiring pin)");
+        let after_header = &SOURCE[fn_start + fn_anchor.len()..];
+        let body_end = after_header
+            .find("\n    async fn ")
+            .map(|p| fn_start + fn_anchor.len() + p)
+            .unwrap_or(SOURCE.len());
+        let body = &SOURCE[fn_start..body_end];
+
+        // The targets-empty branch (`if target_result.targets.is_empty() {`)
+        // ends at the `return;` that precedes the targets-found code. Everything
+        // after that return is the targets-found path.
+        let empty_branch_anchor = "if target_result.targets.is_empty() {";
+        let empty_start = body.find(empty_branch_anchor).expect(
+            "#4359: targets-empty branch anchor missing — give-up stash wiring cannot be located",
+        );
+        let empty_branch = &body[empty_start..];
+        let empty_return = empty_branch
+            .find("\n            return;")
+            .expect("#4359: targets-empty branch must early-return before the targets-found path");
+        let giveup_branch = &empty_branch[..empty_return];
+        let targets_found_branch = &empty_branch[empty_return..];
+
+        assert!(
+            giveup_branch.contains("pending_broadcasts\n                    .stash(")
+                || giveup_branch.contains("pending_broadcasts.stash("),
+            "#4359: the broadcast give-up (retries-exhausted) branch MUST stash the state in \
+             op_manager.pending_broadcasts — otherwise a fresh-contract PUT that loses the \
+             broadcast/interest-resolve race is permanently abandoned (locally-hosted only). \
+             Give-up branch:\n{giveup_branch}"
+        );
+        assert!(
+            giveup_branch.contains("pending_broadcast_stash_recheck"),
+            "#4359: the give-up branch MUST re-resolve targets after stashing (the \
+             pending_broadcast_stash_recheck guard) to close the stash-after-flush \
+             lost-wakeup race. Give-up branch:\n{giveup_branch}"
+        );
+        assert!(
+            targets_found_branch.contains("pending_broadcasts.take("),
+            "#4359: the targets-found branch MUST take()/clear any stashed deferred broadcast \
+             so a recovered contract is not later re-emitted with superseded state. \
+             Targets-found branch:\n{targets_found_branch}"
+        );
+    }
+
+    /// #4359 trigger-completeness pin (MUST-FIX 1). The deferred broadcast only
+    /// drains when a viable target appears, signalled by
+    /// `flush_pending_broadcast_on_interest`. The interest-manager (Source 2)
+    /// path makes a peer a target via `register_peer_interest`; EVERY such call
+    /// site that can be the first viable target for a never-seen id must flush.
+    /// This pin asserts that each `register_peer_interest` call in the
+    /// production interest-registration files is accompanied by a nearby
+    /// `flush_pending_broadcast_on_interest`, so a future call site cannot
+    /// silently regress the fix (the failure mode the re-review caught: flush
+    /// wired at one caller while several others made a peer a target with no
+    /// flush). Source 1 (proximity) is guarded by the node.rs assertion below.
+    #[test]
+    fn pending_broadcast_flush_wired_at_all_interest_sites() {
+        // (file, how many register_peer_interest calls in this file are
+        // first-viable-target sites that must be flush-paired). Test files are
+        // excluded by checking only the listed production modules.
+        let cases: &[(&str, &str)] = &[
+            (
+                "../../operations/subscribe.rs",
+                include_str!("../../operations/subscribe.rs"),
+            ),
+            ("../../operations.rs", include_str!("../../operations.rs")),
+            (
+                "../../operations/get/op_ctx_task.rs",
+                include_str!("../../operations/get/op_ctx_task.rs"),
+            ),
+            ("../../node.rs", include_str!("../../node.rs")),
+        ];
+
+        for (path, src) in cases {
+            // Strip the `#[cfg(test)] mod tests` region so test-only
+            // register_peer_interest calls don't trip the pin.
+            let prod = src.find("\nmod tests").map(|p| &src[..p]).unwrap_or(src);
+            let reg_count = prod.matches("register_peer_interest(").count();
+            let flush_count = prod.matches("flush_pending_broadcast_on_interest(").count();
+            assert!(
+                flush_count >= reg_count,
+                "#4359 MUST-FIX 1: {path} has {reg_count} register_peer_interest call(s) but only \
+                 {flush_count} flush_pending_broadcast_on_interest call(s). Every interest \
+                 registration that can be the first viable broadcast target for a cold id must \
+                 flush the deferred broadcast, or the fix silently fails for that path. If a new \
+                 register_peer_interest site genuinely cannot be a first viable target, document \
+                 why and adjust this pin."
+            );
+        }
+
+        // Source 1 (proximity): the NeighborHosting overlap path must flush too,
+        // since a neighbor newly announcing it hosts our contract is a viable
+        // target with no interest_manager entry.
+        const NODE: &str = include_str!("../../node.rs");
+        let node_prod = NODE.find("\nmod tests").map(|p| &NODE[..p]).unwrap_or(NODE);
+        assert!(
+            node_prod.contains("Source 1 / proximity")
+                && node_prod.contains("flush_pending_broadcast_on_interest(&key)"),
+            "#4359 MUST-FIX 1: the NeighborHosting proximity overlap path in node.rs must flush \
+             the deferred broadcast (Source 1 first-viable-target signal), or a cold-id PUT whose \
+             first target arrives via proximity announcement never drains."
         );
     }
 }

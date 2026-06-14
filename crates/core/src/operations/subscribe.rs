@@ -441,9 +441,15 @@ pub(super) async fn finalize_originator_subscribe(
         .get_peer_by_addr(upstream_addr)
     {
         let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key);
-        op_manager
+        let is_new = op_manager
             .interest_manager
             .register_peer_interest(&key, peer_key, None, true);
+        if is_new {
+            // #4359 (MUST-FIX 1): this upstream peer is now a viable broadcast
+            // target. If a fresh-contract PUT gave up with no targets and is
+            // stashed, flush it so the deferred state reaches the network.
+            op_manager.flush_pending_broadcast_on_interest(&key).await;
+        }
     }
 
     op_manager.ring.subscribe(key);
@@ -544,7 +550,7 @@ pub(crate) async fn register_downstream_subscriber(
                 // downstream subscriber is the first viable target — flush the
                 // deferred state to it so the never-before-seen id reaches the
                 // network instead of staying locally-hosted only.
-                op_manager.flush_pending_broadcast_on_interest(key);
+                op_manager.flush_pending_broadcast_on_interest(key).await;
                 let became_interested = op_manager.interest_manager.add_downstream_subscriber(key);
                 if became_interested {
                     super::broadcast_change_interests(op_manager, vec![*key], vec![]).await;
