@@ -194,6 +194,24 @@ jobs:
 
           case "$HTTP_STATUS" in
             200|202) ;;
+            409)
+              # 409 Conflict: an update is already in flight on this gateway
+              # (an overlapping/legit re-run — e.g. a manual re-trigger landing
+              # while the release.published rollout is still restarting the
+              # service). The agent's in-flight guard rejected the duplicate to
+              # prevent the #4271 double-stop. This is NOT a failure: the
+              # in-progress update is the one that matters, so fall through to
+              # the verify step below, which polls /version until the gateway
+              # converges on the target version with an active service.
+              echo "::notice::Gateway ${{ matrix.gateway.name }} reports an update already in progress (HTTP 409); skipping duplicate spawn and proceeding to verify."
+              ;;
+            429)
+              # 429 Too Many Requests: the rate-limit window hasn't elapsed
+              # since the last accepted update. Like 409, this means an update
+              # was recently kicked off, so the target is (or will be) applied.
+              # Proceed to verify rather than failing the release.
+              echo "::notice::Gateway ${{ matrix.gateway.name }} rate-limited this update (HTTP 429); a recent update is in effect. Proceeding to verify."
+              ;;
             *)
               echo "::error::Gateway ${{ matrix.gateway.name }} rejected update: HTTP $HTTP_STATUS"
               exit 1

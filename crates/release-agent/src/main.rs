@@ -39,6 +39,9 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let config = Config::from_path(&cli.config)?;
+    // Surface a misconfig that would disable the rate-limit backstop for the
+    // in-flight overlap guard (see Config::warn_if_rate_limit_below_max_hold).
+    config.warn_if_rate_limit_below_max_hold();
     let secret = config.load_secret()?;
 
     let http = HttpClient::builder()

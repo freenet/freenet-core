@@ -62,8 +62,14 @@ impl InFlightGuard {
     /// update is already running and the caller must back off.
     ///
     /// Uses a compare-and-swap so two concurrent callers can never both win.
+    ///
+    /// The success ordering is `Acquire` (not `AcqRel`): the meaningful
+    /// publish — making the slot available again — happens on `Drop` via the
+    /// `Release` store below, so the CAS only needs to *observe* the prior
+    /// release, not itself publish anything. `Acquire` pairs with that
+    /// `Release` and is sufficient.
     pub fn try_acquire(flag: &Arc<AtomicBool>) -> Option<Self> {
-        match flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire) {
+        match flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Acquire) {
             Ok(_) => Some(Self {
                 flag: Arc::clone(flag),
             }),
@@ -98,7 +104,12 @@ const EARLY_EXIT_PROBE: Duration = Duration::from_secs(1);
 /// observed ~90s drain plus new-process startup, with generous headroom,
 /// while still guaranteeing the slot frees within a bounded window if the
 /// update never reports completion.
-const MAX_UPDATE_HOLD: Duration = Duration::from_secs(300);
+///
+/// Public so config validation can warn when `rate_limit_seconds` is set below
+/// this value, which would remove the rate-limit backstop that covers the
+/// residual re-open window if an update runs past the max-hold (see the timeout
+/// arm in [`Updater::run`] and `Config::warn_if_rate_limit_below_max_hold`).
+pub const MAX_UPDATE_HOLD: Duration = Duration::from_secs(300);
 
 impl Updater {
     /// Invoke the update script for `target_version`, or log the intent if
@@ -182,6 +193,16 @@ impl Updater {
                 let cmd_path = self.command.clone();
                 let target = target_version.to_string();
                 tokio::spawn(async move {
+                    // LOAD-BEARING: this binding keeps the InFlightGuard alive
+                    // for the WHOLE `child.wait()` below. Its scope IS the
+                    // in-flight window — the slot stays claimed until this task
+                    // ends (clean exit, timeout, or panic), at which point the
+                    // guard drops and releases the slot. Do NOT narrow its scope
+                    // (e.g. `drop(in_flight)` early, or move the wait out from
+                    // under it): that would re-open the #4271 overlap window,
+                    // letting a second POST acquire the slot and spawn a racing
+                    // `systemctl stop` while this update's restart is still in
+                    // progress.
                     let _in_flight = in_flight;
                     match tokio::time::timeout(MAX_UPDATE_HOLD, child.wait()).await {
                         Ok(Ok(status)) => {
@@ -201,12 +222,43 @@ impl Updater {
                             );
                         }
                         Err(_elapsed) => {
-                            tracing::warn!(
+                            // RESIDUAL RE-OPEN WINDOW (documented intentionally):
+                            // we free the in-flight slot here even though the
+                            // child is STILL running (kill_on_drop=false leaves
+                            // it alive). If a real update genuinely runs past
+                            // MAX_UPDATE_HOLD, a second POST could now acquire the
+                            // slot and spawn a racing `systemctl stop` — the exact
+                            // #4271 double-stop. The time-bound is mandatory (an
+                            // unbounded exemption would let a hung/zombied update
+                            // wedge the agent against ALL future updates forever,
+                            // violating the project rule that lock/GC exemptions
+                            // be time-bounded), so we accept this narrow residual
+                            // window as the lesser evil.
+                            //
+                            // SECOND BACKSTOP: the rate-limit window
+                            // (`rate_limit_seconds`, prod default 600s) gates how
+                            // OFTEN updates may start. With the default it is >
+                            // MAX_UPDATE_HOLD (300s), so a second POST in this
+                            // window is rejected by the rate-limiter (429) before
+                            // it can reach the in-flight check — closing the gap.
+                            // Config load emits a `warn!` if an operator sets
+                            // rate_limit_seconds < MAX_UPDATE_HOLD, which would
+                            // remove this backstop. See `Config::warn_if_*`.
+                            //
+                            // WHY 300s: it comfortably covers TimeoutStopSec (45s
+                            // final SIGTERM) + the observed ~90s nova drain + new-
+                            // process startup, with generous headroom — a >300s
+                            // update is an operational anomaly, not a normal slow
+                            // restart, hence the `error!` level below.
+                            tracing::error!(
                                 target,
                                 command = %cmd_path.display(),
                                 max_hold_secs = MAX_UPDATE_HOLD.as_secs(),
                                 "update command still running past max-hold; \
-                                 releasing in-flight slot so future updates aren't blocked"
+                                 releasing in-flight slot so future updates aren't \
+                                 blocked. If rate_limit_seconds < max-hold the \
+                                 overlap guard is no longer backstopped — a second \
+                                 update could now race this one's restart (#4271)"
                             );
                         }
                     }

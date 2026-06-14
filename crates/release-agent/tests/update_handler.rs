@@ -29,6 +29,28 @@ fn now_secs() -> i64 {
         .as_secs() as i64
 }
 
+/// Poll `path` until it exists and is non-empty, returning its contents. The
+/// fake-sudo wrappers record argv from the SPAWNED child, which races the HTTP
+/// response — a single read can land before the child has written under
+/// parallel load. Bounded deadline so a genuinely missing write still fails the
+/// test rather than hanging.
+async fn poll_file_nonempty(path: &Path) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            if !contents.trim().is_empty() {
+                return contents;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "expected {} to be recorded within the deadline",
+            path.display()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 fn write_stub_freenet(dir: &Path, version: &str) -> std::path::PathBuf {
     let bin = dir.join("fake-freenet");
     let script = format!("#!/bin/sh\necho freenet {version}\n");
@@ -521,47 +543,73 @@ async fn healthz_is_ok() {
 #[tokio::test]
 async fn spawn_failure_does_not_consume_rate_limit_window() {
     // Security-critical contract: an immediate sudo rejection or script
-    // failure within the 1s probe window must NOT mark the rate-limit
-    // window consumed — otherwise an attacker (or a transient sudoers
-    // misconfig) could lock out legitimate retries for the full window.
-    let tmp = tempfile::tempdir().unwrap();
-    let argv_record = tmp.path().join("argv.log");
-    // Update script exits 1 immediately. Surface as 500 to the caller.
-    let h = Harness::build_live(
-        "0.2.55",
-        Version::new(0, 2, 56),
-        600, // 10 min window — long enough that a second successful spawn
-        // within seconds proves the window WAS NOT consumed.
-        "#!/bin/sh\nexit 1\n",
-        &argv_record,
-    )
-    .await;
+    // failure that is caught within the 1s probe window (surfaced as 500) must
+    // NOT mark the rate-limit window consumed — otherwise an attacker (or a
+    // transient sudoers misconfig) could lock out legitimate retries for the
+    // full window.
+    //
+    // Determinism note: whether the `exit 1` child is *reaped* within the 1s
+    // wall-clock probe is scheduler-dependent. Under heavy parallel load the
+    // child can miss the probe deadline and be (legitimately) classified as
+    // "still running" → 202, in which case production DOES consume the window
+    // for that classification — so we cannot assert "never 429" against a
+    // single attempt. Instead we retry the scenario on a FRESH harness until
+    // the probe deterministically catches the fast exit (500), then assert the
+    // window-not-consumed contract on that attempt. In isolation the 500 path
+    // is reliable; the retry only absorbs rare load-induced misses.
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let tmp = tempfile::tempdir().unwrap();
+        let argv_record = tmp.path().join("argv.log");
+        // Update script exits 1 immediately. Surface as 500 to the caller.
+        let h = Harness::build_live(
+            "0.2.55",
+            Version::new(0, 2, 56),
+            600, // 10 min window — long enough that a second successful spawn
+            // within seconds proves the window WAS NOT consumed.
+            "#!/bin/sh\nexit 1\n",
+            &argv_record,
+        )
+        .await;
 
-    let (body, sig) = h.signed_body("0.2.56", now_secs());
-    let r1 = reqwest::Client::new()
-        .post(format!("{}/update", h.base))
-        .header(HEADER_SIGNATURE.as_str(), &sig)
-        .body(body)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r1.status(), 500, "spawn failure should surface as 500");
+        let (body, sig) = h.signed_body("0.2.56", now_secs());
+        let r1 = reqwest::Client::new()
+            .post(format!("{}/update", h.base))
+            .header(HEADER_SIGNATURE.as_str(), &sig)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        if r1.status() != 500 {
+            // Probe missed the fast exit under load (got 202); retry on a fresh
+            // harness so this stays deterministic. Bounded to avoid a hang if
+            // the 500 path were genuinely broken.
+            assert!(
+                attempt < 20,
+                "spawn failure never surfaced as 500 across {attempt} attempts; got {}",
+                r1.status()
+            );
+            continue;
+        }
 
-    // Immediately retry. Should NOT be 429 — window must not have
-    // been consumed by the failed spawn.
-    let (body2, sig2) = h.signed_body("0.2.56", now_secs());
-    let r2 = reqwest::Client::new()
-        .post(format!("{}/update", h.base))
-        .header(HEADER_SIGNATURE.as_str(), &sig2)
-        .body(body2)
-        .send()
-        .await
-        .unwrap();
-    assert_ne!(
-        r2.status(),
-        429,
-        "rate-limit window must not be consumed by a failed spawn"
-    );
+        // Immediately retry. Should NOT be 429 — window must not have
+        // been consumed by the failed spawn.
+        let (body2, sig2) = h.signed_body("0.2.56", now_secs());
+        let r2 = reqwest::Client::new()
+            .post(format!("{}/update", h.base))
+            .header(HEADER_SIGNATURE.as_str(), &sig2)
+            .body(body2)
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            r2.status(),
+            429,
+            "rate-limit window must not be consumed by a failed spawn"
+        );
+        break;
+    }
 }
 
 #[tokio::test]
@@ -581,10 +629,13 @@ async fn concurrent_updates_only_spawn_once() {
     let tmp = tempfile::tempdir().unwrap();
     let argv_record = tmp.path().join("argv.log");
     let spawn_count = tmp.path().join("spawns.log");
-    // Each spawn appends a line, then sleeps 3s so it is still running when the
-    // second POST arrives (1s probe << 3s sleep).
+    // Each spawn appends a line, then sleeps just past the 1s early-exit probe
+    // so it is still running when the second POST arrives (1s probe < 1.5s
+    // sleep). Kept as short as possible so the stub child doesn't linger after
+    // the HTTP responses land and add scheduler contention to sibling tests
+    // running in parallel.
     let update_script = format!(
-        "#!/bin/sh\necho spawned >> {}\nsleep 3\n",
+        "#!/bin/sh\necho spawned >> {}\nsleep 1.5\n",
         spawn_count.display()
     );
     // rate_limit_seconds = 0 so the rate-limiter never fires: this test
@@ -683,15 +734,17 @@ async fn concurrent_updates_only_spawn_once() {
 async fn update_after_in_flight_completes_is_accepted() {
     // The in-flight guard must be RELEASED when the update completes, so a
     // legitimate follow-up update is not permanently blocked. Uses a short
-    // sleep (past the 1s probe) then exit, and a 0s rate-limit window so the
-    // rate-limiter doesn't mask the in-flight behaviour being tested.
+    // sleep (just past the 1s probe) then exit, and a 0s rate-limit window so
+    // the rate-limiter doesn't mask the in-flight behaviour being tested.
     let tmp = tempfile::tempdir().unwrap();
     let argv_record = tmp.path().join("argv.log");
     let h = Harness::build_live(
         "0.2.55",
         Version::new(0, 2, 56),
         0, // no rate-limit, so we isolate the in-flight guard
-        "#!/bin/sh\nsleep 2\n",
+        // Sleep just past the 1s early-exit probe; kept minimal so the stub
+        // child doesn't linger and add scheduler contention to parallel tests.
+        "#!/bin/sh\nsleep 1.5\n",
         &argv_record,
     )
     .await;
@@ -717,22 +770,40 @@ async fn update_after_in_flight_completes_is_accepted() {
         .unwrap();
     assert_eq!(r2.status(), 409, "overlapping update must be 409");
 
-    // Wait for the first update's stub to exit (2s sleep) plus a margin, so
-    // the in-flight guard's background wait task releases the slot.
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-
-    let (body3, sig3) = h.signed_body("0.2.56", now_secs());
-    let r3 = reqwest::Client::new()
-        .post(format!("{}/update", h.base))
-        .header(HEADER_SIGNATURE.as_str(), &sig3)
-        .body(body3)
-        .send()
-        .await
-        .unwrap();
+    // POLL for the guard to release rather than asserting on a fixed sleep that
+    // happens to match the stub's runtime. The background wait task frees the
+    // slot when the stub child exits (~1.5s) — under parallel load that can
+    // slip well past the nominal time, so a fixed wait would flake. Retry POST 3
+    // until it is accepted, with a bounded deadline. Each rejected attempt is a
+    // 409 (slot still held); we tolerate those and only fail if the slot never
+    // frees within the deadline. rate_limit_seconds = 0 means an accepted POST
+    // never turns into a 429, so retries are safe.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let last_status = loop {
+        let (body3, sig3) = h.signed_body("0.2.56", now_secs());
+        let r3 = reqwest::Client::new()
+            .post(format!("{}/update", h.base))
+            .header(HEADER_SIGNATURE.as_str(), &sig3)
+            .body(body3)
+            .send()
+            .await
+            .unwrap();
+        let last_status = r3.status().as_u16();
+        if last_status == 200 || last_status == 202 {
+            break last_status;
+        }
+        assert_eq!(
+            last_status, 409,
+            "while the slot is still held the follow-up must be 409, got {last_status}"
+        );
+        if std::time::Instant::now() >= deadline {
+            break last_status;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
     assert!(
-        r3.status() == 200 || r3.status() == 202,
-        "guard must be released after the update completes; got {}",
-        r3.status()
+        last_status == 200 || last_status == 202,
+        "guard must be released after the update completes; got {last_status}"
     );
 }
 
@@ -746,12 +817,15 @@ async fn sudoers_argv_matches_allowlist() {
     // wrapper and asserts it lines up with the sudoers allowlist.
     let tmp = tempfile::tempdir().unwrap();
     let argv_record = tmp.path().join("argv.log");
-    // Update script does nothing; we only care about the argv sudo sees.
+    // Update script does nothing; we only care about the argv sudo sees. Sleep
+    // just past the 1s early-exit probe (so the handler returns 202, not a
+    // probe-window failure) and no longer — a lingering stub child only adds
+    // scheduler contention to the parallel suite.
     let h = Harness::build_live(
         "0.2.55",
         Version::new(0, 2, 56),
         600,
-        "#!/bin/sh\n# noop — wait long enough that the 1s probe times out\nsleep 5\n",
+        "#!/bin/sh\n# noop — wait long enough that the 1s probe times out\nsleep 1.5\n",
         &argv_record,
     )
     .await;
@@ -770,8 +844,11 @@ async fn sudoers_argv_matches_allowlist() {
         r.status()
     );
 
-    let recorded =
-        std::fs::read_to_string(&argv_record).expect("fake-sudo should have recorded argv");
+    // POLL for the fake-sudo wrapper to record argv. The wrapper runs in the
+    // spawned child, which races the HTTP response — under parallel load the
+    // file may not exist yet when the response lands. A single read here was
+    // green only by luck; poll with a bounded deadline instead.
+    let recorded = poll_file_nonempty(&argv_record).await;
     let argv = recorded.trim();
     // Expected: <update_script_path> --force --target-version v0.2.56
     assert!(
@@ -925,7 +1002,9 @@ async fn announce_disabled_still_requires_signature() {
 async fn announce_happy_path() {
     let tmp = tempfile::tempdir().unwrap();
     let record = tmp.path().join("argv.log");
-    let h = build_with_announcer("#!/bin/sh\nsleep 5\n", &record).await;
+    // Sleep just past the 1s probe so the handler returns 202; kept short so
+    // the stub child doesn't linger and contend with the parallel suite.
+    let h = build_with_announcer("#!/bin/sh\nsleep 1.5\n", &record).await;
     let (body, sig) = signed_announce(&h.secret, "Freenet v0.2.57 released", now_secs());
     let resp = reqwest::Client::new()
         .post(format!("{}/announce/river", h.base))
@@ -939,7 +1018,11 @@ async fn announce_happy_path() {
         "got {}",
         resp.status()
     );
-    let recorded = std::fs::read_to_string(&record).expect("fake-sudo recorded argv");
+    // POLL for the fake-sudo wrapper to record argv. It runs in the spawned
+    // child, which races the HTTP response — under parallel load the file may
+    // not exist yet when the response lands. The wrapper writes `record.full`
+    // first, then `record`, so a non-empty `record` implies both are present.
+    let recorded = poll_file_nonempty(&record).await;
     assert!(
         recorded.contains("Freenet v0.2.57 released"),
         "argv should contain the message, got: {recorded:?}"
@@ -1014,33 +1097,52 @@ async fn announce_oversize_message_is_413() {
 
 #[tokio::test]
 async fn announce_spawn_failure_does_not_consume_rate_limit() {
-    let tmp = tempfile::tempdir().unwrap();
-    let record = tmp.path().join("argv.log");
-    // Script exits 1 immediately → 500 + window NOT consumed.
-    let h = build_with_announcer("#!/bin/sh\nexit 1\n", &record).await;
-    let (body, sig) = signed_announce(&h.secret, "first", now_secs());
-    let r1 = reqwest::Client::new()
-        .post(format!("{}/announce/river", h.base))
-        .header(HEADER_SIGNATURE.as_str(), &sig)
-        .body(body)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r1.status(), 500);
+    // Mirrors `spawn_failure_does_not_consume_rate_limit_window`: the
+    // announce path uses the same 1s wall-clock early-exit probe, so whether
+    // the `exit 1` child is reaped within it is scheduler-dependent. Retry on a
+    // FRESH harness until the probe deterministically catches the fast exit
+    // (500), then assert the window-not-consumed contract on that attempt.
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let tmp = tempfile::tempdir().unwrap();
+        let record = tmp.path().join("argv.log");
+        // Script exits 1 immediately → 500 + window NOT consumed.
+        let h = build_with_announcer("#!/bin/sh\nexit 1\n", &record).await;
+        let (body, sig) = signed_announce(&h.secret, "first", now_secs());
+        let r1 = reqwest::Client::new()
+            .post(format!("{}/announce/river", h.base))
+            .header(HEADER_SIGNATURE.as_str(), &sig)
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        if r1.status() != 500 {
+            // Probe missed the fast exit under load (got 202); retry on a fresh
+            // harness. Bounded to avoid hanging if the 500 path were broken.
+            assert!(
+                attempt < 20,
+                "announce spawn failure never surfaced as 500 across {attempt} attempts; got {}",
+                r1.status()
+            );
+            continue;
+        }
 
-    let (body2, sig2) = signed_announce(&h.secret, "second", now_secs());
-    let r2 = reqwest::Client::new()
-        .post(format!("{}/announce/river", h.base))
-        .header(HEADER_SIGNATURE.as_str(), &sig2)
-        .body(body2)
-        .send()
-        .await
-        .unwrap();
-    assert_ne!(
-        r2.status(),
-        429,
-        "failed spawn must not consume the announce rate-limit window"
-    );
+        let (body2, sig2) = signed_announce(&h.secret, "second", now_secs());
+        let r2 = reqwest::Client::new()
+            .post(format!("{}/announce/river", h.base))
+            .header(HEADER_SIGNATURE.as_str(), &sig2)
+            .body(body2)
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            r2.status(),
+            429,
+            "failed spawn must not consume the announce rate-limit window"
+        );
+        break;
+    }
 }
 
 #[tokio::test]
@@ -1107,7 +1209,9 @@ async fn announce_exactly_at_message_limit_is_accepted() {
     // so 4096 passes. One-over (4097) goes 413 — see next test.
     let tmp = tempfile::tempdir().unwrap();
     let record = tmp.path().join("argv.log");
-    let h = build_with_announcer("#!/bin/sh\nsleep 5\n", &record).await;
+    // Sleep just past the 1s probe so the handler returns 202; kept short so
+    // the stub child doesn't linger and contend with the parallel suite.
+    let h = build_with_announcer("#!/bin/sh\nsleep 1.5\n", &record).await;
     let exact = "x".repeat(4096);
     let (body, sig) = signed_announce(&h.secret, &exact, now_secs());
     let resp = reqwest::Client::new()
