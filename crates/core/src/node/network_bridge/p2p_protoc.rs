@@ -6352,57 +6352,237 @@ mod tests {
         );
     }
 
+    /// Strip every `#[cfg(test)]` region (single item *or* brace-delimited
+    /// module/block) from a Rust source string, leaving only production code.
+    ///
+    /// This is deliberately a small ad-hoc scanner rather than a real parser:
+    /// it only needs to be precise enough that test-only
+    /// `register_peer_interest(` calls (which all live under `#[cfg(test)]`)
+    /// don't count toward the production tally walked by
+    /// `pending_broadcast_flush_wired_at_all_interest_sites`. It handles the
+    /// two cfg(test) shapes that occur in this crate:
+    ///
+    /// * single item — `#[cfg(test)]\npub(crate) use ...;` / `mod foo;`
+    ///   (removed up to and including the terminating `;`), and
+    /// * block — `#[cfg(test)]\nmod tests { ... }` (removed with brace
+    ///   balancing, so nested `{}` inside the block don't end it early).
+    ///
+    /// Braces inside string/char literals or comments are ignored well enough
+    /// for this purpose because the only thing we measure afterward is the
+    /// count of two specific identifiers, and those never appear inside a
+    /// literal in production source.
+    fn strip_cfg_test_regions(src: &str) -> String {
+        const MARKER: &str = "#[cfg(test)]";
+        let bytes = src.as_bytes();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0usize;
+        while i < src.len() {
+            if src[i..].starts_with(MARKER) {
+                // Advance past the marker and any following attributes/whitespace
+                // until the first significant token of the gated item.
+                let mut j = i + MARKER.len();
+                // Skip whitespace and additional `#[...]` attribute lines.
+                loop {
+                    while j < src.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if src[j..].starts_with("#[") {
+                        // Skip a balanced `#[ ... ]` attribute.
+                        let mut depth = 0i32;
+                        while j < src.len() {
+                            match bytes[j] {
+                                b'[' => depth += 1,
+                                b']' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        j += 1;
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            j += 1;
+                        }
+                        continue;
+                    }
+                    break;
+                }
+                // From `j`, find the end of this gated item: either the matching
+                // `}` of the first `{ ... }` block, or the terminating `;`.
+                let mut k = j;
+                let mut found_brace = false;
+                while k < src.len() {
+                    match bytes[k] {
+                        b'{' => {
+                            found_brace = true;
+                            break;
+                        }
+                        b';' => break,
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                if found_brace {
+                    // Brace-balance to the matching close.
+                    let mut depth = 0i32;
+                    while k < src.len() {
+                        match bytes[k] {
+                            b'{' => depth += 1,
+                            b'}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    k += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        k += 1;
+                    }
+                } else if k < src.len() {
+                    // Consume the terminating `;`.
+                    k += 1;
+                }
+                i = k;
+                continue;
+            }
+            // Copy one byte of production source. `src` is valid UTF-8 and we
+            // only ever split on ASCII boundaries (markers/braces/`;`), so
+            // pushing the char at this index is safe.
+            let ch = src[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        out
+    }
+
+    /// Recursively collect every `*.rs` file under `dir`.
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
     /// #4359 trigger-completeness pin (MUST-FIX 1). The deferred broadcast only
     /// drains when a viable target appears, signalled by
     /// `flush_pending_broadcast_on_interest`. The interest-manager (Source 2)
     /// path makes a peer a target via `register_peer_interest`; EVERY such call
     /// site that can be the first viable target for a never-seen id must flush.
-    /// This pin asserts that each `register_peer_interest` call in the
-    /// production interest-registration files is accompanied by a nearby
-    /// `flush_pending_broadcast_on_interest`, so a future call site cannot
-    /// silently regress the fix (the failure mode the re-review caught: flush
-    /// wired at one caller while several others made a peer a target with no
-    /// flush). Source 1 (proximity) is guarded by the node.rs assertion below.
+    ///
+    /// Rather than trusting a static allow-list of files (the brittle shape the
+    /// re-review flagged — a NEW production `register_peer_interest` added in
+    /// some other module would silently escape the pin and re-open the
+    /// unflushed-target bug), this pin WALKS the entire crate source tree
+    /// (`$CARGO_MANIFEST_DIR/src/**/*.rs`), strips `#[cfg(test)]` regions, and
+    /// asserts that:
+    ///
+    ///   1. the SET of production files that contain a `register_peer_interest(`
+    ///      call equals the known-wired set (so a brand-new file with such a
+    ///      call trips the pin even before we reach the per-file count), and
+    ///   2. within each such file, production
+    ///      `flush_pending_broadcast_on_interest(` calls >= production
+    ///      `register_peer_interest(` calls (the pairing convention the fix
+    ///      established).
+    ///
+    /// Source 1 (proximity) is guarded by the node.rs assertion at the end.
     #[test]
     fn pending_broadcast_flush_wired_at_all_interest_sites() {
-        // (file, how many register_peer_interest calls in this file are
-        // first-viable-target sites that must be flush-paired). Test files are
-        // excluded by checking only the listed production modules.
-        let cases: &[(&str, &str)] = &[
-            (
-                "../../operations/subscribe.rs",
-                include_str!("../../operations/subscribe.rs"),
-            ),
-            ("../../operations.rs", include_str!("../../operations.rs")),
-            (
-                "../../operations/get/op_ctx_task.rs",
-                include_str!("../../operations/get/op_ctx_task.rs"),
-            ),
-            ("../../node.rs", include_str!("../../node.rs")),
-        ];
+        // The set of production files (relative to `src/`) that are known to
+        // make a peer a first-viable-target via `register_peer_interest` and
+        // are correctly flush-paired. A NEW production call site in any other
+        // file must FAIL this pin — see the set-equality assertion below.
+        let known_wired: std::collections::BTreeSet<&str> = [
+            "node.rs",
+            "operations.rs",
+            "operations/subscribe.rs",
+            "operations/get/op_ctx_task.rs",
+        ]
+        .into_iter()
+        .collect();
 
-        for (path, src) in cases {
-            // Strip the `#[cfg(test)] mod tests` region so test-only
-            // register_peer_interest calls don't trip the pin.
-            let prod = src.find("\nmod tests").map(|p| &src[..p]).unwrap_or(src);
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs_files(&src_root, &mut files);
+        assert!(
+            !files.is_empty(),
+            "#4359 MUST-FIX 1: source walk found no .rs files under {} — the pin cannot \
+             guarantee completeness if it can't read the crate source.",
+            src_root.display()
+        );
+
+        let mut found_with_register: std::collections::BTreeSet<String> = Default::default();
+        // Per-file pairing failures: (relative path, reg_count, flush_count).
+        let mut pairing_failures: Vec<(String, usize, usize)> = Vec::new();
+
+        for path in &files {
+            let rel = path
+                .strip_prefix(&src_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let src = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let prod = strip_cfg_test_regions(&src);
             let reg_count = prod.matches("register_peer_interest(").count();
+            if reg_count == 0 {
+                continue;
+            }
+            // The interest-manager method *definition* itself lives in
+            // ring/interest.rs and is not a call site; ignore it. Detect by the
+            // presence of the `pub fn register_peer_interest` definition.
+            if prod.contains("fn register_peer_interest(") {
+                continue;
+            }
+            found_with_register.insert(rel.clone());
             let flush_count = prod.matches("flush_pending_broadcast_on_interest(").count();
-            assert!(
-                flush_count >= reg_count,
-                "#4359 MUST-FIX 1: {path} has {reg_count} register_peer_interest call(s) but only \
-                 {flush_count} flush_pending_broadcast_on_interest call(s). Every interest \
-                 registration that can be the first viable broadcast target for a cold id must \
-                 flush the deferred broadcast, or the fix silently fails for that path. If a new \
-                 register_peer_interest site genuinely cannot be a first viable target, document \
-                 why and adjust this pin."
-            );
+            if flush_count < reg_count {
+                pairing_failures.push((rel, reg_count, flush_count));
+            }
         }
+
+        // (1) Set equality: no NEW production file may carry a
+        // register_peer_interest call without being deliberately wired here.
+        let found_refs: std::collections::BTreeSet<&str> =
+            found_with_register.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            found_refs, known_wired,
+            "#4359 MUST-FIX 1: the set of production files that call \
+             register_peer_interest changed. Found {found_refs:?}, expected {known_wired:?}. \
+             A NEW register_peer_interest call site can be the first viable broadcast target \
+             for a cold id; it MUST flush the deferred broadcast (call \
+             flush_pending_broadcast_on_interest) or the #4359 fix silently fails for that \
+             path. Wire the flush, then add the file to `known_wired` in this pin. If the new \
+             site genuinely cannot be a first viable target, document why and adjust this pin."
+        );
+
+        // (2) Per-file pairing: every wired file's flush count covers its
+        // register count.
+        assert!(
+            pairing_failures.is_empty(),
+            "#4359 MUST-FIX 1: interest registration without a paired broadcast flush: \
+             {pairing_failures:?} (file, register_peer_interest count, \
+             flush_pending_broadcast_on_interest count). Every interest registration that can \
+             be the first viable broadcast target for a cold id must flush the deferred \
+             broadcast, or the fix silently fails for that path."
+        );
 
         // Source 1 (proximity): the NeighborHosting overlap path must flush too,
         // since a neighbor newly announcing it hosts our contract is a viable
         // target with no interest_manager entry.
-        const NODE: &str = include_str!("../../node.rs");
-        let node_prod = NODE.find("\nmod tests").map(|p| &NODE[..p]).unwrap_or(NODE);
+        let node_path = src_root.join("node.rs");
+        let node_src = std::fs::read_to_string(&node_path).expect("node.rs must be readable");
+        let node_prod = strip_cfg_test_regions(&node_src);
         assert!(
             node_prod.contains("Source 1 / proximity")
                 && node_prod.contains("flush_pending_broadcast_on_interest(&key)"),

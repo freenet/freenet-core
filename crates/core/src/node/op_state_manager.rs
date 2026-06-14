@@ -706,34 +706,17 @@ impl OpManager {
     /// when nothing is pending for the contract — the overwhelmingly common
     /// case, kept cheap by checking membership before any contract-handler read.
     pub(crate) async fn flush_pending_broadcast_on_interest(&self, key: &ContractKey) {
-        // Fast path: nothing stashed for this contract (the common case for the
-        // many interest registrations on already-propagated contracts). Avoid
-        // the take()/contract-handler read entirely.
-        if !self.pending_broadcasts.contains(key.id()) {
-            return;
-        }
-        // Drain the stash marker. If it raced away (TTL expiry, a concurrent
-        // targets-found take, or another flush) there is nothing to do.
-        let Some(stashed) = self.pending_broadcasts.take(key.id()) else {
-            return;
-        };
-
-        // Stale-state safety: re-read the CURRENT local state instead of
-        // re-broadcasting the give-up-time bytes. Fall back to the stashed bytes
-        // if the live read fails so we never regress to dropping the broadcast.
-        let state = self
-            .read_current_contract_state(key)
-            .await
-            .unwrap_or(stashed);
-
-        emit_pending_broadcast_reemit_on(
+        flush_pending_broadcast_on_interest_on(
+            &self.pending_broadcasts,
             self.to_event_listener.notifications_sender(),
             self.to_event_listener.notification_channel_pending(),
             self.to_event_listener.notifications_sender().capacity(),
-            &self.pending_broadcasts,
             key,
-            state,
-        );
+            // Live read of the CURRENT local state, evaluated lazily so the
+            // fast path (nothing stashed) never touches the contract handler.
+            || self.read_current_contract_state(key),
+        )
+        .await;
     }
 
     /// Read the current local state for `key` from the contract handler, or
@@ -1305,6 +1288,65 @@ fn try_notify_node_event_on(
             Err(OpError::NotificationError)
         }
     }
+}
+
+/// Orchestration-core of [`OpManager::flush_pending_broadcast_on_interest`],
+/// extracted as a free function so its three branches are unit-testable against
+/// a raw store + notifier + a stubbed "read current state" step, without
+/// building a full `OpManager` (same pattern as [`emit_pending_broadcast_reemit_on`]
+/// / [`release_pending_op_slot_on`]).
+///
+/// Issue #4359 (re-review, SHOULD-FIX 4 stale-state safety + fast-path):
+///
+/// 1. **Fast path / no-op** — nothing stashed for `key` (the common case: most
+///    interest registrations are on already-propagated contracts). Returns
+///    without invoking `read_current_state` or emitting anything, so the
+///    contract handler is never touched on the hot path.
+/// 2. **take()-None** — the membership check passed but `take()` lost the entry
+///    to a concurrent drain (TTL expiry, a targets-found take, another flush);
+///    again a no-op.
+/// 3. **stashed → re-read current state** — re-broadcast the CURRENT local
+///    state (`read_current_state` returned `Some`) rather than the possibly
+///    superseded give-up-time bytes; fall back to the stashed `bytes` when the
+///    live read fails (`None`) so we never regress to dropping the broadcast.
+///
+/// `read_current_state` is a closure returning the read future so it is only
+/// polled once a stash entry is actually drained (preserving the fast path).
+async fn flush_pending_broadcast_on_interest_on<F, Fut>(
+    pending: &crate::operations::update::pending_broadcast::PendingBroadcastStore,
+    notifications_sender: &mpsc::Sender<Either<NetMessage, NodeEvent>>,
+    channel_pending: usize,
+    channel_remaining: usize,
+    key: &ContractKey,
+    read_current_state: F,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<WrappedState>>,
+{
+    // Fast path: nothing stashed for this contract. Avoid the take()/contract-
+    // handler read entirely.
+    if !pending.contains(key.id()) {
+        return;
+    }
+    // Drain the stash marker. If it raced away (TTL expiry, a concurrent
+    // targets-found take, or another flush) there is nothing to do.
+    let Some(stashed) = pending.take(key.id()) else {
+        return;
+    };
+
+    // Stale-state safety: re-read the CURRENT local state instead of
+    // re-broadcasting the give-up-time bytes. Fall back to the stashed bytes
+    // if the live read fails so we never regress to dropping the broadcast.
+    let state = read_current_state().await.unwrap_or(stashed);
+
+    emit_pending_broadcast_reemit_on(
+        notifications_sender,
+        channel_pending,
+        channel_remaining,
+        pending,
+        key,
+        state,
+    );
 }
 
 /// Emit a deferred fresh-contract re-broadcast for `key` carrying `state` on the
@@ -2035,6 +2077,195 @@ mod tests {
         assert_eq!(recovered.as_ref(), state.as_ref());
 
         drop(notifications_receiver);
+        GlobalSimulationTime::clear_time();
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // Regression tests for #4359 re-review (SHOULD-FIX 4 + fast-path):
+    // `flush_pending_broadcast_on_interest`'s OWN branching — the
+    // contains() no-op fast path, the take()-None race path, and the
+    // read_current_contract_state Some/None handling — exercised through
+    // `flush_pending_broadcast_on_interest_on`, the orchestration-core the
+    // method delegates to (the method itself only wires `self`'s store,
+    // notifier, and `read_current_contract_state` into this function). The
+    // `read_current_state` step is stubbed so the live-read Some/None
+    // branches are driven deterministically without a contract handler.
+    //
+    // These restore coverage that an earlier revision dropped when it kept
+    // only the `emit_pending_broadcast_reemit_on` tests above — those cover
+    // the emit-core, NOT the stash-membership / stale-state branching.
+    // ──────────────────────────────────────────────────────────
+
+    /// Load-bearing: nothing stashed → the flush is a pure no-op. It must NOT
+    /// read current state and must NOT emit anything, so the overwhelmingly
+    /// common interest-registration-on-an-already-propagated-contract case
+    /// stays cheap. If the membership fast path regressed (e.g. always
+    /// take()/read), this test fails: `read_current_state` would be invoked and
+    /// the channel would receive an emission.
+    #[tokio::test]
+    async fn flush_noop_when_nothing_stashed() {
+        use crate::operations::update::pending_broadcast::PendingBroadcastStore;
+
+        GlobalSimulationTime::set_time_ms(0);
+        let (receiver, notifier) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut notifications_receiver,
+            ..
+        } = receiver;
+
+        let store = PendingBroadcastStore::new();
+        let key = test_contract_key(21);
+        let read_called = std::cell::Cell::new(false);
+
+        super::flush_pending_broadcast_on_interest_on(
+            &store,
+            notifier.notifications_sender(),
+            notifier.notification_channel_pending(),
+            notifier.notifications_sender().capacity(),
+            &key,
+            || {
+                read_called.set(true);
+                std::future::ready(None)
+            },
+        )
+        .await;
+
+        assert!(
+            !read_called.get(),
+            "no-op fast path must NOT read current contract state when nothing is stashed"
+        );
+        // No emission must reach the channel.
+        match notifications_receiver.try_recv() {
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            other => panic!("expected no emission on the no-op path, got {other:?}"),
+        }
+        GlobalSimulationTime::clear_time();
+    }
+
+    /// Load-bearing: stashed + live read returns `Some(current)` → the re-emit
+    /// must carry the CURRENT state, NOT the stale give-up-time bytes. This pins
+    /// the stale-state safety (SHOULD-FIX 4): a locally-applied UPDATE between
+    /// give-up and flush must win. If the method regressed to re-emitting the
+    /// stashed bytes, the asserted state would be the stale ones and this fails.
+    #[tokio::test]
+    async fn flush_reemits_current_state_when_live_read_present() {
+        use crate::operations::update::pending_broadcast::PendingBroadcastStore;
+
+        GlobalSimulationTime::set_time_ms(0);
+        let (receiver, notifier) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut notifications_receiver,
+            ..
+        } = receiver;
+
+        let store = PendingBroadcastStore::new();
+        let key = test_contract_key(22);
+        let stale = freenet_stdlib::prelude::WrappedState::new(vec![0xAA; 8]);
+        let current = freenet_stdlib::prelude::WrappedState::new(vec![0xBB; 12]);
+        store.stash(*key.id(), stale.clone());
+
+        let current_for_read = current.clone();
+        super::flush_pending_broadcast_on_interest_on(
+            &store,
+            notifier.notifications_sender(),
+            notifier.notification_channel_pending(),
+            notifier.notifications_sender().capacity(),
+            &key,
+            || std::future::ready(Some(current_for_read.clone())),
+        )
+        .await;
+
+        let received = timeout(Duration::from_millis(200), notifications_receiver.recv())
+            .await
+            .expect("timed out waiting for re-broadcast emission")
+            .expect("notification channel closed");
+        match received {
+            Either::Right(NodeEvent::BroadcastStateChange {
+                key: observed_key,
+                new_state,
+                is_reemit,
+                ..
+            }) => {
+                assert_eq!(observed_key, key);
+                assert_eq!(
+                    new_state.as_ref(),
+                    current.as_ref(),
+                    "must re-emit the CURRENT live state, not the stale stashed bytes"
+                );
+                assert_ne!(
+                    new_state.as_ref(),
+                    stale.as_ref(),
+                    "stale give-up-time bytes must not be broadcast when a live read succeeds"
+                );
+                assert!(is_reemit, "deferred flush must be tagged is_reemit");
+            }
+            other @ Either::Left(_) | other @ Either::Right(_) => {
+                panic!("expected BroadcastStateChange, got {other:?}")
+            }
+        }
+        // The stash must have been drained.
+        assert!(
+            store.take(key.id()).is_none(),
+            "the stash entry must be drained by the flush"
+        );
+        GlobalSimulationTime::clear_time();
+    }
+
+    /// Load-bearing: stashed + live read returns `None` (contract handler
+    /// unavailable / not hosted) → the re-emit must FALL BACK to the stashed
+    /// bytes rather than dropping the broadcast. This pins the None-fallback
+    /// branch of `read_current_contract_state` handling: a failed live read is
+    /// strictly no worse than re-emitting the give-up-time state. If the
+    /// fallback regressed (e.g. `?`-style early return on None), nothing would
+    /// be emitted and this fails on the recv timeout.
+    #[tokio::test]
+    async fn flush_falls_back_to_stashed_bytes_when_live_read_absent() {
+        use crate::operations::update::pending_broadcast::PendingBroadcastStore;
+
+        GlobalSimulationTime::set_time_ms(0);
+        let (receiver, notifier) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut notifications_receiver,
+            ..
+        } = receiver;
+
+        let store = PendingBroadcastStore::new();
+        let key = test_contract_key(23);
+        let stashed = freenet_stdlib::prelude::WrappedState::new(vec![0xCC; 10]);
+        store.stash(*key.id(), stashed.clone());
+
+        super::flush_pending_broadcast_on_interest_on(
+            &store,
+            notifier.notifications_sender(),
+            notifier.notification_channel_pending(),
+            notifier.notifications_sender().capacity(),
+            &key,
+            // Live read fails (handler unavailable / not hosted).
+            || std::future::ready(None),
+        )
+        .await;
+
+        let received = timeout(Duration::from_millis(200), notifications_receiver.recv())
+            .await
+            .expect("timed out: the None live-read path must fall back to stashed bytes, not drop")
+            .expect("notification channel closed");
+        match received {
+            Either::Right(NodeEvent::BroadcastStateChange {
+                key: observed_key,
+                new_state,
+                ..
+            }) => {
+                assert_eq!(observed_key, key);
+                assert_eq!(
+                    new_state.as_ref(),
+                    stashed.as_ref(),
+                    "must fall back to the stashed bytes when the live read returns None"
+                );
+            }
+            other @ Either::Left(_) | other @ Either::Right(_) => {
+                panic!("expected BroadcastStateChange, got {other:?}")
+            }
+        }
         GlobalSimulationTime::clear_time();
     }
 
