@@ -1,7 +1,14 @@
 # Transport Layer Documentation Gaps - Analysis Report
 
-**Generated:** 2026-01-19
+**Generated:** 2026-01-19 (gaps below); reconciled 2026-06-14
 **Purpose:** Comprehensive analysis of missing documentation vs. implemented features
+
+> **Since-merged update (2026-06-14):** Streaming flight-size release on abort
+> (#4345 / #4393) and the stream-scoped `OutboundStreamFailed` error semantics
+> (#4374) have since landed and are now documented in
+> [`design/streaming-infrastructure.md`](design/streaming-infrastructure.md)
+> ("Stream Abort and Flight-Size Release"). The streaming-handler abort/release
+> work is no longer an open gap. The remaining gaps below are unchanged.
 
 ---
 

@@ -2,18 +2,9 @@
 
 ## Overview
 
-The streaming infrastructure provides lock-free, high-performance fragment reassembly for large message transfers (Issue #1452).
+The streaming infrastructure provides lock-free, high-performance fragment reassembly for large message transfers (Issue #1452). It is **shipped and active**: a PUT/GET whose payload exceeds `streaming_threshold` (default 64 KB) is sent as a fragment stream rather than a single message — see [Selection](#selection).
 
-## Implementation Status
-
-| Phase | Status | PR | Description |
-|-------|--------|-----|-------------|
-| Phase 1: Lock-Free StreamBuffer | **COMPLETE** | #2443 | Lock-free fragment storage with `AtomicPtr<Bytes>` |
-| Phase 2: Piped Forwarding | **COMPLETE** | #2458/2465 | Intermediate node forwarding without reassembly |
-| Phase 3: Message Layer | **COMPLETE** | #2476 | Streaming message variants and OrphanStreamRegistry |
-| Phase 4: Streaming Handlers | **IN PROGRESS** | - | Implement handlers in put.rs/get.rs |
-| Phase 5: Capability Negotiation | Not started | - | Backward compatibility with non-streaming nodes |
-| Phase 6: Rollout | Not started | - | Shadow mode, metrics, gradual enablement |
+This document describes the design of the components that make that work: the lock-free reassembly buffer, piped forwarding, the streaming message variants and orphan registry, the operation-layer handlers, and stream-abort / flight-size handling. It is a design reference, not an implementation plan.
 
 ## Problem Statement
 
@@ -26,7 +17,7 @@ The original `InboundStream` implementation used `RwLock<HashMap>` for fragment 
 
 ---
 
-## Phase 1: Lock-Free StreamBuffer (COMPLETE)
+## Lock-Free StreamBuffer
 
 ### Architecture
 
@@ -65,10 +56,10 @@ The original `InboundStream` implementation used `RwLock<HashMap>` for fragment 
 
 #### 1. LockFreeStreamBuffer
 
-The core lock-free buffer using `OnceLock<Bytes>` slots. See `streaming_buffer.rs:39-53`.
+The core lock-free buffer using `AtomicPtr<Bytes>` slots. See `streaming_buffer.rs` (`LockFreeStreamBuffer`).
 
 **Key Properties:**
-- **Lock-free writes**: `OnceLock::set()` is a single atomic CAS
+- **Lock-free writes**: insertion is a single atomic CAS on the slot's `AtomicPtr`; unlike `OnceLock`, an `AtomicPtr` slot can be cleared after consumption (`mark_consumed`), enabling progressive memory reclamation
 - **Idempotent inserts**: Duplicates are automatic no-ops
 - **Zero-copy**: Uses `Bytes` for reference-counted data
 - **Pre-allocated**: Buffer size determined by stream header
@@ -116,9 +107,13 @@ Global registry for transport-to-operations handoff using `DashMap` for lock-fre
 
 ---
 
-## Phase 2: Piped Forwarding (COMPLETE)
+## Piped Forwarding
 
-Enables intermediate nodes to forward fragments without full reassembly.
+Enables intermediate nodes to forward fragments without full reassembly. Relay
+`ResponseStreaming` forwarding (fork + pipe) is implemented (#4307). One piece
+remains deferred: the `PipedStream` *primitive*'s target-failure tracking (which
+targets are dead) and retry logic — per its rustdoc, these wait until `PipedStream`
+itself is wired into the main forwarding path.
 
 ### Architecture
 
@@ -159,9 +154,9 @@ Buffers out-of-order fragments and forwards in-order fragments immediately.
 
 ---
 
-## Phase 3: Message Layer Infrastructure (COMPLETE)
+## Message Layer
 
-Adds streaming message variants and the orphan stream registry for handling race conditions.
+Streaming message variants and the orphan stream registry for handling race conditions.
 
 ### Message Variants
 
@@ -172,7 +167,7 @@ pub enum PutMsg {
     Request { ... },      // Existing
     Response { ... },     // Existing
 
-    // Streaming variants (Phase 3)
+    // Streaming variants
     RequestStreaming {
         id: Transaction,
         stream_id: StreamId,
@@ -197,7 +192,7 @@ pub enum GetMsg {
     Request { ... },      // Existing
     Response { ... },     // Existing
 
-    // Streaming variants (Phase 3)
+    // Streaming variants
     ResponseStreaming {
         id: Transaction,
         instance_id: ContractInstanceId,
@@ -231,8 +226,14 @@ pub struct OrphanStreamRegistry {
 ```
 
 **Key Constants:**
-- `ORPHAN_STREAM_TIMEOUT`: 30 seconds - unclaimed streams are garbage collected
-- `STREAM_CLAIM_TIMEOUT`: 10 seconds - timeout when waiting for stream
+- `ORPHAN_STREAM_TIMEOUT`: 60 seconds - unclaimed streams are garbage collected
+- `STREAM_CLAIM_TIMEOUT`: 60 seconds - timeout when waiting for stream
+
+Both are 60s: on resource-constrained CI runners stream fragments can be delayed
+significantly (concurrent WASM compilation, transport-level rate limiting, Docker
+NAT overhead), so this provides headroom while still failing promptly on genuinely
+broken connections. `ORPHAN_STREAM_TIMEOUT` must be `>= STREAM_CLAIM_TIMEOUT` to
+avoid a race where a waiter registers just as the orphan is being cleaned up.
 
 ### State Machine Extensions
 
@@ -246,29 +247,34 @@ pub struct OrphanStreamRegistry {
 - `AwaitingStreamData { stream_id, key, instance_id, total_size, includes_contract, subscribe }`
 - `SendingStreamResponse { stream_id, key, instance_id, target_addr }`
 
-### Configuration
+### Selection
 
 ```rust
-streaming_enabled: bool,        // Default: false
-streaming_threshold: usize,     // Default: 64KB
+streaming_threshold: usize,     // Default: 64KB (network_api.streaming_threshold)
 ```
 
-Streaming is used when: `streaming_enabled && payload_size > streaming_threshold`
+A transfer uses streaming when `payload_size > streaming_threshold`
+(`operations::should_use_streaming`). There is no separate on/off flag — the
+threshold is the sole gate, so streaming is always available and engages by size.
 
 ---
 
-## Phase 4: Streaming Handlers (IN PROGRESS)
+## Streaming Handlers
 
-Implements the actual message handlers that use the Phase 3 infrastructure.
+The message handlers that use the infrastructure above, delivered as part of the
+per-transaction operation drivers (#1454).
 
-### Goals
+The wire-format streaming variants are *defined* in `operations/put.rs` and
+`operations/get.rs` (the `PutMsg`/`GetMsg` enums); the actual *handling* lives in
+the per-transaction drivers under `*/op_ctx_task.rs`, with dispatch in `node.rs` —
+which is where the #1454 refactor moved it.
 
-1. Wire `PeerConnection` to call `orphan_stream_registry.register_orphan()` when streams arrive
-2. Implement `PutMsg::RequestStreaming` handler
-3. Implement `PutMsg::ResponseStreaming` handler
-4. Implement `GetMsg::ResponseStreaming` handler
-5. Implement `GetMsg::ResponseStreamingAck` handler
-6. Add periodic GC task for orphan streams
+1. `PeerConnection` registers arriving streams via `orphan_stream_registry.register_orphan()` (`crates/core/src/transport/peer_connection.rs`).
+2. `PutMsg::RequestStreaming` handler (`crates/core/src/operations/put/op_ctx_task.rs`; dispatch in `crates/core/src/node.rs`).
+3. `PutMsg::ResponseStreaming` handler (`crates/core/src/operations/put/op_ctx_task.rs`).
+4. `GetMsg::ResponseStreaming` handler (`crates/core/src/operations/get/op_ctx_task.rs`).
+5. `GetMsg::ResponseStreamingAck` — handled by the transport/stream layer, **not** the GET op driver: the driver classifies it as `AttemptOutcome::Unexpected` by design (`get/op_ctx_task.rs`, `node.rs` — "ResponseStreamingAck handled by stream layer").
+6. Periodic orphan GC task — `gc_expired()` runs every 5s, removing streams older than `ORPHAN_STREAM_TIMEOUT` (`crates/core/src/operations/orphan_streams.rs`).
 
 ### Data Flow
 
@@ -299,31 +305,45 @@ Requester                   Intermediate                   Owner
   │─── ResponseStreamingAck ────►│─── ResponseStreamingAck ────►│
 ```
 
----
+### Stream Abort and Flight-Size Release (#4345 / #4393 / #4374)
 
-## Phase 5: Capability Negotiation (NOT STARTED)
+An outbound stream can abort mid-transfer. Triggers:
 
-Backward compatibility with non-streaming nodes via handshake negotiation.
+- **cwnd-wait timeout**: the congestion window stays closed past `CWND_WAIT_TIMEOUT`.
+- **upstream stall/error** (relay-pipe path): the inbound feed stalls past
+  `STREAM_INACTIVITY_TIMEOUT` or yields an error.
+- **mid-send `packet_sending` failure**: a fragment fails to leave the socket.
 
-### Planned Features
+#### Flight-size release on abort
 
-- Add `PeerCapabilities` to handshake protocol
-- Store negotiated transport mode per connection
-- Gate streaming features behind capability check
-- Protocol version bump for streaming support
+A stream's already-sent, unacked fragments are still counted in the
+connection-wide flight size. Left pinned, they stay counted until each fragment is
+independently ACKed or ages out via `MAX_PACKET_RETRANSMITS` (~6s) — and FixedRate's
+loss-pause caps cwnd at the frozen flight size, so a single aborted stream starves
+every subsequent stream on the same connection (the #4345 symptom).
 
----
+To avoid this, `release_aborted_stream_flightsize()`
+(`outbound_stream.rs`) calls `SentPacketTracker::drop_stream(stream_id)`
+(`sent_packet_tracker.rs`), which atomically removes all of that stream's tracked
+packets and returns their exact byte total. That total is handed to
+`CongestionControl::release_flightsize(bytes)`, freeing the stranded bytes in one
+step so the next stream sees an open cwnd. (The tracker lock is dropped before
+calling into the congestion controller, mirroring the ACK path's lock ordering.)
 
-## Phase 6: Rollout (NOT STARTED)
+**Resurrection-safety invariant (anti-double-decrement):** once a packet leaves the
+tracker via `drop_stream`, a late ACK or the per-packet abandon path finds nothing
+and is a no-op. Each packet therefore contributes to flight-size accounting exactly
+once. See [`.claude/rules/transport.md`](../../../../.claude/rules/transport.md)
+("Flight-size release invariant") for the full invariant — it is not duplicated here.
 
-Gradual enablement with monitoring.
+#### Error semantics: `OutboundStreamFailed`, not `ConnectionClosed`
 
-### Planned Features
-
-- Feature flags: `FREENET_STREAMING`, `FREENET_STREAMING_THRESHOLD`
-- Shadow mode for A/B validation
-- Prometheus metrics for streaming health
-- Gradual enablement: shadow -> opt-in -> default
+A stream abort returns `TransportError::OutboundStreamFailed(peer_addr)`, a
+**stream-scoped** error — NOT `ConnectionClosed`. The connection survives, so
+subsequent streams on it can proceed or retry. The operations layer classifies it
+as a transient send failure (`is_transient_send_failure()`): the idle timeout
+remains the sole authority on connection liveness, and the op layer times out and
+retries against another candidate (#4374).
 
 ---
 
