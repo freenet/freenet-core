@@ -1638,6 +1638,16 @@ impl Ring {
         self.hosting_manager.set_storage(storage);
     }
 
+    /// Drop the ring's clones of the redb `Storage` handle (hosting metadata +
+    /// broken-invariants persistence). Called on node shutdown so the redb
+    /// `Database` Arc count can fall to zero and release the on-disk file lock
+    /// — otherwise an in-process restart against the same data dir deadlocks on
+    /// the still-held lock. See issue #4401.
+    pub(crate) fn clear_redb_storage(&self) {
+        self.hosting_manager.clear_storage();
+        self.broken_invariants.clear_storage();
+    }
+
     /// Load hosting cache from persisted storage.
     ///
     /// Call this during startup after storage is available to restore

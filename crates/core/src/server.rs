@@ -134,7 +134,7 @@ async fn serve_with_listener(
     socket: SocketAddr,
     router: axum::Router,
     pre_bound: Option<std::net::TcpListener>,
-) -> std::io::Result<()> {
+) -> std::io::Result<tokio::task::AbortHandle> {
     let listener = match pre_bound {
         Some(std_listener) => {
             std_listener.set_nonblocking(true)?;
@@ -194,7 +194,11 @@ async fn serve_with_listener(
         }
     };
     tracing::info!("HTTP client API listening on {}", socket);
-    GlobalExecutor::spawn(async move {
+    // Retain the spawn's AbortHandle so the node can tear the server down on
+    // graceful shutdown (issue #4401). Dropping the JoinHandle alone does NOT
+    // abort the task, so without this the server keeps serving on the bound
+    // port after the node has shut down.
+    let handle = GlobalExecutor::spawn(async move {
         axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -204,7 +208,7 @@ async fn serve_with_listener(
             tracing::error!("Error while running HTTP client API server: {e}");
         })
     });
-    Ok(())
+    Ok(handle.abort_handle())
 }
 
 /// Returns `true` if the IP is a private/local address suitable for LAN access.
@@ -265,7 +269,19 @@ pub mod local_node {
         // this path also binds an IPv4+IPv6 companion pair for loopback/wildcard
         // addresses — keeping every client-API serve path reachable over both
         // families (#4330).
-        serve_dual_stack(socket, ws_router.layer(TraceLayer::new_for_http()), None).await?;
+        //
+        // `run_local_node` owns the server for the lifetime of the process (it
+        // loops forever below), so the abort guard is leaked deliberately: there
+        // is no graceful-shutdown hook on this path to hand it to.
+        let mut aborts = crate::util::AbortOnDrop::new();
+        serve_dual_stack(
+            socket,
+            ws_router.layer(TraceLayer::new_for_http()),
+            None,
+            &mut aborts,
+        )
+        .await?;
+        std::mem::forget(aborts);
 
         // TODO: use combinator instead
         // let mut all_clients =
@@ -578,15 +594,24 @@ async fn serve_client_api_in_impl(
 ) -> std::io::Result<(HttpClientApi, WebSocketProxy)> {
     let ws_socket = (config.address, config.port).into();
 
+    // Collects the AbortHandles of every detached task this function spawns
+    // (token cleanup + the `axum::serve` server socket(s)) so they are torn
+    // down when the returned `WebSocketProxy` is dropped. The proxy is one of
+    // the node's `BoxedClient`s, so aborting the node's client-events task on
+    // shutdown drops the proxy and, with it, these server tasks — releasing the
+    // bound ports instead of leaving a stale server answering requests meant
+    // for a restarted node. See issue #4401.
+    let mut server_aborts = crate::util::AbortOnDrop::new();
+
     // Create a shared origin_contracts map with token expiration support
     let origin_contracts: OriginContractMap = Arc::new(DashMap::new());
 
     // Spawn background task to clean up expired tokens
-    spawn_token_cleanup_task(
+    server_aborts.push(spawn_token_cleanup_task(
         origin_contracts.clone(),
         config.token_ttl_seconds,
         config.token_cleanup_interval_seconds,
-    );
+    ));
 
     // Pass the shared map to both the HTTP client API and WebSocketProxy
     let (gw, gw_router) = HttpClientApi::as_router_with_origin_contracts(
@@ -650,7 +675,11 @@ async fn serve_client_api_in_impl(
             .layer(TraceLayer::new_for_http())
     };
 
-    serve_dual_stack(ws_socket, router, pre_bound).await?;
+    serve_dual_stack(ws_socket, router, pre_bound, &mut server_aborts).await?;
+
+    // Hand ownership of the server tasks' abort guard to the proxy so they are
+    // torn down when the proxy is dropped on node shutdown (issue #4401).
+    let ws_proxy = ws_proxy.with_server_aborts(server_aborts);
     Ok((gw, ws_proxy))
 }
 
@@ -668,6 +697,7 @@ async fn serve_dual_stack(
     primary: SocketAddr,
     router: axum::Router,
     pre_bound: Option<std::net::TcpListener>,
+    aborts: &mut crate::util::AbortOnDrop,
 ) -> std::io::Result<()> {
     let companion = if pre_bound.is_none() {
         companion_bind_addr(primary.ip()).map(|ip| SocketAddr::from((ip, primary.port())))
@@ -676,20 +706,21 @@ async fn serve_dual_stack(
     };
     match companion {
         Some(companion) => {
-            serve_with_listener(primary, router.clone(), pre_bound).await?;
-            if let Err(e) = serve_with_listener(companion, router, None).await {
-                tracing::warn!(
+            aborts.push(serve_with_listener(primary, router.clone(), pre_bound).await?);
+            match serve_with_listener(companion, router, None).await {
+                Ok(handle) => aborts.push(handle),
+                Err(e) => tracing::warn!(
                     %companion,
                     primary = %primary,
                     error = %e,
                     "Could not bind companion {} listener for the client API; \
                      continuing with the primary listener only",
                     if companion.is_ipv4() { "IPv4" } else { "IPv6" },
-                );
+                ),
             }
         }
         None => {
-            serve_with_listener(primary, router, pre_bound).await?;
+            aborts.push(serve_with_listener(primary, router, pre_bound).await?);
         }
     }
     Ok(())
@@ -731,7 +762,7 @@ fn spawn_token_cleanup_task(
     origin_contracts: OriginContractMap,
     token_ttl_seconds: u64,
     cleanup_interval_seconds: u64,
-) {
+) -> tokio::task::AbortHandle {
     let token_ttl = Duration::from_secs(token_ttl_seconds);
     let cleanup_interval = Duration::from_secs(cleanup_interval_seconds);
 
@@ -773,7 +804,8 @@ fn spawn_token_cleanup_task(
                 );
             }
         }
-    });
+    })
+    .abort_handle()
 }
 
 #[cfg(test)]
@@ -1251,9 +1283,13 @@ mod tests {
 
         let primary = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
         let router = Router::new().route("/", get(handler));
-        serve_dual_stack(primary, router, None)
+        let mut aborts = crate::util::AbortOnDrop::new();
+        serve_dual_stack(primary, router, None, &mut aborts)
             .await
             .expect("binding the IPv6 loopback primary must succeed");
+        // Keep the servers alive for the duration of the assertions below; the
+        // guard would otherwise abort them as soon as this scope's locals drop.
+        std::mem::forget(aborts);
 
         // GET over BOTH families and assert OUR handler answered. Checking the
         // body (not just a TCP connect) rules out a false pass where an

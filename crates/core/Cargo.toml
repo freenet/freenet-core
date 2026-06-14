@@ -147,6 +147,9 @@ freenet-macros = { path = "../freenet-macros" }
 httptest = { workspace = true }
 libc = { workspace = true }  # For sendmmsg syscall batching benchmarks
 parking_lot = { workspace = true, features = ["deadlock_detection"] }
+# Used by tests/in_process_restart.rs to directly probe the redb file lock as a
+# negative control (issue #4401).
+redb = { workspace = true }
 rstest = { workspace = true }
 statrs = { workspace = true }
 tempfile = { workspace = true }

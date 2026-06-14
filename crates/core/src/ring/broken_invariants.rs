@@ -120,7 +120,12 @@ struct FlagEntry {
 /// in-memory only — this matches the pattern used by `HostingManager`.
 pub(crate) struct BrokenInvariantsTracker {
     flags: Arc<DashMap<ContractInstanceId, FlagEntry>>,
-    storage: std::sync::OnceLock<Storage>,
+    // `RwLock<Option<Storage>>` (mirroring `HostingManager`) rather than a
+    // `OnceLock` so the handle can be dropped on shutdown via `clear_storage`,
+    // releasing its redb `Database` clone (issue #4401). None of the readers
+    // are on a hot path: only `record`/`remove_from_storage`/`set_storage`
+    // touch the handle, all off the broadcast/commit fast path.
+    storage: parking_lot::RwLock<Option<Storage>>,
     time_source: Arc<dyn TimeSource + Send + Sync>,
 }
 
@@ -128,7 +133,7 @@ impl BrokenInvariantsTracker {
     pub fn new(time_source: Arc<dyn TimeSource + Send + Sync>) -> Self {
         Self {
             flags: Arc::new(DashMap::new()),
-            storage: std::sync::OnceLock::new(),
+            storage: parking_lot::RwLock::new(None),
             time_source,
         }
     }
@@ -186,7 +191,7 @@ impl BrokenInvariantsTracker {
             // `HostingManager` makes — see #4279 deferred follow-up to
             // add sqlite parity.
             #[cfg(feature = "redb")]
-            if let Some(storage) = self.storage.get() {
+            if let Some(storage) = self.storage.read().as_ref() {
                 if let Err(e) = storage.store_broken_invariant(&id, kind.to_byte()) {
                     tracing::warn!(
                         contract = %id,
@@ -260,7 +265,7 @@ impl BrokenInvariantsTracker {
     /// next restart.
     fn remove_from_storage(&self, id: &ContractInstanceId) {
         #[cfg(feature = "redb")]
-        if let Some(storage) = self.storage.get() {
+        if let Some(storage) = self.storage.read().as_ref() {
             if let Err(e) = storage.remove_broken_invariant(id) {
                 tracing::warn!(
                     contract = %id,
@@ -273,18 +278,21 @@ impl BrokenInvariantsTracker {
         let _ = id;
     }
 
-    /// Wire persistent storage. Called once at startup; idempotent on the
-    /// `OnceLock` so callers cannot accidentally re-init with a different
-    /// database. Hydrates the in-memory map from previously-persisted
-    /// entries on first wiring.
+    /// Wire persistent storage. Called once at startup; ignores re-init so
+    /// callers cannot accidentally swap in a different database. Hydrates the
+    /// in-memory map from previously-persisted entries on first wiring.
     ///
     /// Loaded flags are stamped with the current time, so a node restart
     /// gives each previously-flagged contract a fresh TTL window rather than
     /// inheriting an unknown (and un-persisted) original timestamp.
     pub fn set_storage(&self, storage: Storage) {
-        if self.storage.set(storage.clone()).is_err() {
-            tracing::warn!("BrokenInvariantsTracker storage already set; ignoring re-init");
-            return;
+        {
+            let mut slot = self.storage.write();
+            if slot.is_some() {
+                tracing::warn!("BrokenInvariantsTracker storage already set; ignoring re-init");
+                return;
+            }
+            *slot = Some(storage.clone());
         }
         #[cfg(feature = "redb")]
         match storage.load_all_broken_invariants() {
@@ -310,6 +318,20 @@ impl BrokenInvariantsTracker {
                 tracing::warn!(error = %e, "Failed to load broken-invariant flags from storage");
             }
         }
+    }
+
+    /// Drop the storage handle so its redb `Database` clone is released. Called
+    /// on node shutdown to help free the on-disk file lock (issue #4401). The
+    /// in-memory flags are left intact — only the persistence backing is
+    /// dropped, since the node is going away.
+    ///
+    /// Runs on the shutdown thread (`run_node`'s teardown) while `record` /
+    /// `remove_from_storage` run on the detached executor task. The write lock
+    /// taken here may briefly wait on an in-flight redb write held by those
+    /// readers, but cannot deadlock: the `RwLock` is non-reentrant and the
+    /// writer/readers are distinct tasks.
+    pub(crate) fn clear_storage(&self) {
+        *self.storage.write() = None;
     }
 }
 
