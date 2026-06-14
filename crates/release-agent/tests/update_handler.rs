@@ -111,6 +111,7 @@ impl Harness {
             systemctl_path,
             last_update_attempt: Arc::new(Mutex::new(None)),
             last_announce_attempt: Arc::new(Mutex::new(None)),
+            update_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -171,6 +172,7 @@ impl Harness {
             systemctl_path,
             last_update_attempt: Arc::new(Mutex::new(None)),
             last_announce_attempt: Arc::new(Mutex::new(None)),
+            update_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -266,6 +268,7 @@ impl Harness {
             systemctl_path,
             last_update_attempt: Arc::new(Mutex::new(None)),
             last_announce_attempt: Arc::new(Mutex::new(None)),
+            update_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -562,6 +565,178 @@ async fn spawn_failure_does_not_consume_rate_limit_window() {
 }
 
 #[tokio::test]
+async fn concurrent_updates_only_spawn_once() {
+    // Regression for #4271 (nova 0.2.65 outage): two update POSTs arriving
+    // while the first update's restart is still in flight must NOT both spawn
+    // a `systemctl stop/restart` — the second restart SIGKILLed the freshly
+    // started process and took the gateway DOWN. The in-flight guard makes the
+    // agent idempotent: the first POST spawns, the second is rejected with 409
+    // while the first is still running.
+    //
+    // The update script appends one line per invocation to a shared counter
+    // file and sleeps well past the 1s early-exit probe, so the first update
+    // is provably "in flight" when the second POST lands. Without the guard,
+    // BOTH POSTs spawn and the counter file has two lines — the assertion below
+    // is load-bearing.
+    let tmp = tempfile::tempdir().unwrap();
+    let argv_record = tmp.path().join("argv.log");
+    let spawn_count = tmp.path().join("spawns.log");
+    // Each spawn appends a line, then sleeps 3s so it is still running when the
+    // second POST arrives (1s probe << 3s sleep).
+    let update_script = format!(
+        "#!/bin/sh\necho spawned >> {}\nsleep 3\n",
+        spawn_count.display()
+    );
+    // rate_limit_seconds = 0 so the rate-limiter never fires: this test
+    // isolates the in-flight guard (429 vs 409 are different mechanisms, and
+    // the first request holds the rate-limit mutex across its 1s probe, so a
+    // nonzero window would mask the overlap with a 429 instead of the 409 we
+    // are asserting).
+    let h = Harness::build_live(
+        "0.2.55",
+        Version::new(0, 2, 56),
+        0,
+        &update_script,
+        &argv_record,
+    )
+    .await;
+
+    // Fire both POSTs concurrently. Distinct issued_at so the HMACs differ,
+    // mirroring two genuinely separate update commands.
+    let now = now_secs();
+    let (body1, sig1) = h.signed_body("0.2.56", now);
+    let (body2, sig2) = h.signed_body("0.2.56", now + 1);
+    let base = h.base.clone();
+    let url = format!("{base}/update");
+
+    let url1 = url.clone();
+    let f1 = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(&url1)
+            .header(HEADER_SIGNATURE.as_str(), &sig1)
+            .body(body1)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    });
+    // Small skew so f1 reliably claims the slot first, then f2 races into the
+    // in-flight window while f1's stub is still sleeping.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let f2 = tokio::spawn(async move {
+        reqwest::Client::new()
+            .post(&url)
+            .header(HEADER_SIGNATURE.as_str(), &sig2)
+            .body(body2)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    });
+
+    let s1 = f1.await.unwrap();
+    let s2 = f2.await.unwrap();
+
+    // Exactly one acceptance (200/202) and exactly one 409 rejection, in
+    // either order.
+    let mut statuses = [s1, s2];
+    statuses.sort_unstable();
+    assert_eq!(
+        statuses[1], 409,
+        "the second, overlapping update must be rejected with 409 Conflict (got {s1} and {s2})"
+    );
+    assert!(
+        statuses[0] == 200 || statuses[0] == 202,
+        "the first update must be accepted (got {s1} and {s2})"
+    );
+
+    // Load-bearing: only ONE spawn reached the update script. Without the
+    // in-flight guard the second POST would also spawn and this file would
+    // have two lines — the exact double-stop that downed nova.
+    //
+    // The spawned stub writes its marker at the top of the script, but it runs
+    // asynchronously; under load it may not have flushed by the time the HTTP
+    // responses land. Poll briefly for the first marker to appear, then assert
+    // it never grows to two — if a second spawn occurred it would already be
+    // present (both POSTs were dispatched and resolved above).
+    let spawns = {
+        let mut contents = String::new();
+        for _ in 0..50 {
+            contents = std::fs::read_to_string(&spawn_count).unwrap_or_default();
+            if !contents.trim().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        contents
+    };
+    assert_eq!(
+        spawns.lines().count(),
+        1,
+        "exactly one update may spawn while another is in flight, got: {spawns:?}"
+    );
+}
+
+#[tokio::test]
+async fn update_after_in_flight_completes_is_accepted() {
+    // The in-flight guard must be RELEASED when the update completes, so a
+    // legitimate follow-up update is not permanently blocked. Uses a short
+    // sleep (past the 1s probe) then exit, and a 0s rate-limit window so the
+    // rate-limiter doesn't mask the in-flight behaviour being tested.
+    let tmp = tempfile::tempdir().unwrap();
+    let argv_record = tmp.path().join("argv.log");
+    let h = Harness::build_live(
+        "0.2.55",
+        Version::new(0, 2, 56),
+        0, // no rate-limit, so we isolate the in-flight guard
+        "#!/bin/sh\nsleep 2\n",
+        &argv_record,
+    )
+    .await;
+
+    let (body1, sig1) = h.signed_body("0.2.56", now_secs());
+    let r1 = reqwest::Client::new()
+        .post(format!("{}/update", h.base))
+        .header(HEADER_SIGNATURE.as_str(), &sig1)
+        .body(body1)
+        .send()
+        .await
+        .unwrap();
+    assert!(r1.status() == 200 || r1.status() == 202);
+
+    // While still in flight, a second update is 409.
+    let (body2, sig2) = h.signed_body("0.2.56", now_secs());
+    let r2 = reqwest::Client::new()
+        .post(format!("{}/update", h.base))
+        .header(HEADER_SIGNATURE.as_str(), &sig2)
+        .body(body2)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 409, "overlapping update must be 409");
+
+    // Wait for the first update's stub to exit (2s sleep) plus a margin, so
+    // the in-flight guard's background wait task releases the slot.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let (body3, sig3) = h.signed_body("0.2.56", now_secs());
+    let r3 = reqwest::Client::new()
+        .post(format!("{}/update", h.base))
+        .header(HEADER_SIGNATURE.as_str(), &sig3)
+        .body(body3)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        r3.status() == 200 || r3.status() == 202,
+        "guard must be released after the update completes; got {}",
+        r3.status()
+    );
+}
+
+#[tokio::test]
 async fn sudoers_argv_matches_allowlist() {
     // Pins the exact argv shape the sudoers entry must match:
     //   /usr/local/bin/gateway-auto-update.sh --force --target-version *
@@ -675,6 +850,7 @@ async fn build_with_announcer(announce_script: &str, record_file: &Path) -> Harn
         systemctl_path,
         last_update_attempt: Arc::new(Mutex::new(None)),
         last_announce_attempt: Arc::new(Mutex::new(None)),
+        update_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

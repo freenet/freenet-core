@@ -69,6 +69,7 @@ async fn main() -> Result<()> {
         systemctl_path: PathBuf::from("systemctl"),
         last_update_attempt: Arc::new(Mutex::new(None)),
         last_announce_attempt: Arc::new(Mutex::new(None)),
+        update_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
     serve(listen_addr, build_router(state)).await
