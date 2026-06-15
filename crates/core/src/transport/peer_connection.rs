@@ -2548,6 +2548,137 @@ mod tests {
         });
     }
 
+    /// Regression guard for issue #3318/#3321 at the `packet_sending` layer:
+    /// a transient send failure must map to a recoverable, transient error and
+    /// must not leave the send path in a poisoned state.
+    ///
+    /// The production incident saw a brief ENETUNREACH blip tear down all 11
+    /// ring connections in under two seconds because every failed
+    /// `socket.send_to()` surfaced as `ConnectionClosed`.  This drives the
+    /// exact same `packet_sending` path through a transient failure and then
+    /// asserts that, once the blip clears, the *same* socket and key send
+    /// successfully again.
+    ///
+    /// Scope note: `packet_sending` is a stateless free function, so this locks
+    /// only its error-mapping (blip → transient, not `ConnectionClosed`) and
+    /// its statelessness/recoverability — a failed datagram leaves nothing
+    /// behind that blocks the next send on the same socket+key. It does NOT
+    /// exercise connection teardown: the decision to keep or drop the
+    /// connection lives in the callers that consume this error
+    /// (`is_transient_send_failure` dispatch sites), which this free function
+    /// does not drive. That residual caller-level gap is the #3321 follow-up.
+    #[test]
+    fn transient_send_failure_then_recovery_succeeds() {
+        let fail_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (tx, mut rx) = mpsc::channel(16);
+        let socket = Arc::new(FailableTestSocket::new(tx, fail_flag.clone()));
+        let remote_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let outbound_key = {
+                use aes_gcm::KeyInit;
+                Aes128Gcm::new(&[0u8; 16].into())
+            };
+            let sent_tracker = Arc::new(parking_lot::Mutex::new(
+                crate::transport::sent_packet_tracker::tests::mock_sent_packet_tracker(),
+            ));
+
+            // ---- blip: send fails transiently ----
+            let err = packet_sending(
+                remote_addr,
+                &socket,
+                1,
+                &outbound_key,
+                vec![],
+                (),
+                &sent_tracker,
+                None,
+                PacketStream::Control,
+            )
+            .await
+            .expect_err("send during blip should fail");
+            assert!(
+                err.is_transient_send_failure(),
+                "blip must surface as a transient failure callers can swallow, got: {err:?}"
+            );
+            assert!(
+                !matches!(err, TransportError::ConnectionClosed(_)),
+                "a single failed datagram must NOT report the connection closed — issue #3321"
+            );
+
+            // ---- blip clears: the same socket + key recover ----
+            fail_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+            packet_sending(
+                remote_addr,
+                &socket,
+                2,
+                &outbound_key,
+                vec![],
+                (),
+                &sent_tracker,
+                None,
+                PacketStream::Control,
+            )
+            .await
+            .expect("send after the blip clears must succeed on the same connection");
+
+            let (target, _) = rx.recv().await.expect("recovered packet must be sent");
+            assert_eq!(
+                target, remote_addr,
+                "recovered packet must go to the same peer"
+            );
+        });
+    }
+
+    /// All transient send error kinds observed in production (the ENETUNREACH
+    /// family and friends) must classify as transient so the p2p error
+    /// handlers swallow them instead of closing the connection.  This locks
+    /// the `is_transient_send_failure` contract the #3321 fix relies on.
+    ///
+    /// Classification is deliberately kind-agnostic: `is_transient_send_failure`
+    /// matches `SendFailed(..)` on the *variant*, not the inner `ErrorKind`, so
+    /// every send error is connection-local regardless of errno. The loop below
+    /// therefore pins "every `SendFailed` is transient"; the explicit negative
+    /// assertion on a non-`SendFailed` variant pins the *boundary* — a genuine
+    /// `ConnectionClosed` must NOT be swallowed as transient — so the test
+    /// nails down both sides of the predicate rather than only the true case.
+    #[test]
+    fn send_failed_kinds_classify_as_transient() {
+        use std::io::ErrorKind;
+        let remote_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        for kind in [
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::HostUnreachable,
+            ErrorKind::ConnectionReset,
+            ErrorKind::WouldBlock,
+            ErrorKind::TimedOut,
+        ] {
+            let err = TransportError::SendFailed(remote_addr, kind);
+            assert!(
+                err.is_transient_send_failure(),
+                "SendFailed({kind:?}) must be transient so the connection survives — issue #3321"
+            );
+        }
+
+        // Boundary: a real connection-teardown error must NOT be classified as
+        // a transient send blip, otherwise the swallow path would mask genuine
+        // closures. `ConnectionClosed` and `ChannelClosed` are the canonical
+        // non-transient variants.
+        assert!(
+            !TransportError::ConnectionClosed(remote_addr).is_transient_send_failure(),
+            "ConnectionClosed must NOT be swallowed as a transient send failure — issue #3321"
+        );
+        assert!(
+            !TransportError::ChannelClosed.is_transient_send_failure(),
+            "ChannelClosed must NOT be swallowed as a transient send failure — issue #3321"
+        );
+    }
+
     /// Phase 1.6 (#4074): the hot-path instrumentation must feed the
     /// classified byte counters, and only on a successful send. A
     /// `ShortMessage` advances `short`, a `StreamFragment` advances `bulk`,
