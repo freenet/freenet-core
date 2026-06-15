@@ -12,7 +12,7 @@ use freenet_stdlib::prelude::*;
 use std::sync::Arc;
 
 use crate::contract::executor::mock_wasm_runtime::{MockWasmRuntime, ValidateOverride};
-use crate::contract::executor::{ContractExecutor, Executor, UpsertResult};
+use crate::contract::executor::{ContractExecutor, Executor, UpsertOutcome, UpsertResult};
 use crate::wasm_runtime::MockStateStorage;
 
 /// Create a MockWasmRuntime executor.
@@ -1104,4 +1104,95 @@ async fn test_update_state_requires_related_self_reference_rejected() {
         result.is_err(),
         "self-reference in update_state requires() must be rejected: {result:?}"
     );
+}
+
+// =========================================================================
+// Test (#4391 round-3.1 P2): in DEFERRABLE mode, a contract that re-requests
+// an already-SUPPLIED related contract MUST NOT trigger an inline network
+// fetch on the serial loop. The supplied state must resolve locally; a
+// misbehaving re-request hits the depth>1 cap — never `fetch_related_via_network`.
+//
+// Regression for the gap where the deferrable local-only check counted a
+// caller-supplied (but not state_store-persisted) related as "local" and fell
+// through to the join_all/network path, which checks ONLY state_store and so
+// escalated to an inline network GET — bypassing the one-deferral cap.
+// =========================================================================
+
+#[tokio::test(flavor = "current_thread")]
+async fn deferrable_supplied_related_never_inline_fetches() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let mut executor = create_executor().await;
+
+    // PUT the main contract A with an initial state.
+    let contract_a = make_contract(b"defer_supplied_a");
+    let key_a = contract_a.key();
+    executor
+        .upsert_contract_state(
+            key_a,
+            Either::Left(WrappedState::new(br#"{"v":0}"#.to_vec())),
+            RelatedContracts::default(),
+            Some(contract_a.clone()),
+        )
+        .await
+        .expect("initial PUT for A");
+
+    // A ALWAYS re-requests related B, even after B is supplied — this drives the
+    // re-request-on-resume path. B is NOT in the state_store (never PUT).
+    let id_b = *make_contract(b"defer_supplied_b").key().id();
+    executor.runtime.validate_overrides.insert(
+        *key_a.id(),
+        ValidateOverride::AlwaysRequestRelated(vec![id_b]),
+    );
+
+    // Supply B's state via the caller-provided related map (NOT persisted).
+    let mut supplied: std::collections::HashMap<ContractInstanceId, Option<State<'static>>> =
+        std::collections::HashMap::new();
+    supplied.insert(id_b, Some(State::from(br#"{"b":"supplied"}"#.to_vec())));
+    let related_with_b = RelatedContracts::from(supplied);
+
+    // PANIC if the inline network fetch ever fires for the supplied id — the
+    // whole point is that deferrable mode resolves B locally and never escalates.
+    let calls: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+    let calls_inner = calls.clone();
+    crate::contract::executor::runtime::set_test_network_fetch_override(Some(Rc::new(move |id| {
+        *calls_inner.borrow_mut() += 1;
+        panic!("deferrable mode must NOT inline-fetch a supplied related (id={id})");
+    })));
+
+    // Drive the DEFERRABLE path (the serial-loop entry point).
+    let result = executor
+        .upsert_contract_state_deferrable(
+            key_a,
+            Either::Left(WrappedState::new(br#"{"v":1}"#.to_vec())),
+            related_with_b,
+            Some(contract_a),
+        )
+        .await;
+
+    crate::contract::executor::runtime::set_test_network_fetch_override(None);
+
+    // The network override must NEVER have fired.
+    assert_eq!(
+        *calls.borrow(),
+        0,
+        "deferrable mode must resolve a supplied related locally, never inline-fetch"
+    );
+
+    // B was supplied (resolved locally), so the second validate runs and
+    // AlwaysRequestRelated returns RequestRelated again → depth>1 reject, which
+    // surfaces as a plain executor `Err` (NOT a DeferRelated — the supplied
+    // related was resolved, so it must not be deferred again; and NOT a network
+    // result, since no inline fetch ran). The critical assertion is the calls==0
+    // above; this just confirms the outcome shape.
+    match result {
+        Err(_) => {} // depth>1 rejection — expected, no inline fetch
+        Ok(UpsertOutcome::DeferRelated(missing)) => {
+            panic!("a SUPPLIED related must NOT be deferred again; got DeferRelated({missing:?})")
+        }
+        Ok(UpsertOutcome::Completed(r)) => {
+            panic!("AlwaysRequestRelated must surface a depth>1 error, got Completed({r:?})")
+        }
+    }
 }
