@@ -1349,9 +1349,53 @@ async fn setup_assembly_retry_network(name: &str, seed: u64, threshold: usize) -
 /// per-candidate diagnostics.
 #[test]
 fn test_streaming_get_retries_after_assembly_failure() {
+    use freenet::config::SimulationIdleTimeout;
     use freenet::dev_tool::GET_DRIVER_CALL_COUNT;
     use freenet::dev_tool::get_assembly_fault_injection;
     use std::sync::atomic::Ordering;
+
+    // Root cause of this test's merge-queue flakiness (fix for the #4345
+    // follow-up): `run_controlled_simulation` drives Turmoil, whose hosts run
+    // their `start_paused(true)` runtimes on THIS thread. The transport's
+    // connection idle / keepalive deadline (`PeerConnection::recv`) is checked
+    // against `RealTime`, which under a paused runtime is tokio's
+    // auto-advancing virtual clock. While a host runs a real (non-mock) WASM
+    // contract via `spawn_blocking`, that clock can jump well past the
+    // production 120s idle timeout in a single step — and the jumps grow under
+    // CPU contention, e.g. the merge-queue runs this alongside four parallel
+    // `fdev` simulations that also execute real WASM, so the OS time-slices the
+    // blocking work and a starved host's real-time WASM step stretches out.
+    // A jump past 120s spuriously tears down otherwise-healthy connections, so
+    // the cold-node GET can no longer reach ANY holder. That is exactly the
+    // observed failure: under load every candidate reported
+    // `retry_path_taken=false` (holder unreachable), whereas in isolation
+    // several candidates reach a holder and one demonstrates the retry path.
+    //
+    // The idle-timeout flag is thread-local and Turmoil runs every host on this
+    // thread, so enabling it here (before any `run_controlled_simulation` call)
+    // extends the simulation idle timeout to 24h — matching VirtualTime and the
+    // documented "120s (RealTime), 24h (VirtualTime/simulation)" contract — and
+    // removes the spurious drops without changing what the test verifies (the
+    // assembly-failure retry is driven by deterministic fault injection, not by
+    // any real connection timing). `run_simulation_direct` enables the same
+    // flag for the same reason; we keep it scoped to this test rather than to
+    // all of `run_controlled_simulation`, because other controlled-sim tests
+    // (e.g. `test_six_peer_contract_lifecycle`) deliberately rely on the
+    // production 120s idle timeout to reap stale connections and break if it is
+    // extended globally.
+    SimulationIdleTimeout::enable();
+    // Restore production behaviour on this libtest worker thread when the test
+    // returns or unwinds, so the thread-local flag cannot leak into a later
+    // test reusing the same thread under plain `cargo test` (nextest isolates
+    // per process, so it never leaks there). This makes the "scoped to this
+    // test" guarantee above actually hold rather than only mostly hold.
+    struct RestoreIdleTimeout;
+    impl Drop for RestoreIdleTimeout {
+        fn drop(&mut self) {
+            freenet::config::SimulationIdleTimeout::disable();
+        }
+    }
+    let _restore_idle_timeout = RestoreIdleTimeout;
 
     const SEED: u64 = 0xDE1A_4345_0000_0001;
     const NETWORK_NAME_PHASE1: &str = "get-assembly-retry-p1";
