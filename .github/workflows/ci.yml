@@ -481,7 +481,7 @@ jobs:
     # slots on every queue entry — the runner stays cheap there since every step
     # is gated off (see skip_check below).
     runs-on: "${{ (github.event_name == 'merge_group' && !startsWith(github.event.merge_group.head_commit.message, 'build: release')) && 'ubuntu-latest' || 'ubicloud-standard-16' }}"
-    timeout-minutes: 30
+    timeout-minutes: 40
     needs: fmt_check
     # Same skip conditions as test_unit (see test_unit comment for details)
     if: |
@@ -553,7 +553,7 @@ jobs:
             --features simulation_tests,testing --profile ci
           cargo build -p fdev --release --locked
 
-      - name: Run simulation tests (nextest + fdev in parallel)
+      - name: Run simulation tests (nextest first, then fdev load sims)
         if: steps.skip_check.outputs.skip != 'true'
         env:
           RUST_LOG: info,turmoil=warn
@@ -563,8 +563,19 @@ jobs:
           # we can upload them as artifacts and tell which one wedged.
           mkdir -p sim-logs
 
-          # Nextest simulation tests (already built above with --no-run).
-          {
+          # Phase 1: run the precise nextest simulation tests FIRST and ALONE
+          # (already built above with --no-run). Previously these ran
+          # concurrently with the fdev load sims below; under a high-contention
+          # runner the Turmoil `start_paused` clock auto-advances past the 120s
+          # RealTime connection idle timeout during `spawn_blocking` (WASM
+          # execution), spuriously tearing down healthy connections and flaking
+          # the precise streaming/GET sim tests on EVERY nextest retry (the fdev
+          # sims run ~8m, overlapping all 3 retries). Running nextest uncontended
+          # first removes that interference; the fdev load sims run afterwards
+          # (still parallel among themselves). Use a ( ) subshell so `exit $rc`
+          # ends the subshell, not this whole step.
+          NEXTEST_FAILED=0
+          (
             echo "== $(date -u +%H:%M:%S) nextest starting"
             cargo nextest run -p freenet --locked \
               --test simulation_integration \
@@ -575,8 +586,8 @@ jobs:
             rc=$?
             echo "== $(date -u +%H:%M:%S) nextest done rc=${rc}"
             exit $rc
-          } > sim-logs/nextest.log 2>&1 &
-          NEXTEST_PID=$!
+          ) > sim-logs/nextest.log 2>&1 || NEXTEST_FAILED=1
+          echo "nextest phase done (failed=${NEXTEST_FAILED}) — starting fdev load sims"
 
           # 8 minute cap per sim, SIGKILL 30s later if it refuses to die.
           # Background directly (no function) so $! refers to the actual child
@@ -650,11 +661,11 @@ jobs:
           } > sim-logs/ci-churn-20.log 2>&1 &
           PID4=$!
 
-          echo "Started: nextest=$NEXTEST_PID medium=$PID1 fault=$PID2 latency=$PID3 churn=$PID4"
+          echo "Started fdev: medium=$PID1 fault=$PID2 latency=$PID3 churn=$PID4"
 
-          # Wait for all and fail if any failed
-          FAILED=0
-          wait $NEXTEST_PID || { echo "nextest FAILED"; FAILED=1; }
+          # Wait for the fdev sims and fail if any (or nextest above) failed
+          FAILED=$NEXTEST_FAILED
+          [ "$NEXTEST_FAILED" -eq 1 ] && echo "nextest FAILED"
           wait $PID1 || { echo "ci-medium-50 FAILED"; FAILED=1; }
           wait $PID2 || { echo "ci-fault-loss FAILED"; FAILED=1; }
           wait $PID3 || { echo "ci-high-latency FAILED"; FAILED=1; }
