@@ -61,16 +61,25 @@ jobs:
             echo "${crate}=${version}" >> "$GITHUB_OUTPUT"
           done
 
+      # `--strategies crate-meta-data` restricts binstall to ONLY the GitHub
+      # release asset named by the crate's binstall metadata. Without it, the
+      # default strategies (crate-meta-data,quick-install,compile) would let a
+      # missing/404ing release asset silently fall through to the quickinstall
+      # mirror or a from-source compile — and the smoke test would pass while
+      # the exact failure mode it exists to detect (a broken release upload)
+      # went unnoticed. The whole point is to fail when the GitHub asset is bad.
       - name: Install freenet via cargo binstall
         shell: bash
         run: |
-          cargo binstall --no-confirm --targets "${{ matrix.target }}" \
+          cargo binstall --no-confirm --strategies crate-meta-data \
+            --targets "${{ matrix.target }}" \
             "freenet@${{ steps.versions.outputs.freenet }}"
 
       - name: Install fdev via cargo binstall
         shell: bash
         run: |
-          cargo binstall --no-confirm --targets "${{ matrix.target }}" \
+          cargo binstall --no-confirm --strategies crate-meta-data \
+            --targets "${{ matrix.target }}" \
             "fdev@${{ steps.versions.outputs.fdev }}"
 
       - name: Assert binaries respond to --version
