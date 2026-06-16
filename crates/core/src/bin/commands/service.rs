@@ -278,6 +278,17 @@ fn mark_first_run_complete_at(marker: &Path) -> std::io::Result<()> {
     std::fs::File::create(marker).map(|_| ())
 }
 
+/// Path of the legacy-install migration marker (issue #3943). DISTINCT from
+/// the first-run/onboarding marker: a user who already launched a DMG before
+/// this migration shipped has the first-run marker set but may still have the
+/// racing legacy launchd agent, so the migration must NOT be gated on
+/// onboarding state. The migration is its own one-shot, tracked by its own
+/// marker, so it runs once for existing DMG users too.
+#[allow(dead_code)]
+fn legacy_migration_marker_path() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("freenet").join(".legacy-migration-complete"))
+}
+
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn dashboard_port_is_listening() -> bool {
     use std::net::TcpStream;
@@ -890,14 +901,18 @@ pub(super) struct ResolvedLegacyInstall {
     pub binaries: Vec<PathBuf>,
 }
 
-/// Decide how to migrate a pre-existing `install.sh` legacy install on first
-/// DMG launch. PURE: takes the relevant filesystem state as inputs and
-/// returns a plan, with no side effects, so it can be unit-tested on any
-/// platform with a mock `$HOME`.
+/// Decide how to migrate a pre-existing `install.sh` legacy install. PURE:
+/// takes the relevant filesystem state as inputs and returns a plan, with no
+/// side effects, so it can be unit-tested on any platform with a mock `$HOME`.
 ///
 /// Arguments:
-/// - `is_first_run`: whether this is the first DMG launch (marker absent).
-///   Migration is gated on first run so it happens at most once per install.
+/// - `migration_already_done`: whether the dedicated legacy-migration marker
+///   is present (we already migrated on a previous launch). This is NOT the
+///   onboarding first-run marker: a user who already launched a DMG before
+///   this migration shipped has the first-run marker set but may still have
+///   the racing legacy agent, so gating on first-run would skip exactly the
+///   users who need the migration (Codex P1 on PR #4448). The migration is
+///   its own one-shot tracked by its own marker.
 /// - `legacy_plist`: the legacy plist path and whether it currently exists.
 ///   `None` means `$HOME` was unresolvable (no migration possible).
 /// - `resolved`: the legacy install's OWN artifacts (wrapper script + the
@@ -909,17 +924,18 @@ pub(super) struct ResolvedLegacyInstall {
 ///   destructive side effect beyond fixing the launchd race (Codex P2 on
 ///   PR #4448). Targeting only the legacy install's own artifacts avoids that.
 ///
-/// Returns `NoMigration` unless this is a first run AND the legacy plist
-/// exists. We anchor migration on the plist (not on a stray binary) because
-/// the plist is the thing that actively races for the port on login; a lone
-/// legacy binary with no auto-start agent is harmless and left alone.
+/// Returns `NoMigration` unless the migration hasn't been done yet AND the
+/// legacy plist exists. We anchor migration on the plist (not on a stray
+/// binary) because the plist is the thing that actively races for the port on
+/// login; a lone legacy binary with no auto-start agent is harmless and left
+/// alone.
 #[allow(dead_code)]
 pub(super) fn legacy_install_migration_plan(
-    is_first_run: bool,
+    migration_already_done: bool,
     legacy_plist: Option<(PathBuf, bool)>,
     resolved: &ResolvedLegacyInstall,
 ) -> LegacyMigrationPlan {
-    if !is_first_run {
+    if migration_already_done {
         return LegacyMigrationPlan::NoMigration;
     }
     let Some((plist_path, plist_exists)) = legacy_plist else {
@@ -1161,15 +1177,21 @@ pub(super) fn macos_launch_at_login_startup(log_dir: &Path) {
     };
     let is_first_run = is_first_run_at(&marker);
 
-    // First-run legacy-install migration (issue #3943). If a pre-existing
-    // install.sh launch agent is present on first DMG launch, boot it out,
-    // remove its plist + auto-update wrapper script, and remove the CLI
-    // binaries THAT legacy install owned, so the two installs stop racing for
-    // port 7509. We resolve the legacy install's own artifacts from its plist
-    // and wrapper (never guessed locations) so we don't delete an unrelated
-    // `freenet`/`fdev` a user installed separately. The decision is computed
-    // by the pure `legacy_install_migration_plan` so it is unit-testable on
-    // Linux.
+    // Legacy-install migration (issue #3943). If a pre-existing install.sh
+    // launch agent is present, boot it out, remove its plist + auto-update
+    // wrapper script, and remove the CLI binaries THAT legacy install owned,
+    // so the two installs stop racing for port 7509. We resolve the legacy
+    // install's own artifacts from its plist and wrapper (never guessed
+    // locations) so we don't delete an unrelated `freenet`/`fdev` a user
+    // installed separately. The decision is computed by the pure
+    // `legacy_install_migration_plan` so it is unit-testable on Linux.
+    //
+    // Gated on a DEDICATED migration marker, NOT the onboarding first-run
+    // marker: existing DMG users have the first-run marker set but may still
+    // have the racing legacy agent, and must still get migrated (Codex P1).
+    let migration_done = legacy_migration_marker_path()
+        .map(|m| m.exists())
+        .unwrap_or(false);
     let legacy_plist_path = launch_agent_plist_path_for(LEGACY_SERVICE_LAUNCHD_LABEL);
     let legacy_present = legacy_plist_path
         .as_ref()
@@ -1177,11 +1199,11 @@ pub(super) fn macos_launch_at_login_startup(log_dir: &Path) {
         .unwrap_or(false);
     let resolved = legacy_plist_path
         .as_ref()
-        .filter(|_| is_first_run && legacy_present)
+        .filter(|_| !migration_done && legacy_present)
         .map(|p| resolve_legacy_install(p))
         .unwrap_or_default();
     let legacy_plist = legacy_plist_path.map(|p| (p, legacy_present));
-    let plan = legacy_install_migration_plan(is_first_run, legacy_plist, &resolved);
+    let plan = legacy_install_migration_plan(migration_done, legacy_plist, &resolved);
     let migrated = run_legacy_install_migration(log_dir, &plan);
 
     // Re-evaluate legacy presence after migration: a successful migration
@@ -1193,6 +1215,24 @@ pub(super) fn macos_launch_at_login_startup(log_dir: &Path) {
     } else {
         legacy_present
     };
+
+    // Mark the migration done ONLY once the legacy plist is actually gone, so
+    // a launch where plist removal was denied (rare; the plist is user-owned)
+    // retries next time rather than giving up permanently. Marking it lets us
+    // stop re-attempting (and re-logging) the migration on every later launch.
+    if migrated && !legacy_present {
+        if let Some(m) = legacy_migration_marker_path() {
+            if let Err(e) = mark_first_run_complete_at(&m) {
+                log_wrapper_event(
+                    log_dir,
+                    &format!(
+                        "Migration: failed to write migration marker {}: {e}",
+                        m.display()
+                    ),
+                );
+            }
+        }
+    }
 
     // Legacy-agent warning: if the legacy plist is STILL present (we either
     // didn't migrate this launch, or removal was denied), warn the user.
@@ -4689,45 +4729,49 @@ mod tests {
     }
 
     #[test]
-    fn legacy_install_migration_plan_skips_when_not_first_run() {
-        // Even with a legacy plist and binaries present, a non-first-run
-        // launch must never re-migrate (the marker means we already did,
-        // or the user deliberately keeps the legacy install).
+    fn legacy_install_migration_plan_skips_when_already_migrated() {
+        // Migration marker present (we already migrated on a previous launch):
+        // never re-migrate, even with a legacy plist + binaries still present.
         let resolved = ResolvedLegacyInstall {
             wrapper_script: Some(PathBuf::from("/u/.local/bin/freenet-service-wrapper.sh")),
             binaries: vec![PathBuf::from("/u/.local/bin/freenet")],
         };
-        let plan = legacy_install_migration_plan(false, legacy_plist(true), &resolved);
+        let plan = legacy_install_migration_plan(
+            /* migration_already_done */ true,
+            legacy_plist(true),
+            &resolved,
+        );
         assert_eq!(plan, LegacyMigrationPlan::NoMigration);
     }
 
     #[test]
     fn legacy_install_migration_plan_skips_when_no_legacy_plist() {
-        // First run on a clean (new-user) DMG install: no legacy plist, so
-        // there is nothing to migrate even if a stray binary somehow exists.
-        // A lone binary with no auto-start agent is harmless.
+        // Clean (new-user) DMG install: no legacy plist, so there is nothing
+        // to migrate even if a stray binary somehow exists. A lone binary with
+        // no auto-start agent is harmless.
         let resolved = ResolvedLegacyInstall {
             wrapper_script: None,
             binaries: vec![PathBuf::from("/u/.local/bin/freenet")],
         };
         assert_eq!(
-            legacy_install_migration_plan(true, None, &resolved),
+            legacy_install_migration_plan(false, None, &resolved),
             LegacyMigrationPlan::NoMigration
         );
         assert_eq!(
-            legacy_install_migration_plan(true, legacy_plist(false), &resolved),
+            legacy_install_migration_plan(false, legacy_plist(false), &resolved),
             LegacyMigrationPlan::NoMigration
         );
     }
 
-    /// Regression test for issue #3943. Before the fix, first-run DMG launch
-    /// with a pre-existing install.sh legacy install only LOGGED a warning;
-    /// it did NOT remove the legacy plist, wrapper, or CLI binaries, so the
-    /// two installs raced for port 7509 on every login. This asserts the plan
+    /// Regression test for issue #3943. Before the fix, a DMG launch with a
+    /// pre-existing install.sh legacy install only LOGGED a warning; it did
+    /// NOT remove the legacy plist, wrapper, or CLI binaries, so the two
+    /// installs raced for port 7509 on every login. This asserts the plan
     /// boots out + removes the legacy plist first, then the wrapper script,
-    /// then each legacy binary, in order.
+    /// then each legacy binary, in order. `migration_already_done = false`
+    /// (covers existing DMG users, not just brand-new onboarding — Codex P1).
     #[test]
-    fn legacy_install_migration_plan_removes_plist_wrapper_and_binaries_on_first_run() {
+    fn legacy_install_migration_plan_removes_plist_wrapper_and_binaries() {
         let plist = PathBuf::from("/u/Library/LaunchAgents/org.freenet.node.plist");
         let resolved = ResolvedLegacyInstall {
             wrapper_script: Some(PathBuf::from("/u/.local/bin/freenet-service-wrapper.sh")),
@@ -4736,7 +4780,7 @@ mod tests {
                 PathBuf::from("/u/.local/bin/freenet"),
             ],
         };
-        let plan = legacy_install_migration_plan(true, Some((plist.clone(), true)), &resolved);
+        let plan = legacy_install_migration_plan(false, Some((plist.clone(), true)), &resolved);
 
         assert_eq!(
             plan,
@@ -4762,7 +4806,7 @@ mod tests {
         // fabricate binary-removal steps for guessed locations.
         let plist = PathBuf::from("/u/Library/LaunchAgents/org.freenet.node.plist");
         let plan = legacy_install_migration_plan(
-            true,
+            false,
             Some((plist.clone(), true)),
             &ResolvedLegacyInstall::default(),
         );
@@ -4775,8 +4819,8 @@ mod tests {
     /// Plist-path extractor against representative launchd-plist XML (the
     /// shape `generate_plist` emits). Runs on every platform — Linux CI
     /// exercises the parsing logic here; the macOS-only
-    /// `*_matches_generate_plist` test below additionally pins the coupling
-    /// to the generator's exact output.
+    /// `legacy_extractors_match_generators` test below additionally pins the
+    /// coupling to the generator's exact output.
     #[test]
     fn legacy_program_path_from_plist_parses_program_arguments() {
         let xml = "\
