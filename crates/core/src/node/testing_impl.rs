@@ -958,8 +958,9 @@ pub struct SimNetwork {
     /// convergence (e.g. `test_interest_renewal`), running the full polling tail
     /// when the network happens not to converge adds up to 1800s of virtual time
     /// for no benefit, blowing the wall-clock budget and making the test time out
-    /// in CI. Set this (via `TestConfig::require_convergence(false)`) so such tests
-    /// stay bounded regardless of whether the network converges. See #3792.
+    /// in CI. The test crate sets this via `TestConfig::no_convergence_wait()` so
+    /// such tests stay bounded regardless of whether the network converges.
+    /// See #3792.
     pub skip_convergence_wait: bool,
     /// Optional churn (crash/restart) configuration for the chaos driver.
     churn_config: Option<ChurnConfig>,
@@ -4744,7 +4745,7 @@ impl SimNetwork {
             //
             // Early exit: if all contracts converge, we break immediately.
             //
-            // When `skip_convergence_wait` is set (TestConfig::require_convergence(false)),
+            // When `skip_convergence_wait` is set (TestConfig::no_convergence_wait()),
             // we do only a brief fixed settle and skip the polling loop entirely. The
             // polling tail is advisory — it only logs on failure, never fails the
             // simulation — so a test that never asserts convergence gains nothing from
