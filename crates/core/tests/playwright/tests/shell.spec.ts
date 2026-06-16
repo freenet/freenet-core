@@ -227,6 +227,50 @@ test("same-origin in-contract link performs an in-place navigate hop", async ({ 
   await expect(page).not.toHaveURL(/__sandbox/);
 });
 
+test("a link carrying a download attribute is NOT intercepted", async ({ page }) => {
+  await page.goto(shellUrl!);
+  await captureShellMessages(page);
+  const frame = await fixtureFrame(page);
+
+  // `#download-link` is a SAME-ORIGIN href (page2.html) that, WITHOUT the
+  // `download` attribute, would be intercepted as a `navigate` (proven by the
+  // same-origin test above). `handleAnchorClick` early-returns on the
+  // `download` attribute (path_handlers.rs:2013), so clicking it must send NO
+  // interception postMessage (no `navigate`, no `open_url`). A regression that
+  // dropped the `if (target.hasAttribute('download')) return;` guard would turn
+  // this back into a `navigate`.
+  //
+  // Ordering matters: we assert on the *delta* of captured messages around the
+  // click, because the click may (natively) cause the iframe to load page2 —
+  // which would tear down the in-iframe listeners and make a post-click control
+  // click impossible. So we (1) prove the interceptor is live with a control
+  // click on the SAME element with its `download` attribute removed, expecting
+  // a `navigate`; then (2) reload, re-arm capture, click the unmodified
+  // download link, and assert it adds NO message.
+
+  // (1) Control: same element minus `download` IS intercepted → listener live,
+  // and the element/selector themselves are wired correctly.
+  await frame.locator("#download-link").evaluate((el) => el.removeAttribute("download"));
+  await frame.locator("#download-link").click();
+  await expect
+    .poll(async () => (await shellMessages(page)).map((m) => m.type))
+    .toContain("navigate");
+
+  // (2) Reload to restore the original DOM (with the `download` attribute) and
+  // a fresh, empty capture buffer, then click the real download link.
+  await page.goto(shellUrl!);
+  await captureShellMessages(page);
+  const frame2 = await fixtureFrame(page);
+  await frame2.locator("#download-link").click();
+  // Give any (erroneous) interception postMessage a tick to arrive.
+  await page.waitForTimeout(300);
+  const types = (await shellMessages(page)).map((m) => m.type);
+  expect(
+    types,
+    `a download link must not be intercepted, but got messages: ${types.join(", ")}`,
+  ).toEqual([]);
+});
+
 test("browser Back restores the previous subpage via the popstate handler (#3839)", async ({
   page,
 }) => {

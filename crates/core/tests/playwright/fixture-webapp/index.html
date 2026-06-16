@@ -44,10 +44,20 @@
 
 <!--
   Download link. The interceptor must NOT intercept links carrying a
-  `download` attribute; they fall through to the browser/shell download path
-  (path_handlers.rs handleAnchorClick early-return on `download`).
+  `download` attribute; `handleAnchorClick` early-returns on `download`
+  (path_handlers.rs:2013), so no open_url / navigate postMessage is sent and
+  the link keeps its native (download) behaviour.
+
+  The href is SAME-ORIGIN (a data URL would be skipped earlier by the
+  javascript:/data: protocol check at path_handlers.rs:2011, which would NOT
+  isolate the `download` guard). Without the `download` attribute this exact
+  same-origin link would be intercepted as a `navigate` (see #same-origin-link);
+  the `download` attribute is what makes the early-return fire instead, so the
+  absence of a `navigate` postMessage on click is attributable to the
+  `download` guard specifically. The test reads `#download-link` directly and
+  does not rely on what the browser does natively after the early-return.
 -->
-<a id="download-link" href="data:text/plain,hello" download="hello.txt">Download</a>
+<a id="download-link" href="page2.html" download="hello.txt">Download</a>
 
 <!-- Result sink the Playwright tests read via page.evaluate. -->
 <pre id="poll-result">pending</pre>
