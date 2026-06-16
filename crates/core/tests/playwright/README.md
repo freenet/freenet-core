@@ -57,3 +57,16 @@ To iterate on the specs alone against an already-running node, point
 > Linux-only: the harness binds the node to a varied `127.x.y.1` loopback for
 > test isolation. The full `127.0.0.0/8` range is loopback on Linux but not on
 > macOS, where only `127.0.0.1` is reachable by default.
+
+## Why the fixture's external link targets `example.com`, not localhost
+
+The shell's `open_url` bridge deliberately **refuses** to open `localhost`,
+`127.0.0.1`, `::1`, and `0.0.0.0` URLs — it must not be usable as a proxy from
+a sandboxed contract to other services on the operator's machine
+(`path_handlers.rs` `open_url` handler). So the cross-origin fixture link uses
+`https://example.com/external` (RFC 2606 documentation domain), which clears
+that blocklist and is intercepted *before* any network request is made — the
+test never actually reaches example.com. A side effect of the same blocklist:
+you cannot use the Freenet shell to open links to your own local dev servers
+(e.g. `http://localhost:3000`); that is an accepted security trade-off, not a
+bug.

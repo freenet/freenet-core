@@ -55,7 +55,11 @@ use std::time::Duration;
 
 use freenet::test_utils::TestContext;
 use freenet_macros::freenet_test;
-use testresult::TestResult;
+// NOTE: the `#[freenet_test]` macro rewrites the wrapped function's return type
+// to `freenet::test_utils::TestResult`, so the `-> TestResult` annotation below
+// is parsed but discarded — no `TestResult` import is needed (and importing one
+// trips `unused_imports`). This matches the other `#[freenet_test]` suites
+// (e.g. error_notification.rs), which also write `-> TestResult` with no import.
 
 /// Name of the website signing key created in the temp config dir.
 const FIXTURE_KEY_NAME: &str = "smoke-fixture";
@@ -109,6 +113,31 @@ fn fixture_webapp_dir() -> PathBuf {
     playwright_dir().join("fixture-webapp")
 }
 
+/// Strip ANSI CSI escape sequences (`ESC [ ... <final byte>`) from a line.
+/// Small hand-rolled stripper so the harness needs no extra dependency; it
+/// only has to handle the colour/SGR sequences a CLI might emit.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // ESC: skip an optional '[' then everything up to and including the
+            // final byte in the range 0x40..=0x7e.
+            if chars.peek() == Some(&'[') {
+                chars.next();
+            }
+            for d in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&d) {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // fdev website publish helpers
 // ---------------------------------------------------------------------------
@@ -129,12 +158,29 @@ fn website_init(config_home: &Path) -> anyhow::Result<String> {
             String::from_utf8_lossy(&output.stderr),
         );
     }
+    // Parse the "Your website contract key: <key>" line. `fdev` writes it with
+    // a plain `println!` and we capture its stdout via a pipe (not a TTY), so
+    // no ANSI colouring is emitted; we still strip CSI escape sequences and any
+    // trailing CR/whitespace defensively so a future colourised fdev, or a
+    // Windows CRLF, doesn't silently corrupt the key.
     let key = stdout
         .lines()
-        .find_map(|l| l.strip_prefix("Your website contract key: "))
-        .map(|k| k.trim().to_string())
-        .ok_or_else(|| anyhow::anyhow!("could not parse contract key from fdev output:\n{stdout}"))?;
-    anyhow::ensure!(!key.is_empty(), "fdev printed an empty contract key");
+        .find_map(|l| {
+            let stripped = strip_ansi(l);
+            stripped
+                .strip_prefix("Your website contract key: ")
+                .map(|k| k.trim().to_string())
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("could not parse contract key from fdev output:\n{stdout}")
+        })?;
+    // Contract keys are base58 (alphanumeric, no punctuation/whitespace). A
+    // value that fails this shape check means our parse picked up the wrong
+    // text — fail loudly rather than feed garbage into the shell URL.
+    anyhow::ensure!(
+        !key.is_empty() && key.chars().all(|c| c.is_ascii_alphanumeric()),
+        "parsed contract key has unexpected shape (ANSI/format drift?): {key:?}"
+    );
     Ok(key)
 }
 
@@ -228,7 +274,10 @@ fn run_playwright(shell_url: &str) -> anyhow::Result<()> {
         .args(["playwright", "test"])
         .status()
         .map_err(|e| anyhow::anyhow!("failed to spawn `npx playwright test` in {dir:?}: {e}"))?;
-    anyhow::ensure!(status.success(), "Playwright suite failed (exit {status:?})");
+    anyhow::ensure!(
+        status.success(),
+        "Playwright suite failed (exit {status:?})"
+    );
     Ok(())
 }
 
@@ -243,10 +292,17 @@ fn run_playwright(shell_url: &str) -> anyhow::Result<()> {
 /// A single gateway node suffices: it stores its own published contract, so
 /// `contract_home` fetches it locally and renders the shell without needing
 /// network propagation.
+// Budget: the harness times the WHOLE test, including the `fdev website
+// publish` step (which can burn its full ~90s single-shot Put timeout before
+// the insert lands — see `website_publish_observed`), the shell-readiness poll
+// (up to 120s), and the Playwright suite (~70s for 7 specs). An observed local
+// run finished in ~282s, so 300s left almost no slack on a contended runner;
+// 600s gives comfortable headroom without masking a genuine hang (the
+// individual sub-steps have their own tighter internal deadlines).
 #[freenet_test(
     health_check_readiness = true,
     nodes = ["gateway"],
-    timeout_secs = 300,
+    timeout_secs = 600,
     startup_wait_secs = 30,
     tokio_flavor = "multi_thread",
     tokio_worker_threads = 4,

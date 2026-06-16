@@ -27,12 +27,16 @@ on:
       - 'crates/core/src/server/**'
       - 'crates/core/tests/playwright/**'
       - 'crates/core/tests/playwright_shell.rs'
+      # fdev is the publish path the harness shells out to; a regression in
+      # `fdev website publish` would break the harness, so run on fdev changes.
+      - 'crates/fdev/**'
       - '.github/workflows/playwright-shell.yml'
   pull_request:
     paths:
       - 'crates/core/src/server/**'
       - 'crates/core/tests/playwright/**'
       - 'crates/core/tests/playwright_shell.rs'
+      - 'crates/fdev/**'
       - '.github/workflows/playwright-shell.yml'
 
 concurrency:

@@ -217,8 +217,40 @@ test("same-origin in-contract link performs an in-place navigate hop", async ({ 
   expect(navigate?.href, `navigate href: ${navigate?.href}`).toContain("page2.html");
 
   // The shell performs the hop in place: the iframe now shows page 2 and the
-  // top-level URL no longer carries __sandbox (issue #3839).
+  // top-level URL no longer carries __sandbox (issue #3839). Use Playwright's
+  // polling toHaveURL (not a synchronous page.url() snapshot) because the
+  // pushState that updates the address bar runs in the bridge's message
+  // handler, which can settle a tick after the iframe content loads.
   await expect(page.frameLocator("iframe#app").locator("#page2-title")).toBeVisible();
-  expect(page.url()).toContain("page2.html");
-  expect(page.url()).not.toContain("__sandbox");
+  await expect(page).toHaveURL(/page2\.html/);
+  await expect(page).not.toHaveURL(/__sandbox/);
+});
+
+test("browser Back restores the previous subpage via the popstate handler (#3839)", async ({
+  page,
+}) => {
+  await page.goto(shellUrl!);
+  const frame = await fixtureFrame(page);
+
+  // Navigate forward to page 2 (in-place hop, pushes a history entry).
+  await frame.locator("#same-origin-link").click();
+  await expect(page.frameLocator("iframe#app").locator("#page2-title")).toBeVisible();
+  await expect(page).toHaveURL(/page2\.html/);
+
+  // Browser Back must fire the bridge's popstate handler, which restores the
+  // iframe to the PREVIOUS subpage (index) rather than leaving it on page 2 or
+  // blanking it. Restoring iframe.src is exactly the behaviour the popstate
+  // handler owns (path_handlers.rs SHELL_BRIDGE_JS popstate listener), so we
+  // assert on the iframe content — the observable effect of that handler.
+  //
+  // We deliberately do NOT assert on the top-level address-bar URL here: the
+  // forward hop used history.pushState, so going back is a popstate event that
+  // only swaps iframe.src and never triggers a document load. Whether/when the
+  // browser's address bar reverts on a scripted history.back() is a browser
+  // history detail, not part of the bridge's contract, and asserting it is
+  // flaky under headless automation. The forward-navigate test above already
+  // pins the address-bar behaviour for the push direction.
+  await page.evaluate(() => window.history.back());
+  await expect(page.frameLocator("iframe#app").locator("#title")).toBeVisible();
+  await expect(page.frameLocator("iframe#app").locator("#page2-title")).toHaveCount(0);
 });
