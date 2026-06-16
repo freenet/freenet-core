@@ -1047,6 +1047,29 @@ pub(super) fn legacy_binary_path_from_wrapper(wrapper_sh: &str) -> Option<PathBu
     None
 }
 
+/// Basename of the auto-update wrapper script `freenet service install`
+/// writes (see [`wrapper_script_path`]). The migration only treats a plist's
+/// `ProgramArguments` target as a removable Freenet wrapper if it has this
+/// exact filename.
+const LEGACY_WRAPPER_SCRIPT_NAME: &str = "freenet-service-wrapper.sh";
+
+/// Distinctive header line [`generate_wrapper_script`] writes at the top of
+/// every wrapper. Used as a content signature so we never delete a
+/// hand-written or repurposed script that merely happens to be referenced by
+/// an `org.freenet.node` plist.
+const LEGACY_WRAPPER_SIGNATURE: &str = "# Freenet service wrapper for auto-update support.";
+
+/// Returns true if `(basename, contents)` look like a Freenet-generated
+/// auto-update wrapper script — i.e. it is safe for the migration to delete.
+/// PURE so the guard is unit-testable. We require BOTH the canonical filename
+/// AND the generated header signature, so a user who repurposed the legacy
+/// `org.freenet.node` label to launch an unrelated script does NOT have that
+/// script deleted (Codex P2, round 4 on PR #4448).
+#[allow(dead_code)]
+pub(super) fn is_legacy_freenet_wrapper(basename: Option<&str>, contents: &str) -> bool {
+    basename == Some(LEGACY_WRAPPER_SCRIPT_NAME) && contents.contains(LEGACY_WRAPPER_SIGNATURE)
+}
+
 /// Reverse of [`xml_escape`] for the entity set that function emits. Used to
 /// recover a real filesystem path from a plist `<string>` (e.g. a path with
 /// `&amp;` in it).
@@ -1146,7 +1169,12 @@ fn remove_legacy_file(log_dir: &Path, kind: &str, path: &Path) {
 ///
 /// We deliberately derive the binary from the wrapper script rather than
 /// guessing install locations, so we never remove an unrelated user-installed
-/// `freenet`/`fdev` (Codex P2 on PR #4448).
+/// `freenet`/`fdev` (Codex P2, round 1 on PR #4448). We also VALIDATE that the
+/// referenced script is actually a Freenet-generated wrapper (canonical
+/// filename + header signature) before scheduling it — or its binary — for
+/// removal, so a hand-edited or repurposed `org.freenet.node` plist pointing
+/// at an unrelated script cannot cause that script/binary to be deleted
+/// (Codex P2, round 4).
 #[cfg(target_os = "macos")]
 fn resolve_legacy_install(legacy_plist: &Path) -> ResolvedLegacyInstall {
     let Ok(plist_xml) = std::fs::read_to_string(legacy_plist) else {
@@ -1156,21 +1184,31 @@ fn resolve_legacy_install(legacy_plist: &Path) -> ResolvedLegacyInstall {
         return ResolvedLegacyInstall::default();
     };
 
+    // Only act on the wrapper if it is genuinely a Freenet-generated script.
+    // If we can't read it, or it doesn't look like ours, remove nothing here
+    // (the caller still removes the plist itself, which is the race cause).
+    let Ok(wrapper_sh) = std::fs::read_to_string(&wrapper_path) else {
+        return ResolvedLegacyInstall::default();
+    };
+    let basename = wrapper_path.file_name().and_then(|n| n.to_str());
+    if !is_legacy_freenet_wrapper(basename, &wrapper_sh) {
+        return ResolvedLegacyInstall::default();
+    }
+
     // The plist's ProgramArguments points at the auto-update wrapper script,
     // not the binary directly (see `generate_plist`). Recover the binary from
     // the wrapper, then offer its sibling `fdev` too (install.sh ships both).
+    // Constrain to the canonical `freenet`/`fdev` basenames as a second guard.
     let mut binaries = Vec::new();
-    if let Ok(wrapper_sh) = std::fs::read_to_string(&wrapper_path) {
-        if let Some(bin) = legacy_binary_path_from_wrapper(&wrapper_sh) {
-            if bin.exists() {
-                if let Some(dir) = bin.parent() {
-                    let fdev = dir.join("fdev");
-                    if fdev.exists() {
-                        binaries.push(fdev);
-                    }
+    if let Some(bin) = legacy_binary_path_from_wrapper(&wrapper_sh) {
+        if bin.file_name().and_then(|n| n.to_str()) == Some("freenet") && bin.exists() {
+            if let Some(dir) = bin.parent() {
+                let fdev = dir.join("fdev");
+                if fdev.exists() {
+                    binaries.push(fdev);
                 }
-                binaries.push(bin);
             }
+            binaries.push(bin);
         }
     }
 
@@ -4973,9 +5011,33 @@ mod tests {
         );
     }
 
+    /// The wrapper-ownership guard (Codex P2, round 4): we only delete a script
+    /// that is BOTH named `freenet-service-wrapper.sh` AND carries the
+    /// generated header. A hand-edited/repurposed `org.freenet.node` plist
+    /// pointing at an unrelated script must not get that script deleted.
+    #[test]
+    fn is_legacy_freenet_wrapper_requires_name_and_signature() {
+        let real = "#!/bin/bash\n# Freenet service wrapper for auto-update support.\n…";
+        assert!(is_legacy_freenet_wrapper(
+            Some("freenet-service-wrapper.sh"),
+            real
+        ));
+
+        // Right content but wrong filename (repurposed plist target).
+        assert!(!is_legacy_freenet_wrapper(Some("my-script.sh"), real));
+        // Right filename but not our content (user overwrote it).
+        assert!(!is_legacy_freenet_wrapper(
+            Some("freenet-service-wrapper.sh"),
+            "#!/bin/bash\nrm -rf ~\n"
+        ));
+        // No basename at all.
+        assert!(!is_legacy_freenet_wrapper(None, real));
+    }
+
     /// macOS-only: pin the extractors to `generate_plist` /
     /// `generate_wrapper_script`'s EXACT output so a format drift in either
-    /// generator (which only compiles on macOS) trips CI.
+    /// generator (which only compiles on macOS) trips CI. Also confirm the
+    /// real generated wrapper passes the ownership guard.
     #[cfg(target_os = "macos")]
     #[test]
     fn legacy_extractors_match_generators() {
@@ -4987,6 +5049,12 @@ mod tests {
         let bin = PathBuf::from("/u/.local/bin/freenet");
         let sh = generate_wrapper_script(&bin);
         assert_eq!(legacy_binary_path_from_wrapper(&sh), Some(bin));
+        // The real generated wrapper must satisfy the ownership guard, or the
+        // migration would never act on a genuine legacy install.
+        assert!(is_legacy_freenet_wrapper(
+            Some("freenet-service-wrapper.sh"),
+            &sh
+        ));
 
         // End-to-end: plist → wrapper path → wrapper script → binary path.
         let spacey = PathBuf::from("/Users/Some User/bin/freenet");
