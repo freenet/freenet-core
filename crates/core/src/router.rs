@@ -1248,6 +1248,265 @@ mod tests {
         );
     }
 
+    // ===================== issue #4230 support =====================
+    //
+    // Follow-up to #4222. #4222 widened the candidate window from 5 to 25 and
+    // proved (via `select_closest_peers_includes_subscribers_4222`) that the
+    // wider window is wide enough to *surface* subscribers. #4230 asks the
+    // converse question: does the wider window *degrade routing quality* for
+    // ordinary (non-subscriber) GETs by letting the isotonic predictor pick a
+    // distant peer that happens to have slightly better per-peer EWMA history
+    // than the closest peer?
+    //
+    // The predictor's scoring (`predict_routing_outcome`) has no direct
+    // distance term; distance enters only via (a) the global isotonic
+    // regression (`isotonic_estimator.rs`) and (b) as a feature handed to the
+    // renegade predictor. Once a peer has >= ADJUSTMENT_PRIOR_SIZE (10) events,
+    // its per-peer EWMA adjustment can shift its failure estimate away from the
+    // global distance curve. At window=5 the truncation was self-limiting; at
+    // window=25 there are 5x more candidates whose per-peer history can compete
+    // against geographic locality.
+    //
+    // The window only controls which peers are VISIBLE to the predictor, not
+    // the pairwise ranking of any two fixed peers, so the meaningful question
+    // is an aggregate one: over many random targets against a realistically
+    // trained router, does the chosen next hop stay in the closest tail of the
+    // candidate pool (small-world progress), or does it drift toward the median
+    // (no progress) as the window widens? `measure_convergence` answers this
+    // via the chosen hop's rank-percentile. These tests pin that aggregate
+    // convergence property at the shipped window and across a window sweep (the
+    // historical 5 -> shipped 25 -> beyond), so a future change that lets
+    // per-peer history override locality — lengthening routes — trips CI.
+
+    /// Build a peer whose ring location is `Location::from_address` of a
+    /// deterministic non-loopback address with a unique masked IP. `Location`
+    /// is address-derived (it masks the low IP byte and ignores the port for
+    /// non-loopback addresses), so distinct values in the upper three octets
+    /// yield distinct, stable ring locations. The hash is not invertible, so
+    /// callers do not control the exact location — they generate a pool and
+    /// measure distances to a chosen target. `seed` in [0, 65535] (16 bits)
+    /// keeps the octets in range.
+    fn peer_in_subnet(seed: u32) -> PeerKeyLocation {
+        use crate::transport::TransportKeypair;
+        use std::net::SocketAddr;
+        // Vary the second and third octets (the low octet is masked out by
+        // `Location::from_address`, so it can stay 0). First octet fixed at
+        // 198 (RFC 2544 benchmark range, non-loopback). 16 bits of `seed`
+        // give 65536 distinct masked IPs — more than any test below needs.
+        let b = ((seed >> 8) & 0xFF) as u8;
+        let c = (seed & 0xFF) as u8;
+        let addr: SocketAddr = format!("198.{b}.{c}.0:9000").parse().unwrap();
+        PeerKeyLocation::new(TransportKeypair::new().public().clone(), addr)
+    }
+
+    /// Train a `Router` on a synthetic history whose global shape matches what
+    /// the production isotonic regression learns: a distance->failure gradient
+    /// (closer peers succeed more, farther peers fail more) plus per-peer noise
+    /// so that per-peer EWMA adjustments are populated across the whole pool —
+    /// the regime in which a distant-but-historically-good peer could in
+    /// principle out-score a close-but-unlucky one.
+    ///
+    /// `pool` is the set of peers events are drawn from; each of `rounds`
+    /// rounds touches every peer once at a fresh random target, so every peer
+    /// accrues >= ADJUSTMENT_PRIOR_SIZE events. Returns the event history (the
+    /// caller builds a `Router` per candidate window from it, since `Router` is
+    /// not `Clone`). Deterministic under the caller's seed guard.
+    fn gradient_history(pool: &[PeerKeyLocation], rounds: usize) -> Vec<RouteEvent> {
+        let mut events: Vec<RouteEvent> = Vec::new();
+        for _ in 0..rounds {
+            // Fresh random target each round so the gradient is learned across
+            // the whole ring, not just one contract location.
+            let contract = Location::random();
+            for p in pool {
+                let d = contract.distance(p.location().unwrap()).as_f64(); // [0, 0.5]
+                // Failure probability rises with distance: ~0 when adjacent,
+                // ~1 at the antipode. This is the correlation the issue says
+                // the production regression learns.
+                let fail = GlobalRng::random_range(0.0..1.0) < (d * 2.0);
+                events.push(RouteEvent {
+                    peer: p.clone(),
+                    contract_location: contract,
+                    outcome: if fail {
+                        RouteOutcome::Failure
+                    } else {
+                        RouteOutcome::SuccessUntimed
+                    },
+                    op_type: None,
+                });
+            }
+        }
+        events
+    }
+
+    /// Measure routing convergence at a given candidate window over many random
+    /// targets, against a fixed trained router and peer pool.
+    ///
+    /// For each target we ask the router (with `consider_n_closest_peers =
+    /// window`) for its single best next hop, then compute that hop's
+    /// *rank-percentile*: the fraction of the pool that is STRICTLY closer to
+    /// the target than the chosen hop. 0.0 = the chosen hop is the closest peer
+    /// (perfect greedy routing); 0.5 = it is the median peer (no progress, like
+    /// a random choice); 1.0 = it is the farthest.
+    ///
+    /// We use rank-percentile rather than a distance ratio because the ratio's
+    /// denominator (the closest peer's distance) is near zero whenever a peer
+    /// sits almost on the target, which makes a mean-ratio metric explode on
+    /// outliers and measure denominator noise instead of routing quality.
+    /// Rank-percentile is bounded in [0, 1] and directly captures small-world
+    /// progress: a router that consistently picks peers in the closest tail
+    /// converges in O(log n) hops; one that drifts toward the median does not.
+    ///
+    /// Returns `(mean_rank_percentile, p90_rank_percentile)`. Lower is better.
+    /// Deterministic under the caller's seed.
+    fn measure_convergence(
+        history: &[RouteEvent],
+        pool: &[PeerKeyLocation],
+        window: usize,
+        trials: usize,
+    ) -> (f64, f64) {
+        let router = Router::new(history).considering_n_closest_peers(window as u32);
+        assert!(
+            router.has_sufficient_routing_events(),
+            "trained router below prediction threshold ({} events)",
+            router.failure_estimator.len()
+        );
+        let mut percentiles: Vec<f64> = Vec::with_capacity(trials);
+        for _ in 0..trials {
+            let target = Location::random();
+            let selected = router
+                .select_peer(pool, target)
+                .expect("non-empty pool must yield a hop");
+            let sel_d = target.distance(selected.location().unwrap()).as_f64();
+            // Count peers strictly closer than the chosen hop. Use a tiny
+            // epsilon so a peer tied with the chosen one (e.g. the chosen peer
+            // itself) is not counted as "closer".
+            let closer = pool
+                .iter()
+                .filter(|p| target.distance(p.location().unwrap()).as_f64() < sel_d - 1e-12)
+                .count();
+            percentiles.push(closer as f64 / pool.len() as f64);
+        }
+        let mean = percentiles.iter().sum::<f64>() / percentiles.len() as f64;
+        percentiles.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p90 = percentiles[(percentiles.len() as f64 * 0.9) as usize];
+        (mean, p90)
+    }
+
+    /// #4230 (steady state): at the SHIPPED window of 25, small-world routing
+    /// convergence is preserved. Over many random targets against a router
+    /// trained on a realistic distance->failure gradient, the chosen next hop
+    /// lands deep in the closest tail of the candidate pool — far from the
+    /// median (which would mean no progress / non-convergence). If the widened
+    /// window had let per-peer EWMA history routinely override geographic
+    /// locality (the #4230 worry), the chosen hop's rank-percentile would drift
+    /// toward 0.5; instead it stays near zero.
+    ///
+    /// Empirical basis for the thresholds: across an 8-seed robustness scan the
+    /// window=25 mean rank-percentile ranged 0.0075..0.097 and p90 ranged
+    /// 0.025..0.175 (120-peer pool). The bounds below (mean < 0.15, p90 < 0.25)
+    /// sit comfortably above the observed worst case while remaining far below
+    /// the no-convergence value of 0.5, so a real degradation (history
+    /// overriding distance) trips CI but seed jitter does not. Deterministic.
+    #[test]
+    fn routing_convergence_preserved_at_window_25_4230() {
+        let _guard = crate::config::GlobalRng::seed_guard(0x4230_C0DE);
+
+        // Pin the shipped window so a silent default change surfaces here too
+        // (mirrors the pin in the #4222 test).
+        assert_eq!(
+            Router::new(&[]).consider_n_closest_peers,
+            25,
+            "issue #4230: expected DEFAULT_CONSIDER_N_CLOSEST_PEERS = 25"
+        );
+
+        let pool: Vec<PeerKeyLocation> = (0..120u32).map(peer_in_subnet).collect();
+        // The pool must contain 120 distinct ring locations; if `peer_in_subnet`
+        // ever collided them the metrics below would silently lose meaning.
+        let distinct_locs: std::collections::HashSet<_> = pool
+            .iter()
+            .map(|p| p.location().unwrap().as_f64().to_bits())
+            .collect();
+        assert_eq!(distinct_locs.len(), pool.len(), "peer pool has collisions");
+
+        let history = gradient_history(&pool, 4); // 4 * 120 = 480 events
+
+        let (mean_pct, p90_pct) = measure_convergence(&history, &pool, 25, 400);
+
+        assert!(
+            mean_pct < 0.15,
+            "issue #4230 regression: at window=25 the chosen next hop's mean \
+             rank-percentile is {mean_pct:.3} — the predictor is drifting away \
+             from the closest tail (0.5 = median = no progress), so per-peer \
+             history is overriding geographic locality and small-world routing \
+             convergence has degraded"
+        );
+        assert!(
+            p90_pct < 0.25,
+            "issue #4230 regression: at window=25 the 90th-percentile chosen-hop \
+             rank-percentile is {p90_pct:.3} — the routing tail has degraded; \
+             too many hops are landing far from the target"
+        );
+    }
+
+    /// #4230 (threshold map): sweep the candidate window from the historical 5
+    /// through the shipped 25 and beyond, and confirm widening does NOT push
+    /// routing toward non-convergence. The issue asks for this sweep
+    /// explicitly: if window=25 sits comfortably inside the safe region the
+    /// test is a regression guard; if widening had driven the chosen-hop
+    /// rank-percentile toward the median, the fix would have needed a soft
+    /// distance bias in the predictor rather than truncation alone.
+    ///
+    /// Finding: widening DOES raise the chosen-hop rank-percentile modestly
+    /// (more near-equidistant candidates become visible, so per-peer history
+    /// breaks more ties), but it plateaus well inside the convergent regime —
+    /// it never drifts toward 0.5. So the #4222 widening is safe; this test
+    /// pins that. Deterministic.
+    #[test]
+    fn routing_convergence_window_sweep_does_not_degrade_4230() {
+        let _guard = crate::config::GlobalRng::seed_guard(0x4230_5EED);
+
+        let pool: Vec<PeerKeyLocation> = (0..120u32).map(peer_in_subnet).collect();
+        let history = gradient_history(&pool, 4);
+
+        // (window, mean_pct, p90_pct) for each swept window.
+        let mut results: Vec<(usize, f64, f64)> = Vec::new();
+        for &window in &[5usize, 10, 25, 50, 100] {
+            let (mean_pct, p90_pct) = measure_convergence(&history, &pool, window, 300);
+            results.push((window, mean_pct, p90_pct));
+        }
+
+        // At EVERY swept window the chosen hop stays deep in the closest tail —
+        // never near the median. This is the load-bearing convergence property:
+        // widening the candidate window does not break small-world routing.
+        for &(window, mean_pct, p90_pct) in &results {
+            assert!(
+                mean_pct < 0.15,
+                "issue #4230: at window={window} mean chosen-hop rank-percentile \
+                 {mean_pct:.3} drifted toward the median — routing convergence \
+                 degraded by the candidate-window size"
+            );
+            assert!(
+                p90_pct < 0.30,
+                "issue #4230: at window={window} p90 chosen-hop rank-percentile \
+                 {p90_pct:.3} is too high — the routing tail degraded"
+            );
+        }
+
+        // Widening from the historical 5 to the shipped 25 must keep the chosen
+        // hop firmly in the closest tail. We do NOT require window=25 to equal
+        // window=5 (it is expected to be slightly higher — more visible
+        // candidates), only that the increase is bounded and stays convergent.
+        let m5 = results.iter().find(|r| r.0 == 5).unwrap().1;
+        let m25 = results.iter().find(|r| r.0 == 25).unwrap().1;
+        assert!(
+            m25 < 0.15 && m25 - m5 < 0.13,
+            "issue #4230: widening the candidate window from 5 to 25 raised the \
+             mean chosen-hop rank-percentile from {m5:.3} to {m25:.3} — the \
+             widening pushed routing materially toward the median and may need \
+             a soft distance bias in the predictor (see issue #4230)"
+        );
+    }
+
     #[test]
     fn test_select_closest_peers_equality() {
         let _guard = crate::config::GlobalRng::seed_guard(0xCAFE_BABE);
