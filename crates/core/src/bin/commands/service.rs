@@ -763,37 +763,6 @@ pub(super) fn first_run_launch_at_login_action(
     }
 }
 
-/// Decide whether to (re)write the DMG `org.freenet.Freenet` launch agent on
-/// startup. PURE so the combined first-run + post-migration logic is unit-
-/// testable without filesystem/launchctl side effects.
-///
-/// Returns `true` when EITHER:
-/// - this is a first-run onboarding launch and nothing auto-starts Freenet yet
-///   (`first_run_launch_at_login_action` says `Register`), OR
-/// - a legacy migration has settled (`migration_replaced_legacy`) and we have
-///   no plist of our own (`own_plist_present == false`). This second arm
-///   exists because an EXISTING DMG user (onboarding already complete, so NOT
-///   a first run) may never have gotten our agent — the pre-migration code
-///   treated the legacy plist as already-enabled. After migration removes the
-///   legacy plist they would otherwise be left with NO auto-start at all
-///   (Codex P2, round 2 on PR #4448). The caller derives
-///   `migration_replaced_legacy` from a DURABLE marker (not a one-shot
-///   this-launch flag) so a transient registration failure retries on a later
-///   launch instead of giving up permanently (Codex P2, round 3).
-#[allow(dead_code)]
-pub(super) fn launch_at_login_needs_registration(
-    is_first_run: bool,
-    already_enabled: bool,
-    migration_replaced_legacy: bool,
-    own_plist_present: bool,
-) -> bool {
-    let first_run_register = matches!(
-        first_run_launch_at_login_action(is_first_run, already_enabled),
-        FirstRunLaunchAtLoginAction::Register
-    );
-    first_run_register || (migration_replaced_legacy && !own_plist_present)
-}
-
 /// Decision outcome for a user-initiated Launch at Login toggle (click
 /// on the tray menu check item). Pure function, same testability
 /// rationale as `first_run_launch_at_login_action`.
@@ -1280,19 +1249,53 @@ pub(super) fn macos_launch_at_login_startup(log_dir: &Path) {
     let migrated = run_legacy_install_migration(log_dir, &plan);
 
     // Re-evaluate legacy presence after migration: a successful migration
-    // removed the legacy plist, so the auto-register decision below should
-    // now write the NEW agent rather than treating the legacy one as
-    // already-enabled.
+    // removed the legacy plist.
     let legacy_present = if migrated {
         legacy_launchd_agent_present()
     } else {
         legacy_present
     };
 
+    // If we migrated an existing user who had no DMG agent of their own (the
+    // pre-migration code treated the legacy plist as already-enabled, so an
+    // already-onboarded user never got ours), register the replacement NOW —
+    // in the same launch as the migration — so they aren't left with Launch
+    // at Login silently off (Codex P2, round 2).
+    //
+    // This is intentionally a ONE-SHOT tied to the migrating launch, NOT a
+    // durable "re-register whenever our plist is absent" rule: once the
+    // migration marker is written (below), a migrated user who later DISABLES
+    // Launch at Login via the tray must keep it disabled — we must not
+    // recreate the plist against their explicit choice (Codex P2, round 5).
+    let migrated_off_legacy = migrated && !legacy_present;
+    if migrated_off_legacy && !is_launch_at_login_enabled() {
+        match std::env::current_exe() {
+            Ok(exe) => match enable_launch_at_login(&exe) {
+                Ok(()) => log_wrapper_event(
+                    log_dir,
+                    "Migration: registered replacement Launch at Login agent",
+                ),
+                Err(e) => log_wrapper_event(
+                    log_dir,
+                    &format!(
+                        "Migration: replacement Launch at Login registration failed ({e}). \
+                         Enable it from the Freenet tray menu if you want auto-start on login."
+                    ),
+                ),
+            },
+            Err(e) => log_wrapper_event(
+                log_dir,
+                &format!("Migration: could not resolve current exe for replacement agent: {e}"),
+            ),
+        }
+    }
+
     // Mark the migration done ONLY once the legacy plist is actually gone, so
     // a launch where plist removal was denied (rare; the plist is user-owned)
-    // retries next time rather than giving up permanently. Marking it lets us
-    // stop re-attempting (and re-logging) the migration on every later launch.
+    // retries next time rather than giving up permanently. The marker means
+    // "the legacy race is resolved": once written we never auto-manage Launch
+    // at Login off the migration path again, so a later user disable sticks
+    // (Codex P2, round 5).
     if migrated && !legacy_present {
         if let Some(m) = legacy_migration_marker_path() {
             if let Err(e) = mark_first_run_complete_at(&m) {
@@ -1306,18 +1309,6 @@ pub(super) fn macos_launch_at_login_startup(log_dir: &Path) {
             }
         }
     }
-
-    // Durable "a migration has happened and the legacy plist is gone" signal,
-    // recomputed each launch from the marker (set above or on an earlier
-    // launch). Used below to RETRY replacement-agent registration: if that
-    // registration fails transiently on the migrating launch, `migrated` is
-    // false next time, but this durable signal is still true, so we retry
-    // rather than leaving the user with no auto-start (Codex P2, round 3).
-    let migrated_settled = migration_done
-        || (migrated
-            && legacy_migration_marker_path()
-                .map(|m| m.exists())
-                .unwrap_or(false));
 
     // Legacy-agent warning: if the legacy plist is STILL present (we either
     // didn't migrate this launch, or removal was denied), warn the user.
@@ -1335,46 +1326,34 @@ pub(super) fn macos_launch_at_login_startup(log_dir: &Path) {
         );
     }
 
-    // Auto-register the DMG launch agent. Two independent reasons to register:
-    //
-    // 1. First-run onboarding: register unless something is already enabled
-    //    (our own plist, or a legacy plist we couldn't remove).
-    // 2. Post-migration replacement: a migration has happened and the legacy
-    //    plist is gone, but we have no plist of our own. This can happen for an
-    //    existing DMG user whose onboarding already completed (so it is NOT a
-    //    first run) but who never got our agent because the old code treated
-    //    the legacy plist as already-enabled. Without this, migration would
-    //    leave them with Launch at Login silently OFF (Codex P2, round 2). We
-    //    use the DURABLE `migrated_settled` signal (not a one-shot this-launch
-    //    flag) so a transient registration failure retries next launch instead
-    //    of giving up permanently (Codex P2, round 3).
-    let own_plist_present = is_launch_at_login_enabled();
-    let already_enabled = own_plist_present || legacy_present;
-    let needs_replacement = migrated_settled && !legacy_present;
-    if launch_at_login_needs_registration(
-        is_first_run,
-        already_enabled,
-        needs_replacement,
-        own_plist_present,
-    ) {
-        match std::env::current_exe() {
+    // First-run onboarding auto-register: register unless something already
+    // auto-starts Freenet (our own plist, or a legacy plist we couldn't
+    // remove). The post-migration replacement registration is handled above;
+    // here we only handle genuine first-run and the stale-plist self-heal.
+    let already_enabled = is_launch_at_login_enabled() || legacy_present;
+    match first_run_launch_at_login_action(is_first_run, already_enabled) {
+        FirstRunLaunchAtLoginAction::Register => match std::env::current_exe() {
             Ok(exe) => match enable_launch_at_login(&exe) {
-                Ok(()) => log_wrapper_event(log_dir, "Registered Launch at Login agent"),
+                Ok(()) => log_wrapper_event(log_dir, "First-run: registered Launch at Login agent"),
                 Err(e) => log_wrapper_event(
                     log_dir,
-                    &format!("Launch at Login registration failed: {e}"),
+                    &format!("First-run Launch at Login registration failed: {e}"),
                 ),
             },
             Err(e) => log_wrapper_event(
                 log_dir,
-                &format!("Launch at Login: could not resolve current exe: {e}"),
+                &format!("First-run Launch at Login: could not resolve current exe: {e}"),
             ),
+        },
+        FirstRunLaunchAtLoginAction::AlreadyEnabled | FirstRunLaunchAtLoginAction::NotFirstRun => {
+            // Nothing to register; if our OWN plist is present it may be stale
+            // (user moved the .app, new DMG location). Refresh it. Don't
+            // resurrect a rewrite cycle on a legacy-only install (own plist
+            // absent), and don't fight a user who deliberately disabled it.
+            if is_launch_at_login_enabled() {
+                refresh_launch_at_login_plist_if_stale();
+            }
         }
-    } else if own_plist_present {
-        // Not registering this launch; if our OWN plist is present it may be
-        // stale (user moved the .app, new DMG location). Refresh it. Don't
-        // resurrect a rewrite cycle on a legacy-only install (own plist absent).
-        refresh_launch_at_login_plist_if_stale();
     }
 }
 
@@ -4812,39 +4791,6 @@ mod tests {
             first_run_launch_at_login_action(false, true),
             FirstRunLaunchAtLoginAction::NotFirstRun
         );
-    }
-
-    #[test]
-    fn launch_at_login_needs_registration_covers_first_run_and_migration() {
-        // First-run onboarding, nothing enabled yet → register.
-        assert!(launch_at_login_needs_registration(
-            true, false, false, false
-        ));
-        // First-run but already enabled (own or legacy plist) → don't.
-        assert!(!launch_at_login_needs_registration(
-            true, true, false, false
-        ));
-
-        // Not a first run and nothing migrated → don't (normal later launch).
-        assert!(!launch_at_login_needs_registration(
-            false, false, false, true
-        ));
-        assert!(!launch_at_login_needs_registration(
-            false, false, false, false
-        ));
-
-        // Regression for Codex P2 (round 2): existing DMG user (NOT first run),
-        // a migration has replaced the legacy plist, and they have no plist of
-        // their own → MUST register, or they end up with no auto-start at all.
-        // The caller derives the 3rd arg from a durable marker, so this retries
-        // on later launches if registration failed once (Codex P2, round 3).
-        assert!(launch_at_login_needs_registration(
-            false, false, true, false
-        ));
-
-        // Migration settled but we already have our own plist → no need to
-        // rewrite it here (the stale-refresh path handles that).
-        assert!(!launch_at_login_needs_registration(false, true, true, true));
     }
 
     // ── Legacy install.sh → DMG migration (issue #3943) ──
