@@ -3522,10 +3522,53 @@ mod tests {
             }],
         };
         let serialized = toml::to_string(&gateways).unwrap();
+        // The `Host` variant must serialize as a FLAT table (host/port as
+        // sibling keys), matching the new wire form in the issue — not nested
+        // under a `[gateways.address.host]` sub-table (the derived enum form).
+        assert!(
+            serialized.contains("host = \"vega.locut.us\"") && serialized.contains("port = 31337"),
+            "unexpected serialized form:\n{serialized}"
+        );
+        assert!(
+            !serialized.contains("[gateways.address.host]"),
+            "Host variant must not nest under its own sub-table:\n{serialized}"
+        );
         let deserialized: Gateways = toml::from_str(&serialized).unwrap();
         assert_eq!(
             deserialized.gateways[0].address,
             gateways.gateways[0].address
+        );
+    }
+
+    /// Pin the legacy serialized wire forms so a future refactor can't silently
+    /// change what we write to `gateways.toml` (old binaries must keep reading
+    /// files this build writes).
+    #[test]
+    fn test_address_legacy_variants_serialize_unchanged() {
+        let hostname = Gateways {
+            gateways: vec![GatewayConfig {
+                address: Address::Hostname("vega.locut.us:31337".to_string()),
+                public_key_path: PathBuf::from("keys/k.pem"),
+                location: None,
+            }],
+        };
+        let s = toml::to_string(&hostname).unwrap();
+        assert!(
+            s.contains("hostname = \"vega.locut.us:31337\""),
+            "legacy hostname form changed:\n{s}"
+        );
+
+        let host_addr = Gateways {
+            gateways: vec![GatewayConfig {
+                address: Address::HostAddress("203.0.113.1:31337".parse().unwrap()),
+                public_key_path: PathBuf::from("keys/k.pem"),
+                location: None,
+            }],
+        };
+        let s = toml::to_string(&host_addr).unwrap();
+        assert!(
+            s.contains("host_address = \"203.0.113.1:31337\""),
+            "legacy host_address form changed:\n{s}"
         );
     }
 
