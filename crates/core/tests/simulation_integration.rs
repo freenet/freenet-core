@@ -3109,6 +3109,233 @@ fn test_pr2763_crdt_convergence_with_resync() {
     // Clean up
 }
 
+/// Regression test for the #4233 full-state broadcast storm (issue #4145).
+///
+/// ## What this guards
+///
+/// Sustained UPDATE fan-out from one host to its direct subscribers of a CRDT
+/// contract. After each subscriber bootstraps on a single full state, every
+/// subsequent broadcast to that subscriber must be a small delta — not another
+/// full state. The #4145 fix caches the target peer's summary on ANY delivered
+/// broadcast (delta OR full state), not just deltas, so the host can compute a
+/// delta for the next broadcast instead of re-sending full state forever.
+///
+/// ## Scenario
+///
+/// 1 gateway (the contract host / broadcast source) + a small number of direct
+/// subscriber nodes. The gateway PUTs+subscribes, every node subscribes, then
+/// the gateway drives a burst of sequential UPDATEs that fan out to all
+/// subscribers.
+///
+/// ## Why a *small* star topology (1 gateway + 2 direct subscribers)
+///
+/// The chicken-and-egg the fix targets is per-(sender, target): a sender that
+/// lacks a target's cached summary must send full state. A LARGER topology
+/// (e.g. 5+ subscribers forming a multi-hop relay tree) does NOT make this test
+/// more sensitive — it makes it LESS sensitive. Relay nodes cache a downstream
+/// peer's *full state* as its "summary", and `compute_delta` then rejects the
+/// diff as "not efficient" (`is_delta_efficient`), emitting full state
+/// regardless of the #4145 gate. Those relay-tree full-states swamp the signal:
+/// at 5 subscribers, fix vs reverted is ~199 vs ~201 full-state sends — noise.
+///
+/// A clean star (the host broadcasts directly to its subscribers, no relay tree)
+/// removes that floor, so the metric isolates exactly the bug the fix addresses:
+/// with the fix `full_state_sends` stays at roughly one bootstrap per subscriber
+/// while `delta_sends` grows with the update count; reverted, `full_state_sends`
+/// scales with updates × subscribers and overtakes `delta_sends`. The unit tests
+/// in `broadcast_queue.rs` pin the gate logic directly; this sim pins the
+/// system-level consequence on the path simulation builds actually exercise
+/// (the `#[cfg(simulation_tests)]` inline broadcast loop in `p2p_protoc.rs`).
+///
+/// ## Assertions (the delta-dominance one FAILS if the #4145 gate is reverted)
+///
+/// - (a) Event-loop liveness: no `StalePeer` anomaly — every subscriber keeps
+///   receiving broadcasts; none goes silent under the fan-out.
+/// - (b) Full-state-send rate collapses: `delta_sends > full_state_sends`. With
+///   the fix each subscriber takes one bootstrap full state then transitions to
+///   deltas, so deltas dominate. Reverted, every update is full state to every
+///   subscriber and `delta_sends` stays low → this assertion fails. (Measured:
+///   fix ≈ 78 delta / 47 full; reverted ≈ 21 delta / 104 full.)
+/// - (c) Broadcast delivery / update propagation stays high: all peers converge.
+#[test_log::test]
+fn test_sustained_update_fanout_no_full_state_storm() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x4233_5701_0001;
+    const NETWORK_NAME: &str = "i4233-fanout-storm";
+    // Direct subscribers of the gateway (the broadcast fan-out width). Kept small
+    // so the host broadcasts directly to subscribers with no multi-hop relay tree
+    // — see the "Why a small star topology" note above.
+    const SUBSCRIBERS: usize = 2;
+    // UPDATEs driven into the hot contract AFTER all subscribers have bootstrapped.
+    // Enough that, reverted, the per-update full-state fan-out clearly overtakes
+    // the one-time bootstrap deltas.
+    const SUSTAINED_UPDATES: usize = 20;
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1,           // 1 gateway (the broadcast source / contract host)
+            SUBSCRIBERS, // subscriber nodes (the fan-out targets)
+            7,           // max_htl
+            3,           // rnd_if_htl_above
+            10,          // max_connections
+            2,           // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // CRDT contract so post-bootstrap broadcasts compute real version-aware
+    // deltas (a plain hash contract's "delta" is full state, which would not
+    // exercise the delta transition this test is about).
+    let contract = SimOperation::create_test_contract(0x42);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let initial_state = SimOperation::create_crdt_state(1, 0x10);
+
+    let mut operations = Vec::new();
+
+    // Bootstrap: gateway PUTs + subscribes (becomes the host/source), then every
+    // node subscribes. Each subscriber's FIRST broadcast is full state — that is
+    // the one bootstrap full-state per subscriber the fix permits.
+    operations.push(ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: initial_state,
+            subscribe: true,
+        },
+    ));
+    for node_idx in 1..=SUBSCRIBERS {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, node_idx),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+
+    // Sustained UPDATE fan-out: a burst of UPDATEs from the gateway, each fanned
+    // out to all subscribers. With the fix every subscriber already has a cached
+    // summary after its bootstrap full state, so these all go out as deltas.
+    // Without the fix every one of these is another full state to every
+    // subscriber — the storm.
+    for v in 0..SUSTAINED_UPDATES {
+        let version = (v as u64) + 2; // versions 2.. (v1 was the PUT)
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(version, 0x20 + v as u8),
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(240), // simulation duration (virtual)
+        Duration::from_secs(90),  // post-op propagation wait (virtual)
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let convergence =
+        rt.block_on(async { freenet::dev_tool::check_convergence_from_logs(&logs_handle).await });
+    let delta_sends = GlobalTestMetrics::delta_sends();
+    let full_state_sends = GlobalTestMetrics::full_state_sends();
+    let resync_count = GlobalTestMetrics::resync_requests();
+
+    // Anomaly report for liveness (StalePeer = a subscriber that stopped
+    // receiving broadcasts while others kept getting them).
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    });
+    let stale = report.stale_peers();
+
+    tracing::info!(
+        "i4233 fanout: delta_sends={}, full_state_sends={}, resyncs={}, converged={}/{}, stale_peers={}",
+        delta_sends,
+        full_state_sends,
+        resync_count,
+        convergence.converged.len(),
+        convergence.total_contracts(),
+        stale.len(),
+    );
+
+    // Sanity: the scenario must actually have broadcast something, otherwise the
+    // collapse assertion below would pass vacuously.
+    assert!(
+        delta_sends + full_state_sends > 0,
+        "no broadcasts were recorded — the fan-out scenario did not run"
+    );
+
+    // (a) LIVENESS: no subscriber goes silent under the fan-out. A full-state
+    // storm that pins the event loop strands a subscriber, which surfaces as a
+    // StalePeer anomaly.
+    assert!(
+        stale.is_empty(),
+        "#4233 liveness: {} subscriber(s) went stale under sustained UPDATE \
+         fan-out (event loop starved by the broadcast storm): {:?}",
+        stale.len(),
+        stale,
+    );
+
+    // (b) FULL-STATE-SEND RATE COLLAPSES — the load-bearing #4145 discriminator.
+    //
+    // With the fix each subscriber takes exactly ONE bootstrap full state and
+    // then transitions to deltas, so over SUSTAINED_UPDATES updates the delta
+    // sends dominate the (bounded) bootstrap full states: delta_sends >
+    // full_state_sends.
+    //
+    // Reverted to `if sent_delta`, the host never caches a subscriber's summary,
+    // so EVERY update is full state to EVERY subscriber and delta_sends stays
+    // low — full_state_sends overtakes delta_sends and THIS assertion fails.
+    // (Measured on this star topology: fix ≈ 78 delta / 47 full; reverted ≈ 21
+    // delta / 104 full.)
+    //
+    // We assert the *direction* (deltas dominate) rather than an absolute
+    // full-state budget: a fixed numeric cap is brittle against topology/retry
+    // jitter, whereas the delta-vs-full crossover flips cleanly between the fixed
+    // and reverted gate.
+    assert!(
+        delta_sends > full_state_sends,
+        "#4145 REGRESSION: deltas must dominate after bootstrap, but \
+         delta_sends={delta_sends} <= full_state_sends={full_state_sends}. \
+         A reverted summary-cache gate traps every subscriber on full state \
+         (the #4233 storm): every update re-sends full state to every subscriber \
+         instead of a delta."
+    );
+
+    // (c) DELIVERY / PROPAGATION stays high: all peers converge to one state.
+    assert!(
+        convergence.is_converged(),
+        "#4233: broadcast delivery degraded — peers failed to converge under \
+         sustained fan-out. {} converged, {} diverged",
+        convergence.converged.len(),
+        convergence.diverged.len(),
+    );
+
+    tracing::info!(
+        "test_sustained_update_fanout_no_full_state_storm PASSED: \
+         delta_sends={} > full_state_sends={}, converged, no stale peers",
+        delta_sends,
+        full_state_sends,
+    );
+}
+
 // =============================================================================
 // Extended Edge Case Tests for Ring Protocol
 // =============================================================================

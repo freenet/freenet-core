@@ -358,9 +358,10 @@ fn record_streaming_delivery<T: crate::util::time_source::TimeSource + Sync>(
 }
 
 /// The side effects a *delivered* broadcast applies to the interest manager:
-/// record send telemetry, refresh the peer interest TTL, and (for deltas) cache
-/// the peer summary. Factored out so both the streaming gate
-/// ([`record_streaming_delivery`]) and the non-streaming path share one body.
+/// record send telemetry, refresh the peer interest TTL, and cache the peer
+/// summary (on ANY delivered broadcast — delta or full state — per #4145).
+/// Factored out so both the streaming gate ([`record_streaming_delivery`]) and
+/// the non-streaming path share one body.
 fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
     interest_manager: &crate::ring::interest::InterestManager<T>,
     sent_delta: bool,
@@ -382,11 +383,30 @@ fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
     // Issue #3046: Refresh the peer's interest TTL on every successful send
     interest_manager.refresh_peer_interest(key, peer_key);
 
-    // PR #2763: Only update cached summary when we sent a delta
-    if sent_delta {
-        if let Some(summary) = our_summary {
-            interest_manager.update_peer_summary(key, peer_key, Some(summary.clone()));
-        }
+    // Issue #4145: Cache the peer summary on ANY delivered broadcast — delta OR
+    // full state — not just deltas.
+    //
+    // PR #2763 originally gated this on `sent_delta` because a streamed
+    // full-state "success" didn't reliably mean the peer received the state:
+    // caching `our_summary` for a peer that never got the state would make the
+    // next delta unappliable (wrong base) and diverge. That gate created a
+    // chicken-and-egg: a delta needs the peer's cached summary, but the summary
+    // was only cached after a delta — so every NEW subscriber (and any peer
+    // whose summary was cleared) starts on full state and is trapped sending
+    // full state forever. Under sustained fan-out that is the #4233 full-state
+    // broadcast storm.
+    //
+    // #4235 added a real-delivery signal (`BroadcastDeliveryOutcome::Delivered`).
+    // This helper now runs ONLY on a real delivery: for the streaming
+    // (full-state) path the caller gates it behind
+    // `record_streaming_delivery` → `streaming_completion_delivered`, and for
+    // the non-streaming path it runs only inside the send-success arm. After a
+    // real delivery the peer has `our_summary` regardless of how the state was
+    // sent, so caching it here is safe and lets the NEXT broadcast be a small
+    // delta. Each peer now gets exactly ONE bootstrap full-state, then deltas.
+    // (Telemetry above still records delta-vs-full-state separately.)
+    if let Some(summary) = our_summary {
+        interest_manager.update_peer_summary(key, peer_key, Some(summary.clone()));
     }
 }
 
@@ -847,6 +867,130 @@ mod tests {
                      summary, or the next summary-mismatch resend is suppressed (#4235)"
                 );
             }
+        }
+    }
+
+    /// Issue #4145 — the chicken-and-egg fix. A peer that starts with NO cached
+    /// summary receives a *full-state* broadcast (`sent_delta = false`). After a
+    /// real delivery its summary MUST be cached, so the NEXT broadcast can be a
+    /// small delta instead of full state again.
+    ///
+    /// This is the bug #4145/#4233 describe: PR #2763 gated the summary cache on
+    /// `sent_delta`, so a peer bootstrapped on full state never got a cached
+    /// summary and was trapped sending full state forever (the broadcast storm).
+    ///
+    /// Pre-fix (`if sent_delta { update_peer_summary(..) }`) the `sent_delta =
+    /// false` call below cached nothing, so `get_peer_summary` would stay `None`
+    /// and this test FAILS. With the fix it caches on any delivery and the
+    /// summary is present, mirroring the precondition
+    /// `broadcast_to_single_peer` checks (a present peer summary → `compute_delta`
+    /// → `sent_delta = true`) on the subsequent broadcast.
+    #[tokio::test]
+    async fn full_state_delivery_caches_summary_so_next_broadcast_is_delta() {
+        let our_summary = StateSummary::from(vec![1, 2, 3, 4]);
+
+        let time_source = SharedMockTimeSource::new();
+        let manager = InterestManager::new(time_source.clone());
+        let contract = make_contract_key(42);
+        let peer = make_peer_key();
+
+        // New subscriber: interested, but no cached summary yet — exactly the
+        // state that forces a full-state broadcast on the first send.
+        manager.register_peer_interest(&contract, peer.clone(), None, false);
+        assert_eq!(
+            manager.get_peer_summary(&contract, &peer),
+            None,
+            "precondition: a brand-new subscriber has no cached summary, so the \
+             first broadcast must be full state"
+        );
+
+        // A FULL-STATE broadcast (`sent_delta = false`) is really Delivered.
+        let delivered = record_streaming_delivery(
+            &manager,
+            Ok(Ok(BroadcastDeliveryOutcome::Delivered)),
+            /* sent_delta */ false,
+            &contract,
+            &peer,
+            Some(&our_summary),
+            /* state_size */ 4096,
+            /* payload_size */ 4096,
+        );
+        assert!(delivered, "a Delivered outcome must classify as delivered");
+
+        // #4145 FIX: the summary is now cached even though we sent FULL STATE.
+        // This is the assertion that fails on the old `if sent_delta` gate.
+        assert_eq!(
+            manager.get_peer_summary(&contract, &peer),
+            Some(our_summary.clone()),
+            "#4145: a delivered FULL-STATE broadcast must cache the peer summary, \
+             so the next broadcast can be a delta — otherwise the peer is trapped \
+             sending full state forever (the #4233 storm)"
+        );
+
+        // The cached summary is the exact precondition `broadcast_to_single_peer`
+        // uses to compute a delta: `their_summary = get_peer_summary(..)` being
+        // `Some` drives the delta branch (`sent_delta = true`) next time.
+        let their_summary = manager.get_peer_summary(&contract, &peer);
+        assert!(
+            their_summary.is_some(),
+            "#4145: with a cached peer summary the next broadcast takes the delta \
+             path (compute_delta), not another full state"
+        );
+    }
+
+    /// Issue #4145 / #2763 — divergence guard preserved. The #4145 fix caches on
+    /// any *delivered* broadcast, but a DROPPED full-state stream (peer never
+    /// received the state) MUST still NOT cache the summary — otherwise the next
+    /// delta would be computed against a base the peer doesn't have, and the
+    /// summary-mismatch resend that should re-send the state is suppressed.
+    ///
+    /// This is the full-state (`sent_delta = false`) counterpart to
+    /// [`drop_outcome_does_not_refresh_interest_or_cache_summary`], pinning that
+    /// the #4145 change did NOT weaken the #4235/#2763 drop guard for full state.
+    #[tokio::test]
+    async fn dropped_full_state_stream_does_not_cache_summary() {
+        let our_summary = StateSummary::from(vec![5, 6, 7, 8]);
+
+        let dropped = dropped_oneshot().await;
+        let timed_out = elapsed_timeout().await;
+        // Every non-delivery completion for a FULL-STATE (`sent_delta = false`)
+        // stream must leave the summary uncached.
+        let cases: Vec<(&str, super::StreamCompletionResult)> = vec![
+            ("explicit-drop", Ok(Ok(BroadcastDeliveryOutcome::Dropped))),
+            ("dropped-oneshot", Ok(dropped)),
+            ("timeout", Err(timed_out)),
+        ];
+
+        for (name, completion) in cases {
+            let time_source = SharedMockTimeSource::new();
+            let manager = InterestManager::new(time_source.clone());
+            let contract = make_contract_key(43);
+            let peer = make_peer_key();
+
+            manager.register_peer_interest(&contract, peer.clone(), None, false);
+
+            let delivered = record_streaming_delivery(
+                &manager,
+                completion,
+                /* sent_delta */ false,
+                &contract,
+                &peer,
+                Some(&our_summary),
+                /* state_size */ 4096,
+                /* payload_size */ 4096,
+            );
+            assert!(
+                !delivered,
+                "[{name}] a dropped/timed-out full-state stream must NOT classify \
+                 as delivered"
+            );
+            assert_eq!(
+                manager.get_peer_summary(&contract, &peer),
+                None,
+                "[{name}] #4145 must not weaken the #2763/#4235 guard: a DROPPED \
+                 full-state stream must NOT cache the summary (the peer never got \
+                 the state), or the next summary-mismatch resend is suppressed"
+            );
         }
     }
 }

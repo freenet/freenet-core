@@ -5355,13 +5355,29 @@ impl P2pConnManager {
                 op_manager
                     .interest_manager
                     .refresh_peer_interest(&key, &peer_key);
-            }
 
-            // PR #2763 FIX: Only update cached summary when we sent a delta.
-            // This is separate from the TTL refresh above — update_peer_summary
-            // sets the cached summary (used for delta computation), while
-            // refresh_peer_interest only extends the TTL.
-            if sent_delta {
+                // Issue #4145: Cache the peer summary on ANY successful broadcast
+                // send — delta OR full state — not just deltas. Separate from the
+                // TTL refresh above: update_peer_summary sets the cached summary
+                // (used for delta computation), refresh_peer_interest only extends
+                // the TTL.
+                //
+                // PR #2763 originally gated this on `sent_delta`, which created a
+                // chicken-and-egg: a delta needs the peer's cached summary, but the
+                // summary was only cached after a delta — so every NEW subscriber
+                // (or a peer whose summary was cleared) starts on full state and is
+                // trapped sending full state forever. Under sustained fan-out that
+                // is the #4233 full-state broadcast storm.
+                //
+                // Safe now because this runs only inside the send-success (`else`)
+                // arm. This is the inline non-streaming `BroadcastTo` path: a
+                // successful `bridge.send` is the terminal state we can observe
+                // (the same assumption the delta path already made), and any rare
+                // wrong cache is corrected by the summary-mismatch resync. Caching
+                // here lets the NEXT broadcast to this peer be a small delta. The
+                // streaming (full-state) path is gated more strictly on a real
+                // `Delivered` completion (#4235) in `broadcast_queue.rs`.
+                // (Telemetry above still records delta-vs-full-state separately.)
                 if let Some(summary) = &our_summary {
                     op_manager.interest_manager.update_peer_summary(
                         &key,
