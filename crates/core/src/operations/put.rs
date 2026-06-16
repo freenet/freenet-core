@@ -181,6 +181,25 @@ pub(super) async fn put_contract(
     related_contracts: RelatedContracts<'static>,
     contract: &ContractContainer,
 ) -> Result<(WrappedState, bool), OpError> {
+    // Reject debug-compiled contracts before storing (#2257). This is the
+    // shared storage chokepoint for the network/relay PUT path
+    // (`relay_put_store_locally` → here), which does NOT pass through the
+    // originator's `process_open_request` / `contract_requests` guards.
+    // Without this, a debug contract from a malicious or mixed-version
+    // peer could still be stored and re-forwarded by this node. Debug WASM
+    // carries DWARF `.debug_*` sections and is 10-100x larger than release.
+    if crate::contract::contains_debug_sections(contract.data()) {
+        let sections = crate::contract::debug_sections(contract.data()).join(", ");
+        tracing::warn!(
+            contract = %key,
+            sections = %sections,
+            "Rejecting debug-compiled contract at storage time (#2257)"
+        );
+        return Err(OpError::ContractError(
+            crate::contract::ContractError::DebugWasmRejected { sections },
+        ));
+    }
+
     match op_manager
         .notify_contract_handler(ContractHandlerEvent::PutQuery {
             key,
@@ -946,6 +965,50 @@ mod tests {
              freenet-stdlib mirror demo 180s cold-GET timeout (2026-05-14) \
              returns. See contracts_needing_renewal at hosting.rs:971-991 \
              for the downstream gate that depends on this flag."
+        );
+    }
+
+    /// Pin (#2257): `put_contract` — the shared storage chokepoint for the
+    /// network/relay PUT path — MUST reject debug-compiled WASM
+    /// (`contains_debug_sections`) before notifying the contract handler
+    /// to store it. This is the only debug-WASM guard for contracts
+    /// arriving via relay/forwarding (`relay_put_store_locally`), which
+    /// bypasses the originator-side `process_open_request` /
+    /// `contract_requests` guards. Without it a malicious or
+    /// mixed-version peer could still get this node to store and
+    /// re-forward a debug build. Matches on executable code (line comments
+    /// stripped) so the doc comment above the call can't false-pass.
+    #[test]
+    fn put_contract_rejects_debug_wasm_before_storing() {
+        const SOURCE: &str = include_str!("put.rs");
+        let fn_start = SOURCE
+            .find("pub(super) async fn put_contract(")
+            .expect("put_contract definition not found");
+        let body_start = SOURCE[fn_start..]
+            .find('{')
+            .map(|p| fn_start + p)
+            .expect("put_contract body opening brace not found");
+        let body_end = SOURCE[body_start..]
+            .find("\n}\n")
+            .map(|p| body_start + p)
+            .expect("put_contract body closing brace not found");
+        let body = &SOURCE[body_start..body_end];
+        let executable: String = body
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let guard_pos = executable
+            .find("contains_debug_sections")
+            .expect("put_contract must call contains_debug_sections (executable code)");
+        let store_pos = executable
+            .find("notify_contract_handler")
+            .expect("put_contract must call notify_contract_handler");
+        assert!(
+            guard_pos < store_pos,
+            "the debug-WASM guard MUST run BEFORE notify_contract_handler so a \
+             relayed debug contract is rejected before this node stores it"
         );
     }
 }

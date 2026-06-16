@@ -2209,6 +2209,62 @@ where
     Ok(())
 }
 
+/// Prefix shared by all DWARF debug custom sections (`.debug_info`,
+/// `.debug_str`, ...). Release builds (`--release`) emit none of these.
+const DEBUG_SECTION_PREFIX: &str = ".debug_";
+
+/// Scan a WASM module's custom sections and collect the names of any
+/// DWARF debug sections (`.debug_*`) it contains.
+///
+/// Debug-compiled contracts are typically 10-100x larger than release
+/// builds (e.g. ~12MB vs ~186KB for the ping contract) and can exceed
+/// WebSocket message-size limits, surfacing as a confusing "Message too
+/// long" transport error rather than an actionable one. We detect them
+/// at PUT time by looking for the `.debug_*` custom sections the Rust
+/// debug profile leaves in the module. See #2257.
+///
+/// Returns the matching section names in encounter order, or an empty
+/// vec when the module is a release build OR cannot be fully parsed.
+///
+/// A module that fails to parse is treated as "no debug sections" —
+/// including the case where some `.debug_*` sections were collected
+/// before the parse error: we discard the partial result and return
+/// empty. Malformed-WASM rejection is a separate concern handled
+/// downstream by the WASM runtime with a precise error; we must not
+/// short-circuit it here with a misleading "recompile with --release"
+/// message, and a partial scan of a module we can't fully parse is not
+/// trustworthy evidence of a debug build. We only trust the `.debug_*`
+/// signal on a module that parses cleanly end to end.
+pub(crate) fn debug_sections(wasm: &[u8]) -> Vec<String> {
+    let mut found = Vec::new();
+    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
+        match payload {
+            Ok(wasmparser::Payload::CustomSection(reader)) => {
+                let name = reader.name();
+                if name.starts_with(DEBUG_SECTION_PREFIX) {
+                    found.push(name.to_string());
+                }
+            }
+            // A parse error anywhere voids the whole scan: section
+            // boundaries past it can't be trusted, and any `.debug_*`
+            // names collected BEFORE it are not reliable evidence on a
+            // module we can't fully parse. Treat the module as "no debug
+            // sections" (see doc comment) so the runtime surfaces the real
+            // malformed-WASM error instead of "recompile with --release".
+            Err(_) => return Vec::new(),
+            // Non-custom sections are irrelevant to debug detection.
+            Ok(_) => {}
+        }
+    }
+    found
+}
+
+/// Returns true if the WASM module contains any DWARF debug section,
+/// i.e. it was compiled in debug mode. See [`debug_sections`].
+pub(crate) fn contains_debug_sections(wasm: &[u8]) -> bool {
+    !debug_sections(wasm).is_empty()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ContractError {
     #[error("handler channel dropped")]
@@ -2222,6 +2278,19 @@ pub(crate) enum ContractError {
         key: ContractKey,
         error: ExecutorError,
     },
+    /// The contract WASM contains DWARF debug sections (`.debug_*`),
+    /// indicating it was compiled in debug mode. Debug builds are
+    /// typically 10-100x larger than release builds and can exceed
+    /// WebSocket message-size limits, producing confusing "Message too
+    /// long" errors. Rejected at PUT time so the problem surfaces with
+    /// an actionable message instead of a transport failure. See #2257.
+    #[error(
+        "contract appears to be compiled in debug mode \
+         (contains {sections} section(s)). Debug WASM is typically \
+         10-100x larger than release builds and may exceed message-size \
+         limits. Recompile the contract with `--release` before publishing."
+    )]
+    DebugWasmRejected { sections: String },
 }
 
 #[cfg(test)]

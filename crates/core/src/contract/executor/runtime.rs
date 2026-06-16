@@ -3520,6 +3520,30 @@ impl Executor<Runtime> {
                     state_size = state.as_ref().len(),
                     "putting contract"
                 );
+                // Reject debug-compiled contracts (#2257). The network
+                // client path guards this in `process_open_request`, but
+                // local-node mode (`run_local_node`, the local server
+                // loop, `preload`, `handle_request`) PUTs straight through
+                // here — and local development is the most likely place to
+                // hand the node a debug build. Debug WASM carries DWARF
+                // `.debug_*` sections and is 10-100x larger than release,
+                // so without this guard it surfaces as an opaque
+                // "Message too long" error instead of an actionable one.
+                let key = contract.key();
+                if crate::contract::contains_debug_sections(contract.data()) {
+                    let sections = crate::contract::debug_sections(contract.data()).join(", ");
+                    return Err(ExecutorError::request(StdContractError::Put {
+                        key,
+                        cause: format!(
+                            "contract appears to be compiled in debug mode \
+                             (contains {sections} section(s)). Debug WASM is \
+                             typically 10-100x larger than release builds and \
+                             may exceed message-size limits. Recompile the \
+                             contract with `--release` before publishing."
+                        )
+                        .into(),
+                    }));
+                }
                 self.perform_contract_put(contract, state, related_contracts)
                     .await
             }
@@ -4966,6 +4990,39 @@ mod executor_pin_tests {
         assert!(
             !body.contains("DEFAULT_MODULE_CACHE_CAPACITY"),
             "RuntimePool::new must no longer reference the removed count cap"
+        );
+    }
+
+    /// Pin (#2257): the `ContractRequest::Put` arm of `contract_requests`
+    /// MUST reject debug-compiled WASM (`contains_debug_sections`) BEFORE
+    /// delegating to `perform_contract_put`. This is the only debug-WASM
+    /// guard on the local-node PUT path (`run_local_node`, the local
+    /// server loop, `preload`, `handle_request`), which never touches
+    /// `process_open_request`. A migration that drops this call would
+    /// silently restore the opaque "Message too long" symptom for local
+    /// development — exactly the case #2257 targets. Source-scrape pin per
+    /// `.claude/rules/bug-prevention-patterns.md` (cheaper and more robust
+    /// than standing up a full `Executor<Runtime>` fixture for a one-line
+    /// guard).
+    #[test]
+    fn contract_requests_put_rejects_debug_wasm_before_perform_put() {
+        let src = include_str!("runtime.rs");
+        // Isolate the `contract_requests` function body.
+        let body = src
+            .split("pub async fn contract_requests(")
+            .nth(1)
+            .expect("contract_requests must exist");
+        let guard_pos = body
+            .find("contains_debug_sections")
+            .expect("contract_requests Put arm must call contains_debug_sections");
+        let put_pos = body
+            .find("self.perform_contract_put(")
+            .expect("contract_requests must call perform_contract_put");
+        assert!(
+            guard_pos < put_pos,
+            "the debug-WASM guard (contains_debug_sections) must run BEFORE \
+             perform_contract_put, so a debug build is rejected before any \
+             local storage/validation work"
         );
     }
 }

@@ -83,6 +83,9 @@ tower-http = { workspace = true }
 ulid = { workspace = true }
 zeroize = { workspace = true }
 wasmtime = { workspace = true, optional = true }
+# Always enabled (not gated on wasmtime-backend): debug-section rejection at
+# PUT time must run regardless of which WASM execution backend is compiled in.
+wasmparser = { workspace = true }
 xz2 = { workspace = true }
 reqwest = { workspace = true }
 x25519-dalek = { workspace = true }
