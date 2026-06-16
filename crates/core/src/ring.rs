@@ -2395,6 +2395,55 @@ impl Ring {
         }
     }
 
+    /// Snapshot of the contract ban list for the local-peer dashboard
+    /// (#4302). Reads directly from the canonical `contract_ban_list` —
+    /// no mirror, no cache. The count, capacity-rejection counter, and
+    /// per-entry list (key + reason + time remaining) all come from the
+    /// list's own accessors, so the panel can't drift the way a mirrored
+    /// counter would.
+    pub fn dashboard_ban_list_snapshot(&self) -> crate::node::network_status::BanListSnapshot {
+        use crate::node::network_status as ns;
+        use crate::ring::contract_ban_list::BanReason;
+
+        let map_reason = |r: BanReason| match r {
+            BanReason::AutoMad => ns::BanReasonSnapshot::AutoMad,
+            BanReason::Operator => ns::BanReasonSnapshot::Operator,
+        };
+
+        let mut entries: Vec<ns::BanListEntry> = self
+            .contract_ban_list
+            .snapshot()
+            .into_iter()
+            .map(|e| ns::BanListEntry {
+                instance_id: e.contract.to_string(),
+                reason: map_reason(e.reason),
+                expires_in_secs: e.remaining.as_secs(),
+            })
+            .collect();
+        // Stable display order: soonest-to-lift first, then by id so the
+        // dashboard doesn't reshuffle rows between refreshes (DashMap
+        // iteration order is unspecified).
+        entries.sort_by(|a, b| {
+            a.expires_in_secs
+                .cmp(&b.expires_in_secs)
+                .then_with(|| a.instance_id.cmp(&b.instance_id))
+        });
+
+        // Count LIVE entries — derive from the filtered snapshot, not
+        // `ContractBanList::len()`. `len()` includes entries that have
+        // expired but not yet been swept by `cleanup()`/`unban()`;
+        // `snapshot()` filters those out with the same `now < expires_at`
+        // predicate as `is_banned`. Using `len()` here would let the
+        // count tile read "1 contract banned" while the entry list (and
+        // the wire boundary) show zero — an inconsistency in the
+        // expiry-before-sweep window. (Codex review on #4464.)
+        ns::BanListSnapshot {
+            count: entries.len(),
+            capacity_rejected_total: self.contract_ban_list.capacity_rejected_total(),
+            entries,
+        }
+    }
+
     /// Record that a state update was observed for `contract`.
     /// No-op if the contract is not currently subscribed.
     pub fn record_contract_update(&self, contract: &ContractKey) {

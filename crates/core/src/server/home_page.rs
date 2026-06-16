@@ -33,6 +33,7 @@ fn homepage_html() -> String {
     let status_card = build_status_card(&snap);
     let peers_card = build_peers_card(&snap);
     let governance_card = build_governance_card(&snap);
+    let ban_list_card = build_ban_list_card(&snap);
     let contracts_card = build_contracts_card(&snap);
     let ops_card = build_ops_card(&snap);
     let transfer_card = build_transfer_card(&snap);
@@ -109,6 +110,7 @@ fn homepage_html() -> String {
         {peers_card}
         {transfer_card}
         {governance_card}
+        {ban_list_card}
         {contracts_card}
         {ops_card}
 
@@ -1359,6 +1361,99 @@ fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
         mad = mad_txt,
         threshold = threshold_txt,
         rows = rows,
+    )
+}
+
+/// Contract ban-list card (#4302). Surfaces the canonical
+/// `Ring::contract_ban_list` so operators can see whether the Phase 7
+/// hardening mechanism is catching abusers or sitting idle.
+///
+/// Two concrete asks from the issue: a count tile ("N contracts on ban
+/// list") and a per-entry list (key, reason, time remaining). The
+/// governance-state-machine drill-down is deferred (the ban list stores
+/// only the current entry, not the transition history that led to it).
+///
+/// The card is rendered whenever a snapshot exists — including when the
+/// list is empty — so an idle-but-active mechanism is distinguishable
+/// from one that isn't wired. Every value here comes from the ban list's
+/// own accessors via the provider closure; nothing is invented at render
+/// time.
+fn build_ban_list_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {
+    let Some(snap) = snap else {
+        return String::new();
+    };
+    let b = &snap.ban_list;
+
+    let plural = |n: usize| if n == 1 { "contract" } else { "contracts" };
+
+    // Capacity-rejection note: only shown when non-zero, so the common
+    // case stays uncluttered. A non-zero value is the operator's signal
+    // that the bounded list (MAX_BANNED_CONTRACTS) is overflowing.
+    let capacity_note = if b.capacity_rejected_total > 0 {
+        format!(
+            r#"<p class="empty" style="margin: 0 0.9rem 0.6rem; font-size: 0.82rem; color: var(--danger, #c0392b);">{n} ban{s} rejected — list at capacity.</p>"#,
+            n = b.capacity_rejected_total,
+            s = if b.capacity_rejected_total == 1 {
+                ""
+            } else {
+                "s"
+            },
+        )
+    } else {
+        String::new()
+    };
+
+    let body = if b.entries.is_empty() {
+        r#"<p class="empty" style="margin: 0.6rem 0.9rem;">No contracts banned. The mechanism is active and currently idle.</p>"#
+            .to_string()
+    } else {
+        let mut rows = String::new();
+        for e in &b.entries {
+            let reason_txt = match e.reason {
+                network_status::BanReasonSnapshot::AutoMad => "auto (governance)",
+                network_status::BanReasonSnapshot::Operator => "operator",
+            };
+            let remaining = if e.expires_in_secs == 0 {
+                "lifting".to_string()
+            } else {
+                format!("{} left", format_duration(e.expires_in_secs))
+            };
+            // html_escape the contract id even though instance ids are
+            // base58 (no HTML metacharacters today): defense-in-depth so
+            // the row stays safe if the id format ever changes.
+            write!(
+                rows,
+                r#"<tr><td class="mono">{id}</td><td>{reason}</td><td>{remaining}</td></tr>"#,
+                id = html_escape(&e.instance_id),
+                reason = reason_txt,
+                remaining = html_escape(&remaining),
+            )
+            .ok();
+        }
+        format!(
+            r#"<table class="data-table">
+                <thead><tr><th>Contract</th><th>Reason</th><th>Expires</th></tr></thead>
+                <tbody>{rows}</tbody>
+            </table>"#
+        )
+    };
+
+    format!(
+        r##"<div class="card">
+            <div class="card-header"><h2>Contract Ban List</h2></div>
+            <div class="g-verdict-row">
+                <div class="g-norms">
+                    <div class="g-norm"><div class="g-norm-label">On ban list</div><div class="g-norm-value">{count}</div></div>
+                </div>
+                <p class="empty" style="margin: 0; padding: 0.4rem 0.9rem; font-size: 0.9rem;">{count} {n_word} currently banned at this node.</p>
+            </div>
+            {capacity_note}
+            {body}
+        </div>"##,
+        count = b.count,
+        n_word = plural(b.count),
+        capacity_note = capacity_note,
+        body = body,
     )
 }
 
@@ -3962,6 +4057,7 @@ mod tests {
             ring_stats: RingStatsSnapshot::default(),
             transport_snapshot: TransportSnapshot::default(),
             governance: Default::default(),
+            ban_list: Default::default(),
         }
     }
 
@@ -5505,6 +5601,160 @@ mod tests {
     #[test]
     fn governance_card_omits_when_snap_is_none() {
         let html = build_governance_card(&None);
+        assert!(html.is_empty());
+    }
+
+    // ─── Contract ban-list card (#4302) ────────────────────────────
+
+    use crate::node::network_status::{BanListEntry, BanListSnapshot, BanReasonSnapshot};
+
+    fn mk_ban_entry(id: &str, reason: BanReasonSnapshot, expires_in_secs: u64) -> BanListEntry {
+        BanListEntry {
+            instance_id: id.to_string(),
+            reason,
+            expires_in_secs,
+        }
+    }
+
+    #[test]
+    fn ban_list_card_empty_state_renders_count_zero_and_idle_message() {
+        // Empty list still renders the card so operators can tell the
+        // mechanism is active-but-idle (the issue's core motivation),
+        // not unwired. Count tile shows 0.
+        let snap = base_snapshot();
+        let html = build_ban_list_card(&Some(snap));
+        assert!(
+            html.contains("Contract Ban List"),
+            "card must render its heading even when empty — got:\n{html}"
+        );
+        assert!(
+            html.contains(
+                r#"<div class="g-norm-label">On ban list</div><div class="g-norm-value">0</div>"#
+            ),
+            "empty state must show a 0 count tile — got:\n{html}"
+        );
+        assert!(
+            html.contains("0 contracts currently banned"),
+            "empty state must say 0 contracts banned — got:\n{html}"
+        );
+        assert!(
+            html.contains("active and currently idle"),
+            "empty state must distinguish idle-but-active from unwired — got:\n{html}"
+        );
+        assert!(
+            !html.contains("<table"),
+            "empty state must not render an entry table — got:\n{html}"
+        );
+    }
+
+    #[test]
+    fn ban_list_card_lists_entries_with_key_reason_and_expiry() {
+        // The two concrete asks: count tile + entry list (key, reason,
+        // expiry remaining). Pin all three columns for both reasons.
+        let mut snap = base_snapshot();
+        snap.ban_list = BanListSnapshot {
+            count: 2,
+            capacity_rejected_total: 0,
+            entries: vec![
+                mk_ban_entry("AutoBannedContract11111", BanReasonSnapshot::AutoMad, 1800),
+                mk_ban_entry("OperatorBannedContract22", BanReasonSnapshot::Operator, 90),
+            ],
+        };
+        let html = build_ban_list_card(&Some(snap));
+        // Count tile.
+        assert!(
+            html.contains(r#"<div class="g-norm-value">2</div>"#),
+            "count tile must show 2 — got:\n{html}"
+        );
+        // Keys appear.
+        assert!(
+            html.contains("AutoBannedContract11111"),
+            "auto-banned contract id must appear — got:\n{html}"
+        );
+        assert!(
+            html.contains("OperatorBannedContract22"),
+            "operator-banned contract id must appear — got:\n{html}"
+        );
+        // Reasons distinguish AutoMad vs Operator.
+        assert!(
+            html.contains("auto (governance)"),
+            "AutoMad ban must render an 'auto (governance)' reason — got:\n{html}"
+        );
+        assert!(
+            html.contains(">operator<"),
+            "Operator ban must render an 'operator' reason — got:\n{html}"
+        );
+        // Expiry remaining: 90s formatted, and 1800s as 30m.
+        assert!(
+            html.contains("30m left") || html.contains("30m 0s left"),
+            "expiry remaining must render the 1800s ban as ~30m — got:\n{html}"
+        );
+        assert!(
+            html.contains("1m 30s left") || html.contains("90s left"),
+            "expiry remaining must render the 90s ban — got:\n{html}"
+        );
+    }
+
+    #[test]
+    fn ban_list_card_singular_count_pluralization() {
+        // Boundary: count == 1 must read "1 contract", not "1 contracts".
+        let mut snap = base_snapshot();
+        snap.ban_list = BanListSnapshot {
+            count: 1,
+            capacity_rejected_total: 0,
+            entries: vec![mk_ban_entry("OnlyBanned1", BanReasonSnapshot::AutoMad, 600)],
+        };
+        let html = build_ban_list_card(&Some(snap));
+        assert!(
+            html.contains("1 contract currently banned"),
+            "count==1 must use singular 'contract' — got:\n{html}"
+        );
+        assert!(
+            !html.contains("1 contracts currently banned"),
+            "count==1 must not say '1 contracts' — got:\n{html}"
+        );
+    }
+
+    #[test]
+    fn ban_list_card_shows_capacity_rejection_note_when_nonzero() {
+        // The capacity-rejection counter is the operator's signal that
+        // the bounded list is overflowing — surface it only when > 0.
+        let mut snap = base_snapshot();
+        snap.ban_list = BanListSnapshot {
+            count: 1,
+            capacity_rejected_total: 5,
+            entries: vec![mk_ban_entry("AtCapacity1", BanReasonSnapshot::AutoMad, 300)],
+        };
+        let html = build_ban_list_card(&Some(snap));
+        assert!(
+            html.contains("5 bans rejected"),
+            "non-zero capacity rejection must surface a note — got:\n{html}"
+        );
+        assert!(
+            html.contains("list at capacity"),
+            "capacity note must explain the cause — got:\n{html}"
+        );
+    }
+
+    #[test]
+    fn ban_list_card_hides_capacity_note_when_zero() {
+        // Common case: no capacity pressure → no clutter.
+        let mut snap = base_snapshot();
+        snap.ban_list = BanListSnapshot {
+            count: 1,
+            capacity_rejected_total: 0,
+            entries: vec![mk_ban_entry("Normal1", BanReasonSnapshot::Operator, 300)],
+        };
+        let html = build_ban_list_card(&Some(snap));
+        assert!(
+            !html.contains("rejected"),
+            "zero capacity rejections must not render the note — got:\n{html}"
+        );
+    }
+
+    #[test]
+    fn ban_list_card_omits_when_snap_is_none() {
+        let html = build_ban_list_card(&None);
         assert!(html.is_empty());
     }
 }

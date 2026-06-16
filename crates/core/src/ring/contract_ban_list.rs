@@ -379,8 +379,12 @@ impl ContractBanList {
         }
     }
 
-    /// Number of currently-banned contracts. Used by tests and the
-    /// dashboard's governance card for "N contracts on ban list."
+    /// Raw number of entries in the map, including any that have expired
+    /// but not yet been swept by [`Self::cleanup`] / [`Self::unban`].
+    /// Test-only: the dashboard count tile uses [`Self::snapshot`]`.len()`
+    /// instead, which filters to LIVE entries (the same `now <
+    /// expires_at` predicate as [`Self::is_banned`]) so the count agrees
+    /// with the rendered entry list and the wire boundary.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -388,12 +392,51 @@ impl ContractBanList {
 
     /// Total bans rejected because the list was at capacity. A non-zero
     /// value tells operators the cap is being hit — surfaced on the
-    /// dashboard's governance card alongside the ban count. Mirrors
+    /// dashboard's ban-list card (#4302) alongside the ban count. Mirrors
     /// [`crate::ring::update_rate_limit::UpdateRateLimiter::capacity_rejected_total`].
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn capacity_rejected_total(&self) -> u64 {
         self.capacity_rejected_total.load(Ordering::Relaxed)
     }
+
+    /// Read-only view of every currently-banned contract, for the
+    /// local-peer dashboard's ban-list panel (#4302).
+    ///
+    /// Returns one [`BanListEntry`] per live entry: the contract id, why
+    /// it was banned, and how long until the ban automatically lifts
+    /// (`expires_at - now`, clamped at zero). Already-expired entries
+    /// that haven't been swept yet are skipped so the panel never shows a
+    /// "banned" row that `is_banned` would already treat as lifted — the
+    /// same `now < expires_at` predicate as [`Self::is_banned`].
+    ///
+    /// This is a snapshot, not a structure the list maintains: it
+    /// collects the values already stored in each entry at call time. The
+    /// returned `Vec` has no guaranteed order (it follows `DashMap`
+    /// iteration order); the renderer sorts for stable display.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn snapshot(&self) -> Vec<BanListEntry> {
+        let now = self.time_source.now();
+        self.entries
+            .iter()
+            .filter(|e| now < e.value().expires_at)
+            .map(|e| BanListEntry {
+                contract: *e.key(),
+                reason: e.value().reason,
+                remaining: e.value().expires_at.saturating_duration_since(now),
+            })
+            .collect()
+    }
+}
+
+/// One row of [`ContractBanList::snapshot`]: a currently-banned contract,
+/// the reason it was banned, and the time remaining before the ban lifts.
+/// Carries only data the ban list already stores per entry.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BanListEntry {
+    pub contract: ContractInstanceId,
+    pub reason: BanReason,
+    pub remaining: std::time::Duration,
 }
 
 #[cfg(test)]
@@ -1153,4 +1196,114 @@ mod tests {
     // unit tests, where the test helpers for the state-machine setup
     // (mk_mgr_shared, etc.) already exist. See
     // `governance_to_ban_list_end_to_end` in that module.
+
+    // ─── snapshot() — dashboard data source (#4302) ────────────────
+
+    #[test]
+    fn snapshot_of_empty_list_is_empty() {
+        let (bl, _ts) = mk_ban_list();
+        assert!(bl.snapshot().is_empty());
+    }
+
+    #[test]
+    fn snapshot_reports_key_reason_and_remaining() {
+        let (bl, ts) = mk_ban_list();
+        let auto = mk_contract(1);
+        let operator = mk_contract(2);
+        let now = ts.now();
+        bl.ban(auto, now + Duration::from_secs(120), BanReason::AutoMad);
+        bl.ban(
+            operator,
+            now + Duration::from_secs(300),
+            BanReason::Operator,
+        );
+
+        let snap = bl.snapshot();
+        assert_eq!(snap.len(), 2, "both bans must appear in the snapshot");
+
+        let auto_row = snap
+            .iter()
+            .find(|e| e.contract == auto)
+            .expect("auto-banned contract must be in snapshot");
+        assert_eq!(auto_row.reason, BanReason::AutoMad);
+        assert_eq!(auto_row.remaining, Duration::from_secs(120));
+
+        let op_row = snap
+            .iter()
+            .find(|e| e.contract == operator)
+            .expect("operator-banned contract must be in snapshot");
+        assert_eq!(op_row.reason, BanReason::Operator);
+        assert_eq!(op_row.remaining, Duration::from_secs(300));
+    }
+
+    #[test]
+    fn snapshot_remaining_shrinks_as_time_advances() {
+        let (bl, ts) = mk_ban_list();
+        let contract = mk_contract(1);
+        let now = ts.now();
+        bl.ban(contract, now + Duration::from_secs(100), BanReason::AutoMad);
+
+        ts.advance_time(Duration::from_secs(40));
+        let snap = bl.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(
+            snap[0].remaining,
+            Duration::from_secs(60),
+            "remaining must reflect elapsed time"
+        );
+    }
+
+    #[test]
+    fn snapshot_excludes_expired_but_unswept_entries() {
+        // A ban can sit in `entries` past its expiry until the next
+        // `cleanup()` sweep or explicit `unban()`. The snapshot must use
+        // the same `now < expires_at` predicate as `is_banned`, so the
+        // dashboard never shows a row the wire boundary would already
+        // treat as lifted.
+        let (bl, ts) = mk_ban_list();
+        let contract = mk_contract(1);
+        let now = ts.now();
+        bl.ban(contract, now + Duration::from_secs(30), BanReason::AutoMad);
+
+        // Advance past expiry WITHOUT calling cleanup/unban.
+        ts.advance_time(Duration::from_secs(31));
+        assert!(
+            !bl.is_banned(&contract),
+            "guard: entry is logically expired"
+        );
+        assert!(
+            bl.snapshot().is_empty(),
+            "expired-but-unswept entry must not appear in the snapshot"
+        );
+    }
+
+    /// Source-scrape pin (Codex review on #4464): the dashboard count
+    /// tile MUST be derived from the LIVE filtered `entries`, not from
+    /// `ContractBanList::len()`. `len()` includes expired-but-unswept
+    /// entries, so using it would let the count tile read "1 banned"
+    /// while the entry list (and the wire boundary) show zero during the
+    /// expiry-before-sweep window. Building a full `Ring` for this is
+    /// overkill, so pin the wiring at the source level the same way the
+    /// dispatch-gate tests above do.
+    #[test]
+    fn dashboard_count_derives_from_live_entries_not_len() {
+        const RING_SRC: &str = include_str!("../ring.rs");
+        let fn_pos = RING_SRC
+            .find("pub fn dashboard_ban_list_snapshot")
+            .expect("dashboard_ban_list_snapshot must exist in ring.rs");
+        // Scope the scan to the function body so an unrelated `len()`
+        // elsewhere in ring.rs can't satisfy or break this pin.
+        let body = &RING_SRC[fn_pos..fn_pos.saturating_add(2_000).min(RING_SRC.len())];
+        assert!(
+            body.contains("count: entries.len()"),
+            "dashboard count must be derived from the filtered live \
+             `entries`, not the raw ban-list `len()` — see Codex review \
+             on #4464:\n{body}"
+        );
+        assert!(
+            !body.contains("count: self.contract_ban_list.len()"),
+            "dashboard count must NOT use `contract_ban_list.len()` — it \
+             includes expired-but-unswept entries the entry list omits"
+        );
+    }
 }

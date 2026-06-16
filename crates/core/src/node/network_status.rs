@@ -39,6 +39,14 @@ pub type GovernanceProvider = Arc<dyn Fn() -> GovernanceSnapshot + Send + Sync +
 /// Same provider pattern as `SubscriptionProvider`/`GovernanceProvider`.
 pub type RingStatsProvider = Arc<dyn Fn() -> RingStatsSnapshot + Send + Sync + 'static>;
 
+/// Provider for the contract ban-list snapshot (#4302). Same pattern as
+/// `GovernanceProvider`: registered at node startup, replaceable for
+/// multi-node test harnesses, read by `get_snapshot` on every dashboard
+/// request. In production the closure captures `Arc<Ring>` and calls
+/// `Ring::dashboard_ban_list_snapshot()`, which reads the canonical
+/// `Ring::contract_ban_list` directly — no mirrored counter to rot.
+pub type BanListProvider = Arc<dyn Fn() -> BanListSnapshot + Send + Sync + 'static>;
+
 /// Snapshot of ring-level statistics exposed to the dashboard.
 #[derive(Debug, Clone, Default)]
 pub struct RingStatsSnapshot {
@@ -91,6 +99,16 @@ pub(crate) fn clear_ring_stats_provider() {
 #[allow(dead_code)] // consumed by Phase 4.5 dashboard tests
 pub(crate) fn clear_governance_provider() {
     *GOVERNANCE_PROVIDER.write() = None;
+}
+
+static BAN_LIST_PROVIDER: parking_lot::RwLock<Option<BanListProvider>> =
+    parking_lot::RwLock::new(None);
+
+/// Register the dashboard's contract-ban-list data source (#4302).
+/// Replaces any previously-registered provider so multi-node in-process
+/// harnesses can re-wire to the current node.
+pub fn set_ban_list_provider(provider: BanListProvider) {
+    *BAN_LIST_PROVIDER.write() = Some(provider);
 }
 
 /// Replaceable storage for the subscription provider. Wrapped in a
@@ -542,6 +560,55 @@ pub struct NetworkStatusSnapshot {
     /// we silence it here too with the same justification.
     #[allow(dead_code)] // consumed by the dashboard renderer (Phase 4.5)
     pub governance: GovernanceSnapshot,
+    /// Contract ban list (Phase 7, #4302). Drives the "N contracts on
+    /// ban list" tile and the per-entry list in the dashboard's ban-list
+    /// card. Read from the canonical `Ring::contract_ban_list` via the
+    /// provider closure — no mirrored counter to rot. Empty when nothing
+    /// is banned (the common case).
+    pub ban_list: BanListSnapshot,
+}
+
+/// Snapshot of the contract ban list for the dashboard (#4302).
+///
+/// Carries only data the canonical `Ring::contract_ban_list` already
+/// exposes: the live count, the per-entry list (key + reason + time
+/// remaining), and the cumulative capacity-rejection counter. There is
+/// no mirrored state — `get_snapshot` rebuilds this on every dashboard
+/// request from the provider closure.
+#[derive(Debug, Clone, Default)]
+pub struct BanListSnapshot {
+    /// Number of currently-banned contracts (`ContractBanList::len`).
+    /// Drives the count tile.
+    pub count: usize,
+    /// Total bans rejected because the list was at `MAX_BANNED_CONTRACTS`
+    /// capacity. A non-zero value tells operators the cap is being hit.
+    pub capacity_rejected_total: u64,
+    /// One entry per currently-banned contract.
+    pub entries: Vec<BanListEntry>,
+}
+
+/// One row of [`BanListSnapshot`]: a banned contract, why it was banned,
+/// and how long until the ban lifts.
+#[derive(Debug, Clone)]
+pub struct BanListEntry {
+    /// `ContractInstanceId.to_string()` — the same string the dashboard's
+    /// other contract panels render.
+    pub instance_id: String,
+    /// Why the contract is banned: governance-automatic vs operator-driven.
+    pub reason: BanReasonSnapshot,
+    /// Seconds until the ban automatically lifts (`expires_at - now`,
+    /// clamped at zero). Rendered as a human-readable "Ns" / "Nm" string.
+    pub expires_in_secs: u64,
+}
+
+/// Public mirror of the `pub(crate)` `ring::contract_ban_list::BanReason`,
+/// so the snapshot stays decoupled from the ring-internal enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BanReasonSnapshot {
+    /// Auto-flipped by the governance reaper after `BanTriggered`.
+    AutoMad,
+    /// Operator-driven via the CLI / config flag (#4274).
+    Operator,
 }
 
 /// Snapshot of the governance system's state, mirrored from
@@ -919,6 +986,11 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
         ring_stats,
         transport_snapshot,
         governance: GOVERNANCE_PROVIDER
+            .read()
+            .as_ref()
+            .map(|provider| provider())
+            .unwrap_or_default(),
+        ban_list: BAN_LIST_PROVIDER
             .read()
             .as_ref()
             .map(|provider| provider())

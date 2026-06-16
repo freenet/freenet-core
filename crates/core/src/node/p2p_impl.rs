@@ -256,6 +256,13 @@ impl NodeP2P {
         super::network_status::set_governance_provider(std::sync::Arc::new(move || {
             ring.dashboard_governance_snapshot()
         }));
+        // Same pattern for the contract ban list (#4302) — dashboard
+        // reads the canonical `Ring::contract_ban_list` so the count
+        // tile + entry list can't drift from a mirrored counter.
+        let ban_list_ring = self.op_manager.ring.clone();
+        super::network_status::set_ban_list_provider(std::sync::Arc::new(move || {
+            ban_list_ring.dashboard_ban_list_snapshot()
+        }));
 
         // Wire live ring stats for the dashboard: connection count +
         // hosted contracts + own public key, read on every homepage
