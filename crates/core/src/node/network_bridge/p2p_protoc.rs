@@ -626,7 +626,15 @@ pub(in crate::node) struct P2pConnManager {
 /// Simulation tests that want the cascade lower the floor per-node at runtime via
 /// `NodeConfig::subscribe_hint_floor_override` (set by
 /// `SimNetwork::enable_placement_migration`), which never touches production.
-const SUBSCRIBE_HINT_MIN_VERSION: (u8, u8, u16) = (0, 2, 73);
+// DEACTIVATED 2026-06-16: v0.2.73 shipped #4404's placement migration ACTIVE
+// (floor == 0.2.73). On the live network this correlated with a climbing
+// UPDATE-broadcast stream-assembly + WASM compute-time failure rate — the
+// migration's extra directed-subscribes and per-GET/PUT
+// `ConsiderContractMigration` emits re-load the notification/broadcast
+// backpressure surface that wedged the gateways in #4145/#4231. Raised the
+// floor to (0, 3, 0) so the migration stays DORMANT on all 0.2.x; re-lower it
+// to the intended activation version once the cause is fixed and validated.
+const SUBSCRIBE_HINT_MIN_VERSION: (u8, u8, u16) = (0, 3, 0);
 
 /// Pure version-gate decision, factored out so the comparison and the
 /// fail-closed-on-unknown-version (`None`) behavior are unit-testable with an
