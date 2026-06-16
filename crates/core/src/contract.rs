@@ -2222,6 +2222,19 @@ pub(crate) enum ContractError {
         key: ContractKey,
         error: ExecutorError,
     },
+    /// The contract WASM contains DWARF debug sections (`.debug_*`),
+    /// indicating it was compiled in debug mode. Debug builds are
+    /// typically 10-100x larger than release builds and can exceed
+    /// WebSocket message-size limits, producing confusing "Message too
+    /// long" errors. Rejected at PUT time so the problem surfaces with
+    /// an actionable message instead of a transport failure. See #2257.
+    #[error(
+        "contract appears to be compiled in debug mode \
+         (contains {sections} section(s)). Debug WASM is typically \
+         10-100x larger than release builds and may exceed message-size \
+         limits. Recompile the contract with `--release` before publishing."
+    )]
+    DebugWasmRejected { sections: String },
 }
 
 #[cfg(test)]
