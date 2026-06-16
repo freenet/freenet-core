@@ -1,0 +1,140 @@
+name: Binstall Smoke Test (Nightly)
+
+# End-to-end check that the LATEST published `freenet` and `fdev` crates can
+# actually be installed via `cargo binstall`. The in-repo manifest tests
+# (#3997) lock in the structural invariants of the binstall metadata, but they
+# cannot catch a user-visible 404: release assets that failed to attach, a
+# release stuck in draft, or asset naming that drifted out of sync with the
+# `pkg-url` in Cargo.toml. This downloads the real GitHub release assets and
+# runs the binaries, so any of those break this workflow. See issue #3998.
+
+on:
+  schedule:
+    # 5 AM UTC daily — staggered after simulation-nightly (3 AM UTC).
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+# Don't pile up concurrent runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  binstall-smoke-test:
+    name: Binstall ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux release assets are built for the musl target (see
+          # cross-compile.yml). The default gnu host target would 404, so pin
+          # the target binstall resolves to match the published asset name.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          # Windows exercises the `.zip` / `bin-dir = *.exe` override path.
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - name: Install cargo-binstall
+        # `@main` is the upstream-recommended ref for this action: the repo's
+        # `vX.Y.Z` tags are cargo-binstall *crate* releases, not pinned action
+        # versions. Don't "upgrade" this to a vX tag — that pins to a crate
+        # release, not the maintained action.
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Resolve latest published versions from crates.io
+        id: versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          # crates.io requires a descriptive User-Agent or it 403s. `jq` is
+          # preinstalled on every GitHub-hosted runner (incl. windows-latest
+          # under bash), so it's portable across the matrix.
+          UA="freenet-core binstall-smoke-test (https://github.com/freenet/freenet-core)"
+          for crate in freenet fdev; do
+            version=$(curl -sSf -H "User-Agent: $UA" \
+              "https://crates.io/api/v1/crates/${crate}" \
+              | jq -er '.crate.max_stable_version')
+            echo "Latest ${crate}: ${version}"
+            echo "${crate}=${version}" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Install freenet via cargo binstall
+        shell: bash
+        run: |
+          cargo binstall --no-confirm --targets "${{ matrix.target }}" \
+            "freenet@${{ steps.versions.outputs.freenet }}"
+
+      - name: Install fdev via cargo binstall
+        shell: bash
+        run: |
+          cargo binstall --no-confirm --targets "${{ matrix.target }}" \
+            "fdev@${{ steps.versions.outputs.fdev }}"
+
+      - name: Assert binaries respond to --version
+        shell: bash
+        run: |
+          set -euo pipefail
+          freenet --version
+          fdev --version
+
+  # Notify the public Freenet River room on failure (same transport as
+  # simulation-nightly.yml). Best-effort: never red-fails on its own.
+  notify-failure:
+    name: Notify River on Failure
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: binstall-smoke-test
+    if: failure() && needs.binstall-smoke-test.result == 'failure'
+    continue-on-error: true
+    steps:
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Install riverctl
+        run: cargo install riverctl
+
+      - name: Send failure message to River (with exponential backoff)
+        env:
+          RIVER_SIGNING_KEY: ${{ secrets.RIVER_SIGNING_KEY }}
+        run: |
+          MESSAGE="🚨 Nightly Binstall Smoke Test Failed - ${{ github.repository }} - cargo binstall of the latest published freenet/fdev release failed - ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          NODE_URL="${{ secrets.RIVER_GATEWAY_URL }}"
+          ROOM_ID="${{ secrets.RIVER_ROOM_ID }}"
+
+          max_attempts=7
+          delay=10
+          for attempt in $(seq 1 $max_attempts); do
+            echo "Attempt $attempt/$max_attempts (delay: ${delay}s)..."
+            if riverctl --node-url "$NODE_URL" message send "$ROOM_ID" "$MESSAGE" 2>&1; then
+              echo "Message sent successfully on attempt $attempt"
+              exit 0
+            fi
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              echo "Failed, retrying in ${delay}s..."
+              sleep "$delay"
+              delay=$((delay * 2))
+            fi
+          done
+          echo "::warning::Failed to send River notification after $max_attempts attempts (gateway may be restarting)"
+          exit 0
+
+  # Mirror the failure into the private freenet-dev room.
+  notify-dev-room-failure:
+    name: Notify dev room on Failure
+    runs-on: ubuntu-latest
+    needs: binstall-smoke-test
+    if: failure() && needs.binstall-smoke-test.result == 'failure'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/river-dev-notify
+        with:
+          message: "🚨 Nightly binstall smoke test failed — cargo binstall of the latest published freenet/fdev release failed — ${{ github.repository }} — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}
