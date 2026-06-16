@@ -2633,6 +2633,37 @@ impl P2pConnManager {
                                         );
                                     }
                                 }
+
+                                // Invariant hardening (#3099): this is the one
+                                // terminal path that publishes its result directly
+                                // via `result_router_tx` instead of routing through
+                                // `OpManager::send_client_result`, so it never emits
+                                // `NodeEvent::TransactionCompleted` and never reaches
+                                // the `TransactionCompleted` handler that prunes
+                                // `pending_op_results`.
+                                //
+                                // Today `tx` here is always the client/parent tx,
+                                // which is NEVER inserted into `pending_op_results`:
+                                // the SUBSCRIBE driver only registers per-attempt
+                                // `attempt_tx` slots (see subscribe/op_ctx_task.rs
+                                // module docs — "`client_tx` ... never passed to
+                                // `send_and_await`"), and each `attempt_tx` slot is
+                                // released via `release_pending_op_slot`. So this call
+                                // is a no-op on every currently-reachable case and is
+                                // purely defensive. We keep it — pinned by
+                                // `local_subscribe_complete_reclaims_pending_op_result`
+                                // — so that if a future refactor ever routes a
+                                // `pending_op_results`-bearing tx through this arm, the
+                                // entry is freed immediately instead of lingering until
+                                // the 60s periodic sweep. `reclaim_pending_op_result`
+                                // is idempotent and records the matching
+                                // `pending_op_remove` metric so the accounting behind
+                                // `test_pending_op_results_bounded` (#3100) stays
+                                // balanced. `live_tx_tracker`/`under_progress` are
+                                // already cleaned by the `op_manager.completed(tx)`
+                                // that `complete_local_subscription` ran, so they are
+                                // not touched again here.
+                                state.reclaim_pending_op_result(tx);
                             }
                             NodeEvent::BroadcastHostingUpdate { message } => {
                                 ctx.handle_hosting_broadcast(message).await;
@@ -5449,6 +5480,28 @@ impl EventListenerState {
             last_backoff_cleanup: Instant::now(),
         }
     }
+
+    /// Reclaim the executor callback sender for a transaction that has
+    /// reached a terminal state, recording the matching `pending_op_remove`
+    /// metric so the `inserts - removes` balance that backs
+    /// `test_pending_op_results_bounded` (#3100) stays accurate.
+    ///
+    /// Returns `true` if an entry was actually removed. Idempotent: calling
+    /// it again for the same `tx` is a no-op and records nothing. This is
+    /// the same `pending_op_results` cleanup the `TransactionCompleted`
+    /// handler performs for the common terminal path. The standalone-parent
+    /// `LocalSubscribeComplete` arm calls it directly because that arm
+    /// publishes its result via `result_router_tx` without emitting
+    /// `TransactionCompleted` (#3099) — see that arm for why the call is
+    /// defensive (the parent tx is not a `pending_op_results` key today).
+    fn reclaim_pending_op_result(&mut self, tx: Transaction) -> bool {
+        if self.pending_op_results.remove(&tx).is_some() {
+            crate::config::GlobalTestMetrics::record_pending_op_remove();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 impl Drop for EventListenerState {
@@ -6546,6 +6599,97 @@ mod tests {
             ExpectedInboundTracker::empty_for_test(),
         ));
         assert_eq!(GlobalTestMetrics::pending_op_removes(), removes_before);
+    }
+
+    /// Behavioral guard for #3099's `reclaim_pending_op_result` helper, which
+    /// the `LocalSubscribeComplete` arm calls so the bypass path participates
+    /// in the same `pending_op_results` cleanup as the `TransactionCompleted`
+    /// handler. When an entry is present it MUST be dropped and record exactly
+    /// one `pending_op_remove`; a second call MUST be idempotent (so layering
+    /// it on top of the `op_manager.completed(tx)` that
+    /// `complete_local_subscription` already ran cannot double-count or panic),
+    /// and a subsequent `Drop` MUST NOT re-count the already-reclaimed entry.
+    #[test]
+    fn reclaim_pending_op_result_drops_entry_and_records_remove() {
+        use crate::config::GlobalTestMetrics;
+        use crate::message::Transaction;
+        use crate::transport::ExpectedInboundTracker;
+
+        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let tx = Transaction::ttl_transaction();
+        let (callback, _rx) = mpsc::channel(1);
+        state.pending_op_results.insert(tx, callback);
+
+        let removes_before = GlobalTestMetrics::pending_op_removes();
+
+        // First call: removes the resident entry and records one remove.
+        assert!(
+            state.reclaim_pending_op_result(tx),
+            "reclaim must remove a resident pending_op_results entry (#3099)"
+        );
+        assert!(
+            !state.pending_op_results.contains_key(&tx),
+            "pending_op_results entry must be gone after reclaim (#3099)"
+        );
+        assert_eq!(
+            GlobalTestMetrics::pending_op_removes() - removes_before,
+            1,
+            "reclaim must record exactly one pending_op_remove so test_pending_op_results_bounded (#3100) stays balanced"
+        );
+
+        // Second call: idempotent — no entry, no spurious metric.
+        assert!(
+            !state.reclaim_pending_op_result(tx),
+            "reclaim must be idempotent: a second call on the same tx removes nothing"
+        );
+        assert_eq!(
+            GlobalTestMetrics::pending_op_removes() - removes_before,
+            1,
+            "idempotent reclaim must not record a second pending_op_remove"
+        );
+
+        // Drop must not record a spurious remove for the already-reclaimed tx.
+        drop(state);
+        assert_eq!(
+            GlobalTestMetrics::pending_op_removes() - removes_before,
+            1,
+            "Drop must not re-count an entry that reclaim already removed"
+        );
+    }
+
+    /// Pin for #3099: the standalone-parent branch of the
+    /// `LocalSubscribeComplete` arm MUST reclaim its `pending_op_results`
+    /// entry. This arm is the one terminal path that bypasses
+    /// `OpManager::send_client_result` (it pushes directly to
+    /// `result_router_tx`), so it never emits `NodeEvent::TransactionCompleted`
+    /// and never reaches the handler that prunes `pending_op_results`. The
+    /// call is defensive today (the parent tx is not a `pending_op_results`
+    /// key — see the arm comment), but pinning it guarantees that if a future
+    /// refactor ever routes a `pending_op_results`-bearing tx through this arm
+    /// the entry is freed immediately instead of lingering until the 60s sweep.
+    #[test]
+    fn local_subscribe_complete_reclaims_pending_op_result() {
+        const SOURCE: &str = include_str!("p2p_protoc.rs");
+
+        let arm_anchor = "NodeEvent::LocalSubscribeComplete {";
+        let arm_start = SOURCE
+            .find(arm_anchor)
+            .expect("LocalSubscribeComplete handler renamed or removed");
+        // The arm closes at the next `BroadcastHostingUpdate` arm — bound the
+        // slice there so the assertion can't match a later arm's body.
+        let arm_end = SOURCE[arm_start..]
+            .find("NodeEvent::BroadcastHostingUpdate")
+            .map(|p| arm_start + p)
+            .expect("LocalSubscribeComplete arm closer not found");
+        let body = &SOURCE[arm_start..arm_end];
+
+        assert!(
+            body.contains("reclaim_pending_op_result(tx)"),
+            "LocalSubscribeComplete's standalone-parent path must call \
+             state.reclaim_pending_op_result(tx) so the executor callback \
+             sender is freed immediately instead of leaking until the 60s \
+             sweep (#3099). Arm body:\n{body}"
+        );
     }
 
     /// Test that connection_id generation produces unique, monotonically increasing IDs.
