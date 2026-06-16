@@ -11,7 +11,18 @@ impl Eq for Rate {}
 
 impl Ord for Rate {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        // Compare the underlying value directly. `total_cmp` gives a total
+        // order over all f64 (including NaN), which is required for the `Eq`
+        // + `Ord` impls to be consistent and is relied upon by
+        // `calculate_estimated_usage_rate`'s `sort_unstable`.
+        //
+        // NOTE: `cmp` MUST NOT delegate to `partial_cmp` here — `partial_cmp`
+        // delegates back to `cmp`, so any mutual delegation infinite-loops
+        // into a stack overflow. This was a latent bug that only surfaced
+        // once the topology meter started being fed real samples in
+        // production (#3453): the first `Rate` comparison (via `sort_unstable`)
+        // recursed until the stack overflowed.
+        self.value.total_cmp(&other.value)
     }
 }
 
@@ -91,6 +102,41 @@ mod tests {
         let rate2 = Rate::new(200.0, Duration::from_secs(2));
         let rate3 = rate2 - rate1;
         assert_eq!(rate3.per_second(), 50.0);
+    }
+
+    /// Regression for #3453: `Rate::cmp` and `Rate::partial_cmp` used to
+    /// delegate to each other, infinite-looping into a stack overflow on the
+    /// FIRST comparison. This was latent until the topology meter started
+    /// being fed real samples in production, at which point
+    /// `calculate_estimated_usage_rate`'s `sort_unstable` over `Vec<Rate>`
+    /// triggered the overflow and aborted every node. These comparisons must
+    /// terminate and return the correct ordering.
+    #[test]
+    fn test_ord_does_not_recurse() {
+        use std::cmp::Ordering;
+
+        let lo = Rate::new_per_second(1.0);
+        let hi = Rate::new_per_second(2.0);
+
+        // Each of these would stack-overflow (SIGABRT, not a test failure)
+        // under the old mutually-recursive impls.
+        assert_eq!(lo.cmp(&hi), Ordering::Less);
+        assert_eq!(hi.cmp(&lo), Ordering::Greater);
+        assert_eq!(lo.cmp(&lo), Ordering::Equal);
+        assert_eq!(lo.partial_cmp(&hi), Some(Ordering::Less));
+        assert!(lo < hi);
+        assert!(hi > lo);
+
+        // Sorting is the exact production trigger (sort_unstable in
+        // calculate_estimated_usage_rate).
+        let mut rates = vec![
+            Rate::new_per_second(3.0),
+            Rate::new_per_second(1.0),
+            Rate::new_per_second(2.0),
+        ];
+        rates.sort_unstable();
+        let sorted: Vec<f64> = rates.iter().map(|r| r.per_second()).collect();
+        assert_eq!(sorted, vec![1.0, 2.0, 3.0]);
     }
 }
 
