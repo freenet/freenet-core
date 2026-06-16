@@ -3210,7 +3210,8 @@ impl SimNetwork {
                     match sub_event {
                         SubscribeEvent::Request { .. } => summary.subscribe.requested += 1,
                         SubscribeEvent::SubscribeSuccess { .. } => summary.subscribe.succeeded += 1,
-                        SubscribeEvent::SubscribeNotFound { .. } => summary.subscribe.failed += 1,
+                        SubscribeEvent::SubscribeNotFound { .. }
+                        | SubscribeEvent::SubscribeTimeout { .. } => summary.subscribe.failed += 1,
                         SubscribeEvent::ResponseSent { .. }
                         | SubscribeEvent::HostingStarted { .. }
                         | SubscribeEvent::HostingStopped { .. }

@@ -661,7 +661,8 @@ impl super::StateVerifier {
                     ));
                 }
                 EventKind::Subscribe(SubscribeEvent::SubscribeSuccess { id, .. })
-                | EventKind::Subscribe(SubscribeEvent::SubscribeNotFound { id, .. }) => {
+                | EventKind::Subscribe(SubscribeEvent::SubscribeNotFound { id, .. })
+                | EventKind::Subscribe(SubscribeEvent::SubscribeTimeout { id, .. }) => {
                     if let Some(entry) = tx_states.get_mut(id) {
                         entry.3 = true;
                     }
