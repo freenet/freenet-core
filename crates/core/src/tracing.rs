@@ -698,6 +698,35 @@ impl<'a> NetEventLog<'a> {
         })
     }
 
+    /// Create a Subscribe timeout event (#3445).
+    ///
+    /// Emitted from the client-initiated subscribe driver when it exhausts
+    /// all candidate peers without ever receiving a terminal reply (every
+    /// attempt timed out or errored). Mirrors [`Self::subscribe_not_found`]
+    /// but records the timeout outcome so the dashboard pairs every
+    /// `subscribe_request` with an outcome instead of leaving it dangling.
+    pub fn subscribe_timeout(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        instance_id: ContractInstanceId,
+        retries: usize,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Subscribe(SubscribeEvent::SubscribeTimeout {
+                id: *tx,
+                requester: own_loc,
+                instance_id,
+                retries,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
     // ==================== UPDATE Operation Helpers ====================
 
     /// Create an Update request event.
@@ -1590,7 +1619,9 @@ impl NetLogMessage {
             EventKind::Get(GetEvent::GetSuccess { .. } | GetEvent::GetNotFound { .. }) => true,
             EventKind::Get(_) => false,
             EventKind::Subscribe(
-                SubscribeEvent::SubscribeSuccess { .. } | SubscribeEvent::SubscribeNotFound { .. },
+                SubscribeEvent::SubscribeSuccess { .. }
+                | SubscribeEvent::SubscribeNotFound { .. }
+                | SubscribeEvent::SubscribeTimeout { .. },
             ) => true,
             EventKind::Subscribe(_) => false,
             _ => false,
@@ -2846,14 +2877,16 @@ impl EventKind {
         }
     }
 
-    /// Returns whether this is a subscribe outcome event (success or not-found).
+    /// Returns whether this is a subscribe outcome event (success or failure).
     ///
-    /// Returns `Some(true)` for `SubscribeSuccess`, `Some(false)` for `SubscribeNotFound`,
+    /// Returns `Some(true)` for `SubscribeSuccess`, `Some(false)` for the
+    /// failure outcomes `SubscribeNotFound` and `SubscribeTimeout` (#3445),
     /// `None` for all other events (including subscribe requests/responses).
     pub fn subscribe_outcome(&self) -> Option<bool> {
         match self {
             EventKind::Subscribe(SubscribeEvent::SubscribeSuccess { .. }) => Some(true),
-            EventKind::Subscribe(SubscribeEvent::SubscribeNotFound { .. }) => Some(false),
+            EventKind::Subscribe(SubscribeEvent::SubscribeNotFound { .. })
+            | EventKind::Subscribe(SubscribeEvent::SubscribeTimeout { .. }) => Some(false),
             EventKind::Connect(_)
             | EventKind::Put(_)
             | EventKind::Get(_)
@@ -3825,6 +3858,29 @@ pub(crate) enum SubscribeEvent {
         at: PeerKeyLocation,
         timestamp: u64,
     },
+    /// A client-initiated Subscribe operation gave up without a terminal
+    /// reply (every candidate peer timed out / errored before any of them
+    /// returned Subscribed or NotFound). This is a terminal outcome, like
+    /// `SubscribeSuccess`/`SubscribeNotFound`, but distinct because the
+    /// originator never heard back from the network at all.
+    ///
+    /// Issue #3445: without this event a timed-out subscribe left a
+    /// `subscribe_request` on the dashboard with no paired outcome, making
+    /// the failure invisible (the River container contract showed 196
+    /// requests and 0 outcomes — all silent timeouts).
+    SubscribeTimeout {
+        id: Transaction,
+        /// The peer that initiated the subscribe (this node).
+        requester: PeerKeyLocation,
+        /// Contract instance that was being subscribed to (the full key is
+        /// not known on the originator until a successful Subscribed reply).
+        instance_id: ContractInstanceId,
+        /// Number of routing rounds attempted before giving up.
+        retries: usize,
+        /// Time elapsed since the operation started (milliseconds).
+        elapsed_ms: u64,
+        timestamp: u64,
+    },
 }
 
 impl SubscribeEvent {
@@ -3844,7 +3900,8 @@ impl SubscribeEvent {
             | SubscribeEvent::_Reserved9
             | SubscribeEvent::_Reserved10
             | SubscribeEvent::UnsubscribeSent { .. }
-            | SubscribeEvent::UnsubscribeReceived { .. } => None,
+            | SubscribeEvent::UnsubscribeReceived { .. }
+            | SubscribeEvent::SubscribeTimeout { .. } => None,
         }
     }
 }

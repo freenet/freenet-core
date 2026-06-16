@@ -745,6 +745,7 @@ fn event_kind_to_string(kind: &EventKind) -> String {
                 SubscribeEvent::Request { .. } => "subscribe_request".to_string(),
                 SubscribeEvent::SubscribeSuccess { .. } => "subscribe_success".to_string(),
                 SubscribeEvent::SubscribeNotFound { .. } => "subscribe_not_found".to_string(),
+                SubscribeEvent::SubscribeTimeout { .. } => "subscribe_timeout".to_string(),
                 SubscribeEvent::ResponseSent { .. } => "subscribe_response_sent".to_string(),
                 SubscribeEvent::HostingStarted { .. } => "hosting_started".to_string(),
                 SubscribeEvent::HostingStopped { .. } => "hosting_stopped".to_string(),
@@ -1273,6 +1274,24 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "instance_id": instance_id.to_string(),
                         "target": target.to_string(),
                         "hop_count": hop_count,
+                        "elapsed_ms": elapsed_ms,
+                        "timestamp": timestamp,
+                    })
+                }
+                SubscribeEvent::SubscribeTimeout {
+                    id,
+                    requester,
+                    instance_id,
+                    retries,
+                    elapsed_ms,
+                    timestamp,
+                } => {
+                    serde_json::json!({
+                        "type": "subscribe_timeout",
+                        "id": id.to_string(),
+                        "requester": requester.to_string(),
+                        "instance_id": instance_id.to_string(),
+                        "retries": retries,
                         "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
                     })
@@ -2415,5 +2434,49 @@ mod tests {
             serialized.get("priority").is_none(),
             "priority must be #[serde(skip)] so the OTLP payload is unchanged"
         );
+    }
+
+    /// #3445: a client subscribe that exhausts every candidate without a
+    /// terminal reply must emit a `subscribe_timeout` outcome event so the
+    /// dashboard pairs the original `subscribe_request` with an outcome
+    /// instead of leaving it dangling. Without the new `SubscribeTimeout`
+    /// variant + its name-mapping and JSON arms this test does not compile,
+    /// and before they were wired in the timeout was completely invisible.
+    #[test]
+    fn test_event_kind_to_json_subscribe_timeout() {
+        use crate::message::Transaction;
+        use crate::ring::PeerKeyLocation;
+        use crate::tracing::SubscribeEvent;
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let tx = Transaction::new::<crate::operations::subscribe::SubscribeMsg>();
+        let requester = PeerKeyLocation::random();
+        let instance_id = ContractInstanceId::new([7u8; 32]);
+
+        let event = EventKind::Subscribe(SubscribeEvent::SubscribeTimeout {
+            id: tx,
+            requester: requester.clone(),
+            instance_id,
+            retries: 4,
+            elapsed_ms: 60000,
+            timestamp: 12345,
+        });
+
+        // Name-mapping (OTLP event_type): must be a dedicated, queryable name.
+        assert_eq!(event_kind_to_string(&event), "subscribe_timeout");
+
+        // JSON serialization (dashboard payload): every field round-trips.
+        let json = event_kind_to_json(&event);
+        assert_eq!(json["type"], "subscribe_timeout");
+        assert_eq!(json["id"], tx.to_string());
+        assert_eq!(json["requester"], requester.to_string());
+        assert_eq!(json["instance_id"], instance_id.to_string());
+        assert_eq!(json["retries"], 4);
+        assert_eq!(json["elapsed_ms"], 60000);
+        assert_eq!(json["timestamp"], 12345);
+
+        // It is classified as a (failure) subscribe outcome so dashboards
+        // counting paired outcomes recognize it, unlike non-terminal events.
+        assert_eq!(event.subscribe_outcome(), Some(false));
     }
 }

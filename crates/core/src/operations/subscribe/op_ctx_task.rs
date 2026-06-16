@@ -811,6 +811,22 @@ async fn drive_client_subscribe_inner(
                         continue;
                     }
                     None => {
+                        // #3445: emit a terminal telemetry event so a
+                        // timed-out client subscribe is no longer invisible
+                        // on the dashboard. Keyed on `client_tx` (the same
+                        // tx the originating `subscribe_request` was keyed
+                        // on) so the request pairs with this outcome.
+                        if let Some(event) = crate::tracing::NetEventLog::subscribe_timeout(
+                            &client_tx,
+                            &op_manager.ring,
+                            instance_id,
+                            retries + 1,
+                        ) {
+                            op_manager
+                                .ring
+                                .register_events(either::Either::Left(event))
+                                .await;
+                        }
                         return Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                             cause: format!(
                                 "subscribe to {instance_id} timed out after {} rounds",
@@ -3027,6 +3043,49 @@ mod tests {
             after.contains("op_manager.ring.routing_finished("),
             "Subscribed branch must hand the RouteEvent to \
              `routing_finished` so the router actually learns from it."
+        );
+    }
+
+    /// #3445 regression (source-scrape pin): the client-initiated SUBSCRIBE
+    /// driver must emit a `NetEventLog::subscribe_timeout` telemetry event on
+    /// the branch where every candidate peer timed out without a terminal
+    /// reply. Before the fix this branch returned an `OperationError` with no
+    /// telemetry, so a timed-out subscribe left a `subscribe_request` on the
+    /// dashboard with no paired outcome (the River container contract showed
+    /// 196 requests and 0 outcomes — all silent timeouts).
+    ///
+    /// This guards against a future migration silently dropping the call, the
+    /// telemetry-counter-rot failure mode from
+    /// `.claude/rules/bug-prevention-patterns.md`.
+    #[test]
+    fn drive_client_subscribe_inner_emits_timeout_telemetry_on_exhaustion() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let prod = production_source(SOURCE);
+        let body = extract_fn_body(prod, "async fn drive_client_subscribe_inner(");
+
+        // The timeout-exhausted branch is identified by its terminal cause
+        // string; the telemetry emission must appear before that return.
+        let timeout_return = body
+            .find("timed out after {} rounds")
+            .expect("timeout-exhausted branch must exist");
+        let before_timeout_return = &body[..timeout_return];
+        assert!(
+            before_timeout_return.contains("NetEventLog::subscribe_timeout("),
+            "the subscribe timeout-exhausted branch must emit \
+             NetEventLog::subscribe_timeout(..) before returning the \
+             OperationError; otherwise a timed-out subscribe is invisible on \
+             the telemetry dashboard (#3445)."
+        );
+        // It must actually be registered into the event pipeline, not built
+        // and dropped.
+        let emit_pos = before_timeout_return
+            .rfind("NetEventLog::subscribe_timeout(")
+            .unwrap();
+        assert!(
+            before_timeout_return[emit_pos..].contains("register_events("),
+            "the subscribe_timeout event must be handed to \
+             op_manager.ring.register_events(..) so it reaches the telemetry \
+             pipeline (#3445)."
         );
     }
 
