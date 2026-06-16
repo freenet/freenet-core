@@ -303,52 +303,7 @@ async fn register_subscription_listener(
     }
 }
 
-/// Names of the DWARF debug custom sections that mark a debug-compiled
-/// WASM module. Release builds (`--release`) emit none of these.
-const DEBUG_SECTION_PREFIX: &str = ".debug_";
-
-/// Scan a WASM module's custom sections and collect the names of any
-/// DWARF debug sections (`.debug_*`) it contains.
-///
-/// Debug-compiled contracts are typically 10-100x larger than release
-/// builds (e.g. ~12MB vs ~186KB for the ping contract) and can exceed
-/// WebSocket message-size limits, surfacing as a confusing "Message too
-/// long" transport error rather than an actionable one. We detect them
-/// at PUT time by looking for the `.debug_*` custom sections the Rust
-/// debug profile leaves in the module. See #2257.
-///
-/// Returns the matching section names in encounter order (empty when the
-/// module is a release build or cannot be parsed). A module that fails to
-/// parse is treated as "no debug sections": malformed-WASM rejection is a
-/// separate concern handled downstream by the executor, and we must not
-/// reject a contract here merely because this lightweight scan disagrees
-/// with the full validator.
-fn debug_sections(wasm: &[u8]) -> Vec<String> {
-    let mut found = Vec::new();
-    for payload in wasmparser::Parser::new(0).parse_all(wasm) {
-        match payload {
-            Ok(wasmparser::Payload::CustomSection(reader)) => {
-                let name = reader.name();
-                if name.starts_with(DEBUG_SECTION_PREFIX) {
-                    found.push(name.to_string());
-                }
-            }
-            // Stop scanning on the first parse error: we cannot trust
-            // section boundaries past it. Treat as "no debug sections"
-            // (see doc comment) rather than guessing.
-            Err(_) => break,
-            // Non-custom sections are irrelevant to debug detection.
-            Ok(_) => {}
-        }
-    }
-    found
-}
-
-/// Returns true if the WASM module contains any DWARF debug section,
-/// i.e. it was compiled in debug mode. See [`debug_sections`].
-fn contains_debug_sections(wasm: &[u8]) -> bool {
-    !debug_sections(wasm).is_empty()
-}
+use crate::contract::{contains_debug_sections, debug_sections};
 
 /// Report an operation init failure to the client via the result router.
 async fn report_op_init_error(
@@ -2493,7 +2448,7 @@ pub(crate) mod test {
     // would trip `dead_code` in a plain `cargo build`.
     #[cfg(test)]
     mod debug_wasm {
-        use super::super::{contains_debug_sections, debug_sections};
+        use crate::contract::{contains_debug_sections, debug_sections};
 
         /// Minimal unsigned-LEB128 encoder for building WASM section bytes by
         /// hand. Sufficient for the small lengths used in these fixtures.
