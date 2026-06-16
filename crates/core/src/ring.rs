@@ -1332,6 +1332,27 @@ impl Ring {
                     break;
                 }
 
+                // Phase 7 egress gate (#4373). Don't renew a subscription
+                // for a contract we have banned: a renewal re-registers
+                // interest via the same outbound-SUBSCRIBE machinery as a
+                // client-initiated request, but unlike the four
+                // `start_client_*` originator entry points this scheduler
+                // doesn't pass through `reject_if_contract_banned`. Without
+                // this check the node keeps emitting outbound SUBSCRIBE
+                // renewals for a banned-but-still-subscribed contract on
+                // every maintenance cycle until the ban TTL lifts. Checked
+                // before `can_request_subscription` so a banned contract is
+                // skipped regardless of its spam-backoff state.
+                if ring.contract_ban_list.is_banned(contract.id()) {
+                    tracing::debug!(
+                        %contract,
+                        phase = "subscription_renewal_banned_skip",
+                        "skipping subscription renewal for banned contract"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+
                 // Check spam prevention (respects exponential backoff and pending checks)
                 if !ring.can_request_subscription(&contract) {
                     skipped += 1;
@@ -3869,6 +3890,177 @@ mod k_closest_source_tests {
             body.contains("not_ready_fallback"),
             "k_closest_potentially_hosting must keep the not-yet-ready peer \
              fallback so cold-start nodes don't fail every GET with EmptyRing."
+        );
+    }
+}
+
+#[cfg(test)]
+mod renewal_ban_gate_source_tests {
+    //! Source-scrape pin test for the subscription-renewal ban gate (#4373).
+    //!
+    //! `recover_orphaned_subscriptions` spawns a `run_renewal_subscribe`
+    //! driver for every contract in `contracts_needing_renewal()`. That
+    //! driver emits an outbound SUBSCRIBE using the same machinery as a
+    //! client-initiated request, but — unlike the four `start_client_*`
+    //! originator entry points — the renewal scheduler does NOT route
+    //! through `operations::reject_if_contract_banned`. So before #4373 a
+    //! contract that was banned while the node still held an active
+    //! subscription kept emitting outbound SUBSCRIBE renewals on every
+    //! maintenance cycle until the ban TTL lifted.
+    //!
+    //! The fix adds an `is_banned` gate in the renewal loop. As the
+    //! `k_closest_source_tests` module above documents, building a real
+    //! `Ring` for a behavioral test requires scaffolding that does not yet
+    //! exist in this suite, so — mirroring the `*_dispatch_gates_banned_contracts`
+    //! pins in `contract_ban_list.rs` — this test scrapes the production
+    //! source to ensure the gate stays wired in and keeps running BEFORE
+    //! the renewal is spawned. A refactor that drops or reorders the gate
+    //! would fail CI rather than silently re-open the egress leak.
+
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("ring.rs");
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("ring.rs must have a top-level #[cfg(test)] mod section");
+        &FULL[..cutoff]
+    }
+
+    fn extract_fn_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
+        let start = source
+            .find(signature_prefix)
+            .unwrap_or_else(|| panic!("could not find {signature_prefix}"));
+        let brace = source[start..].find('{').expect("fn sig must have body");
+        let body_start = start + brace + 1;
+        let bytes = source.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unbalanced braces while extracting {signature_prefix}");
+    }
+
+    #[test]
+    fn renewal_loop_gates_banned_contracts_before_spawning() {
+        let src = production_source();
+        let body = extract_fn_body(
+            src,
+            "async fn recover_orphaned_subscriptions(ring: Arc<Self>",
+        );
+
+        let gate_pos = body.find("contract_ban_list.is_banned").expect(
+            "the subscription-renewal loop must gate on \
+             `contract_ban_list.is_banned` so a banned-but-still-subscribed \
+             contract stops emitting outbound SUBSCRIBE renewals (#4373). If \
+             this gate was removed, the egress leak is back.",
+        );
+
+        // The gate must precede the spam-prevention check: a banned contract
+        // is skipped regardless of its `can_request_subscription` backoff
+        // state, so order matters.
+        let can_request_pos = body
+            .find("can_request_subscription(&contract)")
+            .expect("renewal loop must still consult can_request_subscription");
+        assert!(
+            gate_pos < can_request_pos,
+            "ban gate (offset {gate_pos}) must run BEFORE the \
+             can_request_subscription spam check (offset {can_request_pos}) so \
+             a banned contract is always skipped"
+        );
+
+        // The gate must precede the renewal spawn. Both `mark_subscription_pending`
+        // (which flips per-contract pending state) and `run_renewal_subscribe`
+        // (the outbound-egress driver) must only be reached for non-banned
+        // contracts.
+        let mark_pending_pos = body
+            .find("mark_subscription_pending(contract)")
+            .expect("renewal loop must still call mark_subscription_pending");
+        assert!(
+            gate_pos < mark_pending_pos,
+            "ban gate (offset {gate_pos}) must run BEFORE \
+             mark_subscription_pending (offset {mark_pending_pos})"
+        );
+        let spawn_pos = body
+            .find("run_renewal_subscribe(")
+            .expect("renewal loop must still spawn run_renewal_subscribe");
+        assert!(
+            gate_pos < spawn_pos,
+            "ban gate (offset {gate_pos}) must run BEFORE the \
+             run_renewal_subscribe outbound-egress spawn (offset {spawn_pos})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod renewal_ban_gate_behavior_tests {
+    //! Behavioral coverage for the predicate the renewal-loop ban gate
+    //! relies on (#4373): a contract on the `ContractBanList` reports
+    //! `is_banned == true` (so the loop's `continue` fires), and an
+    //! un-banned contract reports `false` (so renewal proceeds). This
+    //! exercises the exact `contract_ban_list.is_banned(contract.id())`
+    //! call the loop makes, including the `ContractKey::id()` projection,
+    //! against the real ban-list type and a controllable time source.
+
+    use super::contract_ban_list::{BanReason, ContractBanList};
+    // `TimeSource` is needed in scope for the `ts.now()` trait method.
+    use crate::util::time_source::{SharedMockTimeSource, TimeSource};
+    use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn mk_key(byte: u8) -> ContractKey {
+        // A full `ContractKey` (not a bare instance id) so the test
+        // exercises the same `contract.id()` projection the renewal loop's
+        // `is_banned(contract.id())` gate performs.
+        ContractKey::from_id_and_code(
+            ContractInstanceId::new([byte; 32]),
+            CodeHash::new([byte; 32]),
+        )
+    }
+
+    #[test]
+    fn banned_contract_is_skipped_for_renewal_while_unbanned_proceeds() {
+        let ts = SharedMockTimeSource::new();
+        let ban_list = ContractBanList::new(Arc::new(ts.clone()));
+
+        let banned = mk_key(1);
+        let healthy = mk_key(2);
+
+        // Ban one contract; leave the other alone.
+        ban_list.ban(
+            *banned.id(),
+            ts.now() + Duration::from_secs(60),
+            BanReason::AutoMad,
+        );
+
+        // The renewal loop's gate is `if is_banned(contract.id()) { continue }`.
+        // Banned -> skipped; un-banned -> proceeds to renewal.
+        assert!(
+            ban_list.is_banned(banned.id()),
+            "a banned contract must be skipped for subscription renewal (#4373)"
+        );
+        assert!(
+            !ban_list.is_banned(healthy.id()),
+            "a non-banned contract must still be eligible for renewal"
+        );
+
+        // Once the ban TTL lifts, the formerly-banned contract becomes
+        // eligible for renewal again — the gate is time-bounded, matching
+        // the issue's "self-resolves when the ban TTL expires" note.
+        ts.advance_time(Duration::from_secs(61));
+        assert!(
+            !ban_list.is_banned(banned.id()),
+            "after the ban TTL expires the contract is eligible for renewal again"
         );
     }
 }
