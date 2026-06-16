@@ -1310,6 +1310,12 @@ mod tests {
     /// competing against a close-but-unlucky one — so the convergence metric is
     /// stressed, not just rubber-stamped against a clean monotone gradient.
     ///
+    /// `bias_mag` controls the per-peer reliability bias magnitude (the EWMA
+    /// adjustment strength); the sweep test varies it to map the EWMA-magnitude
+    /// dimension the issue asks about. Larger `bias_mag` = individual records
+    /// diverge harder from the distance curve, i.e. the strongest test of
+    /// whether per-peer history can override locality.
+    ///
     /// To exercise MATURE per-peer history (`>= ADJUSTMENT_PRIOR_SIZE = 10`
     /// retained events per peer) within `IsotonicEstimator`'s 500-point rolling
     /// window, keep `pool.len() * rounds <= MAX_REGRESSION_POINTS (500)` and
@@ -1317,15 +1323,15 @@ mod tests {
     /// with `rounds` retained observations. Returns the event history (the
     /// caller builds a `Router` per candidate window from it, since `Router` is
     /// not `Clone`). Deterministic under the caller's seed guard.
-    fn gradient_history(pool: &[PeerKeyLocation], rounds: usize) -> Vec<RouteEvent> {
-        // Per-peer reliability bias in [-0.35, +0.35], independent of distance.
-        // Positive = the peer fails MORE than its distance predicts (bad
-        // individual record); negative = fails LESS (good individual record).
-        // Drawn once per peer so the bias is stable across rounds and the EWMA
-        // converges to a mature, peer-specific adjustment.
+    fn gradient_history(pool: &[PeerKeyLocation], rounds: usize, bias_mag: f64) -> Vec<RouteEvent> {
+        // Per-peer reliability bias in [-bias_mag, +bias_mag], independent of
+        // distance. Positive = the peer fails MORE than its distance predicts
+        // (bad individual record); negative = fails LESS (good individual
+        // record). Drawn once per peer so the bias is stable across rounds and
+        // the EWMA converges to a mature, peer-specific adjustment.
         let bias: Vec<f64> = pool
             .iter()
-            .map(|_| GlobalRng::random_range(-0.35..0.35))
+            .map(|_| GlobalRng::random_range(-bias_mag..bias_mag))
             .collect();
 
         let mut events: Vec<RouteEvent> = Vec::new();
@@ -1418,13 +1424,16 @@ mod tests {
     /// locality (the #4230 worry), the chosen hop's rank-percentile would drift
     /// toward 0.5; instead it stays near zero.
     ///
-    /// Empirical basis for the thresholds: across a 12-seed robustness scan
-    /// (40-peer pool, MATURE per-peer history with per-peer reliability biases
-    /// independent of distance), the window=25 mean rank-percentile ranged
-    /// 0.042..0.120 and p90 ranged 0.10..0.30. The bounds below (mean < 0.18,
-    /// p90 < 0.40) sit above the observed worst case while remaining far below
-    /// the no-convergence value of 0.5, so a real degradation (history
-    /// overriding distance) trips CI but seed jitter does not. Deterministic.
+    /// Empirical basis for the thresholds: across a 12-seed x 2-bias-magnitude
+    /// robustness scan (40-peer pool, MATURE per-peer history with per-peer
+    /// reliability biases independent of distance), the window=25 mean
+    /// rank-percentile ranged 0.037..0.159 and p90 ranged 0.10..0.35. The bounds
+    /// below for this steady-state case (bias_mag 0.35: mean < 0.18, p90 < 0.40)
+    /// sit above the observed worst case while remaining far below the
+    /// no-convergence value of 0.5, so a real degradation (history overriding
+    /// distance) trips CI but seed jitter does not. The companion sweep test
+    /// uses slightly wider bounds because it also exercises bias_mag 0.5.
+    /// Deterministic.
     #[test]
     fn routing_convergence_preserved_at_window_25_4230() {
         let _guard = crate::config::GlobalRng::seed_guard(0x4230_C0DE);
@@ -1438,11 +1447,11 @@ mod tests {
         );
 
         // 40 peers x 12 rounds = 480 events (<= the estimator's 500-point
-        // window), giving every peer 12 retained observations — above
-        // ADJUSTMENT_PRIOR_SIZE (10), so per-peer EWMA adjustments are MATURE,
-        // not shrunk toward the global curve. This is the regime #4230 cares
-        // about: a peer's individual record has had time to diverge from what
-        // its distance alone predicts.
+        // window), giving every peer 12 retained observations. Combined with
+        // the per-peer reliability bias in `gradient_history`, this drives each
+        // peer's EWMA adjustment to a mature, peer-specific value that diverges
+        // from the global distance curve — the regime #4230 cares about, where
+        // a peer's individual record competes against geographic locality.
         let pool: Vec<PeerKeyLocation> = (0..40u32).map(peer_in_subnet).collect();
         // The pool must contain 40 distinct ring locations; if `peer_in_subnet`
         // ever collided them the metrics below would silently lose meaning.
@@ -1452,30 +1461,40 @@ mod tests {
             .collect();
         assert_eq!(distinct_locs.len(), pool.len(), "peer pool has collisions");
 
-        let history = gradient_history(&pool, 12); // 40 * 12 = 480 events
+        let history = gradient_history(&pool, 12, 0.35); // 40 * 12 = 480 events
 
-        // Prove the mature-history regime is actually exercised (addresses the
-        // false-coverage risk where too few events leave adjustments shrunk):
-        // every peer must carry a per-peer failure adjustment with effective
-        // count >= ADJUSTMENT_PRIOR_SIZE.
+        // Prove the divergent-per-peer-history regime is actually exercised, so
+        // these tests aren't false comfort. Two checks:
+        //   (a) every peer has an active per-peer adjustment (the global
+        //       regression reached ADJUSTMENT_PRIOR_SIZE, so adjustments were
+        //       created and, since the seeded effective_count >=
+        //       MIN_POINTS_FOR_REGRESSION, are actually APPLIED in scoring), and
+        //   (b) the per-peer adjustment VALUES span a meaningful range — i.e.
+        //       individual records genuinely diverge from the global distance
+        //       curve rather than all collapsing onto it. (We assert on the
+        //       adjustment *value* spread, NOT effective_count: effective_count
+        //       is seeded at the EWMA fixed point ~10 and stays there regardless
+        //       of how many real events accrue, so it cannot witness divergence.)
         let router_probe = Router::new(&history);
         assert_eq!(
             router_probe.failure_estimator.peer_adjustments.len(),
             pool.len(),
-            "every peer must have a per-peer failure adjustment"
+            "every peer must have a per-peer failure adjustment applied"
         );
-        let min_eff = router_probe
+        let adj_values: Vec<f64> = router_probe
             .failure_estimator
             .peer_adjustments
             .values()
-            .map(|a| a.event_count())
-            .min()
-            .unwrap();
+            .map(|a| a.value())
+            .collect();
+        let adj_min = adj_values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let adj_max = adj_values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         assert!(
-            min_eff >= 10,
-            "per-peer EWMA not mature: min effective event count {min_eff} < 10 \
-             (ADJUSTMENT_PRIOR_SIZE) — the test would not exercise the regime \
-             where per-peer history can override distance"
+            adj_max - adj_min > 0.2,
+            "per-peer history did not diverge (adjustment value spread \
+             {:.3} too small) — the test would not exercise the regime where \
+             per-peer history competes against distance",
+            adj_max - adj_min
         );
 
         let (mean_pct, p90_pct) = measure_convergence(&history, &pool, 25, 400);
@@ -1507,59 +1526,80 @@ mod tests {
     /// Finding: widening DOES raise the chosen-hop rank-percentile modestly
     /// (more near-equidistant candidates become visible, so per-peer history
     /// breaks more ties), but it plateaus well inside the convergent regime —
-    /// it never drifts toward 0.5. So the #4222 widening is safe; this test
-    /// pins that. Deterministic.
+    /// it never drifts toward 0.5, even when per-peer histories diverge hard
+    /// from the distance curve. So the #4222 widening is safe; this test pins
+    /// that across both the window dimension and the EWMA-magnitude dimension
+    /// the issue calls out. Deterministic.
+    ///
+    /// Note on the structural cap: `select_closest_peers` truncates to the
+    /// `window` closest peers BEFORE the predictor reranks, so at small windows
+    /// the chosen-hop rank-percentile is mechanically bounded near `window /
+    /// pool_len` (e.g. ~0.125 at window=5 in a 40-peer pool) and the assertions
+    /// there essentially cannot fail. The load-bearing checks are therefore at
+    /// the wide windows (25 and 40, where the whole near-cluster — or the whole
+    /// pool — is visible and per-peer history has the most room to override
+    /// locality) plus the bounded 5->25 increase.
     #[test]
     fn routing_convergence_window_sweep_does_not_degrade_4230() {
         let _guard = crate::config::GlobalRng::seed_guard(0x4230_5EED);
 
-        // 40 peers x 12 rounds = 480 events: mature per-peer EWMA (>= 10
-        // retained observations per peer) within the 500-point window. See the
-        // companion steady-state test for the rationale and the explicit
-        // maturity assertion.
+        // 40 peers x 12 rounds = 480 events: mature per-peer EWMA within the
+        // 500-point window. See the companion steady-state test for the
+        // divergence assertion. The sweep tops out at window=40 (the pool size);
+        // windows beyond that are equivalent since truncation can't exceed the
+        // candidate count.
+        //
+        // Second sweep dimension: per-peer bias magnitude (EWMA-adjustment
+        // strength). 0.35 is the steady-state value; 0.5 pushes individual
+        // records to diverge maximally from the distance curve — the strongest
+        // stress on "can per-peer history override locality?".
         let pool: Vec<PeerKeyLocation> = (0..40u32).map(peer_in_subnet).collect();
-        let history = gradient_history(&pool, 12);
 
-        // (window, mean_pct, p90_pct) for each swept window. The sweep tops out
-        // at 40 (the pool size); windows beyond that are equivalent to 40 since
-        // truncation can't exceed the candidate count.
-        let mut results: Vec<(usize, f64, f64)> = Vec::new();
-        for &window in &[5usize, 10, 25, 40] {
-            let (mean_pct, p90_pct) = measure_convergence(&history, &pool, window, 300);
-            results.push((window, mean_pct, p90_pct));
-        }
+        for &bias_mag in &[0.35f64, 0.5] {
+            let history = gradient_history(&pool, 12, bias_mag);
 
-        // At EVERY swept window the chosen hop stays deep in the closest tail —
-        // never near the median. This is the load-bearing convergence property:
-        // widening the candidate window does not break small-world routing.
-        for &(window, mean_pct, p90_pct) in &results {
+            // (window, mean_pct, p90_pct) for each swept window.
+            let mut results: Vec<(usize, f64, f64)> = Vec::new();
+            for &window in &[5usize, 10, 25, 40] {
+                let (mean_pct, p90_pct) = measure_convergence(&history, &pool, window, 300);
+                results.push((window, mean_pct, p90_pct));
+            }
+
+            // At EVERY swept window the chosen hop stays deep in the closest
+            // tail — never near the median. This is the load-bearing
+            // convergence property: widening the candidate window (at any EWMA
+            // magnitude) does not break small-world routing.
+            for &(window, mean_pct, p90_pct) in &results {
+                assert!(
+                    mean_pct < 0.20,
+                    "issue #4230: at window={window} bias_mag={bias_mag} mean \
+                     chosen-hop rank-percentile {mean_pct:.3} drifted toward the \
+                     median — routing convergence degraded by candidate-window size"
+                );
+                assert!(
+                    p90_pct < 0.42,
+                    "issue #4230: at window={window} bias_mag={bias_mag} p90 \
+                     chosen-hop rank-percentile {p90_pct:.3} is too high — the \
+                     routing tail degraded"
+                );
+            }
+
+            // Widening from the historical 5 to the shipped 25 must keep the
+            // chosen hop firmly in the closest tail. We do NOT require window=25
+            // to equal window=5 (it is expected to be higher — more visible
+            // candidates means per-peer history breaks more near-equidistant
+            // ties), only that the increase is bounded and stays convergent.
+            let m5 = results.iter().find(|r| r.0 == 5).unwrap().1;
+            let m25 = results.iter().find(|r| r.0 == 25).unwrap().1;
             assert!(
-                mean_pct < 0.18,
-                "issue #4230: at window={window} mean chosen-hop rank-percentile \
-                 {mean_pct:.3} drifted toward the median — routing convergence \
-                 degraded by the candidate-window size"
-            );
-            assert!(
-                p90_pct < 0.40,
-                "issue #4230: at window={window} p90 chosen-hop rank-percentile \
-                 {p90_pct:.3} is too high — the routing tail degraded"
+                m25 < 0.20 && m25 - m5 < 0.15,
+                "issue #4230: at bias_mag={bias_mag} widening the candidate \
+                 window from 5 to 25 raised the mean chosen-hop rank-percentile \
+                 from {m5:.3} to {m25:.3} — the widening pushed routing \
+                 materially toward the median and may need a soft distance bias \
+                 in the predictor (see issue #4230)"
             );
         }
-
-        // Widening from the historical 5 to the shipped 25 must keep the chosen
-        // hop firmly in the closest tail. We do NOT require window=25 to equal
-        // window=5 (it is expected to be higher — more visible candidates means
-        // per-peer history breaks more near-equidistant ties), only that the
-        // increase is bounded and stays well inside the convergent regime.
-        let m5 = results.iter().find(|r| r.0 == 5).unwrap().1;
-        let m25 = results.iter().find(|r| r.0 == 25).unwrap().1;
-        assert!(
-            m25 < 0.18 && m25 - m5 < 0.13,
-            "issue #4230: widening the candidate window from 5 to 25 raised the \
-             mean chosen-hop rank-percentile from {m5:.3} to {m25:.3} — the \
-             widening pushed routing materially toward the median and may need \
-             a soft distance bias in the predictor (see issue #4230)"
-        );
     }
 
     #[test]
