@@ -213,7 +213,7 @@ fn emit_snapshot(local_peer_id: &str, target: SocketAddr, stats: &RollingRttStat
         recent_samples,
         "shadow_reference_ping"
     );
-    crate::tracing::telemetry::send_standalone_event_with_peer_id(
+    crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
         "shadow_reference_ping",
         local_peer_id,
         serde_json::json!({

@@ -298,8 +298,9 @@ pub(crate) fn spawn_demand_aggregator(local_peer_id: String, monitor: &Backgroun
 /// Emit one `shadow_rate_demand` event. See the module-level rustdoc for
 /// why the OTLP send is independent of the `tracing::debug!` level: the
 /// local mirror is at DEBUG (compiled out of release builds via
-/// `release_max_level_info`), while `send_standalone_event_with_peer_id`
-/// reaches the collector regardless of log level.
+/// `release_max_level_info`), while `send_standalone_shadow_event_with_peer_id`
+/// reaches the collector regardless of log level (tagged low-priority so it
+/// yields to operational telemetry under the rate-limiter sub-budget, #4380).
 fn emit_demand_snapshot(local_peer_id: &str, sent_bytes_last_interval: u64) {
     let active_connections = active_connections();
     let broadcast_queue_depth = BROADCAST_QUEUE_DEPTH.load(Ordering::Relaxed);
@@ -318,7 +319,7 @@ fn emit_demand_snapshot(local_peer_id: &str, sent_bytes_last_interval: u64) {
         global_per_connection_rate_bytes,
         "shadow_rate_demand"
     );
-    crate::tracing::telemetry::send_standalone_event_with_peer_id(
+    crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
         "shadow_rate_demand",
         local_peer_id,
         serde_json::json!({
@@ -377,7 +378,7 @@ fn emit_class_snapshot(
         bulk_bytes,
         "shadow_outbound_class"
     );
-    crate::tracing::telemetry::send_standalone_event_with_peer_id(
+    crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
         "shadow_outbound_class",
         local_peer_id,
         serde_json::json!({
