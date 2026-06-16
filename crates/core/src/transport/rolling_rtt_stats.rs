@@ -331,19 +331,21 @@ pub(crate) fn spawn_aggregator(
 /// mirror at INFO was the third-largest contributor to the
 /// #4251 / #4272 log-volume regression at ~3,600 lines/hour per
 /// node. Production telemetry reaches the OTLP collector via the
-/// `send_standalone_event_with_peer_id` call below, which is
+/// `send_standalone_shadow_event_with_peer_id` call below, which is
 /// independent of the tracing level, so the dashboard's 1 Hz feed
 /// survives.
 ///
-/// `send_standalone_event_with_peer_id` pushes a structured event
-/// through the global telemetry sender
-/// (`crate::tracing::telemetry::send_standalone_event_with_peer_id`)
+/// `send_standalone_shadow_event_with_peer_id` pushes a structured
+/// event through the global telemetry sender
+/// (`crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id`)
 /// so it reaches the central OTLP collector (per the `NetEventLog`
 /// path that `TelemetryReporter` consumes). Without that, the
 /// aggregate would land only in per-node file logs and the 2-4 week
 /// observation the RFC calls for would require manual log scraping.
 /// The `local_peer_id` argument is attached as an OTLP attribute so
-/// the collector can disaggregate per reporting node.
+/// the collector can disaggregate per reporting node. The shadow
+/// variant tags the event as low-priority so it yields to operational
+/// telemetry under the rate-limiter sub-budget (#4380).
 fn emit_aggregate_snapshot(local_peer_id: &str) {
     let snap = registry_snapshot();
     let active_peers = snap.len();
@@ -382,7 +384,7 @@ fn emit_aggregate_snapshot(local_peer_id: &str) {
     // call surfaces the same numbers in the freenet telemetry
     // dashboard so the 2-4 week observation horizon is queryable
     // without manual log scraping.
-    crate::tracing::telemetry::send_standalone_event_with_peer_id(
+    crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
         "shadow_rtt_aggregate",
         local_peer_id,
         serde_json::json!({

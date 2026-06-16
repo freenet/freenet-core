@@ -172,7 +172,7 @@ fn emit_iface_snapshot(
         op_tx_bytes,
         "shadow_iface_tx"
     );
-    crate::tracing::telemetry::send_standalone_event_with_peer_id(
+    crate::tracing::telemetry::send_standalone_shadow_event_with_peer_id(
         "shadow_iface_tx",
         local_peer_id,
         serde_json::json!({
