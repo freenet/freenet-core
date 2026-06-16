@@ -606,17 +606,29 @@ pub(in crate::node) struct P2pConnManager {
 /// Minimum negotiated protocol version a peer must report before we send it a
 /// [`SubscribeHint`](crate::message::NetMessageV1::SubscribeHint).
 ///
-/// MUST equal the release version that first ships SubscribeHint. A peer is only
+/// DEACTIVATED after the v0.2.73 UPDATE-broadcast-degradation incident. Set to
+/// `(0, 3, 0)`, which is ABOVE every shipped 0.2.x release, so the gate
+/// (`remote.is_some_and(|v| v >= floor)`, fail-closed on unknown) evaluates to
+/// `false` for all 0.2.x peers and the placement-migration wire behavior never
+/// fires in production. The placement-migration path (directed subscribes plus
+/// the `ConsiderContractMigration` emits) amplified the #4145/#4231
+/// broadcast-backpressure surface and drove a network-wide UPDATE-broadcast
+/// degradation on 0.2.73. The migration code is intentionally left in place;
+/// re-enable it by LOWERING this floor back to the release that first ships a
+/// load-safe SubscribeHint once the broadcast-backpressure load issue is fixed.
+///
+/// Original (pre-deactivation) contract, still true mechanically: a peer is only
 /// sent SubscribeHint if its negotiated version is >= this; older peers cannot
 /// deserialize the new wire variant and would drop the connection. None (unknown,
 /// e.g. joiner->gateway) is treated as unsupported.
 ///
-/// UPDATE AT RELEASE TIME, then FREEZE: set this to the exact release version
-/// that first ships SubscribeHint and do NOT keep bumping it afterward to track
-/// the crate version. Once shipped in release R, peers running R can deserialize
-/// the variant, so the floor must stay at R forever — raising it above R would
-/// silently stop sending hints to fully-capable R peers. (This is why there is
-/// no `floor` vs `CARGO_PKG_VERSION` unit test; see docs/RELEASING.md.)
+/// WHEN RE-ENABLING — UPDATE AT RELEASE TIME, then FREEZE: set this to the exact
+/// release version that first ships the load-safe SubscribeHint and do NOT keep
+/// bumping it afterward to track the crate version. Once shipped in release R,
+/// peers running R can deserialize the variant, so the floor must stay at R
+/// forever — raising it above R would silently stop sending hints to
+/// fully-capable R peers. (This is why there is no `floor` vs `CARGO_PKG_VERSION`
+/// unit test; see docs/RELEASING.md.)
 ///
 /// This is a single non-cfg constant: deliberately NOT lowered under any test
 /// feature, because `testing` is pulled into the SHIPPED release binary (`fdev`
@@ -626,7 +638,7 @@ pub(in crate::node) struct P2pConnManager {
 /// Simulation tests that want the cascade lower the floor per-node at runtime via
 /// `NodeConfig::subscribe_hint_floor_override` (set by
 /// `SimNetwork::enable_placement_migration`), which never touches production.
-const SUBSCRIBE_HINT_MIN_VERSION: (u8, u8, u16) = (0, 2, 73);
+const SUBSCRIBE_HINT_MIN_VERSION: (u8, u8, u16) = (0, 3, 0);
 
 /// Pure version-gate decision, factored out so the comparison and the
 /// fail-closed-on-unknown-version (`None`) behavior are unit-testable with an
