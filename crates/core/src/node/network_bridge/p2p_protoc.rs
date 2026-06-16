@@ -5296,21 +5296,37 @@ impl P2pConnManager {
                     }
                 };
                 let send_res = bridge.send(peer_addr, net_msg).await;
-                if send_res.is_ok() {
-                    // Send the stream data after the metadata message
-                    if let Err(err) = bridge
-                        .send_stream(peer_addr, sid, bytes::Bytes::from(payload_bytes), metadata)
-                        .await
-                    {
-                        tracing::warn!(
-                            tx = %update_tx,
-                            peer = %peer_addr,
-                            error = %err,
-                            "Failed to send broadcast stream data"
-                        );
+                match send_res {
+                    Ok(()) => {
+                        // The metadata message went out; the streamed full state is
+                        // the actual payload. The success arm below caches
+                        // `our_summary` for this peer (FIX 1 of #4145), which is only
+                        // correct if the STATE was sent — so this branch's result must
+                        // reflect the stream send, not just the metadata send. If
+                        // `send_stream` fails, a streamed full state that never landed
+                        // would otherwise be marked as delivered, recreating the
+                        // #2763/#4235 divergence hazard (a wrongly-cached summary makes
+                        // the next delta unappliable). Propagate the stream-send error.
+                        bridge
+                            .send_stream(
+                                peer_addr,
+                                sid,
+                                bytes::Bytes::from(payload_bytes),
+                                metadata,
+                            )
+                            .await
+                            .inspect_err(|err| {
+                                tracing::warn!(
+                                    tx = %update_tx,
+                                    peer = %peer_addr,
+                                    error = %err,
+                                    "Failed to send broadcast stream data"
+                                );
+                            })
                     }
+                    // Metadata send failed; nothing was streamed. Propagate the error.
+                    Err(err) => Err(err),
                 }
-                send_res
             } else {
                 let msg = crate::operations::update::UpdateMsg::BroadcastTo {
                     id: update_tx,
@@ -5355,13 +5371,35 @@ impl P2pConnManager {
                 op_manager
                     .interest_manager
                     .refresh_peer_interest(&key, &peer_key);
-            }
 
-            // PR #2763 FIX: Only update cached summary when we sent a delta.
-            // This is separate from the TTL refresh above — update_peer_summary
-            // sets the cached summary (used for delta computation), while
-            // refresh_peer_interest only extends the TTL.
-            if sent_delta {
+                // Issue #4145: Cache the peer summary on ANY successful broadcast
+                // send — delta OR full state — not just deltas. Separate from the
+                // TTL refresh above: update_peer_summary sets the cached summary
+                // (used for delta computation), refresh_peer_interest only extends
+                // the TTL.
+                //
+                // PR #2763 originally gated this on `sent_delta`, which created a
+                // chicken-and-egg: a delta needs the peer's cached summary, but the
+                // summary was only cached after a delta — so every NEW subscriber
+                // (or a peer whose summary was cleared) starts on full state and is
+                // trapped sending full state forever. Under sustained fan-out that
+                // is the #4233 full-state broadcast storm.
+                //
+                // Safe now because this runs only inside the send-success (`else`)
+                // arm. This is the inline non-streaming `BroadcastTo` path: a
+                // successful `bridge.send` is the terminal state we can observe
+                // (the same assumption the delta path already made). Caching on a
+                // delivered broadcast is safe even when the cache is momentarily
+                // wrong: a wrongly-cached summary is corrected by the periodic
+                // InterestSync summary exchange (~5 min, node.rs) and by the
+                // delta-apply-failure → ResyncRequest path that clears the
+                // sender's cached summary (node.rs ~2119). Caching here lets the
+                // NEXT broadcast to this peer be a small delta. The streaming
+                // (full-state) path is gated more strictly on a `Delivered`
+                // completion (#4235) in `broadcast_queue.rs` — note that signal is
+                // sender-side completion, not a receiver ack, so a lost stream
+                // tail is covered by the same two backstops.
+                // (Telemetry above still records delta-vs-full-state separately.)
                 if let Some(summary) = &our_summary {
                     op_manager.interest_manager.update_peer_summary(
                         &key,
