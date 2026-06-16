@@ -570,7 +570,7 @@ jobs:
           # RealTime connection idle timeout during `spawn_blocking` (WASM
           # execution), spuriously tearing down healthy connections and flaking
           # the precise streaming/GET sim tests on EVERY nextest retry (the fdev
-          # sims run ~8m, overlapping all 3 retries). Running nextest uncontended
+          # sims run ~8-15m, overlapping all 3 retries). Running nextest uncontended
           # first removes that interference; the fdev load sims run afterwards
           # (still parallel among themselves). Use a ( ) subshell so `exit $rc`
           # ends the subshell, not this whole step.
@@ -589,12 +589,15 @@ jobs:
           ) > sim-logs/nextest.log 2>&1 || NEXTEST_FAILED=1
           echo "nextest phase done (failed=${NEXTEST_FAILED}) — starting fdev load sims"
 
-          # 8 minute cap per sim, SIGKILL 30s later if it refuses to die.
+          # 15 minute cap per sim, SIGKILL 30s later if it refuses to die.
+          # (#4404 placement migration roughly doubles per-sim cost when active,
+          # so 8m could be exceeded on a slow release-branch runner; the job's
+          # 40m timeout-minutes still covers the four sims running in parallel.)
           # Background directly (no function) so $! refers to the actual child
           # of this shell, which `wait` can then reap.
           {
             echo "== $(date -u +%H:%M:%S) ci-medium-50 starting"
-            timeout --kill-after=30s 8m target/release/fdev test \
+            timeout --kill-after=30s 15m target/release/fdev test \
               --name "ci-medium-50" \
               --seed 0xDEADBEEF \
               --gateways 4 --nodes 46 --events 2000 \
@@ -611,7 +614,7 @@ jobs:
 
           {
             echo "== $(date -u +%H:%M:%S) ci-fault-loss starting"
-            timeout --kill-after=30s 8m target/release/fdev test \
+            timeout --kill-after=30s 15m target/release/fdev test \
               --name "ci-fault-loss" \
               --seed 0xFA017001 \
               --gateways 3 --nodes 27 --events 1000 \
@@ -628,7 +631,7 @@ jobs:
 
           {
             echo "== $(date -u +%H:%M:%S) ci-high-latency starting"
-            timeout --kill-after=30s 8m target/release/fdev test \
+            timeout --kill-after=30s 15m target/release/fdev test \
               --name "ci-high-latency" \
               --seed 0x1A7E0C71 \
               --gateways 2 --nodes 12 --events 500 \
@@ -644,7 +647,7 @@ jobs:
 
           {
             echo "== $(date -u +%H:%M:%S) ci-churn-20 starting"
-            timeout --kill-after=30s 8m target/release/fdev test \
+            timeout --kill-after=30s 15m target/release/fdev test \
               --name "ci-churn-20" \
               --seed 0xC102FEED \
               --gateways 2 --nodes 18 --events 500 \

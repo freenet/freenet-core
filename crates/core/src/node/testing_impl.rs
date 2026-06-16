@@ -1266,6 +1266,36 @@ impl SimNetwork {
         self
     }
 
+    /// Force the placement-migration (`SubscribeHint`) cascade OFF for this
+    /// simulation, regardless of the build version, by raising the per-node
+    /// version floor to an unreachable value `(255, 255, 65535)`.
+    ///
+    /// The mirror of [`enable_placement_migration`](Self::enable_placement_migration).
+    /// The cascade is already OFF by default in sim *on a build below the
+    /// production `SUBSCRIBE_HINT_MIN_VERSION` floor* — but a test must not rely
+    /// on that build-version gating: when the build version reaches the floor
+    /// (e.g. on the v0.2.73 release branch, where #4404 ships active), the
+    /// default flips to ON and silently perturbs any test whose premise assumes
+    /// the contract stays put. A test that exercises relay/assembly/dead-end
+    /// mechanics (not placement) calls this to pin migration OFF at any build
+    /// version. Like `enable_placement_migration`, this patches the
+    /// already-built node/gateway configs (config_* ran during construction
+    /// when the override was still `None`).
+    #[allow(dead_code)]
+    pub fn disable_placement_migration(&mut self) -> &mut Self {
+        // Unreachable floor: no real or simulated peer version reaches it, so
+        // `version_supports_subscribe_hint` always returns false → cascade off.
+        const UNREACHABLE_FLOOR: (u8, u8, u16) = (255, 255, 65535);
+        self.subscribe_hint_floor_override = Some(UNREACHABLE_FLOOR);
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.subscribe_hint_floor_override = Some(UNREACHABLE_FLOOR);
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.subscribe_hint_floor_override = Some(UNREACHABLE_FLOOR);
+        }
+        self
+    }
+
     /// Returns the VirtualTime instance for this simulation.
     ///
     /// VirtualTime is always enabled. Use this to advance time and control
