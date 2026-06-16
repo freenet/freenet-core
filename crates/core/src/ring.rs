@@ -1011,11 +1011,21 @@ impl Ring {
             let history = match register.get_router_events(Self::ROUTER_HISTORY_LIMIT).await {
                 Ok(h) => h,
                 Err(error) => {
-                    // Previously this was an `expect()` that would silently panic
-                    // the task. Now that the task is monitored, returning will
-                    // trigger the BackgroundTaskMonitor and propagate the failure.
-                    tracing::error!(error = %error, "Shutting down refresh router task");
-                    return;
+                    // get_router_events errors are transient and recoverable —
+                    // e.g. file-descriptor exhaustion ("os error 24") when the
+                    // AOF segment file can't be opened during a connection-churn
+                    // spike. Router refresh is a best-effort optimization, so we
+                    // keep the existing in-memory router in place and retry on
+                    // the next interval rather than killing the node. (A genuine
+                    // panic inside this task is still caught by the
+                    // BackgroundTaskMonitor — only this expected, transient read
+                    // failure is swallowed here.)
+                    tracing::error!(
+                        error = %error,
+                        "Failed to refresh routing history from event log; \
+                         keeping existing router and retrying on next interval"
+                    );
+                    continue;
                 }
             };
             if !history.is_empty() {
@@ -4237,6 +4247,7 @@ mod op_manager_state_tests {
 #[cfg(test)]
 mod refresh_router_tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use either::Either;
@@ -4346,6 +4357,111 @@ mod refresh_router_tests {
         let snapshot = router.read().snapshot();
         assert_eq!(snapshot.failure_events, 0);
         assert_eq!(snapshot.success_events, 0);
+    }
+
+    /// Mock register whose `get_router_events` fails the first `fail_first`
+    /// times it is called, then returns the configured events on every
+    /// subsequent call. Records the total call count so tests can confirm the
+    /// refresh loop keeps polling past a transient error rather than dying.
+    #[derive(Clone)]
+    struct FlakyRegister {
+        events: Vec<RouteEvent>,
+        fail_first: usize,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl NetEventRegister for FlakyRegister {
+        fn register_events<'a>(
+            &'a self,
+            _events: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
+        ) -> futures::future::BoxFuture<'a, ()> {
+            async {}.boxed()
+        }
+
+        fn notify_of_time_out(
+            &mut self,
+            _tx: crate::message::Transaction,
+            _op_type: &str,
+            _target_peer: Option<String>,
+        ) -> futures::future::BoxFuture<'_, ()> {
+            async {}.boxed()
+        }
+
+        fn trait_clone(&self) -> Box<dyn NetEventRegister> {
+            Box::new(self.clone())
+        }
+
+        fn get_router_events(
+            &self,
+            number: usize,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let fail = call < self.fail_first;
+            let events: Vec<RouteEvent> = self.events.iter().take(number).cloned().collect();
+            async move {
+                if fail {
+                    // Mimics the production failure: an AOF segment read failing
+                    // under fd exhaustion ("No file descriptors available").
+                    Err(anyhow::anyhow!(
+                        "No file descriptors available (os error 24)"
+                    ))
+                } else {
+                    Ok(events)
+                }
+            }
+            .boxed()
+        }
+    }
+
+    /// Regression test: a transient `get_router_events` error inside the
+    /// periodic refresh loop must NOT terminate the task (which, as a monitored
+    /// background task, would be node-fatal and crash-loop the gateway).
+    ///
+    /// The mock fails the startup load plus the first few periodic ticks, then
+    /// succeeds. We assert the loop kept polling past the errors (call count >
+    /// the number of injected failures) AND eventually recovered by loading the
+    /// history — both impossible if the error arm had `return`ed.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_router_survives_transient_get_router_events_error() {
+        let events = make_route_events(100);
+        let calls = Arc::new(AtomicUsize::new(0));
+        // Fail the startup load (call 0) and the first 3 periodic ticks
+        // (calls 1..=3), then succeed from call 4 onward.
+        let register = FlakyRegister {
+            events: events.clone(),
+            fail_first: 4,
+            calls: calls.clone(),
+        };
+        let router = Arc::new(RwLock::new(Router::new(&[])));
+
+        // The periodic loop ticks every 5 minutes; under start_paused the
+        // timeout auto-advances virtual time, so ~40 min covers >5 ticks and
+        // lets the loop poll well past the injected failures and recover.
+        tokio::time::timeout(
+            Duration::from_secs(60 * 40),
+            super::Ring::refresh_router(router.clone(), register),
+        )
+        .await
+        .ok(); // timeout is expected — the loop runs forever when healthy
+
+        // The loop must have kept polling past every injected failure rather
+        // than returning on the first Err.
+        let total_calls = calls.load(Ordering::SeqCst);
+        assert!(
+            total_calls > 4,
+            "refresh loop should keep polling past transient errors, but only \
+             called get_router_events {total_calls} times (<= the 4 injected failures), \
+             implying it returned/died instead of retrying"
+        );
+
+        // And it must have recovered: once get_router_events started succeeding,
+        // the router got populated from the historical events.
+        let snapshot = router.read().snapshot();
+        assert_eq!(
+            snapshot.success_events, 100,
+            "router should have recovered and loaded history after the transient \
+             errors cleared"
+        );
     }
 }
 

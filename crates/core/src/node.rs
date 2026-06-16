@@ -1698,6 +1698,48 @@ where
             return Ok(());
         }
         NetMessageV1::SubscribeHint(hint) => {
+            // Placement-migration deactivation gate (v0.2.74 hotfix). The
+            // placement migration was disabled after the v0.2.73 UPDATE-broadcast
+            // degradation by parking the SubscribeHint version floor at
+            // `(0, 3, 0)`, above every shipped 0.2.x release. The SEND side
+            // (`p2p_protoc::peer_supports_subscribe_hint`) already respects this
+            // floor, but the floor bump alone only stops US from emitting hints —
+            // a 0.2.74 node receiving a hint from a not-yet-upgraded 0.2.73 peer
+            // would still ACT on it and keep the migration load alive throughout
+            // the multi-hour staggered rollout.
+            //
+            // So gate the RECEIVE path too. The symmetric (sender-version) gate is
+            // not cleanly reachable here — the per-connection remote version lives
+            // in `P2pConnManager.connections` and is not exposed through the
+            // `NetworkBridge` trait — so use this node's OWN version against the
+            // SAME floor the send side uses. With the floor parked at `(0, 3, 0)`
+            // and our own version on the 0.2.x line this evaluates to "migration
+            // off → ignore"; lowering the floor re-activates both sides together.
+            //
+            // Read the floor via `subscribe_hint_floor_override().unwrap_or(...)`,
+            // identical to the send side, so a simulation that opts into the
+            // cascade (`SimNetwork::enable_placement_migration`, which lowers the
+            // per-node floor to `(0,0,0)`) still has its receivers act on hints.
+            let floor = op_manager
+                .ring
+                .connection_manager
+                .subscribe_hint_floor_override()
+                .unwrap_or(crate::node::network_bridge::p2p_protoc::SUBSCRIBE_HINT_MIN_VERSION);
+            let own_version = crate::node::network_bridge::p2p_protoc::own_crate_version();
+            if !crate::node::network_bridge::p2p_protoc::version_supports_subscribe_hint(
+                Some(own_version),
+                floor,
+            ) {
+                tracing::debug!(
+                    key = %hint.key,
+                    ?own_version,
+                    ?floor,
+                    ?source_addr,
+                    "Ignoring inbound SubscribeHint — placement migration deactivated \
+                     (own version below the SubscribeHint floor)"
+                );
+                return Ok(());
+            }
             // Directed-subscribe placement (#4404): a holder is nudging us to
             // host `hint.key` because we are closer to it in the ring. If we
             // already host it there is nothing to do. Otherwise start a
@@ -2869,6 +2911,94 @@ mod tests {
 
         assert_eq!(init_peer.peer_key_location, peer_key_location);
         assert_eq!(init_peer.location, location);
+    }
+
+    // Tests for the INBOUND `SubscribeHint` receive gate (v0.2.74 hotfix).
+    //
+    // FIX 1: the floor bump to `(0, 3, 0)` only gates the SEND side; the
+    // receive handler must ALSO ignore inbound hints while the placement
+    // migration is deactivated, so a 0.2.74 node does not act on hints sent
+    // by a not-yet-upgraded 0.2.73 peer during the staggered rollout.
+    mod inbound_subscribe_hint_gate {
+        use crate::node::network_bridge::p2p_protoc::{
+            SUBSCRIBE_HINT_MIN_VERSION, own_crate_version, version_supports_subscribe_hint,
+        };
+
+        /// The gate predicate ignores an inbound hint while the migration is
+        /// deactivated: for THIS node's own (0.2.x) version against the parked
+        /// production floor, `version_supports_subscribe_hint` returns `false`,
+        /// which is the "ignore the hint" branch in the receive handler.
+        #[test]
+        fn receive_gate_ignores_hint_while_deactivated() {
+            let own = own_crate_version();
+            // Sanity: this hotfix ships on the 0.2.x line, strictly below the
+            // parked floor. If the crate ever crosses the floor this guard
+            // (and the deactivation it pins) must be revisited.
+            assert!(
+                own < SUBSCRIBE_HINT_MIN_VERSION,
+                "own version {own:?} must be below the parked floor \
+                 {SUBSCRIBE_HINT_MIN_VERSION:?} for the migration to stay off"
+            );
+            assert!(
+                !version_supports_subscribe_hint(Some(own), SUBSCRIBE_HINT_MIN_VERSION),
+                "while deactivated, the receive gate must IGNORE inbound hints \
+                 (own version below the floor)"
+            );
+            // A concrete 0.2.73 sender's own-version analogue is likewise ignored.
+            assert!(!version_supports_subscribe_hint(
+                Some((0, 2, 73)),
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+        }
+
+        /// Lowering the floor (as `SimNetwork::enable_placement_migration` does
+        /// to `(0, 0, 0)`) re-activates the receive side: the gate now ACTS on
+        /// the hint. This is the symmetry the cascade simulation test relies on.
+        #[test]
+        fn receive_gate_acts_on_hint_when_floor_lowered() {
+            let own = own_crate_version();
+            assert!(
+                version_supports_subscribe_hint(Some(own), (0, 0, 0)),
+                "with the floor lowered to (0,0,0) the receive side must act on hints"
+            );
+        }
+
+        /// Source-pin: the `SubscribeHint` receive arm must compute the floor
+        /// the SAME way as the send side (`subscribe_hint_floor_override()`
+        /// `unwrap_or` the production constant) and bail via the gate predicate
+        /// BEFORE invoking `start_directed_subscribe`. Without this pin a future
+        /// refactor could delete the gate and the predicate unit tests above
+        /// would still pass.
+        #[test]
+        fn receive_gate_is_wired_before_directed_subscribe() {
+            const SOURCE: &str = include_str!("node.rs");
+            let arm_anchor: String = ["NetMessageV1::", "SubscribeHint(hint)", " => {"].concat();
+            let arm_start = SOURCE
+                .find(&arm_anchor)
+                .expect("SubscribeHint receive arm not found — update this guard");
+            // Bound at the start of the next match arm.
+            let next_anchor: String = ["NetMessageV1::", "Aborted(tx)", " => {"].concat();
+            let arm_end = SOURCE[arm_start..]
+                .find(&next_anchor)
+                .map(|i| arm_start + i)
+                .expect("end of SubscribeHint arm not found — update guard");
+            let arm = &SOURCE[arm_start..arm_end];
+
+            let gate_idx = arm
+                .find("version_supports_subscribe_hint(")
+                .expect("receive arm must call version_supports_subscribe_hint as a gate");
+            let directed_idx = arm
+                .find("start_directed_subscribe(")
+                .expect("receive arm must still call start_directed_subscribe");
+            assert!(
+                gate_idx < directed_idx,
+                "the deactivation gate must run BEFORE start_directed_subscribe"
+            );
+            assert!(
+                arm.contains("subscribe_hint_floor_override()"),
+                "receive gate must read the same per-node floor override as the send side"
+            );
+        }
     }
 
     // Tests for `try_forward_driver_reply`.

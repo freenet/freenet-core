@@ -261,11 +261,19 @@ impl Router {
                     payload_transfer_time,
                 } = re.outcome
                 {
-                    Some(IsotonicEvent {
-                        peer: re.peer.clone(),
-                        contract_location: re.contract_location,
-                        result: payload_size as f64 / payload_transfer_time.as_secs_f64(),
-                    })
+                    // Mirror the per-op / add_event guard: SUBSCRIBE successes
+                    // report payload_size=0 and payload_transfer_time=ZERO, so
+                    // 0/0 = NaN. Skip those so NaN never enters the isotonic
+                    // regression (a single NaN poisons interpolation).
+                    if payload_size > 0 && !payload_transfer_time.is_zero() {
+                        Some(IsotonicEvent {
+                            peer: re.peer.clone(),
+                            contract_location: re.contract_location,
+                            result: payload_size as f64 / payload_transfer_time.as_secs_f64(),
+                        })
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -281,10 +289,17 @@ impl Router {
             if let RouteOutcome::Success {
                 time_to_response_start: _,
                 payload_size,
-                payload_transfer_time: _,
+                payload_transfer_time,
             } = event.outcome
             {
-                mean_transfer_size.add(payload_size as f64);
+                // Only feed transfer size estimator when there's actual payload
+                // data. Operations like SUBSCRIBE report payload_size=0 and
+                // payload_transfer_time=ZERO; counting those would bias
+                // mean_transfer_size downward on a router reload. Mirrors the
+                // incremental `add_event` guard.
+                if payload_size > 0 && !payload_transfer_time.is_zero() {
+                    mean_transfer_size.add(payload_size as f64);
+                }
             }
         }
 
@@ -2911,6 +2926,106 @@ mod tests {
                 pred.expected_total_time.is_finite(),
                 "expected_total_time must be finite, got {}",
                 pred.expected_total_time
+            );
+        }
+    }
+
+    /// Regression test for the latent NaN bug in the GLOBAL `transfer_rates`
+    /// batch path of `Router::new`. A SUBSCRIBE success reports payload_size=0
+    /// and payload_transfer_time=ZERO, so the rate is 0/0 = NaN. Without the
+    /// guard, that NaN flows into the `transfer_rate_estimator` isotonic
+    /// regression and poisons it: `interpolate()` at the affected distance then
+    /// returns NaN (verified against pav_regression 0.7.0). The per-op and
+    /// `add_event` paths already screen these events out; this test pins the
+    /// equivalent guard on the batch path.
+    ///
+    /// To exercise the bug the events must land at the SAME route distance (so
+    /// the NaN and finite points share an x in the regression) with enough
+    /// interleaved NaN/finite events to populate the estimator. We use DISTINCT
+    /// peers that nonetheless share a ring location: `Location::from_address`
+    /// masks the low byte of the IP and ignores the port for non-loopback
+    /// addresses, so peers on the same /24 map to one location while remaining
+    /// distinct `PeerKeyLocation`s. Interleaving ≥40 NaN-producing subscribe
+    /// successes with finite-rate GET successes at that shared location is what
+    /// actually exercises the NaN path; a single homogeneous event does not.
+    ///
+    /// Asserts: (1) `Router::new` completes, and (2) the resulting
+    /// `transfer_rate_estimator`'s raw regression curve is entirely finite —
+    /// which fails (NaN) if the NaN subscribe events are not screened out of
+    /// the batch path. (`Router::new` itself does not panic on this NaN; the
+    /// load-bearing assertion is regression finiteness, hence the name.)
+    #[test]
+    fn router_new_does_not_poison_transfer_rate_regression_with_nan() {
+        use crate::transport::TransportKeypair;
+        use std::net::SocketAddr;
+
+        let contract_location = Location::random();
+
+        // Build distinct peers that all share the SAME ring location: same /24
+        // (so the masked IP is identical), varying only the host byte/port.
+        // Distinct pub keys + distinct addresses make them distinct peers, while
+        // the masked location (and thus route_distance) is identical for all.
+        let make_peer = |i: usize| {
+            let pub_key = TransportKeypair::new().public().clone();
+            // 203.0.113.0/24 (TEST-NET-3, non-loopback): low byte is masked out,
+            // so every host in this /24 hashes to the same Location.
+            let addr: SocketAddr = format!("203.0.113.{}:{}", i % 250, 9000 + i)
+                .parse()
+                .unwrap();
+            PeerKeyLocation::new(pub_key, addr)
+        };
+
+        // Interleave NaN-producing SUBSCRIBE successes with finite-rate GET
+        // successes — all at the shared location so their points share x.
+        let events: Vec<RouteEvent> = (0..120)
+            .map(|i| {
+                let peer = make_peer(i);
+                if i % 2 == 0 {
+                    // SUBSCRIBE success: payload_size=0, transfer_time=ZERO -> 0/0 = NaN
+                    RouteEvent {
+                        peer,
+                        contract_location,
+                        outcome: RouteOutcome::Success {
+                            time_to_response_start: Duration::from_millis(40),
+                            payload_size: 0,
+                            payload_transfer_time: Duration::ZERO,
+                        },
+                        op_type: Some(OpType::Subscribe),
+                    }
+                } else {
+                    // GET success with a finite transfer rate.
+                    RouteEvent {
+                        peer,
+                        contract_location,
+                        outcome: RouteOutcome::Success {
+                            time_to_response_start: Duration::from_millis(40),
+                            payload_size: 4096,
+                            payload_transfer_time: Duration::from_millis(20),
+                        },
+                        op_type: Some(OpType::Get),
+                    }
+                }
+            })
+            .collect();
+
+        // (1) Must not panic: the guard keeps the NaN out of the global isotonic
+        // regression, mirroring the per-op / add_event paths.
+        let router = Router::new(&events);
+
+        // (2) The transfer-rate estimator must not be NaN-poisoned. Sample its
+        // raw regression curve (which exposes `interpolate()` outputs directly,
+        // unlike `estimate_retrieval_time` which masks NaN via `.max(0.0)`).
+        // Without the guard, the NaN subscribe points poison the regression and
+        // at least one sampled y comes back NaN.
+        let curve = router
+            .transfer_rate_estimator
+            .sampled_curve(0.0, f64::MAX, 64);
+        for (x, y) in &curve {
+            assert!(
+                y.is_finite(),
+                "transfer_rate regression produced a non-finite value {y} at \
+                 distance {x} — NaN subscribe events leaked into the batch \
+                 regression"
             );
         }
     }

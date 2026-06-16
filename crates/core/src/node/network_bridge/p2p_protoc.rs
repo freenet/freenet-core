@@ -606,17 +606,29 @@ pub(in crate::node) struct P2pConnManager {
 /// Minimum negotiated protocol version a peer must report before we send it a
 /// [`SubscribeHint`](crate::message::NetMessageV1::SubscribeHint).
 ///
-/// MUST equal the release version that first ships SubscribeHint. A peer is only
+/// DEACTIVATED after the v0.2.73 UPDATE-broadcast-degradation incident. Set to
+/// `(0, 3, 0)`, which is ABOVE every shipped 0.2.x release, so the gate
+/// (`remote.is_some_and(|v| v >= floor)`, fail-closed on unknown) evaluates to
+/// `false` for all 0.2.x peers and the placement-migration wire behavior never
+/// fires in production. The placement-migration path (directed subscribes plus
+/// the `ConsiderContractMigration` emits) amplified the #4145/#4231
+/// broadcast-backpressure surface and drove a network-wide UPDATE-broadcast
+/// degradation on 0.2.73. The migration code is intentionally left in place;
+/// re-enable it by LOWERING this floor back to the release that first ships a
+/// load-safe SubscribeHint once the broadcast-backpressure load issue is fixed.
+///
+/// Original (pre-deactivation) contract, still true mechanically: a peer is only
 /// sent SubscribeHint if its negotiated version is >= this; older peers cannot
 /// deserialize the new wire variant and would drop the connection. None (unknown,
 /// e.g. joiner->gateway) is treated as unsupported.
 ///
-/// UPDATE AT RELEASE TIME, then FREEZE: set this to the exact release version
-/// that first ships SubscribeHint and do NOT keep bumping it afterward to track
-/// the crate version. Once shipped in release R, peers running R can deserialize
-/// the variant, so the floor must stay at R forever — raising it above R would
-/// silently stop sending hints to fully-capable R peers. (This is why there is
-/// no `floor` vs `CARGO_PKG_VERSION` unit test; see docs/RELEASING.md.)
+/// WHEN RE-ENABLING — UPDATE AT RELEASE TIME, then FREEZE: set this to the exact
+/// release version that first ships the load-safe SubscribeHint and do NOT keep
+/// bumping it afterward to track the crate version. Once shipped in release R,
+/// peers running R can deserialize the variant, so the floor must stay at R
+/// forever — raising it above R would silently stop sending hints to
+/// fully-capable R peers. (This is why there is no `floor` vs `CARGO_PKG_VERSION`
+/// unit test; see docs/RELEASING.md.)
 ///
 /// This is a single non-cfg constant: deliberately NOT lowered under any test
 /// feature, because `testing` is pulled into the SHIPPED release binary (`fdev`
@@ -626,7 +638,57 @@ pub(in crate::node) struct P2pConnManager {
 /// Simulation tests that want the cascade lower the floor per-node at runtime via
 /// `NodeConfig::subscribe_hint_floor_override` (set by
 /// `SimNetwork::enable_placement_migration`), which never touches production.
-const SUBSCRIBE_HINT_MIN_VERSION: (u8, u8, u16) = (0, 2, 73);
+///
+/// `pub(crate)` so the INBOUND `SubscribeHint` receive handler in
+/// [`crate::node`] can share the same floor: the send-side gate alone is not
+/// enough, because a 0.2.74 node would otherwise still ACT on hints sent by a
+/// pre-floor 0.2.73 peer and keep the (deactivated) migration load alive during
+/// the staggered rollout.
+pub(crate) const SUBSCRIBE_HINT_MIN_VERSION: (u8, u8, u16) = (0, 3, 0);
+
+/// This node's own crate version as a `(major, minor, patch)` tuple, parsed at
+/// compile time from `CARGO_PKG_VERSION`.
+///
+/// Used by the INBOUND `SubscribeHint` receive gate (see [`crate::node`]) to ask
+/// "is the placement migration active for a node running THIS version?" via
+/// [`version_supports_subscribe_hint`]. With the floor parked at `(0, 3, 0)` and
+/// our own version on the 0.2.x line, the gate evaluates to "migration off →
+/// ignore inbound hints"; lowering the floor re-activates both the send and the
+/// receive side together.
+pub(crate) const fn own_crate_version() -> (u8, u8, u16) {
+    parse_crate_version(env!("CARGO_PKG_VERSION"))
+}
+
+/// `const` parser for `"X.Y.Z"` / `"X.Y.Z-pre"` into `(major, minor, patch)`.
+///
+/// Mirrors `connection_handler::parse_semver` (kept local so this gate does not
+/// reach into the transport module). Pre-release suffixes are ignored.
+const fn parse_crate_version(version: &str) -> (u8, u8, u16) {
+    let bytes = version.as_bytes();
+    let mut major = 0u8;
+    let mut minor = 0u8;
+    let mut patch = 0u16;
+    let mut state = 0u8; // 0: major, 1: minor, 2: patch
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'.' {
+            state += 1;
+        } else if c.is_ascii_digit() {
+            let digit = (c - b'0') as u16;
+            match state {
+                0 => major = (major as u16 * 10 + digit) as u8,
+                1 => minor = (minor as u16 * 10 + digit) as u8,
+                2 => patch = patch * 10 + digit,
+                _ => {}
+            }
+        } else {
+            break; // Pre-release suffix — ignored.
+        }
+        i += 1;
+    }
+    (major, minor, patch)
+}
 
 /// Pure version-gate decision, factored out so the comparison and the
 /// fail-closed-on-unknown-version (`None`) behavior are unit-testable with an
@@ -636,7 +698,13 @@ const SUBSCRIBE_HINT_MIN_VERSION: (u8, u8, u16) = (0, 2, 73);
 /// unknown remote version is treated as unsupported: an older peer that cannot
 /// deserialize the appended `SubscribeHint` wire variant would drop the
 /// connection, so when in doubt we do not send the hint.
-fn version_supports_subscribe_hint(remote: Option<(u8, u8, u16)>, floor: (u8, u8, u16)) -> bool {
+///
+/// `pub(crate)` so the inbound `SubscribeHint` receive gate in [`crate::node`]
+/// can reuse the identical predicate (kept symmetric with the send side).
+pub(crate) fn version_supports_subscribe_hint(
+    remote: Option<(u8, u8, u16)>,
+    floor: (u8, u8, u16),
+) -> bool {
     remote.is_some_and(|v| v >= floor)
 }
 
@@ -6035,7 +6103,7 @@ mod tests {
     }
 
     mod version_gate {
-        use super::super::version_supports_subscribe_hint;
+        use super::super::{SUBSCRIBE_HINT_MIN_VERSION, version_supports_subscribe_hint};
 
         const FLOOR: (u8, u8, u16) = (0, 2, 73);
 
@@ -6080,6 +6148,29 @@ mod tests {
             // (this is the simulation/test floor behavior).
             assert!(version_supports_subscribe_hint(Some((0, 0, 0)), (0, 0, 0)));
             assert!(!version_supports_subscribe_hint(None, (0, 0, 0)));
+        }
+
+        /// Pin the PRODUCTION constant (not the local `FLOOR`): with
+        /// `SUBSCRIBE_HINT_MIN_VERSION` parked at `(0, 3, 0)` the placement
+        /// migration is dormant for EVERY shipped 0.2.x peer — both the lowest
+        /// shipped patch and any conceivable future 0.2.x — and stays fail-closed
+        /// on an unknown version. If someone lowers the floor to a 0.2.x release
+        /// (silently re-enabling the migration disabled in v0.2.74), this test
+        /// fails. See docs/RELEASING.md and issue #4145.
+        #[test]
+        fn placement_migration_deactivated_for_all_0_2_x() {
+            assert!(!version_supports_subscribe_hint(
+                Some((0, 2, 73)),
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+            assert!(!version_supports_subscribe_hint(
+                Some((0, 2, 255)),
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+            assert!(!version_supports_subscribe_hint(
+                None,
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
         }
     }
 
