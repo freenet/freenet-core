@@ -1762,6 +1762,23 @@ impl EventRegister {
         self.flush_handle.clone()
     }
 
+    /// Build a register around an existing sender WITHOUT spawning the
+    /// `record_logs` drain task. Tests use this to saturate the bounded log
+    /// channel and assert `register_events` never blocks the caller (the
+    /// event-log backpressure deadlock regression).
+    #[cfg(test)]
+    fn from_sender_for_test(log_sender: mpsc::Sender<EventLogCommand>) -> Self {
+        let flush_handle = EventFlushHandle {
+            sender: log_sender.clone(),
+        };
+        Self {
+            log_sender,
+            log_file: Arc::new(PathBuf::from("event-log-no-drain-test")),
+            clone_count: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            flush_handle,
+        }
+    }
+
     async fn record_logs(
         mut log_recv: mpsc::Receiver<EventLogCommand>,
         event_log_path: Arc<PathBuf>,
@@ -1875,6 +1892,27 @@ impl Drop for EventRegister {
     }
 }
 
+/// Count of telemetry event-log messages dropped because the bounded
+/// `record_logs` channel was full. Telemetry is best-effort: dropping under
+/// load keeps the node alive, whereas blocking the event loop on a stalled log
+/// consumer deadlocked the entire node (every thread parked on a futex at 0%
+/// CPU). Logged at power-of-two milestones so a persistent stall stays visible
+/// without spamming the log.
+static DROPPED_EVENT_LOGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_dropped_event_log() {
+    use std::sync::atomic::Ordering;
+    let dropped = DROPPED_EVENT_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+    if dropped.is_power_of_two() {
+        tracing::warn!(
+            dropped_total = dropped,
+            "event log channel full; dropping telemetry event(s). The node is \
+             healthy — telemetry is intentionally lossy under load rather than \
+             blocking the event loop (see .claude/rules/channel-safety.md)."
+        );
+    }
+}
+
 impl NetEventRegister for EventRegister {
     fn register_events<'a>(
         &'a self,
@@ -1882,9 +1920,21 @@ impl NetEventRegister for EventRegister {
     ) -> BoxFuture<'a, ()> {
         async {
             for log_msg in NetLogMessage::to_log_message(logs) {
-                if let Err(e) = self.log_sender.send(EventLogCommand::Log(log_msg)).await {
-                    tracing::debug!(error = %e, "event log channel closed");
-                    break;
+                // Best-effort telemetry MUST NOT block the caller. This future is
+                // awaited from the network event loop's hot outbound path (see the
+                // `OutboundMessageWithTarget` and disconnect handlers in
+                // p2p_protoc.rs). A blocking `.send().await` on the bounded log
+                // channel wedged the whole node when `record_logs` stalled on its
+                // metrics WebSocket or AOF write: the channel filled, the event
+                // loop blocked here forever, and every thread parked on a futex at
+                // 0% CPU. Drop on full instead (see channel-safety.md).
+                match self.log_sender.try_send(EventLogCommand::Log(log_msg)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => note_dropped_event_log(),
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::debug!("event log channel closed");
+                        break;
+                    }
                 }
             }
         }
@@ -1914,8 +1964,15 @@ impl NetEventRegister for EventRegister {
         };
         let sender = self.log_sender.clone();
         async move {
-            if let Err(e) = sender.send(EventLogCommand::Log(log_msg)).await {
-                tracing::debug!(error = %e, "event log channel closed during timeout notification");
+            // Non-blocking for the same reason as `register_events`: a stalled
+            // log consumer must never wedge a caller on the bounded log channel
+            // (see channel-safety.md). Best-effort telemetry — drop on full.
+            match sender.try_send(EventLogCommand::Log(log_msg)) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => note_dropped_event_log(),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::debug!("event log channel closed during timeout notification");
+                }
             }
         }
         .boxed()
@@ -1923,6 +1980,77 @@ impl NetEventRegister for EventRegister {
 
     fn get_router_events(&self, number: usize) -> BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
         async move { aof::LogFile::get_router_events(number, &self.log_file).await }.boxed()
+    }
+}
+
+#[cfg(test)]
+mod eventlog_backpressure_tests {
+    use super::*;
+
+    /// Regression: the network event loop awaits `register_events` on the hot
+    /// outbound path (`p2p_protoc.rs` `OutboundMessageWithTarget`). When
+    /// `record_logs` stalled on its metrics WebSocket or AOF write, a blocking
+    /// `.send().await` on the bounded log channel filled the buffer and wedged
+    /// the entire node — every thread parked on a futex at 0% CPU. The send
+    /// must drop on full instead of blocking. Without the fix this test hangs
+    /// (caught by the timeout); with it, it completes instantly.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn register_events_does_not_block_when_log_channel_full() {
+        // Capacity-1 channel whose receiver is never drained. Keep `_rx` alive
+        // so the channel stays OPEN (a closed channel would make `send` return
+        // immediately and hide the deadlock), and pre-fill the single slot so
+        // every subsequent send hits a full channel.
+        let (tx, _rx) = mpsc::channel::<EventLogCommand>(1);
+        let (filler_tx, _filler_rx) = tokio::sync::oneshot::channel::<()>();
+        tx.try_send(EventLogCommand::Flush(filler_tx))
+            .expect("first slot accepts the filler");
+
+        let register = EventRegister::from_sender_for_test(tx);
+
+        let fire_many = async {
+            for _ in 0..2_000 {
+                let event = NetEventLog {
+                    tx: Transaction::NULL,
+                    peer_id: PeerId::random(),
+                    kind: EventKind::Disconnected {
+                        from: PeerId::random(),
+                        reason: DisconnectReason::RemoteDropped,
+                        connection_duration_ms: None,
+                        bytes_sent: None,
+                        bytes_received: None,
+                    },
+                };
+                register.register_events(Either::Left(event)).await;
+            }
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), fire_many)
+            .await
+            .expect("register_events must never block when the log channel is full");
+    }
+
+    /// `notify_of_time_out` writes to the same bounded log channel and is also
+    /// reachable from hot paths, so it must drop on full rather than block.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn notify_of_time_out_does_not_block_when_log_channel_full() {
+        let (tx, _rx) = mpsc::channel::<EventLogCommand>(1);
+        let (filler_tx, _filler_rx) = tokio::sync::oneshot::channel::<()>();
+        tx.try_send(EventLogCommand::Flush(filler_tx))
+            .expect("first slot accepts the filler");
+
+        let mut register = EventRegister::from_sender_for_test(tx);
+
+        let fire_many = async {
+            for _ in 0..2_000 {
+                register
+                    .notify_of_time_out(*Transaction::NULL, "get", None)
+                    .await;
+            }
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), fire_many)
+            .await
+            .expect("notify_of_time_out must never block when the log channel is full");
     }
 }
 
