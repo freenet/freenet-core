@@ -6,6 +6,7 @@ mod delegate_store;
 pub(crate) mod engine;
 mod error;
 pub(crate) mod mock_state_storage;
+mod module_cache;
 mod native_api;
 mod runtime;
 pub mod secret_snapshots;
@@ -22,11 +23,13 @@ pub use delegate_store::DelegateStore;
 pub(crate) use engine::BackendEngine;
 pub(crate) use error::{ContractError, RuntimeInnerError, RuntimeResult};
 pub use mock_state_storage::MockStateStorage;
+pub use module_cache::default_module_cache_budget_bytes;
+pub(crate) use module_cache::{DELEGATE_MODULE_CACHE_BUDGET_DIVISOR, ModuleCache};
 pub(crate) use native_api::{
     CREATED_DELEGATES_COUNT, DELEGATE_INHERITED_ORIGINS, DELEGATE_SUBSCRIPTIONS,
     DelegateContextCache, new_delegate_context_cache,
 };
-pub use runtime::{ContractExecError, DEFAULT_MODULE_CACHE_CAPACITY, Runtime};
+pub use runtime::{ContractExecError, Runtime};
 pub(crate) use runtime::{RuntimeConfig, SharedModuleCache};
 pub use secrets_store::{SecretStoreError, SecretsStore};
 // NOTE: InMemoryContractStore and SimulationStores are available but currently unused
