@@ -65,7 +65,88 @@ mod build_info {
     pub const BUILD_TIMESTAMP: &str = env!("BUILD_TIMESTAMP");
 }
 
+/// Raise the process's `RLIMIT_NOFILE` (open file-descriptor) soft limit up to
+/// its hard limit, so a busy node does not hit `EMFILE` ("No file descriptors
+/// available", os error 24).
+///
+/// WHY: the WASM module cache holds up to ~1024 compiled contracts, each backed
+/// by a `memfd`, plus AOF segment files, UDP sockets, the WS API, etc. systemd's
+/// `DefaultLimitNOFILE` soft limit is typically 1024, and freenet never raised
+/// it, so a busy gateway exhausted file descriptors. The resulting `EMFILE`
+/// killed a monitored background task (`refresh_router` opening an AOF segment),
+/// which the `BackgroundTaskMonitor` treats as node-fatal — producing a
+/// systemd crash-loop. Raising the soft limit to the hard limit at startup gives
+/// the node the FD headroom the kernel already permits, without operator
+/// intervention or a unit-file change.
+///
+/// Best-effort and non-fatal: on any error we `warn!` and continue with the
+/// inherited limit rather than failing startup. No-op on non-unix.
+#[cfg(unix)]
+fn raise_fd_limit() {
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` with a valid resource id and a properly initialized,
+    // exclusively-borrowed `rlimit` out-param is sound; we check the return code
+    // before reading the struct.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } != 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(error = %err, "failed to read RLIMIT_NOFILE; leaving fd limit unchanged");
+        return;
+    }
+
+    // `rlim_t` is `u64` on linux-gnu but `i64`/`u64` varies across unix targets;
+    // normalize to `u64` for logging. The cast is redundant on the CI target,
+    // hence the scoped allow rather than a bare `as u64` that trips clippy.
+    #[allow(clippy::unnecessary_cast)]
+    let previous_soft = limits.rlim_cur as u64;
+    #[allow(clippy::unnecessary_cast)]
+    let hard = limits.rlim_max as u64;
+
+    if previous_soft >= hard {
+        // Already at (or above) the hard limit — nothing to raise.
+        tracing::info!(
+            soft = previous_soft,
+            hard,
+            "RLIMIT_NOFILE soft limit already at hard limit"
+        );
+        return;
+    }
+
+    limits.rlim_cur = limits.rlim_max;
+    // SAFETY: `setrlimit` with a valid resource id and an exclusively-borrowed,
+    // fully-initialized `rlimit` whose soft limit (rlim_cur) does not exceed the
+    // hard limit (rlim_max) is sound.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limits) } != 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!(
+            error = %err,
+            soft = previous_soft,
+            hard,
+            "failed to raise RLIMIT_NOFILE soft limit; leaving fd limit unchanged"
+        );
+        return;
+    }
+
+    tracing::info!(
+        soft = hard,
+        hard,
+        previous_soft,
+        "raised RLIMIT_NOFILE soft limit"
+    );
+}
+
+#[cfg(not(unix))]
+fn raise_fd_limit() {
+    // No RLIMIT_NOFILE concept on non-unix targets; nothing to do.
+}
+
 async fn run(config: Config) -> anyhow::Result<()> {
+    // Raise the open-fd soft limit before the node starts serving, so a busy
+    // node does not crash-loop on EMFILE (see `raise_fd_limit` rustdoc).
+    raise_fd_limit();
+
     // Log build info on startup - critical for correlating logs with code version
     tracing::info!(
         version = build_info::VERSION,
@@ -802,6 +883,49 @@ fn main() {
 mod tests {
     #[cfg(target_os = "linux")]
     use super::parse_listening_inode;
+
+    #[test]
+    #[cfg(unix)]
+    fn raise_fd_limit_does_not_lower_soft_limit() {
+        let mut before = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit with a valid resource id and an initialized,
+        // exclusively-borrowed out-param is sound; we check the return code.
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut before) };
+        assert_eq!(rc, 0, "getrlimit should succeed");
+
+        // Must not panic and must be safe to call.
+        super::raise_fd_limit();
+
+        let mut after = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: same invariants as the `before` read above.
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut after) };
+        assert_eq!(rc, 0, "getrlimit should succeed after raising");
+
+        // The soft limit must never decrease. We do NOT assert an exact value:
+        // CI runners differ in their hard limits, and a sandbox may forbid the
+        // raise entirely (in which case the helper warns and leaves the soft
+        // limit unchanged — still >= the previous soft limit).
+        assert!(
+            after.rlim_cur >= before.rlim_cur,
+            "soft fd limit must not decrease: before={}, after={}",
+            before.rlim_cur,
+            after.rlim_cur
+        );
+        // The soft limit must never exceed the hard limit (an invariant the OS
+        // enforces, but we assert it to catch a logic error in the helper).
+        assert!(
+            after.rlim_cur <= after.rlim_max,
+            "soft fd limit must not exceed hard limit: soft={}, hard={}",
+            after.rlim_cur,
+            after.rlim_max
+        );
+    }
 
     #[test]
     #[cfg(target_os = "linux")]
