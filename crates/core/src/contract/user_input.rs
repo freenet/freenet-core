@@ -494,6 +494,89 @@ mod tests {
         assert_eq!(labels, vec!["Valid", "Option 2"]);
     }
 
+    // ----- Sanitization-cap boundary tests (issue #3821) -----
+    //
+    // `parse_message` / `parse_button_labels` enforce the producer-side
+    // display caps MAX_MESSAGE_LEN (2048), MAX_LABEL_LEN (64) and
+    // MAX_LABELS (10). The existing tests above cover control-char
+    // stripping and invalid-UTF-8 fallback but never exercise the length
+    // caps at their boundaries. These tests pin the exact at-limit /
+    // over-limit behaviour so a future cap change (or a refactor that
+    // moves the `.take()` before/after the `.filter()`) is caught.
+
+    /// A message exactly at MAX_MESSAGE_LEN chars passes through untouched.
+    #[test]
+    fn test_parse_message_at_max_len_unchanged() {
+        let msg = "a".repeat(MAX_MESSAGE_LEN);
+        let req = make_test_request(&msg, vec![]);
+        let parsed = parse_message(&req);
+        assert_eq!(parsed.chars().count(), MAX_MESSAGE_LEN);
+        assert_eq!(parsed, msg);
+    }
+
+    /// A message one char over MAX_MESSAGE_LEN is truncated to the cap.
+    #[test]
+    fn test_parse_message_over_max_len_truncated() {
+        let msg = "a".repeat(MAX_MESSAGE_LEN + 1);
+        let req = make_test_request(&msg, vec![]);
+        let parsed = parse_message(&req);
+        assert_eq!(parsed.chars().count(), MAX_MESSAGE_LEN);
+    }
+
+    /// Truncation counts by `char`, not byte: a multi-byte message over the
+    /// cap must truncate at MAX_MESSAGE_LEN codepoints without splitting a
+    /// grapheme (which would otherwise risk a panic on a byte boundary).
+    #[test]
+    fn test_parse_message_over_max_len_char_based() {
+        let msg = "\u{1F525}".repeat(MAX_MESSAGE_LEN + 5);
+        let req = make_test_request(&msg, vec![]);
+        let parsed = parse_message(&req);
+        assert_eq!(parsed.chars().count(), MAX_MESSAGE_LEN);
+        assert!(parsed.chars().all(|c| c == '\u{1F525}'));
+    }
+
+    /// A button label exactly at MAX_LABEL_LEN chars passes through untouched.
+    #[test]
+    fn test_parse_button_labels_at_max_label_len_unchanged() {
+        let label = "x".repeat(MAX_LABEL_LEN);
+        let req = make_test_request("msg", vec![label.as_str()]);
+        let labels = parse_button_labels(&req);
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].chars().count(), MAX_LABEL_LEN);
+        assert_eq!(labels[0], label);
+    }
+
+    /// A button label one char over MAX_LABEL_LEN is truncated to the cap.
+    #[test]
+    fn test_parse_button_labels_over_max_label_len_truncated() {
+        let label = "x".repeat(MAX_LABEL_LEN + 1);
+        let req = make_test_request("msg", vec![label.as_str()]);
+        let labels = parse_button_labels(&req);
+        assert_eq!(labels.len(), 1);
+        assert_eq!(labels[0].chars().count(), MAX_LABEL_LEN);
+    }
+
+    /// Exactly MAX_LABELS responses are all kept.
+    #[test]
+    fn test_parse_button_labels_at_max_labels_kept() {
+        let resp: Vec<String> = (0..MAX_LABELS).map(|i| format!("Option {i}")).collect();
+        let resp_refs: Vec<&str> = resp.iter().map(String::as_str).collect();
+        let req = make_test_request("msg", resp_refs);
+        let labels = parse_button_labels(&req);
+        assert_eq!(labels.len(), MAX_LABELS);
+    }
+
+    /// One response over MAX_LABELS drops the extra label(s): the rendered
+    /// button grid is capped so a delegate can't force an arbitrary count.
+    #[test]
+    fn test_parse_button_labels_over_max_labels_capped() {
+        let resp: Vec<String> = (0..MAX_LABELS + 1).map(|i| format!("Option {i}")).collect();
+        let resp_refs: Vec<&str> = resp.iter().map(String::as_str).collect();
+        let req = make_test_request("msg", resp_refs);
+        let labels = parse_button_labels(&req);
+        assert_eq!(labels.len(), MAX_LABELS);
+    }
+
     #[test]
     fn test_parse_message_raw_utf8() {
         use freenet_stdlib::prelude::NotificationMessage;

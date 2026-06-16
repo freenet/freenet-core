@@ -1390,6 +1390,50 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
     }
 
+    // An out-of-range button index must return 400 BAD_REQUEST without
+    // consuming the prompt, so a user who fat-fingers (or a buggy client
+    // that posts a stale index) can still retry. The other respond error
+    // paths (missing/untrusted Origin -> 403, expired/unknown nonce -> 404)
+    // are covered above; this pins the remaining `index >= labels.len()`
+    // arm (issue #3821).
+    #[tokio::test]
+    async fn test_respond_invalid_index_returns_400_and_keeps_prompt() {
+        let pending = empty_pending();
+        // Two labels -> valid indices are 0 and 1; index 2 is out of range.
+        let _rx = insert_prompt(
+            &pending,
+            "n",
+            "m",
+            vec!["Allow", "Deny"],
+            "d",
+            webapp_caller("c"),
+        );
+
+        let resp = permission_respond(
+            Path("n".to_string()),
+            trusted_header(),
+            None,
+            None,
+            Extension(pending.clone()),
+            Json(PermissionResponse { index: 2 }),
+        )
+        .await
+        .into_response();
+        assert_eq!(resp.status(), axum::http::StatusCode::BAD_REQUEST);
+
+        use axum::body::to_bytes;
+        let body = to_bytes(resp.into_body(), 1024).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["error"], "invalid index");
+
+        // The prompt must still be pending so the user can retry with a
+        // valid index — a 400 must NOT consume the nonce.
+        assert!(
+            pending.get("n").is_some(),
+            "invalid index must not consume the prompt"
+        );
+    }
+
     // Regression tests for issue #3857 — behavioural assertions on the
     // standalone HTML page (no structural assertions, per codex review
     // point 7).
