@@ -9855,9 +9855,7 @@ fn test_get_dead_ends_at_close_cluster_without_migration() {
     let num_nodes = node_locations.len();
 
     let rt = create_runtime();
-    // NOTE: deliberately NO `enable_placement_migration()` — that is the whole
-    // point of this control.
-    let sim = rt.block_on(async {
+    let mut sim = rt.block_on(async {
         SimNetwork::new_with_node_locations(
             NETWORK_NAME,
             1,
@@ -9871,6 +9869,14 @@ fn test_get_dead_ends_at_close_cluster_without_migration() {
         )
         .await
     });
+    // This control asserts the GET dead-ends *because migration is off* — it
+    // deliberately does NOT call `enable_placement_migration()`. But "off by
+    // default" only holds on a build below the production
+    // SUBSCRIBE_HINT_MIN_VERSION floor; on the v0.2.73 release branch (#4404
+    // ships active) the default flips to ON and this control would falsely
+    // fail. Pin migration OFF explicitly so the control's premise holds at any
+    // build version — do not rely on build-version gating.
+    sim.disable_placement_migration();
 
     let host_label = NodeLabel::node(NETWORK_NAME, 7);
     let requester_label = NodeLabel::node(NETWORK_NAME, 8);

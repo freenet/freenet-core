@@ -627,7 +627,7 @@ fn test_streaming_get_through_relay() {
     const BASE_EPOCH_MS: u64 = 1577836800000;
     const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
     GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
-    let sim = rt.block_on(async {
+    let mut sim = rt.block_on(async {
         let mut sim = SimNetwork::new(
             NETWORK_NAME,
             1, // gateways
@@ -642,6 +642,14 @@ fn test_streaming_get_through_relay() {
         sim.with_streaming_threshold(THRESHOLD);
         sim
     });
+    // This test asserts a streaming relay-forward hop fires (node 5 must relay
+    // to reach the storer). Placement migration (#4404) spreads the contract
+    // toward the requester, so the relay hop never runs and the
+    // RELAY_GET_STREAMING_FORWARD_COUNT assertion fails. The test exercises the
+    // relay-streaming mechanic, not placement, so pin migration OFF — don't
+    // rely on build-version gating, which flips ON on the v0.2.73 release
+    // branch where #4404 ships active.
+    sim.disable_placement_migration();
 
     let contract = SimOperation::create_test_contract(0xAB);
     let large_state = SimOperation::create_large_state(LARGE_STATE_SIZE, 0xAB);
@@ -1315,6 +1323,15 @@ async fn setup_assembly_retry_network(name: &str, seed: u64, threshold: usize) -
     )
     .await;
     sim.with_streaming_threshold(threshold);
+    // The #4345 assembly-retry test hand-builds a cold-node → holder routing
+    // scenario. Placement migration (#4404) moves the contract toward the
+    // requester, disrupting that scenario (the injected assembly failure no
+    // longer drives the retry path under test). This helper feeds both the
+    // phase-1 and phase-2 sims, so pin migration OFF here — the test exercises
+    // assembly-retry mechanics, not placement, and must not rely on
+    // build-version gating (which flips ON on the v0.2.73 release branch where
+    // #4404 ships active).
+    sim.disable_placement_migration();
     sim
 }
 
