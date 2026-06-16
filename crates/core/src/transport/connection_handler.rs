@@ -2024,44 +2024,45 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     direction = "outbound",
                     "Received intro packet"
                 );
-                let protoc = &decrypted_intro_packet.data()[..PROTOC_VERSION.len()];
-                if let Ok(protoc_bytes) = <[u8; 8]>::try_from(protoc) {
-                    match version_cmp::is_compatible(&PROTOC_VERSION, &protoc_bytes) {
-                        Ok(remote_info) => {
-                            crate::transport::report_peer_version(remote_info.version);
-                            *remote_protoc_version = Some(remote_info.version);
-                        }
-                        Err(reason) => {
-                            // Track version even on incompatible peers — aids version discovery.
-                            let remote_info = version_cmp::parse_version_bytes(&protoc_bytes);
-                            crate::transport::report_peer_version(remote_info.version);
-                            if version_cmp::remote_requires_newer_than_us(
-                                &PROTOC_VERSION,
-                                &protoc_bytes,
-                            ) {
-                                crate::transport::signal_urgent_update();
-                            }
-                            tracing::debug!(
-                                peer_addr = %remote_addr,
-                                %reason,
-                                direction = "outbound",
-                                "Remote is using an incompatible protocol version"
-                            );
-                            return Err(());
-                        }
-                    }
-                } else {
+                // Bounds-check before slicing: asym encryption to our public
+                // key does not authenticate the sender, so a too-short payload
+                // is attacker-reachable and must not panic (#4406).
+                let Some((protoc_bytes, outbound_key_bytes)) =
+                    split_asym_intro_payload(decrypted_intro_packet.data())
+                else {
                     tracing::debug!(
                         peer_addr = %remote_addr,
                         direction = "outbound",
-                        "Protocol version field wrong size"
+                        "Intro packet too short to parse"
                     );
                     return Err(());
+                };
+                match version_cmp::is_compatible(&PROTOC_VERSION, &protoc_bytes) {
+                    Ok(remote_info) => {
+                        crate::transport::report_peer_version(remote_info.version);
+                        *remote_protoc_version = Some(remote_info.version);
+                    }
+                    Err(reason) => {
+                        // Track version even on incompatible peers — aids version discovery.
+                        let remote_info = version_cmp::parse_version_bytes(&protoc_bytes);
+                        crate::transport::report_peer_version(remote_info.version);
+                        if version_cmp::remote_requires_newer_than_us(
+                            &PROTOC_VERSION,
+                            &protoc_bytes,
+                        ) {
+                            crate::transport::signal_urgent_update();
+                        }
+                        tracing::debug!(
+                            peer_addr = %remote_addr,
+                            %reason,
+                            direction = "outbound",
+                            "Remote is using an incompatible protocol version"
+                        );
+                        return Err(());
+                    }
                 }
-                let outbound_key_bytes =
-                    &decrypted_intro_packet.data()[PROTOC_VERSION.len()..PROTOC_VERSION.len() + 16];
                 let outbound_key =
-                    Aes128Gcm::new_from_slice(outbound_key_bytes).expect("correct length");
+                    Aes128Gcm::new_from_slice(&outbound_key_bytes).expect("correct length");
                 *outbound_sym_key = Some(outbound_key);
                 // Got remote's key, now we can send ACK with our key
                 *state = HandshakePhase::RemoteInbound;
@@ -2496,6 +2497,37 @@ fn handle_ack_connection_error(err: Cow<'static, str>) -> TransportError {
     } else {
         TransportError::ConnectionEstablishmentFailure { cause: err }
     }
+}
+
+/// Number of symmetric-key bytes carried by an asymmetric intro packet
+/// (AES-128 key for the reverse direction of the handshake).
+const ASYM_INTRO_SYM_KEY_LEN: usize = 16;
+
+/// Minimum decrypted length of a well-formed asymmetric intro packet:
+/// `PROTOC_VERSION` (8 bytes) followed by the 16-byte symmetric key.
+const ASYM_INTRO_MIN_LEN: usize = PROTOC_VERSION.len() + ASYM_INTRO_SYM_KEY_LEN;
+
+/// Split a decrypted asymmetric intro payload into the protocol-version
+/// prefix and the symmetric-key bytes, bounds-checking the length first.
+///
+/// Asymmetric encryption to our public key does NOT authenticate the
+/// sender — the key is public, so any peer can encrypt an arbitrarily
+/// short payload to us. Slicing such a payload directly (`data[..8]` /
+/// `data[8..24]`) would panic with an index-out-of-bounds, crashing the
+/// node: a remote, unauthenticated denial of service (#4406). Returning
+/// `None` here lets the caller drop the packet silently per the transport
+/// decryption-failure rule.
+fn split_asym_intro_payload(data: &[u8]) -> Option<([u8; 8], [u8; ASYM_INTRO_SYM_KEY_LEN])> {
+    if data.len() < ASYM_INTRO_MIN_LEN {
+        return None;
+    }
+    let protoc_bytes: [u8; 8] = data[..PROTOC_VERSION.len()]
+        .try_into()
+        .expect("slice is PROTOC_VERSION.len() bytes after length check");
+    let key_bytes: [u8; ASYM_INTRO_SYM_KEY_LEN] = data[PROTOC_VERSION.len()..ASYM_INTRO_MIN_LEN]
+        .try_into()
+        .expect("slice is ASYM_INTRO_SYM_KEY_LEN bytes after length check");
+    Some((protoc_bytes, key_bytes))
 }
 
 fn key_from_addr(addr: &SocketAddr) -> [u8; 16] {
@@ -3084,6 +3116,80 @@ mod version_cmp {
             manager.get_state(&addr).is_none(),
             "State should be cleaned up after expiration"
         );
+    }
+
+    /// Regression test for #4406 — a too-short asymmetric intro payload must
+    /// not panic when parsed.
+    ///
+    /// Asymmetric encryption to our public key does not authenticate the
+    /// sender (the key is public), so any peer can encrypt an arbitrarily
+    /// short payload to us. The outbound NAT-traversal `decrypt_asym` path
+    /// used to slice `decrypted.data()[..8]` / `[8..24]` with no length
+    /// check, so a decrypted payload shorter than `PROTOC_VERSION.len() + 16`
+    /// bytes triggered an index-out-of-bounds panic — a remote,
+    /// unauthenticated denial of service.
+    ///
+    /// Two layers are exercised:
+    ///  1. The pure `split_asym_intro_payload` bounds check, swept across
+    ///     every length from empty up to one byte below the minimum, plus
+    ///     the exact boundary and an over-long payload.
+    ///  2. The full attacker path: a real keypair, a short payload encrypted
+    ///     to the public key, then asymmetric decryption + parse — proving
+    ///     the end-to-end flow returns `None` instead of panicking.
+    #[test]
+    fn test_short_asym_intro_packet_does_not_panic() {
+        use super::{
+            ASYM_INTRO_MIN_LEN, MAX_PACKET_SIZE, PROTOC_VERSION, split_asym_intro_payload,
+        };
+        use crate::transport::crypto::TransportKeypair;
+        use crate::transport::packet_data::{PacketData, UnknownEncryption};
+
+        // Layer 1: every too-short length must return None, never panic.
+        for len in 0..ASYM_INTRO_MIN_LEN {
+            let payload = vec![0u8; len];
+            assert!(
+                split_asym_intro_payload(&payload).is_none(),
+                "payload of len {len} (< {ASYM_INTRO_MIN_LEN}) must be rejected, not sliced"
+            );
+        }
+
+        // Boundary: exactly the minimum length parses successfully and splits
+        // into the version prefix and the 16-byte symmetric key.
+        let exact: Vec<u8> = (0..ASYM_INTRO_MIN_LEN as u8).collect();
+        let (protoc, key) =
+            split_asym_intro_payload(&exact).expect("minimum-length payload must parse");
+        assert_eq!(&protoc[..], &exact[..PROTOC_VERSION.len()]);
+        assert_eq!(&key[..], &exact[PROTOC_VERSION.len()..ASYM_INTRO_MIN_LEN]);
+
+        // Over-long payloads parse too (extra trailing bytes are ignored).
+        let long = vec![7u8; ASYM_INTRO_MIN_LEN + 32];
+        assert!(
+            split_asym_intro_payload(&long).is_some(),
+            "over-long payload must still parse"
+        );
+
+        // Layer 2: full attacker path. Encrypt a short payload to our public
+        // key, decrypt it, and parse — this is exactly what an unauthenticated
+        // remote peer can send to the outbound handshake path.
+        let keypair = TransportKeypair::new();
+        for short_len in [0usize, 1, 7, PROTOC_VERSION.len(), ASYM_INTRO_MIN_LEN - 1] {
+            let short_payload = vec![0xABu8; short_len];
+            let encrypted = keypair.public().encrypt(&short_payload);
+            let packet = PacketData::<UnknownEncryption, MAX_PACKET_SIZE>::from_buf(&encrypted);
+            let decrypted = packet
+                .try_decrypt_asym(keypair.secret())
+                .expect("we encrypted to our own key, so decryption must succeed");
+            assert_eq!(
+                decrypted.data().len(),
+                short_len,
+                "decrypted payload should round-trip to the original short length"
+            );
+            // The bug: this call previously panicked for short_len < 24.
+            assert!(
+                split_asym_intro_payload(decrypted.data()).is_none(),
+                "short asym intro payload (len {short_len}) must be rejected without panicking"
+            );
+        }
     }
 
     /// Regression invariant for #3959 — the UDP listener forwarding path must
