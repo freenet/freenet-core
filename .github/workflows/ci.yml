@@ -545,7 +545,19 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
         run: |
+          # `--lib` is included so the in-crate simulation tests gated behind
+          # `#[cfg(all(test, feature = "simulation_tests"))]` (e.g. the
+          # governance ban-chain e2e module in
+          # crates/core/src/contract/governance.rs) are built and run. They use
+          # `pub(crate)` accessors (Ring::governance, Ring::contract_ban_list,
+          # the test-only hosting_manager_* counters) that an external
+          # tests/ integration binary cannot reach, so they MUST live in the
+          # lib. Without `--lib` here this whole class of tests was compiled
+          # out of the workspace test step (no simulation_tests feature) AND
+          # excluded from this simulation step (only --test binaries), so it
+          # never ran in CI. See issue #4301.
           cargo nextest run -p freenet --locked --no-run \
+            --lib \
             --test simulation_integration \
             --test simulation_smoke \
             --test streaming_e2e \
@@ -577,11 +589,21 @@ jobs:
           NEXTEST_FAILED=0
           (
             echo "== $(date -u +%H:%M:%S) nextest starting"
+            # `--lib` makes the in-crate simulation_tests-gated tests (see the
+            # build step above and issue #4301) available to run alongside the
+            # integration binaries. The filterset then restricts execution to
+            # ALL integration tests (`kind(test)`) PLUS only the simulation
+            # e2e lib tests (`kind(lib) & test(sim_e2e_tests)`) — so the ~3000
+            # ordinary freenet lib unit tests (already covered by the
+            # workspace test job) are NOT re-run here. They were all built with
+            # --no-run above.
             cargo nextest run -p freenet --locked \
+              --lib \
               --test simulation_integration \
               --test simulation_smoke \
               --test streaming_e2e \
               --test state_verification \
+              -E 'kind(test) | (kind(lib) & test(sim_e2e_tests))' \
               --features simulation_tests,testing --profile ci 2>&1
             rc=$?
             echo "== $(date -u +%H:%M:%S) nextest done rc=${rc}"
