@@ -160,10 +160,11 @@ fn distinct_keys_same_code(
 /// count of resident entries is far BELOW the old 1024-entry count cap, proving
 /// eviction is driven by size, not count.
 ///
-/// On `origin/main` (count-capped `LruCache` with capacity 1024) this test
-/// fails: all the loaded entries stay resident (well under 1024), the byte
-/// total grows unbounded relative to any byte budget, and there is no
-/// `total_bytes`/`budget_bytes` accounting at all (the methods don't exist).
+/// Forward regression test: the byte-budget cache API this exercises
+/// (`total_bytes`/`budget_bytes`/byte-driven eviction) does not exist on `main`
+/// — `main` is a count-capped `LruCache` (capacity 1024) with no byte
+/// accounting. So this test pins the NEW behavior introduced by this PR rather
+/// than reproducing a failure that compiles on `main`.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_module_cache_evicts_by_bytes_not_count() -> Result<(), Box<dyn std::error::Error>> {
     let code = get_test_module("test_contract_1")?;

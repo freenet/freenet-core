@@ -31,7 +31,7 @@ use super::ModuleCache;
 ///
 /// The cache is bounded by the total compiled **byte size** of its entries
 /// (see [`ModuleCache`] and
-/// [`DEFAULT_MODULE_CACHE_BUDGET_BYTES`](super::DEFAULT_MODULE_CACHE_BUDGET_BYTES)),
+/// [`default_module_cache_budget_bytes`](super::default_module_cache_budget_bytes)),
 /// not by a fixed entry count. A byte budget is the correct bound here because:
 ///
 /// - It scales with how many contracts a node actually hosts: a node hosting
@@ -159,22 +159,23 @@ pub struct RuntimeConfig {
     /// Safety margin for CPU speed variations (0.0 to 1.0)
     pub safety_margin: f64,
     pub enable_metering: bool,
-    /// Byte budget for each compiled WASM module cache (contract and delegate
-    /// caches each get this budget). LRU entries are evicted on insert until the
-    /// cache's tracked compiled-byte total is within budget. See
-    /// [`DEFAULT_MODULE_CACHE_BUDGET_BYTES`].
+    /// Byte budget for the compiled-WASM **contract** module cache. The
+    /// delegate cache is sized to a fraction of this in `RuntimePool::new`
+    /// (`DELEGATE_MODULE_CACHE_BUDGET_DIVISOR`). LRU entries are evicted on
+    /// insert until the cache's tracked compiled-byte total is within budget.
+    /// See [`default_module_cache_budget_bytes`](super::default_module_cache_budget_bytes).
     pub module_cache_budget_bytes: usize,
-    /// Whether a cache-miss compile is offloaded to a blocking thread.
+    /// Production opt-in to offload a cache-miss compile to a blocking thread.
     ///
-    /// In production this is `true`: the Cranelift compile (`engine.compile`)
-    /// runs on a `spawn_blocking` thread so a cold-contract compile does not
-    /// pin the single-threaded `contract_handling` loop (issue #4441's HANG).
-    ///
-    /// Under simulation / determinism tests it MUST be `false`: the direct sim
-    /// runner is `current_thread` + `start_paused`, and `spawn_blocking`
-    /// introduces real-thread completion ordering that breaks the
-    /// event-trace determinism those tests pin. With it `false`, the compile
-    /// runs inline (synchronously) exactly as before, preserving determinism.
+    /// When `true`, `engine.compile` *may* run the Cranelift compile on a
+    /// `spawn_blocking` thread so a cold-contract compile doesn't stall the
+    /// current worker's other tasks (issue #4441's whole-node HANG). Whether it
+    /// actually offloads is decided from the live runtime flavor inside
+    /// `wasmtime_engine::compile_offloaded`: it offloads only on a MULTI-THREAD
+    /// runtime and compiles inline under a current_thread / no runtime. So this
+    /// flag is a safe opt-in everywhere — it can never panic and stays
+    /// deterministic in the `current_thread` + `start_paused` sim runner even
+    /// if set. Production sets it `true`; tests/sim leave it `false`.
     pub offload_compilation: bool,
 }
 
@@ -185,7 +186,7 @@ impl Default for RuntimeConfig {
             cpu_cycles_per_second: None,
             safety_margin: 0.2,
             enable_metering: false,
-            module_cache_budget_bytes: super::DEFAULT_MODULE_CACHE_BUDGET_BYTES,
+            module_cache_budget_bytes: super::default_module_cache_budget_bytes(),
             // Default off so that any code path building a `RuntimeConfig`
             // without explicitly opting in (tests, sim) keeps the deterministic
             // inline compile. Production opts in explicitly — see

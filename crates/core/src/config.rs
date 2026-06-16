@@ -799,7 +799,7 @@ impl ConfigArgs {
                 .unwrap_or(crate::ring::DEFAULT_HOSTING_BUDGET_BYTES),
             module_cache_budget_bytes: self
                 .module_cache_budget_bytes
-                .unwrap_or(crate::wasm_runtime::DEFAULT_MODULE_CACHE_BUDGET_BYTES),
+                .unwrap_or_else(crate::wasm_runtime::default_module_cache_budget_bytes),
             shutdown_drain_secs: self
                 .shutdown_drain_secs
                 .unwrap_or_else(default_shutdown_drain_secs),
@@ -920,10 +920,14 @@ pub struct Config {
         rename = "max-hosting-storage"
     )]
     pub max_hosting_storage: u64,
-    /// Byte budget for each compiled-WASM module cache (contract and delegate
-    /// caches each get this budget). Bounds the cache by total compiled bytes
-    /// rather than entry count, so a node hosting many contracts doesn't thrash
-    /// (issue #4441). Default: 384 MiB.
+    /// Byte budget for the compiled-WASM **contract** module cache. The
+    /// delegate cache gets a fraction of this
+    /// (`DELEGATE_MODULE_CACHE_BUDGET_DIVISOR`), so the combined ceiling is
+    /// ~1.25× this value. Bounds the cache by total compiled bytes rather than
+    /// entry count, so a node hosting many contracts doesn't thrash (issue
+    /// #4441). When unset, the default scales with system RAM
+    /// (`clamp(total_ram / 8, 64 MiB, 384 MiB)`) so a small VPS doesn't OOM and
+    /// a big gateway still caches a large working set.
     #[serde(
         default = "default_module_cache_budget_bytes",
         rename = "module-cache-budget-bytes"
@@ -978,13 +982,14 @@ fn default_max_hosting_storage() -> u64 {
     crate::ring::DEFAULT_HOSTING_BUDGET_BYTES
 }
 
-/// Default per-cache byte budget for compiled WASM modules (384 MiB).
+/// Default contract-module cache byte budget, scaled to system RAM
+/// (`clamp(total_ram / 8, 64 MiB, 384 MiB)`).
 ///
-/// Resolves to [`crate::wasm_runtime::DEFAULT_MODULE_CACHE_BUDGET_BYTES`], the
+/// Resolves to [`crate::wasm_runtime::default_module_cache_budget_bytes`], the
 /// single source of truth, so the operator-facing default and the in-code
 /// default never drift.
 fn default_module_cache_budget_bytes() -> usize {
-    crate::wasm_runtime::DEFAULT_MODULE_CACHE_BUDGET_BYTES
+    crate::wasm_runtime::default_module_cache_budget_bytes()
 }
 
 impl Config {
@@ -3006,7 +3011,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn module_cache_budget_defaults_to_384_mib() {
+    async fn module_cache_budget_defaults_to_ram_scaled_clamped() {
         let temp_dir = tempfile::tempdir().unwrap();
         let args = ConfigArgs {
             mode: Some(OperationMode::Local),
@@ -3018,16 +3023,19 @@ mod tests {
             ..Default::default()
         };
         let cfg = args.build().await.unwrap();
+        // The default is RAM-scaled and clamped to [64 MiB, 384 MiB]. It must
+        // resolve to the wasm_runtime single-source-of-truth default and land
+        // within the documented clamp range on any host.
         assert_eq!(
             cfg.module_cache_budget_bytes,
-            crate::wasm_runtime::DEFAULT_MODULE_CACHE_BUDGET_BYTES,
+            crate::wasm_runtime::default_module_cache_budget_bytes(),
             "default module cache budget should resolve to the wasm_runtime \
              single-source-of-truth default"
         );
-        assert_eq!(
-            crate::wasm_runtime::DEFAULT_MODULE_CACHE_BUDGET_BYTES,
-            384 * 1024 * 1024,
-            "default module cache budget should be 384 MiB"
+        assert!(
+            (64 * 1024 * 1024..=384 * 1024 * 1024).contains(&cfg.module_cache_budget_bytes),
+            "default budget {} must be within the [64 MiB, 384 MiB] clamp",
+            cfg.module_cache_budget_bytes
         );
     }
 

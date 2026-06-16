@@ -23,8 +23,8 @@ pub use delegate_store::DelegateStore;
 pub(crate) use engine::BackendEngine;
 pub(crate) use error::{ContractError, RuntimeInnerError, RuntimeResult};
 pub use mock_state_storage::MockStateStorage;
-pub use module_cache::DEFAULT_MODULE_CACHE_BUDGET_BYTES;
-pub(crate) use module_cache::ModuleCache;
+pub use module_cache::default_module_cache_budget_bytes;
+pub(crate) use module_cache::{DELEGATE_MODULE_CACHE_BUDGET_DIVISOR, ModuleCache};
 pub(crate) use native_api::{
     CREATED_DELEGATES_COUNT, DELEGATE_INHERITED_ORIGINS, DELEGATE_SUBSCRIPTIONS,
     DelegateContextCache, new_delegate_context_cache,

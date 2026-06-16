@@ -67,19 +67,26 @@ use crate::wasm_runtime::{
     BackendEngine, MAX_STATE_SIZE, ModuleCache, RuntimeConfig, SharedModuleCache,
 };
 
-/// Whether the production `RuntimePool` should offload cache-miss WASM compiles
-/// to a blocking thread.
+/// Whether the production `RuntimePool` requests offloading cache-miss WASM
+/// compiles to a blocking thread.
 ///
-/// Returns `true` in real (non-test) builds so a cold-contract Cranelift
-/// compile does not pin the single-threaded `contract_handling` loop (issue
-/// #4441's HANG). Returns `false` under `cfg!(test)` so that any in-process
-/// test driving the real `RuntimePool` keeps the deterministic inline compile
-/// (no `spawn_blocking` completion-ordering nondeterminism). The simulation
-/// determinism harness itself uses `MockRuntime` and never reaches this path,
-/// but gating on `cfg!(test)` is belt-and-suspenders for the real-WASM
-/// integration tests.
+/// Always `true`: the production pool *opts in* to offload so a cold-contract
+/// Cranelift compile doesn't stall the current worker's other tasks (issue
+/// #4441's whole-node HANG). Whether the offload actually happens is decided
+/// at compile time from the LIVE runtime flavor inside
+/// `wasmtime_engine::compile_offloaded`: it offloads only on a multi-thread
+/// runtime and compiles INLINE under a current_thread runtime (the sim runner
+/// and `current_thread` integration tests) or with no runtime at all.
+///
+/// This is why correctness does NOT rest on `cfg!(test)`. The previous
+/// `!cfg!(test)` gate was wrong: in an integration-test crate the freenet lib
+/// is compiled *without* `cfg(test)`, so the gate evaluated to `true` and
+/// turned offload on under the `current_thread` runtime of
+/// `error_notification::test_connection_drop_error_notification`, panicking at
+/// `block_in_place`. The runtime-flavor check in the engine is the real safety
+/// net; this flag is just the explicit production opt-in.
 fn production_offload_compilation() -> bool {
-    !cfg!(test)
+    true
 }
 use dashmap::DashMap;
 use freenet_stdlib::prelude::{MessageOrigin, RelatedContract};
@@ -253,14 +260,25 @@ impl RuntimePool {
         //
         // The caches are bounded by total compiled BYTES, not entry count, so a
         // gateway hosting thousands of contracts no longer thrashes the old
-        // 1024-entry count cap (issue #4441). The byte budget is operator-tunable
-        // via `Config::module_cache_budget_bytes`
-        // (FREENET_MODULE_CACHE_BUDGET_BYTES / `module-cache-budget-bytes`).
-        let cache_budget = config.module_cache_budget_bytes;
-        let shared_contract_modules: SharedModuleCache<ContractKey> =
-            Arc::new(Mutex::new(ModuleCache::new(cache_budget)));
-        let shared_delegate_modules: SharedModuleCache<DelegateKey> =
-            Arc::new(Mutex::new(ModuleCache::new(cache_budget)));
+        // 1024-entry count cap (issue #4441). The contract budget is
+        // operator-tunable via `Config::module_cache_budget_bytes`
+        // (FREENET_MODULE_CACHE_BUDGET_BYTES / `module-cache-budget-bytes`);
+        // when unset it scales with system RAM (see
+        // `wasm_runtime::default_module_cache_budget_bytes`). The DELEGATE cache
+        // gets only a fraction of the contract budget
+        // (`DELEGATE_MODULE_CACHE_BUDGET_DIVISOR`) — delegates are far fewer and
+        // smaller, and this keeps the COMBINED ceiling safe on a small VPS so
+        // the #4441 OOM fix doesn't itself OOM a small box.
+        let contract_cache_budget = config.module_cache_budget_bytes;
+        let delegate_cache_budget = (contract_cache_budget
+            / crate::wasm_runtime::DELEGATE_MODULE_CACHE_BUDGET_DIVISOR)
+            .max(1);
+        let shared_contract_modules: SharedModuleCache<ContractKey> = Arc::new(Mutex::new(
+            ModuleCache::with_label(contract_cache_budget, "contract"),
+        ));
+        let shared_delegate_modules: SharedModuleCache<DelegateKey> = Arc::new(Mutex::new(
+            ModuleCache::with_label(delegate_cache_budget, "delegate"),
+        ));
         // Shared delegate-context cache so a prompt round-trip routed to a
         // different pool executor still finds its `ctx.write()` blob.
         let shared_delegate_contexts = crate::wasm_runtime::new_delegate_context_cache();
@@ -401,7 +419,7 @@ impl RuntimePool {
     /// Observability-only — the sequential event loop means at most one contract
     /// is ever in flight at a time.
     ///
-    /// Panic safety: WASM panics are caught at the wasmer FFI boundary and
+    /// Panic safety: WASM traps are caught at the wasmtime boundary and
     /// converted to errors (not Rust panics), so `track_contract_return` is
     /// guaranteed to run after `track_contract_checkout` in the methods below.
     /// There are no `?` operators between the checkout/return calls.
@@ -3367,14 +3385,16 @@ impl Executor<Runtime> {
         let db = shared_state_store.storage();
         let (contract_store, delegate_store, secret_store) =
             Self::get_runtime_stores(&config, db.clone())?;
-        // Production RuntimeConfig: enable compile offload so a cold-contract
-        // Cranelift compile runs on a blocking thread instead of pinning the
-        // single-threaded contract-handling loop (issue #4441). Offload is
-        // suppressed under `cfg!(test)` to keep any test that drives the real
-        // RuntimePool free of `spawn_blocking` completion-ordering
-        // nondeterminism. The byte budget here also threads into the backend
-        // (though the *shared* cache size comes from the caches passed in by
-        // RuntimePool::new).
+        // Production RuntimeConfig: opt in to compile offload so a cold-contract
+        // Cranelift compile can run on a blocking thread instead of stalling the
+        // current worker's other tasks (issue #4441). Whether the offload
+        // actually happens is decided from the live runtime flavor inside
+        // `wasmtime_engine::compile_offloaded` — it offloads only on a
+        // multi-thread runtime and compiles inline under a current_thread / no
+        // runtime, so this stays deterministic in the sim runner and never
+        // panics in `current_thread` integration tests. The byte budget here
+        // also threads into the backend (though the *shared* cache size comes
+        // from the caches passed in by RuntimePool::new).
         let runtime_config = RuntimeConfig {
             offload_compilation: production_offload_compilation(),
             module_cache_budget_bytes: config.module_cache_budget_bytes,
@@ -4864,17 +4884,20 @@ mod executor_pin_tests {
         );
     }
 
-    /// Gate (issue #4441): under the test harness the production pool MUST run
-    /// the cache-miss compile INLINE, never offloaded — `spawn_blocking`
-    /// completion ordering would break the determinism tests that pin event
-    /// traces. `production_offload_compilation()` is the single gate; it must
-    /// return `false` when `cfg!(test)` and we assert that here.
+    /// Gate (issue #4441): the production pool OPTS IN to compile offload
+    /// (`production_offload_compilation()` is always `true`). Safety/determinism
+    /// no longer rests on this flag — it rests on the runtime-flavor check in
+    /// `wasmtime_engine::compile_offloaded`, which compiles inline under a
+    /// current_thread / no runtime and offloads only on a multi-thread runtime.
+    /// This is the fix for the old `!cfg!(test)` gate that wrongly turned
+    /// offload on in integration-test crates (compiled without `cfg(test)`) and
+    /// panicked at `block_in_place` on their current_thread runtimes.
     #[test]
-    fn production_offload_is_disabled_under_test() {
+    fn production_offload_is_opt_in() {
         assert!(
-            !super::production_offload_compilation(),
-            "compile offload MUST be off under cfg(test) so determinism tests \
-             stay deterministic"
+            super::production_offload_compilation(),
+            "production pool must opt in to offload; the runtime-flavor check in \
+             compile_offloaded keeps it safe/deterministic everywhere else"
         );
     }
 
@@ -4926,8 +4949,17 @@ mod executor_pin_tests {
             "RuntimePool::new must size caches from config.module_cache_budget_bytes"
         );
         assert!(
-            body.contains("ModuleCache::new(cache_budget)"),
-            "RuntimePool::new must build byte-budget ModuleCache instances"
+            body.contains("ModuleCache::with_label(contract_cache_budget, \"contract\")"),
+            "RuntimePool::new must build the contract cache from the contract byte budget"
+        );
+        assert!(
+            body.contains("ModuleCache::with_label(delegate_cache_budget, \"delegate\")"),
+            "RuntimePool::new must build the delegate cache from its own (smaller) budget"
+        );
+        assert!(
+            body.contains("DELEGATE_MODULE_CACHE_BUDGET_DIVISOR"),
+            "the delegate cache must be a fraction of the contract budget so the \
+             COMBINED default ceiling stays safe on a small box (issue #4441 fix-up)"
         );
         // The old count-cap constant must be gone from this path.
         assert!(
