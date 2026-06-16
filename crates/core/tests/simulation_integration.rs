@@ -8031,17 +8031,29 @@ fn test_relay_route_events_multihop() {
 ///
 /// Exercises: `get.rs` alternative retry (line ~1521) and k_closest re-query (line ~1569)
 ///
-/// Ignored: freenet-stdlib 0.2.2 adds the StreamChunk variant to ClientRequest,
-/// changing bincode serialization sizes and altering RNG-dependent topology formation.
-/// The test's fixed seed produces a different topology under 0.2.2 where node-10 cannot
-/// reach caching nodes. The GET retry logic itself is unchanged and covered by
-/// test_get_routing_coverage_low_htl. See PR #3488.
-#[ignore]
+/// Seed history: this test was `#[ignore]`d in PR #3488 because the original
+/// seed (`0xBEEF_CAFE_0001`) stopped producing a sparse-but-reachable topology
+/// after a freenet-stdlib bump shifted RNG-dependent topology formation (the
+/// stdlib's enum layout changes bincode serialization sizes, which perturbs the
+/// seeded RNG stream). #3506 re-seeded it for the current stdlib: with
+/// `SEED = 0x3506_000B_0001` the gateway PUT at HTL=2 caches the contract at
+/// exactly 2 of the 10 nodes (verified with a PUT-only run of this same
+/// topology), so 8 of the 10 GET requesters must use the retry-with-alternatives
+/// path to reach a cacher, and all 10 do, deterministically across repeated
+/// runs. Like every seed-coupled topology test, a future stdlib/topology change
+/// could perturb the RNG stream again and require another re-seed; that is
+/// expected maintenance rather than a regression in the GET retry logic itself
+/// (which is also covered by `test_get_routing_coverage_low_htl`).
 #[test_log::test]
 fn test_get_retry_with_alternatives_sparse_topology() {
     use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
 
-    const SEED: u64 = 0xBEEF_CAFE_0001;
+    // Seed reselected for the current freenet-stdlib layout (see #3506). Under
+    // this seed the gateway PUT at HTL=2 caches the contract at exactly 2 of the
+    // 10 nodes, and all 10 GET requesters reach one of those 2 cachers via the
+    // GET retry-with-alternatives path. Verified sparse + reachable + deterministic
+    // before un-ignoring; see the doc comment above for the full rationale.
+    const SEED: u64 = 0x3506_000B_0001;
     const NETWORK_NAME: &str = "get-retry-sparse";
 
     GlobalTestMetrics::reset();
