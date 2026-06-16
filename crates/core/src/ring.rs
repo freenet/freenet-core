@@ -2560,6 +2560,96 @@ fn resource_weight(resource: crate::topology::meter::ResourceType) -> f64 {
     }
 }
 
+/// Bridge the transport layer's per-peer wire-byte counters into the
+/// topology meter so `TopologyManager::adjust_topology` can make load-aware
+/// connection decisions in production (#3453).
+///
+/// `TRANSPORT_METRICS.per_peer_snapshot()` exposes *cumulative* sent/received
+/// byte counts per peer socket address. The topology meter, by contrast,
+/// expects per-sample byte counts that it accumulates into a rate over a
+/// sliding window. We therefore diff the current snapshot against the
+/// previous tick's counts (`prev`) to recover the bytes transferred during
+/// the tick, and feed that delta as one sample per direction:
+///   - received bytes → `InboundBandwidthBytes`
+///   - sent bytes     → `OutboundBandwidthBytes`
+///
+/// Only deltas with a resolvable `PeerKeyLocation` are reported: an address
+/// that doesn't (yet) map to a ring peer — e.g. a transient handshake
+/// connection — is skipped rather than attributed to a phantom source, so we
+/// don't pollute the meter with samples that can't be matched against the
+/// node's actual neighbors.
+///
+/// `prev` is updated in place to the current cumulative counts, and entries
+/// for peers no longer present in `snapshot` are dropped. This keeps `prev`
+/// bounded by the transport metrics table size (`MAX_TRACKED_PEERS`) rather
+/// than growing without limit as peers churn.
+///
+/// This takes the topology manager's write lock once per reported delta. It
+/// performs no channel sends and no `.await`, so it is safe to call inline on
+/// the `connection_maintenance` tick (cf. `.claude/rules/channel-safety.md`).
+fn feed_peer_bandwidth_to_meter(
+    connection_manager: &ConnectionManager,
+    snapshot: &[(SocketAddr, u64, u64)],
+    prev: &mut HashMap<SocketAddr, (u64, u64)>,
+    at_time: Instant,
+) {
+    use crate::topology::meter::{AttributionSource, ResourceType};
+
+    for &(addr, cum_sent, cum_recv) in snapshot {
+        // Cumulative counters only ever increase, but use saturating
+        // subtraction so a counter reset (e.g. the per-peer slot was evicted
+        // and re-created since the last tick) can never underflow into a
+        // huge bogus delta.
+        let (prev_sent, prev_recv) = prev.get(&addr).copied().unwrap_or((0, 0));
+        let sent_delta = cum_sent.saturating_sub(prev_sent);
+        let recv_delta = cum_recv.saturating_sub(prev_recv);
+
+        // Always record the latest cumulative counts so the next tick diffs
+        // against them, even when this tick produced no usable delta.
+        prev.insert(addr, (cum_sent, cum_recv));
+
+        if sent_delta == 0 && recv_delta == 0 {
+            continue;
+        }
+
+        let Some(peer) = connection_manager.get_peer_by_addr(addr) else {
+            // No ring peer for this address (transient/handshake connection,
+            // or just-torn-down). Skip rather than attribute to a phantom.
+            continue;
+        };
+
+        let source = AttributionSource::Peer(peer);
+        let mut topo = connection_manager.topology_manager.write();
+        if recv_delta > 0 {
+            topo.report_resource_usage(
+                &source,
+                ResourceType::InboundBandwidthBytes,
+                recv_delta as f64,
+                at_time,
+            );
+        }
+        if sent_delta > 0 {
+            topo.report_resource_usage(
+                &source,
+                ResourceType::OutboundBandwidthBytes,
+                sent_delta as f64,
+                at_time,
+            );
+        }
+    }
+
+    // Drop prior-tick entries for peers that vanished from the snapshot so
+    // `prev` stays bounded as peers churn (#3453). After the loop above,
+    // every snapshot address is present in `prev`, so `prev.len() >
+    // snapshot.len()` holds exactly when some prior peer is no longer in the
+    // snapshot — the only case where a prune is needed.
+    if prev.len() > snapshot.len() {
+        let live: std::collections::HashSet<SocketAddr> =
+            snapshot.iter().map(|&(addr, _, _)| addr).collect();
+        prev.retain(|addr, _| live.contains(addr));
+    }
+}
+
 impl Ring {
     // ==================== Subscription Retry Spam Prevention ====================
 
@@ -2752,6 +2842,27 @@ impl Ring {
         // successful connection, use a shorter isolation escalation threshold
         // for faster recovery from cold-start failures (#3737).
         let mut ever_had_connections = false;
+
+        // Prior-tick cumulative per-peer wire-byte counts, keyed by the
+        // transport socket address. Each maintenance tick we diff the current
+        // `TRANSPORT_METRICS.per_peer_snapshot()` against this to derive the
+        // bytes transferred *during the tick*, then feed that delta into the
+        // topology meter so `adjust_topology` can make load-aware decisions
+        // (#3453). Bounded: entries for peers absent from the latest snapshot
+        // are pruned each tick, so this never outgrows the transport metrics
+        // table (capped at `MAX_TRACKED_PEERS`).
+        //
+        // Seed with the current cumulative counts so the first maintenance
+        // tick attributes only the bytes transferred *during* that first
+        // interval, not the entire history accumulated before the loop
+        // started (which would over-count any pre-maintenance bootstrap
+        // traffic into a single inflated first sample).
+        let mut prev_peer_bandwidth: HashMap<SocketAddr, (u64, u64)> =
+            crate::transport::metrics::TRANSPORT_METRICS
+                .per_peer_snapshot()
+                .into_iter()
+                .map(|(addr, sent, recv)| (addr, (sent, recv)))
+                .collect();
 
         // Gateway version probe: random initial delay to prevent thundering herd.
         // The loop guard (`!is_gateway`) ensures gateways never probe themselves.
@@ -3260,6 +3371,19 @@ impl Ring {
                 candidates = peers.len(),
                 live_tx_peers = live_tx_tracker.len(),
                 "Evaluating topology maintenance"
+            );
+
+            // Feed the per-peer bandwidth measured since the previous tick into
+            // the topology meter BEFORE adjust_topology reads it. Without this
+            // the meter sees no peer-attributed bandwidth samples in production,
+            // so `calculate_usage_proportion` always reports ~0% usage and
+            // `adjust_topology` perpetually takes the "add connections" branch —
+            // the load-aware add/hold/remove logic never engages (#3453).
+            feed_peer_bandwidth_to_meter(
+                &self.connection_manager,
+                &crate::transport::metrics::TRANSPORT_METRICS.per_peer_snapshot(),
+                &mut prev_peer_bandwidth,
+                self.time_source.now(),
             );
 
             let adjustment = self
@@ -3801,6 +3925,305 @@ fn deferred_swap_drops_to_execute(
 #[inline]
 fn classify_suspend_jump(boot_elapsed: Duration, mono_elapsed: Duration) -> Duration {
     boot_elapsed.saturating_sub(mono_elapsed)
+}
+
+#[cfg(test)]
+mod resource_meter_bridge_tests {
+    //! Regression tests for #3453: the topology resource meter was never fed
+    //! per-peer bandwidth data in production, so `adjust_topology` always saw
+    //! ~0% usage and perpetually took the "add connections" branch. These
+    //! tests drive `feed_peer_bandwidth_to_meter` — the production bridge from
+    //! `TRANSPORT_METRICS.per_peer_snapshot()` into the meter — and assert the
+    //! meter actually receives the samples, exercising the load-aware
+    //! remove/hold/add decision logic that was previously dead in production.
+
+    // `super::*` brings in ConnectionManager, TopologyAdjustment, Location,
+    // SocketAddr, HashMap, BTreeMap, Duration, and tokio's Instant.
+    use super::*;
+    use crate::topology::meter::{AttributionSource, ResourceType};
+    use crate::transport::TransportKeypair;
+
+    /// Mirror of `topology::constants::SOURCE_RAMP_UP_DURATION` (5 min). That
+    /// constant is `pub(super)` to the topology module, so we restate it here.
+    /// Samples reported older than this window use their measured attributed
+    /// rate rather than the P50 ramp-up extrapolation.
+    const SOURCE_RAMP_UP_DURATION: Duration = Duration::from_secs(5 * 60);
+
+    /// Add `n` ring connections to `cm`, returning their socket addresses in
+    /// the order added. Each gets a distinct loopback address and location.
+    fn add_connections(cm: &ConnectionManager, n: usize) -> Vec<SocketAddr> {
+        let mut addrs = Vec::with_capacity(n);
+        for i in 0..n {
+            let addr: SocketAddr = format!("127.0.0.1:{}", 9000 + i).parse().unwrap();
+            // Spread locations across the ring so each peer is a distinct
+            // neighbor location (adjust_topology keys neighbors by location).
+            let loc = Location::new((i as f64 + 0.5) / n as f64);
+            let keypair = TransportKeypair::new();
+            assert!(cm.add_connection(loc, addr, keypair.public().clone(), false));
+            addrs.push(addr);
+        }
+        addrs
+    }
+
+    /// Drive the bridge once per simulated second, placing the first sample at
+    /// `first_sample` and one sample per second thereafter for `ticks` seconds.
+    /// `per_sec_recv[i]` is the bytes-received delta attributed to `addrs[i]`
+    /// each second; cumulative counters are simulated by accumulating the
+    /// per-second deltas (mirrors production, where each maintenance tick feeds
+    /// one delta per peer). Returns the final `prev` map for inspection.
+    ///
+    /// Callers that want the meter to report a *measured* rate (rather than the
+    /// ramp-up P50 estimate) must arrange two things, both governed by the
+    /// sample timestamps relative to the eventual `adjust_topology` query time
+    /// `q`:
+    ///   1. The first sample (the source's creation time) must be older than
+    ///      `SOURCE_RAMP_UP_DURATION` before `q`, or `extrapolated_usage`
+    ///      treats the source as ramping up and substitutes the network P50.
+    ///   2. The samples must extend up to just before `q`, because the meter's
+    ///      rate is `sum(retained samples) / (q − oldest_retained_sample)`.
+    ///      A window that ends far in the past inflates the denominator and
+    ///      dilutes the rate toward zero. The meter retains only the most
+    ///      recent `RUNNING_AVERAGE_WINDOW` (100) samples.
+    fn drive_bridge(
+        cm: &ConnectionManager,
+        addrs: &[SocketAddr],
+        per_sec_recv: &[u64],
+        first_sample: Instant,
+        ticks: u64,
+    ) -> HashMap<SocketAddr, (u64, u64)> {
+        let mut prev: HashMap<SocketAddr, (u64, u64)> = HashMap::new();
+        let mut cumulative: Vec<u64> = vec![0; addrs.len()];
+        for t in 0..ticks {
+            for (i, c) in cumulative.iter_mut().enumerate() {
+                *c += per_sec_recv[i];
+            }
+            let snapshot: Vec<(SocketAddr, u64, u64)> = addrs
+                .iter()
+                .zip(cumulative.iter())
+                .map(|(&addr, &recv)| (addr, 0u64, recv))
+                .collect();
+            let at = first_sample + Duration::from_secs(t);
+            feed_peer_bandwidth_to_meter(cm, &snapshot, &mut prev, at);
+        }
+        prev
+    }
+
+    /// The core regression: with the bridge feeding high per-peer bandwidth,
+    /// `adjust_topology` reaches the resource-overload "remove" branch. Before
+    /// the fix nothing fed the meter, so this path was unreachable in
+    /// production and the node would instead always try to ADD connections.
+    #[test_log::test]
+    fn bridge_feeds_meter_so_overloaded_node_removes() {
+        // test_default: min_connections=4, max_connections=10,
+        // max_upstream/downstream = 1_000_000 bytes/sec.
+        let cm = ConnectionManager::test_default();
+        let addrs = add_connections(&cm, 6);
+
+        // `extrapolated_usage` SUMS the per-source rates across all peers, so
+        // 200_000 B/s inbound per peer × 6 peers = 1_200_000 B/s = 1.2× the
+        // 1_000_000 downstream limit → usage proportion 1.2 > 0.9 → remove.
+        let per_sec_recv = vec![200_000u64; 6];
+
+        // Choose the query time `now`, then lay samples from
+        // (now − RAMP_UP − 30s) up to (now − 1s): the first sample is older
+        // than the ramp-up window (so the source reports its measured rate),
+        // and the retained 100-sample tail ends ~1s before `now` (so the rate
+        // isn't diluted by a stale denominator). See `drive_bridge` docs.
+        let now = Instant::now();
+        let first_sample = now - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
+        let ticks = SOURCE_RAMP_UP_DURATION.as_secs() + 29; // last sample ≈ now − 1s
+        drive_bridge(&cm, &addrs, &per_sec_recv, first_sample, ticks);
+
+        let mut neighbor_locations = BTreeMap::new();
+        let conns = cm.get_connections_by_location();
+        for (loc, c) in &conns {
+            neighbor_locations.insert(*loc, c.clone());
+        }
+
+        let adjustment =
+            cm.topology_manager
+                .write()
+                .adjust_topology(&neighbor_locations, &None, now, 6);
+
+        assert!(
+            matches!(adjustment, TopologyAdjustment::RemoveConnections(_)),
+            "overloaded node fed via the bridge must remove a connection, got {adjustment:?}"
+        );
+    }
+
+    /// Demonstrates the bug: with NO bridge call (the production state before
+    /// this fix), the meter is empty and `adjust_topology` on a node above
+    /// min_connections takes the low-usage "add" branch. This is the symptom
+    /// #3453 describes; the test above proves the bridge cures it.
+    #[test_log::test]
+    fn empty_meter_never_removes() {
+        let cm = ConnectionManager::test_default();
+        let _addrs = add_connections(&cm, 6);
+
+        let mut neighbor_locations = BTreeMap::new();
+        let conns = cm.get_connections_by_location();
+        for (loc, c) in &conns {
+            neighbor_locations.insert(*loc, c.clone());
+        }
+
+        let adjustment = cm.topology_manager.write().adjust_topology(
+            &neighbor_locations,
+            &None,
+            Instant::now(),
+            6,
+        );
+
+        assert!(
+            !matches!(adjustment, TopologyAdjustment::RemoveConnections(_)),
+            "with an unfed meter the remove branch must be unreachable (the #3453 bug), got {adjustment:?}"
+        );
+    }
+
+    /// The bridge must attribute samples to the right `ResourceType` and only
+    /// for peers that resolve to a ring `PeerKeyLocation`.
+    #[test_log::test]
+    fn bridge_records_inbound_and_outbound_for_known_peer() {
+        let cm = ConnectionManager::test_default();
+        let addrs = add_connections(&cm, 1);
+        let peer = cm
+            .get_peer_by_addr(addrs[0])
+            .expect("peer is a ring connection");
+
+        let at = Instant::now();
+        let mut prev = HashMap::new();
+        // First snapshot establishes the baseline; cumulative counts start here.
+        feed_peer_bandwidth_to_meter(&cm, &[(addrs[0], 1_000, 2_000)], &mut prev, at);
+
+        let source = AttributionSource::Peer(peer);
+        // `attributed_usage_rate` takes `&mut self` (it can refresh the
+        // meter's cached estimate), so a write guard is required.
+        let mut topo = cm.topology_manager.write();
+        // First tick: delta == cumulative (prev was 0), so both directions get
+        // a sample equal to the cumulative count.
+        let outbound = topo.attributed_usage_rate(
+            &source,
+            &ResourceType::OutboundBandwidthBytes,
+            at + Duration::from_secs(1),
+        );
+        let inbound = topo.attributed_usage_rate(
+            &source,
+            &ResourceType::InboundBandwidthBytes,
+            at + Duration::from_secs(1),
+        );
+        drop(topo);
+
+        assert_eq!(outbound.expect("outbound recorded").per_second(), 1_000.0);
+        assert_eq!(inbound.expect("inbound recorded").per_second(), 2_000.0);
+    }
+
+    /// An address with no ring connection (e.g. a transient handshake) must be
+    /// skipped, not attributed to a phantom source. `prev` is still updated so
+    /// the next tick diffs correctly if the peer later resolves.
+    #[test_log::test]
+    fn bridge_skips_unresolvable_address() {
+        let cm = ConnectionManager::test_default();
+        // Six real peers above min_connections so the only thing that could
+        // push usage into the remove branch is bandwidth attribution.
+        let _addrs = add_connections(&cm, 6);
+        // An address that is NOT a ring connection.
+        let unknown: SocketAddr = "127.0.0.1:55555".parse().unwrap();
+
+        // Feed enormous traffic for the unknown address across a full window.
+        let now = Instant::now();
+        let window_end = now - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
+        let mut prev = HashMap::new();
+        let mut cum = 0u64;
+        for t in 0..120u64 {
+            cum += 10_000_000; // far above any limit, IF it were attributed
+            feed_peer_bandwidth_to_meter(
+                &cm,
+                &[(unknown, 0, cum)],
+                &mut prev,
+                window_end - Duration::from_secs(120 - t),
+            );
+        }
+
+        let mut neighbor_locations = BTreeMap::new();
+        for (loc, c) in &cm.get_connections_by_location() {
+            neighbor_locations.insert(*loc, c.clone());
+        }
+        let adjustment =
+            cm.topology_manager
+                .write()
+                .adjust_topology(&neighbor_locations, &None, now, 6);
+
+        // The unknown address contributed no meter sample, so usage stays ~0
+        // and the node must NOT remove — proving the skip.
+        assert!(
+            !matches!(adjustment, TopologyAdjustment::RemoveConnections(_)),
+            "traffic for an unresolvable address must not be attributed, got {adjustment:?}"
+        );
+        // But prev is still updated so a future tick computes the delta from here.
+        assert_eq!(prev.get(&unknown).copied(), Some((0, cum)));
+    }
+
+    /// A counter that goes backwards (per-peer slot evicted then re-created,
+    /// resetting cumulative counts) must not underflow into a giant bogus
+    /// delta. saturating_sub clamps it to zero.
+    #[test_log::test]
+    fn bridge_handles_counter_reset_without_underflow() {
+        let cm = ConnectionManager::test_default();
+        let addrs = add_connections(&cm, 1);
+        let peer = cm.get_peer_by_addr(addrs[0]).unwrap();
+        let source = AttributionSource::Peer(peer);
+
+        let t0 = Instant::now();
+        let mut prev = HashMap::new();
+        // Establish a high cumulative count.
+        feed_peer_bandwidth_to_meter(&cm, &[(addrs[0], 0, 1_000_000)], &mut prev, t0);
+        // Counter reset: cumulative drops to a small value. Delta must be 0,
+        // not u64::MAX - something.
+        let t1 = t0 + Duration::from_secs(1);
+        feed_peer_bandwidth_to_meter(&cm, &[(addrs[0], 0, 10)], &mut prev, t1);
+
+        let rate = cm
+            .topology_manager
+            .write()
+            .attributed_usage_rate(
+                &source,
+                &ResourceType::InboundBandwidthBytes,
+                t1 + Duration::from_secs(1),
+            )
+            .unwrap()
+            .per_second();
+        // Only the first tick's 1_000_000 sample is present; the reset tick
+        // contributed a 0 delta (no sample). Sum=1_000_000 over a ~2s window.
+        assert!(
+            rate > 0.0 && rate.is_finite(),
+            "counter reset must clamp to a finite, non-underflowed rate, got {rate}"
+        );
+    }
+
+    /// `prev` must stay bounded as peers churn: entries for peers absent from
+    /// the latest snapshot are pruned so it never outgrows the transport
+    /// metrics table.
+    #[test_log::test]
+    fn bridge_prunes_departed_peers_from_prev() {
+        let cm = ConnectionManager::test_default();
+        let addrs = add_connections(&cm, 3);
+
+        let at = Instant::now();
+        let mut prev = HashMap::new();
+        let full: Vec<_> = addrs.iter().map(|&a| (a, 1u64, 1u64)).collect();
+        feed_peer_bandwidth_to_meter(&cm, &full, &mut prev, at);
+        assert_eq!(prev.len(), 3);
+
+        // Next tick: only one peer remains in the snapshot. The other two must
+        // be pruned from prev.
+        feed_peer_bandwidth_to_meter(
+            &cm,
+            &[(addrs[0], 2, 2)],
+            &mut prev,
+            at + Duration::from_secs(1),
+        );
+        assert_eq!(prev.len(), 1, "departed peers must be pruned from prev");
+        assert!(prev.contains_key(&addrs[0]));
+    }
 }
 
 #[cfg(test)]
