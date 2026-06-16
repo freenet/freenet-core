@@ -1418,4 +1418,140 @@ mod tests {
              receive loop."
         );
     }
+
+    /// Regression guard for the retry-accept ring-promotion invariant
+    /// (#3838 / PR #3893; tracked by #3894).
+    ///
+    /// The CONNECT relay accepts a joiner from THREE production sites:
+    ///
+    /// 1. the happy-path terminus/near-terminus accept
+    ///    (`initial_actions.accept`),
+    /// 2. the `Rejected` retry-accept ("accepting locally after uphill
+    ///    rejection"), and
+    /// 3. the `ConnectFailed` retry-accept ("accepting locally after
+    ///    ConnectFailed").
+    ///
+    /// EVERY accept site MUST call `dispatch_expect_connection_from` to
+    /// promote the joiner's transient transport connection into a ring
+    /// connection (it emits `NodeEvent::ExpectPeerConnection` +
+    /// `NodeEvent::ConnectPeer { is_gw: false }`). The original #3838 bug
+    /// was exactly a retry branch that sent the `ConnectResponse` upstream
+    /// but DROPPED the promotion call, stranding the joiner in
+    /// `transient_connections` on the acceptor — invisible to
+    /// `get_peer_by_addr` (subscribe interest registration, broadcast
+    /// fan-out), so UPDATEs never reached it.
+    ///
+    /// PR #3893 made the data-level drop unrepresentable by bundling the
+    /// response + joiner into `AcceptOutcome` (covered by the unit test
+    /// `connect.rs::relay_retry_acceptance_bundles_joiner_with_response`).
+    /// This source-scrape pin closes the remaining gap at the *driver*
+    /// level: it fails the build if a future edit re-inlines an accept
+    /// branch that forwards the response without dispatching the promotion.
+    ///
+    /// A behavioural simulation test was investigated for #3894 but is not
+    /// viable: the retry-accept branches are not deterministically reached
+    /// by emergent SimNetwork topology (a sparse-ring run exercised only the
+    /// terminus / near-terminus accept paths, never the `Rejected` /
+    /// `ConnectFailed` retries), and `FaultConfig` cannot inject a CONNECT
+    /// rejection to force them. Forcing the branch via capacity races would
+    /// be seed/timing-dependent (a flaky test). This pin is the deterministic
+    /// guard for the same invariant.
+    #[test]
+    fn every_relay_accept_site_promotes_joiner_to_ring() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+
+        // Restrict to production code: the `#[cfg(test)]` module below must
+        // not contribute (or mask) call sites.
+        let prod_end = SOURCE
+            .find("\n#[cfg(test)]\n")
+            .expect("expected a `#[cfg(test)]` module in op_ctx_task.rs");
+        let prod = &SOURCE[..prod_end];
+
+        // 1. Exactly three accept sites, each pairing its `accept` with the
+        //    promotion dispatch. The count is load-bearing: an added accept
+        //    branch without a matching dispatch would NOT raise this above 3,
+        //    so the per-branch checks below are also required.
+        let dispatch_sites = prod
+            .matches("dispatch_expect_connection_from(op_manager, incoming_tx,")
+            .count();
+        assert_eq!(
+            dispatch_sites, 3,
+            "expected exactly 3 `dispatch_expect_connection_from` call sites in \
+             the CONNECT relay driver (happy-path accept + `Rejected` retry-accept \
+             + `ConnectFailed` retry-accept), found {dispatch_sites}. If you added \
+             or removed an accept site, update this pin AND ensure the new site \
+             promotes the joiner — see #3838 / PR #3893."
+        );
+
+        // 2. Each retry-accept branch, anchored by its unique log message,
+        //    MUST dispatch the promotion BEFORE it forwards the
+        //    `ConnectMsg::Response` upstream. The Response send is the
+        //    branch's terminal action, so requiring the dispatch to precede
+        //    it pins both presence ("the branch promotes the joiner") and the
+        //    documented ordering ("promote joiner BEFORE sending Response
+        //    upstream"). Without the dispatch the joiner is accepted but never
+        //    promoted — the #3838 signature.
+        for (anchor, branch) in [
+            (
+                "CONNECT relay: accepting locally after uphill rejection",
+                "`Rejected` retry-accept",
+            ),
+            (
+                "CONNECT relay: accepting locally after ConnectFailed",
+                "`ConnectFailed` retry-accept",
+            ),
+        ] {
+            let anchor_pos = prod.find(anchor).unwrap_or_else(|| {
+                panic!(
+                    "retry-accept anchor log line not found: {anchor:?}. The {branch} \
+                     branch was renamed or removed — update this pin and verify the \
+                     branch still promotes the joiner (#3838 / PR #3893)."
+                )
+            });
+            let window = &prod[anchor_pos..];
+            // The branch's terminal action is forwarding the ConnectResponse
+            // upstream. Bound the window to that send so we only inspect this
+            // branch's body, independent of how the surrounding arms are
+            // structured (`} else {`, early return, etc.).
+            let response_send_offset = window
+                .find("NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Response {")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{branch} branch (anchored at {anchor:?}) no longer forwards a \
+                         ConnectMsg::Response upstream — update this pin and verify the \
+                         branch still promotes the joiner before replying (#3838)."
+                    )
+                });
+            let dispatch_offset =
+                window.find("dispatch_expect_connection_from(op_manager, incoming_tx,");
+            assert!(
+                dispatch_offset.is_some_and(|d| d < response_send_offset),
+                "{branch} branch (anchored at {anchor:?}) forwards the ConnectResponse \
+                 upstream WITHOUT first calling `dispatch_expect_connection_from`. \
+                 This re-introduces #3838: the joiner is accepted but never promoted \
+                 from `transient_connections` to a ring connection, so subscribe \
+                 interest registration and broadcast fan-out can't find it."
+            );
+        }
+
+        // 3. The happy-path accept branch must dispatch too, so the pin is
+        //    not satisfied solely by the retry branches.
+        let happy_pos = prod
+            .find("if let Some(ref accept) = initial_actions.accept {")
+            .expect(
+                "happy-path accept branch `if let Some(ref accept) = initial_actions.accept` \
+                 not found — renamed or removed; update this pin and verify it still \
+                 promotes the joiner.",
+            );
+        let happy_window = &prod[happy_pos..];
+        let happy_dispatch =
+            happy_window.find("dispatch_expect_connection_from(op_manager, incoming_tx,");
+        let happy_block_end = happy_window.find("\n    }").unwrap_or(happy_window.len());
+        assert!(
+            happy_dispatch.is_some_and(|d| d < happy_block_end),
+            "happy-path accept branch (`initial_actions.accept`) must call \
+             `dispatch_expect_connection_from` to promote the joiner to a ring \
+             connection before forwarding the response upstream (#3838 / PR #3893)."
+        );
+    }
 }
