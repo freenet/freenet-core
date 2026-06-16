@@ -763,6 +763,34 @@ pub(super) fn first_run_launch_at_login_action(
     }
 }
 
+/// Decide whether to (re)write the DMG `org.freenet.Freenet` launch agent on
+/// startup. PURE so the combined first-run + post-migration logic is unit-
+/// testable without filesystem/launchctl side effects.
+///
+/// Returns `true` when EITHER:
+/// - this is a first-run onboarding launch and nothing auto-starts Freenet yet
+///   (`first_run_launch_at_login_action` says `Register`), OR
+/// - we just removed the legacy plist this launch (`migrated_off_legacy`) and
+///   have no plist of our own (`own_plist_present == false`). This second arm
+///   exists because an EXISTING DMG user (onboarding already complete, so NOT
+///   a first run) may never have gotten our agent — the pre-migration code
+///   treated the legacy plist as already-enabled. After we remove the legacy
+///   plist they would otherwise be left with NO auto-start at all (Codex P2,
+///   round 2 on PR #4448).
+#[allow(dead_code)]
+pub(super) fn launch_at_login_needs_registration(
+    is_first_run: bool,
+    already_enabled: bool,
+    migrated_off_legacy: bool,
+    own_plist_present: bool,
+) -> bool {
+    let first_run_register = matches!(
+        first_run_launch_at_login_action(is_first_run, already_enabled),
+        FirstRunLaunchAtLoginAction::Register
+    );
+    first_run_register || (migrated_off_legacy && !own_plist_present)
+}
+
 /// Decision outcome for a user-initiated Launch at Login toggle (click
 /// on the tray menu check item). Pure function, same testability
 /// rationale as `first_run_launch_at_login_action`.
@@ -1250,36 +1278,43 @@ pub(super) fn macos_launch_at_login_startup(log_dir: &Path) {
         );
     }
 
-    // First-run auto-register. Treat the legacy plist as already-enabled
-    // so migrating users don't end up with two plists (Codex P2).
-    let already_enabled = is_launch_at_login_enabled() || legacy_present;
-    match first_run_launch_at_login_action(is_first_run, already_enabled) {
-        FirstRunLaunchAtLoginAction::Register => match std::env::current_exe() {
+    // Auto-register the DMG launch agent. Two independent reasons to register:
+    //
+    // 1. First-run onboarding: register unless something is already enabled
+    //    (our own plist, or a legacy plist we couldn't remove).
+    // 2. Post-migration replacement: we just removed the ONLY auto-start plist
+    //    (the legacy one) and have no plist of our own. This can happen for an
+    //    existing DMG user whose onboarding already completed (so it is NOT a
+    //    first run) but who never got our agent because the old code treated
+    //    the legacy plist as already-enabled. Without this, migration would
+    //    leave them with Launch at Login silently OFF (Codex P2, round 2).
+    let own_plist_present = is_launch_at_login_enabled();
+    let already_enabled = own_plist_present || legacy_present;
+    let migrated_off_legacy = migrated && !legacy_present;
+    if launch_at_login_needs_registration(
+        is_first_run,
+        already_enabled,
+        migrated_off_legacy,
+        own_plist_present,
+    ) {
+        match std::env::current_exe() {
             Ok(exe) => match enable_launch_at_login(&exe) {
-                Ok(()) => log_wrapper_event(log_dir, "First-run: registered Launch at Login agent"),
+                Ok(()) => log_wrapper_event(log_dir, "Registered Launch at Login agent"),
                 Err(e) => log_wrapper_event(
                     log_dir,
-                    &format!("First-run Launch at Login registration failed: {e}"),
+                    &format!("Launch at Login registration failed: {e}"),
                 ),
             },
             Err(e) => log_wrapper_event(
                 log_dir,
-                &format!("First-run Launch at Login: could not resolve current exe: {e}"),
+                &format!("Launch at Login: could not resolve current exe: {e}"),
             ),
-        },
-        FirstRunLaunchAtLoginAction::AlreadyEnabled => {
-            // Nothing to do for first-run, but the plist may still be stale.
-            // Only refresh if our OWN plist is present — don't resurrect
-            // a rewrite cycle on a legacy-only install.
-            if is_launch_at_login_enabled() {
-                refresh_launch_at_login_plist_if_stale();
-            }
         }
-        FirstRunLaunchAtLoginAction::NotFirstRun => {
-            if is_launch_at_login_enabled() {
-                refresh_launch_at_login_plist_if_stale();
-            }
-        }
+    } else if own_plist_present {
+        // Not registering this launch; if our OWN plist is present it may be
+        // stale (user moved the .app, new DMG location). Refresh it. Don't
+        // resurrect a rewrite cycle on a legacy-only install (own plist absent).
+        refresh_launch_at_login_plist_if_stale();
     }
 }
 
@@ -4717,6 +4752,37 @@ mod tests {
             first_run_launch_at_login_action(false, true),
             FirstRunLaunchAtLoginAction::NotFirstRun
         );
+    }
+
+    #[test]
+    fn launch_at_login_needs_registration_covers_first_run_and_migration() {
+        // First-run onboarding, nothing enabled yet → register.
+        assert!(launch_at_login_needs_registration(
+            true, false, false, false
+        ));
+        // First-run but already enabled (own or legacy plist) → don't.
+        assert!(!launch_at_login_needs_registration(
+            true, true, false, false
+        ));
+
+        // Not a first run and nothing migrated → don't (normal later launch).
+        assert!(!launch_at_login_needs_registration(
+            false, false, false, true
+        ));
+        assert!(!launch_at_login_needs_registration(
+            false, false, false, false
+        ));
+
+        // Regression for Codex P2 (round 2): existing DMG user (NOT first run),
+        // we just removed the legacy plist this launch, and have no plist of
+        // our own → MUST register, or they end up with no auto-start at all.
+        assert!(launch_at_login_needs_registration(
+            false, false, true, false
+        ));
+
+        // Migrated but we somehow already have our own plist → no need to
+        // rewrite it here (the stale-refresh path handles that).
+        assert!(!launch_at_login_needs_registration(false, true, true, true));
     }
 
     // ── Legacy install.sh → DMG migration (issue #3943) ──
