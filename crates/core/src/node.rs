@@ -4285,6 +4285,60 @@ mod tests {
         }
     }
 
+    /// Source-level pin for the #4145 non-streaming caching safety net.
+    ///
+    /// The summary-cache fix (#4145) caches a peer's summary on any
+    /// *delivered* broadcast. That is only safe because the
+    /// `ResyncRequest` handler clears the SENDER's cached summary for the
+    /// peer when a downstream delta fails to apply — otherwise a wrongly
+    /// cached summary would trap the pair sending unappliable deltas.
+    /// If a refactor drops the `update_peer_summary(.., None)` clear from
+    /// this handler, the #4145 caching loses its corrective backstop and
+    /// the behavioural sim test would still pass. Pin it at the source
+    /// level so the omission fails CI.
+    mod resync_request_clears_sender_summary {
+        const SOURCE: &str = include_str!("node.rs");
+
+        /// The body of the `InterestMessage::ResyncRequest` match arm,
+        /// bounded by the start of the following `ResyncResponse` arm.
+        fn resync_request_arm() -> &'static str {
+            let arm_anchor = "InterestMessage::ResyncRequest { key } => {";
+            let arm_start = SOURCE.find(arm_anchor).expect(
+                "ResyncRequest arm of handle_interest_sync_message not found — \
+                 the match arm has been renamed or moved; update this guard",
+            );
+            let next_anchor = "InterestMessage::ResyncResponse {";
+            let arm_end = SOURCE[arm_start..]
+                .find(next_anchor)
+                .map(|i| arm_start + i)
+                .expect("end of ResyncRequest arm not found — update guard");
+            &SOURCE[arm_start..arm_end]
+        }
+
+        #[test]
+        fn resync_request_handler_clears_cached_peer_summary() {
+            let arm = resync_request_arm();
+            assert!(
+                arm.contains("update_peer_summary"),
+                "ResyncRequest handler no longer calls update_peer_summary. \
+                 #4145 caching relies on this handler clearing the sender's \
+                 cached summary so a delta-apply failure forces a fresh \
+                 full-state resend instead of looping on unappliable deltas."
+            );
+            // The clear MUST pass `None` (clear), not a `Some(summary)` cache.
+            // Strip whitespace so the multi-line call (`op_manager\n
+            // .interest_manager\n .update_peer_summary(&key, pk, None);`)
+            // matches regardless of formatting.
+            let collapsed: String = arm.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                collapsed.contains("update_peer_summary(&key,pk,None)"),
+                "ResyncRequest handler must clear the cached summary with \
+                 `update_peer_summary(&key, pk, None)` (the `None` clears it). \
+                 Caching a summary here instead would defeat the #4145 backstop."
+            );
+        }
+    }
+
     /// Tests for `ShutdownHandle::shutdown`'s drain behaviour. The
     /// drain stops in-flight client PUT/GET/UPDATE/SUBSCRIBE drivers
     /// from being torn down mid-operation when the gateway is stopped

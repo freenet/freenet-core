@@ -3140,7 +3140,8 @@ fn test_pr2763_crdt_convergence_with_resync() {
 ///
 /// A clean star (the host broadcasts directly to its subscribers, no relay tree)
 /// removes that floor, so the metric isolates exactly the bug the fix addresses:
-/// with the fix `full_state_sends` stays at roughly one bootstrap per subscriber
+/// with the fix `full_state_sends` collapses below `delta_sends` (the host caches
+/// each subscriber's summary after a delivered broadcast and switches to deltas)
 /// while `delta_sends` grows with the update count; reverted, `full_state_sends`
 /// scales with updates × subscribers and overtakes `delta_sends`. The unit tests
 /// in `broadcast_queue.rs` pin the gate logic directly; this sim pins the
@@ -3152,10 +3153,13 @@ fn test_pr2763_crdt_convergence_with_resync() {
 /// - (a) Event-loop liveness: no `StalePeer` anomaly — every subscriber keeps
 ///   receiving broadcasts; none goes silent under the fan-out.
 /// - (b) Full-state-send rate collapses: `delta_sends > full_state_sends`. With
-///   the fix each subscriber takes one bootstrap full state then transitions to
-///   deltas, so deltas dominate. Reverted, every update is full state to every
-///   subscriber and `delta_sends` stays low → this assertion fails. (Measured:
-///   fix ≈ 78 delta / 47 full; reverted ≈ 21 delta / 104 full.)
+///   the fix the host caches each subscriber's summary after a delivered
+///   broadcast, so subsequent updates go out as deltas and deltas dominate.
+///   (Full-state sends are reduced below delta sends but NOT to one-per-
+///   subscriber — bootstrap + retry jitter mean several full states per
+///   subscriber.) Reverted, every update is full state to every subscriber and
+///   `delta_sends` stays low → this assertion fails. (Measured on this star
+///   topology: fix = 78 delta / 47 full; reverted = 40 delta / 85 full.)
 /// - (c) Broadcast delivery / update propagation stays high: all peers converge.
 #[test_log::test]
 fn test_sustained_update_fanout_no_full_state_storm() {
@@ -3255,6 +3259,11 @@ fn test_sustained_update_fanout_no_full_state_storm() {
     let delta_sends = GlobalTestMetrics::delta_sends();
     let full_state_sends = GlobalTestMetrics::full_state_sends();
     let resync_count = GlobalTestMetrics::resync_requests();
+    // Event-loop backlog proxy: the high-water mark of in-flight transactions
+    // awaiting a reply (`pending_op_results` map size). A full-state storm that
+    // pins the event loop lets replies pile up, pushing this mark up; a healthy
+    // run keeps it low. See `GlobalTestMetrics::pending_op_high_water_mark`.
+    let pending_op_hwm = GlobalTestMetrics::pending_op_high_water_mark();
 
     // Anomaly report for liveness (StalePeer = a subscriber that stopped
     // receiving broadcasts while others kept getting them).
@@ -3266,10 +3275,11 @@ fn test_sustained_update_fanout_no_full_state_storm() {
     let stale = report.stale_peers();
 
     tracing::info!(
-        "i4233 fanout: delta_sends={}, full_state_sends={}, resyncs={}, converged={}/{}, stale_peers={}",
+        "i4233 fanout: delta_sends={}, full_state_sends={}, resyncs={}, pending_op_hwm={}, converged={}/{}, stale_peers={}",
         delta_sends,
         full_state_sends,
         resync_count,
+        pending_op_hwm,
         convergence.converged.len(),
         convergence.total_contracts(),
         stale.len(),
@@ -3293,18 +3303,39 @@ fn test_sustained_update_fanout_no_full_state_storm() {
         stale,
     );
 
+    // (a2) EVENT-LOOP BACKLOG STAYS BOUNDED. StalePeer is a content-divergence
+    // proxy for liveness; this is a more direct event-loop-backlog signal. The
+    // high-water mark of `pending_op_results` (in-flight transactions awaiting a
+    // reply) tracks how far the event loop falls behind: if the loop is pinned by
+    // a broadcast storm, replies pile up and the mark climbs. Measured steady
+    // state on this star is ~15 (identical on both the fixed and reverted gate —
+    // in this small deterministic harness the storm shows up as full-state-send
+    // volume, not as op-result backlog, so this bound is a SATURATION guard, not
+    // the fix-vs-revert discriminator; assertion (b) is that discriminator). The
+    // bound is set well above steady state but far below a level that would
+    // indicate the loop is wedged and replies are accumulating unboundedly.
+    const PENDING_OP_BACKLOG_BOUND: u64 = 200;
+    assert!(
+        pending_op_hwm < PENDING_OP_BACKLOG_BOUND,
+        "#4233 liveness: event-loop backlog high-water mark {pending_op_hwm} \
+         reached {PENDING_OP_BACKLOG_BOUND}+ in-flight op-results under sustained \
+         UPDATE fan-out — the event loop is falling behind (replies piling up), \
+         a sign the broadcast path is pinning the loop."
+    );
+
     // (b) FULL-STATE-SEND RATE COLLAPSES — the load-bearing #4145 discriminator.
     //
-    // With the fix each subscriber takes exactly ONE bootstrap full state and
-    // then transitions to deltas, so over SUSTAINED_UPDATES updates the delta
-    // sends dominate the (bounded) bootstrap full states: delta_sends >
-    // full_state_sends.
+    // With the fix the host caches a subscriber's summary after a delivered
+    // broadcast, so subsequent updates go out as deltas. Full-state sends collapse
+    // BELOW delta sends (not to one-per-subscriber — bootstrap plus retry jitter
+    // produce several full states per subscriber), so over SUSTAINED_UPDATES
+    // updates the delta sends dominate: delta_sends > full_state_sends.
     //
     // Reverted to `if sent_delta`, the host never caches a subscriber's summary,
     // so EVERY update is full state to EVERY subscriber and delta_sends stays
     // low — full_state_sends overtakes delta_sends and THIS assertion fails.
-    // (Measured on this star topology: fix ≈ 78 delta / 47 full; reverted ≈ 21
-    // delta / 104 full.)
+    // (Measured on this star topology: fix = 78 delta / 47 full; reverted = 40
+    // delta / 85 full.)
     //
     // We assert the *direction* (deltas dominate) rather than an absolute
     // full-state budget: a fixed numeric cap is brittle against topology/retry
