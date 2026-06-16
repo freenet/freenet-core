@@ -2429,8 +2429,16 @@ impl Ring {
                 .then_with(|| a.instance_id.cmp(&b.instance_id))
         });
 
+        // Count LIVE entries — derive from the filtered snapshot, not
+        // `ContractBanList::len()`. `len()` includes entries that have
+        // expired but not yet been swept by `cleanup()`/`unban()`;
+        // `snapshot()` filters those out with the same `now < expires_at`
+        // predicate as `is_banned`. Using `len()` here would let the
+        // count tile read "1 contract banned" while the entry list (and
+        // the wire boundary) show zero — an inconsistency in the
+        // expiry-before-sweep window. (Codex review on #4464.)
         ns::BanListSnapshot {
-            count: self.contract_ban_list.len(),
+            count: entries.len(),
             capacity_rejected_total: self.contract_ban_list.capacity_rejected_total(),
             entries,
         }

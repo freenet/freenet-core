@@ -379,8 +379,12 @@ impl ContractBanList {
         }
     }
 
-    /// Number of currently-banned contracts. Used by tests and the
-    /// dashboard's governance card for "N contracts on ban list."
+    /// Raw number of entries in the map, including any that have expired
+    /// but not yet been swept by [`Self::cleanup`] / [`Self::unban`].
+    /// Test-only: the dashboard count tile uses [`Self::snapshot`]`.len()`
+    /// instead, which filters to LIVE entries (the same `now <
+    /// expires_at` predicate as [`Self::is_banned`]) so the count agrees
+    /// with the rendered entry list and the wire boundary.
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -388,7 +392,7 @@ impl ContractBanList {
 
     /// Total bans rejected because the list was at capacity. A non-zero
     /// value tells operators the cap is being hit — surfaced on the
-    /// dashboard's governance card alongside the ban count. Mirrors
+    /// dashboard's ban-list card (#4302) alongside the ban count. Mirrors
     /// [`crate::ring::update_rate_limit::UpdateRateLimiter::capacity_rejected_total`].
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn capacity_rejected_total(&self) -> u64 {
@@ -1270,6 +1274,36 @@ mod tests {
         assert!(
             bl.snapshot().is_empty(),
             "expired-but-unswept entry must not appear in the snapshot"
+        );
+    }
+
+    /// Source-scrape pin (Codex review on #4464): the dashboard count
+    /// tile MUST be derived from the LIVE filtered `entries`, not from
+    /// `ContractBanList::len()`. `len()` includes expired-but-unswept
+    /// entries, so using it would let the count tile read "1 banned"
+    /// while the entry list (and the wire boundary) show zero during the
+    /// expiry-before-sweep window. Building a full `Ring` for this is
+    /// overkill, so pin the wiring at the source level the same way the
+    /// dispatch-gate tests above do.
+    #[test]
+    fn dashboard_count_derives_from_live_entries_not_len() {
+        const RING_SRC: &str = include_str!("../ring.rs");
+        let fn_pos = RING_SRC
+            .find("pub fn dashboard_ban_list_snapshot")
+            .expect("dashboard_ban_list_snapshot must exist in ring.rs");
+        // Scope the scan to the function body so an unrelated `len()`
+        // elsewhere in ring.rs can't satisfy or break this pin.
+        let body = &RING_SRC[fn_pos..fn_pos.saturating_add(2_000).min(RING_SRC.len())];
+        assert!(
+            body.contains("count: entries.len()"),
+            "dashboard count must be derived from the filtered live \
+             `entries`, not the raw ban-list `len()` — see Codex review \
+             on #4464:\n{body}"
+        );
+        assert!(
+            !body.contains("count: self.contract_ban_list.len()"),
+            "dashboard count must NOT use `contract_ban_list.len()` — it \
+             includes expired-but-unswept entries the entry list omits"
         );
     }
 }
