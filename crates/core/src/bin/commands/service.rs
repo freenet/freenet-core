@@ -278,6 +278,17 @@ fn mark_first_run_complete_at(marker: &Path) -> std::io::Result<()> {
     std::fs::File::create(marker).map(|_| ())
 }
 
+/// Path of the legacy-install migration marker (issue #3943). DISTINCT from
+/// the first-run/onboarding marker: a user who already launched a DMG before
+/// this migration shipped has the first-run marker set but may still have the
+/// racing legacy launchd agent, so the migration must NOT be gated on
+/// onboarding state. The migration is its own one-shot, tracked by its own
+/// marker, so it runs once for existing DMG users too.
+#[allow(dead_code)]
+fn legacy_migration_marker_path() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("freenet").join(".legacy-migration-complete"))
+}
+
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn dashboard_port_is_listening() -> bool {
     use std::net::TcpStream;
@@ -815,6 +826,367 @@ pub(super) fn legacy_launchd_agent_present() -> bool {
         .unwrap_or(false)
 }
 
+// ── Legacy install.sh → DMG migration (issue #3943) ──
+//
+// Users who installed Freenet via the old `install.sh` path on macOS have a
+// legacy launchd agent (`~/Library/LaunchAgents/org.freenet.node.plist`) that
+// auto-starts a legacy CLI binary on login, plus that binary somewhere on
+// disk (`~/.local/bin/freenet` by default, `/usr/local/bin/freenet`, etc.).
+//
+// When such a user installs the signed DMG, both auto-starts race for port
+// 7509 on every login: launchd respawns the legacy backend, the DMG wrapper's
+// `kill_stale_freenet_processes` pkills it, launchd respawns it again, and the
+// new wrapper's backend loses the port race and exits 43.
+//
+// On first DMG launch we migrate by removing the legacy plist (after booting
+// out its launchd agent) and the legacy CLI binaries, then letting the normal
+// first-run flow register the new `org.freenet.Freenet` agent.
+//
+// The DECISION (what to remove) is a pure function so it is unit-testable on
+// Linux CI with a mock `$HOME`; the EXECUTION (launchctl bootout, fs::remove)
+// is the macOS-only side-effecting wrapper. This split follows the
+// deployment-rule pattern (`first_run_marker_*`, `compute_menu_state`).
+
+/// A side effect the legacy-install migration should perform, in the order
+/// listed by [`legacy_install_migration_plan`]. Each variant names exactly
+/// one filesystem object so the executor can attempt them independently and
+/// fall back to a manual-cleanup warning per object (e.g. a root-owned
+/// binary the user can't `rm` without `sudo`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(super) enum LegacyMigrationStep {
+    /// Boot out the legacy launchd agent for this plist, then remove the
+    /// plist file. Bootout must precede removal so launchd stops respawning
+    /// the legacy backend before we delete its definition.
+    BootOutAndRemovePlist(PathBuf),
+    /// Remove the legacy auto-update wrapper script the plist invoked
+    /// (`freenet-service-wrapper.sh`).
+    RemoveLegacyWrapperScript(PathBuf),
+    /// Remove a legacy CLI binary that THIS legacy install owned (derived
+    /// from the legacy install's own artifacts, never a guessed location —
+    /// see [`legacy_install_migration_plan`]).
+    RemoveLegacyBinary(PathBuf),
+}
+
+/// What to do about a detected legacy install. Pure value computed by
+/// [`legacy_install_migration_plan`]; the executor turns it into side
+/// effects. `NoMigration` is its own variant (rather than an empty step
+/// list) so the caller can log "nothing to migrate" distinctly from a
+/// plan that ended up empty by accident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(super) enum LegacyMigrationPlan {
+    /// No legacy plist present, or not a first-run invocation: do nothing.
+    NoMigration,
+    /// A legacy install was detected; perform these steps in order.
+    Migrate(Vec<LegacyMigrationStep>),
+}
+
+/// The legacy install's own artifacts, resolved from its plist and wrapper
+/// script (NOT guessed from hard-coded locations). The caller resolves these
+/// by reading the legacy plist's `ProgramArguments` and the wrapper script it
+/// points at, so the plan only ever touches files THIS legacy install owned.
+///
+/// This is the input that lets [`legacy_install_migration_plan`] stay pure:
+/// the caller does the file I/O and existence checks, the planner just decides.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(super) struct ResolvedLegacyInstall {
+    /// The wrapper script path from the plist's `ProgramArguments`, if it was
+    /// parseable AND the file exists. Removed by the migration.
+    pub wrapper_script: Option<PathBuf>,
+    /// Legacy CLI binaries that exist AND were referenced by the legacy
+    /// install (the binary embedded in the wrapper script, plus its sibling
+    /// `fdev`). Empty when the wrapper couldn't be read/parsed.
+    pub binaries: Vec<PathBuf>,
+}
+
+/// Decide how to migrate a pre-existing `install.sh` legacy install. PURE:
+/// takes the relevant filesystem state as inputs and returns a plan, with no
+/// side effects, so it can be unit-tested on any platform with a mock `$HOME`.
+///
+/// Arguments:
+/// - `migration_already_done`: whether the dedicated legacy-migration marker
+///   is present (we already migrated on a previous launch). This is NOT the
+///   onboarding first-run marker: a user who already launched a DMG before
+///   this migration shipped has the first-run marker set but may still have
+///   the racing legacy agent, so gating on first-run would skip exactly the
+///   users who need the migration (Codex P1 on PR #4448). The migration is
+///   its own one-shot tracked by its own marker.
+/// - `legacy_plist`: the legacy plist path and whether it currently exists.
+///   `None` means `$HOME` was unresolvable (no migration possible).
+/// - `resolved`: the legacy install's OWN artifacts (wrapper script + the
+///   binaries it referenced), already resolved and existence-filtered by the
+///   caller. We deliberately do NOT remove binaries from guessed locations:
+///   a user may have an unrelated `freenet`/`fdev` (Homebrew, cargo, manual)
+///   in `/usr/local/bin` or `~/bin` while the legacy service used
+///   `~/.local/bin`, and deleting that unrelated binary would be a
+///   destructive side effect beyond fixing the launchd race (Codex P2 on
+///   PR #4448). Targeting only the legacy install's own artifacts avoids that.
+///
+/// Returns `NoMigration` unless the migration hasn't been done yet AND the
+/// legacy plist exists. We anchor migration on the plist (not on a stray
+/// binary) because the plist is the thing that actively races for the port on
+/// login; a lone legacy binary with no auto-start agent is harmless and left
+/// alone.
+#[allow(dead_code)]
+pub(super) fn legacy_install_migration_plan(
+    migration_already_done: bool,
+    legacy_plist: Option<(PathBuf, bool)>,
+    resolved: &ResolvedLegacyInstall,
+) -> LegacyMigrationPlan {
+    if migration_already_done {
+        return LegacyMigrationPlan::NoMigration;
+    }
+    let Some((plist_path, plist_exists)) = legacy_plist else {
+        return LegacyMigrationPlan::NoMigration;
+    };
+    if !plist_exists {
+        return LegacyMigrationPlan::NoMigration;
+    }
+
+    let mut steps = Vec::with_capacity(2 + resolved.binaries.len());
+    // Bootout + plist removal first: stop launchd respawning the legacy
+    // backend before anything else.
+    steps.push(LegacyMigrationStep::BootOutAndRemovePlist(plist_path));
+    if let Some(wrapper) = &resolved.wrapper_script {
+        steps.push(LegacyMigrationStep::RemoveLegacyWrapperScript(
+            wrapper.clone(),
+        ));
+    }
+    for bin in &resolved.binaries {
+        steps.push(LegacyMigrationStep::RemoveLegacyBinary(bin.clone()));
+    }
+    LegacyMigrationPlan::Migrate(steps)
+}
+
+/// Extract the first `ProgramArguments` entry from a launchd plist's XML.
+/// For the legacy `org.freenet.node` plist this is the auto-update wrapper
+/// script path (`~/.local/bin/freenet-service-wrapper.sh`); see
+/// [`generate_plist`]. Pure string parsing so it is unit-testable: the legacy
+/// plist's exact shape is asserted in the tests against [`generate_plist`]'s
+/// own output, so a format drift trips CI.
+///
+/// Returns `None` if the plist has no `ProgramArguments` array or no
+/// `<string>` inside it (a hand-edited or unexpected plist) — in which case
+/// the caller falls back to removing only the plist itself.
+#[allow(dead_code)]
+pub(super) fn legacy_program_path_from_plist(plist_xml: &str) -> Option<PathBuf> {
+    // Find the ProgramArguments array, then the first <string>…</string>.
+    let after_key = plist_xml.split("<key>ProgramArguments</key>").nth(1)?;
+    let array = after_key.split("<array>").nth(1)?;
+    let array = array.split("</array>").next()?;
+    let start = array.find("<string>")? + "<string>".len();
+    let end = array[start..].find("</string>")? + start;
+    let raw = array[start..end].trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(xml_unescape(raw)))
+}
+
+/// Extract the freenet binary path embedded in a legacy auto-update wrapper
+/// script. [`generate_wrapper_script`] writes the binary as `"{binary}" network`
+/// / `"{binary}" update` lines; we recover it from the `network` invocation.
+/// Pure string parsing, unit-tested against [`generate_wrapper_script`]'s own
+/// output so a format drift trips CI.
+///
+/// Returns `None` if the expected invocation line isn't found (e.g. a
+/// hand-written wrapper), in which case the caller removes only the wrapper
+/// script and plist, not a guessed binary.
+#[allow(dead_code)]
+pub(super) fn legacy_binary_path_from_wrapper(wrapper_sh: &str) -> Option<PathBuf> {
+    // Match the `"<binary>" network …` launch line. The path is quoted so an
+    // install path containing spaces survives.
+    for line in wrapper_sh.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('"') {
+            continue;
+        }
+        let rest = &trimmed[1..];
+        let Some(close) = rest.find('"') else {
+            continue;
+        };
+        let path = &rest[..close];
+        let after = rest[close + 1..].trim_start();
+        if after.starts_with("network") && !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    None
+}
+
+/// Basename of the auto-update wrapper script `freenet service install`
+/// writes (see [`wrapper_script_path`]). The migration only treats a plist's
+/// `ProgramArguments` target as a removable Freenet wrapper if it has this
+/// exact filename.
+const LEGACY_WRAPPER_SCRIPT_NAME: &str = "freenet-service-wrapper.sh";
+
+/// Distinctive header line [`generate_wrapper_script`] writes at the top of
+/// every wrapper. Used as a content signature so we never delete a
+/// hand-written or repurposed script that merely happens to be referenced by
+/// an `org.freenet.node` plist.
+const LEGACY_WRAPPER_SIGNATURE: &str = "# Freenet service wrapper for auto-update support.";
+
+/// Returns true if `(basename, contents)` look like a Freenet-generated
+/// auto-update wrapper script — i.e. it is safe for the migration to delete.
+/// PURE so the guard is unit-testable. We require BOTH the canonical filename
+/// AND the generated header signature, so a user who repurposed the legacy
+/// `org.freenet.node` label to launch an unrelated script does NOT have that
+/// script deleted (Codex P2, round 4 on PR #4448).
+#[allow(dead_code)]
+pub(super) fn is_legacy_freenet_wrapper(basename: Option<&str>, contents: &str) -> bool {
+    basename == Some(LEGACY_WRAPPER_SCRIPT_NAME) && contents.contains(LEGACY_WRAPPER_SIGNATURE)
+}
+
+/// Reverse of [`xml_escape`] for the entity set that function emits. Used to
+/// recover a real filesystem path from a plist `<string>` (e.g. a path with
+/// `&amp;` in it).
+#[allow(dead_code)]
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        // &amp; must be last so we don't double-decode the others.
+        .replace("&amp;", "&")
+}
+
+/// Execute a [`LegacyMigrationPlan`] on macOS. Best-effort and idempotent:
+/// each step is attempted independently and a failure (e.g. a root-owned
+/// binary the user can't `rm` without `sudo`) logs a manual-cleanup hint
+/// rather than aborting the whole migration or failing wrapper startup.
+///
+/// Returns `true` if a migration was attempted (so the caller knows the
+/// legacy plist is gone and the normal first-run agent registration should
+/// proceed), `false` if there was nothing to migrate.
+#[cfg(target_os = "macos")]
+fn run_legacy_install_migration(log_dir: &Path, plan: &LegacyMigrationPlan) -> bool {
+    let LegacyMigrationPlan::Migrate(steps) = plan else {
+        return false;
+    };
+    log_wrapper_event(
+        log_dir,
+        "Legacy install.sh install detected on first DMG launch; migrating to \
+         the DMG-managed launch agent (issue #3943).",
+    );
+    for step in steps {
+        match step {
+            LegacyMigrationStep::BootOutAndRemovePlist(plist) => {
+                // Bootout first so launchd stops auto-respawning the legacy
+                // backend; bootout is a no-op/non-fatal if not loaded.
+                launchctl_bootout(plist);
+                match remove_launch_agent_plist_at(plist) {
+                    Ok(()) => log_wrapper_event(
+                        log_dir,
+                        &format!("Migration: removed legacy launch agent {}", plist.display()),
+                    ),
+                    Err(e) => log_wrapper_event(
+                        log_dir,
+                        &format!(
+                            "Migration: could not remove legacy launch agent {} ({e}). \
+                             Please remove it manually: rm {}",
+                            plist.display(),
+                            plist.display()
+                        ),
+                    ),
+                }
+            }
+            LegacyMigrationStep::RemoveLegacyWrapperScript(wrapper) => {
+                remove_legacy_file(log_dir, "legacy wrapper script", wrapper);
+            }
+            LegacyMigrationStep::RemoveLegacyBinary(bin) => {
+                remove_legacy_file(log_dir, "legacy CLI binary", bin);
+            }
+        }
+    }
+    true
+}
+
+/// Remove a single legacy file as part of the migration, logging the outcome.
+/// Idempotent: a missing file is a no-op (it raced away between the caller's
+/// existence check and now). A permission failure (e.g. a root-owned binary
+/// the user can't `rm` without `sudo`) logs a manual-cleanup hint rather than
+/// failing the migration.
+#[cfg(target_os = "macos")]
+fn remove_legacy_file(log_dir: &Path, kind: &str, path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => log_wrapper_event(
+            log_dir,
+            &format!("Migration: removed {kind} {}", path.display()),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Raced away between the existence check and now; fine.
+        }
+        Err(e) => log_wrapper_event(
+            log_dir,
+            &format!(
+                "Migration: could not remove {kind} {} ({e}). \
+                 If it persists, remove it manually: sudo rm {}",
+                path.display(),
+                path.display()
+            ),
+        ),
+    }
+}
+
+/// Resolve a legacy install's own artifacts by reading its plist and the
+/// wrapper script the plist invokes. Side-effecting (file I/O) but does NOT
+/// mutate anything; the pure decision still lives in
+/// [`legacy_install_migration_plan`]. Only artifacts that exist on disk are
+/// returned, so the planner's output matches what is actually present.
+///
+/// We deliberately derive the binary from the wrapper script rather than
+/// guessing install locations, so we never remove an unrelated user-installed
+/// `freenet`/`fdev` (Codex P2, round 1 on PR #4448). We also VALIDATE that the
+/// referenced script is actually a Freenet-generated wrapper (canonical
+/// filename + header signature) before scheduling it — or its binary — for
+/// removal, so a hand-edited or repurposed `org.freenet.node` plist pointing
+/// at an unrelated script cannot cause that script/binary to be deleted
+/// (Codex P2, round 4).
+#[cfg(target_os = "macos")]
+fn resolve_legacy_install(legacy_plist: &Path) -> ResolvedLegacyInstall {
+    let Ok(plist_xml) = std::fs::read_to_string(legacy_plist) else {
+        return ResolvedLegacyInstall::default();
+    };
+    let Some(wrapper_path) = legacy_program_path_from_plist(&plist_xml) else {
+        return ResolvedLegacyInstall::default();
+    };
+
+    // Only act on the wrapper if it is genuinely a Freenet-generated script.
+    // If we can't read it, or it doesn't look like ours, remove nothing here
+    // (the caller still removes the plist itself, which is the race cause).
+    let Ok(wrapper_sh) = std::fs::read_to_string(&wrapper_path) else {
+        return ResolvedLegacyInstall::default();
+    };
+    let basename = wrapper_path.file_name().and_then(|n| n.to_str());
+    if !is_legacy_freenet_wrapper(basename, &wrapper_sh) {
+        return ResolvedLegacyInstall::default();
+    }
+
+    // The plist's ProgramArguments points at the auto-update wrapper script,
+    // not the binary directly (see `generate_plist`). Recover the binary from
+    // the wrapper, then offer its sibling `fdev` too (install.sh ships both).
+    // Constrain to the canonical `freenet`/`fdev` basenames as a second guard.
+    let mut binaries = Vec::new();
+    if let Some(bin) = legacy_binary_path_from_wrapper(&wrapper_sh) {
+        if bin.file_name().and_then(|n| n.to_str()) == Some("freenet") && bin.exists() {
+            if let Some(dir) = bin.parent() {
+                let fdev = dir.join("fdev");
+                if fdev.exists() {
+                    binaries.push(fdev);
+                }
+            }
+            binaries.push(bin);
+        }
+    }
+
+    ResolvedLegacyInstall {
+        wrapper_script: wrapper_path.exists().then_some(wrapper_path),
+        binaries,
+    }
+}
+
 /// Run all the macOS-only Launch-at-Login housekeeping that must happen
 /// before the tray is built. Specifically:
 ///
@@ -824,9 +1196,12 @@ pub(super) fn legacy_launchd_agent_present() -> bool {
 ///   Launch at Login but the plist's embedded executable path no longer
 ///   matches the current one (user moved the .app, upgraded via a new
 ///   DMG installed elsewhere, etc.), rewrite it.
-/// - If the legacy `org.freenet.node` LaunchAgent from the install.sh
-///   era is still present, log a prominent warning so migrating users
-///   know to clean it up before the two agents race for port 7509.
+/// - If a legacy `org.freenet.node` LaunchAgent from the install.sh era is
+///   present, migrate away from it (issue #3943): boot it out, remove its
+///   plist + wrapper + the binaries that install owned, then register our own
+///   agent. If migration can't remove the legacy plist (rare), fall back to
+///   logging a prominent manual-cleanup warning so the user knows the two
+///   agents race for port 7509.
 ///
 /// Called synchronously (not from the wrapper thread) so the tray's
 /// Launch-at-Login check item reads the final filesystem state when
@@ -836,14 +1211,109 @@ pub(super) fn legacy_launchd_agent_present() -> bool {
 /// on first launch even though Launch at Login had been enabled.
 #[cfg(target_os = "macos")]
 pub(super) fn macos_launch_at_login_startup(log_dir: &Path) {
-    // Legacy-agent warning: fire once per startup regardless of first-run.
-    // If users see this, they have an auto-start from the old install.sh
-    // flow still configured; if we also write our own plist below, both
-    // agents race for port 7509 on every login. To avoid that race we
-    // treat the legacy plist's presence as "already enabled" for the
-    // first-run decision, so we don't layer a second auto-start on top.
-    // User is still instructed to clean up the legacy one manually.
-    let legacy_present = legacy_launchd_agent_present();
+    // Resolve the onboarding first-run marker up front: the auto-register
+    // decision below uses it. (The legacy migration is gated on its OWN marker,
+    // not this one — see below.)
+    let Some(marker) = first_run_marker_path() else {
+        return;
+    };
+    let is_first_run = is_first_run_at(&marker);
+
+    // Legacy-install migration (issue #3943). If a pre-existing install.sh
+    // launch agent is present, boot it out, remove its plist + auto-update
+    // wrapper script, and remove the CLI binaries THAT legacy install owned,
+    // so the two installs stop racing for port 7509. We resolve the legacy
+    // install's own artifacts from its plist and wrapper (never guessed
+    // locations) so we don't delete an unrelated `freenet`/`fdev` a user
+    // installed separately. The decision is computed by the pure
+    // `legacy_install_migration_plan` so it is unit-testable on Linux.
+    //
+    // Gated on a DEDICATED migration marker, NOT the onboarding first-run
+    // marker: existing DMG users have the first-run marker set but may still
+    // have the racing legacy agent, and must still get migrated (Codex P1).
+    let migration_done = legacy_migration_marker_path()
+        .map(|m| m.exists())
+        .unwrap_or(false);
+    let legacy_plist_path = launch_agent_plist_path_for(LEGACY_SERVICE_LAUNCHD_LABEL);
+    let legacy_present = legacy_plist_path
+        .as_ref()
+        .map(|p| p.exists())
+        .unwrap_or(false);
+    let resolved = legacy_plist_path
+        .as_ref()
+        .filter(|_| !migration_done && legacy_present)
+        .map(|p| resolve_legacy_install(p))
+        .unwrap_or_default();
+    let legacy_plist = legacy_plist_path.map(|p| (p, legacy_present));
+    let plan = legacy_install_migration_plan(migration_done, legacy_plist, &resolved);
+    let migrated = run_legacy_install_migration(log_dir, &plan);
+
+    // Re-evaluate legacy presence after migration: a successful migration
+    // removed the legacy plist.
+    let legacy_present = if migrated {
+        legacy_launchd_agent_present()
+    } else {
+        legacy_present
+    };
+
+    // If we migrated an existing user who had no DMG agent of their own (the
+    // pre-migration code treated the legacy plist as already-enabled, so an
+    // already-onboarded user never got ours), register the replacement NOW —
+    // in the same launch as the migration — so they aren't left with Launch
+    // at Login silently off (Codex P2, round 2).
+    //
+    // This is intentionally a ONE-SHOT tied to the migrating launch, NOT a
+    // durable "re-register whenever our plist is absent" rule: once the
+    // migration marker is written (below), a migrated user who later DISABLES
+    // Launch at Login via the tray must keep it disabled — we must not
+    // recreate the plist against their explicit choice (Codex P2, round 5).
+    let migrated_off_legacy = migrated && !legacy_present;
+    if migrated_off_legacy && !is_launch_at_login_enabled() {
+        match std::env::current_exe() {
+            Ok(exe) => match enable_launch_at_login(&exe) {
+                Ok(()) => log_wrapper_event(
+                    log_dir,
+                    "Migration: registered replacement Launch at Login agent",
+                ),
+                Err(e) => log_wrapper_event(
+                    log_dir,
+                    &format!(
+                        "Migration: replacement Launch at Login registration failed ({e}). \
+                         Enable it from the Freenet tray menu if you want auto-start on login."
+                    ),
+                ),
+            },
+            Err(e) => log_wrapper_event(
+                log_dir,
+                &format!("Migration: could not resolve current exe for replacement agent: {e}"),
+            ),
+        }
+    }
+
+    // Mark the migration done ONLY once the legacy plist is actually gone, so
+    // a launch where plist removal was denied (rare; the plist is user-owned)
+    // retries next time rather than giving up permanently. The marker means
+    // "the legacy race is resolved": once written we never auto-manage Launch
+    // at Login off the migration path again, so a later user disable sticks
+    // (Codex P2, round 5).
+    if migrated && !legacy_present {
+        if let Some(m) = legacy_migration_marker_path() {
+            if let Err(e) = mark_first_run_complete_at(&m) {
+                log_wrapper_event(
+                    log_dir,
+                    &format!(
+                        "Migration: failed to write migration marker {}: {e}",
+                        m.display()
+                    ),
+                );
+            }
+        }
+    }
+
+    // Legacy-agent warning: if the legacy plist is STILL present (we either
+    // didn't migrate this launch, or removal was denied), warn the user.
+    // Treating the legacy plist's presence as "already enabled" below avoids
+    // layering a second auto-start on top of one we couldn't remove.
     if legacy_present {
         log_wrapper_event(
             log_dir,
@@ -856,13 +1326,12 @@ pub(super) fn macos_launch_at_login_startup(log_dir: &Path) {
         );
     }
 
-    // First-run auto-register. Treat the legacy plist as already-enabled
-    // so migrating users don't end up with two plists (Codex P2).
-    let Some(marker) = first_run_marker_path() else {
-        return;
-    };
+    // First-run onboarding auto-register: register unless something already
+    // auto-starts Freenet (our own plist, or a legacy plist we couldn't
+    // remove). The post-migration replacement registration is handled above;
+    // here we only handle genuine first-run and the stale-plist self-heal.
     let already_enabled = is_launch_at_login_enabled() || legacy_present;
-    match first_run_launch_at_login_action(is_first_run_at(&marker), already_enabled) {
+    match first_run_launch_at_login_action(is_first_run, already_enabled) {
         FirstRunLaunchAtLoginAction::Register => match std::env::current_exe() {
             Ok(exe) => match enable_launch_at_login(&exe) {
                 Ok(()) => log_wrapper_event(log_dir, "First-run: registered Launch at Login agent"),
@@ -876,15 +1345,11 @@ pub(super) fn macos_launch_at_login_startup(log_dir: &Path) {
                 &format!("First-run Launch at Login: could not resolve current exe: {e}"),
             ),
         },
-        FirstRunLaunchAtLoginAction::AlreadyEnabled => {
-            // Nothing to do for first-run, but the plist may still be stale.
-            // Only refresh if our OWN plist is present — don't resurrect
-            // a rewrite cycle on a legacy-only install.
-            if is_launch_at_login_enabled() {
-                refresh_launch_at_login_plist_if_stale();
-            }
-        }
-        FirstRunLaunchAtLoginAction::NotFirstRun => {
+        FirstRunLaunchAtLoginAction::AlreadyEnabled | FirstRunLaunchAtLoginAction::NotFirstRun => {
+            // Nothing to register; if our OWN plist is present it may be stale
+            // (user moved the .app, new DMG location). Refresh it. Don't
+            // resurrect a rewrite cycle on a legacy-only install (own plist
+            // absent), and don't fight a user who deliberately disabled it.
             if is_launch_at_login_enabled() {
                 refresh_launch_at_login_plist_if_stale();
             }
@@ -4326,6 +4791,221 @@ mod tests {
             first_run_launch_at_login_action(false, true),
             FirstRunLaunchAtLoginAction::NotFirstRun
         );
+    }
+
+    // ── Legacy install.sh → DMG migration (issue #3943) ──
+
+    fn legacy_plist(exists: bool) -> Option<(PathBuf, bool)> {
+        Some((
+            PathBuf::from("/u/Library/LaunchAgents/org.freenet.node.plist"),
+            exists,
+        ))
+    }
+
+    #[test]
+    fn legacy_install_migration_plan_skips_when_already_migrated() {
+        // Migration marker present (we already migrated on a previous launch):
+        // never re-migrate, even with a legacy plist + binaries still present.
+        let resolved = ResolvedLegacyInstall {
+            wrapper_script: Some(PathBuf::from("/u/.local/bin/freenet-service-wrapper.sh")),
+            binaries: vec![PathBuf::from("/u/.local/bin/freenet")],
+        };
+        let plan = legacy_install_migration_plan(
+            /* migration_already_done */ true,
+            legacy_plist(true),
+            &resolved,
+        );
+        assert_eq!(plan, LegacyMigrationPlan::NoMigration);
+    }
+
+    #[test]
+    fn legacy_install_migration_plan_skips_when_no_legacy_plist() {
+        // Clean (new-user) DMG install: no legacy plist, so there is nothing
+        // to migrate even if a stray binary somehow exists. A lone binary with
+        // no auto-start agent is harmless.
+        let resolved = ResolvedLegacyInstall {
+            wrapper_script: None,
+            binaries: vec![PathBuf::from("/u/.local/bin/freenet")],
+        };
+        assert_eq!(
+            legacy_install_migration_plan(false, None, &resolved),
+            LegacyMigrationPlan::NoMigration
+        );
+        assert_eq!(
+            legacy_install_migration_plan(false, legacy_plist(false), &resolved),
+            LegacyMigrationPlan::NoMigration
+        );
+    }
+
+    /// Regression test for issue #3943. Before the fix, a DMG launch with a
+    /// pre-existing install.sh legacy install only LOGGED a warning; it did
+    /// NOT remove the legacy plist, wrapper, or CLI binaries, so the two
+    /// installs raced for port 7509 on every login. This asserts the plan
+    /// boots out + removes the legacy plist first, then the wrapper script,
+    /// then each legacy binary, in order. `migration_already_done = false`
+    /// (covers existing DMG users, not just brand-new onboarding — Codex P1).
+    #[test]
+    fn legacy_install_migration_plan_removes_plist_wrapper_and_binaries() {
+        let plist = PathBuf::from("/u/Library/LaunchAgents/org.freenet.node.plist");
+        let resolved = ResolvedLegacyInstall {
+            wrapper_script: Some(PathBuf::from("/u/.local/bin/freenet-service-wrapper.sh")),
+            binaries: vec![
+                PathBuf::from("/u/.local/bin/fdev"),
+                PathBuf::from("/u/.local/bin/freenet"),
+            ],
+        };
+        let plan = legacy_install_migration_plan(false, Some((plist.clone(), true)), &resolved);
+
+        assert_eq!(
+            plan,
+            LegacyMigrationPlan::Migrate(vec![
+                // Bootout + plist removal first so launchd stops respawning
+                // the legacy backend before we remove anything else.
+                LegacyMigrationStep::BootOutAndRemovePlist(plist),
+                LegacyMigrationStep::RemoveLegacyWrapperScript(PathBuf::from(
+                    "/u/.local/bin/freenet-service-wrapper.sh"
+                )),
+                LegacyMigrationStep::RemoveLegacyBinary(PathBuf::from("/u/.local/bin/fdev")),
+                LegacyMigrationStep::RemoveLegacyBinary(PathBuf::from("/u/.local/bin/freenet")),
+            ])
+        );
+    }
+
+    #[test]
+    fn legacy_install_migration_plan_handles_plist_only() {
+        // Legacy plist present but the wrapper/binary couldn't be resolved
+        // (e.g. wrapper already deleted, or plist hand-edited). We still boot
+        // out + remove the plist — that is the thing racing for the port —
+        // and the plan contains exactly that one step. Crucially we do NOT
+        // fabricate binary-removal steps for guessed locations.
+        let plist = PathBuf::from("/u/Library/LaunchAgents/org.freenet.node.plist");
+        let plan = legacy_install_migration_plan(
+            false,
+            Some((plist.clone(), true)),
+            &ResolvedLegacyInstall::default(),
+        );
+        assert_eq!(
+            plan,
+            LegacyMigrationPlan::Migrate(vec![LegacyMigrationStep::BootOutAndRemovePlist(plist)])
+        );
+    }
+
+    /// Plist-path extractor against representative launchd-plist XML (the
+    /// shape `generate_plist` emits). Runs on every platform — Linux CI
+    /// exercises the parsing logic here; the macOS-only
+    /// `legacy_extractors_match_generators` test below additionally pins the
+    /// coupling to the generator's exact output.
+    #[test]
+    fn legacy_program_path_from_plist_parses_program_arguments() {
+        let xml = "\
+<plist version=\"1.0\"><dict>
+  <key>Label</key><string>org.freenet.node</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/u/.local/bin/freenet-service-wrapper.sh</string>
+  </array>
+</dict></plist>";
+        assert_eq!(
+            legacy_program_path_from_plist(xml),
+            Some(PathBuf::from("/u/.local/bin/freenet-service-wrapper.sh"))
+        );
+
+        // XML-escaped ampersand in the path round-trips through unescape.
+        let xml = "<key>ProgramArguments</key><array><string>/u/A &amp; B/w.sh</string></array>";
+        assert_eq!(
+            legacy_program_path_from_plist(xml),
+            Some(PathBuf::from("/u/A & B/w.sh"))
+        );
+
+        // No ProgramArguments, empty array, empty string → None (caller then
+        // removes only the plist itself).
+        assert_eq!(legacy_program_path_from_plist("<plist></plist>"), None);
+        assert_eq!(
+            legacy_program_path_from_plist("<key>ProgramArguments</key><array></array>"),
+            None
+        );
+        assert_eq!(
+            legacy_program_path_from_plist(
+                "<key>ProgramArguments</key><array><string></string></array>"
+            ),
+            None
+        );
+    }
+
+    /// Wrapper-binary extractor against representative wrapper-script content
+    /// (the shape `generate_wrapper_script` emits), including a path with a
+    /// space. Runs on every platform.
+    #[test]
+    fn legacy_binary_path_from_wrapper_parses_launch_line() {
+        let sh = "#!/bin/bash\n# preamble\n    \"/u/.local/bin/freenet\" network 2>/dev/null &\n";
+        assert_eq!(
+            legacy_binary_path_from_wrapper(sh),
+            Some(PathBuf::from("/u/.local/bin/freenet"))
+        );
+
+        // Quoted path with a space survives (the `-o command=` regression).
+        let sh = "\"/Users/Some User/bin/freenet\" network &\n";
+        assert_eq!(
+            legacy_binary_path_from_wrapper(sh),
+            Some(PathBuf::from("/Users/Some User/bin/freenet"))
+        );
+
+        // No recognizable launch line → None (no guessed binary removed).
+        assert_eq!(
+            legacy_binary_path_from_wrapper("#!/bin/bash\necho hi\n"),
+            None
+        );
+    }
+
+    /// The wrapper-ownership guard (Codex P2, round 4): we only delete a script
+    /// that is BOTH named `freenet-service-wrapper.sh` AND carries the
+    /// generated header. A hand-edited/repurposed `org.freenet.node` plist
+    /// pointing at an unrelated script must not get that script deleted.
+    #[test]
+    fn is_legacy_freenet_wrapper_requires_name_and_signature() {
+        let real = "#!/bin/bash\n# Freenet service wrapper for auto-update support.\n…";
+        assert!(is_legacy_freenet_wrapper(
+            Some("freenet-service-wrapper.sh"),
+            real
+        ));
+
+        // Right content but wrong filename (repurposed plist target).
+        assert!(!is_legacy_freenet_wrapper(Some("my-script.sh"), real));
+        // Right filename but not our content (user overwrote it).
+        assert!(!is_legacy_freenet_wrapper(
+            Some("freenet-service-wrapper.sh"),
+            "#!/bin/bash\nrm -rf ~\n"
+        ));
+        // No basename at all.
+        assert!(!is_legacy_freenet_wrapper(None, real));
+    }
+
+    /// macOS-only: pin the extractors to `generate_plist` /
+    /// `generate_wrapper_script`'s EXACT output so a format drift in either
+    /// generator (which only compiles on macOS) trips CI. Also confirm the
+    /// real generated wrapper passes the ownership guard.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn legacy_extractors_match_generators() {
+        let wrapper = PathBuf::from("/u/.local/bin/freenet-service-wrapper.sh");
+        let log_dir = PathBuf::from("/u/.local/state/freenet");
+        let xml = generate_plist(&wrapper, &log_dir);
+        assert_eq!(legacy_program_path_from_plist(&xml), Some(wrapper));
+
+        let bin = PathBuf::from("/u/.local/bin/freenet");
+        let sh = generate_wrapper_script(&bin);
+        assert_eq!(legacy_binary_path_from_wrapper(&sh), Some(bin));
+        // The real generated wrapper must satisfy the ownership guard, or the
+        // migration would never act on a genuine legacy install.
+        assert!(is_legacy_freenet_wrapper(
+            Some("freenet-service-wrapper.sh"),
+            &sh
+        ));
+
+        // End-to-end: plist → wrapper path → wrapper script → binary path.
+        let spacey = PathBuf::from("/Users/Some User/bin/freenet");
+        let sh = generate_wrapper_script(&spacey);
+        assert_eq!(legacy_binary_path_from_wrapper(&sh), Some(spacey));
     }
 
     #[test]
