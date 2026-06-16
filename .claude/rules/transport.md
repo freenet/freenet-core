@@ -138,9 +138,12 @@ populated by `RollingRttStatsHandle` in every `RemoteConnection`. A
 mirror; visible via `RUST_LOG=…=debug` in debug builds, compiled
 out entirely in release builds via the `release_max_level_info`
 feature in `crates/core/Cargo.toml`) and via
-`send_standalone_event_with_peer_id` so it reaches the OTLP
+`send_standalone_shadow_event_with_peer_id` so it reaches the OTLP
 collector regardless of log level, tagged with the local node id
-so the collector can disaggregate samples per reporting node.
+so the collector can disaggregate samples per reporting node. All
+five shadow emitters use the `_shadow_` variant so the telemetry
+rate limiter admits them under a low-priority sub-budget and they
+cannot starve operational telemetry (#4380).
 
 `transport/reference_ping.rs` runs an analogous 1Hz loop
 (`reference_ping` background task) that probes a fixed external
