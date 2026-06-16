@@ -1,0 +1,139 @@
+name: Shell Playwright E2E
+
+# Browser smoke tests for the gateway shell + sandboxed iframe postMessage
+# contract (freenet/freenet-core#3856).
+#
+# Why a separate workflow: the shell bridge, navigation interceptor, and CSP
+# are JavaScript strings injected by crates/core/src/server/path_handlers.rs +
+# client_api.rs. Every other CI job only ever asserts substrings of that JS at
+# the Rust level; nothing executes it in a real browser. Four regressions
+# (#3842, #3849, #3852, #3854) shipped to production through that gap. This job
+# boots a node (via the #[freenet_test] harness in
+# crates/core/tests/playwright_shell.rs), publishes a fixture webapp, and drives
+# the injected JS against headless Chromium with Playwright.
+#
+# NOT a required check (yet): it is path-filtered to the server JS + the test
+# harness, so it does not run on every PR. A path-filtered workflow does not
+# reliably produce a check context for branch protection, so do NOT mark this
+# required without first restructuring it into an always-green gate + a
+# conditional real job (see the note in macos-dmg-swap-e2e.yml). Until then it
+# runs as an informational gate on PRs that touch the relevant surface and on
+# main.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/core/src/server/**'
+      - 'crates/core/tests/playwright/**'
+      - 'crates/core/tests/playwright_shell.rs'
+      # fdev is the publish path the harness shells out to; a regression in
+      # `fdev website publish` would break the harness, so run on fdev changes.
+      - 'crates/fdev/**'
+      - '.github/workflows/playwright-shell.yml'
+  pull_request:
+    paths:
+      - 'crates/core/src/server/**'
+      - 'crates/core/tests/playwright/**'
+      - 'crates/core/tests/playwright_shell.rs'
+      - 'crates/fdev/**'
+      - '.github/workflows/playwright-shell.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  shell-e2e:
+    name: Shell Playwright E2E
+    runs-on: ubicloud-standard-8
+    timeout-minutes: 30
+
+    env:
+      # Quiet logs; the harness emits its own progress at INFO via tracing only
+      # when something is wrong. A full DEBUG run produces GBs for a node boot.
+      RUST_LOG: warn
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      RUST_MIN_STACK: 268435456
+      FREENET_PLAYWRIGHT: "1"
+      # Reduce gateway connection backoff for CI (default 30s is too aggressive
+      # for localhost tests under CI resource pressure). See issue #3078.
+      FREENET_BACKOFF_BASE_SECS: "5"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install mold linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install nextest
+        run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      # fdev is the publish path the harness shells out to. Build it (and the
+      # test's own crate deps) before the test step so the binary is on disk.
+      - name: Build fdev
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: cargo build --bin fdev --locked
+
+      - name: Install Playwright deps
+        working-directory: crates/core/tests/playwright
+        run: npm ci
+
+      # Cache the downloaded browser binaries keyed on the pinned Playwright
+      # version so we only re-download when the version in package.json changes.
+      - name: Resolve Playwright version
+        id: pw
+        working-directory: crates/core/tests/playwright
+        run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: pw-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ steps.pw.outputs.version }}
+
+      - name: Install Playwright browsers
+        working-directory: crates/core/tests/playwright
+        run: npx playwright install --with-deps chromium
+
+      - name: Clean test directories
+        run: rm -rf /tmp/freenet /tmp/freenet-* 2>/dev/null || true
+
+      - name: Run shell Playwright E2E
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: |
+          cargo nextest run -p freenet \
+            --no-default-features \
+            --features trace,websocket,redb,wasmtime-backend,testing \
+            --test playwright_shell --no-capture
+
+      - name: Upload Playwright report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            crates/core/tests/playwright/playwright-report
+            crates/core/tests/playwright/test-results
+          retention-days: 7
+          if-no-files-found: ignore

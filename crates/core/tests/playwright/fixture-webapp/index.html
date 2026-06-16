@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Freenet shell smoke-test fixture</title>
+</head>
+<body>
+<!--
+  This page is published as a Freenet website contract and loaded inside the
+  shell's sandboxed iframe by the Playwright smoke tests
+  (crates/core/tests/playwright/tests/shell.spec.ts).
+
+  It deliberately does NOT include the shell bridge, the WebSocket shim, or the
+  navigation interceptor: the freenet node injects those into the served HTML
+  (see crates/core/src/server/path_handlers.rs::sandbox_content_body). The
+  point of the test is to exercise that injected code against a real browser,
+  so the fixture only provides the DOM the injected code acts on.
+
+  Stable element ids are the test contract — keep them in sync with
+  shell.spec.ts.
+-->
+<h1 id="title">Freenet shell fixture</h1>
+
+<!--
+  Cross-origin link. The navigation interceptor must intercept clicks on this
+  (left, middle, and shift) and forward them to the shell as an `open_url`
+  postMessage rather than letting the sandboxed iframe open a null-origin
+  popup (freenet/freenet-core#3852, #3854). example.com is a reserved
+  documentation domain (RFC 2606) that is never actually navigated to in the
+  tests — the click is intercepted before any network request.
+-->
+<a id="cross-origin-link" href="https://example.com/external" target="_blank" rel="noopener">
+  External cross-origin link
+</a>
+
+<!--
+  Same-origin, in-contract link. The interceptor must turn this into a
+  `navigate` postMessage so the shell performs an in-place iframe hop instead
+  of a full reload. The href is relative so it resolves under this contract's
+  web prefix regardless of the contract key.
+-->
+<a id="same-origin-link" href="page2.html">In-contract page 2</a>
+
+<!--
+  Download link. The interceptor must NOT intercept links carrying a
+  `download` attribute; `handleAnchorClick` early-returns on `download`
+  (path_handlers.rs:2013), so no open_url / navigate postMessage is sent and
+  the link keeps its native (download) behaviour.
+
+  The href is SAME-ORIGIN (a data URL would be skipped earlier by the
+  javascript:/data: protocol check at path_handlers.rs:2011, which would NOT
+  isolate the `download` guard). Without the `download` attribute this exact
+  same-origin link would be intercepted as a `navigate` (see #same-origin-link);
+  the `download` attribute is what makes the early-return fire instead, so the
+  absence of a `navigate` postMessage on click is attributable to the
+  `download` guard specifically. The test reads `#download-link` directly and
+  does not rely on what the browser does natively after the early-return.
+-->
+<a id="download-link" href="page2.html" download="hello.txt">Download</a>
+
+<!-- Result sink the Playwright tests read via page.evaluate. -->
+<pre id="poll-result">pending</pre>
+
+<script>
+  // Exercise the CSP `connect-src 'self'` directive that #3842 fixed: a
+  // same-origin fetch to the permission poller endpoint. If the shell CSP
+  // regresses to `ws: wss:` only, the browser blocks this fetch and emits a
+  // "Content-Security-Policy: blocked ... (connect-src)" console error, which
+  // the Playwright test asserts is absent.
+  //
+  // We surface the outcome in #poll-result so the test can also confirm the
+  // fetch actually ran (a CSP block rejects the promise rather than returning
+  // a response).
+  (function () {
+    var sink = document.getElementById('poll-result');
+    fetch('/permission/pending', { headers: { 'accept': 'application/json' } })
+      .then(function (resp) { sink.textContent = 'fetched:' + resp.status; })
+      .catch(function (err) { sink.textContent = 'error:' + (err && err.message); });
+  })();
+</script>
+</body>
+</html>
