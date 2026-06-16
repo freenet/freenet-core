@@ -81,11 +81,29 @@ version**, then leave it frozen — do NOT bump it on later releases (raising it
 above the first-shipping version would silently stop sending to fully-capable
 peers).
 
-Current wire-gated floors to set at first ship:
+Current wire-gated floors:
 
 - `SUBSCRIBE_HINT_MIN_VERSION` in `crates/core/src/node/network_bridge/p2p_protoc.rs`
-  (SubscribeHint placement migration, #4404). Must equal the first release that
-  includes it.
+  (SubscribeHint placement migration, #4404).
+
+  **DO NOT lower this to the release version.** It is intentionally **parked at
+  `(0, 3, 0)`** — above every shipped 0.2.x release — to keep the placement
+  migration **DEACTIVATED**. The migration's directed-subscribe / hint-broadcast
+  load drove a network-wide UPDATE-broadcast degradation after the v0.2.73
+  release, and v0.2.74 disabled it by raising this floor above all live peers
+  (the SEND side **and** the inbound-hint RECEIVE gate in `node.rs` both read
+  this floor, so the migration is dormant in both directions). This is the one
+  wire-gated floor that does **NOT** follow the "set to the first-shipping
+  release version" rule above.
+
+  Lowering it to the release version would **silently re-enable** the migration
+  and reproduce the degradation. Leave it at `(0, 3, 0)` until the
+  broadcast-backpressure load issue (#4145) is fixed; only then drop it to the
+  release that first ships a load-safe SubscribeHint and freeze it there per the
+  general rule.
+
+When a NEW wire-gated feature first ships (not this one), set its floor to
+**exactly that release version** and freeze it, as described above.
 
 ## What fires when
 
