@@ -2566,12 +2566,25 @@ fn resource_weight(resource: crate::topology::meter::ResourceType) -> f64 {
 ///
 /// `TRANSPORT_METRICS.per_peer_snapshot()` exposes *cumulative* sent/received
 /// byte counts per peer socket address. The topology meter, by contrast,
-/// expects per-sample byte counts that it accumulates into a rate over a
-/// sliding window. We therefore diff the current snapshot against the
-/// previous tick's counts (`prev`) to recover the bytes transferred during
-/// the tick, and feed that delta as one sample per direction:
+/// accumulates each reported sample into a sliding-window sum and divides by
+/// the elapsed wall-time (`now − oldest_sample`) to produce a rate. We diff
+/// the current snapshot against the previous tick's counts (`prev`) to recover
+/// the bytes transferred *during the interval*, and feed that delta as one
+/// sample per direction:
 ///   - received bytes → `InboundBandwidthBytes`
 ///   - sent bytes     → `OutboundBandwidthBytes`
+///
+/// `interval_start` MUST be the time of the *previous* maintenance tick, not
+/// the current one. The meter divides the windowed byte sum by
+/// `query_time − oldest_sample_time` with a 1-second floor
+/// (`RunningAverage::get_rate_at_time`). `adjust_topology` queries the meter at
+/// the current tick time immediately after this call, so timestamping the
+/// interval's whole byte delta at the interval START makes the very first
+/// sample divide by the real interval length (e.g. ~60s) instead of flooring
+/// to 1s. Timestamping at the interval END would treat a full interval's bytes
+/// as if they were transferred in a single second, overstating the rate by up
+/// to the tick interval (~60×) and triggering spurious connection removals
+/// under ordinary traffic (#3453 review).
 ///
 /// Only deltas with a resolvable `PeerKeyLocation` are reported: an address
 /// that doesn't (yet) map to a ring peer — e.g. a transient handshake
@@ -2579,21 +2592,31 @@ fn resource_weight(resource: crate::topology::meter::ResourceType) -> f64 {
 /// don't pollute the meter with samples that can't be matched against the
 /// node's actual neighbors.
 ///
-/// `prev` is updated in place to the current cumulative counts, and entries
-/// for peers no longer present in `snapshot` are dropped. This keeps `prev`
-/// bounded by the transport metrics table size (`MAX_TRACKED_PEERS`) rather
-/// than growing without limit as peers churn.
+/// Three things are bounded as peers churn (#3453 review):
+///   - `prev` is pruned of peers absent from `snapshot`, so it stays bounded
+///     by the transport metrics table size (`MAX_TRACKED_PEERS`).
+///   - The topology meter's per-source bandwidth meters AND
+///     `source_creation_times` are pruned to the set of peers resolved this
+///     tick via `retain_peer_sources`, so neither grows without bound (and
+///     `adjust_topology`, which iterates `source_creation_times` every tick,
+///     stays O(live peers)).
 ///
-/// This takes the topology manager's write lock once per reported delta. It
-/// performs no channel sends and no `.await`, so it is safe to call inline on
-/// the `connection_maintenance` tick (cf. `.claude/rules/channel-safety.md`).
+/// This takes the topology manager's write lock once per reported delta plus
+/// once for the retain. It performs no channel sends and no `.await`, so it is
+/// safe to call inline on the `connection_maintenance` tick
+/// (cf. `.claude/rules/channel-safety.md`).
 fn feed_peer_bandwidth_to_meter(
     connection_manager: &ConnectionManager,
     snapshot: &[(SocketAddr, u64, u64)],
     prev: &mut HashMap<SocketAddr, (u64, u64)>,
-    at_time: Instant,
+    interval_start: Instant,
 ) {
     use crate::topology::meter::{AttributionSource, ResourceType};
+
+    // Peers resolved to a ring `PeerKeyLocation` this tick. Used to bound the
+    // meter / source_creation_times to the live connection set below.
+    let mut live_peers: std::collections::HashSet<PeerKeyLocation> =
+        std::collections::HashSet::new();
 
     for &(addr, cum_sent, cum_recv) in snapshot {
         // Cumulative counters only ever increase, but use saturating
@@ -2608,15 +2631,19 @@ fn feed_peer_bandwidth_to_meter(
         // against them, even when this tick produced no usable delta.
         prev.insert(addr, (cum_sent, cum_recv));
 
-        if sent_delta == 0 && recv_delta == 0 {
-            continue;
-        }
-
         let Some(peer) = connection_manager.get_peer_by_addr(addr) else {
             // No ring peer for this address (transient/handshake connection,
             // or just-torn-down). Skip rather than attribute to a phantom.
             continue;
         };
+        // Track every resolvable peer (even with a zero delta this tick) as
+        // live so retain below doesn't evict a currently-connected, currently
+        // idle peer's accumulated samples.
+        live_peers.insert(peer.clone());
+
+        if sent_delta == 0 && recv_delta == 0 {
+            continue;
+        }
 
         let source = AttributionSource::Peer(peer);
         let mut topo = connection_manager.topology_manager.write();
@@ -2625,7 +2652,7 @@ fn feed_peer_bandwidth_to_meter(
                 &source,
                 ResourceType::InboundBandwidthBytes,
                 recv_delta as f64,
-                at_time,
+                interval_start,
             );
         }
         if sent_delta > 0 {
@@ -2633,10 +2660,18 @@ fn feed_peer_bandwidth_to_meter(
                 &source,
                 ResourceType::OutboundBandwidthBytes,
                 sent_delta as f64,
-                at_time,
+                interval_start,
             );
         }
     }
+
+    // Bound the meter / source_creation_times to the live peer set so they
+    // don't accumulate departed peers forever (#3453 review). Non-Peer
+    // (Contract/Delegate) sources are retained by `retain_peer_sources`.
+    connection_manager
+        .topology_manager
+        .write()
+        .retain_peer_sources(&live_peers);
 
     // Drop prior-tick entries for peers that vanished from the snapshot so
     // `prev` stays bounded as peers churn (#3453). After the loop above,
@@ -2863,6 +2898,12 @@ impl Ring {
                 .into_iter()
                 .map(|(addr, sent, recv)| (addr, (sent, recv)))
                 .collect();
+        // Time of the previous bandwidth feed (the start of the interval whose
+        // byte delta the next feed reports). Seeded with "now" so the first
+        // feed's delta is divided by the real first-interval length rather than
+        // flooring to the meter's 1s minimum (#3453 review — see
+        // `feed_peer_bandwidth_to_meter`).
+        let mut prev_bandwidth_tick = self.time_source.now();
 
         // Gateway version probe: random initial delay to prevent thundering herd.
         // The loop guard (`!is_gateway`) ensures gateways never probe themselves.
@@ -3379,12 +3420,17 @@ impl Ring {
             // so `calculate_usage_proportion` always reports ~0% usage and
             // `adjust_topology` perpetually takes the "add connections" branch —
             // the load-aware add/hold/remove logic never engages (#3453).
+            let bandwidth_tick_now = self.time_source.now();
             feed_peer_bandwidth_to_meter(
                 &self.connection_manager,
                 &crate::transport::metrics::TRANSPORT_METRICS.per_peer_snapshot(),
                 &mut prev_peer_bandwidth,
-                self.time_source.now(),
+                // Timestamp this interval's byte delta at the PREVIOUS tick
+                // (interval start) so the meter divides by the real interval
+                // length, not the 1s floor. See feed_peer_bandwidth_to_meter.
+                prev_bandwidth_tick,
             );
+            prev_bandwidth_tick = bandwidth_tick_now;
 
             let adjustment = self
                 .connection_manager
@@ -4223,6 +4269,110 @@ mod resource_meter_bridge_tests {
         );
         assert_eq!(prev.len(), 1, "departed peers must be pruned from prev");
         assert!(prev.contains_key(&addrs[0]));
+    }
+
+    /// #3453 review (P1): the per-interval byte delta must be timestamped at
+    /// the interval START so the meter divides it by the real interval length,
+    /// not the 1-second floor in `RunningAverage::get_rate_at_time`. A single
+    /// tick reporting one interval's worth of bytes must yield
+    /// `bytes / interval`, NOT `bytes / 1s` (which would overstate the rate by
+    /// the interval length and trigger spurious removals).
+    #[test_log::test]
+    fn bridge_timestamps_delta_at_interval_start_no_inflation() {
+        let cm = ConnectionManager::test_default();
+        let addrs = add_connections(&cm, 1);
+        let peer = cm.get_peer_by_addr(addrs[0]).unwrap();
+        let source = AttributionSource::Peer(peer);
+
+        // 60_000 bytes transferred over a 60s interval = 1000 B/s. Production
+        // passes the PREVIOUS tick time as `interval_start`.
+        let interval = Duration::from_secs(60);
+        let interval_start = Instant::now();
+        let query_time = interval_start + interval;
+
+        let mut prev = HashMap::new();
+        feed_peer_bandwidth_to_meter(&cm, &[(addrs[0], 0, 60_000)], &mut prev, interval_start);
+
+        let rate = cm
+            .topology_manager
+            .write()
+            .attributed_usage_rate(&source, &ResourceType::InboundBandwidthBytes, query_time)
+            .expect("inbound recorded")
+            .per_second();
+
+        // Correct: 60_000 / 60s = 1000 B/s. The interval-END bug would give
+        // 60_000 / 1s = 60_000 B/s (60× inflation).
+        assert!(
+            (rate - 1000.0).abs() < 1.0,
+            "interval delta must be divided by the real interval, got {rate} B/s (expected ~1000)"
+        );
+        assert!(
+            rate < 2000.0,
+            "rate must not be inflated toward the 1s-floor (delta/1s = 60000), got {rate}"
+        );
+    }
+
+    /// #3453 review (P2): peers that leave the live set must be pruned from the
+    /// topology meter (and `source_creation_times`), not accumulate forever.
+    /// After a peer departs, a subsequent bridge tick that no longer resolves
+    /// it must drop its meter samples.
+    #[test_log::test]
+    fn bridge_prunes_departed_peer_from_meter() {
+        let cm = ConnectionManager::test_default();
+        let addrs = add_connections(&cm, 2);
+        let peer0 = cm.get_peer_by_addr(addrs[0]).unwrap();
+        let peer1 = cm.get_peer_by_addr(addrs[1]).unwrap();
+        let src0 = AttributionSource::Peer(peer0);
+        let src1 = AttributionSource::Peer(peer1);
+
+        let t0 = Instant::now();
+        let mut prev = HashMap::new();
+        // Tick 1: both peers transfer bytes — both get meter entries.
+        feed_peer_bandwidth_to_meter(
+            &cm,
+            &[(addrs[0], 0, 10_000), (addrs[1], 0, 10_000)],
+            &mut prev,
+            t0,
+        );
+        let q = t0 + Duration::from_secs(60);
+        {
+            let mut topo = cm.topology_manager.write();
+            assert!(
+                topo.attributed_usage_rate(&src0, &ResourceType::InboundBandwidthBytes, q)
+                    .is_some(),
+                "peer0 should have a meter entry after tick 1"
+            );
+            assert!(
+                topo.attributed_usage_rate(&src1, &ResourceType::InboundBandwidthBytes, q)
+                    .is_some(),
+                "peer1 should have a meter entry after tick 1"
+            );
+        }
+
+        // peer1 disconnects from the ring; only peer0 remains a resolvable
+        // connection. The transport snapshot drops the departed peer too.
+        cm.prune_alive_connection(addrs[1]);
+        assert!(
+            cm.get_peer_by_addr(addrs[1]).is_none(),
+            "peer1 must no longer resolve after prune"
+        );
+
+        // Tick 2: only peer0 present in the snapshot. peer1 is no longer in the
+        // live set, so its meter samples must be pruned.
+        feed_peer_bandwidth_to_meter(&cm, &[(addrs[0], 0, 20_000)], &mut prev, t0);
+        {
+            let mut topo = cm.topology_manager.write();
+            assert!(
+                topo.attributed_usage_rate(&src0, &ResourceType::InboundBandwidthBytes, q)
+                    .is_some(),
+                "live peer0 must keep its meter entry"
+            );
+            assert!(
+                topo.attributed_usage_rate(&src1, &ResourceType::InboundBandwidthBytes, q)
+                    .is_none(),
+                "departed peer1 must be pruned from the meter"
+            );
+        }
     }
 }
 
@@ -5181,16 +5331,24 @@ mod deferred_swap_drop_tests {
 ///     needs real wall-clock time (see `.claude/rules/code-style.md`).
 ///     These carry a type prefix, so they don't match a *bare* `Instant::now()`.
 ///
-/// The only remaining bare `Instant::now()` call sites live in the
-/// `#[cfg(test)]` `gateway_version_probe_predicate_tests` module, where they
-/// construct inputs for the pure `should_probe_gateway` predicate (no
-/// production time is read there). If you add a new production time read,
-/// route it through `self.time_source.now()` rather than bumping this count.
+/// The only remaining bare `Instant::now()` call sites live in two
+/// `#[cfg(test)]` modules:
+///   * `gateway_version_probe_predicate_tests` (6 sites) — constructs inputs
+///     for the pure `should_probe_gateway` predicate (no production time read).
+///   * `resource_meter_bridge_tests` (8 sites) — drives the #3453 bandwidth
+///     bridge directly with synthetic timestamps; `feed_peer_bandwidth_to_meter`
+///     itself takes the time as a parameter, and the production caller in
+///     `connection_maintenance` supplies `self.time_source.now()`.
+///
+/// If you add a new production time read, route it through
+/// `self.time_source.now()` rather than bumping this count.
 #[cfg(test)]
 mod instant_now_pin_test {
     /// Number of bare `Instant::now()` call sites expected in this file, all
     /// in test code. Production code must use `self.time_source.now()`.
-    const EXPECTED_BARE_INSTANT_NOW: usize = 6;
+    /// 6 in `gateway_version_probe_predicate_tests` + 8 in
+    /// `resource_meter_bridge_tests` (#3453).
+    const EXPECTED_BARE_INSTANT_NOW: usize = 14;
 
     #[test]
     fn no_unexpected_bare_instant_now_call_sites() {
