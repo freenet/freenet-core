@@ -887,6 +887,13 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn raise_fd_limit_does_not_lower_soft_limit() {
+        // Normalize `rlim_t` (u64 on linux-gnu, varies elsewhere) to u64 for
+        // arithmetic / comparison without tripping clippy on the redundant cast.
+        #[allow(clippy::unnecessary_cast)]
+        fn as_u64(v: libc::rlim_t) -> u64 {
+            v as u64
+        }
+
         let mut before = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
@@ -895,6 +902,37 @@ mod tests {
         // exclusively-borrowed out-param is sound; we check the return code.
         let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut before) };
         assert_eq!(rc, 0, "getrlimit should succeed");
+
+        let orig_soft = as_u64(before.rlim_cur);
+        let hard = as_u64(before.rlim_max);
+
+        // To exercise the ACTUAL raise branch (not the soft==hard no-op that is
+        // the common CI case), first LOWER our soft limit to a finite value
+        // strictly below hard, then call `raise_fd_limit()` and assert it raised
+        // back up to hard. Lowering one's OWN soft limit never requires
+        // privilege, but if the sandbox forbids even that we fall back to the
+        // weaker "no-decrease" assertion so the test is never flaky.
+        let lowered_to: Option<u64> = if hard != as_u64(libc::RLIM_INFINITY) && hard > 1 {
+            // Pick a finite target strictly below hard: min(orig_soft, hard/2),
+            // floored at 1 so we never request 0 fds.
+            let target = orig_soft.min(hard / 2).max(1);
+            // Guard: only meaningful if we can land strictly below hard.
+            if target < hard {
+                let lowered = libc::rlimit {
+                    rlim_cur: target as libc::rlim_t,
+                    rlim_max: before.rlim_max,
+                };
+                // SAFETY: setrlimit with a valid resource id and a fully
+                // initialized rlimit whose soft (target < hard) does not exceed
+                // the unchanged hard limit is sound.
+                let rc = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) };
+                if rc == 0 { Some(target) } else { None }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Must not panic and must be safe to call.
         super::raise_fd_limit();
@@ -906,25 +944,51 @@ mod tests {
         // SAFETY: same invariants as the `before` read above.
         let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut after) };
         assert_eq!(rc, 0, "getrlimit should succeed after raising");
+        let after_soft = as_u64(after.rlim_cur);
+        let after_hard = as_u64(after.rlim_max);
 
-        // The soft limit must never decrease. We do NOT assert an exact value:
-        // CI runners differ in their hard limits, and a sandbox may forbid the
-        // raise entirely (in which case the helper warns and leaves the soft
-        // limit unchanged — still >= the previous soft limit).
-        assert!(
-            after.rlim_cur >= before.rlim_cur,
-            "soft fd limit must not decrease: before={}, after={}",
-            before.rlim_cur,
-            after.rlim_cur
-        );
+        match lowered_to {
+            Some(target) => {
+                // We genuinely lowered the soft limit, so `raise_fd_limit` had a
+                // real raise to perform. It must have raised the soft limit back
+                // up to the hard limit (and at minimum strictly above where we
+                // lowered it to).
+                assert_eq!(
+                    after_soft, after_hard,
+                    "raise_fd_limit must raise the soft limit up to the hard limit \
+                     (lowered_to={target}, hard={after_hard}, after_soft={after_soft})"
+                );
+                assert!(
+                    after_soft > target,
+                    "raise_fd_limit must strictly increase the lowered soft limit: \
+                     lowered_to={target}, after={after_soft}"
+                );
+            }
+            None => {
+                // Could not lower (already minimal, infinite hard limit, or
+                // sandbox forbade it): fall back to the no-decrease invariant.
+                assert!(
+                    after_soft >= orig_soft,
+                    "soft fd limit must not decrease: before={orig_soft}, after={after_soft}"
+                );
+            }
+        }
+
         // The soft limit must never exceed the hard limit (an invariant the OS
         // enforces, but we assert it to catch a logic error in the helper).
         assert!(
-            after.rlim_cur <= after.rlim_max,
-            "soft fd limit must not exceed hard limit: soft={}, hard={}",
-            after.rlim_cur,
-            after.rlim_max
+            after_soft <= after_hard,
+            "soft fd limit must not exceed hard limit: soft={after_soft}, hard={after_hard}"
         );
+
+        // Restore the original soft limit so we don't leak a changed limit into
+        // other tests sharing this process. Best-effort; ignore failures.
+        let restore = libc::rlimit {
+            rlim_cur: before.rlim_cur,
+            rlim_max: before.rlim_max,
+        };
+        // SAFETY: restoring the exact limits we read at entry is sound.
+        let _ = unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &restore) };
     }
 
     #[test]
