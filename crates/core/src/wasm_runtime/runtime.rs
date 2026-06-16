@@ -15,44 +15,33 @@ use freenet_stdlib::{
     },
     prelude::*,
 };
-use lru::LruCache;
+use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex};
-use std::{num::NonZeroUsize, sync::atomic::AtomicI64};
+
+use super::ModuleCache;
 
 /// A compiled WASM module cache shared across multiple `Runtime` instances.
 ///
-/// Wasmer `Module` wraps `Arc<Artifact>`, so clones are cheap (just an Arc
-/// refcount bump). Sharing the cache across the `RuntimePool` avoids compiling
-/// and storing the same contract N times (once per pool executor).
-pub(crate) type SharedModuleCache<K> = Arc<Mutex<LruCache<K, <Engine as WasmEngine>::Module>>>;
+/// The backend is wasmtime: a `Module` owns its compiled machine code via an
+/// internal `Arc<CodeMemory>`, so clones are cheap (an Arc refcount bump) and
+/// dropping the last clone frees the compiled code (verified by
+/// `wasmtime_engine::tests::test_module_drop_frees_memory`). Sharing one cache
+/// across the `RuntimePool` avoids compiling and storing the same contract N
+/// times (once per pool executor).
+///
+/// The cache is bounded by the total compiled **byte size** of its entries
+/// (see [`ModuleCache`] and
+/// [`DEFAULT_MODULE_CACHE_BUDGET_BYTES`](super::DEFAULT_MODULE_CACHE_BUDGET_BYTES)),
+/// not by a fixed entry count. A byte budget is the correct bound here because:
+///
+/// - It scales with how many contracts a node actually hosts: a node hosting
+///   thousands of small contracts no longer thrashes the way the old 1024-entry
+///   *count* cap did (the eviction-recompilation cycle behind issue #4441).
+/// - It bounds the cache's absolute memory footprint regardless of contract
+///   count, which a count cap could not (1024 large modules ≫ 1024 small ones).
+pub(crate) type SharedModuleCache<K> = Arc<Mutex<ModuleCache<K, <Engine as WasmEngine>::Module>>>;
 
 static INSTANCE_ID: AtomicI64 = AtomicI64::new(0);
-
-/// Default capacity for each compiled WASM module cache.
-///
-/// This limits how many compiled contract/delegate modules are kept in memory.
-/// When a cache is full, the least recently used module is evicted.
-///
-/// **Current value: 1024 modules per cache**
-///
-/// # Why 1024?
-///
-/// Wasmer's internal `code_memory: Vec<CodeMemory>` only grows — compiled machine
-/// code persists even after a `Module` is dropped. Memory is only freed when the
-/// entire `Engine` is dropped. Every eviction-recompilation cycle permanently grows
-/// `code_memory`, causing unbounded memory growth proportional to total compilations
-/// over the Engine's lifetime (see #2941).
-///
-/// A capacity of 1024 avoids evictions on production gateways (~92 contracts as of
-/// Feb 2026), preventing the eviction-recompilation cycles that drive `code_memory`
-/// growth.
-///
-/// # Memory Impact
-///
-/// Each compiled `Module` is typically 100KB-1MB. With shared caches (one instance
-/// per cache type across all pool executors), actual memory usage is bounded by the
-/// number of unique contracts/delegates on the network, not the capacity.
-pub const DEFAULT_MODULE_CACHE_CAPACITY: usize = 1024;
 
 /// A live WASM instance with RAII cleanup.
 ///
@@ -170,8 +159,23 @@ pub struct RuntimeConfig {
     /// Safety margin for CPU speed variations (0.0 to 1.0)
     pub safety_margin: f64,
     pub enable_metering: bool,
-    /// Maximum number of compiled modules to keep in each cache.
-    pub module_cache_capacity: usize,
+    /// Byte budget for each compiled WASM module cache (contract and delegate
+    /// caches each get this budget). LRU entries are evicted on insert until the
+    /// cache's tracked compiled-byte total is within budget. See
+    /// [`DEFAULT_MODULE_CACHE_BUDGET_BYTES`].
+    pub module_cache_budget_bytes: usize,
+    /// Whether a cache-miss compile is offloaded to a blocking thread.
+    ///
+    /// In production this is `true`: the Cranelift compile (`engine.compile`)
+    /// runs on a `spawn_blocking` thread so a cold-contract compile does not
+    /// pin the single-threaded `contract_handling` loop (issue #4441's HANG).
+    ///
+    /// Under simulation / determinism tests it MUST be `false`: the direct sim
+    /// runner is `current_thread` + `start_paused`, and `spawn_blocking`
+    /// introduces real-thread completion ordering that breaks the
+    /// event-trace determinism those tests pin. With it `false`, the compile
+    /// runs inline (synchronously) exactly as before, preserving determinism.
+    pub offload_compilation: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -181,7 +185,12 @@ impl Default for RuntimeConfig {
             cpu_cycles_per_second: None,
             safety_margin: 0.2,
             enable_metering: false,
-            module_cache_capacity: DEFAULT_MODULE_CACHE_CAPACITY,
+            module_cache_budget_bytes: super::DEFAULT_MODULE_CACHE_BUDGET_BYTES,
+            // Default off so that any code path building a `RuntimeConfig`
+            // without explicitly opting in (tests, sim) keeps the deterministic
+            // inline compile. Production opts in explicitly — see
+            // `RuntimePool::new` / `from_config_with_shared_modules`.
+            offload_compilation: false,
         }
     }
 }
@@ -266,8 +275,7 @@ impl Runtime {
         host_mem: bool,
         config: RuntimeConfig,
     ) -> RuntimeResult<Self> {
-        let cache_capacity =
-            NonZeroUsize::new(config.module_cache_capacity).unwrap_or(NonZeroUsize::MIN);
+        let budget = config.module_cache_budget_bytes;
 
         let engine = Engine::new(&config, host_mem)?;
 
@@ -276,10 +284,10 @@ impl Runtime {
 
             secret_store,
             delegate_store,
-            contract_modules: Arc::new(Mutex::new(LruCache::new(cache_capacity))),
+            contract_modules: Arc::new(Mutex::new(ModuleCache::new(budget))),
 
             contract_store,
-            delegate_modules: Arc::new(Mutex::new(LruCache::new(cache_capacity))),
+            delegate_modules: Arc::new(Mutex::new(ModuleCache::new(budget))),
             delegate_contexts: super::native_api::new_delegate_context_cache(),
             state_store_db: None,
             state_write_callback: None,
@@ -328,9 +336,15 @@ impl Runtime {
         delegate_modules: SharedModuleCache<DelegateKey>,
         delegate_contexts: super::native_api::DelegateContextCache,
         shared_backend: BackendEngine,
+        config: &RuntimeConfig,
     ) -> RuntimeResult<Self> {
-        let engine =
-            Engine::new_with_shared_backend(&RuntimeConfig::default(), host_mem, shared_backend)?;
+        // The pre-built `contract_modules`/`delegate_modules` caches carry the
+        // byte budget (the pool sizes them in `RuntimePool::new`). `config`
+        // here carries `offload_compilation` (and execution/metering knobs)
+        // through to the engine — previously this hardcoded
+        // `RuntimeConfig::default()`, which left `offload_compilation` dead on
+        // the production pool path.
+        let engine = Engine::new_with_shared_backend(config, host_mem, shared_backend)?;
         Ok(Self {
             engine,
             secret_store,
@@ -488,14 +502,21 @@ impl Runtime {
         parameters: &Parameters,
         req_bytes: usize,
     ) -> RuntimeResult<RunningInstance> {
-        // Check shared cache first (lock held briefly for Arc clone)
+        // Check shared cache first. The lock is held only for the duration of
+        // the lookup + Module clone (an Arc bump) and is ALWAYS dropped before
+        // the compile below — never held across the blocking compile.
         let cached = self.contract_modules.lock().unwrap().get(key).cloned();
         let module = if let Some(module) = cached {
             tracing::debug!(contract = %key, "Module cache hit");
             module
         } else {
             tracing::info!(contract = %key, "Module cache miss — compiling");
-            // Cache miss — compile outside the lock to avoid blocking other executors
+            // Cache miss — fetch the code and compile with the lock released so
+            // the (potentially multi-hundred-millisecond) Cranelift compile
+            // never blocks other executors waiting on the shared cache. When
+            // `offload_compilation` is set, `engine.compile` further offloads
+            // the compile to a blocking thread so it does not pin the
+            // single-threaded contract-handling loop (issue #4441).
             let contract = self
                 .contract_store
                 .fetch_contract(key, parameters)
@@ -515,20 +536,17 @@ impl Runtime {
                 ContractContainer::Wasm(_) | _ => unimplemented!(),
             };
             let module = self.engine.compile(&code)?;
-            // Re-check cache: the LRU lock was released before compilation,
-            // so another executor may have compiled and cached this contract.
+            let compiled_size = self.engine.module_compiled_size(&module);
+            // Re-check cache: the lock was released before compilation, so
+            // another executor may have compiled and cached this contract
+            // (the per-hash coalescing mutex in the engine prevents the
+            // duplicate Cranelift work, but two distinct misses can still race
+            // to this insert). Prefer the already-cached clone if present.
             let mut cache = self.contract_modules.lock().unwrap();
             if let Some(existing) = cache.get(key).cloned() {
                 existing
             } else {
-                if let Some((evicted_key, _)) = cache.push(*key, module.clone()) {
-                    tracing::warn!(
-                        evicted_contract = %evicted_key,
-                        cache_capacity = cache.cap().get(),
-                        "Module cache eviction. \
-                         Consider increasing DEFAULT_MODULE_CACHE_CAPACITY"
-                    );
-                }
+                cache.insert(*key, module.clone(), compiled_size);
                 module
             }
         };
@@ -551,6 +569,8 @@ impl Runtime {
         key: &DelegateKey,
         req_bytes: usize,
     ) -> RuntimeResult<(RunningInstance, DelegateApiVersion)> {
+        // Lock held only for the lookup + Module clone; always dropped before
+        // the compile below (never held across the blocking compile).
         let cached = self.delegate_modules.lock().unwrap().get(key).cloned();
         let module = if let Some(module) = cached {
             tracing::debug!(delegate = %key, "Module cache hit");
@@ -563,20 +583,14 @@ impl Runtime {
                 .ok_or_else(|| RuntimeInnerError::DelegateNotFound(key.clone()))?;
             let code = delegate.code().as_ref().to_vec();
             let module = self.engine.compile(&code)?;
-            // Re-check cache: the LRU lock was released before compilation,
-            // so another executor may have compiled and cached this delegate.
+            let compiled_size = self.engine.module_compiled_size(&module);
+            // Re-check cache: the lock was released before compilation, so
+            // another executor may have compiled and cached this delegate.
             let mut cache = self.delegate_modules.lock().unwrap();
             if let Some(existing) = cache.get(key).cloned() {
                 existing
             } else {
-                if let Some((evicted_key, _)) = cache.push(key.clone(), module.clone()) {
-                    tracing::warn!(
-                        evicted_delegate = %evicted_key,
-                        cache_capacity = cache.cap().get(),
-                        "Delegate cache eviction. \
-                         Consider increasing DEFAULT_MODULE_CACHE_CAPACITY"
-                    );
-                }
+                cache.insert(key.clone(), module.clone(), compiled_size);
                 module
             }
         };

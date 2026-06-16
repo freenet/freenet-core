@@ -113,7 +113,18 @@ pub(crate) trait WasmEngine: Send {
     // -- Compilation --
 
     /// Compile WASM bytecode into an executable module.
+    ///
+    /// May offload the compile to a blocking thread (see
+    /// `RuntimeConfig::offload_compilation`) so a cold-contract compile does
+    /// not pin the single-threaded contract-handling loop. The call is
+    /// synchronous from the caller's perspective regardless.
     fn compile(&mut self, code: &[u8]) -> Result<Self::Module, WasmError>;
+
+    /// Approximate compiled byte size of a module, used to bound the module
+    /// cache by total compiled bytes rather than entry count. Measured once at
+    /// insert time by the runtime so the value is amortized across all later
+    /// cache hits for that module.
+    fn module_compiled_size(&self, module: &Self::Module) -> usize;
 
     // -- Module inspection --
 

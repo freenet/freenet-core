@@ -64,11 +64,25 @@ fn byte_multiset_eq(a: &[u8], b: &[u8]) -> bool {
 
 use crate::node::OpManager;
 use crate::wasm_runtime::{
-    BackendEngine, DEFAULT_MODULE_CACHE_CAPACITY, MAX_STATE_SIZE, RuntimeConfig, SharedModuleCache,
+    BackendEngine, MAX_STATE_SIZE, ModuleCache, RuntimeConfig, SharedModuleCache,
 };
+
+/// Whether the production `RuntimePool` should offload cache-miss WASM compiles
+/// to a blocking thread.
+///
+/// Returns `true` in real (non-test) builds so a cold-contract Cranelift
+/// compile does not pin the single-threaded `contract_handling` loop (issue
+/// #4441's HANG). Returns `false` under `cfg!(test)` so that any in-process
+/// test driving the real `RuntimePool` keeps the deterministic inline compile
+/// (no `spawn_blocking` completion-ordering nondeterminism). The simulation
+/// determinism harness itself uses `MockRuntime` and never reaches this path,
+/// but gating on `cfg!(test)` is belt-and-suspenders for the real-WASM
+/// integration tests.
+fn production_offload_compilation() -> bool {
+    !cfg!(test)
+}
 use dashmap::DashMap;
 use freenet_stdlib::prelude::{MessageOrigin, RelatedContract};
-use lru::LruCache;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -233,15 +247,20 @@ impl RuntimePool {
             tokio::sync::mpsc::channel(super::DELEGATE_NOTIFICATION_CHANNEL_SIZE);
 
         // Create shared module caches so all pool executors share one set of compiled WASM modules.
-        // Without this, each of the N executors would maintain its own LRU cache, causing
+        // Without this, each of the N executors would maintain its own cache, causing
         // the same contracts to be compiled and stored N times (e.g., 16 executors × 92 contracts
         // × ~500KB-1MB = ~1.2 GB of duplicate compiled modules on the nova gateway).
-        let cache_capacity =
-            NonZeroUsize::new(DEFAULT_MODULE_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN);
+        //
+        // The caches are bounded by total compiled BYTES, not entry count, so a
+        // gateway hosting thousands of contracts no longer thrashes the old
+        // 1024-entry count cap (issue #4441). The byte budget is operator-tunable
+        // via `Config::module_cache_budget_bytes`
+        // (FREENET_MODULE_CACHE_BUDGET_BYTES / `module-cache-budget-bytes`).
+        let cache_budget = config.module_cache_budget_bytes;
         let shared_contract_modules: SharedModuleCache<ContractKey> =
-            Arc::new(Mutex::new(LruCache::new(cache_capacity)));
+            Arc::new(Mutex::new(ModuleCache::new(cache_budget)));
         let shared_delegate_modules: SharedModuleCache<DelegateKey> =
-            Arc::new(Mutex::new(LruCache::new(cache_capacity)));
+            Arc::new(Mutex::new(ModuleCache::new(cache_budget)));
         // Shared delegate-context cache so a prompt round-trip routed to a
         // different pool executor still finds its `ctx.write()` blob.
         let shared_delegate_contexts = crate::wasm_runtime::new_delegate_context_cache();
@@ -3348,6 +3367,19 @@ impl Executor<Runtime> {
         let db = shared_state_store.storage();
         let (contract_store, delegate_store, secret_store) =
             Self::get_runtime_stores(&config, db.clone())?;
+        // Production RuntimeConfig: enable compile offload so a cold-contract
+        // Cranelift compile runs on a blocking thread instead of pinning the
+        // single-threaded contract-handling loop (issue #4441). Offload is
+        // suppressed under `cfg!(test)` to keep any test that drives the real
+        // RuntimePool free of `spawn_blocking` completion-ordering
+        // nondeterminism. The byte budget here also threads into the backend
+        // (though the *shared* cache size comes from the caches passed in by
+        // RuntimePool::new).
+        let runtime_config = RuntimeConfig {
+            offload_compilation: production_offload_compilation(),
+            module_cache_budget_bytes: config.module_cache_budget_bytes,
+            ..RuntimeConfig::default()
+        };
         let mut rt = Runtime::build_with_shared_module_caches(
             contract_store,
             delegate_store,
@@ -3359,11 +3391,10 @@ impl Executor<Runtime> {
             shared_backend.unwrap_or_else(|| {
                 // First executor — create a fresh backend engine; RuntimePool
                 // will extract and share it with subsequent executors.
-                crate::wasm_runtime::engine::Engine::create_backend_engine(
-                        &RuntimeConfig::default(),
-                    )
+                crate::wasm_runtime::engine::Engine::create_backend_engine(&runtime_config)
                     .expect("Failed to create WASM backend engine")
             }),
+            &runtime_config,
         )
         .unwrap();
         rt.set_state_store_db(db);
@@ -4830,6 +4861,78 @@ mod executor_pin_tests {
              (closest preceding macro is `tracing::{macro_name}!`). \
              Re-promotion to INFO/WARN restores the #4251 / #4272 log-volume regression.\n\
              Preceding source (last 200 bytes):\n{tail}"
+        );
+    }
+
+    /// Gate (issue #4441): under the test harness the production pool MUST run
+    /// the cache-miss compile INLINE, never offloaded — `spawn_blocking`
+    /// completion ordering would break the determinism tests that pin event
+    /// traces. `production_offload_compilation()` is the single gate; it must
+    /// return `false` when `cfg!(test)` and we assert that here.
+    #[test]
+    fn production_offload_is_disabled_under_test() {
+        assert!(
+            !super::production_offload_compilation(),
+            "compile offload MUST be off under cfg(test) so determinism tests \
+             stay deterministic"
+        );
+    }
+
+    /// Pin: `from_config_with_shared_modules` MUST build the engine with the
+    /// offload gate (`production_offload_compilation()`) and thread the byte
+    /// budget through, rather than the old hardcoded `RuntimeConfig::default()`
+    /// that left `offload_compilation` dead on the production pool path.
+    #[test]
+    fn from_config_with_shared_modules_wires_offload_and_budget() {
+        let src = include_str!("runtime.rs");
+        let body = src
+            .split("pub(crate) async fn from_config_with_shared_modules(")
+            .nth(1)
+            .expect("from_config_with_shared_modules must exist")
+            .split("\n    pub async fn preload(")
+            .next()
+            .expect("end of from_config_with_shared_modules");
+        assert!(
+            body.contains("offload_compilation: production_offload_compilation()"),
+            "must set offload_compilation from the production gate"
+        );
+        assert!(
+            body.contains("module_cache_budget_bytes: config.module_cache_budget_bytes"),
+            "must thread the operator-configured byte budget into the runtime config"
+        );
+        // The hardcoded default that previously dropped offload must be gone:
+        // the backend engine is now built from `runtime_config`, not a fresh
+        // `RuntimeConfig::default()`.
+        assert!(
+            body.contains("Engine::create_backend_engine(&runtime_config)"),
+            "backend engine must be built from the threaded runtime_config"
+        );
+    }
+
+    /// Pin: `RuntimePool::new` MUST size the shared module caches by the
+    /// operator-configured byte budget, not a hardcoded count constant.
+    #[test]
+    fn runtime_pool_sizes_caches_by_byte_budget() {
+        let src = include_str!("runtime.rs");
+        let body = src
+            .split("pub async fn new(")
+            .nth(1)
+            .expect("RuntimePool::new must exist")
+            .split("\n    ")
+            .take(60)
+            .collect::<String>();
+        assert!(
+            body.contains("config.module_cache_budget_bytes"),
+            "RuntimePool::new must size caches from config.module_cache_budget_bytes"
+        );
+        assert!(
+            body.contains("ModuleCache::new(cache_budget)"),
+            "RuntimePool::new must build byte-budget ModuleCache instances"
+        );
+        // The old count-cap constant must be gone from this path.
+        assert!(
+            !body.contains("DEFAULT_MODULE_CACHE_CAPACITY"),
+            "RuntimePool::new must no longer reference the removed count cap"
         );
     }
 }

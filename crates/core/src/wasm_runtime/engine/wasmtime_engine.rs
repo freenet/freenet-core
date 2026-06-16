@@ -173,6 +173,93 @@ fn compile_coalesce_map() -> &'static DashMap<[u8; 32], Arc<Mutex<()>>> {
     MAP.get_or_init(DashMap::new)
 }
 
+/// Compile WASM bytes into a `Module`, de-duplicating concurrent compiles of
+/// the same bytes via the process-global per-hash coalescing mutex.
+///
+/// The first thread to grab the per-hash mutex runs the actual Cranelift
+/// compile (and writes the wasmtime disk cache); others block on the mutex and
+/// then get a near-instant disk-cache hit from `Module::new()`. Runs
+/// synchronously on the calling thread — the offload decision is made one level
+/// up in `compile()`.
+fn compile_coalesced(engine: &Engine, code: &[u8]) -> Result<Module, WasmError> {
+    let hash = *blake3::hash(code).as_bytes();
+    let map = compile_coalesce_map();
+    let mutex = map.entry(hash).or_default().clone();
+    let _guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
+
+    let result = Module::new(engine, code).map_err(|e| WasmError::Compile(e.to_string()));
+
+    // Clean up when no other thread holds or is waiting on this entry.
+    // If another thread grabbed a clone between our entry() and lock(),
+    // strong_count > 1 and we leave the entry for them to clean up.
+    if Arc::strong_count(&mutex) == 1 {
+        map.remove(&hash);
+    }
+
+    result
+}
+
+/// Offload [`compile_coalesced`] to a blocking thread and block the caller on
+/// its completion.
+///
+/// Mirrors `execute_wasm_blocking`'s dual strategy: use `spawn_blocking` +
+/// `block_in_place` when a tokio runtime is present (so the current worker
+/// keeps draining other tasks while the Cranelift compile runs on a blocking
+/// thread), and fall back to `std::thread::spawn` + join when there is no
+/// runtime. The point is that the cold-contract compile no longer pins the
+/// single-threaded `contract_handling` async loop (issue #4441's HANG).
+fn compile_offloaded(engine: Engine, code: Vec<u8>) -> Result<Module, WasmError> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            let join = tokio::task::spawn_blocking(move || compile_coalesced(&engine, &code));
+            match tokio::task::block_in_place(|| handle.block_on(join)) {
+                Ok(result) => result,
+                Err(e) if e.is_panic() => {
+                    tracing::error!("WASM compile task panicked");
+                    Err(WasmError::Compile("compile task panicked".to_string()))
+                }
+                Err(e) => Err(WasmError::Compile(format!("compile task failed: {e}"))),
+            }
+        }
+        Err(_) => {
+            // No tokio runtime (e.g. a direct synchronous test caller). Still
+            // run off the calling thread for parity, then join.
+            std::thread::spawn(move || compile_coalesced(&engine, &code))
+                .join()
+                .unwrap_or_else(|_| {
+                    tracing::error!("WASM compile thread panicked");
+                    Err(WasmError::Compile("compile thread panicked".to_string()))
+                })
+        }
+    }
+}
+
+/// Approximate compiled byte size of a `Module`, used to bound the module cache
+/// by total compiled bytes.
+///
+/// Uses `Module::serialize().len()` — the size of the module's serialized
+/// compiled artifact (machine code + metadata), which closely tracks the
+/// resident `Arc<CodeMemory>` footprint. This is measured exactly once per
+/// module, at cache-insert time, so its cost is amortized across every
+/// subsequent cache hit. On the rare serialize failure we fall back to the raw
+/// estimate of the WASM module's own reported size so the cache still accounts
+/// *something* for the entry rather than treating it as free.
+fn compiled_module_size(module: &Module) -> usize {
+    match module.serialize() {
+        Ok(bytes) => bytes.len(),
+        Err(e) => {
+            tracing::warn!(
+                "failed to serialize module for size accounting: {e}; \
+                 falling back to a 1 MiB estimate"
+            );
+            // Conservative non-zero fallback so an unmeasurable module still
+            // counts against the byte budget (never treated as size 0, which
+            // would let unbounded unmeasurable modules accumulate).
+            1024 * 1024
+        }
+    }
+}
+
 /// WASM stack size in bytes (8 MiB).
 const WASM_STACK_SIZE: usize = 8 * 1024 * 1024;
 
@@ -228,6 +315,12 @@ pub(crate) struct WasmtimeEngine {
     lifetime_instances: u64,
     /// When the current Store was created. Used by [`STORE_MAX_AGE`] fallback.
     store_created_at: Instant,
+    /// Whether a cache-miss compile is offloaded to a blocking thread.
+    /// `true` in production (so a cold compile doesn't pin the
+    /// contract-handling loop); `false` under simulation/determinism tests to
+    /// keep compile inline and deterministic. See
+    /// `RuntimeConfig::offload_compilation`.
+    offload_compilation: bool,
 }
 
 /// Host state for wasmtime Store, implementing ResourceLimiter for memory limits.
@@ -330,6 +423,7 @@ impl WasmEngine for WasmtimeEngine {
             max_fuel,
             lifetime_instances: 0,
             store_created_at: Instant::now(),
+            offload_compilation: config.offload_compilation,
         })
     }
 
@@ -338,25 +432,30 @@ impl WasmEngine for WasmtimeEngine {
     }
 
     fn compile(&mut self, code: &[u8]) -> Result<Module, WasmError> {
-        // Coalesce concurrent compilations of the same WASM bytes across
-        // RuntimePools. The first thread compiles via Cranelift and writes
-        // to the disk cache; others block here and then get a near-instant
-        // disk cache hit from Module::new().
-        let hash = *blake3::hash(code).as_bytes();
-        let map = compile_coalesce_map();
-        let mutex = map.entry(hash).or_default().clone();
-        let _guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
-
-        let result = Module::new(&self.engine, code).map_err(|e| WasmError::Compile(e.to_string()));
-
-        // Clean up when no other thread holds or is waiting on this entry.
-        // If another thread grabbed a clone between our entry() and lock(),
-        // strong_count > 1 and we leave the entry for them to clean up.
-        if Arc::strong_count(&mutex) == 1 {
-            map.remove(&hash);
+        if self.offload_compilation {
+            // PRODUCTION: offload the Cranelift compile to a blocking thread so
+            // a cold-contract compile does not pin the single-threaded
+            // contract-handling async loop (issue #4441's HANG). The wasmtime
+            // `Engine` is `Clone` (Arc internally), so the spawned closure
+            // compiles against the same backend — the resulting `Module` is
+            // valid in this engine's Stores. The per-hash coalescing mutex
+            // (a process-global map) still de-duplicates concurrent compiles
+            // of the same bytes across threads.
+            let engine = self.engine.clone();
+            let code = code.to_vec();
+            compile_offloaded(engine, code)
+        } else {
+            // SIMULATION / TEST: compile inline (synchronously) on the caller's
+            // thread. The direct sim runner is `current_thread` + paused-clock
+            // and pins event traces for determinism; `spawn_blocking` would
+            // introduce real-thread completion ordering that breaks those
+            // determinism assertions. Inline compile is deterministic.
+            compile_coalesced(&self.engine, code)
         }
+    }
 
-        result
+    fn module_compiled_size(&self, module: &Module) -> usize {
+        compiled_module_size(module)
     }
 
     fn module_has_async_imports(&self, module: &Module) -> bool {
@@ -785,6 +884,7 @@ impl WasmtimeEngine {
             max_fuel,
             lifetime_instances: 0,
             store_created_at: Instant::now(),
+            offload_compilation: config.offload_compilation,
         })
     }
 
@@ -1431,6 +1531,104 @@ mod tests {
 
         let result = Module::new(&engine, SIMPLE_WASM);
         assert!(result.is_ok(), "Failed to compile simple WASM module");
+    }
+
+    /// The offload gate is honored end-to-end: with `offload_compilation = true`
+    /// the cache-miss compile is dispatched through `spawn_blocking` (when a
+    /// tokio runtime is present) and still yields a correct, instantiable
+    /// module. This is the production configuration (issue #4441 fix).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_offloaded_compile_produces_valid_module() {
+        let config = RuntimeConfig {
+            offload_compilation: true,
+            ..RuntimeConfig::default()
+        };
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        assert!(
+            engine.offload_compilation,
+            "engine must carry the offload flag from config"
+        );
+        // Compiling under offload must succeed and be instantiable.
+        let module = engine
+            .compile(SIMPLE_WASM)
+            .expect("offloaded compile should succeed");
+        let handle = engine.create_instance(&module, 0, 1024).unwrap();
+        engine.drop_instance(&handle);
+        assert!(engine.module_compiled_size(&module) > 0);
+    }
+
+    /// With `offload_compilation = false` (sim/test default) the compile runs
+    /// inline and still yields a correct module — the determinism-preserving
+    /// path. Both gate settings must produce functionally identical modules.
+    #[test]
+    fn test_inline_compile_produces_valid_module() {
+        let config = RuntimeConfig {
+            offload_compilation: false,
+            ..RuntimeConfig::default()
+        };
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        assert!(!engine.offload_compilation);
+        let module = engine
+            .compile(SIMPLE_WASM)
+            .expect("inline compile should succeed");
+        let handle = engine.create_instance(&module, 0, 1024).unwrap();
+        engine.drop_instance(&handle);
+        assert!(engine.module_compiled_size(&module) > 0);
+    }
+
+    /// `module_compiled_size` returns the serialized compiled-artifact size,
+    /// which is non-zero and bounds the module cache.
+    #[test]
+    fn test_module_compiled_size_nonzero() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let module = engine.compile(SIMPLE_WASM).unwrap();
+        let size = engine.module_compiled_size(&module);
+        assert!(size > 0, "compiled size must be non-zero, got {size}");
+        // Sanity: serialize() agrees with our size helper.
+        assert_eq!(size, module.serialize().unwrap().len());
+    }
+
+    /// Pin (issue #4441): `compile()` MUST offload to `spawn_blocking` when
+    /// `offload_compilation` is set, and MUST run inline otherwise. This is the
+    /// determinism gate — the inline branch is what keeps the sim/determinism
+    /// tests deterministic, the offload branch is what unblocks the
+    /// contract-handling loop in production.
+    #[test]
+    fn compile_honors_offload_gate_in_source() {
+        let src = include_str!("wasmtime_engine.rs");
+        let body = src
+            .split("fn compile(&mut self, code: &[u8]) -> Result<Module, WasmError> {")
+            .nth(1)
+            .expect("compile must exist")
+            .split("\n    fn module_compiled_size(")
+            .next()
+            .expect("end of compile");
+        assert!(
+            body.contains("if self.offload_compilation"),
+            "compile must branch on the offload_compilation gate"
+        );
+        assert!(
+            body.contains("compile_offloaded("),
+            "the offload branch must dispatch to compile_offloaded (spawn_blocking)"
+        );
+        assert!(
+            body.contains("compile_coalesced("),
+            "the inline branch must run compile_coalesced directly"
+        );
+
+        // And the offload helper actually uses spawn_blocking.
+        let offload_body = src
+            .split("fn compile_offloaded(engine: Engine, code: Vec<u8>)")
+            .nth(1)
+            .expect("compile_offloaded must exist")
+            .split("\nfn compiled_module_size(")
+            .next()
+            .expect("end of compile_offloaded");
+        assert!(
+            offload_body.contains("spawn_blocking"),
+            "compile_offloaded must offload via tokio spawn_blocking"
+        );
     }
 
     /// Regression test for Report 2RDXTD: wasmtime's per-Store instance counter is

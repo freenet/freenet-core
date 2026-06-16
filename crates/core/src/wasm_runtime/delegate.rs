@@ -758,7 +758,7 @@ impl DelegateRuntimeInterface for Runtime {
 
     #[inline]
     fn unregister_delegate(&mut self, key: &DelegateKey) -> RuntimeResult<()> {
-        self.delegate_modules.lock().unwrap().pop(key);
+        self.delegate_modules.lock().unwrap().remove(key);
         // Drop persisted ctx.write() bytes so an unregistered delegate can't
         // hold onto stale state if it's later re-registered.
         self.delegate_contexts.remove(key);

@@ -111,6 +111,15 @@ pub struct ConfigArgs {
     #[arg(long, env = "MAX_HOSTING_STORAGE")]
     pub max_hosting_storage: Option<u64>,
 
+    /// Byte budget for each compiled-WASM module cache (the contract cache and
+    /// the delegate cache each get this budget). When a cache's tracked
+    /// compiled-byte total would exceed this on insert, least-recently-used
+    /// modules are evicted until it fits. Bounding by bytes (not entry count)
+    /// stops a node hosting many contracts from thrashing the cache and
+    /// recompiling on every access (issue #4441). Default: 384 MiB.
+    #[arg(long, env = "FREENET_MODULE_CACHE_BUDGET_BYTES")]
+    pub module_cache_budget_bytes: Option<usize>,
+
     /// Seconds to wait on graceful shutdown for in-flight client
     /// PUT/GET/UPDATE/SUBSCRIBE operations to finish before tearing
     /// down peer connections. Set to 0 to disable. Default: 30s. See
@@ -166,6 +175,7 @@ impl Default for ConfigArgs {
             version: false,
             max_blocking_threads: None,
             max_hosting_storage: None,
+            module_cache_budget_bytes: None,
             shutdown_drain_secs: None,
             telemetry: Default::default(),
         }
@@ -384,6 +394,8 @@ impl ConfigArgs {
             self.log_level.get_or_insert(cfg.log_level);
             self.max_hosting_storage
                 .get_or_insert(cfg.max_hosting_storage);
+            self.module_cache_budget_bytes
+                .get_or_insert(cfg.module_cache_budget_bytes);
             self.shutdown_drain_secs
                 .get_or_insert(cfg.shutdown_drain_secs);
             self.config_paths.merge(cfg.config_paths.as_ref().clone());
@@ -785,6 +797,9 @@ impl ConfigArgs {
             max_hosting_storage: self
                 .max_hosting_storage
                 .unwrap_or(crate::ring::DEFAULT_HOSTING_BUDGET_BYTES),
+            module_cache_budget_bytes: self
+                .module_cache_budget_bytes
+                .unwrap_or(crate::wasm_runtime::DEFAULT_MODULE_CACHE_BUDGET_BYTES),
             shutdown_drain_secs: self
                 .shutdown_drain_secs
                 .unwrap_or_else(default_shutdown_drain_secs),
@@ -905,6 +920,15 @@ pub struct Config {
         rename = "max-hosting-storage"
     )]
     pub max_hosting_storage: u64,
+    /// Byte budget for each compiled-WASM module cache (contract and delegate
+    /// caches each get this budget). Bounds the cache by total compiled bytes
+    /// rather than entry count, so a node hosting many contracts doesn't thrash
+    /// (issue #4441). Default: 384 MiB.
+    #[serde(
+        default = "default_module_cache_budget_bytes",
+        rename = "module-cache-budget-bytes"
+    )]
+    pub module_cache_budget_bytes: usize,
     /// Telemetry configuration
     #[serde(flatten)]
     pub telemetry: TelemetryConfig,
@@ -952,6 +976,15 @@ fn default_max_blocking_threads() -> usize {
 /// default and the in-code default from ever drifting apart.
 fn default_max_hosting_storage() -> u64 {
     crate::ring::DEFAULT_HOSTING_BUDGET_BYTES
+}
+
+/// Default per-cache byte budget for compiled WASM modules (384 MiB).
+///
+/// Resolves to [`crate::wasm_runtime::DEFAULT_MODULE_CACHE_BUDGET_BYTES`], the
+/// single source of truth, so the operator-facing default and the in-code
+/// default never drift.
+fn default_module_cache_budget_bytes() -> usize {
+    crate::wasm_runtime::DEFAULT_MODULE_CACHE_BUDGET_BYTES
 }
 
 impl Config {
@@ -2970,6 +3003,56 @@ mod tests {
         assert!(serialized.contains("max-hosting-storage"));
         let deserialized: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(deserialized.max_hosting_storage, custom);
+    }
+
+    #[tokio::test]
+    async fn module_cache_budget_defaults_to_384_mib() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            ..Default::default()
+        };
+        let cfg = args.build().await.unwrap();
+        assert_eq!(
+            cfg.module_cache_budget_bytes,
+            crate::wasm_runtime::DEFAULT_MODULE_CACHE_BUDGET_BYTES,
+            "default module cache budget should resolve to the wasm_runtime \
+             single-source-of-truth default"
+        );
+        assert_eq!(
+            crate::wasm_runtime::DEFAULT_MODULE_CACHE_BUDGET_BYTES,
+            384 * 1024 * 1024,
+            "default module cache budget should be 384 MiB"
+        );
+    }
+
+    #[tokio::test]
+    async fn module_cache_budget_explicit_value_round_trips() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let custom = 768 * 1024 * 1024_usize;
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            module_cache_budget_bytes: Some(custom),
+            ..Default::default()
+        };
+        let cfg = args.build().await.unwrap();
+        assert_eq!(cfg.module_cache_budget_bytes, custom);
+
+        // Round-trips through TOML serialization.
+        let serialized = toml::to_string(&cfg).unwrap();
+        assert!(serialized.contains("module-cache-budget-bytes"));
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.module_cache_budget_bytes, custom);
     }
 
     /// Build a minimal local-mode ConfigArgs with the given CIDR list and
