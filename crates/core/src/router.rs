@@ -289,10 +289,17 @@ impl Router {
             if let RouteOutcome::Success {
                 time_to_response_start: _,
                 payload_size,
-                payload_transfer_time: _,
+                payload_transfer_time,
             } = event.outcome
             {
-                mean_transfer_size.add(payload_size as f64);
+                // Only feed transfer size estimator when there's actual payload
+                // data. Operations like SUBSCRIBE report payload_size=0 and
+                // payload_transfer_time=ZERO; counting those would bias
+                // mean_transfer_size downward on a router reload. Mirrors the
+                // incremental `add_event` guard.
+                if payload_size > 0 && !payload_transfer_time.is_zero() {
+                    mean_transfer_size.add(payload_size as f64);
+                }
             }
         }
 
@@ -2942,12 +2949,13 @@ mod tests {
     /// successes with finite-rate GET successes at that shared location is what
     /// actually exercises the NaN path; a single homogeneous event does not.
     ///
-    /// Asserts: (1) `Router::new` does not panic, and (2) the resulting
+    /// Asserts: (1) `Router::new` completes, and (2) the resulting
     /// `transfer_rate_estimator`'s raw regression curve is entirely finite —
     /// which fails (NaN) if the NaN subscribe events are not screened out of
-    /// the batch path.
+    /// the batch path. (`Router::new` itself does not panic on this NaN; the
+    /// load-bearing assertion is regression finiteness, hence the name.)
     #[test]
-    fn router_new_does_not_panic_on_subscribe_nan_transfer_rates() {
+    fn router_new_does_not_poison_transfer_rate_regression_with_nan() {
         use crate::transport::TransportKeypair;
         use std::net::SocketAddr;
 
