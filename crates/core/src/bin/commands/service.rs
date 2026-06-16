@@ -166,6 +166,17 @@ pub enum ServiceCommand {
         #[arg(long)]
         system: bool,
     },
+    /// Recover a wedged service install: re-template the wrapper/unit to the
+    /// current binary, reap stale orphaned `freenet network` processes (PPID=1,
+    /// holding the port on an old binary), and restart cleanly. Use when the
+    /// node appears frozen on an old version (see issue #3967). Unlike
+    /// `restart`, this kills detached orphans and refreshes the wrapper, so it
+    /// closes the bootstrap gap that `restart` alone cannot.
+    Doctor {
+        /// Repair the system-wide service instead of the user service
+        #[arg(long)]
+        system: bool,
+    },
     /// View service logs (follows new output)
     Logs {
         /// Show only error logs
@@ -201,6 +212,7 @@ impl ServiceCommand {
             ServiceCommand::Start { system } => start_service(*system),
             ServiceCommand::Stop { system } => stop_service(*system),
             ServiceCommand::Restart { system } => restart_service(*system),
+            ServiceCommand::Doctor { system } => service_doctor(*system),
             ServiceCommand::Logs { err } => service_logs(*err),
             ServiceCommand::Report(cmd) => {
                 cmd.run(version, git_commit, git_dirty, build_timestamp, config_dirs)
@@ -2033,6 +2045,166 @@ fn kill_stale_freenet_processes(log_dir: &Path) {
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
     }
+}
+
+/// Per-platform directory the wrapper writes its lifecycle log to. Mirrors the
+/// path `service_logs` tails, so `doctor`'s reap events land in the same place a
+/// user would already be looking.
+fn doctor_log_dir() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library/Logs/freenet")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        home.join(".local/state/freenet")
+    }
+}
+
+/// Reap stale `freenet network` processes, escalating to SIGKILL for any that
+/// ignore the initial SIGTERM.
+///
+/// `kill_stale_freenet_processes` (the wrapper-startup reaper) sends a single
+/// `pkill` (SIGTERM) and returns. That is right for the startup path — the
+/// wrapper is about to relaunch and a lingering drainer will exit on its own —
+/// but `doctor` is invoked precisely because a node is WEDGED, and the original
+/// incident's orphan ignored SIGTERM for >11s (see `heal_stale_orphan_or_defer`
+/// in `generate_wrapper_script`). So here we SIGTERM, wait, then SIGKILL the
+/// holdouts. Returns the number of processes that were still matching after the
+/// SIGTERM pass (i.e. needed escalation), for the summary output.
+#[cfg(unix)]
+fn reap_stale_freenet_processes_escalating(log_dir: &Path) -> usize {
+    let uid = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+    let escalated = kill_pattern_escalating(uid.trim(), "freenet network", 12);
+    if escalated > 0 {
+        log_wrapper_event(
+            log_dir,
+            "doctor: stale freenet network process(es) ignored SIGTERM, sent SIGKILL",
+        );
+    } else {
+        log_wrapper_event(log_dir, "doctor: reaped stale freenet network process(es)");
+    }
+    escalated
+}
+
+/// SIGTERM a user-scoped process set matched by `pattern` (a `pgrep -f`
+/// substring), wait up to `grace_secs` for graceful exit polling once a second,
+/// then SIGKILL any survivor. Returns the count of survivors that needed the
+/// SIGKILL escalation.
+///
+/// Parameterized on `pattern` (not hardcoded to "freenet network") purely so the
+/// escalation timing/decision is unit-testable against a controllable child;
+/// production callers always pass "freenet network".
+#[cfg(unix)]
+fn kill_pattern_escalating(uid: &str, pattern: &str, grace_secs: usize) -> usize {
+    use std::time::Duration;
+
+    // SIGTERM pass. Ignore the result: a non-match (nothing to kill) is the
+    // common, healthy case, and we re-check liveness via pgrep below regardless.
+    std::process::Command::new("pkill")
+        .args(["-f", "-u", uid, pattern])
+        .status()
+        .ok();
+
+    // Wait for graceful exit, escalating as soon as the survivors are quiet.
+    for _ in 0..grace_secs {
+        std::thread::sleep(Duration::from_secs(1));
+        if pids_matching(uid, pattern).is_empty() {
+            return 0;
+        }
+    }
+
+    // SIGKILL any survivor.
+    let survivors = pids_matching(uid, pattern).len();
+    if survivors > 0 {
+        std::process::Command::new("pkill")
+            .args(["-9", "-f", "-u", uid, pattern])
+            .status()
+            .ok();
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    survivors
+}
+
+/// PIDs of user-scoped processes whose command line matches `pattern`
+/// (`pgrep -f`). Empty on any error.
+#[cfg(unix)]
+fn pids_matching(uid: &str, pattern: &str) -> Vec<u32> {
+    std::process::Command::new("pgrep")
+        .args(["-f", "-u", uid, pattern])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| {
+            s.split_whitespace()
+                .filter_map(|p| p.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Recover a wedged service install (issue #3967). Orchestrates the manual
+/// recovery that `restart` cannot do:
+///
+///   1. Re-template the wrapper/unit to the CURRENT binary via the install
+///      path. This closes the bootstrap gap: the self-heal wrapper (#4408) can
+///      only reach disk through `freenet update`, which a node wedged on a
+///      stale orphan never runs — so an already-wedged install never adopts the
+///      fix on its own. Idempotent on a healthy install.
+///   2. Stop the managed service so launchd/systemd releases its child cleanly.
+///   3. Reap stale orphaned `freenet network` processes (PPID=1, holding the
+///      port on an old binary), escalating SIGTERM -> SIGKILL for holdouts.
+///   4. Start the service so the freshly-templated wrapper launches on a clean
+///      port.
+///
+/// Cross-platform: it calls the cfg-gated install/stop/start helpers and the
+/// unix reaper, so it compiles on every target.
+fn service_doctor(system: bool) -> Result<()> {
+    println!("freenet service doctor: recovering service install...");
+
+    // 1. Re-template wrapper/unit to the current binary.
+    println!("  - Re-templating service wrapper/unit to the current binary...");
+    install_service(system)?;
+
+    // 2. Stop the managed service (best-effort: a wedged install may show the
+    //    agent as not-running, in which case stop is a no-op we don't want to
+    //    abort on).
+    println!("  - Stopping the managed service...");
+    if let Err(e) = stop_service(system) {
+        println!("    (stop reported: {e} — continuing; the service may already be down)");
+    }
+
+    // 3. Reap stale orphans (the step `restart` lacks).
+    #[cfg(unix)]
+    {
+        let log_dir = doctor_log_dir();
+        println!("  - Reaping stale 'freenet network' processes...");
+        let escalated = reap_stale_freenet_processes_escalating(&log_dir);
+        if escalated > 0 {
+            println!("    ({escalated} process(es) ignored SIGTERM and were force-killed)");
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        println!("  - Reaping stale 'freenet network' processes...");
+        kill_stale_freenet_processes(&doctor_log_dir());
+    }
+
+    // 4. Start fresh so the new wrapper text loads on a clean port.
+    println!("  - Starting the service...");
+    start_service(system)?;
+
+    println!("freenet service doctor: done. The service has been re-templated and restarted.");
+    println!(
+        "If the dashboard still shows an old version, hard-refresh the page to clear cached assets."
+    );
+    Ok(())
 }
 
 /// Determine whether the user wants to purge data directories.
@@ -6280,5 +6452,132 @@ echo "RC=$?"
         );
         assert!(!hash_path.exists(), "hash sidecar must be removed");
         assert!(!bak_path.exists(), "bak backup must be removed");
+    }
+
+    // Regression for #3967: `freenet service doctor` must exist as a parseable
+    // subcommand (both user and --system forms). It is the one-shot recovery
+    // for a wedged install that `restart` cannot perform.
+    #[test]
+    fn service_doctor_subcommand_parses() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: ServiceCommand,
+        }
+
+        let user = TestCli::try_parse_from(["freenet", "doctor"]).expect("`doctor` must parse");
+        assert!(
+            matches!(user.cmd, ServiceCommand::Doctor { system: false }),
+            "bare `doctor` must be the user-mode variant"
+        );
+
+        let sys = TestCli::try_parse_from(["freenet", "doctor", "--system"])
+            .expect("`doctor --system` must parse");
+        assert!(
+            matches!(sys.cmd, ServiceCommand::Doctor { system: true }),
+            "`doctor --system` must set system=true"
+        );
+    }
+
+    // Behavioral regression for the doctor reap step (#3967): the original
+    // incident's orphan ignored SIGTERM for >11s and needed SIGKILL. This proves
+    // `kill_pattern_escalating` actually escalates: a child that traps and
+    // ignores SIGTERM must still be reaped (via SIGKILL) and counted as a
+    // survivor. Uses a real child whose argv carries a unique marker so the
+    // user-scoped `pgrep -f` matches exactly this process and nothing else.
+    #[test]
+    #[cfg(unix)]
+    fn kill_pattern_escalating_force_kills_sigterm_ignorer() {
+        use std::time::Duration;
+
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .unwrap_or_default();
+        let uid = uid.trim().to_string();
+
+        // Unique marker in the command line so pgrep -f matches only this child.
+        let marker = format!("freenet-doctor-test-{}", std::process::id());
+        // `trap '' TERM` makes the child ignore SIGTERM entirely; it only dies on
+        // SIGKILL. The marker is embedded in the script text (a `:` no-op with the
+        // marker as an argument) so it is unambiguously part of the command line
+        // `pgrep -f` inspects, regardless of how the OS reports argv[0].
+        // Trailing `; :` defeats the shell's exec-the-last-command optimization,
+        // so the trap-installing `sh` stays the live process (an exec would
+        // replace it with bare `sleep`, dropping both the TERM trap and the
+        // marker from argv).
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("trap '' TERM; : {marker}; sleep 60; :"))
+            .spawn()
+            .expect("spawn sigterm-ignoring child");
+
+        // Give it a moment to install the trap and be visible to pgrep.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !pids_matching(&uid, &marker).is_empty(),
+            "test child must be discoverable via pgrep -f before reaping"
+        );
+
+        // Short grace window (2s) keeps the test fast; the child ignores SIGTERM
+        // so escalation to SIGKILL is the only thing that can reap it.
+        let escalated = kill_pattern_escalating(&uid, &marker, 2);
+
+        assert_eq!(
+            escalated, 1,
+            "the SIGTERM-ignoring child must be counted as a force-killed survivor"
+        );
+        assert!(
+            pids_matching(&uid, &marker).is_empty(),
+            "the SIGTERM-ignoring child must be gone after SIGKILL escalation"
+        );
+        // Reap the zombie so we don't leak it.
+        child.wait().ok();
+    }
+
+    // Complementary case: a child that exits promptly on SIGTERM must be reaped
+    // WITHOUT escalation (escalated count == 0), confirming we don't SIGKILL
+    // (or miscount) a well-behaved process that drains on the polite signal.
+    #[test]
+    #[cfg(unix)]
+    fn kill_pattern_escalating_no_escalation_for_graceful_exit() {
+        use std::time::Duration;
+
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .unwrap_or_default();
+        let uid = uid.trim().to_string();
+
+        let marker = format!("freenet-doctor-graceful-{}", std::process::id());
+        // No TERM trap: default disposition terminates the process on SIGTERM.
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(": {marker}; sleep 60; :"))
+            .spawn()
+            .expect("spawn graceful child");
+
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !pids_matching(&uid, &marker).is_empty(),
+            "graceful test child must be discoverable before reaping"
+        );
+
+        let escalated = kill_pattern_escalating(&uid, &marker, 12);
+        assert_eq!(
+            escalated, 0,
+            "a child that exits on SIGTERM must not need SIGKILL escalation"
+        );
+        assert!(
+            pids_matching(&uid, &marker).is_empty(),
+            "graceful child must be gone after SIGTERM"
+        );
+        child.wait().ok();
     }
 }
