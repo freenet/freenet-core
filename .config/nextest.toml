@@ -9,8 +9,14 @@ fail-fast = false
 # Terminate tests that hang (2 periods of 120s = 4 min max per test).
 slow-timeout = { period = "120s", terminate-after = 2 }
 
-# Interest renewal runs a full simulation with contract operations and needs
-# extra time when competing with parallel fdev tests for CPU (#3792).
+# Interest renewal drives a 6-node / 8-contract simulation for ~1200s of virtual
+# time (paused-time direct runner, advanced in ~1ms quanta), so its wall-clock
+# scales with runner CPU and can be 2-3x slower under load. The original CI
+# timeout (#3792) was a 1800s convergence-polling tail stacked on top of that
+# whenever the network didn't fully converge; that tail is now skipped for this
+# test (it never asserts convergence — see test_interest_renewal's
+# no_convergence_wait()). This generous timeout remains as headroom for the fixed
+# event-phase cost on slow/contended runners.
 [[profile.ci.overrides]]
 filter = "test(test_interest_renewal)"
 slow-timeout = { period = "300s", terminate-after = 2 }

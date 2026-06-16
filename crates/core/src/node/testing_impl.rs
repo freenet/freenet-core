@@ -947,6 +947,20 @@ pub struct SimNetwork {
     /// When true, use `MockWasmRuntime` (production `ContractExecutor` code path)
     /// instead of `MockRuntime` (simplified hash-based merge).
     pub use_mock_wasm: bool,
+    /// When true, the direct runner skips the long post-event convergence-polling
+    /// loop and does only a brief fixed propagation settle instead.
+    ///
+    /// The direct runner normally polls for full state convergence for up to
+    /// ~1800s of virtual time after the event phase (30 rounds × 60s, early-exit
+    /// on convergence). That tail is advisory — the runner only logs a warning if
+    /// convergence is never reached, it does not fail the simulation. For tests
+    /// that analyze events produced *during* the event phase and never assert
+    /// convergence (e.g. `test_interest_renewal`), running the full polling tail
+    /// when the network happens not to converge adds up to 1800s of virtual time
+    /// for no benefit, blowing the wall-clock budget and making the test time out
+    /// in CI. Set this (via `TestConfig::require_convergence(false)`) so such tests
+    /// stay bounded regardless of whether the network converges. See #3792.
+    pub skip_convergence_wait: bool,
     /// Optional churn (crash/restart) configuration for the chaos driver.
     churn_config: Option<ChurnConfig>,
     /// Optional governance-manager config override applied to every node
@@ -1111,6 +1125,7 @@ impl SimNetwork {
             streaming_threshold: None,
             connection_managers: HashMap::new(),
             use_mock_wasm: false,
+            skip_convergence_wait: false,
             churn_config: None,
             governance_config_override: None,
             subscribe_hint_floor_override: None,
@@ -4419,6 +4434,7 @@ impl SimNetwork {
         // non-deterministic convergence failures even in small networks.
         SimulationTransportOpt::enable();
         let use_mock_wasm = self.use_mock_wasm;
+        let skip_convergence_wait = self.skip_convergence_wait;
 
         let result: anyhow::Result<()> = rt.block_on(async {
             // Time driver: bridges tokio's paused time → VirtualTime
@@ -4727,34 +4743,48 @@ impl SimNetwork {
             // compete across multi-hop topologies.
             //
             // Early exit: if all contracts converge, we break immediately.
+            //
+            // When `skip_convergence_wait` is set (TestConfig::require_convergence(false)),
+            // we do only a brief fixed settle and skip the polling loop entirely. The
+            // polling tail is advisory — it only logs on failure, never fails the
+            // simulation — so a test that never asserts convergence gains nothing from
+            // it but pays up to 1800s of virtual time when the network happens not to
+            // converge, which is exactly how test_interest_renewal timed out in CI (#3792).
             tokio::time::sleep(Duration::from_secs(15)).await;
 
-            let converged = 'convergence: {
-                for round in 0..30u32 {
-                    let result = check_convergence_from_logs(&event_logs).await;
-                    let total = result.converged.len() + result.diverged.len();
-                    if total > 0 && result.diverged.is_empty() {
-                        tracing::info!(
-                            converged = result.converged.len(),
-                            round,
-                            "Convergence achieved during propagation"
-                        );
-                        break 'convergence true;
-                    }
-                    tracing::debug!(
-                        converged = result.converged.len(),
-                        diverged = result.diverged.len(),
-                        round,
-                        "Convergence not yet achieved, waiting..."
-                    );
-                    tokio::time::sleep(Duration::from_secs(60)).await;
-                }
-                false
-            };
-            if !converged {
-                tracing::warn!(
-                    "Propagation timeout — convergence not achieved after 30 rounds (1800s)"
+            if skip_convergence_wait {
+                tracing::info!(
+                    "Skipping convergence-polling tail (require_convergence = false); \
+                     brief settle only"
                 );
+            } else {
+                let converged = 'convergence: {
+                    for round in 0..30u32 {
+                        let result = check_convergence_from_logs(&event_logs).await;
+                        let total = result.converged.len() + result.diverged.len();
+                        if total > 0 && result.diverged.is_empty() {
+                            tracing::info!(
+                                converged = result.converged.len(),
+                                round,
+                                "Convergence achieved during propagation"
+                            );
+                            break 'convergence true;
+                        }
+                        tracing::debug!(
+                            converged = result.converged.len(),
+                            diverged = result.diverged.len(),
+                            round,
+                            "Convergence not yet achieved, waiting..."
+                        );
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                    false
+                };
+                if !converged {
+                    tracing::warn!(
+                        "Propagation timeout — convergence not achieved after 30 rounds (1800s)"
+                    );
+                }
             }
 
             // Shutdown: abort chaos driver, time driver, then check node tasks

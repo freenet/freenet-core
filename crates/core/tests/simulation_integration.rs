@@ -230,6 +230,20 @@ impl TestConfig {
         self
     }
 
+    /// Opt out of asserting convergence.
+    ///
+    /// For `run_direct()` tests this ALSO tells the runner to skip its
+    /// up-to-1800s post-event convergence-polling tail and do only a brief
+    /// settle instead. Use this for tests that analyze events produced during
+    /// the event phase and never assert final-state convergence — running the
+    /// advisory polling tail (which only warns, never fails) when the network
+    /// happens not to converge just burns wall-clock and risks a CI timeout.
+    /// See #3792.
+    fn no_convergence_wait(mut self) -> Self {
+        self.require_convergence = false;
+        self
+    }
+
     /// Add latency jitter simulation.
     #[allow(dead_code)]
     fn with_latency(mut self, min: Duration, max: Duration) -> Self {
@@ -345,6 +359,12 @@ impl TestConfig {
         let rt = create_runtime();
 
         let use_mock_wasm = self.use_mock_wasm;
+        // Tests that never assert convergence (require_convergence = false) skip the
+        // direct runner's up-to-1800s convergence-polling tail and do a brief settle
+        // instead. The tail is advisory (it only warns on failure), so skipping it
+        // changes no assertion but keeps wall-clock bounded when the network does not
+        // converge — the failure mode that timed out test_interest_renewal in CI (#3792).
+        let skip_convergence_wait = !self.require_convergence;
         let (sim, logs_handle) = rt.block_on(async {
             let mut sim = SimNetwork::new(
                 self.name,
@@ -358,6 +378,7 @@ impl TestConfig {
             )
             .await;
             sim.use_mock_wasm = use_mock_wasm;
+            sim.skip_convergence_wait = skip_convergence_wait;
 
             // Apply fault injection if configured (latency and/or message loss)
             let has_latency = self.latency_range.is_some();
@@ -6267,6 +6288,13 @@ fn test_router_learning() {
 /// Uses `run_direct()` (paused-time single-thread runtime) for efficiency.
 /// Virtual time is controlled by iterations * event_wait, not `with_duration()`.
 ///
+/// `no_convergence_wait()`: this test asserts only on broadcast-received events
+/// produced during the 1200s event phase, never on final-state convergence, so
+/// it skips the direct runner's advisory up-to-1800s convergence-polling tail.
+/// When the network happens not to converge, that tail would add 1800s of virtual
+/// time (processed in ~1ms quanta) on top of the event phase for no benefit — the
+/// exact failure mode that made this test consistently time out in CI (#3792).
+///
 /// Catches #3093 (interest TTL not refreshed on broadcast send).
 #[test_log::test]
 fn test_interest_renewal() {
@@ -6278,6 +6306,7 @@ fn test_interest_renewal() {
         .with_nodes(4)
         .with_iterations(400)
         .with_event_wait(Duration::from_secs(3))
+        .no_convergence_wait()
         .run_direct()
         .assert_ok();
 
