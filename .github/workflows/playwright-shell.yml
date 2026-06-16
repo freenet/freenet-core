@@ -7,7 +7,7 @@ name: Shell Playwright E2E
 # are JavaScript strings injected by crates/core/src/server/path_handlers.rs +
 # client_api.rs. Every other CI job only ever asserts substrings of that JS at
 # the Rust level; nothing executes it in a real browser. Four regressions
-# (#3842, #3852, #3853, #3854) shipped to production through that gap. This job
+# (#3842, #3849, #3852, #3854) shipped to production through that gap. This job
 # boots a node (via the #[freenet_test] harness in
 # crates/core/tests/playwright_shell.rs), publishes a fixture webapp, and drives
 # the injected JS against headless Chromium with Playwright.

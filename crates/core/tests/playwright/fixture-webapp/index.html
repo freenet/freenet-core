@@ -26,7 +26,7 @@
   Cross-origin link. The navigation interceptor must intercept clicks on this
   (left, middle, and shift) and forward them to the shell as an `open_url`
   postMessage rather than letting the sandboxed iframe open a null-origin
-  popup (freenet/freenet-core#3852, #3853, #3854). example.com is a reserved
+  popup (freenet/freenet-core#3852, #3854). example.com is a reserved
   documentation domain (RFC 2606) that is never actually navigated to in the
   tests — the click is intercepted before any network request.
 -->

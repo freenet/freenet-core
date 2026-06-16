@@ -10,7 +10,7 @@ injects into the shell page and the sandboxed iframe — `SHELL_BRIDGE_JS`,
 (`SHELL_PAGE_CSP`, `sandbox_csp_for_origin` in
 `crates/core/src/server/client_api.rs`). Before this suite, that code was only
 guarded by Rust-level substring assertions on the emitted JS; four regressions
-(#3842, #3852, #3853, #3854) shipped to production through that gap.
+(#3842, #3849, #3852, #3854) shipped to production through that gap.
 
 ## How it runs
 

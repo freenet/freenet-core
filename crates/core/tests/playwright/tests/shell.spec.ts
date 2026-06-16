@@ -14,8 +14,9 @@ import { test, expect, type Page, type ConsoleMessage } from "@playwright/test";
 //   - #3842 — shell CSP must allow same-origin fetches (connect-src 'self').
 //   - #3852 — cross-origin target="_blank" links must not open null-origin
 //             sandboxed popups; they go through the shell's open_url bridge.
-//   - #3853 / #3854 — middle-click (auxclick) and shift-click must also be
-//             intercepted, not just primary-button click.
+//   - #3854 — middle-click (auxclick) and shift-click must also be
+//             intercepted, not just primary-button click (the merged fix;
+//             #3853 was the closed predecessor PR for the same work).
 
 const shellUrl = process.env.FREENET_SHELL_URL;
 
@@ -170,7 +171,7 @@ test("left-click on a cross-origin link routes through the open_url bridge (#385
   await expect.poll(async () => await openCalls(page)).toContain("https://example.com/external");
 });
 
-test("middle-click (auxclick) on a cross-origin link is also intercepted (#3853/#3854)", async ({
+test("middle-click (auxclick) on a cross-origin link is also intercepted (#3854)", async ({
   page,
 }) => {
   await page.goto(shellUrl!);
@@ -189,7 +190,7 @@ test("middle-click (auxclick) on a cross-origin link is also intercepted (#3853/
   expect(openUrl?.url).toBe("https://example.com/external");
 });
 
-test("shift-click on a cross-origin link forwards shiftKey (#3853)", async ({ page }) => {
+test("shift-click on a cross-origin link forwards shiftKey (#3854)", async ({ page }) => {
   await page.goto(shellUrl!);
   await captureShellMessages(page);
   await stubWindowOpen(page);
