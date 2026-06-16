@@ -61,6 +61,24 @@ stalling the entire event loop. This has caused 5+ production deadlocks:
   because it carries a one-shot transition — see its inline
   `DELIBERATELY blocking` comment for the rationale.
 
+  The same #4145/#4231 investigation surfaced a SECOND, separate
+  degradation under the same fan-out — not a deadlock but a full-state
+  broadcast STORM (#4442). A peer's summary was cached only after a
+  *delta* send (PR #2763's `if sent_delta`), but a delta needs the
+  peer's cached summary to compute against — a chicken-and-egg that
+  trapped every summary-less subscriber (any new subscriber, or one
+  whose summary was cleared) on full state forever. Under sustained
+  fan-out that meant every update re-sent full state to every
+  subscriber, swamping the event loop. Fixed (#4442) by caching the
+  summary on any *delivered* broadcast (delta OR full state): #4235's
+  real-delivery signal (`BroadcastDeliveryOutcome::Delivered`) makes
+  caching on a full-state delivery safe, so the next broadcast to that
+  peer collapses to a small delta. A wrongly-cached summary (e.g. a
+  lost stream tail — `Delivered` is sender-side completion, not a
+  receiver ack) is corrected by the periodic InterestSync summary
+  exchange and by the delta-apply-failure → ResyncRequest path that
+  clears the sender's cached summary.
+
 ## Exception: same-runtime internal consumers
 
 `.send().await` on a bounded channel is acceptable when **all** of the

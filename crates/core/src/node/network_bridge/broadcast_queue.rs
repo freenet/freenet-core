@@ -397,13 +397,23 @@ fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
     // broadcast storm.
     //
     // #4235 added a real-delivery signal (`BroadcastDeliveryOutcome::Delivered`).
-    // This helper now runs ONLY on a real delivery: for the streaming
+    // This helper runs only on a delivered broadcast: for the streaming
     // (full-state) path the caller gates it behind
     // `record_streaming_delivery` → `streaming_completion_delivered`, and for
-    // the non-streaming path it runs only inside the send-success arm. After a
-    // real delivery the peer has `our_summary` regardless of how the state was
-    // sent, so caching it here is safe and lets the NEXT broadcast be a small
-    // delta. Each peer now gets exactly ONE bootstrap full-state, then deltas.
+    // the non-streaming path it runs only inside the send-success arm.
+    //
+    // Caching `our_summary` on ANY delivered broadcast (delta or full state) is
+    // safe even though `Delivered` is a SENDER-SIDE completion (the last
+    // fragment was handed to the transport — see outbound_stream.rs ~434 — NOT a
+    // receiver ACK), so on the streaming path a lost stream tail could leave the
+    // peer without the state and the cached summary momentarily wrong. Two
+    // backstops bound that window: the periodic InterestSync summary exchange
+    // (~5 min, node.rs) re-reconciles what each peer actually has, and a delta
+    // that fails to apply at the receiver triggers a ResyncRequest that clears
+    // the sender's cached summary (node.rs ~2119). The streaming `Delivered`
+    // signal is sender-side completion, so the rare tail-loss case is corrected
+    // by those backstops rather than by an end-to-end ack here. Caching lets the
+    // NEXT broadcast to this peer be a small delta instead of full state.
     // (Telemetry above still records delta-vs-full-state separately.)
     if let Some(summary) = our_summary {
         interest_manager.update_peer_summary(key, peer_key, Some(summary.clone()));
