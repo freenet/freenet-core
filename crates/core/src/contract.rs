@@ -2223,12 +2223,18 @@ const DEBUG_SECTION_PREFIX: &str = ".debug_";
 /// at PUT time by looking for the `.debug_*` custom sections the Rust
 /// debug profile leaves in the module. See #2257.
 ///
-/// Returns the matching section names in encounter order (empty when the
-/// module is a release build or cannot be parsed). A module that fails to
-/// parse is treated as "no debug sections": malformed-WASM rejection is a
-/// separate concern handled downstream by the WASM runtime, and we must
-/// not reject a contract here merely because this lightweight scan
-/// disagrees with the full validator.
+/// Returns the matching section names in encounter order, or an empty
+/// vec when the module is a release build OR cannot be fully parsed.
+///
+/// A module that fails to parse is treated as "no debug sections" —
+/// including the case where some `.debug_*` sections were collected
+/// before the parse error: we discard the partial result and return
+/// empty. Malformed-WASM rejection is a separate concern handled
+/// downstream by the WASM runtime with a precise error; we must not
+/// short-circuit it here with a misleading "recompile with --release"
+/// message, and a partial scan of a module we can't fully parse is not
+/// trustworthy evidence of a debug build. We only trust the `.debug_*`
+/// signal on a module that parses cleanly end to end.
 pub(crate) fn debug_sections(wasm: &[u8]) -> Vec<String> {
     let mut found = Vec::new();
     for payload in wasmparser::Parser::new(0).parse_all(wasm) {
@@ -2239,10 +2245,13 @@ pub(crate) fn debug_sections(wasm: &[u8]) -> Vec<String> {
                     found.push(name.to_string());
                 }
             }
-            // Stop scanning on the first parse error: we cannot trust
-            // section boundaries past it. Treat as "no debug sections"
-            // (see doc comment) rather than guessing.
-            Err(_) => break,
+            // A parse error anywhere voids the whole scan: section
+            // boundaries past it can't be trusted, and any `.debug_*`
+            // names collected BEFORE it are not reliable evidence on a
+            // module we can't fully parse. Treat the module as "no debug
+            // sections" (see doc comment) so the runtime surfaces the real
+            // malformed-WASM error instead of "recompile with --release".
+            Err(_) => return Vec::new(),
             // Non-custom sections are irrelevant to debug detection.
             Ok(_) => {}
         }

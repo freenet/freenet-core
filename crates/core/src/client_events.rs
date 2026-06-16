@@ -2571,6 +2571,28 @@ pub(crate) mod test {
             assert!(!contains_debug_sections(&truncated));
         }
 
+        /// A `.debug_*` section followed by a parse error must NOT leave the
+        /// scan reporting the already-collected debug section (Codex P3): a
+        /// module we can't fully parse is not trustworthy evidence of a
+        /// debug build, and rejecting it with "recompile with --release"
+        /// would mask the real malformed-WASM error. The whole scan must
+        /// void to empty on any parse error.
+        #[test]
+        fn debug_section_before_parse_error_is_not_flagged() {
+            // A complete, valid `.debug_info` custom section...
+            let mut wasm = wasm_with_custom_section(".debug_info", &[0xde, 0xad]);
+            // ...then a second custom section header that lies about its
+            // length, so the parser errors AFTER the debug section is seen.
+            wasm.push(0x00); // custom section id
+            wasm.push(0x40); // claims 64 bytes follow, but none do
+            assert!(
+                !contains_debug_sections(&wasm),
+                "a parse error after a debug section must void the scan, \
+                 not report the partial result"
+            );
+            assert!(debug_sections(&wasm).is_empty());
+        }
+
         /// The rejection maps through `report_op_init_error`'s
         /// `OpError::ContractError(_)` arm to a client-visible
         /// `ErrorKind::OperationError` whose cause carries the actionable
