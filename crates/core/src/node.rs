@@ -454,12 +454,25 @@ impl NodeConfig {
 
     pub(crate) async fn parse_socket_addr(address: &Address) -> anyhow::Result<SocketAddr> {
         let (hostname, port) = match address {
+            // New form: host and port already separated. `port` is always
+            // populated (defaulted to DEFAULT_GATEWAY_PORT at deserialize time).
+            crate::config::Address::Host { host, port } => {
+                let host_with_port = format!("{host}:{port}");
+                if let Ok(mut addrs) = host_with_port.to_socket_addrs() {
+                    if let Some(addr) = addrs.next() {
+                        return Ok(addr);
+                    }
+                }
+                (Cow::Borrowed(host.as_str()), Some(*port))
+            }
             crate::config::Address::Hostname(hostname) => {
                 match hostname.rsplit_once(':') {
                     None => {
-                        // no port found, use default
+                        // No port found. Default to the gateway port (31337), NOT
+                        // a random local port — we are addressing a gateway we need
+                        // to reach (issue #1388).
                         let hostname_with_port =
-                            format!("{}:{}", hostname, crate::config::default_network_api_port());
+                            format!("{}:{}", hostname, crate::config::DEFAULT_GATEWAY_PORT);
 
                         if let Ok(mut addrs) = hostname_with_port.to_socket_addrs() {
                             if let Some(addr) = addrs.next() {
@@ -499,7 +512,9 @@ impl NodeConfig {
         match ips.iter().next() {
             Some(ip) => Ok(SocketAddr::new(
                 ip,
-                port.unwrap_or_else(crate::config::default_network_api_port),
+                // No explicit port → default to the gateway port (31337), not a
+                // random local port (issue #1388).
+                port.unwrap_or(crate::config::DEFAULT_GATEWAY_PORT),
             )),
             None => Err(anyhow::anyhow!("Fail to resolve IP address of {hostname}")),
         }
@@ -2736,13 +2751,21 @@ mod tests {
     // Hostname resolution tests
     #[tokio::test]
     async fn test_hostname_resolution_localhost() {
+        // A port-less host must resolve to the fixed gateway port (31337), NOT a
+        // random local port. Regression for issue #1388: the old code fell back
+        // to `default_network_api_port()` (a random free port), which made the
+        // gateway unreachable.
         let addr = Address::Hostname("localhost".to_string());
         let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
         assert!(
             socket_addr.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST)
                 || socket_addr.ip() == IpAddr::V6(Ipv6Addr::LOCALHOST)
         );
-        assert!(socket_addr.port() > 1024);
+        assert_eq!(
+            socket_addr.port(),
+            crate::config::DEFAULT_GATEWAY_PORT,
+            "port-less gateway host must default to 31337, not a random port"
+        );
     }
 
     #[tokio::test]
@@ -2750,6 +2773,32 @@ mod tests {
         let addr = Address::Hostname("google.com:8080".to_string());
         let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
         assert_eq!(socket_addr.port(), 8080);
+    }
+
+    #[tokio::test]
+    async fn test_host_variant_defaults_to_gateway_port() {
+        // New `{ host, port }` form with the default port resolves to 31337.
+        let addr = Address::Host {
+            host: "localhost".to_string(),
+            port: crate::config::DEFAULT_GATEWAY_PORT,
+        };
+        let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
+        assert!(
+            socket_addr.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST)
+                || socket_addr.ip() == IpAddr::V6(Ipv6Addr::LOCALHOST)
+        );
+        assert_eq!(socket_addr.port(), crate::config::DEFAULT_GATEWAY_PORT);
+    }
+
+    #[tokio::test]
+    async fn test_host_variant_explicit_port() {
+        // New `{ host, port }` form honors an explicit non-default port.
+        let addr = Address::Host {
+            host: "localhost".to_string(),
+            port: 12345,
+        };
+        let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
+        assert_eq!(socket_addr.port(), 12345);
     }
 
     #[tokio::test]

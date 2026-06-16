@@ -45,6 +45,15 @@ pub const DEFAULT_RANDOM_PEER_CONN_THRESHOLD: usize = 7;
 /// (if it applies, e.g. connect requests).
 pub const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
 
+/// Default UDP port a gateway listens on.
+///
+/// Used as the fallback when a gateway address in `gateways.toml` specifies a
+/// host without an explicit port. This is a fixed, well-known value (NOT a
+/// randomly chosen free port like [`default_network_api_port`]): a gateway we
+/// are trying to *reach* must be addressed at its real listening port, and a
+/// random local port would make the gateway unreachable (issue #1388).
+pub const DEFAULT_GATEWAY_PORT: u16 = 31337;
+
 /// How long an operation (GET, PUT, SUBSCRIBE, etc.) can run before timing out.
 pub(crate) const OPERATION_TTL: Duration = Duration::from_secs(60);
 
@@ -2190,12 +2199,127 @@ impl std::hash::Hash for GatewayConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone)]
+/// A gateway address as it appears in `gateways.toml`.
+///
+/// # On-disk formats (all accepted on deserialize, see [`Address`]'s
+/// `Deserialize` impl)
+///
+/// New, preferred form — host and port as separate fields, port optional and
+/// defaulting to [`DEFAULT_GATEWAY_PORT`]:
+///
+/// ```toml
+/// [gateways.address]
+/// host = "vega.locut.us"
+/// port = 31337            # optional; defaults to 31337 when omitted
+/// ```
+///
+/// Legacy forms (still parsed so existing deployments keep working):
+///
+/// ```toml
+/// [gateways.address]
+/// hostname = "vega.locut.us:31337"   # host[:port] packed into one string
+/// ```
+///
+/// ```toml
+/// [gateways.address]
+/// host_address = "203.0.113.1:31337" # a fully-resolved socket address
+/// ```
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum Address {
-    #[serde(rename = "hostname")]
+    /// Separate host and port. This is the canonical form emitted on serialize.
+    ///
+    /// `port` is always populated (defaulted to [`DEFAULT_GATEWAY_PORT`] when
+    /// omitted on the wire) so the serialized form is unambiguous and
+    /// round-trips.
+    Host { host: String, port: u16 },
+    /// Legacy: host with an optional `:port` suffix packed into one string.
     Hostname(String),
-    #[serde(rename = "host_address")]
+    /// Legacy: a fully-resolved socket address.
     HostAddress(SocketAddr),
+}
+
+// Custom `Serialize` emits each variant as a *flat* table so the on-disk form
+// is symmetric with `Deserialize` (below) and matches the legacy wire format
+// exactly (e.g. `hostname = "..."`). The derived enum `Serialize` would instead
+// nest the struct variant under its own key (`[address.host]`), which neither
+// the deserializer nor old binaries expect.
+impl Serialize for Address {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        match self {
+            Address::Host { host, port } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("host", host)?;
+                map.serialize_entry("port", port)?;
+                map.end()
+            }
+            Address::Hostname(hostname) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("hostname", hostname)?;
+                map.end()
+            }
+            Address::HostAddress(addr) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                // SocketAddr serializes as its string form ("ip:port") here,
+                // matching the legacy `host_address = "..."` representation.
+                map.serialize_entry("host_address", &addr.to_string())?;
+                map.end()
+            }
+        }
+    }
+}
+
+// Custom `Deserialize` so a single `Address` table can be one of three shapes:
+//   { host = "...", port = N? }  (new)
+//   { hostname = "host[:port]" } (legacy)
+//   { host_address = "ip:port" } (legacy)
+//
+// We deserialize into an intermediate that captures whichever key is present,
+// then validate that exactly one address form was supplied. A hand-written
+// impl (rather than `#[serde(untagged)]`) keeps the error messages precise and
+// lets `port` default to `DEFAULT_GATEWAY_PORT` for the new `host` form.
+impl<'de> Deserialize<'de> for Address {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct AddressRepr {
+            host: Option<String>,
+            port: Option<u16>,
+            hostname: Option<String>,
+            host_address: Option<SocketAddr>,
+        }
+
+        let repr = AddressRepr::deserialize(deserializer)?;
+
+        // `port` is only meaningful alongside `host`.
+        if repr.port.is_some() && repr.host.is_none() {
+            return Err(serde::de::Error::custom(
+                "gateway address `port` is only valid together with `host`; \
+                 for the legacy single-string form put the port inside `hostname` \
+                 (e.g. hostname = \"example.com:31337\")",
+            ));
+        }
+
+        match (repr.host, repr.hostname, repr.host_address) {
+            (Some(host), None, None) => Ok(Address::Host {
+                host,
+                port: repr.port.unwrap_or(DEFAULT_GATEWAY_PORT),
+            }),
+            (None, Some(hostname), None) => Ok(Address::Hostname(hostname)),
+            (None, None, Some(addr)) => Ok(Address::HostAddress(addr)),
+            (None, None, None) => Err(serde::de::Error::custom(
+                "gateway address must specify one of `host`, `hostname`, or `host_address`",
+            )),
+            _ => Err(serde::de::Error::custom(
+                "gateway address must specify exactly one of `host`, `hostname`, or `host_address`",
+            )),
+        }
+    }
 }
 
 /// Global async executor abstraction for spawning tasks.
@@ -3323,6 +3447,220 @@ mod tests {
 
         let serialized = toml::to_string(&gateways).unwrap();
         let _: Gateways = toml::from_str(&serialized).unwrap();
+    }
+
+    // ---- Address deserialization: backward compat + new host/port form (#1388) ----
+
+    /// Legacy single-string form, exactly as it appears in the deployed
+    /// `https://freenet.org/keys/gateways.toml` today. MUST keep parsing.
+    #[test]
+    fn test_address_deser_legacy_hostname_string() {
+        let toml_str = r#"
+            [[gateways]]
+            public_key = "keys/public.vega.gw.pem"
+            [gateways.address]
+            hostname = "vega.locut.us:31337"
+        "#;
+        let gateways: Gateways = toml::from_str(toml_str).unwrap();
+        assert_eq!(gateways.gateways.len(), 1);
+        assert_eq!(
+            gateways.gateways[0].address,
+            Address::Hostname("vega.locut.us:31337".to_string())
+        );
+    }
+
+    /// Legacy single-string form without a port still parses (port is resolved
+    /// later by `parse_socket_addr`, which now defaults to 31337).
+    #[test]
+    fn test_address_deser_legacy_hostname_string_no_port() {
+        let toml_str = r#"
+            [[gateways]]
+            public_key = "keys/public.vega.gw.pem"
+            [gateways.address]
+            hostname = "vega.locut.us"
+        "#;
+        let gateways: Gateways = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            gateways.gateways[0].address,
+            Address::Hostname("vega.locut.us".to_string())
+        );
+    }
+
+    /// Legacy fully-resolved socket-address form. MUST keep parsing.
+    #[test]
+    fn test_address_deser_legacy_host_address() {
+        let toml_str = r#"
+            [[gateways]]
+            public_key = "keys/k.pem"
+            [gateways.address]
+            host_address = "203.0.113.1:31337"
+        "#;
+        let gateways: Gateways = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            gateways.gateways[0].address,
+            Address::HostAddress("203.0.113.1:31337".parse().unwrap())
+        );
+    }
+
+    /// New form with explicit host and port.
+    #[test]
+    fn test_address_deser_new_host_port() {
+        let toml_str = r#"
+            [[gateways]]
+            public_key = "keys/public.vega.gw.pem"
+            [gateways.address]
+            host = "vega.locut.us"
+            port = 31337
+        "#;
+        let gateways: Gateways = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            gateways.gateways[0].address,
+            Address::Host {
+                host: "vega.locut.us".to_string(),
+                port: 31337
+            }
+        );
+    }
+
+    /// New form with host and a non-default explicit port.
+    #[test]
+    fn test_address_deser_new_host_explicit_nondefault_port() {
+        let toml_str = r#"
+            [[gateways]]
+            public_key = "keys/k.pem"
+            [gateways.address]
+            host = "example.com"
+            port = 12345
+        "#;
+        let gateways: Gateways = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            gateways.gateways[0].address,
+            Address::Host {
+                host: "example.com".to_string(),
+                port: 12345
+            }
+        );
+    }
+
+    /// New form with host but NO port: must default to 31337, not a random port.
+    #[test]
+    fn test_address_deser_new_host_default_port() {
+        let toml_str = r#"
+            [[gateways]]
+            public_key = "keys/public.vega.gw.pem"
+            [gateways.address]
+            host = "vega.locut.us"
+        "#;
+        let gateways: Gateways = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            gateways.gateways[0].address,
+            Address::Host {
+                host: "vega.locut.us".to_string(),
+                port: DEFAULT_GATEWAY_PORT
+            }
+        );
+        assert_eq!(DEFAULT_GATEWAY_PORT, 31337);
+    }
+
+    /// `port` without `host` is rejected (it would silently be lost otherwise).
+    #[test]
+    fn test_address_deser_port_without_host_is_error() {
+        let toml_str = r#"
+            [[gateways]]
+            public_key = "keys/k.pem"
+            [gateways.address]
+            hostname = "example.com:80"
+            port = 31337
+        "#;
+        assert!(toml::from_str::<Gateways>(toml_str).is_err());
+    }
+
+    /// An address table with none of the recognized keys is rejected.
+    #[test]
+    fn test_address_deser_empty_is_error() {
+        let toml_str = r#"
+            [[gateways]]
+            public_key = "keys/k.pem"
+            [gateways.address]
+        "#;
+        assert!(toml::from_str::<Gateways>(toml_str).is_err());
+    }
+
+    /// Specifying more than one address form at once is rejected.
+    #[test]
+    fn test_address_deser_conflicting_forms_is_error() {
+        let toml_str = r#"
+            [[gateways]]
+            public_key = "keys/k.pem"
+            [gateways.address]
+            host = "example.com"
+            hostname = "example.com:31337"
+        "#;
+        assert!(toml::from_str::<Gateways>(toml_str).is_err());
+    }
+
+    /// The new `Host` variant round-trips through serialize -> deserialize.
+    #[test]
+    fn test_address_host_variant_roundtrip() {
+        let gateways = Gateways {
+            gateways: vec![GatewayConfig {
+                address: Address::Host {
+                    host: "vega.locut.us".to_string(),
+                    port: 31337,
+                },
+                public_key_path: PathBuf::from("keys/k.pem"),
+                location: None,
+            }],
+        };
+        let serialized = toml::to_string(&gateways).unwrap();
+        // The `Host` variant must serialize as a FLAT table (host/port as
+        // sibling keys), matching the new wire form in the issue — not nested
+        // under a `[gateways.address.host]` sub-table (the derived enum form).
+        assert!(
+            serialized.contains("host = \"vega.locut.us\"") && serialized.contains("port = 31337"),
+            "unexpected serialized form:\n{serialized}"
+        );
+        assert!(
+            !serialized.contains("[gateways.address.host]"),
+            "Host variant must not nest under its own sub-table:\n{serialized}"
+        );
+        let deserialized: Gateways = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            deserialized.gateways[0].address,
+            gateways.gateways[0].address
+        );
+    }
+
+    /// Pin the legacy serialized wire forms so a future refactor can't silently
+    /// change what we write to `gateways.toml` (old binaries must keep reading
+    /// files this build writes).
+    #[test]
+    fn test_address_legacy_variants_serialize_unchanged() {
+        let hostname = Gateways {
+            gateways: vec![GatewayConfig {
+                address: Address::Hostname("vega.locut.us:31337".to_string()),
+                public_key_path: PathBuf::from("keys/k.pem"),
+                location: None,
+            }],
+        };
+        let s = toml::to_string(&hostname).unwrap();
+        assert!(
+            s.contains("hostname = \"vega.locut.us:31337\""),
+            "legacy hostname form changed:\n{s}"
+        );
+
+        let host_addr = Gateways {
+            gateways: vec![GatewayConfig {
+                address: Address::HostAddress("203.0.113.1:31337".parse().unwrap()),
+                public_key_path: PathBuf::from("keys/k.pem"),
+                location: None,
+            }],
+        };
+        let s = toml::to_string(&host_addr).unwrap();
+        assert!(
+            s.contains("host_address = \"203.0.113.1:31337\""),
+            "legacy host_address form changed:\n{s}"
+        );
     }
 
     #[tokio::test]
