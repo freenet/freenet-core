@@ -4595,9 +4595,13 @@ fn resolve_message_origin(
     } else if let Some(contract_id) = origin_contract {
         Some(MessageOrigin::WebApp(*contract_id))
     } else {
+        // Plain read, no timestamp update. The "last used" time is refreshed in
+        // inbound_app_message instead, so a child that only ever gets messages
+        // from other delegates (those don't reach this branch) still counts as
+        // active and isn't dropped.
         crate::wasm_runtime::DELEGATE_INHERITED_ORIGINS
             .get(delegate_key)
-            .and_then(|ids| ids.first().map(|c| MessageOrigin::WebApp(*c)))
+            .and_then(|entry| entry.origins.first().copied().map(MessageOrigin::WebApp))
     }
 }
 
@@ -4670,10 +4674,10 @@ mod resolve_message_origin_tests {
 
         // Plant an inherited WebApp origin for the recipient so the
         // fallback branch would have something to return.
-        crate::wasm_runtime::DELEGATE_INHERITED_ORIGINS
-            .entry(recipient.clone())
-            .or_default()
-            .push(inherited_contract);
+        crate::wasm_runtime::DELEGATE_INHERITED_ORIGINS.insert(
+            recipient.clone(),
+            crate::wasm_runtime::InheritedOriginsEntry::new(vec![inherited_contract]),
+        );
 
         let origin = resolve_message_origin(Some(&caller), None, &recipient);
 
@@ -4685,6 +4689,30 @@ mod resolve_message_origin_tests {
             Some(MessageOrigin::Delegate(k)) => assert_eq!(k, caller),
             other => panic!("Expected Delegate(caller), got {other:?}"),
         }
+    }
+
+    /// Fallback branch (no live caller/origin) yields the child's inherited
+    /// WebApp origin via a pure read — it does not refresh `last_access`
+    /// (liveness lives in `inbound_app_message`). Pairs with
+    /// `no_arguments_and_no_inherited_yields_none`.
+    #[test]
+    fn inherited_origin_fallback_yields_webapp() {
+        use crate::wasm_runtime::{DELEGATE_INHERITED_ORIGINS, InheritedOriginsEntry};
+
+        let recipient = dkey(0xC5);
+        let contract = ContractInstanceId::new([0xC6; 32]);
+        DELEGATE_INHERITED_ORIGINS.insert(
+            recipient.clone(),
+            InheritedOriginsEntry::new(vec![contract]),
+        );
+
+        let origin = resolve_message_origin(None, None, &recipient);
+        DELEGATE_INHERITED_ORIGINS.remove(&recipient);
+
+        assert!(
+            matches!(origin, Some(MessageOrigin::WebApp(c)) if c == contract),
+            "fallback must yield the inherited WebApp origin, got {origin:?}"
+        );
     }
 }
 

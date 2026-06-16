@@ -530,6 +530,11 @@ impl DelegateRuntimeInterface for Runtime {
         // bytes for prompts whose `UserResponse` never arrives (user
         // dismisses, app crashes, network partition).
         native_api::prune_expired_contexts(&self.delegate_contexts);
+        // Keep the inherited-origins map tidy. Mark this delegate as just-used
+        // so the cleanup keeps its entry, then drop entries for delegates that
+        // have gone unused long enough. See `InheritedOriginsEntry`.
+        native_api::touch_inherited_origin(delegate_key);
+        native_api::prune_expired_inherited_origins();
         let mut context: Vec<u8> = self
             .delegate_contexts
             .get(delegate_key)
@@ -1858,6 +1863,31 @@ mod test {
 
         std::mem::drop(temp_dir);
         Ok(())
+    }
+
+    /// Checks that `inbound_app_message` calls `touch_inherited_origin` before
+    /// `prune_expired_inherited_origins`. The other tests verify the eviction
+    /// logic on its own, so without this one nobody would notice if those two
+    /// calls were removed or swapped — and the #3492 leak would come back. Reads
+    /// the source and asserts both calls are present and in that order.
+    #[test]
+    fn inbound_app_message_wires_inherited_origins_ttl_in_order() {
+        let src = include_str!("delegate.rs");
+        // The impl is the LAST occurrence; the first is the trait method signature.
+        let body = src
+            .rsplit("fn inbound_app_message(")
+            .next()
+            .expect("inbound_app_message impl must exist");
+        let touch = body
+            .find("touch_inherited_origin(delegate_key)")
+            .expect("inbound_app_message must refresh inherited-origin liveness (touch)");
+        let prune = body
+            .find("prune_expired_inherited_origins()")
+            .expect("inbound_app_message must run the inherited-origins TTL sweep (prune)");
+        assert!(
+            touch < prune,
+            "touch_inherited_origin must run BEFORE prune so a just-delivered message is not evicted"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

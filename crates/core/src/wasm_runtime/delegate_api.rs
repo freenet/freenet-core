@@ -1158,7 +1158,7 @@ mod tests {
             inherited.is_some(),
             "child should have inherited attestations"
         );
-        assert_eq!(inherited.unwrap().value(), &vec![contract_id]);
+        assert_eq!(inherited.unwrap().value().origins, vec![contract_id]);
 
         // Cleanup
         DELEGATE_INHERITED_ORIGINS.remove(&child_key);
@@ -1200,5 +1200,225 @@ mod tests {
 
         // Cleanup
         CREATED_DELEGATES_COUNT.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    // These tests check the eviction rule directly. They build a small map by
+    // hand, set each entry's timestamps relative to `base`, then ask the pruner
+    // "if the time were `now`, what gets dropped?". Times are built forward
+    // (`base + offset`) because subtracting days from `Instant::now()` can
+    // underflow on a freshly-booted CI machine. A local map keeps them from
+    // interfering with other tests.
+
+    /// Regression (#3492): an entry left unused for longer than the TTL is
+    /// dropped, even though nobody called `UnregisterDelegate` — that is the
+    /// leak, since children created via `create_delegate` are never unregistered.
+    #[test]
+    fn test_inherited_origins_idle_ttl_evicts() {
+        use super::super::native_api::{
+            DELEGATE_INHERITED_ORIGINS_TTL, InheritedOriginsEntry, prune_inherited_origins_at,
+        };
+        use dashmap::DashMap;
+        use freenet_stdlib::prelude::CodeHash;
+
+        let base = tokio::time::Instant::now();
+        let map = DashMap::new();
+        let child = DelegateKey::new([0x71; 32], CodeHash::new([0x71; 32]));
+        map.insert(
+            child.clone(),
+            InheritedOriginsEntry {
+                origins: vec![ContractInstanceId::new([0x72; 32])],
+                created_at: base,
+                last_access: base,
+            },
+        );
+
+        // 1s past the idle TTL, nothing touched it.
+        let now = base + DELEGATE_INHERITED_ORIGINS_TTL + std::time::Duration::from_secs(1);
+        prune_inherited_origins_at(&map, now);
+
+        assert!(
+            !map.contains_key(&child),
+            "an entry idle past the TTL must be pruned even without UnregisterDelegate"
+        );
+    }
+
+    /// Even an entry refreshed right now (last_access = now) is dropped once it
+    /// is older than the cap. This is what stops a constantly-used entry from
+    /// living forever, as the AGENTS.md cleanup rule requires.
+    #[test]
+    fn test_inherited_origins_absolute_cap_overrides_refresh() {
+        use super::super::native_api::{
+            DELEGATE_INHERITED_ORIGINS_MAX_AGE, InheritedOriginsEntry, prune_inherited_origins_at,
+        };
+        use dashmap::DashMap;
+        use freenet_stdlib::prelude::CodeHash;
+
+        let base = tokio::time::Instant::now();
+        let map = DashMap::new();
+        let child = DelegateKey::new([0x73; 32], CodeHash::new([0x73; 32]));
+        // now is 1s past the cap; last_access == now (as if just refreshed).
+        let now = base + DELEGATE_INHERITED_ORIGINS_MAX_AGE + std::time::Duration::from_secs(1);
+        map.insert(
+            child.clone(),
+            InheritedOriginsEntry {
+                origins: vec![ContractInstanceId::new([0x74; 32])],
+                created_at: base,
+                last_access: now,
+            },
+        );
+
+        prune_inherited_origins_at(&map, now);
+
+        assert!(
+            !map.contains_key(&child),
+            "an entry older than MAX_AGE must be pruned despite a fresh last_access"
+        );
+    }
+
+    /// A delivered message refreshes the entry, so one that would otherwise be
+    /// dropped for being idle is kept. This is why an active child — even one
+    /// only ever reached by other delegates — keeps its origin.
+    #[test]
+    fn test_touch_inherited_origin_rescues_idle_entry() {
+        use super::super::native_api::{
+            DELEGATE_INHERITED_ORIGINS_TTL, InheritedOriginsEntry, prune_inherited_origins_at,
+            touch_inherited_origin_at,
+        };
+        use dashmap::DashMap;
+        use freenet_stdlib::prelude::CodeHash;
+
+        let base = tokio::time::Instant::now();
+        let map = DashMap::new();
+        let child = DelegateKey::new([0x77; 32], CodeHash::new([0x77; 32]));
+        map.insert(
+            child.clone(),
+            InheritedOriginsEntry {
+                origins: vec![ContractInstanceId::new([0x78; 32])],
+                created_at: base,
+                last_access: base,
+            },
+        );
+
+        // A message is delivered at the idle horizon, then the sweep runs 1s
+        // later: idle is now 1s (< TTL) and age is TTL+1s (< cap), so it stays.
+        let delivery = base + DELEGATE_INHERITED_ORIGINS_TTL;
+        touch_inherited_origin_at(&map, &child, delivery);
+        let now = delivery + std::time::Duration::from_secs(1);
+        prune_inherited_origins_at(&map, now);
+
+        assert!(
+            map.contains_key(&child),
+            "a touched (recently-delivered) entry must survive the idle sweep"
+        );
+    }
+
+    /// A brand-new entry is not dropped by a sweep (the opposite of the eviction
+    /// tests).
+    #[test]
+    fn test_inherited_origins_fresh_entry_survives() {
+        use super::super::native_api::{
+            DELEGATE_INHERITED_ORIGINS_TTL, InheritedOriginsEntry, prune_inherited_origins_at,
+        };
+        use dashmap::DashMap;
+        use freenet_stdlib::prelude::CodeHash;
+
+        let base = tokio::time::Instant::now();
+        let map = DashMap::new();
+        let child = DelegateKey::new([0x75; 32], CodeHash::new([0x75; 32]));
+        map.insert(
+            child.clone(),
+            InheritedOriginsEntry {
+                origins: vec![ContractInstanceId::new([0x76; 32])],
+                created_at: base,
+                last_access: base,
+            },
+        );
+
+        // Well within the idle window.
+        let now = base + DELEGATE_INHERITED_ORIGINS_TTL / 2;
+        prune_inherited_origins_at(&map, now);
+
+        assert!(
+            map.contains_key(&child),
+            "a fresh entry must survive the prune sweep"
+        );
+    }
+
+    /// Exactly at the TTL the entry is dropped; one second under, it is kept.
+    /// Catches an accidental `<` -> `<=` change in the comparison.
+    #[test]
+    fn test_inherited_origins_idle_ttl_boundary() {
+        use super::super::native_api::{
+            DELEGATE_INHERITED_ORIGINS_TTL, InheritedOriginsEntry, prune_inherited_origins_at,
+        };
+        use dashmap::DashMap;
+        use freenet_stdlib::prelude::CodeHash;
+
+        let base = tokio::time::Instant::now();
+        let child = DelegateKey::new([0x79; 32], CodeHash::new([0x79; 32]));
+        let make = || InheritedOriginsEntry {
+            origins: vec![ContractInstanceId::new([0x7a; 32])],
+            created_at: base,
+            last_access: base,
+        };
+
+        // idle == TTL -> evicted (strict `<`).
+        let at = DashMap::new();
+        at.insert(child.clone(), make());
+        prune_inherited_origins_at(&at, base + DELEGATE_INHERITED_ORIGINS_TTL);
+        assert!(
+            !at.contains_key(&child),
+            "idle == TTL must evict (strict <)"
+        );
+
+        // idle just under TTL -> retained.
+        let under = DashMap::new();
+        under.insert(child.clone(), make());
+        prune_inherited_origins_at(
+            &under,
+            base + DELEGATE_INHERITED_ORIGINS_TTL - std::time::Duration::from_secs(1),
+        );
+        assert!(
+            under.contains_key(&child),
+            "idle just under TTL must retain"
+        );
+    }
+
+    /// Runs the real `prune_expired_inherited_origins` / `touch_inherited_origin`
+    /// (the functions production calls; the other tests use the `_at` variants
+    /// with a hand-picked time). Checks that touching a delegate with no entry
+    /// does not create one, and that a fresh entry is kept. Uses its own keys so
+    /// it can't disturb other tests that share the global map.
+    #[test]
+    fn test_global_inherited_origin_wrappers_smoke() {
+        use super::super::native_api::{
+            DELEGATE_INHERITED_ORIGINS, InheritedOriginsEntry, prune_expired_inherited_origins,
+            touch_inherited_origin,
+        };
+        use freenet_stdlib::prelude::CodeHash;
+
+        let child = DelegateKey::new([0x7b; 32], CodeHash::new([0x7b; 32]));
+        let absent = DelegateKey::new([0x7c; 32], CodeHash::new([0x7c; 32]));
+        DELEGATE_INHERITED_ORIGINS.insert(
+            child.clone(),
+            InheritedOriginsEntry::new(vec![ContractInstanceId::new([0x7d; 32])]),
+        );
+
+        // touch must NOT create an entry for a delegate with no inherited origin.
+        touch_inherited_origin(&absent);
+        assert!(
+            !DELEGATE_INHERITED_ORIGINS.contains_key(&absent),
+            "touch must be a no-op (never insert) for a key with no entry"
+        );
+
+        // touch refreshes an existing entry; the global sweep keeps it fresh.
+        touch_inherited_origin(&child);
+        prune_expired_inherited_origins();
+        assert!(
+            DELEGATE_INHERITED_ORIGINS.contains_key(&child),
+            "global prune must keep a freshly-touched entry"
+        );
+
+        DELEGATE_INHERITED_ORIGINS.remove(&child);
     }
 }
