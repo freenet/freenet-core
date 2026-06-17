@@ -25,19 +25,36 @@ RIVER_DIR="${RIVER_DIR:-$HOME/code/freenet/river/main}"
 ROOM_OWNER_VK="${ROOM_OWNER_VK:-4uNUKFzZQCnzo4K2ecZ16cMsYEEfoaRS35z6exEsbvm4}"
 SIGNING_KEY_FILE="${SIGNING_KEY_FILE:-$HOME/.config/freenet-river-official/room_owner_signing_key.bin}"
 ROOMS_JSON="${ROOMS_JSON:-$HOME/.local/share/river/rooms.json}"
+# Display-only since the readiness probe became a real room read: it appears
+# in log lines for context, but riverctl reaches the node via its OWN config,
+# not this URL. Changing FREENET_NODE_URL relabels the logs; it does NOT
+# redirect where the room read / send actually connect.
 FREENET_NODE_URL="${FREENET_NODE_URL:-http://127.0.0.1:7509/}"
 # Optional persistent log file. Empty by default — the release-agent already
 # captures this script's stderr to journald, and the old /var/log default
 # was not writable by the announce user, so every log() call emitted a
 # spurious "Permission denied" line (issue #4208).
 LOG_FILE="${LOG_FILE:-}"
-# Node-reachability polling budget. A release announcement runs concurrently
+# Room-readability polling budget. A release announcement runs concurrently
 # with the gateway update that restarts the local node, so it must wait that
-# restart out (issue #4208). ATTEMPTS * INTERVAL is the wall-clock budget —
-# default ~5 min, comfortably over the ~90s gateway down-window observed on
-# the v0.2.61 release. Overridable (e.g. INTERVAL=0 in tests).
+# restart out (issue #4208).
+#
+# The per-attempt wall-clock is bounded by READ_PROBE_TIMEOUT, NOT just
+# NODE_WAIT_INTERVAL: each probe is a real `riverctl message list` GET, and a
+# FAILING GET during the down-window is slow — riverctl walks all ~24 legacy
+# contract generations (~8s each) before giving up. Capping each probe at
+# READ_PROBE_TIMEOUT keeps the worst case bounded: roughly
+# ATTEMPTS * (READ_PROBE_TIMEOUT + INTERVAL). With the defaults that is
+# ~60 * (15s + 5s) = ~20 min worst case if the node never recovers, while the
+# happy path (room readable) returns in well under a second. The budget is
+# comfortably over the ~90s gateway down-window observed on the v0.2.61
+# release. Overridable (e.g. NODE_WAIT_INTERVAL=0 in tests).
 NODE_WAIT_ATTEMPTS="${NODE_WAIT_ATTEMPTS:-60}"
 NODE_WAIT_INTERVAL="${NODE_WAIT_INTERVAL:-5}"
+# Per-probe timeout for each room read (readiness probe and post-send verify).
+# Bounds the legacy-generation walk a failing GET performs during the
+# down-window; the happy-path read is far faster. Overridable in tests.
+READ_PROBE_TIMEOUT="${READ_PROBE_TIMEOUT:-15}"
 # Set to any non-empty value to skip the post-send convergence re-read (the
 # read that confirms the message actually landed in room state). Off by
 # default; primarily a test hook.
@@ -67,10 +84,21 @@ EOF
 # rebuild instead of a cold ~3min compile. Without this, each poll attempt
 # in wait_for_room() would re-pay the build cost and the ~5min budget would
 # only buy one or two real probes.
+#
+# RIVER_SKIP_CONTRACT_CHECK=1 matches every other riverctl invocation below
+# (read_room_state, post_message, the post-send verify). riverctl's
+# cli/build.rs panics ("room_contract.wasm out of date") when the flag is
+# unset and a stale wasm artifact happens to be present in the workspace.
+# Because this build is a *fatal* step (a failure aborts the whole announce),
+# omitting the flag here would introduce a brand-new failure mode the old
+# script never had — it only ever ran the skip-flagged `cargo run`. build.rs
+# declares rerun-if-changed, so cargo does NOT rebuild merely because the flag
+# toggles between this build and the later runs; the build-once optimization
+# still holds.
 build_riverctl() {
     cd "$RIVER_DIR" || return 1
     log "building riverctl once before the readiness probe"
-    cargo build --quiet -p riverctl
+    RIVER_SKIP_CONTRACT_CHECK=1 cargo build --quiet -p riverctl
 }
 
 # Read room state via riverctl (the same owner-signed `message list` GET that
@@ -79,10 +107,50 @@ build_riverctl() {
 # only care about reachability, not the message list.
 read_room_state() {
     cd "$RIVER_DIR" || return 1
-    RIVER_SKIP_CONTRACT_CHECK=1 timeout 60 \
+    RIVER_SKIP_CONTRACT_CHECK=1 timeout "$READ_PROBE_TIMEOUT" \
         cargo run --quiet -p riverctl -- \
             --signing-key-file "$SIGNING_KEY_FILE" \
             message list "$ROOM_OWNER_VK" >/dev/null 2>&1
+}
+
+# Emit the room's message list to stdout (the rendered text verify_converged
+# greps). Factored out from verify_converged so the test can stub it. stderr is
+# discarded; a riverctl failure yields empty output, which verify_converged
+# treats as "not converged".
+read_room_messages() {
+    cd "$RIVER_DIR" || return 1
+    RIVER_SKIP_CONTRACT_CHECK=1 timeout "$READ_PROBE_TIMEOUT" \
+        cargo run --quiet -p riverctl -- \
+            --signing-key-file "$SIGNING_KEY_FILE" \
+            message list "$ROOM_OWNER_VK" 2>/dev/null
+}
+
+# Confirm the just-sent message converged into room state. riverctl prints
+# "Message sent successfully" and exits 0 even when the room contract silently
+# drops the delta (e.g. a non-owner signature — see post_message), so exit 0
+# alone does NOT prove the message landed. Re-read the room and check the
+# message text is present.
+#
+# IMPORTANT: capture the listing into a variable FIRST, then grep it — do NOT
+# pipe `read_room_messages | grep`. Under `set -o pipefail`, `grep -q` exits as
+# soon as it matches and closes the pipe; the still-writing producer then gets
+# SIGPIPE (exit 141) and pipefail reports the whole pipeline as failed, so a
+# genuinely-converged message would be misreported as a silent drop (exit 1) —
+# the exact inverse of the bug this script fixes. Capturing first removes the
+# pipe and the SIGPIPE race entirely.
+#
+# `grep -F` (fixed-string) so a message containing regex metacharacters or a
+# leading `-` (guarded by `--`) still matches literally. The production
+# announcement is a single line ("Freenet vX.Y.Z released: <url>", see
+# release-announce.yml), so the whole text must appear contiguously. NOTE: for
+# a hypothetical MULTI-line message, `grep -F` matches each pattern line
+# independently (OR semantics), so this would pass if ANY one line converged —
+# acceptable as a smoke check, but switch to an exact match if multi-line
+# announcements are ever routed here.
+verify_converged() {
+    local listing
+    listing="$(read_room_messages)"
+    grep -qF -- "$MESSAGE" <<<"$listing"
 }
 
 # Poll until the room is actually READABLE, or NODE_WAIT_ATTEMPTS is reached.
@@ -167,6 +235,25 @@ post_message() {
             message send "$ROOM_OWNER_VK" "$MESSAGE"
 }
 
+# Run post_message and propagate riverctl's REAL exit code on failure.
+#
+# Capture the code with a trailing `|| rc=$?` rather than `if ! post_message`:
+# under `set -e` the `!`-negation resets `$?` to 0 inside the if-body, so a
+# genuine riverctl failure would be seen as rc=0 — masking the failed send and
+# letting the script fall through to the post-send verification as if it had
+# succeeded. `cmd || rc=$?` preserves riverctl's actual exit code. Returns 0 on
+# success and riverctl's non-zero code on failure; callers propagate it with
+# `send_message_checked || exit $?`.
+send_message_checked() {
+    local rc=0
+    post_message || rc=$?
+    if (( rc != 0 )); then
+        log "FAILED with rc=$rc"
+        return "$rc"
+    fi
+    return 0
+}
+
 if [[ $# -ne 1 ]]; then
     usage
 fi
@@ -219,30 +306,20 @@ fi
 log "posting to River room $ROOM_OWNER_VK (msg ${#MESSAGE} bytes)"
 
 # Sign as the owner via the in-memory --signing-key-file override (see
-# post_message above for why pre-patching rooms.json does not work).
-if ! post_message; then
-    rc=$?
-    log "FAILED with rc=$rc"
-    exit "$rc"
-fi
+# post_message above for why pre-patching rooms.json does not work), and
+# propagate riverctl's real exit code on failure (see send_message_checked
+# for why the naive `if ! post_message` masks it as rc=0).
+send_message_checked || exit $?
 
-# Post-send convergence check. riverctl prints "Message sent successfully" and
-# exits 0 even when the room contract silently drops the delta (e.g. a
-# non-owner signature — see post_message), so exit 0 alone does NOT prove the
-# message landed. Re-read room state and confirm the exact message text is
-# present; if it isn't, fail loudly so a future silent drop is visible in
-# journald instead of masquerading as success. Skippable via SKIP_POST_VERIFY.
+# Post-send convergence check (see verify_converged above): re-read room state
+# and confirm the message text is present, so a future silent drop is visible
+# in journald instead of masquerading as success. Skippable via SKIP_POST_VERIFY.
 if [[ -n "$SKIP_POST_VERIFY" ]]; then
     log "OK (post-send verification skipped via SKIP_POST_VERIFY)"
     exit 0
 fi
 
-cd "$RIVER_DIR" || { log "ERROR: cannot cd to $RIVER_DIR for post-send verification"; exit 1; }
-if RIVER_SKIP_CONTRACT_CHECK=1 timeout 60 \
-        cargo run --quiet -p riverctl -- \
-            --signing-key-file "$SIGNING_KEY_FILE" \
-            message list "$ROOM_OWNER_VK" 2>/dev/null \
-        | grep -qF -- "$MESSAGE"; then
+if verify_converged; then
     log "OK (verified message present in room state)"
     exit 0
 else

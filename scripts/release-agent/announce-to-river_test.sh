@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2034
-# ^ FREENET_NODE_URL / NODE_WAIT_* / LOG_FILE are read by the functions
+# shellcheck disable=SC2034,SC2317
+# ^ SC2034: FREENET_NODE_URL / NODE_WAIT_* / LOG_FILE are read by the functions
 #   extracted from announce-to-river.sh via `eval`; shellcheck cannot see
 #   into the eval and would otherwise flag them all as unused.
+#   SC2317: the stub functions (read_room_messages, post_message, curl) are
+#   invoked indirectly from those eval'd functions, so shellcheck wrongly
+#   reports their bodies as unreachable.
 #
 # Regression test for announce-to-river.sh (issues #4208 and the
 # v0.2.74/v0.2.75 lost-announcement race).
@@ -186,6 +189,80 @@ check "post_message runs riverctl from the source repo" \
     "$(printf '%s' "$cargo_args" | grep -cF -- "run --quiet -p riverctl" || true)" "1"
 check "post_message sets RIVER_SKIP_CONTRACT_CHECK for the riverctl run" \
     "$cargo_skip" "1"
+
+# ── verify_converged() ───────────────────────────────────────────────
+#
+# The post-send convergence check, the PR's SECOND silent-drop defense.
+# riverctl exits 0 even when the room contract silently drops the delta, so
+# the script re-reads room state and confirms the message text is present.
+# verify_converged is extracted verbatim; read_room_messages (the riverctl
+# `message list` GET) is stubbed so the test is hermetic.
+#
+# The load-bearing property: verify_converged must CAPTURE the listing into a
+# variable before grepping, NOT pipe `read_room_messages | grep -qF`. Under
+# `set -o pipefail`, a piped `grep -q` exits on first match and SIGPIPEs the
+# still-writing producer (exit 141), so pipefail would report a genuinely
+# converged message as a FAILURE — the inverse of the bug being fixed. The
+# large-output test below pins that: the match is EARLY in a big listing, so a
+# piped implementation gets SIGPIPE (rc=141) when grep exits before the
+# producer finishes, while capture-then-grep returns 0. (A last-line match
+# would NOT trigger it — grep must read all output — which is why the producer
+# emits the match first, then a large tail.)
+# shellcheck disable=SC2317  # stubs below are called indirectly via eval'd verify_converged
+eval "$(awk '/^verify_converged\(\) \{/,/^}/' "$ANNOUNCE_SH")"
+
+# Re-assert pipefail is on (matches the real script's `set -euo pipefail`), so
+# the SIGPIPE-resistance test below is meaningful.
+set -o pipefail
+
+MESSAGE="Freenet v0.2.75 released: https://example/v0.2.75"
+
+# Message present EARLY, followed by a large tail. A piped
+# read_room_messages|grep -qF would SIGPIPE the still-writing producer (rc=141)
+# under pipefail and report failure despite the match. Capture-then-grep
+# returns 0. Verified: against a piped impl this assertion fails (rc=141);
+# against capture-then-grep it passes.
+read_room_messages() {
+    echo "[15:23:44 - Room Owner]: $MESSAGE"
+    for i in $(seq 1 500000); do echo "[old line $i]: filler chatter to overrun the 64KB pipe buffer"; done
+}
+rc=0
+verify_converged || rc=$?
+check "verify_converged() returns 0 when present early in large output (no SIGPIPE false-failure)" "$rc" "0"
+
+# Message absent: the delta was silently dropped — must fail (exit nonzero).
+read_room_messages() {
+    echo "[15:00:00 - Room Owner]: Freenet v0.2.74 released: https://example/v0.2.74"
+}
+rc=0
+verify_converged || rc=$?
+check "verify_converged() returns nonzero when the message is absent" "$rc" "1"
+
+# riverctl read itself fails (empty output): must be treated as not-converged.
+read_room_messages() { return 1; }
+rc=0
+verify_converged || rc=$?
+check "verify_converged() returns nonzero when the room read fails" "$rc" "1"
+
+# grep -F literalness: a message with regex metacharacters / leading dash is
+# matched literally (the `--` and `-F` are load-bearing).
+MESSAGE="-n release [v1.2.3] (50%) a.b*c"
+read_room_messages() { echo "noise"; echo "x $MESSAGE y"; }
+rc=0
+verify_converged || rc=$?
+check "verify_converged() matches messages with regex/dash metacharacters literally" "$rc" "0"
+
+# ── send-failure exit-code preservation ──────────────────────────────
+#
+# Regression for the Codex finding: the success path used `if ! post_message`,
+# under which `set -e` resets `$?` to 0 inside the if-body, so a real riverctl
+# failure was logged and exited as rc=0 — masking the failed announcement and
+# skipping verification. The fix captures the code with `post_message || rc=$?`.
+# This asserts the surviving capture idiom preserves a nonzero exit code.
+post_message() { return 7; }
+rc=0
+post_message || rc=$?
+check "send-failure exit code is preserved (not masked to 0)" "$rc" "7"
 
 # ── result ───────────────────────────────────────────────────────────
 
