@@ -553,36 +553,112 @@ fn parse_meminfo_total_bytes(meminfo: &str) -> Option<usize> {
 /// Best-effort read of the process's cgroup memory limit in bytes, or `None`
 /// when there is no readable limit (or the limit is the "unlimited" sentinel).
 ///
-/// Tries cgroup v2 (`/sys/fs/cgroup/memory.max`) first, then cgroup v1
-/// (`/sys/fs/cgroup/memory/memory.limit_in_bytes`). Both files contain a single
-/// integer of bytes, except v2 uses the literal `max` for "no limit" and v1 uses
-/// a near-`u64::MAX` sentinel (e.g. `9223372036854771712`). We treat anything at
-/// or above [`CGROUP_UNLIMITED_THRESHOLD_BYTES`] as "no limit" so a host-level
+/// Crucially, this resolves the **process's own** cgroup from
+/// `/proc/self/cgroup` rather than only reading the mount-root files. A process
+/// in a non-root cgroup *without* a private cgroup namespace — e.g. a systemd
+/// service with `MemoryMax=`, or a Docker/Kubernetes container sharing the host
+/// cgroup namespace — has its limit at `/sys/fs/cgroup<path>/memory.max`
+/// (v2) or `/sys/fs/cgroup/memory<path>/memory.limit_in_bytes` (v1), where
+/// `<path>` comes from `/proc/self/cgroup`. Reading only the mount root would
+/// miss that limit and size the cache from host RAM (Codex #4481 review). We try
+/// the resolved sub-path first, then fall back to the mount root (the
+/// private-namespace case, where `/proc/self/cgroup` reads `/`).
+///
+/// v2 (`memory.max`) uses the literal `max` for "no limit"; v1
+/// (`memory.limit_in_bytes`) uses a near-`u64::MAX` sentinel (e.g.
+/// `9223372036854771712`). Anything at or above
+/// [`CGROUP_UNLIMITED_THRESHOLD_BYTES`] is treated as "no limit" so a host-level
 /// (effectively unlimited) cgroup doesn't pin the budget to a meaningless huge
 /// number.
 #[cfg(target_os = "linux")]
 fn read_cgroup_memory_limit_bytes() -> Option<usize> {
-    // cgroup v2 unified hierarchy.
-    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+    let (v2_rel, v1_rel) = cgroup_relative_paths();
+
+    // cgroup v2 unified hierarchy: /sys/fs/cgroup<rel>/memory.max, where <rel>
+    // is the process's cgroup path (or "" at the root).
+    let v2_path = format!("/sys/fs/cgroup{v2_rel}/memory.max");
+    if let Ok(s) = std::fs::read_to_string(&v2_path) {
         if let Some(v) = parse_cgroup_limit(&s) {
             return Some(v);
         }
-        // Present but "max" / unparseable → no v2 limit; fall through to v1 in
-        // case of a hybrid mount, then to None.
+        // Present but "max"/unparseable → no v2 limit at this path; fall through.
     }
-    // cgroup v1.
-    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
+    // Fallback: mount root, for a private-cgroup-namespace process whose
+    // /proc/self/cgroup reads "/" but whose limit lives at the visible root.
+    if v2_rel != "/"
+        && !v2_rel.is_empty()
+        && let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        && let Some(v) = parse_cgroup_limit(&s)
+    {
+        return Some(v);
+    }
+
+    // cgroup v1: /sys/fs/cgroup/memory<rel>/memory.limit_in_bytes.
+    let v1_path = format!("/sys/fs/cgroup/memory{v1_rel}/memory.limit_in_bytes");
+    if let Ok(s) = std::fs::read_to_string(&v1_path) {
         if let Some(v) = parse_cgroup_limit(&s) {
             return Some(v);
         }
+    }
+    if v1_rel != "/"
+        && !v1_rel.is_empty()
+        && let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        && let Some(v) = parse_cgroup_limit(&s)
+    {
+        return Some(v);
     }
     None
+}
+
+/// Resolve the process's cgroup paths (relative to the controller mount) for the
+/// v2 unified hierarchy and the v1 `memory` controller, from `/proc/self/cgroup`.
+///
+/// Returns `(v2_rel, v1_rel)`, each a leading-slash path like `/system.slice/x`
+/// or `/` (root). On any read/parse failure both default to `/` (mount root), so
+/// the caller still attempts the root files. See [`parse_proc_self_cgroup`].
+#[cfg(target_os = "linux")]
+fn cgroup_relative_paths() -> (String, String) {
+    match std::fs::read_to_string("/proc/self/cgroup") {
+        Ok(s) => parse_proc_self_cgroup(&s),
+        Err(_) => ("/".to_string(), "/".to_string()),
+    }
+}
+
+/// Pure parse of `/proc/self/cgroup` contents into `(v2_rel, v1_rel)` cgroup
+/// paths. Lines are `hierarchy-id:controllers:path`. The v2 line has an empty
+/// controller field and hierarchy id `0` (`0::/path`); the v1 `memory` line
+/// lists `memory` among its controllers (`N:memory:/path` or
+/// `N:cpu,memory:/path`). Missing entries default to `/`.
+#[cfg(target_os = "linux")]
+fn parse_proc_self_cgroup(contents: &str) -> (String, String) {
+    let mut v2 = "/".to_string();
+    let mut v1 = "/".to_string();
+    for line in contents.lines() {
+        // splitn(3) because the path itself may contain ':'.
+        let mut parts = line.splitn(3, ':');
+        let (Some(_id), Some(controllers), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if controllers.is_empty() {
+            // cgroup v2 unified line ("0::/path").
+            v2 = path.to_string();
+        } else if controllers.split(',').any(|c| c == "memory") {
+            // cgroup v1 memory controller.
+            v1 = path.to_string();
+        }
+    }
+    (v2, v1)
 }
 
 /// Above this, a cgroup limit is treated as "unlimited" rather than a real
 /// bound. Covers cgroup v1's `~u64::MAX` sentinel and a host-root cgroup whose
 /// limit equals (or rounds to) all of physical RAM. Far above any budget we'd
 /// ever want, so clamping the cache to it would be a no-op anyway.
+///
+/// NOTE: 64-bit-only. `1 << 60` overflows a 32-bit `usize`; the project targets
+/// only 64-bit platforms (see cross-compile.yml). If a 32-bit target is ever
+/// added, switch this and `parse_cgroup_limit` to `u64`.
 #[cfg(target_os = "linux")]
 const CGROUP_UNLIMITED_THRESHOLD_BYTES: usize = 1 << 60; // 1 EiB
 
@@ -898,6 +974,55 @@ mod tests {
         let sample = "MemFree:  100 kB\nMemTotal:       16331752 kB\nBuffers:  1 kB\n";
         assert_eq!(parse_meminfo_total_bytes(sample), Some(16331752 * 1024));
         assert_eq!(parse_meminfo_total_bytes("SwapTotal: 0 kB\n"), None);
+    }
+
+    /// `/proc/self/cgroup` parsing resolves the process's OWN cgroup sub-path for
+    /// both the v2 unified line (`0::/path`) and the v1 `memory` controller line,
+    /// so a non-root cgroup's limit file is found at the right place rather than
+    /// only the mount root (Codex #4481 review). Defaults to `/` when absent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_proc_self_cgroup_resolves_own_path() {
+        // Pure cgroup v2 (systemd service with MemoryMax=, host cgroup ns).
+        let v2_only = "0::/system.slice/freenet-gateway.service\n";
+        assert_eq!(
+            parse_proc_self_cgroup(v2_only),
+            (
+                "/system.slice/freenet-gateway.service".to_string(),
+                "/".to_string()
+            )
+        );
+
+        // Hybrid / v1 with the memory controller grouped among several.
+        let hybrid = "12:cpu,memory:/docker/abc123\n0::/docker/abc123\n";
+        assert_eq!(
+            parse_proc_self_cgroup(hybrid),
+            ("/docker/abc123".to_string(), "/docker/abc123".to_string())
+        );
+
+        // v1 memory controller alone, plus an unrelated controller line.
+        let v1 = "8:memory:/kubepods/pod1\n9:cpuset:/elsewhere\n";
+        assert_eq!(
+            parse_proc_self_cgroup(v1),
+            ("/".to_string(), "/kubepods/pod1".to_string())
+        );
+
+        // Root cgroup / empty input → defaults to "/".
+        assert_eq!(
+            parse_proc_self_cgroup("0::/\n"),
+            ("/".to_string(), "/".to_string())
+        );
+        assert_eq!(
+            parse_proc_self_cgroup(""),
+            ("/".to_string(), "/".to_string())
+        );
+
+        // A path containing ':' must survive splitn(3).
+        let weird = "0::/odd:name/x\n";
+        assert_eq!(
+            parse_proc_self_cgroup(weird),
+            ("/odd:name/x".to_string(), "/".to_string())
+        );
     }
 
     /// A zero budget still keeps exactly one most-recently-used entry resident
