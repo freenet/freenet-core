@@ -1,5 +1,5 @@
 ---
-description: Prevent bounded channel deadlocks — cascading backpressure from .send().await in event loops has caused 5+ production incidents
+description: Prevent bounded channel deadlocks — cascading backpressure from .send().await in event loops has caused 6+ production incidents
 paths:
   - "crates/core/src/node/**"
   - "crates/core/src/transport/**"

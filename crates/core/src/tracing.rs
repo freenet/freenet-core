@@ -2701,8 +2701,13 @@ mod opentelemetry_tracer {
                     // `DynamicRegister`, so a blocking `.send().await` here would
                     // wedge the loop if the consumer stalls. Drop on full
                     // (channel-safety.md). Best-effort OT telemetry; `trace-ot`
-                    // is a non-default debug build.
-                    let _ = self.log_sender.try_send(log_msg);
+                    // is a non-default debug build. `match` (not `let _ =`)
+                    // satisfies the crate's `let_underscore_must_use` deny lint.
+                    match self.log_sender.try_send(log_msg) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {}
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    }
                 }
             }
             .boxed()
@@ -2721,6 +2726,10 @@ mod opentelemetry_tracer {
             async move {
                 if cfg!(test) {
                     // Non-blocking, same rationale as `register_events` above.
+                    // Best-effort; intentionally discard the result (drop on
+                    // full or closed). `#[allow]` per the crate convention for
+                    // deliberate `must_use` discards (e.g. tracing.rs:1831).
+                    #[allow(clippy::let_underscore_must_use)]
                     let _ = self.finished_tx_notifier.try_send(tx);
                 }
             }
