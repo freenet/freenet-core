@@ -1068,6 +1068,19 @@ impl Ring {
             snapshot.open_fds = open_fds;
             snapshot.fd_soft_limit = fd_soft_limit;
 
+            // Compiled-WASM module-cache occupancy + eviction gauges (#4440),
+            // read from the process-global the caches publish into (they live
+            // behind the contract-handler channel, unreachable from here).
+            let mc = crate::wasm_runtime::MODULE_CACHE_METRICS.snapshot();
+            snapshot.contract_module_cache_entries = Some(mc.contract_entries);
+            snapshot.contract_module_cache_total_bytes = Some(mc.contract_total_bytes);
+            snapshot.contract_module_cache_budget_bytes = Some(mc.contract_budget_bytes);
+            snapshot.contract_module_cache_evictions_total = Some(mc.contract_evictions_total);
+            snapshot.delegate_module_cache_entries = Some(mc.delegate_entries);
+            snapshot.delegate_module_cache_total_bytes = Some(mc.delegate_total_bytes);
+            snapshot.delegate_module_cache_budget_bytes = Some(mc.delegate_budget_bytes);
+            snapshot.delegate_module_cache_evictions_total = Some(mc.delegate_evictions_total);
+
             tracing::info!(
                 failure_events = snapshot.failure_events,
                 success_events = snapshot.success_events,
@@ -1075,6 +1088,9 @@ impl Ring {
                 consider_n_closest_peers = snapshot.consider_n_closest_peers,
                 open_fds = ?snapshot.open_fds,
                 fd_soft_limit = ?snapshot.fd_soft_limit,
+                contract_module_cache_entries = mc.contract_entries,
+                contract_module_cache_total_bytes = mc.contract_total_bytes,
+                contract_module_cache_evictions_total = mc.contract_evictions_total,
                 "router_snapshot"
             );
 

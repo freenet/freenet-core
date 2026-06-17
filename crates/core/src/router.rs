@@ -156,6 +156,21 @@ pub(crate) struct RouterSnapshotInfo {
     /// The `RLIMIT_NOFILE` soft limit (the ceiling that triggers `EMFILE`), or
     /// `None` on non-unix. Populated by `Ring`; see [`open_fds`](Self::open_fds).
     pub fd_soft_limit: Option<u64>,
+    /// Compiled-WASM module-cache gauges (#4440), populated by `Ring` from the
+    /// process-global `MODULE_CACHE_METRICS`. `None` until the WASM runtime has
+    /// touched the cache. The contract-cache thrash (eviction → recompile) that
+    /// drove the #4441 incident was invisible to central telemetry; these make
+    /// occupancy and eviction pressure observable on the snapshot cadence. The
+    /// `*_evictions_total` fields are monotonic counters — the collector
+    /// differences them across the cadence to derive an eviction rate.
+    pub contract_module_cache_entries: Option<u64>,
+    pub contract_module_cache_total_bytes: Option<u64>,
+    pub contract_module_cache_budget_bytes: Option<u64>,
+    pub contract_module_cache_evictions_total: Option<u64>,
+    pub delegate_module_cache_entries: Option<u64>,
+    pub delegate_module_cache_total_bytes: Option<u64>,
+    pub delegate_module_cache_budget_bytes: Option<u64>,
+    pub delegate_module_cache_evictions_total: Option<u64>,
     /// Per-operation-type estimator curves, keyed by op type name (e.g., "GET").
     pub per_op_curves: HashMap<String, PerOpCurves>,
     /// Renegade predictor diagnostics
@@ -903,6 +918,14 @@ impl Router {
             // Node-health gauges populated by Ring on the snapshot cadence (#4440).
             open_fds: None,
             fd_soft_limit: None,
+            contract_module_cache_entries: None,
+            contract_module_cache_total_bytes: None,
+            contract_module_cache_budget_bytes: None,
+            contract_module_cache_evictions_total: None,
+            delegate_module_cache_entries: None,
+            delegate_module_cache_total_bytes: None,
+            delegate_module_cache_budget_bytes: None,
+            delegate_module_cache_evictions_total: None,
             // Renegade predictor diagnostics
             renegade_failure_events: self.renegade_predictor.len(),
             renegade_response_time_events: self.renegade_predictor.stage_sizes().1,

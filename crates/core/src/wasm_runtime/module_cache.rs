@@ -39,6 +39,8 @@
 
 use std::borrow::Borrow;
 use std::hash::Hash;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use lru::LruCache;
@@ -99,13 +101,20 @@ impl<K: Hash + Eq, V> ModuleCache<K, V> {
     /// Like [`Self::new`] but with a label ("contract" / "delegate") used in the
     /// rate-limited "cache is evicting at budget" operator warning.
     pub(crate) fn with_label(budget_bytes: usize, label: &'static str) -> Self {
+        let budget_bytes = budget_bytes.max(1);
+        // Publish the budget immediately, so an idle cache (a node that hasn't
+        // compiled a module yet, or a delegate cache that's never used) reports
+        // its configured budget instead of the atomic default 0. Otherwise the
+        // collector's occupancy-% denominator is 0 until the first insert/remove
+        // (#4440 — flagged by both PR reviewers).
+        MODULE_CACHE_METRICS.record_occupancy(label, 0, 0, budget_bytes);
         Self {
             // The LRU is unbounded by count; the byte budget is the only
             // bound. `usize::MAX` capacity means `LruCache` never evicts on
             // its own — we drive all eviction via the byte budget below.
             inner: LruCache::unbounded(),
             total_bytes: 0,
-            budget_bytes: budget_bytes.max(1),
+            budget_bytes,
             label,
             evictions_in_window: 0,
             window_started_at: None,
@@ -136,6 +145,12 @@ impl<K: Hash + Eq, V> ModuleCache<K, V> {
         }
         self.total_bytes = self.total_bytes.saturating_add(size_bytes);
         self.evict_to_budget();
+        MODULE_CACHE_METRICS.record_occupancy(
+            self.label,
+            self.inner.len(),
+            self.total_bytes,
+            self.budget_bytes,
+        );
     }
 
     /// Evict least-recently-used entries until `total_bytes <= budget_bytes`,
@@ -153,6 +168,10 @@ impl<K: Hash + Eq, V> ModuleCache<K, V> {
         }
         if evicted_this_insert > 0 {
             self.note_evictions(evicted_this_insert);
+            // Monotonic lifetime counter for telemetry; the collector differences
+            // it across the snapshot cadence to derive an eviction rate. Distinct
+            // from `evictions_in_window`, which resets per warn window (#4440).
+            MODULE_CACHE_METRICS.add_evictions(self.label, evicted_this_insert);
         }
     }
 
@@ -203,6 +222,12 @@ impl<K: Hash + Eq, V> ModuleCache<K, V> {
     {
         let (value, size) = self.inner.pop(key)?;
         self.total_bytes = self.total_bytes.saturating_sub(size);
+        MODULE_CACHE_METRICS.record_occupancy(
+            self.label,
+            self.inner.len(),
+            self.total_bytes,
+            self.budget_bytes,
+        );
         Some(value)
     }
 
@@ -224,6 +249,122 @@ impl<K: Hash + Eq, V> ModuleCache<K, V> {
     #[cfg(test)]
     pub(crate) fn budget_bytes(&self) -> usize {
         self.budget_bytes
+    }
+}
+
+/// Process-global compiled-WASM module-cache occupancy + eviction telemetry
+/// (#4440).
+///
+/// The module caches live behind the contract-handler channel, unreachable from
+/// the `Ring` telemetry-snapshot task that emits `router_snapshot`. Like
+/// [`TRANSPORT_METRICS`](crate::transport::metrics::TRANSPORT_METRICS), the
+/// caches therefore *publish* into this process-global and the snapshot task
+/// *reads* it. A node builds exactly one contract cache and one delegate cache
+/// (`RuntimePool::new`), so one global pair of gauges is correct; this assumes a
+/// single runtime pool per process (the production invariant). The cache-thrash
+/// that drove the #4441 incident was invisible to central telemetry — these
+/// gauges make occupancy and eviction pressure observable.
+pub(crate) static MODULE_CACHE_METRICS: LazyLock<ModuleCacheMetrics> =
+    LazyLock::new(ModuleCacheMetrics::new);
+
+/// Atomic occupancy gauges plus a monotonic eviction counter for one cache.
+#[derive(Default)]
+struct CacheGauges {
+    /// Resident entry count (last-write-wins gauge).
+    entries: AtomicU64,
+    /// Total compiled bytes resident (last-write-wins gauge).
+    total_bytes: AtomicU64,
+    /// Configured byte budget (effectively constant per run; reported so the
+    /// collector can compute occupancy % without hardcoding the budget).
+    budget_bytes: AtomicU64,
+    /// Lifetime evictions (monotonic; the collector differences it across the
+    /// snapshot cadence to derive an eviction rate).
+    evictions_total: AtomicU64,
+}
+
+/// Per-cache module-cache telemetry, routed by the cache's `"contract"` /
+/// `"delegate"` label. See [`MODULE_CACHE_METRICS`].
+pub(crate) struct ModuleCacheMetrics {
+    contract: CacheGauges,
+    delegate: CacheGauges,
+}
+
+/// A point-in-time read of [`MODULE_CACHE_METRICS`] for telemetry emission.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ModuleCacheMetricsSnapshot {
+    pub contract_entries: u64,
+    pub contract_total_bytes: u64,
+    pub contract_budget_bytes: u64,
+    pub contract_evictions_total: u64,
+    pub delegate_entries: u64,
+    pub delegate_total_bytes: u64,
+    pub delegate_budget_bytes: u64,
+    pub delegate_evictions_total: u64,
+}
+
+impl ModuleCacheMetrics {
+    fn new() -> Self {
+        Self {
+            contract: CacheGauges::default(),
+            delegate: CacheGauges::default(),
+        }
+    }
+
+    /// Route to the gauges for a labeled cache. Unlabeled / test caches
+    /// (`ModuleCache::new`, label `"module"`) don't publish.
+    fn gauges_for(&self, label: &str) -> Option<&CacheGauges> {
+        match label {
+            "contract" => Some(&self.contract),
+            "delegate" => Some(&self.delegate),
+            _ => None,
+        }
+    }
+
+    /// Publish current occupancy for the named cache (last-write-wins). Cheap
+    /// `Relaxed` atomics; the caller already holds the cache `Mutex`.
+    fn record_occupancy(
+        &self,
+        label: &str,
+        entries: usize,
+        total_bytes: usize,
+        budget_bytes: usize,
+    ) {
+        if let Some(g) = self.gauges_for(label) {
+            g.entries.store(entries as u64, Ordering::Relaxed);
+            g.total_bytes.store(total_bytes as u64, Ordering::Relaxed);
+            g.budget_bytes.store(budget_bytes as u64, Ordering::Relaxed);
+        }
+    }
+
+    /// Add to the named cache's monotonic lifetime eviction counter.
+    fn add_evictions(&self, label: &str, count: u64) {
+        if let Some(g) = self.gauges_for(label) {
+            g.evictions_total.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
+    /// Read all gauges for telemetry.
+    pub(crate) fn snapshot(&self) -> ModuleCacheMetricsSnapshot {
+        let load = |g: &CacheGauges| {
+            (
+                g.entries.load(Ordering::Relaxed),
+                g.total_bytes.load(Ordering::Relaxed),
+                g.budget_bytes.load(Ordering::Relaxed),
+                g.evictions_total.load(Ordering::Relaxed),
+            )
+        };
+        let (ce, ctb, cbb, cev) = load(&self.contract);
+        let (de, dtb, dbb, dev) = load(&self.delegate);
+        ModuleCacheMetricsSnapshot {
+            contract_entries: ce,
+            contract_total_bytes: ctb,
+            contract_budget_bytes: cbb,
+            contract_evictions_total: cev,
+            delegate_entries: de,
+            delegate_total_bytes: dtb,
+            delegate_budget_bytes: dbb,
+            delegate_evictions_total: dev,
+        }
     }
 }
 
@@ -521,5 +662,61 @@ mod tests {
         assert_eq!(cache.len(), 1, "at most one entry survives a zero budget");
         assert!(cache.get(&1).is_some(), "most-recent entry kept");
         assert!(cache.get(&0).is_none());
+    }
+
+    /// `ModuleCacheMetrics` routes by label, isolates contract vs delegate, and
+    /// treats unknown labels as no-ops. Tests the publishing logic on a LOCAL
+    /// instance so it stays deterministic and never touches the process-global.
+    #[test]
+    fn module_cache_metrics_routing_and_isolation() {
+        let m = ModuleCacheMetrics::new();
+        m.record_occupancy("contract", 3, 300, 1000);
+        m.add_evictions("contract", 2);
+        // Delegate stays zero — the two caches must not bleed into each other.
+        let s = m.snapshot();
+        assert_eq!(s.contract_entries, 3);
+        assert_eq!(s.contract_total_bytes, 300);
+        assert_eq!(s.contract_budget_bytes, 1000);
+        assert_eq!(s.contract_evictions_total, 2);
+        assert_eq!(s.delegate_entries, 0);
+        assert_eq!(s.delegate_evictions_total, 0);
+
+        m.record_occupancy("delegate", 1, 50, 250);
+        m.add_evictions("delegate", 5);
+        // Evictions are monotonic (accumulate); occupancy is last-write-wins.
+        m.add_evictions("contract", 4);
+        m.record_occupancy("contract", 1, 100, 1000);
+        let s = m.snapshot();
+        assert_eq!(s.contract_evictions_total, 6, "evictions accumulate");
+        assert_eq!(s.contract_entries, 1, "occupancy is last-write-wins");
+        assert_eq!(s.delegate_entries, 1);
+        assert_eq!(s.delegate_evictions_total, 5);
+
+        // An unlabeled / test cache ("module") must not publish anywhere.
+        m.record_occupancy("module", 999, 999, 999);
+        m.add_evictions("module", 999);
+        let s = m.snapshot();
+        assert_eq!(s.contract_entries, 1, "unknown label is a no-op");
+        assert_eq!(s.delegate_entries, 1, "unknown label is a no-op");
+    }
+
+    /// A `"contract"`-labeled cache that evicts publishes to the process-global
+    /// monotonic eviction counter. Asserts only the strict increase, which is
+    /// race-safe under concurrent tests (the counter is `fetch_add`-only and
+    /// never resets), unlike the last-write-wins occupancy gauges.
+    #[test]
+    fn evicting_contract_cache_increments_global_eviction_counter() {
+        let before = MODULE_CACHE_METRICS.snapshot().contract_evictions_total;
+        // 10-byte budget, 8-byte entries → the 2nd insert evicts the 1st.
+        let mut cache: ModuleCache<u64, ()> = ModuleCache::with_label(10, "contract");
+        cache.insert(0, (), 8);
+        cache.insert(1, (), 8); // total 16 > 10, len 2 > 1 → evict LRU (key 0)
+        assert_eq!(cache.len(), 1, "the test setup must actually evict");
+        let after = MODULE_CACHE_METRICS.snapshot().contract_evictions_total;
+        assert!(
+            after > before,
+            "eviction on a contract-labeled cache must bump the global counter \
+             (before={before}, after={after})"
+        );
     }
 }

@@ -1106,7 +1106,7 @@ impl<'a> NetEventLog<'a> {
         Some(NetEventLog {
             tx: Transaction::NULL,
             peer_id,
-            kind: EventKind::RouterSnapshot(snapshot),
+            kind: EventKind::RouterSnapshot(Box::new(snapshot)),
         })
     }
 
@@ -2803,7 +2803,12 @@ pub enum EventKind {
     /// that want to emit routing decisions through OTLP with sampling.
     RoutingDecision(crate::router::RoutingDecisionInfo),
     /// Periodic snapshot of the router model (isotonic regression curves, event counts).
-    RouterSnapshot(crate::router::RouterSnapshotInfo),
+    ///
+    /// Boxed because `RouterSnapshotInfo` is by far the largest `EventKind`
+    /// payload (regression curves + per-op maps + the #4440 node-health gauges);
+    /// inlining it would bloat every other variant (`clippy::large_enum_variant`).
+    /// `Box` serializes transparently, so the AOF/OTLP wire format is unchanged.
+    RouterSnapshot(Box<crate::router::RouterSnapshotInfo>),
 }
 
 impl EventKind {
