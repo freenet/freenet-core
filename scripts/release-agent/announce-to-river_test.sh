@@ -252,17 +252,28 @@ rc=0
 verify_converged || rc=$?
 check "verify_converged() matches messages with regex/dash metacharacters literally" "$rc" "0"
 
-# ── send-failure exit-code preservation ──────────────────────────────
+# ── send_message_checked() exit-code preservation ────────────────────
 #
-# Regression for the Codex finding: the success path used `if ! post_message`,
-# under which `set -e` resets `$?` to 0 inside the if-body, so a real riverctl
-# failure was logged and exited as rc=0 — masking the failed announcement and
-# skipping verification. The fix captures the code with `post_message || rc=$?`.
-# This asserts the surviving capture idiom preserves a nonzero exit code.
+# Regression for the Codex finding: the success path originally used
+# `if ! post_message`, under which `set -e` resets `$?` to 0 inside the
+# if-body, so a real riverctl failure was logged/exited as rc=0 — masking the
+# failed announcement and skipping verification. The fix wraps the send in
+# send_message_checked(), which captures the code with `post_message || rc=$?`
+# and returns it. send_message_checked is extracted VERBATIM here, so reverting
+# it to `if ! post_message` (which yields rc=0 on failure) fails this assertion.
+eval "$(awk '/^send_message_checked\(\) \{/,/^}/' "$ANNOUNCE_SH")"
+
+# riverctl send fails: send_message_checked must return riverctl's real code.
 post_message() { return 7; }
 rc=0
-post_message || rc=$?
-check "send-failure exit code is preserved (not masked to 0)" "$rc" "7"
+send_message_checked 2>/dev/null || rc=$?
+check "send_message_checked() preserves a send failure code (not masked to 0)" "$rc" "7"
+
+# riverctl send succeeds: send_message_checked returns 0.
+post_message() { return 0; }
+rc=0
+send_message_checked 2>/dev/null || rc=$?
+check "send_message_checked() returns 0 on a successful send" "$rc" "0"
 
 # ── result ───────────────────────────────────────────────────────────
 
