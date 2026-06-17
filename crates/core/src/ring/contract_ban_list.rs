@@ -1169,13 +1169,34 @@ mod tests {
         // `process_message` itself. Search the whole file scoped to
         // the `for contract in stale_contracts` loop.
         const NODE_SRC: &str = include_str!("../node.rs");
+        // Anchor on the loop header WITH its opening brace so the search
+        // matches the production loop and not the rustdoc prose that also
+        // mentions `for contract in stale_contracts` (the #3798 Gap 1
+        // helper docs). Without the brace, `find` returns the earlier doc
+        // comment; the gate/emit substrings searched below carry their full
+        // `contract_ban_list.is_banned` / `NodeEvent::SyncStateToPeer`
+        // prefixes that the prose lacks, so the assertion still held — but
+        // anchoring on prose is fragile, so pin to the real loop.
         let stale_loop = NODE_SRC
-            .find("for contract in stale_contracts")
+            .find("for contract in stale_contracts {")
             .expect("node.rs is missing the stale_contracts loop");
-        // Bound the search to the loop body — the loop ends when
-        // indentation returns to the loop's level. A loose heuristic:
-        // take 2_000 bytes after the loop header (the body is short).
-        let scan = &NODE_SRC[stale_loop..stale_loop.saturating_add(2_000).min(NODE_SRC.len())];
+        // Bound the search to the loop body. The stale-contract loop is
+        // immediately followed by the deferred-telemetry loop
+        // (`for (key, state_hash) in confirmed_states`) in the same
+        // `Summaries` arm, so that header marks the end of this loop's
+        // body. Bounding structurally (rather than a fixed byte count)
+        // keeps this gate-ordering check robust against legitimate
+        // additions to the loop body — e.g. the #3798 Gap 1 stale-sync
+        // emission cap, which inserted a `warn!` block ahead of the ban
+        // gate and pushed it past the old 2_000-byte heuristic window.
+        let loop_end = NODE_SRC[stale_loop..]
+            .find("for (key, state_hash) in confirmed_states {")
+            .map(|off| stale_loop + off)
+            .expect(
+                "node.rs stale_contracts loop is no longer followed by the \
+                 confirmed_states loop — update this window bound",
+            );
+        let scan = &NODE_SRC[stale_loop..loop_end];
         let gate_pos = scan.find("contract_ban_list.is_banned").expect(
             "stale-summary repair loop is missing the ban-list egress gate — \
              banned contracts would continue to be pushed to peers that report \
