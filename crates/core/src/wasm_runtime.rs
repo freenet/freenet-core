@@ -29,6 +29,11 @@ pub(crate) use native_api::{
     CREATED_DELEGATES_COUNT, DELEGATE_INHERITED_ORIGINS, DELEGATE_SUBSCRIPTIONS,
     DelegateContextCache, new_delegate_context_cache,
 };
+// Only constructed by name in test code (e.g. resolve_message_origin tests);
+// production read/write paths access the entry through the DashMap without
+// naming the type, so gate the re-export to avoid an unused-import warning.
+#[cfg(test)]
+pub(crate) use native_api::InheritedOriginsEntry;
 pub use runtime::{ContractExecError, Runtime};
 pub(crate) use runtime::{RuntimeConfig, SharedModuleCache};
 pub use secrets_store::{SecretStoreError, SecretsStore};
