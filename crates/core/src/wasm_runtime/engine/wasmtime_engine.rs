@@ -1803,6 +1803,34 @@ mod tests {
         );
     }
 
+    /// Pin (issue #4441): the wasmtime disk **compilation** cache MUST stay
+    /// enabled on the engine config. This is the second half of the #4441 fix:
+    /// when a module is evicted from the in-memory `ModuleCache` and accessed
+    /// again, the recompile path (`prepare_contract_call` → `engine.compile` →
+    /// `compile_coalesced` → `Module::new`) hits this disk cache and
+    /// *deserializes* the already-compiled artifact (~100x faster) instead of
+    /// running Cranelift from scratch. Without it, eviction-reload would pay the
+    /// full compile cost every time, re-creating the thrash the byte budget is
+    /// meant to bound. A source-scrape pin (not a behavioral test) because the
+    /// disk cache writes to a shared user cache dir and its hit/miss timing is
+    /// not deterministic enough to assert on in CI.
+    #[test]
+    fn engine_enables_wasmtime_disk_compilation_cache() {
+        let src = include_str!("wasmtime_engine.rs");
+        // The build path that constructs the wasmtime Config must install a
+        // disk cache via `wasmtime_config.cache(Some(...))`.
+        assert!(
+            src.contains("Cache::new(CacheConfig::new())"),
+            "engine config must construct the wasmtime disk compilation cache"
+        );
+        assert!(
+            src.contains("wasmtime_config.cache(Some(cache))"),
+            "engine config must install the disk compilation cache so an \
+             evicted module deserializes from disk on reload instead of \
+             recompiling (issue #4441 fix #2)"
+        );
+    }
+
     /// Regression test for Report 2RDXTD: wasmtime's per-Store instance counter is
     /// monotonic (never decremented) with a default limit of 10,000. Our ResourceLimiter
     /// override sets instances() to usize::MAX so long-running gateways don't exhaust.
