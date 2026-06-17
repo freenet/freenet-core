@@ -118,6 +118,10 @@ fn homepage_html() -> String {
             <h2>Freenet Links</h2>
             <ul class="app-list">
                 <li>
+                    <a href="/v1/contract/web/771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH9/">Atlas</a>
+                    <p class="note">Decentralized search and recommendation engine for Freenet.</p>
+                </li>
+                <li>
                     <a href="/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv/">River Chat</a>
                     <p class="note">You'll need an <a href="https://freenet.org/quickstart#invite-form" target="_blank" rel="noopener noreferrer">invite</a> to join the "Freenet Official" room.</p>
                 </li>
