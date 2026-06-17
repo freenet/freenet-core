@@ -1845,6 +1845,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 // `router_snapshot_json_includes_fd_gauges`.
                 "open_fds": snapshot.open_fds,
                 "fd_soft_limit": snapshot.fd_soft_limit,
+                "contract_module_cache_entries": snapshot.contract_module_cache_entries,
+                "contract_module_cache_total_bytes": snapshot.contract_module_cache_total_bytes,
+                "contract_module_cache_budget_bytes": snapshot.contract_module_cache_budget_bytes,
+                "contract_module_cache_evictions_total": snapshot.contract_module_cache_evictions_total,
+                "delegate_module_cache_entries": snapshot.delegate_module_cache_entries,
+                "delegate_module_cache_total_bytes": snapshot.delegate_module_cache_total_bytes,
+                "delegate_module_cache_budget_bytes": snapshot.delegate_module_cache_budget_bytes,
+                "delegate_module_cache_evictions_total": snapshot.delegate_module_cache_evictions_total,
                 "per_op_curves": snapshot.per_op_curves,
             })
         }
@@ -1856,8 +1864,8 @@ mod tests {
     use super::*;
 
     /// Pin: the manually-mirrored `router_snapshot` OTLP body
-    /// (`event_kind_to_json`) must forward the node-health fd gauges. The body
-    /// is a hand-written `json!` block, so a new `RouterSnapshotInfo` field is
+    /// (`event_kind_to_json`) must forward the node-health gauges. The body is a
+    /// hand-written `json!` block, so a new `RouterSnapshotInfo` field is
     /// silently dropped from central telemetry unless it is added there too
     /// (the #4009/#4010 manually-mirrored-telemetry footgun). See #4440.
     #[test]
@@ -1868,12 +1876,43 @@ mod tests {
             .expect("construct RouterSnapshotInfo for test");
         info.open_fds = Some(123);
         info.fd_soft_limit = Some(4096);
-        let json = event_kind_to_json(&EventKind::RouterSnapshot(info));
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         assert_eq!(json["open_fds"], 123, "open_fds must reach the OTLP body");
         assert_eq!(
             json["fd_soft_limit"], 4096,
             "fd_soft_limit must reach the OTLP body"
         );
+    }
+
+    /// Pin: the module-cache gauges (#4440) must also reach the hand-mirrored
+    /// OTLP body — same footgun as the fd gauges above.
+    #[test]
+    fn router_snapshot_json_includes_module_cache_gauges() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.contract_module_cache_entries = Some(7);
+        info.contract_module_cache_total_bytes = Some(11);
+        info.contract_module_cache_budget_bytes = Some(13);
+        info.contract_module_cache_evictions_total = Some(17);
+        info.delegate_module_cache_entries = Some(19);
+        info.delegate_module_cache_total_bytes = Some(23);
+        info.delegate_module_cache_budget_bytes = Some(29);
+        info.delegate_module_cache_evictions_total = Some(31);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("contract_module_cache_entries", 7),
+            ("contract_module_cache_total_bytes", 11),
+            ("contract_module_cache_budget_bytes", 13),
+            ("contract_module_cache_evictions_total", 17),
+            ("delegate_module_cache_entries", 19),
+            ("delegate_module_cache_total_bytes", 23),
+            ("delegate_module_cache_budget_bytes", 29),
+            ("delegate_module_cache_evictions_total", 31),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
     }
 
     #[test]
