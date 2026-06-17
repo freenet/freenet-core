@@ -1874,7 +1874,12 @@ async fn handle_interest_sync_message(
             let mut entries = Vec::with_capacity(matching.len());
             for contract in matching {
                 let hash = contract_hash(&contract);
-                let summary = get_contract_summary(op_manager, &contract).await;
+                // Only summarize contracts we host or actively serve; phantom
+                // peer-interest contracts (no state, no live subscriber) have
+                // nothing to advertise and their pointless GetSummaryQuery
+                // round-trips were the dominant #4473 storm. See
+                // `summary_if_hosted_or_in_use`.
+                let summary = summary_if_hosted_or_in_use(op_manager, &contract).await;
                 entries.push(SummaryEntry::from_summary(hash, summary.as_ref()));
 
                 if let Some(ref pk) = peer_key {
@@ -1957,7 +1962,13 @@ async fn handle_interest_sync_message(
                         }
 
                         let their_summary = entry.to_summary();
-                        let our_summary = get_contract_summary(op_manager, &contract).await;
+                        // Only summarize contracts we host or actively serve (see
+                        // `summary_if_hosted_or_in_use`, #4473). A contract skipped
+                        // here is neither hosted nor has a live subscriber, so it
+                        // has nothing to advertise and no subscriber whose stale
+                        // copy we'd heal: `our_summary` is None → not stale → no
+                        // SyncStateToPeer, while the loop round-trip is avoided.
+                        let our_summary = summary_if_hosted_or_in_use(op_manager, &contract).await;
 
                         if emit_confirmed {
                             if let Some(ref summary) = our_summary {
@@ -2105,8 +2116,10 @@ async fn handle_interest_sync_message(
                                 .await;
                         }
 
-                        // Get our summary to send back
-                        let summary = get_contract_summary(op_manager, &contract).await;
+                        // Get our summary to send back — only for contracts we
+                        // host or actively serve (see `summary_if_hosted_or_in_use`,
+                        // #4473).
+                        let summary = summary_if_hosted_or_in_use(op_manager, &contract).await;
                         entries.push(SummaryEntry::from_summary(hash, summary.as_ref()));
                     }
                 }
@@ -2380,6 +2393,45 @@ async fn get_contract_summary(
             None
         }
         _ => None,
+    }
+}
+
+/// Compute our summary for `key` for interest-sync, but ONLY if we host it or
+/// are actively serving it (a live local-client or downstream subscriber);
+/// otherwise return `None` without touching the contract-handling loop.
+///
+/// A node can carry *interest* in a contract it neither hosts nor serves —
+/// phantom interest advertised by peers in the InterestSync heartbeat, e.g. the
+/// after-effect of the placement migration (#4404). It has no local state to
+/// advertise for such a contract, yet the old code issued a `GetSummaryQuery`
+/// for it on every heartbeat from every connected peer. Each query is a
+/// round-trip on the single-threaded `contract_handling` loop that returns
+/// "state not found" (uncached) every time. Measured on `technic`: ~40
+/// summarize/sec across ~69 such phantom contracts while taking <10 real
+/// UPDATEs/hour — a ~4,000× amplification that saturated the loop (starving
+/// real GET/PUT/UPDATE on relays; feeding the #4145 notification-channel
+/// saturation on gateways). #4473.
+///
+/// Gating on `is_hosting_contract || contract_in_use` is correct, not just a
+/// heuristic:
+/// - Phantom contracts (the storm) are neither hosted nor in use, so they are
+///   skipped — empirically ~95% of the storm on technic.
+/// - A contract we hold state for but evicted from the hosting cache is only
+///   reachable while NOT in use (`evict_over_budget` retains `contract_in_use`
+///   entries), and `reclaim_evicted_contract` deletes its state once not in use.
+///   So a skipped contract has no live subscriber depending on its interest-sync
+///   heal, and (outside a brief pending-reclamation window) no state to advertise.
+/// - The moment a contract gains a live subscriber it is `contract_in_use`, so
+///   we resume summarizing and healing it — no loss of proactive repair for any
+///   contract a peer is actually subscribed to.
+async fn summary_if_hosted_or_in_use(
+    op_manager: &Arc<OpManager>,
+    key: &freenet_stdlib::prelude::ContractKey,
+) -> Option<freenet_stdlib::prelude::StateSummary<'static>> {
+    if op_manager.ring.is_hosting_contract(key) || op_manager.ring.contract_in_use(key) {
+        get_contract_summary(op_manager, key).await
+    } else {
+        None
     }
 }
 
@@ -2746,6 +2798,75 @@ mod tests {
         // The actionable signal is the queue saturation itself, not
         // the per-summary failure. Caught by rule-review on PR #4252.
         assert_log_site_pin("Failed to get contract summary", "debug", &[], &[]);
+    }
+
+    /// Regression pin for the #4473 / #4145 interest-sync summarize storm.
+    ///
+    /// The three PERIODIC interest-sync arms (`Interests`, `Summaries`,
+    /// `ChangeInterests`) each handle a message from every connected peer on its
+    /// 5-min heartbeat and summarize every shared-interest contract. Before #4473
+    /// they called `get_contract_summary` directly even for contracts we neither
+    /// host nor serve, flooding the serial `contract_handling` loop with pointless
+    /// "state not found" round-trips (~40/sec measured on a relay; decoupled from
+    /// the <10/hour real update rate). They MUST route through
+    /// `summary_if_hosted_or_in_use`, which skips the round-trip for contracts we
+    /// neither host nor actively serve.
+    ///
+    /// Fails (finding a bare `get_contract_summary`) on the pre-fix code. The one
+    /// legitimate bare call left in `handle_interest_sync_message` is the
+    /// `ResyncRequest` arm, which is already state-gated (returns early when
+    /// `get_contract_state` is `None`) and is not heartbeat-driven, so it is
+    /// excluded by slicing up to that arm.
+    #[test]
+    fn interest_sync_periodic_arms_summarize_only_hosted_or_in_use_pin() {
+        let src = include_str!("node.rs");
+
+        // The helper must gate the expensive call on BOTH the hosting check and
+        // the in-use check: gating on hosting alone wrongly drops the proactive
+        // heal for an evicted-but-in-use stateful contract (Codex P1 on #4475).
+        let helper_start = src
+            .find("async fn summary_if_hosted_or_in_use(")
+            .expect("summary_if_hosted_or_in_use helper not found");
+        // Bound the slice to the helper body (its closing `}` at column 0) so the
+        // gate-condition assertions below can't false-pass on a neighboring fn.
+        let helper_end = helper_start
+            + src[helper_start..]
+                .find("\n}\n")
+                .expect("summary_if_hosted_or_in_use body end not found");
+        let helper_src = &src[helper_start..helper_end];
+        assert!(
+            helper_src.contains("is_hosting_contract"),
+            "summary_if_hosted_or_in_use must gate on is_hosting_contract"
+        );
+        assert!(
+            helper_src.contains("contract_in_use"),
+            "summary_if_hosted_or_in_use must ALSO gate on contract_in_use so an \
+             evicted-but-in-use stateful contract keeps its interest-sync heal"
+        );
+
+        // Slice the periodic arms = handler start .. the ResyncRequest arm.
+        let handler_start = src
+            .find("async fn handle_interest_sync_message(")
+            .expect("handle_interest_sync_message not found");
+        let resync_off = src[handler_start..]
+            .find("InterestMessage::ResyncRequest")
+            .expect("ResyncRequest arm not found");
+        let periodic_arms = &src[handler_start..handler_start + resync_off];
+
+        assert!(
+            !periodic_arms.contains("get_contract_summary("),
+            "the periodic interest-sync arms (Interests/Summaries/ChangeInterests) \
+             must call summary_if_hosted_or_in_use, not get_contract_summary \
+             directly (#4473) — a bare call here reintroduces the summarize storm"
+        );
+        let gated_calls = periodic_arms
+            .matches("summary_if_hosted_or_in_use(")
+            .count();
+        assert!(
+            gated_calls >= 3,
+            "expected the 3 periodic interest-sync arms to call \
+             summary_if_hosted_or_in_use, found {gated_calls}"
+        );
     }
 
     // Hostname resolution tests
