@@ -4,19 +4,25 @@
 #   extracted from announce-to-river.sh via `eval`; shellcheck cannot see
 #   into the eval and would otherwise flag them all as unused.
 #
-# Regression test for announce-to-river.sh (issue #4208).
+# Regression test for announce-to-river.sh (issues #4208 and the
+# v0.2.74/v0.2.75 lost-announcement race).
 #
-# Covers the two functions the #4208 fix touches:
-#   - wait_for_node(): the bounded node-reachability poll that lets the
-#     announce survive the gateway restarting the local node mid-release,
-#     instead of failing on a single probe that races the restart window.
+# Covers the functions the fixes touch:
+#   - wait_for_room(): the bounded readiness poll that gates the post on the
+#     room actually being READABLE (a riverctl room GET succeeding), not just
+#     on the WS port answering. The earlier wait_for_node() port probe passed
+#     while the old node was being torn down for the gateway self-update, so
+#     riverctl's room GET hit a mid-teardown node and failed "room not found"
+#     — the silent drop that lost v0.2.74 and v0.2.75. wait_for_room() rides
+#     out that window by retrying the real read.
 #   - log(): now writes a persistent log file only when LOG_FILE is set
 #     (the old unconditional /var/log default emitted "Permission denied"
 #     on every call because the announce user cannot write there).
+#   - post_message(): signs with the owner key via --signing-key-file.
 #
-# Both functions are extracted verbatim from announce-to-river.sh and
-# eval'd here, so the test exercises the real implementation and cannot
-# drift from it. curl is stubbed and NODE_WAIT_INTERVAL=0 keeps it instant.
+# All functions are extracted verbatim from announce-to-river.sh and eval'd
+# here, so the test exercises the real implementation and cannot drift from
+# it. read_room_state is stubbed and NODE_WAIT_INTERVAL=0 keeps it instant.
 #
 # Run manually with: bash scripts/release-agent/announce-to-river_test.sh
 
@@ -36,7 +42,7 @@ trap 'rm -rf "$TMP"' EXIT
 # Pull the two functions verbatim so the test runs the real code, not a
 # copy that could drift. Mirrors scripts/release_state_restore_test.sh.
 eval "$(awk '/^log\(\) \{/,/^}/' "$ANNOUNCE_SH")"
-eval "$(awk '/^wait_for_node\(\) \{/,/^}/' "$ANNOUNCE_SH")"
+eval "$(awk '/^wait_for_room\(\) \{/,/^}/' "$ANNOUNCE_SH")"
 
 FAILURES=0
 check() {
@@ -87,46 +93,61 @@ rc=0
 log "ignored" 2>/dev/null || rc=$?
 check "log() survives an unwritable LOG_FILE" "$rc" "0"
 
-# ── wait_for_node() ──────────────────────────────────────────────────
+# ── wait_for_room() ──────────────────────────────────────────────────
+#
+# The lost-announcement fix. The probe now gates on a real room READ
+# (read_room_state, a riverctl GET) succeeding rather than on a WS-port
+# answer, so it can't be fooled by the old node still answering the port
+# while it is being torn down for the gateway self-update. The crucial
+# difference from the old wait_for_node(): a node that is up at the port
+# layer but whose room GET fails counts as NOT ready, so the poll keeps
+# waiting through the restart instead of declaring success and letting the
+# post hit a mid-teardown node (the v0.2.74/v0.2.75 silent drop).
 
 FREENET_NODE_URL="http://stub/"
 NODE_WAIT_INTERVAL=0
 LOG_FILE=""
 
-# curl stub: fails for the first CURL_FAIL_COUNT calls, then succeeds.
-CURL_CALLS=0
-CURL_FAIL_COUNT=0
-curl() {
-    CURL_CALLS=$((CURL_CALLS + 1))
-    (( CURL_CALLS > CURL_FAIL_COUNT ))
+# read_room_state stub: fails for the first READ_FAIL_COUNT calls (room not
+# yet retrievable — node restarting / mid-teardown), then succeeds. This
+# stands in for the real riverctl `message list` GET. Stubbing the probe
+# function directly keeps the test independent of riverctl/cargo while still
+# exercising the genuine wait_for_room() loop body.
+READ_CALLS=0
+READ_FAIL_COUNT=0
+read_room_state() {
+    READ_CALLS=$((READ_CALLS + 1))
+    (( READ_CALLS > READ_FAIL_COUNT ))
 }
 
-# Node already up: succeeds on the first probe.
+# Room already readable: succeeds on the first probe.
 NODE_WAIT_ATTEMPTS=60
-CURL_CALLS=0
-CURL_FAIL_COUNT=0
+READ_CALLS=0
+READ_FAIL_COUNT=0
 rc=0
-wait_for_node 2>/dev/null || rc=$?
-check "wait_for_node() succeeds when the node is already up" "$rc" "0"
-check "wait_for_node() probes once when the node is up" "$CURL_CALLS" "1"
+wait_for_room 2>/dev/null || rc=$?
+check "wait_for_room() succeeds when the room is already readable" "$rc" "0"
+check "wait_for_room() probes once when the room is readable" "$READ_CALLS" "1"
 
-# Node down then up: the poll bridges the restart window (issue #4208).
+# Room unreadable then readable: the poll bridges the restart window. This is
+# the case the old port-only probe got wrong — the read fails while the node
+# is mid-teardown, and only succeeds once the restarted node has the room.
 NODE_WAIT_ATTEMPTS=60
-CURL_CALLS=0
-CURL_FAIL_COUNT=3
+READ_CALLS=0
+READ_FAIL_COUNT=3
 rc=0
-wait_for_node 2>/dev/null || rc=$?
-check "wait_for_node() succeeds once the node returns" "$rc" "0"
-check "wait_for_node() keeps probing across the down-window" "$CURL_CALLS" "4"
+wait_for_room 2>/dev/null || rc=$?
+check "wait_for_room() succeeds once the room becomes readable" "$rc" "0"
+check "wait_for_room() keeps probing across the down-window" "$READ_CALLS" "4"
 
-# Node never returns: the poll gives up after NODE_WAIT_ATTEMPTS.
+# Room never readable: the poll gives up after NODE_WAIT_ATTEMPTS.
 NODE_WAIT_ATTEMPTS=3
-CURL_CALLS=0
-CURL_FAIL_COUNT=9999
+READ_CALLS=0
+READ_FAIL_COUNT=9999
 rc=0
-wait_for_node 2>/dev/null || rc=$?
-check "wait_for_node() fails when the node never returns" "$rc" "1"
-check "wait_for_node() honours NODE_WAIT_ATTEMPTS as the bound" "$CURL_CALLS" "3"
+wait_for_room 2>/dev/null || rc=$?
+check "wait_for_room() fails when the room never becomes readable" "$rc" "1"
+check "wait_for_room() honours NODE_WAIT_ATTEMPTS as the bound" "$READ_CALLS" "3"
 
 # ── post_message() ───────────────────────────────────────────────────
 #

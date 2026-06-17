@@ -157,6 +157,16 @@ jobs:
       - name: Self-test deploy-local-gateway verify_service
         run: bash scripts/release-agent/deploy-local-gateway_test.sh
 
+      # Regression gate for the release-announce River post (the
+      # v0.2.74/v0.2.75 incident: the announce raced the gateway self-update,
+      # a WS-port probe passed, but riverctl's room GET hit a mid-teardown
+      # node and failed "room not found" while the workflow showed green).
+      # The readiness poll (wait_for_room), owner-signing, and logging
+      # functions are extracted verbatim from announce-to-river.sh and
+      # exercised here, so the script and its test cannot drift.
+      - name: Self-test announce-to-river
+        run: bash scripts/release-agent/announce-to-river_test.sh
+
       - name: Check for old-style mod.rs files
         run: |
           # New modules must use foo.rs + foo/ style, not foo/mod.rs

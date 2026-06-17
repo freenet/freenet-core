@@ -38,6 +38,10 @@ LOG_FILE="${LOG_FILE:-}"
 # the v0.2.61 release. Overridable (e.g. INTERVAL=0 in tests).
 NODE_WAIT_ATTEMPTS="${NODE_WAIT_ATTEMPTS:-60}"
 NODE_WAIT_INTERVAL="${NODE_WAIT_INTERVAL:-5}"
+# Set to any non-empty value to skip the post-send convergence re-read (the
+# read that confirms the message actually landed in room state). Off by
+# default; primarily a test hook.
+SKIP_POST_VERIFY="${SKIP_POST_VERIFY:-}"
 
 log() {
     local timestamp
@@ -58,32 +62,69 @@ EOF
     exit 1
 }
 
-# Poll FREENET_NODE_URL until it responds, or NODE_WAIT_ATTEMPTS is reached.
-# Returns 0 once reachable, 1 if it never became reachable.
+# Build riverctl ONCE, before the wait loop, so every subsequent
+# `cargo run -p riverctl` (the read probe AND the send) is a fast no-op
+# rebuild instead of a cold ~3min compile. Without this, each poll attempt
+# in wait_for_room() would re-pay the build cost and the ~5min budget would
+# only buy one or two real probes.
+build_riverctl() {
+    cd "$RIVER_DIR" || return 1
+    log "building riverctl once before the readiness probe"
+    cargo build --quiet -p riverctl
+}
+
+# Read room state via riverctl (the same owner-signed `message list` GET that
+# the post step relies on). Returns 0 iff riverctl exits 0, i.e. the room was
+# actually retrieved from the local node. stdout/stderr is discarded — callers
+# only care about reachability, not the message list.
+read_room_state() {
+    cd "$RIVER_DIR" || return 1
+    RIVER_SKIP_CONTRACT_CHECK=1 timeout 60 \
+        cargo run --quiet -p riverctl -- \
+            --signing-key-file "$SIGNING_KEY_FILE" \
+            message list "$ROOM_OWNER_VK" >/dev/null 2>&1
+}
+
+# Poll until the room is actually READABLE, or NODE_WAIT_ATTEMPTS is reached.
+# Returns 0 once a room GET succeeds, 1 if it never did.
 #
-# A release announcement runs concurrently with the gateway update that
-# restarts the local node (down ~90s), so a single probe routinely races
-# that window (issue #4208) — hence the polling.
+# A WS-port check is NOT sufficient. A release announcement runs concurrently
+# with the gateway update that restarts the local node (down ~90s, issue
+# #4208). The OLD node keeps answering the WS port right up until the update
+# stops the service, so a port probe passes, riverctl connects, and its room
+# GET then hits the node mid-teardown — returning empty, which riverctl
+# reports as "Room not found on the current contract or any of the 24 known
+# previous contract generations" and exits 1. The release workflow already
+# received its 202 by then, so the failure is silent: the v0.2.74 and
+# v0.2.75 announcements were both lost exactly this way (riverctl exited 1
+# in journald while the workflow showed green). The fix is to gate the post
+# on a real room READ succeeding, not on the WS port answering — that proves
+# the (restarted) node is up AND has the room state retrievable before we
+# attempt the send.
 #
 # The polling also keeps this script alive past the release-agent's
 # 1-second early-exit probe: the agent treats a sub-1s exit as a failure
 # (HTTP 500) but returns 202 for a still-running script and reaps it in the
 # background. So a node that is merely restarting still yields a completed
-# announcement. The flip side: a node that stays down for the whole budget
-# fails only in this script's journald log, not visibly to the release
-# workflow (which already received its 202). A prolonged gateway outage on
-# release day is independently visible, so that trade-off is acceptable;
-# surfacing late failures to the workflow would need a release-agent change.
-wait_for_node() {
+# announcement. The flip side: a node that stays unreadable for the whole
+# budget fails only in this script's journald log, not visibly to the
+# release workflow (which already received its 202). A prolonged gateway
+# outage on release day is independently visible, so that trade-off is
+# acceptable; surfacing late failures to the workflow would need a
+# release-agent change.
+wait_for_room() {
     local attempt
     for ((attempt = 1; attempt <= NODE_WAIT_ATTEMPTS; attempt++)); do
-        if curl -s --max-time 3 "$FREENET_NODE_URL" >/dev/null 2>&1; then
+        if read_room_state; then
+            if (( attempt > 1 )); then
+                log "room readable after $attempt attempts"
+            fi
             return 0
         fi
         if [[ "$attempt" -eq 1 ]]; then
-            log "Freenet node not reachable at $FREENET_NODE_URL yet — waiting (it is restarted by the concurrent gateway update)"
+            log "room not yet readable via $FREENET_NODE_URL — waiting (the node is restarted by the concurrent gateway update)"
         elif (( attempt % 12 == 0 )); then
-            log "still waiting for Freenet node ($attempt/$NODE_WAIT_ATTEMPTS)"
+            log "still waiting for room to become readable ($attempt/$NODE_WAIT_ATTEMPTS)"
         fi
         # No sleep after the final attempt — nothing follows it.
         if (( attempt < NODE_WAIT_ATTEMPTS )); then
@@ -157,11 +198,21 @@ if [[ ! -f "$ROOMS_JSON" ]]; then
     exit 1
 fi
 
-# Wait for the local Freenet node before invoking riverctl (it hangs
-# otherwise). See wait_for_node() above for why this polls rather than
-# probing once.
-if ! wait_for_node; then
-    log "ERROR: Freenet node still not reachable at $FREENET_NODE_URL after $NODE_WAIT_ATTEMPTS attempts"
+# Build riverctl once up front so the readiness probe and the send don't each
+# re-pay the cold-compile cost (see build_riverctl above). A build failure is
+# fatal — riverctl is required for everything below.
+if ! build_riverctl; then
+    log "ERROR: failed to build riverctl in $RIVER_DIR"
+    exit 1
+fi
+
+# Wait until the room is actually READABLE before posting. A WS-port probe is
+# not enough: the old node answers the port right up until the concurrent
+# gateway update stops it, so a port-only check lets riverctl issue a room GET
+# into a node mid-teardown and fail "room not found" (issue #4208 / the
+# v0.2.74+v0.2.75 lost announcements). See wait_for_room() for the full race.
+if ! wait_for_room; then
+    log "ERROR: room $ROOM_OWNER_VK still not readable via $FREENET_NODE_URL after $NODE_WAIT_ATTEMPTS attempts"
     exit 1
 fi
 
@@ -169,11 +220,32 @@ log "posting to River room $ROOM_OWNER_VK (msg ${#MESSAGE} bytes)"
 
 # Sign as the owner via the in-memory --signing-key-file override (see
 # post_message above for why pre-patching rooms.json does not work).
-if post_message; then
-    log "OK"
-    exit 0
-else
+if ! post_message; then
     rc=$?
     log "FAILED with rc=$rc"
     exit "$rc"
+fi
+
+# Post-send convergence check. riverctl prints "Message sent successfully" and
+# exits 0 even when the room contract silently drops the delta (e.g. a
+# non-owner signature — see post_message), so exit 0 alone does NOT prove the
+# message landed. Re-read room state and confirm the exact message text is
+# present; if it isn't, fail loudly so a future silent drop is visible in
+# journald instead of masquerading as success. Skippable via SKIP_POST_VERIFY.
+if [[ -n "$SKIP_POST_VERIFY" ]]; then
+    log "OK (post-send verification skipped via SKIP_POST_VERIFY)"
+    exit 0
+fi
+
+cd "$RIVER_DIR" || { log "ERROR: cannot cd to $RIVER_DIR for post-send verification"; exit 1; }
+if RIVER_SKIP_CONTRACT_CHECK=1 timeout 60 \
+        cargo run --quiet -p riverctl -- \
+            --signing-key-file "$SIGNING_KEY_FILE" \
+            message list "$ROOM_OWNER_VK" 2>/dev/null \
+        | grep -qF -- "$MESSAGE"; then
+    log "OK (verified message present in room state)"
+    exit 0
+else
+    log "ERROR: riverctl reported success but the message did NOT converge into room state (silent drop)"
+    exit 1
 fi
