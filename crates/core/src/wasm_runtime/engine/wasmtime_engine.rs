@@ -1816,16 +1816,29 @@ mod tests {
     /// not deterministic enough to assert on in CI.
     #[test]
     fn engine_enables_wasmtime_disk_compilation_cache() {
+        // Isolate ONLY the production `create_backend_engine` body before
+        // scraping. `include_str!` pulls in this test's own assertion strings,
+        // so a whole-file `contains` would be satisfied by the literals below
+        // and pass even if the real cache-enabling lines were deleted — exactly
+        // the self-satisfying-pin failure mode. Splitting on the function
+        // signature and the next fn restricts the scrape to production code.
         let src = include_str!("wasmtime_engine.rs");
+        let body = src
+            .split("fn create_backend_engine(config: &RuntimeConfig) -> Result<Engine, ContractError> {")
+            .nth(1)
+            .expect("create_backend_engine must exist")
+            .split("\n    fn recover_store(")
+            .next()
+            .expect("end of create_backend_engine");
         // The build path that constructs the wasmtime Config must install a
         // disk cache via `wasmtime_config.cache(Some(...))`.
         assert!(
-            src.contains("Cache::new(CacheConfig::new())"),
-            "engine config must construct the wasmtime disk compilation cache"
+            body.contains("Cache::new(CacheConfig::new())"),
+            "create_backend_engine must construct the wasmtime disk compilation cache"
         );
         assert!(
-            src.contains("wasmtime_config.cache(Some(cache))"),
-            "engine config must install the disk compilation cache so an \
+            body.contains("wasmtime_config.cache(Some(cache))"),
+            "create_backend_engine must install the disk compilation cache so an \
              evicted module deserializes from disk on reload instead of \
              recompiling (issue #4441 fix #2)"
         );

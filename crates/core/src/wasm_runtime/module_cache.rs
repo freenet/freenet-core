@@ -437,7 +437,9 @@ pub const DELEGATE_MODULE_CACHE_BUDGET_DIVISOR: usize = 4;
 const FALLBACK_TOTAL_RAM_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Default per-cache byte budget for the **contract** compiled-module cache,
-/// scaled to the host's physical RAM and clamped to a sane floor/ceiling.
+/// scaled to the memory the node may use (host RAM, or a smaller cgroup limit
+/// when containerized — see [`read_total_ram_bytes`]) and clamped to a sane
+/// floor/ceiling.
 ///
 /// Returns `clamp(total_ram / DEFAULT_MODULE_CACHE_RAM_DIVISOR,
 /// MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES, MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES)`
@@ -475,41 +477,41 @@ fn budget_for_ram(total_ram: usize) -> usize {
     )
 }
 
-/// Best-effort read of the host's total physical RAM in bytes.
+/// Best-effort read of the memory the node may actually use, in bytes.
 ///
-/// Portable and dependency-free:
-/// - On Linux, parse `MemTotal` from `/proc/meminfo` (reported in KiB).
-/// - On other unix, fall back to `sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGESIZE)`.
+/// This is the **minimum** of the host's physical RAM and any cgroup memory
+/// limit applied to the process. Using the cgroup limit matters because raising
+/// the cache clamp to 1.5 GiB would otherwise let a node inside a small
+/// container (say a 2 GiB limit on a 128 GiB host) default to a ~1.5 GiB cache
+/// sized from the *host* total and OOM the container. Taking the min means a
+/// constrained container gets a budget scaled to its real limit, while a host
+/// systemd service (the production gateways) sees no cgroup limit and uses
+/// `MemTotal` as before.
+///
+/// Sources, in order:
+/// - On Linux, physical RAM from `MemTotal` in `/proc/meminfo` (reported in
+///   KiB), then min'd with the cgroup memory limit (cgroup v2 `memory.max`, or
+///   v1 `memory.limit_in_bytes`) when one is present and is a real limit (not
+///   the "unlimited" sentinel).
+/// - On other unix, `sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGESIZE)` (no cgroup
+///   notion).
 /// - Otherwise return `None` so the caller uses `FALLBACK_TOTAL_RAM_BYTES`.
 ///
 /// Never panics; any failure (missing file, parse error, non-positive sysconf)
-/// yields `None`.
-///
-/// # Containers / cgroups
-///
-/// This reports the **host's** physical RAM, not a cgroup memory limit. A node
-/// run inside a container with a memory limit far below host RAM (e.g. a 2 GiB
-/// limit on a 128 GiB host) will size its default cache from the host total, so
-/// the `total_ram / 8` divisor (and the MAX clamp) can land above the container
-/// limit. The Freenet production gateways run as host systemd services, not in
-/// constrained containers, so this is not a concern for them; a containerized
-/// deployment with a tight memory limit should set the explicit
-/// `--module-cache-budget-bytes` / `FREENET_MODULE_CACHE_BUDGET_BYTES` override
-/// sized to its limit. Making this cgroup-aware (min of `MemTotal` and
-/// `memory.max`) is a possible future improvement if containerized nodes become
-/// common.
+/// yields `None` for that source and falls back.
 fn read_total_ram_bytes() -> Option<usize> {
     #[cfg(target_os = "linux")]
     {
-        // /proc/meminfo line: "MemTotal:       16331752 kB"
-        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-        for line in meminfo.lines() {
-            if let Some(rest) = line.strip_prefix("MemTotal:") {
-                let kib: usize = rest.split_whitespace().next()?.parse().ok()?;
-                return kib.checked_mul(1024);
-            }
+        let phys = read_proc_meminfo_total_bytes();
+        // Clamp to the cgroup limit when one applies. If we can read physical
+        // RAM, take the min; if not, fall back to the cgroup limit alone (a
+        // container with no readable /proc/meminfo still gets a sane bound).
+        match (phys, read_cgroup_memory_limit_bytes()) {
+            (Some(p), Some(c)) => Some(p.min(c)),
+            (Some(p), None) => Some(p),
+            (None, Some(c)) => Some(c),
+            (None, None) => None,
         }
-        None
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
@@ -526,6 +528,80 @@ fn read_total_ram_bytes() -> Option<usize> {
     {
         None
     }
+}
+
+/// Parse physical RAM (bytes) from `/proc/meminfo`'s `MemTotal:` line.
+#[cfg(target_os = "linux")]
+fn read_proc_meminfo_total_bytes() -> Option<usize> {
+    // /proc/meminfo line: "MemTotal:       16331752 kB"
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    parse_meminfo_total_bytes(&meminfo)
+}
+
+/// Pure parse of `MemTotal` (KiB) from `/proc/meminfo` contents into bytes.
+#[cfg(target_os = "linux")]
+fn parse_meminfo_total_bytes(meminfo: &str) -> Option<usize> {
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kib: usize = rest.split_whitespace().next()?.parse().ok()?;
+            return kib.checked_mul(1024);
+        }
+    }
+    None
+}
+
+/// Best-effort read of the process's cgroup memory limit in bytes, or `None`
+/// when there is no readable limit (or the limit is the "unlimited" sentinel).
+///
+/// Tries cgroup v2 (`/sys/fs/cgroup/memory.max`) first, then cgroup v1
+/// (`/sys/fs/cgroup/memory/memory.limit_in_bytes`). Both files contain a single
+/// integer of bytes, except v2 uses the literal `max` for "no limit" and v1 uses
+/// a near-`u64::MAX` sentinel (e.g. `9223372036854771712`). We treat anything at
+/// or above [`CGROUP_UNLIMITED_THRESHOLD_BYTES`] as "no limit" so a host-level
+/// (effectively unlimited) cgroup doesn't pin the budget to a meaningless huge
+/// number.
+#[cfg(target_os = "linux")]
+fn read_cgroup_memory_limit_bytes() -> Option<usize> {
+    // cgroup v2 unified hierarchy.
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        if let Some(v) = parse_cgroup_limit(&s) {
+            return Some(v);
+        }
+        // Present but "max" / unparseable → no v2 limit; fall through to v1 in
+        // case of a hybrid mount, then to None.
+    }
+    // cgroup v1.
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
+        if let Some(v) = parse_cgroup_limit(&s) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Above this, a cgroup limit is treated as "unlimited" rather than a real
+/// bound. Covers cgroup v1's `~u64::MAX` sentinel and a host-root cgroup whose
+/// limit equals (or rounds to) all of physical RAM. Far above any budget we'd
+/// ever want, so clamping the cache to it would be a no-op anyway.
+#[cfg(target_os = "linux")]
+const CGROUP_UNLIMITED_THRESHOLD_BYTES: usize = 1 << 60; // 1 EiB
+
+/// Parse a single cgroup memory-limit file value (bytes) into a real limit, or
+/// `None` for the literal `max`, an unparseable value, zero, or an "unlimited"
+/// sentinel at/above [`CGROUP_UNLIMITED_THRESHOLD_BYTES`].
+#[cfg(target_os = "linux")]
+fn parse_cgroup_limit(contents: &str) -> Option<usize> {
+    let trimmed = contents.trim();
+    if trimmed == "max" {
+        return None;
+    }
+    let bytes: usize = trimmed.parse().ok()?;
+    // Zero is not a meaningful budget bound; treat as absent. Sentinels at/above
+    // the threshold mean "unlimited".
+    if bytes == 0 || bytes >= CGROUP_UNLIMITED_THRESHOLD_BYTES {
+        return None;
+    }
+    Some(bytes)
 }
 
 #[cfg(test)]
@@ -701,7 +777,17 @@ mod tests {
             let contract = budget_for_ram(total_ram);
             let delegate = contract / DELEGATE_MODULE_CACHE_BUDGET_DIVISOR;
             let combined = contract + delegate;
-            // The combined default must never exceed 1/4 of physical RAM, so the
+            // Hard floor that must hold at EVERY RAM size, including the tiniest
+            // box where the MIN clamp binds: the combined default must never
+            // exceed total RAM. This catches an unsafe MIN raise (e.g. a MIN
+            // larger than a small box's RAM), which the fractional bound below
+            // would skip because its guard scales with MIN.
+            assert!(
+                combined <= total_ram,
+                "combined default {combined} must never exceed total RAM \
+                 ({total_ram}) — a MIN raise above a small box's RAM would OOM it"
+            );
+            // The combined default must also stay within 1/4 of RAM, so the
             // node always has at least 3/4 of RAM for everything else (state
             // store, transport buffers, WASM instance arenas, the OS). Below the
             // MIN clamp a very small box gets a fixed 64+16 MiB floor, which is
@@ -718,6 +804,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Upper-bound guard (the other side of the net): the COMBINED default
+    /// ceiling at the MAX clamp must stay a safe fraction of the smallest host
+    /// where the MAX binds (`MAX × DEFAULT_MODULE_CACHE_RAM_DIVISOR` of RAM), so
+    /// a future MAX raise can't silently hand a just-large-enough box a cache
+    /// that crowds out the rest of the node. Without this, every other test in
+    /// the suite would still pass if MAX were bumped to, say, 12 GiB (which would
+    /// give a 12-16 GiB box a ~15 GiB combined cache → OOM).
+    #[test]
+    fn max_clamp_combined_ceiling_is_safe_at_binding_host() {
+        let contract = MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES;
+        let delegate = contract / DELEGATE_MODULE_CACHE_BUDGET_DIVISOR;
+        let combined = contract + delegate;
+        // The smallest host at which the MAX clamp binds (below this the divisor
+        // binds first and the small-box test covers it).
+        let binding_host_ram =
+            MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES * DEFAULT_MODULE_CACHE_RAM_DIVISOR;
+        assert!(
+            combined <= binding_host_ram / 4,
+            "combined default at the MAX clamp ({combined}) must stay within 1/4 \
+             of the smallest host where MAX binds ({binding_host_ram}); a MAX \
+             raise that breaks this would OOM a just-large-enough box"
+        );
     }
 
     /// Regression for issue #4441: a large gateway (nova has 125 GiB RAM) must
@@ -753,6 +863,41 @@ mod tests {
             "the default ceiling must hold a realistic gateway working set \
              (~1000 modules at ~1.5 MiB each); holds {modules_held}"
         );
+    }
+
+    /// cgroup limit parsing: a real byte value is a limit; the v2 `max`
+    /// sentinel, the v1 near-`u64::MAX` sentinel, zero, and garbage are all
+    /// "no limit" (`None`). This is what keeps a containerized node from
+    /// defaulting its cache to host RAM and OOMing its cgroup (#4481 review).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_cgroup_limit_distinguishes_real_limits_from_sentinels() {
+        // Real limits (with surrounding whitespace/newline as the kernel emits).
+        assert_eq!(
+            parse_cgroup_limit("2147483648\n"),
+            Some(2 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(parse_cgroup_limit("  536870912  "), Some(512 * 1024 * 1024));
+        // cgroup v2 "no limit".
+        assert_eq!(parse_cgroup_limit("max\n"), None);
+        // cgroup v1 unlimited sentinel (~u64::MAX rounded to page size).
+        assert_eq!(parse_cgroup_limit("9223372036854771712"), None);
+        // A host-root cgroup whose "limit" is enormous → treated as unlimited.
+        assert_eq!(parse_cgroup_limit(&format!("{}", 1usize << 61)), None);
+        // Degenerate / unparseable values.
+        assert_eq!(parse_cgroup_limit("0"), None);
+        assert_eq!(parse_cgroup_limit(""), None);
+        assert_eq!(parse_cgroup_limit("not-a-number"), None);
+    }
+
+    /// `MemTotal` parsing pulls the KiB value and converts to bytes; a file
+    /// without the line yields `None` (caller falls back).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn parse_meminfo_total_reads_kib_as_bytes() {
+        let sample = "MemFree:  100 kB\nMemTotal:       16331752 kB\nBuffers:  1 kB\n";
+        assert_eq!(parse_meminfo_total_bytes(sample), Some(16331752 * 1024));
+        assert_eq!(parse_meminfo_total_bytes("SwapTotal: 0 kB\n"), None);
     }
 
     /// A zero budget still keeps exactly one most-recently-used entry resident
