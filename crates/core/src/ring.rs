@@ -1061,11 +1061,20 @@ impl Ring {
                 snapshot.connect_forward_peer_adjustments = Some(adjustments);
             }
 
+            // Node-health gauges (#4440): make fd-exhaustion headroom observable
+            // on the existing snapshot cadence. Best-effort — `None` where the
+            // platform can't report it (see `read_fd_usage`).
+            let (open_fds, fd_soft_limit) = read_fd_usage();
+            snapshot.open_fds = open_fds;
+            snapshot.fd_soft_limit = fd_soft_limit;
+
             tracing::info!(
                 failure_events = snapshot.failure_events,
                 success_events = snapshot.success_events,
                 prediction_active = snapshot.prediction_active,
                 consider_n_closest_peers = snapshot.consider_n_closest_peers,
+                open_fds = ?snapshot.open_fds,
+                fd_soft_limit = ?snapshot.fd_soft_limit,
                 "router_snapshot"
             );
 
@@ -4020,6 +4029,91 @@ fn deferred_swap_drops_to_execute(
 #[inline]
 fn classify_suspend_jump(boot_elapsed: Duration, mono_elapsed: Duration) -> Duration {
     boot_elapsed.saturating_sub(mono_elapsed)
+}
+
+/// Best-effort snapshot of this process's open file-descriptor count and the
+/// `RLIMIT_NOFILE` soft limit, for the node-health telemetry gauges (#4440).
+///
+/// fd exhaustion (open fds reaching the soft limit → `EMFILE`) drove the
+/// v0.2.73 gateway crash-loop and was invisible to central telemetry at the
+/// time. Emitting these on the existing `router_snapshot` cadence makes the
+/// headroom observable to operators.
+///
+/// Returns `(open_fds, fd_soft_limit)`. Either element is `None` on a platform
+/// where it can't be read cheaply: the open-fd count is Linux-only (via
+/// `/proc/self/fd`); the soft limit is any-unix (via `getrlimit`).
+fn read_fd_usage() -> (Option<u64>, Option<u64>) {
+    (read_open_fd_count(), read_fd_soft_limit())
+}
+
+/// Count this process's open file descriptors by enumerating `/proc/self/fd`.
+///
+/// Returns `None` if the process is already at its fd limit — `read_dir` itself
+/// needs a descriptor and fails with `EMFILE` at the cliff. The companion
+/// [`read_fd_soft_limit`] still reports in that case, and the 5-minute cadence
+/// captures the *approach* to the limit, which is the actionable signal.
+#[cfg(target_os = "linux")]
+fn read_open_fd_count() -> Option<u64> {
+    // `read_dir` itself holds one descriptor open for the duration of the
+    // iteration, so it is included in the entry count; subtract it to report
+    // the steady-state number of descriptors the process actually holds.
+    let count = std::fs::read_dir("/proc/self/fd").ok()?.count() as u64;
+    Some(count.saturating_sub(1))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_open_fd_count() -> Option<u64> {
+    None
+}
+
+/// Read the current `RLIMIT_NOFILE` soft limit (the ceiling that triggers
+/// `EMFILE`). Mirrors the `getrlimit` read in `bin/freenet.rs::raise_fd_limit`.
+#[cfg(unix)]
+fn read_fd_soft_limit() -> Option<u64> {
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` with a valid resource id and an exclusively-borrowed,
+    // initialized out-param is sound; the return code is checked before the
+    // struct is read.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } != 0 {
+        return None;
+    }
+    // `rlim_t` is `u64` on linux-gnu (CI target) but varies across unix targets;
+    // normalize to `u64`. The cast is redundant on linux-gnu, hence the scoped
+    // allow rather than a bare `as u64` that trips clippy.
+    #[allow(clippy::unnecessary_cast)]
+    Some(limits.rlim_cur as u64)
+}
+
+#[cfg(not(unix))]
+fn read_fd_soft_limit() -> Option<u64> {
+    None
+}
+
+#[cfg(test)]
+mod fd_usage_tests {
+    //! Validates the node-health fd gauges (#4440): the open-fd count and the
+    //! `RLIMIT_NOFILE` soft limit must report sane values on Linux so the
+    //! fd-exhaustion headroom signal that was missing during the v0.2.73
+    //! incident is trustworthy.
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_fd_usage_reports_sane_values_on_linux() {
+        let (open, soft) = super::read_fd_usage();
+        let open = open.expect("linux reports an open-fd count via /proc/self/fd");
+        let soft = soft.expect("unix reports the RLIMIT_NOFILE soft limit");
+        // A running process always holds at least stdin/stdout/stderr.
+        assert!(open > 0, "expected a positive open-fd count, got {open}");
+        // The kernel enforces open-fds <= soft limit, so this is invariant, not
+        // a heuristic — it pins that we read the two values the right way round.
+        assert!(
+            soft >= open,
+            "open fds ({open}) must not exceed the soft limit ({soft})"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -1839,6 +1839,12 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "connect_forward_data_range": snapshot.connect_forward_data_range,
                 "connect_forward_events": snapshot.connect_forward_events,
                 "connect_forward_peer_adjustments": snapshot.connect_forward_peer_adjustments,
+                // Node-health gauges (#4440). This body is a hand-mirrored
+                // `json!`, so new RouterSnapshotInfo fields must be added here or
+                // they never reach the collector — pinned by
+                // `router_snapshot_json_includes_fd_gauges`.
+                "open_fds": snapshot.open_fds,
+                "fd_soft_limit": snapshot.fd_soft_limit,
                 "per_op_curves": snapshot.per_op_curves,
             })
         }
@@ -1848,6 +1854,27 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pin: the manually-mirrored `router_snapshot` OTLP body
+    /// (`event_kind_to_json`) must forward the node-health fd gauges. The body
+    /// is a hand-written `json!` block, so a new `RouterSnapshotInfo` field is
+    /// silently dropped from central telemetry unless it is added there too
+    /// (the #4009/#4010 manually-mirrored-telemetry footgun). See #4440.
+    #[test]
+    fn router_snapshot_json_includes_fd_gauges() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.open_fds = Some(123);
+        info.fd_soft_limit = Some(4096);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(info));
+        assert_eq!(json["open_fds"], 123, "open_fds must reach the OTLP body");
+        assert_eq!(
+            json["fd_soft_limit"], 4096,
+            "fd_soft_limit must reach the OTLP body"
+        );
+    }
 
     #[test]
     fn test_backoff_calculation() {
