@@ -137,6 +137,18 @@ WHEN removing a connection (any failure path):
 WHEN exchanging peer lists in sync protocols (e.g., interest sync):
   → MUST filter out peers not currently in the live connection set
   → Stale peer entries cause operations to be sent to dead nodes
+
+WHEN summarizing contracts in the InterestSync heartbeat handlers
+(handle_interest_sync_message: Interests / Summaries / ChangeInterests):
+  → ONLY call get_contract_summary for contracts we host OR actively serve
+    (is_hosting_contract || contract_in_use) — go through
+    summary_if_hosted_or_in_use, never a bare get_contract_summary.
+  → A node carries phantom peer-interest in contracts it neither hosts nor
+    serves (placement-migration after-effect, #4404). Summarizing those issues a
+    GetSummaryQuery round-trip on the serial contract_handling loop that returns
+    "state not found" every heartbeat — the #4473/#4145 summarize storm
+    (~40/sec vs <10 real updates/hr) that wedged gateways. The ResyncRequest arm
+    is exempt: it is state-gated and not heartbeat-driven.
 ```
 
 ### Cleanup Exemptions Must Be Time-Bounded
