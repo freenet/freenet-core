@@ -1811,6 +1811,112 @@ where
     }
 }
 
+/// Maximum number of stale-contract `SyncStateToPeer` events emitted per
+/// `Summaries` message handled (#3798 Gap 1, anti-amplification hardening).
+///
+/// A single peer whose summary diverges on N contracts would otherwise trigger
+/// N `SyncStateToPeer` emissions in one `handle_interest_sync_message` call —
+/// still targeted at one peer (O(1) peer, unlike `BroadcastStateChange`), but
+/// an unbounded burst per message. Capping the per-message burst keeps the
+/// notification channel responsive under a divergent (or crafted) summary.
+///
+/// Eventual consistency is preserved without a backlog queue: staleness is
+/// re-derived every heartbeat cycle from the durable summary comparison in the
+/// `Summaries` arm below (driven by the 5-minute interest heartbeat in
+/// `ring::Ring::interest_heartbeat`, expiry-swept every 60 s by
+/// `InterestManager::sweep_expired_interests`). Any contract over the cap this
+/// cycle is re-detected and synced on a later cycle.
+///
+/// Starvation avoidance: when the stale set exceeds the cap, the emission loop
+/// starts at a random offset and wraps (see the `rotate_left` in the `Summaries`
+/// arm), so the cap window slides across the whole stale set over successive
+/// cycles instead of always re-processing the same prefix. Without this, a
+/// contract stuck in the leading `cap` positions — e.g. one whose
+/// `SyncStateToPeer` is dropped on a full channel, lost in transit, or not
+/// applied by the peer — would re-consume the budget every cycle and
+/// permanently starve every contract past the cap. Random rotation makes each
+/// over-cap contract eligible with independent probability each cycle, so its
+/// expected wait is bounded regardless of whether the rest of the set
+/// converges.
+///
+/// Value chosen to match the per-message burst-control family of existing
+/// caps (`MAX_BROADCAST_RETRIES = 3`, `MAX_BROADCAST_STREAK_ENTRIES = 256`,
+/// `MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT = 512`): 32 bounds the burst well
+/// below those while staying comfortably above the typical handful of stale
+/// contracts a healthy peer reports in one summary exchange.
+const MAX_STALE_SYNCS_PER_SUMMARIES: usize = 32;
+
+/// The per-message budget of stale-contract `SyncStateToPeer` emissions
+/// (#3798 Gap 1): `min(stale_contracts_len, MAX_STALE_SYNCS_PER_SUMMARIES)`.
+///
+/// Returns the maximum number of events the `Summaries` handler may emit this
+/// call. The caller increments an `emitted` counter only for contracts it
+/// actually emits for (banned / no-local-state contracts are skipped without
+/// consuming the budget) and stops once `emitted` reaches this value, so the
+/// number of `SyncStateToPeer` events is hard-bounded by
+/// [`MAX_STALE_SYNCS_PER_SUMMARIES`] regardless of `stale_contracts_len`.
+fn stale_sync_emit_budget(stale_contracts_len: usize) -> usize {
+    stale_contracts_len.min(MAX_STALE_SYNCS_PER_SUMMARIES)
+}
+
+/// Per-contract disposition in the stale-sync emission loop, used to model the
+/// loop's cap accounting in a unit test without constructing an `OpManager`.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StaleSyncDisposition {
+    /// Contract is not banned and has local state — emits a `SyncStateToPeer`
+    /// (and so consumes one unit of the emit budget).
+    Emit,
+    /// Contract is banned — skipped without emitting or consuming the budget.
+    Banned,
+    /// No local state available — skipped without emitting or consuming the
+    /// budget.
+    NoState,
+}
+
+/// Pure model of the stale-sync emission loop's cap accounting (#3798 Gap 1).
+///
+/// Mirrors the `for contract in stale_contracts` loop in the `Summaries` arm of
+/// [`handle_interest_sync_message`]: break once `emitted` reaches the budget;
+/// `Banned` / `NoState` contracts are skipped without consuming the budget;
+/// every `Emit` before the budget is exhausted counts. Returns the number of
+/// `SyncStateToPeer` events the real loop would emit for the given sequence.
+///
+/// Kept in lockstep with the production loop by the
+/// `stale_sync_loop_uses_emit_budget_pin` source-scrape test, which asserts the
+/// loop still applies this budget-and-break structure.
+#[cfg(test)]
+fn count_stale_syncs_emitted(dispositions: &[StaleSyncDisposition]) -> usize {
+    let budget = stale_sync_emit_budget(dispositions.len());
+    let mut emitted = 0usize;
+    for d in dispositions {
+        if emitted >= budget {
+            break;
+        }
+        if *d == StaleSyncDisposition::Emit {
+            emitted += 1;
+        }
+    }
+    emitted
+}
+
+/// Pure model of which original stale-contract indices the capped loop emits
+/// for, given the random rotation start used in the `Summaries` arm (#3798
+/// Gap 1 starvation avoidance).
+///
+/// Mirrors `stale_contracts.rotate_left(start)` followed by the capped
+/// emit loop where every contract is emittable (the all-`Emit` case, which is
+/// the worst case for starvation): after rotation, loop position `p` holds
+/// original index `(start + p) % total`, and the loop emits the first `budget`
+/// positions. Returns the set of original indices that would be emitted this
+/// cycle. Used to prove that, across rotation starts, the cap window covers the
+/// whole stale set (no index is permanently unreachable).
+#[cfg(test)]
+fn emitted_indices_for_rotation(total: usize, start: usize) -> Vec<usize> {
+    let budget = stale_sync_emit_budget(total);
+    (0..budget).map(|p| (start + p) % total).collect()
+}
+
 /// Handle incoming InterestSync messages for delta-based state synchronization.
 ///
 /// This function processes the interest exchange protocol:
@@ -1987,7 +2093,48 @@ async fn handle_interest_sync_message(
             // summary. Previously this emitted BroadcastStateChange which fanned
             // out to ALL subscribers (~28 peers), causing O(peers^2) traffic when
             // many peers reported mismatches within the same heartbeat cycle.
+            //
+            // #3798 Gap 1: cap the number of SyncStateToPeer events emitted per
+            // Summaries message so a peer diverging on many contracts cannot
+            // trigger an unbounded burst in one handler call. `emit_budget`
+            // bounds *emitted* events (not loop iterations) — banned and
+            // no-local-state contracts are skipped without consuming the
+            // budget. Overflow is not dropped permanently: each later
+            // heartbeat re-derives the still-stale set from the durable summary
+            // comparison above and syncs the next batch (see
+            // MAX_STALE_SYNCS_PER_SUMMARIES rustdoc for the eventual-consistency
+            // argument).
+            let total_stale = stale_contracts.len();
+            let emit_budget = stale_sync_emit_budget(total_stale);
+            // Starvation avoidance: when the stale set exceeds the cap, rotate
+            // the start of the iteration by a random offset so the cap window
+            // slides across the whole set over successive cycles. Without this,
+            // a contract stuck in the leading `cap` positions (dropped emit,
+            // lost packet, peer fails to apply) would re-consume the budget
+            // every cycle and permanently starve everything past the cap. No
+            // rotation when total_stale <= cap — every contract is emitted
+            // anyway, so the order does not matter. GlobalRng keeps this
+            // deterministic under simulation/test.
+            if total_stale > emit_budget {
+                let start = crate::config::GlobalRng::random_range(0..total_stale);
+                stale_contracts.rotate_left(start);
+            }
+            let mut emitted = 0usize;
             for contract in stale_contracts {
+                if emitted >= emit_budget {
+                    // Cap reached; the still-stale remainder (any that are not
+                    // banned / have local state) is re-detected and synced on a
+                    // subsequent interest-sync cycle rather than emitted now.
+                    tracing::warn!(
+                        stale_peer = %source,
+                        total_stale,
+                        emitted,
+                        cap = MAX_STALE_SYNCS_PER_SUMMARIES,
+                        "Stale-contract sync cap hit for Summaries message; \
+                         deferring the remainder to a later interest-sync cycle"
+                    );
+                    break;
+                }
                 // Phase 7 egress gate. Don't repair a stale peer's
                 // summary mismatch by pushing state for a contract
                 // we have banned — same rationale as the inbound
@@ -2009,6 +2156,12 @@ async fn handle_interest_sync_message(
                     );
                     continue;
                 };
+                // Count this contract against the emit budget: it has local
+                // state and is not banned, so we are about to emit a
+                // SyncStateToPeer event for it. Increment before the emit so a
+                // channel-full drop still consumes the budget — the dropped
+                // event is retried next cycle exactly like an over-cap one.
+                emitted += 1;
                 // Fires per stale-peer detection during interest sync, which
                 // is dominant on hot contracts. Diagnostic-grade rather than
                 // user-actionable; keep accessible via RUST_LOG=…=debug.
@@ -4547,6 +4700,255 @@ mod tests {
                 rx.recv().await.expect("Disconnect must be sent"),
                 NodeEvent::Disconnect { .. }
             ));
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // #3798 Gap 1: cap stale-contract SyncStateToPeer emission per
+    // Summaries message. Anti-amplification hardening — a peer whose
+    // summary diverges on many contracts must not trigger an unbounded
+    // burst of SyncStateToPeer events in one handler invocation.
+    // ───────────────────────────────────────────────────────────
+    mod stale_sync_cap {
+        use super::super::{
+            MAX_STALE_SYNCS_PER_SUMMARIES, StaleSyncDisposition, count_stale_syncs_emitted,
+            emitted_indices_for_rotation, stale_sync_emit_budget,
+        };
+        use std::collections::HashSet;
+
+        const EMIT: StaleSyncDisposition = StaleSyncDisposition::Emit;
+        const BANNED: StaleSyncDisposition = StaleSyncDisposition::Banned;
+        const NO_STATE: StaleSyncDisposition = StaleSyncDisposition::NoState;
+
+        #[test]
+        fn emit_budget_caps_at_max() {
+            // Below cap: budget is the full count.
+            assert_eq!(stale_sync_emit_budget(0), 0);
+            assert_eq!(stale_sync_emit_budget(1), 1);
+            assert_eq!(
+                stale_sync_emit_budget(MAX_STALE_SYNCS_PER_SUMMARIES - 1),
+                MAX_STALE_SYNCS_PER_SUMMARIES - 1
+            );
+            // At and above cap: budget saturates at the cap.
+            assert_eq!(
+                stale_sync_emit_budget(MAX_STALE_SYNCS_PER_SUMMARIES),
+                MAX_STALE_SYNCS_PER_SUMMARIES
+            );
+            assert_eq!(
+                stale_sync_emit_budget(MAX_STALE_SYNCS_PER_SUMMARIES + 1),
+                MAX_STALE_SYNCS_PER_SUMMARIES
+            );
+            assert_eq!(
+                stale_sync_emit_budget(MAX_STALE_SYNCS_PER_SUMMARIES * 100),
+                MAX_STALE_SYNCS_PER_SUMMARIES
+            );
+        }
+
+        /// The core regression: with far more stale contracts than the cap, the
+        /// loop emits at most MAX_STALE_SYNCS_PER_SUMMARIES events. Without the
+        /// cap this would emit one per contract (here, 200).
+        #[test]
+        fn many_stale_contracts_emit_at_most_cap() {
+            let n = MAX_STALE_SYNCS_PER_SUMMARIES * 100; // 3200 divergent contracts
+            let dispositions = vec![EMIT; n];
+            let emitted = count_stale_syncs_emitted(&dispositions);
+            assert_eq!(
+                emitted, MAX_STALE_SYNCS_PER_SUMMARIES,
+                "a peer diverging on {n} contracts must emit at most the cap \
+                 ({MAX_STALE_SYNCS_PER_SUMMARIES}) SyncStateToPeer events per \
+                 Summaries message, not one per contract"
+            );
+        }
+
+        /// Boundary: exactly cap-many emittable contracts emit all of them.
+        #[test]
+        fn exactly_cap_emits_all() {
+            let dispositions = vec![EMIT; MAX_STALE_SYNCS_PER_SUMMARIES];
+            assert_eq!(
+                count_stale_syncs_emitted(&dispositions),
+                MAX_STALE_SYNCS_PER_SUMMARIES
+            );
+        }
+
+        /// Below cap: emits exactly the emittable count, no spurious cap.
+        #[test]
+        fn below_cap_emits_all_emittable() {
+            let dispositions = vec![EMIT; 5];
+            assert_eq!(count_stale_syncs_emitted(&dispositions), 5);
+            assert_eq!(count_stale_syncs_emitted(&[]), 0);
+        }
+
+        /// Banned / no-state contracts are skipped WITHOUT consuming the budget,
+        /// so the emit count is the number of emittable contracts (capped), and
+        /// a leading run of skips does not starve later emittable contracts when
+        /// the total emittable count is under the cap.
+        #[test]
+        fn skips_do_not_consume_budget() {
+            // 10 banned/no-state skips followed by 3 emittable contracts.
+            // budget = min(13, cap) = 13 (cap is 32), so all 3 emit despite the
+            // skips appearing first.
+            let mut dispositions = vec![BANNED, NO_STATE, BANNED, NO_STATE, BANNED];
+            dispositions.extend([NO_STATE, BANNED, NO_STATE, BANNED, NO_STATE]);
+            dispositions.extend([EMIT, EMIT, EMIT]);
+            assert_eq!(
+                count_stale_syncs_emitted(&dispositions),
+                3,
+                "banned/no-state contracts must be skipped without consuming \
+                 the emit budget"
+            );
+        }
+
+        /// Even with skips interleaved, the number of EMIT events never exceeds
+        /// the cap when there are more than `cap` emittable contracts. Here the
+        /// budget = min(len, cap) where len > cap, so the loop stops at the cap
+        /// (the trailing emittable contracts beyond the cap are deferred).
+        #[test]
+        fn interleaved_skips_still_capped() {
+            // cap*3 emittable contracts, each preceded by one skip → len = cap*6,
+            // budget = cap. The loop counts only EMITs toward the budget and
+            // breaks at the cap.
+            let mut dispositions = Vec::new();
+            for _ in 0..(MAX_STALE_SYNCS_PER_SUMMARIES * 3) {
+                dispositions.push(BANNED);
+                dispositions.push(EMIT);
+            }
+            let emitted = count_stale_syncs_emitted(&dispositions);
+            assert_eq!(
+                emitted, MAX_STALE_SYNCS_PER_SUMMARIES,
+                "emitted SyncStateToPeer events must be capped at \
+                 {MAX_STALE_SYNCS_PER_SUMMARIES} even with skips interleaved"
+            );
+        }
+
+        /// Starvation regression (codex P2 on PR #4468): with more stale
+        /// contracts than the cap, the random rotation must make EVERY contract
+        /// eligible for some rotation start. Otherwise a contract stuck in the
+        /// fixed leading `cap` positions would re-consume the budget every cycle
+        /// and permanently starve the tail. Asserts the union of emitted indices
+        /// over all rotation starts covers the whole stale set.
+        #[test]
+        fn rotation_covers_every_contract_over_cap() {
+            let total = MAX_STALE_SYNCS_PER_SUMMARIES * 3; // 96 > cap
+            let mut covered = HashSet::new();
+            for start in 0..total {
+                for idx in emitted_indices_for_rotation(total, start) {
+                    covered.insert(idx);
+                }
+            }
+            assert_eq!(
+                covered.len(),
+                total,
+                "every one of the {total} stale contracts must be reachable for \
+                 some rotation start — otherwise contracts past the cap are \
+                 permanently starved when the leading prefix stays stale"
+            );
+            // And each cycle still emits exactly the cap (no over/under-emit).
+            for start in 0..total {
+                assert_eq!(
+                    emitted_indices_for_rotation(total, start).len(),
+                    MAX_STALE_SYNCS_PER_SUMMARIES
+                );
+            }
+        }
+
+        /// A contract stuck at original index 0 (its emit keeps failing) must
+        /// NOT prevent an over-cap contract from being attempted. With
+        /// `total = cap + 1`, each rotation window of `cap` consecutive indices
+        /// (mod total) covers all but exactly one index, so there is a rotation
+        /// start whose window includes the tail index while excluding the
+        /// assumed-stuck head index 0 — proving the anti-starvation property the
+        /// deterministic prefix-only loop lacked.
+        #[test]
+        fn stuck_prefix_does_not_block_tail_under_rotation() {
+            let total = MAX_STALE_SYNCS_PER_SUMMARIES + 1; // cap + 1
+            let last = total - 1;
+            let mut found = false;
+            for start in 0..total {
+                let window: HashSet<usize> = emitted_indices_for_rotation(total, start)
+                    .into_iter()
+                    .collect();
+                if window.contains(&last) && !window.contains(&0) {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(
+                found,
+                "there must be a rotation start that attempts the tail contract \
+                 ({last}) without attempting the (assumed-stuck) head contract \
+                 (0); otherwise a stuck head starves the tail"
+            );
+        }
+
+        /// Source-scrape pin: the `Summaries` arm of
+        /// `handle_interest_sync_message` must still wire the emit budget into
+        /// its `for contract in stale_contracts` loop (compute the budget,
+        /// rotate by a random offset when over the cap to avoid starvation,
+        /// break when `emitted >= emit_budget`, and increment `emitted` per
+        /// emission). Guards against a future refactor silently dropping the
+        /// cap or the rotation and re-opening the #3798 Gap 1 amplification
+        /// burst / starvation — the behavioral tests above run against the
+        /// model helpers, not the live loop, so this pin keeps the two in
+        /// lockstep.
+        #[test]
+        fn stale_sync_loop_uses_emit_budget_pin() {
+            const SOURCE: &str = include_str!("node.rs");
+
+            // Bound the search window to the stale-contract emission loop.
+            let loop_anchor = "for contract in stale_contracts {";
+            let start = SOURCE.find(loop_anchor).expect(
+                "stale-contract emission loop not found; the `for contract in \
+                 stale_contracts` loop has been renamed or moved — update this \
+                 pin and re-verify the #3798 Gap 1 cap is still applied",
+            );
+            // End the window at the next sibling loop in the Summaries arm.
+            let window_end = SOURCE[start..]
+                .find("for (key, state_hash) in confirmed_states {")
+                .map(|off| start + off)
+                .unwrap_or(SOURCE.len());
+            // Include the budget computation that immediately precedes the loop.
+            let budget_decl = "let emit_budget = stale_sync_emit_budget(";
+            let budget_pos = SOURCE[..start]
+                .rfind(budget_decl)
+                .expect("emit budget is not computed before the stale-sync loop");
+            let window = &SOURCE[budget_pos..window_end];
+
+            assert!(
+                window.contains("stale_sync_emit_budget("),
+                "stale-sync loop no longer computes the emit budget — the \
+                 #3798 Gap 1 cap has been dropped"
+            );
+            assert!(
+                window.contains("if emitted >= emit_budget {"),
+                "stale-sync loop no longer breaks when the emit budget is \
+                 reached — the #3798 Gap 1 cap is not enforced"
+            );
+            assert!(
+                window.contains("emitted += 1;"),
+                "stale-sync loop no longer counts emissions against the budget \
+                 — the #3798 Gap 1 cap cannot be enforced without it"
+            );
+            assert!(
+                window.contains("MAX_STALE_SYNCS_PER_SUMMARIES"),
+                "stale-sync cap warning no longer references the cap constant"
+            );
+            // Starvation avoidance (codex P2 on #4468): the over-cap branch must
+            // rotate the stale set by a random offset before the loop, else a
+            // stuck leading prefix re-consumes the cap every cycle and starves
+            // the tail.
+            assert!(
+                window.contains("if total_stale > emit_budget {")
+                    && window.contains("rotate_left("),
+                "stale-sync loop no longer rotates the stale set when over the \
+                 cap — over-cap contracts can be permanently starved by a stuck \
+                 prefix (#3798 Gap 1 / #4468 codex P2)"
+            );
+            assert!(
+                window.contains("GlobalRng::random_range("),
+                "stale-sync rotation offset is no longer drawn from GlobalRng — \
+                 a fixed/non-random rotation does not avoid starvation and \
+                 breaks simulation determinism"
+            );
         }
     }
 }
