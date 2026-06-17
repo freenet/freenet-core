@@ -144,6 +144,18 @@ pub(crate) struct RouterSnapshotInfo {
     pub connect_forward_data_range: Option<(f64, f64)>,
     pub connect_forward_events: Option<usize>,
     pub connect_forward_peer_adjustments: Option<usize>,
+    /// Current number of open file descriptors held by this process, or `None`
+    /// where it can't be read cheaply (Linux-only, via `/proc/self/fd`).
+    ///
+    /// Populated by `Ring` on the `router_snapshot` cadence, not by the router
+    /// model. Paired with [`fd_soft_limit`](Self::fd_soft_limit) it makes
+    /// fd-exhaustion headroom observable in central telemetry: open fds reaching
+    /// the soft limit (`EMFILE`) drove the v0.2.73 gateway crash-loop and was
+    /// invisible to the collector at the time. See #4440.
+    pub open_fds: Option<u64>,
+    /// The `RLIMIT_NOFILE` soft limit (the ceiling that triggers `EMFILE`), or
+    /// `None` on non-unix. Populated by `Ring`; see [`open_fds`](Self::open_fds).
+    pub fd_soft_limit: Option<u64>,
     /// Per-operation-type estimator curves, keyed by op type name (e.g., "GET").
     pub per_op_curves: HashMap<String, PerOpCurves>,
     /// Renegade predictor diagnostics
@@ -888,6 +900,9 @@ impl Router {
             connect_forward_data_range: None,
             connect_forward_events: None,
             connect_forward_peer_adjustments: None,
+            // Node-health gauges populated by Ring on the snapshot cadence (#4440).
+            open_fds: None,
+            fd_soft_limit: None,
             // Renegade predictor diagnostics
             renegade_failure_events: self.renegade_predictor.len(),
             renegade_response_time_events: self.renegade_predictor.stage_sizes().1,
