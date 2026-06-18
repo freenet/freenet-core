@@ -5143,6 +5143,19 @@ impl P2pConnManager {
         new_state: freenet_stdlib::prelude::WrappedState,
         target_result: crate::operations::update::BroadcastTargetResult,
     ) {
+        // Skip the whole fan-out when we hold no local state for `key`: there is
+        // nothing to broadcast, and the per-target `get_contract_summary` calls
+        // below are the residual #4473 summarize storm on this path. Mirrors the
+        // production `broadcast_to_single_peer` gate. See
+        // `broadcast_queue::should_broadcast_contract`.
+        if !super::broadcast_queue::should_broadcast_contract(op_manager, &key) {
+            tracing::trace!(
+                contract = %key,
+                "Skipping broadcast fan-out - contract not hosted or in use"
+            );
+            return;
+        }
+
         // Get our summary once for all targets
         let our_summary = op_manager
             .interest_manager
@@ -7058,6 +7071,47 @@ mod tests {
             send_pos > remove_pos,
             "the PeerDisconnected send must happen on the sender taken out by \
              pending_op_results.remove (send-before-drop). Arm body:\n{body}"
+        );
+    }
+
+    /// #4473 path-B summarize-storm pin (sim-inline counterpart of
+    /// `broadcast_queue::broadcast_single_peer_gates_summarize_on_hosted_or_in_use_pin`).
+    ///
+    /// The simulation-only `broadcast_state_to_peers` has its own inline
+    /// `get_contract_summary` (computed once for all targets). It must skip the
+    /// whole fan-out via `should_broadcast_contract` BEFORE that call, so the
+    /// sim path mirrors the production `broadcast_to_single_peer` gate and the
+    /// behavioral broadcast simulation tests can't silently regress the storm.
+    #[test]
+    fn broadcast_state_to_peers_gates_summarize_on_hosted_or_in_use() {
+        const SOURCE: &str = include_str!("p2p_protoc.rs");
+
+        let fn_anchor = "async fn broadcast_state_to_peers(";
+        let fn_start = SOURCE
+            .find(fn_anchor)
+            .expect("broadcast_state_to_peers renamed or removed");
+        // Bound the slice at the next `async fn ` so the assertion can't match a
+        // later function's body.
+        let after_header = &SOURCE[fn_start + fn_anchor.len()..];
+        let body_end = after_header
+            .find("\n    async fn ")
+            .map(|p| fn_start + fn_anchor.len() + p)
+            .unwrap_or(SOURCE.len());
+        let body = &SOURCE[fn_start..body_end];
+
+        let gate_pos = body.find("should_broadcast_contract(op_manager").expect(
+            "broadcast_state_to_peers must gate on should_broadcast_contract — a \
+             bare get_contract_summary here reintroduces the #4473 summarize storm \
+             on the sim-inline broadcast path",
+        );
+        let summarize_pos = body
+            .find("get_contract_summary(")
+            .expect("broadcast_state_to_peers get_contract_summary call not found");
+        assert!(
+            gate_pos < summarize_pos,
+            "broadcast_state_to_peers must call should_broadcast_contract (offset \
+             {gate_pos}) BEFORE get_contract_summary (offset {summarize_pos}) so the \
+             fan-out is skipped for a contract we hold no state for. Body:\n{body}"
         );
     }
 
