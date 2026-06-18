@@ -351,30 +351,44 @@ verify_service() {
                 if [[ -z "$freenet_pid" ]] || [[ "$freenet_pid" == "0" ]]; then
                     # Fallback: locate the freenet process by command line. This
                     # is global, so on a multi-instance host it can match a
-                    # process belonging to a DIFFERENT unit. Attribute the match
-                    # to THIS unit via its cgroup (systemd places each unit's
-                    # processes under .../<unit>.service/...) before trusting it;
-                    # a match that isn't in $service_arg's cgroup is discarded so
-                    # a sibling instance can't bless this (active-but-exited)
-                    # unit. If we can't read the cgroup, we conservatively drop
-                    # the candidate (fail closed) rather than risk a cross-unit
-                    # false success.
+                    # process belonging to a DIFFERENT unit. We therefore
+                    # attribute each candidate to THIS unit via its cgroup
+                    # (systemd places each unit's processes under
+                    # .../<unit>.service/...) and pick the FIRST candidate that
+                    # belongs to $service_arg. Iterating all matches (not just
+                    # the first) matters on multi-instance hosts: if the first
+                    # pgrep hit is a sibling's process, a later hit may still be
+                    # this unit's. If none belongs to this unit (or the cgroup
+                    # can't be read), freenet_pid stays empty → fail closed,
+                    # rather than blessing this (active-but-exited) unit with a
+                    # sibling's live process.
+                    #
+                    # The pattern uses ERE alternation `(A|B)` (pgrep -f uses
+                    # ERE). It matches the freenet gateway command line, which is
+                    # `freenet network ... --is-gateway ...`.
+                    #
                     # `|| true`: pgrep exits non-zero when it finds no match,
                     # which under `set -euo pipefail` would otherwise abort the
                     # function here (skipping the active-but-no-process handling
-                    # below). An empty candidate_pid is the intended "not found".
+                    # below). An empty match list is the intended "not found".
                     local candidate_pid
-                    candidate_pid=$(pgrep -f "freenet.*--is-gateway\|freenet.*network" | head -1 || true)
-                    # Fixed-string match (`-F`): the unit token is matched
-                    # literally so the `.` in `<unit>.service` is not a regex
-                    # wildcard, and `freenet-gateway.service` does not match a
-                    # sibling like `freenet-gateway-hector.service` (the `-` vs
-                    # `.` boundary differs).
-                    if [[ -n "$candidate_pid" ]] \
-                        && sudo cat "/proc/$candidate_pid/cgroup" 2>/dev/null \
+                    while IFS= read -r candidate_pid; do
+                        [[ -z "$candidate_pid" ]] && continue
+                        # Fixed-string match (`-F`): the unit token is matched
+                        # literally so the `.` in `<unit>.service` is not a regex
+                        # wildcard, and `freenet-gateway.service` does not match
+                        # a sibling like `freenet-gateway-hector.service` (the
+                        # `-` vs `.` boundary differs).
+                        if sudo cat "/proc/$candidate_pid/cgroup" 2>/dev/null \
                             | grep -qF "$service_arg.service"; then
-                        freenet_pid="$candidate_pid"
-                    else
+                            freenet_pid="$candidate_pid"
+                            break
+                        fi
+                    done < <(pgrep -f "freenet.*network|freenet.*--is-gateway" || true)
+                    # If no candidate was attributed to this unit, clear the
+                    # leftover MainPID "0"/"" so the active-but-no-process branch
+                    # below fires.
+                    if [[ "$freenet_pid" == "0" ]]; then
                         freenet_pid=""
                     fi
                 fi

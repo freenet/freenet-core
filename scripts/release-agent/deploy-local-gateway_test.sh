@@ -61,8 +61,17 @@ case "\$1" in
   chown) exit 0 ;;
   readlink) echo "$TMP/install/freenet"; exit 0 ;;
   cat)
-    # Only the cgroup read is modelled; echo whatever the test configured.
-    cat "$TMP/cgroup-content" 2>/dev/null || true
+    # Only the cgroup read is modelled: "/proc/<pid>/cgroup". Return per-PID
+    # content from \$TMP/cgroup-<pid> if the test set it, else the default
+    # \$TMP/cgroup-content. Lets a multi-candidate test give each PID a
+    # different unit cgroup.
+    proc_path="\$2"
+    pid=\$(printf '%s' "\$proc_path" | sed -n 's#^/proc/\([0-9]*\)/cgroup\$#\1#p')
+    if [[ -n "\$pid" && -f "$TMP/cgroup-\$pid" ]]; then
+        cat "$TMP/cgroup-\$pid"
+    else
+        cat "$TMP/cgroup-content" 2>/dev/null || true
+    fi
     exit 0
     ;;
   *) exec "\$@" ;;
@@ -104,13 +113,36 @@ EOF
     chmod +x "$TMP/bin/systemctl"
 }
 
-# `pgrep` stub: $1 controls whether a freenet process is "found".
+# `pgrep` stub: $1 controls whether a freenet process is "running" on the box.
+#
+# FAITHFUL to `pgrep -f`: it applies the caller's regex (ERE, last argument)
+# against a REALISTIC freenet gateway command line, so a broken production
+# pattern (e.g. a literal `\|` that matches nothing) makes this stub return no
+# match — the test then catches it instead of masking it. Emits PID 4242 only
+# when "running" AND the pattern matches the fake cmdline; exits 1 otherwise
+# (matching real pgrep's no-match exit).
 write_pgrep() {
-    if [[ "$1" == "found" ]]; then
-        printf '#!/bin/bash\necho 4242\n' > "$TMP/bin/pgrep"
-    else
-        printf '#!/bin/bash\nexit 1\n' > "$TMP/bin/pgrep"
-    fi
+    local running="$1"
+    # "multi" mode emits TWO matching PIDs (4241 a sibling, 4242 this unit) to
+    # exercise the iterate-all-candidates path; "found" emits one (4242).
+    cat > "$TMP/bin/pgrep" <<EOF
+#!/bin/bash
+running="$running"
+# A representative running freenet gateway command line.
+cmdline="/usr/local/bin/freenet network --is-gateway --skip-load-from-network"
+# The regex pgrep -f matches against is the LAST argument.
+pat="\${@: -1}"
+if [[ "\$running" == "multi" ]] && printf '%s' "\$cmdline" | grep -Eq "\$pat"; then
+    echo 4241
+    echo 4242
+    exit 0
+fi
+if [[ "\$running" == "found" ]] && printf '%s' "\$cmdline" | grep -Eq "\$pat"; then
+    echo 4242
+    exit 0
+fi
+exit 1
+EOF
     chmod +x "$TMP/bin/pgrep"
 }
 
@@ -204,6 +236,22 @@ if [[ "$rc" == "0" ]]; then
 else
     fail "verify_service: a this-unit freenet child should verify even when MainPID is 0 (got $rc)"
 fi
+
+# ── MainPID 0, TWO pgrep matches: the first (4241) is a sibling, the second
+#    (4242) belongs to this unit → must iterate past the sibling and verify.
+#    Pins the iterate-all-candidates behaviour (not just the first pgrep hit).
+write_systemctl 0 true 0      # active, MainPID 0
+write_pgrep multi             # pgrep returns 4241 then 4242
+echo "0::/system.slice/freenet-gateway-hector.service" > "$TMP/cgroup-4241"  # sibling
+echo "0::/system.slice/freenet-gateway.service"        > "$TMP/cgroup-4242"  # this unit
+echo "0::/system.slice/freenet-gateway.service" > "$TMP/cgroup-content"      # default fallback
+rc=$(run_deploy)
+if [[ "$rc" == "0" ]]; then
+    pass "verify_service: iterates past a sibling pgrep match to this unit's process → exit 0"
+else
+    fail "verify_service: should iterate past the first (sibling) pgrep match to this unit's (got $rc)"
+fi
+rm -f "$TMP/cgroup-4241" "$TMP/cgroup-4242"
 
 # ── result ────────────────────────────────────────────────────────────
 if (( FAILURES > 0 )); then

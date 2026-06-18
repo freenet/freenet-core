@@ -15,8 +15,13 @@
 #   success           binary is on the target version AND the service is active
 #                     (new-agent path) — the update is confirmed.
 #   success-fallback  binary is on the target version but the agent predates
-#                     the `service_active` field — fall back to binary-only
-#                     verification (with a warning). Backward compatibility.
+#                     the `service_active` field, so service health is
+#                     UNVERIFIABLE. This is a classification only — it does NOT
+#                     mean "accept". As of #4492 the consumer (gateway-update.yml)
+#                     fails closed on this token by default and accepts a
+#                     binary-only check only when explicitly opted in via the
+#                     `allow_binary_only_fallback` input. The policy lives in the
+#                     workflow, not here.
 #   wait              not yet converged: binary not on target, OR binary on
 #                     target but service not active (the vega case), OR the
 #                     gateway is unreachable / returned malformed JSON. The
@@ -58,7 +63,37 @@ verify_version_decision() {
             echo "wait"
         fi
     else
-        # Old agent without the field: fall back to binary-only verification.
+        # Old agent without the field: service health is unverifiable here.
+        # Emit the token; the consumer decides whether to accept binary-only
+        # (off by default since #4492 — see the header).
         echo "success-fallback"
+    fi
+}
+
+# Consumer-side policy for the `success-fallback` token (#4492). Extracted here
+# (rather than inline in gateway-update.yml) so the fail-closed default is unit-
+# tested and cannot silently regress — the inline-in-YAML version is exactly the
+# kind of untested logic this file exists to replace.
+#
+# Usage:
+#   decision=$(fallback_decision "$DECISION_TOKEN" "$ALLOW_BINARY_ONLY_FALLBACK")
+#
+# Echoes one token on stdout:
+#   accept  the workflow may treat this as a successful update. ONLY for
+#           `success-fallback` WHEN `allow` is exactly "true" (the explicit
+#           opt-in). A genuine `success` is the workflow's own concern and is
+#           NOT routed through here.
+#   hold    do NOT accept: keep polling and fail closed at the deadline. This is
+#           the default for `success-fallback` (missing service_active → service
+#           health unverifiable → must not be reported as success).
+#
+# `allow` is treated as opt-in: anything other than the exact string "true"
+# (empty on the release-trigger path, "false", garbage) yields `hold`.
+fallback_decision() {
+    local token="$1" allow="$2"
+    if [[ "$token" == "success-fallback" && "$allow" == "true" ]]; then
+        echo "accept"
+    else
+        echo "hold"
     fi
 }

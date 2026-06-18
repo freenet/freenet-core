@@ -284,7 +284,9 @@ jobs:
                 # like `wait` (keep polling, fail at the deadline) and tell the
                 # operator to update the agent. Only the explicit
                 # allow_binary_only_fallback opt-in restores the old behaviour.
-                if [[ "${ALLOW_BINARY_ONLY_FALLBACK:-false}" == "true" ]]; then
+                # The accept/hold policy lives in fallback_decision() (sourced
+                # above) so it is unit-tested rather than inline-untested.
+                if [[ "$(fallback_decision "$DECISION" "${ALLOW_BINARY_ONLY_FALLBACK:-false}")" == "accept" ]]; then
                   echo "::warning::Gateway ${{ matrix.gateway.name }} agent predates the service-health check (no 'service_active' in /version); allow_binary_only_fallback=true, so accepting binary-only verification. Update the release-agent on this gateway to enable the stronger check."
                   echo "✓ Gateway ${{ matrix.gateway.name }} now reports version $INSTALLED (binary-only check)"
                   exit 0

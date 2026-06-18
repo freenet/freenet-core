@@ -5,8 +5,10 @@
 # This is the exact vega v0.2.71 incident path:
 #   - present `service_active:false` MUST NOT report success (the load-bearing
 #     assertion: that is what let the down gateway look healthy);
-#   - an ABSENT field MUST fall back to binary-only success (backward compat
-#     with agents that predate the field);
+#   - an ABSENT field classifies as `success-fallback` (backward-compat token
+#     for agents predating the field). NOTE: the token is not itself an
+#     "accept" — since #4492 the consumer workflow fails closed on it by
+#     default; this test pins the classifier, not the consumer's policy;
 #   - present `service_active:true` + matching version MUST report success.
 #
 # The real function is sourced (not copied) so the test cannot drift from the
@@ -99,6 +101,38 @@ check "malformed JSON response → wait" \
 check "new agent: service_active null + binary on target → wait" \
     '{"version":"0.2.71","service_active":null}' \
     "$TARGET" "wait"
+
+# ── fallback_decision: consumer policy for the success-fallback token (#4492) ──
+#
+# This is the load-bearing fail-closed default: a missing service_active field
+# must NOT be accepted as success unless the operator explicitly opts in.
+
+check_fallback() {
+    # check_fallback <description> <token> <allow> <expected>
+    local desc="$1" token="$2" allow="$3" expected="$4" actual
+    actual=$(fallback_decision "$token" "$allow")
+    if [[ "$actual" == "$expected" ]]; then
+        echo "ok   - $desc"
+    else
+        echo "FAIL - $desc (got '$actual', expected '$expected')" >&2
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
+# Default (no opt-in): fall back is NOT accepted — fail closed. The empty
+# string is what the release-trigger path passes (no workflow input).
+check_fallback "success-fallback + allow empty → hold (fail closed, release path)" \
+    "success-fallback" "" "hold"
+check_fallback "success-fallback + allow=false → hold (fail closed)" \
+    "success-fallback" "false" "hold"
+check_fallback "success-fallback + allow=garbage → hold (only exact 'true' opts in)" \
+    "success-fallback" "yes" "hold"
+# Explicit opt-in: accepted.
+check_fallback "success-fallback + allow=true → accept (explicit opt-in)" \
+    "success-fallback" "true" "accept"
+# Any non-fallback token never routes through here as accept.
+check_fallback "wait token + allow=true → hold (only success-fallback can accept)" \
+    "wait" "true" "hold"
 
 # ── result ────────────────────────────────────────────────────────────
 
