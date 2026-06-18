@@ -342,8 +342,11 @@ verify_service() {
                 # Fall back to the global pgrep only when MainPID is
                 # unavailable/0 (e.g. an ExecStart wrapper whose MainPID points
                 # at the shell rather than the freenet child).
+                # `|| true`: a non-zero exit (systemctl error / no MainPID)
+                # must yield an empty result, NOT abort the function via
+                # `set -e`. We handle "no PID" explicitly below.
                 local freenet_pid
-                freenet_pid=$(systemctl show -p MainPID --value "$service_arg.service" 2>/dev/null)
+                freenet_pid=$(systemctl show -p MainPID --value "$service_arg.service" 2>/dev/null || true)
 
                 if [[ -z "$freenet_pid" ]] || [[ "$freenet_pid" == "0" ]]; then
                     # Fallback: locate the freenet process by command line. This
@@ -356,11 +359,20 @@ verify_service() {
                     # unit. If we can't read the cgroup, we conservatively drop
                     # the candidate (fail closed) rather than risk a cross-unit
                     # false success.
+                    # `|| true`: pgrep exits non-zero when it finds no match,
+                    # which under `set -euo pipefail` would otherwise abort the
+                    # function here (skipping the active-but-no-process handling
+                    # below). An empty candidate_pid is the intended "not found".
                     local candidate_pid
-                    candidate_pid=$(pgrep -f "freenet.*--is-gateway\|freenet.*network" | head -1)
+                    candidate_pid=$(pgrep -f "freenet.*--is-gateway\|freenet.*network" | head -1 || true)
+                    # Fixed-string match (`-F`): the unit token is matched
+                    # literally so the `.` in `<unit>.service` is not a regex
+                    # wildcard, and `freenet-gateway.service` does not match a
+                    # sibling like `freenet-gateway-hector.service` (the `-` vs
+                    # `.` boundary differs).
                     if [[ -n "$candidate_pid" ]] \
                         && sudo cat "/proc/$candidate_pid/cgroup" 2>/dev/null \
-                            | grep -q "$service_arg.service"; then
+                            | grep -qF "$service_arg.service"; then
                         freenet_pid="$candidate_pid"
                     else
                         freenet_pid=""

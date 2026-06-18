@@ -115,11 +115,13 @@ write_pgrep() {
 }
 
 run_deploy() {
+    # Capture combined output to $TMP/last-output so assertions can inspect
+    # WHICH path was taken (not just the exit code), then echo the exit code.
     bash "$DEPLOY_SH" \
         --binary "$TMP/source-binary" \
         --service freenet-gateway \
         --install-path "$TMP/install/freenet" \
-        >/dev/null 2>&1
+        >"$TMP/last-output" 2>&1
     echo $?
 }
 
@@ -163,6 +165,14 @@ if [[ "$rc" != "0" ]]; then
     pass "verify_service: active-but-no-process → non-zero exit"
 else
     fail "verify_service: active-but-no-process must NOT exit 0 (got $rc)"
+fi
+# It must reach the GRACEFUL active-but-no-process branch, not abort via set -e
+# on the pgrep-not-found command substitution (which would also exit non-zero,
+# but at the wrong place, skipping the retry). Assert the branch's message.
+if grep -q "no running freenet process could be found" "$TMP/last-output"; then
+    pass "verify_service: active-but-no-process reaches graceful branch (no set -e abort on pgrep)"
+else
+    fail "verify_service: active-but-no-process did not reach its graceful branch (likely set -e abort)"
 fi
 
 # ── active-but-no-process for THIS unit, but ANOTHER freenet process is
