@@ -3108,6 +3108,82 @@ mod tests {
         assert!(!manager.contract_in_use(&contract));
     }
 
+    /// Behavioural regression for the #4473 UPDATE auto-fetch gate.
+    ///
+    /// `OpManager::try_auto_fetch_contract` self-heal-fetches a contract only
+    /// when `self.ring.contract_in_use(key)` — i.e. a local client or a
+    /// downstream peer subscriber depends on it. Before the gate, an inbound
+    /// UPDATE/broadcast for a phantom-interest contract (the #4404
+    /// placement-migration after-effect: stale interest with no subscriber)
+    /// spawned a `fetch_contract` sub-op every time the 5-minute cooldown
+    /// lapsed — the residual #4473 churn. This drives the predicate the gate
+    /// keys on through real subscription registration/teardown and asserts the
+    /// decision the gate makes at each step:
+    ///   phantom (no subscriber)            → gate skips  (would NOT auto-fetch)
+    ///   live local client                  → gate passes (WOULD auto-fetch)
+    ///   live downstream subscriber         → gate passes (WOULD auto-fetch)
+    ///   upstream network subscription only → gate skips  (would NOT auto-fetch)
+    /// and that teardown returns the decision to "skip", so the gate re-arms
+    /// only while a real subscriber exists.
+    #[test]
+    fn auto_fetch_gate_skips_phantom_contracts_and_passes_served_ones() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+
+        // Phantom: interest carried with no subscriber of any kind. The gate
+        // (`!contract_in_use`) skips it — no auto-fetch sub-op spawned, which is
+        // the whole point of the #4473 fix.
+        let phantom = make_contract_key(40);
+        assert!(
+            !manager.contract_in_use(&phantom),
+            "phantom contract (no subscriber) MUST be gated out of auto-fetch (#4473)"
+        );
+
+        // A live local client makes the contract genuinely needed → gate passes.
+        let client_served = make_contract_key(41);
+        let client = crate::client_events::ClientId::next();
+        manager.add_client_subscription(client_served.id(), client);
+        assert!(
+            manager.contract_in_use(&client_served),
+            "a contract with a live local-client subscription MUST pass the \
+             auto-fetch gate so genuinely-needed state still self-heals"
+        );
+        // Teardown re-arms the skip: once the client leaves, the contract is
+        // phantom again and must NOT keep auto-fetching.
+        manager.remove_client_subscription(client_served.id(), client);
+        assert!(
+            !manager.contract_in_use(&client_served),
+            "auto-fetch gate must re-close once the last client unsubscribes"
+        );
+
+        // A downstream peer subscriber likewise makes the fetch legitimate.
+        let downstream_served = make_contract_key(42);
+        let peer = make_peer_key(9);
+        manager.add_downstream_subscriber(&downstream_served, peer.clone());
+        assert!(
+            manager.contract_in_use(&downstream_served),
+            "a contract with a downstream subscriber MUST pass the auto-fetch gate"
+        );
+        manager.remove_downstream_subscriber(&downstream_served, &peer);
+        assert!(
+            !manager.contract_in_use(&downstream_served),
+            "auto-fetch gate must re-close once the last downstream subscriber leaves"
+        );
+
+        // An upstream network subscription ALONE is deliberately excluded: it
+        // renews its lease unboundedly (see `contract_in_use` rustdoc) and is
+        // meant to be torn down, not kept alive by self-heal fetches. So a
+        // contract we are merely network-subscribed to stays gated out.
+        let upstream_only = make_contract_key(43);
+        manager.subscribe(upstream_only);
+        assert!(manager.is_subscribed(&upstream_only));
+        assert!(
+            !manager.contract_in_use(&upstream_only),
+            "an upstream-network-subscription-only contract MUST stay gated out \
+             of auto-fetch (#4473): keeping it would re-introduce the phantom churn"
+        );
+        manager.unsubscribe(&upstream_only);
+    }
+
     /// Generation flow through `HostingManager`: bumping the state
     /// generation BEFORE `record_contract_access` makes the captured
     /// generation match; subsequently bumping the generation simulates

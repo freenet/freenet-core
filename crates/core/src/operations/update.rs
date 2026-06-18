@@ -143,11 +143,43 @@ impl OpManager {
     /// the node by fetching the contract directly from the UPDATE sender, who
     /// is known to have the contract.
     ///
+    /// Gated to contracts we actually have a reason to hold: skipped unless a
+    /// local client or a downstream peer is subscribed (`contract_in_use`).
     /// Rate-limited: at most one fetch attempt per contract per 5 minutes.
     pub(crate) fn try_auto_fetch_contract(&self, key: &ContractKey, sender_addr: SocketAddr) {
         use crate::config::GlobalSimulationTime;
 
         let instance_id = *key.id();
+
+        // Don't self-heal-fetch a contract nothing on this node depends on.
+        // An UPDATE/broadcast for a contract we carry only phantom interest in
+        // (e.g. the #4404 placement migration left stale interest with no
+        // subscriber) reaches this path and would spawn a sub-op GET — a
+        // `fetch_contract` span burst against state we have no client or
+        // downstream subscriber to serve. The existing 5-minute cooldown only
+        // *throttles* that to one burst per contract per window; gating on
+        // `contract_in_use` (a live local-client subscription or a downstream
+        // peer subscriber) stops it at the source. This is the fetch-path
+        // analogue of the #4475 / #4482 `is_hosting_contract || contract_in_use`
+        // summarize gates. We intentionally do NOT also accept
+        // `is_hosting_contract` here: on this path the merge already failed
+        // because we lack the contract, so hosting is moot; nor a bare upstream
+        // network subscription, which `contract_in_use` deliberately excludes
+        // (an orphaned upstream sub renews its lease unboundedly and is meant to
+        // be torn down, not kept alive by self-heal fetches — see
+        // `HostingManager::contract_in_use`). A contract that gains a real
+        // local client or downstream subscriber becomes `contract_in_use` and
+        // its next inbound UPDATE re-arms this fetch.
+        if !self.ring.contract_in_use(key) {
+            tracing::debug!(
+                contract = %key,
+                sender = %sender_addr,
+                "Skipping auto-fetch: no local client or downstream subscriber \
+                 depends on this contract (phantom interest)"
+            );
+            return;
+        }
+
         let now_ms = GlobalSimulationTime::read_time_ms();
 
         // Atomic rate-limit: try to insert a new entry. If one exists and hasn't
@@ -1388,6 +1420,44 @@ mod tests {
             return_pos < notify_pos,
             "early return on inequality MUST precede the notify_node_event \
              send — otherwise mismatched summaries would still be transmitted"
+        );
+    }
+
+    /// Pin (#4473): `try_auto_fetch_contract` MUST gate on
+    /// `self.ring.contract_in_use(...)` and early-return BEFORE it spawns a
+    /// sub-op GET (`start_targeted_sub_op_get`). Without the gate, an UPDATE
+    /// for a contract this node carries only phantom interest in (no client,
+    /// no downstream subscriber) spawns a `fetch_contract` sub-op every time
+    /// the per-contract cooldown lapses — the residual #4473 churn the gate
+    /// stops at the source. The existing 5-minute cooldown only throttles
+    /// that; it does not prevent it. If a refactor drops this gate or moves it
+    /// after the spawn, the storm regresses silently (all behavioural tests
+    /// still pass), so pin the ordering at the source level.
+    #[test]
+    fn try_auto_fetch_contract_gates_on_contract_in_use_before_spawn() {
+        let src = include_str!("update.rs");
+        let fn_start = src
+            .find("pub(crate) fn try_auto_fetch_contract(")
+            .expect("try_auto_fetch_contract not found");
+        let fn_src = &src[fn_start..];
+
+        let gate_pos = fn_src.find("self.ring.contract_in_use(key)").expect(
+            "try_auto_fetch_contract MUST gate on self.ring.contract_in_use(key) \
+             so phantom-interest contracts are not auto-fetched (#4473)",
+        );
+        let return_pos = fn_src[gate_pos..]
+            .find("return;")
+            .map(|p| gate_pos + p)
+            .expect("the contract_in_use gate must early-return when not in use");
+        let spawn_pos = fn_src
+            .find("start_targeted_sub_op_get")
+            .expect("try_auto_fetch_contract must still spawn the sub-op GET on the in-use path");
+
+        assert!(
+            gate_pos < return_pos && return_pos < spawn_pos,
+            "the contract_in_use gate + early return MUST precede the \
+             start_targeted_sub_op_get spawn, or phantom-interest contracts \
+             regress the #4473 fetch_contract churn"
         );
     }
 }
