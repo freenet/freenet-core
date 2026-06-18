@@ -282,6 +282,10 @@ pub(crate) struct RoutingPredictor {
     next_peer_id: u64,
     /// Running prediction accuracy tracker for failure predictions.
     accuracy: PredictionAccuracy,
+    /// Accuracy tracker for the response-time regression stage.
+    response_time_accuracy: RegressionAccuracy,
+    /// Accuracy tracker for the transfer-speed regression stage.
+    transfer_speed_accuracy: RegressionAccuracy,
     /// When true, skip periodic training and accuracy tracking (batch loading).
     batch_mode: bool,
     /// Reference time (hours since epoch at predictor creation).
@@ -344,6 +348,38 @@ impl PredictionAccuracy {
     }
 }
 
+/// Tracks regression prediction accuracy (continuous targets such as response
+/// time and transfer speed). Unlike the binary failure stage there is no Brier
+/// score; quality is judged from the spread of (predicted, actual) pairs, which
+/// the dashboard renders as a predicted-vs-actual scatter and summarizes as a
+/// median absolute percentage error over the retained window.
+struct RegressionAccuracy {
+    total: u64,
+    /// Ring buffer of recent (predicted, actual) pairs for visualization.
+    recent_pairs: VecDeque<(f64, f64)>,
+}
+
+impl RegressionAccuracy {
+    fn new() -> Self {
+        RegressionAccuracy {
+            total: 0,
+            recent_pairs: VecDeque::new(),
+        }
+    }
+
+    fn record(&mut self, predicted: f64, actual: f64) {
+        // Drop non-finite samples so a single bad division can't poison the view.
+        if !predicted.is_finite() || !actual.is_finite() {
+            return;
+        }
+        self.total += 1;
+        if self.recent_pairs.len() >= MAX_ACCURACY_HISTORY {
+            self.recent_pairs.pop_front();
+        }
+        self.recent_pairs.push_back((predicted, actual));
+    }
+}
+
 impl std::fmt::Debug for RoutingPredictor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RoutingPredictor")
@@ -367,6 +403,8 @@ impl RoutingPredictor {
             lru_generation: 0,
             next_peer_id: 0,
             accuracy: PredictionAccuracy::new(),
+            response_time_accuracy: RegressionAccuracy::new(),
+            transfer_speed_accuracy: RegressionAccuracy::new(),
             batch_mode: false,
             reference_time_hours: wall_clock_hours(),
         }
@@ -404,13 +442,27 @@ impl RoutingPredictor {
     ) {
         let actual_failure = if outcome.success { 0.0 } else { 1.0 };
 
-        // Track prediction accuracy (skip in batch mode — no trained model yet)
+        // Track prediction accuracy (skip in batch mode — no trained model yet).
+        // Each stage is scored against the *current* model, i.e. before this
+        // event's own observation is added below, so a prediction is never graded
+        // against data that already contains its answer.
         if !self.batch_mode {
-            if let Some(predicted_failure) = self
-                .failure_stage
-                .predict(&self.make_observation_immutable(peer, contract_location, distance, time))
-            {
+            let query = self.make_observation_immutable(peer, contract_location, distance, time);
+            if let Some(predicted_failure) = self.failure_stage.predict(&query) {
                 self.accuracy.record(predicted_failure, actual_failure);
+            }
+            // Regression stages only have a ground-truth actual on timed successes.
+            if outcome.success {
+                if let Some(actual_rt) = outcome.time_to_response_start_secs {
+                    if let Some(predicted_rt) = self.response_time_stage.predict(&query) {
+                        self.response_time_accuracy.record(predicted_rt, actual_rt);
+                    }
+                }
+                if let Some(actual_ts) = outcome.transfer_speed_bps {
+                    if let Some(predicted_ts) = self.transfer_speed_stage.predict(&query) {
+                        self.transfer_speed_accuracy.record(predicted_ts, actual_ts);
+                    }
+                }
             }
         }
 
@@ -523,6 +575,24 @@ impl RoutingPredictor {
 
     pub fn recent_accuracy_pairs(&self) -> &VecDeque<(f64, f64)> {
         &self.accuracy.recent_pairs
+    }
+
+    /// Recent (predicted_secs, actual_secs) pairs for the response-time stage.
+    pub fn response_time_accuracy_pairs(&self) -> &VecDeque<(f64, f64)> {
+        &self.response_time_accuracy.recent_pairs
+    }
+
+    /// Recent (predicted_bps, actual_bps) pairs for the transfer-speed stage.
+    pub fn transfer_speed_accuracy_pairs(&self) -> &VecDeque<(f64, f64)> {
+        &self.transfer_speed_accuracy.recent_pairs
+    }
+
+    pub fn response_time_predictions_evaluated(&self) -> u64 {
+        self.response_time_accuracy.total
+    }
+
+    pub fn transfer_speed_predictions_evaluated(&self) -> u64 {
+        self.transfer_speed_accuracy.total
     }
 
     pub fn stage_sizes(&self) -> (usize, usize, usize) {
@@ -954,5 +1024,68 @@ mod tests {
             "Should have evaluated some predictions",
         );
         assert!(predictor.brier_score().is_some());
+    }
+
+    #[test]
+    fn regression_accuracy_tracked_for_timing_stages() {
+        let mut predictor = RoutingPredictor::new(10000);
+        let peer = make_peer();
+        let contract = Location::try_from(0.5).unwrap();
+
+        // Warm up the timing stages past MIN_OBSERVATIONS_FOR_PREDICTION so the
+        // next timed successes produce a prediction that gets scored.
+        for i in 0..50 {
+            predictor.record_at_time(
+                &peer,
+                contract,
+                0.1,
+                success_timed(0.1, 1000.0),
+                i as f64 * 0.01,
+            );
+        }
+        for i in 50..60 {
+            predictor.record_at_time(
+                &peer,
+                contract,
+                0.1,
+                success_timed(0.1, 1000.0),
+                i as f64 * 0.01,
+            );
+        }
+
+        assert!(
+            predictor.response_time_predictions_evaluated() > 0,
+            "response-time predictions should be scored once the stage is trained",
+        );
+        assert!(
+            predictor.transfer_speed_predictions_evaluated() > 0,
+            "transfer-speed predictions should be scored once the stage is trained",
+        );
+        assert!(
+            !predictor.response_time_accuracy_pairs().is_empty(),
+            "response-time accuracy pairs should be recorded for the scatter plot",
+        );
+        assert!(
+            !predictor.transfer_speed_accuracy_pairs().is_empty(),
+            "transfer-speed accuracy pairs should be recorded for the scatter plot",
+        );
+    }
+
+    #[test]
+    fn regression_accuracy_not_tracked_for_failures() {
+        let mut predictor = RoutingPredictor::new(10000);
+        let peer = make_peer();
+        let contract = Location::try_from(0.5).unwrap();
+
+        // Failures carry no timing ground truth, so the regression stages must
+        // never accumulate accuracy samples from them.
+        for i in 0..60 {
+            predictor.record_at_time(&peer, contract, 0.1, failure(), i as f64 * 0.01);
+        }
+
+        assert_eq!(predictor.response_time_predictions_evaluated(), 0);
+        assert_eq!(predictor.transfer_speed_predictions_evaluated(), 0);
+        assert!(predictor.response_time_accuracy_pairs().is_empty());
+        assert!(predictor.transfer_speed_accuracy_pairs().is_empty());
     }
 }

@@ -3150,13 +3150,14 @@ fn peer_detail_html(address_str: &str) -> String {
         String::new()
     };
 
-    // Build renegade accuracy chart
+    // Build the renegade prediction-accuracy panel (failure + timing models)
     let renegade_chart = if let Some(ref rs) = router_snapshot {
-        if rs.renegade_accuracy_pairs.is_empty() {
-            String::new()
-        } else {
-            build_renegade_accuracy_chart(&rs.renegade_accuracy_pairs)
-        }
+        build_renegade_accuracy_panel(
+            &rs.renegade_accuracy_pairs,
+            rs.renegade_brier_score,
+            &rs.renegade_response_time_pairs,
+            &rs.renegade_transfer_speed_pairs,
+        )
     } else {
         String::new()
     };
@@ -3576,73 +3577,116 @@ fn fmt_prediction_prob(v: f64) -> String {
     }
 }
 
-/// Build an SVG strip chart showing predicted failure probability vs actual outcome.
-/// X-axis: predicted probability [0, 1].
-/// Y-axis: actual outcome (0 = success at bottom, 1 = failure at top).
-/// Good calibration: successes cluster left, failures cluster right.
-fn build_renegade_accuracy_chart(pairs: &[(f64, f64)]) -> String {
+/// Which kind of regression model a scatter chart is rendering, controlling the
+/// axis unit formatting (durations vs throughput).
+#[derive(Clone, Copy)]
+enum RegKind {
+    Time,
+    Speed,
+}
+
+/// Build the renegade prediction-accuracy panel: one reliability diagram for the
+/// binary failure model plus predicted-vs-actual scatters for the two regression
+/// models (response time, transfer speed). Returns an empty string when no model
+/// has scored any predictions yet, so a fresh node shows nothing rather than an
+/// empty card.
+fn build_renegade_accuracy_panel(
+    failure_pairs: &[(f64, f64)],
+    brier: Option<f64>,
+    response_time_pairs: &[(f64, f64)],
+    transfer_speed_pairs: &[(f64, f64)],
+) -> String {
+    if failure_pairs.is_empty() && response_time_pairs.is_empty() && transfer_speed_pairs.is_empty()
+    {
+        return String::new();
+    }
+
+    let failure = build_reliability_chart(failure_pairs, brier);
+    let response = build_regression_chart("Response time", RegKind::Time, response_time_pairs);
+    let transfer = build_regression_chart("Transfer speed", RegKind::Speed, transfer_speed_pairs);
+
+    format!(
+        r#"<div class="card">
+        <h2>Prediction Accuracy</h2>
+        <p style="font-size:0.8em;color:var(--text-muted);">
+            How well each routing model's recent predictions matched reality. Points on the
+            dashed diagonal are perfect: for failure, predicted probability equals the observed
+            failure rate (calibration); for the timing models, predicted equals actual.
+        </p>
+        <div style="display:flex;flex-wrap:wrap;gap:1rem;justify-content:flex-start;">
+            {failure}
+            {response}
+            {transfer}
+        </div>
+    </div>"#,
+        failure = failure,
+        response = response,
+        transfer = transfer,
+    )
+}
+
+/// Reliability (calibration) diagram for the binary failure model.
+/// X = predicted failure probability, Y = observed failure rate within each
+/// predicted-probability bin. Dots on the diagonal mean the model is calibrated;
+/// above the line it under-predicts failure, below it over-predicts.
+fn build_reliability_chart(pairs: &[(f64, f64)], brier: Option<f64>) -> String {
     use std::fmt::Write;
 
-    // Filter out NaN/non-finite values before processing
-    let valid_pairs: Vec<(f64, f64)> = pairs
+    let valid: Vec<(f64, f64)> = pairs
         .iter()
         .copied()
         .filter(|(p, a)| p.is_finite() && a.is_finite())
-        .collect();
-    let total_count = valid_pairs.len();
-
-    let successes: Vec<f64> = valid_pairs
-        .iter()
-        .filter(|(_, a)| *a < 0.5)
-        .map(|(p, _)| p.clamp(0.0, 1.0))
-        .collect();
-    let failures: Vec<f64> = valid_pairs
-        .iter()
-        .filter(|(_, a)| *a >= 0.5)
-        .map(|(p, _)| p.clamp(0.0, 1.0))
+        .map(|(p, a)| (p.clamp(0.0, 1.0), a))
         .collect();
 
-    let w = 400.0_f64;
-    let h = 200.0_f64;
-    let pad_l = 50.0;
-    let pad_r = 20.0;
-    let pad_t = 30.0;
-    let pad_b = 30.0;
+    if valid.is_empty() {
+        return mini_chart_placeholder("Failure (calibration)", "predicted prob vs observed rate");
+    }
+
+    let n = valid.len();
+    let n_bins = 10usize;
+    let mut bin_pred_sum = vec![0.0f64; n_bins];
+    let mut bin_fail = vec![0usize; n_bins];
+    let mut bin_total = vec![0usize; n_bins];
+    for (p, a) in &valid {
+        let bin = ((p * n_bins as f64) as usize).min(n_bins - 1);
+        bin_pred_sum[bin] += p;
+        bin_total[bin] += 1;
+        if *a >= 0.5 {
+            bin_fail[bin] += 1;
+        }
+    }
+
+    let (w, h) = (260.0f64, 220.0f64);
+    let (pad_l, pad_r, pad_t, pad_b) = (38.0f64, 12.0f64, 30.0f64, 30.0f64);
     let plot_w = w - pad_l - pad_r;
     let plot_h = h - pad_t - pad_b;
-    let mid_y = pad_t + plot_h / 2.0; // dividing line between failure (top) and success (bottom)
-    let half_h = plot_h / 2.0;
-
-    // Use dots for very small datasets, bars for larger ones
-    let use_dots = total_count < 15;
-
-    // Adaptive bin count: fewer bins when less data
-    let n_bins = if total_count < 30 {
-        5
-    } else if total_count < 100 {
-        8
-    } else {
-        10
-    };
-    let bin_width = 1.0 / n_bins as f64;
-
-    let to_x = |v: f64| -> f64 { pad_l + v.clamp(0.0, 1.0) * plot_w };
+    let to_x = |v: f64| pad_l + v.clamp(0.0, 1.0) * plot_w;
+    let to_y = |v: f64| pad_t + (1.0 - v.clamp(0.0, 1.0)) * plot_h;
 
     let mut svg = format!(
-        r#"<div class="card">
-        <h2>Renegade Prediction Accuracy</h2>
-        <p style="font-size:0.8em;color:var(--text-muted);">
-            Distribution of predicted failure probability, split by outcome.
-            <span style="color:var(--accent-danger, #f85149);">Failures</span> above,
-            <span style="color:var(--accent-success, #3fb950);">successes</span> below.
-            Well-calibrated: failures skew right, successes skew left.
-        </p>
-        <svg viewBox="0 0 {w} {h}" width="{w}" height="{h}" class="chart-svg">"#,
+        r#"<svg viewBox="0 0 {w} {h}" width="{w}" height="{h}" class="accuracy-chart">"#,
         w = w as u32,
         h = h as u32,
     );
 
-    // Background
+    write!(
+        svg,
+        r#"<text x="{x}" y="14" font-size="10" font-weight="600" fill="var(--text-secondary)">Failure (calibration)</text>"#,
+        x = pad_l,
+    )
+    .ok();
+    let headline = match brier {
+        Some(b) if b.is_finite() => format!("Brier {b:.3} · n={n}"),
+        _ => format!("n={n}"),
+    };
+    write!(
+        svg,
+        r#"<text x="{x}" y="26" font-size="9" fill="var(--text-muted)">{headline}</text>"#,
+        x = pad_l,
+    )
+    .ok();
+
     write!(
         svg,
         r#"<rect x="{lx}" y="{ty}" width="{pw}" height="{ph}" fill="var(--bg-secondary)" rx="2"/>"#,
@@ -3653,233 +3697,274 @@ fn build_renegade_accuracy_chart(pairs: &[(f64, f64)]) -> String {
     )
     .ok();
 
-    // Center dividing line
+    // perfect-calibration diagonal
     write!(
         svg,
-        r#"<line x1="{lx}" y1="{my}" x2="{rx}" y2="{my}" stroke="var(--text-muted)" stroke-width="1"/>"#,
-        lx = pad_l,
-        my = mid_y,
-        rx = pad_l + plot_w,
+        r#"<line x1="{x1:.1}" y1="{y1:.1}" x2="{x2:.1}" y2="{y2:.1}" stroke="var(--text-muted)" stroke-width="1" stroke-dasharray="4"/>"#,
+        x1 = to_x(0.0),
+        y1 = to_y(0.0),
+        x2 = to_x(1.0),
+        y2 = to_y(1.0),
     )
     .ok();
 
-    // X-axis labels and grid
-    for &v in &[0.0, 0.25, 0.5, 0.75, 1.0] {
-        let x = to_x(v);
+    // axis ticks at 0 / 0.5 / 1 on both axes
+    for &v in &[0.0_f64, 0.5, 1.0] {
         write!(
             svg,
-            r#"<text x="{x}" y="{y}" text-anchor="middle" font-size="9" fill="var(--text-muted)">{v}</text>"#,
-            x = x,
-            y = pad_t + plot_h + 15.0,
-            v = v,
+            r#"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">{v}</text>"#,
+            x = to_x(v),
+            y = pad_t + plot_h + 12.0,
         )
         .ok();
         write!(
             svg,
-            r#"<line x1="{x}" y1="{ty}" x2="{x}" y2="{by}" stroke="var(--text-muted)" stroke-width="0.3" stroke-dasharray="3"/>"#,
-            x = x,
+            r#"<text x="{x:.1}" y="{y:.1}" text-anchor="end" font-size="8" fill="var(--text-muted)">{v}</text>"#,
+            x = pad_l - 4.0,
+            y = to_y(v) + 3.0,
+        )
+        .ok();
+    }
+
+    // calibration curve through non-empty bins (in predicted-probability order)
+    let mut pts: Vec<(f64, f64, usize)> = Vec::new();
+    for b in 0..n_bins {
+        if bin_total[b] == 0 {
+            continue;
+        }
+        let mean_pred = bin_pred_sum[b] / bin_total[b] as f64;
+        let obs_rate = bin_fail[b] as f64 / bin_total[b] as f64;
+        pts.push((mean_pred, obs_rate, bin_total[b]));
+    }
+    if pts.len() >= 2 {
+        let path = pts
+            .iter()
+            .map(|(px, py, _)| format!("{:.1},{:.1}", to_x(*px), to_y(*py)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        write!(
+            svg,
+            r#"<polyline points="{path}" fill="none" stroke="var(--accent-primary, #58a6ff)" stroke-width="1.5" opacity="0.8"/>"#,
+        )
+        .ok();
+    }
+    let max_bin = bin_total.iter().copied().max().unwrap_or(1).max(1);
+    for (px, py, count) in &pts {
+        let r = 2.5 + 3.5 * (*count as f64 / max_bin as f64).sqrt();
+        write!(
+            svg,
+            r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{r:.1}" fill="var(--accent-primary, #58a6ff)" opacity="0.85"/>"#,
+            cx = to_x(*px),
+            cy = to_y(*py),
+        )
+        .ok();
+    }
+
+    write!(
+        svg,
+        r#"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">predicted fail prob</text>"#,
+        x = pad_l + plot_w / 2.0,
+        y = h - 1.0,
+    )
+    .ok();
+
+    svg.push_str("</svg>");
+    svg
+}
+
+/// Predicted-vs-actual scatter for a regression model (response time, transfer
+/// speed) on log-log axes, since both targets span orders of magnitude. Points
+/// on the dashed diagonal mean predicted == actual; the headline is the median
+/// absolute percentage error over the retained window.
+fn build_regression_chart(label: &str, kind: RegKind, pairs: &[(f64, f64)]) -> String {
+    use std::fmt::Write;
+
+    // Log axes require strictly-positive, finite values.
+    let valid: Vec<(f64, f64)> = pairs
+        .iter()
+        .copied()
+        .filter(|(p, a)| p.is_finite() && a.is_finite() && *p > 0.0 && *a > 0.0)
+        .collect();
+
+    if valid.len() < 2 {
+        return mini_chart_placeholder(label, "predicted vs actual");
+    }
+
+    let n = valid.len();
+
+    // Median absolute percentage error (robust to the heavy tails of latency /
+    // throughput) as the single headline number.
+    let mut apes: Vec<f64> = valid.iter().map(|(p, a)| ((p - a) / a).abs()).collect();
+    apes.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = apes.len() / 2;
+    let mdape = if apes.len() % 2 == 0 {
+        (apes[mid - 1] + apes[mid]) / 2.0
+    } else {
+        apes[mid]
+    };
+
+    // Shared log range across predicted and actual so the diagonal is 45°.
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for (p, a) in &valid {
+        lo = lo.min(p.min(*a));
+        hi = hi.max(p.max(*a));
+    }
+    let mut log_lo = lo.log10();
+    let mut log_hi = hi.log10();
+    if (log_hi - log_lo) < 0.5 {
+        // Pad a near-flat range so points don't all sit on one edge.
+        let center = (log_hi + log_lo) / 2.0;
+        log_lo = center - 0.5;
+        log_hi = center + 0.5;
+    } else {
+        let pad = (log_hi - log_lo) * 0.08;
+        log_lo -= pad;
+        log_hi += pad;
+    }
+    let span = (log_hi - log_lo).max(1e-9);
+
+    let (w, h) = (260.0f64, 220.0f64);
+    let (pad_l, pad_r, pad_t, pad_b) = (38.0f64, 12.0f64, 30.0f64, 30.0f64);
+    let plot_w = w - pad_l - pad_r;
+    let plot_h = h - pad_t - pad_b;
+    let to_x = |v: f64| pad_l + ((v.log10() - log_lo) / span) * plot_w;
+    let to_y = |v: f64| pad_t + (1.0 - (v.log10() - log_lo) / span) * plot_h;
+
+    let mut svg = format!(
+        r#"<svg viewBox="0 0 {w} {h}" width="{w}" height="{h}" class="accuracy-chart">"#,
+        w = w as u32,
+        h = h as u32,
+    );
+    write!(
+        svg,
+        r#"<text x="{x}" y="14" font-size="10" font-weight="600" fill="var(--text-secondary)">{label}</text>"#,
+        x = pad_l,
+    )
+    .ok();
+    write!(
+        svg,
+        r#"<text x="{x}" y="26" font-size="9" fill="var(--text-muted)">median err {pct:.0}% · n={n}</text>"#,
+        x = pad_l,
+        pct = mdape * 100.0,
+    )
+    .ok();
+
+    write!(
+        svg,
+        r#"<rect x="{lx}" y="{ty}" width="{pw}" height="{ph}" fill="var(--bg-secondary)" rx="2"/>"#,
+        lx = pad_l,
+        ty = pad_t,
+        pw = plot_w,
+        ph = plot_h,
+    )
+    .ok();
+
+    // Power-of-ten gridlines + axis labels.
+    let first_decade = log_lo.ceil() as i32;
+    let last_decade = log_hi.floor() as i32;
+    for d in first_decade..=last_decade {
+        let val = 10f64.powi(d);
+        let gx = to_x(val);
+        let gy = to_y(val);
+        write!(
+            svg,
+            r#"<line x1="{gx:.1}" y1="{ty:.1}" x2="{gx:.1}" y2="{by:.1}" stroke="var(--text-muted)" stroke-width="0.3" stroke-dasharray="3"/>"#,
             ty = pad_t,
             by = pad_t + plot_h,
         )
         .ok();
+        write!(
+            svg,
+            r#"<text x="{gx:.1}" y="{y:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">{lbl}</text>"#,
+            y = pad_t + plot_h + 12.0,
+            lbl = fmt_reg_axis(kind, val),
+        )
+        .ok();
+        write!(
+            svg,
+            r#"<text x="{x:.1}" y="{gy:.1}" text-anchor="end" font-size="8" fill="var(--text-muted)">{lbl}</text>"#,
+            x = pad_l - 4.0,
+            lbl = fmt_reg_axis(kind, val),
+        )
+        .ok();
     }
 
-    // Y-axis labels
+    // Perfect diagonal (predicted == actual).
     write!(
         svg,
-        r#"<text x="{x}" y="{y}" text-anchor="end" font-size="9" fill="var(--accent-danger, #f85149)">Fail</text>"#,
-        x = pad_l - 4.0,
-        y = pad_t + 14.0,
-    )
-    .ok();
-    write!(
-        svg,
-        r#"<text x="{x}" y="{y}" text-anchor="end" font-size="9" fill="var(--accent-success, #3fb950)">OK</text>"#,
-        x = pad_l - 4.0,
-        y = pad_t + plot_h - 6.0,
+        r#"<line x1="{x1:.1}" y1="{y1:.1}" x2="{x2:.1}" y2="{y2:.1}" stroke="var(--text-muted)" stroke-width="1" stroke-dasharray="4"/>"#,
+        x1 = to_x(10f64.powf(log_lo)),
+        y1 = to_y(10f64.powf(log_lo)),
+        x2 = to_x(10f64.powf(log_hi)),
+        y2 = to_y(10f64.powf(log_hi)),
     )
     .ok();
 
-    // X-axis title
+    for (p, a) in &valid {
+        write!(
+            svg,
+            r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="2.2" fill="var(--accent-primary, #58a6ff)" opacity="0.45"/>"#,
+            cx = to_x(*p),
+            cy = to_y(*a),
+        )
+        .ok();
+    }
+
     write!(
         svg,
-        r#"<text x="{x}" y="{y}" text-anchor="middle" font-size="9" fill="var(--text-muted)">Predicted failure probability</text>"#,
+        r#"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">predicted (x) vs actual (y)</text>"#,
         x = pad_l + plot_w / 2.0,
-        y = h - 2.0,
+        y = h - 1.0,
     )
     .ok();
 
-    if use_dots {
-        // Dot strip mode: stack dots vertically from the center line outward
-        let dot_r = 3.5;
-        let dot_spacing = dot_r * 2.2;
+    svg.push_str("</svg>");
+    svg
+}
 
-        // Bin dots to stack them
-        let mut fail_bins: Vec<Vec<f64>> = vec![Vec::new(); n_bins];
-        let mut ok_bins: Vec<Vec<f64>> = vec![Vec::new(); n_bins];
-
-        for &p in &failures {
-            let bin = ((p / bin_width) as usize).min(n_bins - 1);
-            fail_bins[bin].push(p);
-        }
-        for &p in &successes {
-            let bin = ((p / bin_width) as usize).min(n_bins - 1);
-            ok_bins[bin].push(p);
-        }
-
-        // Draw failure dots (grow upward from center), with overflow indicator
-        for (bin_idx, dots) in fail_bins.iter().enumerate() {
-            let cx = pad_l + (bin_idx as f64 + 0.5) * bin_width * plot_w;
-            let mut drawn = 0;
-            for (i, _) in dots.iter().enumerate() {
-                let cy = mid_y - dot_spacing * (i as f64 + 0.5);
-                if cy < pad_t + dot_r {
-                    break;
-                }
-                drawn += 1;
-                write!(
-                    svg,
-                    r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{r}" fill="var(--accent-danger, #f85149)" opacity="0.7"/>"#,
-                    cx = cx,
-                    cy = cy,
-                    r = dot_r,
-                )
-                .ok();
-            }
-            if drawn < dots.len() {
-                write!(
-                    svg,
-                    r#"<text x="{cx:.1}" y="{y:.1}" text-anchor="middle" font-size="8" fill="var(--accent-danger, #f85149)">+{n}</text>"#,
-                    cx = cx,
-                    y = pad_t - 1.0,
-                    n = dots.len() - drawn,
-                )
-                .ok();
+/// Compact axis label for a regression value: durations as s/ms/µs, throughput
+/// as B/KB/MB/GB per second.
+fn fmt_reg_axis(kind: RegKind, v: f64) -> String {
+    match kind {
+        RegKind::Time => {
+            if v >= 1.0 {
+                format!("{v:.0}s")
+            } else if v >= 0.001 {
+                format!("{:.0}ms", v * 1000.0)
+            } else {
+                format!("{:.0}µs", v * 1_000_000.0)
             }
         }
-
-        // Draw success dots (grow downward from center), with overflow indicator
-        for (bin_idx, dots) in ok_bins.iter().enumerate() {
-            let cx = pad_l + (bin_idx as f64 + 0.5) * bin_width * plot_w;
-            let mut drawn = 0;
-            for (i, _) in dots.iter().enumerate() {
-                let cy = mid_y + dot_spacing * (i as f64 + 0.5);
-                if cy > pad_t + plot_h - dot_r {
-                    break;
-                }
-                drawn += 1;
-                write!(
-                    svg,
-                    r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{r}" fill="var(--accent-success, #3fb950)" opacity="0.7"/>"#,
-                    cx = cx,
-                    cy = cy,
-                    r = dot_r,
-                )
-                .ok();
-            }
-            if drawn < dots.len() {
-                write!(
-                    svg,
-                    r#"<text x="{cx:.1}" y="{y:.1}" text-anchor="middle" font-size="8" fill="var(--accent-success, #3fb950)">+{n}</text>"#,
-                    cx = cx,
-                    y = pad_t + plot_h + 10.0,
-                    n = dots.len() - drawn,
-                )
-                .ok();
-            }
-        }
-    } else {
-        // Histogram bar mode
-        let mut fail_counts = vec![0usize; n_bins];
-        let mut ok_counts = vec![0usize; n_bins];
-
-        for &p in &failures {
-            let bin = ((p / bin_width) as usize).min(n_bins - 1);
-            fail_counts[bin] += 1;
-        }
-        for &p in &successes {
-            let bin = ((p / bin_width) as usize).min(n_bins - 1);
-            ok_counts[bin] += 1;
-        }
-
-        let max_count = fail_counts
-            .iter()
-            .chain(ok_counts.iter())
-            .copied()
-            .max()
-            .unwrap_or(1)
-            .max(1);
-
-        let bar_w = plot_w / n_bins as f64;
-        let bar_pad = bar_w * 0.1;
-
-        for i in 0..n_bins {
-            let x = pad_l + i as f64 * bar_w + bar_pad;
-            let bw = bar_w - 2.0 * bar_pad;
-
-            // Failure bars grow upward from center
-            if fail_counts[i] > 0 {
-                let bar_h = (fail_counts[i] as f64 / max_count as f64) * (half_h - 4.0);
-                let y = mid_y - bar_h;
-                write!(
-                    svg,
-                    r#"<rect x="{x:.1}" y="{y:.1}" width="{bw:.1}" height="{bh:.1}" fill="var(--accent-danger, #f85149)" opacity="0.7" rx="1"/>"#,
-                    x = x,
-                    y = y,
-                    bw = bw,
-                    bh = bar_h,
-                )
-                .ok();
-                // Count label on bar
-                write!(
-                    svg,
-                    r#"<text x="{tx:.1}" y="{ty:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">{n}</text>"#,
-                    tx = x + bw / 2.0,
-                    ty = y - 2.0,
-                    n = fail_counts[i],
-                )
-                .ok();
-            }
-
-            // Success bars grow downward from center
-            if ok_counts[i] > 0 {
-                let bar_h = (ok_counts[i] as f64 / max_count as f64) * (half_h - 4.0);
-                write!(
-                    svg,
-                    r#"<rect x="{x:.1}" y="{my:.1}" width="{bw:.1}" height="{bh:.1}" fill="var(--accent-success, #3fb950)" opacity="0.7" rx="1"/>"#,
-                    x = x,
-                    my = mid_y,
-                    bw = bw,
-                    bh = bar_h,
-                )
-                .ok();
-                // Count label on bar
-                write!(
-                    svg,
-                    r#"<text x="{tx:.1}" y="{ty:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">{n}</text>"#,
-                    tx = x + bw / 2.0,
-                    ty = mid_y + bar_h + 10.0,
-                    n = ok_counts[i],
-                )
-                .ok();
+        RegKind::Speed => {
+            if v >= 1e9 {
+                format!("{:.0}GB/s", v / 1e9)
+            } else if v >= 1e6 {
+                format!("{:.0}MB/s", v / 1e6)
+            } else if v >= 1e3 {
+                format!("{:.0}KB/s", v / 1e3)
+            } else {
+                format!("{v:.0}B/s")
             }
         }
     }
+}
 
-    // Stats summary
-    write!(
-        svg,
-        r#"<text x="{x}" y="{y}" text-anchor="start" font-size="9" fill="var(--text-muted)">{n} events ({s} ok, {f} fail)</text>"#,
-        x = pad_l + 2.0,
-        y = pad_t - 5.0,
-        n = total_count,
-        s = successes.len(),
-        f = failures.len(),
+/// A small placeholder chart shown while a model has too little data to plot.
+fn mini_chart_placeholder(label: &str, sub: &str) -> String {
+    let (w, h) = (260.0f64, 220.0f64);
+    format!(
+        r#"<svg viewBox="0 0 {w} {h}" width="{w}" height="{h}" class="accuracy-chart">
+        <text x="38" y="14" font-size="10" font-weight="600" fill="var(--text-secondary)">{label}</text>
+        <text x="{cx}" y="{cy}" text-anchor="middle" font-size="10" fill="var(--text-muted)">collecting data…</text>
+        <text x="{cx}" y="{cy2}" text-anchor="middle" font-size="8" fill="var(--text-muted)">{sub}</text>
+    </svg>"#,
+        w = w as u32,
+        h = h as u32,
+        cx = w / 2.0,
+        cy = h / 2.0,
+        cy2 = h / 2.0 + 14.0,
     )
-    .ok();
-
-    svg.push_str("</svg></div>");
-    svg
 }
 
 const PEER_CSS: &str = r##"
@@ -3936,6 +4021,15 @@ a.header-title {
     display: block;
     width: 100%;
     max-width: 600px;
+}
+/* Small-multiple accuracy charts: fixed width so the three sit side by side
+   in the flex row and wrap on narrow viewports (overridden global width:100%). */
+.accuracy-chart {
+    display: block;
+    width: 260px;
+    max-width: 100%;
+    height: auto;
+    flex: 0 0 auto;
 }
 .chart-svg .axis-label {
     font-family: var(--font-mono);
@@ -4656,63 +4750,118 @@ mod tests {
     }
 
     #[test]
-    fn renegade_chart_empty_input() {
-        let svg = build_renegade_accuracy_chart(&[]);
-        assert!(svg.contains("0 events (0 ok, 0 fail)"));
+    fn reliability_chart_empty_is_placeholder() {
+        let svg = build_reliability_chart(&[], None);
+        assert!(svg.contains("collecting data"));
         assert!(svg.contains("<svg"));
     }
 
     #[test]
-    fn renegade_chart_dot_mode_sparse_data() {
-        // < 15 points should use dot mode (circles, not rects for bars)
-        let pairs: Vec<(f64, f64)> = vec![
-            (0.1, 0.0), // success, low predicted
-            (0.9, 1.0), // failure, high predicted
-            (0.5, 0.0), // success, mid predicted
-        ];
-        let svg = build_renegade_accuracy_chart(&pairs);
-        assert!(svg.contains("<circle"), "dot mode should render circles");
-        assert!(svg.contains("3 events (2 ok, 1 fail)"));
-    }
-
-    #[test]
-    fn renegade_chart_bar_mode_dense_data() {
-        // >= 15 points should use histogram bars
+    fn reliability_chart_renders_points_and_brier() {
+        // Well-separated: low predicted -> success, high predicted -> failure.
         let pairs: Vec<(f64, f64)> = (0..20)
             .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
             .collect();
-        let svg = build_renegade_accuracy_chart(&pairs);
-        assert!(svg.contains("<rect"), "bar mode should render rects");
-        assert!(svg.contains("20 events"));
+        let svg = build_reliability_chart(&pairs, Some(0.042));
+        assert!(svg.contains("Failure (calibration)"));
+        assert!(svg.contains("Brier 0.042"));
+        assert!(svg.contains("n=20"));
+        assert!(svg.contains("<circle"), "bins should render as points");
     }
 
     #[test]
-    fn renegade_chart_filters_nan_values() {
+    fn reliability_chart_filters_nonfinite() {
         let pairs = vec![
-            (0.5, 0.0),           // valid success
-            (f64::NAN, 1.0),      // NaN predicted -- filtered
-            (0.3, f64::NAN),      // NaN actual -- filtered
-            (f64::INFINITY, 0.0), // infinite predicted -- filtered
-            (0.7, 1.0),           // valid failure
+            (0.5, 0.0),
+            (f64::NAN, 1.0),
+            (0.3, f64::NAN),
+            (f64::INFINITY, 0.0),
+            (0.7, 1.0),
         ];
-        let svg = build_renegade_accuracy_chart(&pairs);
-        // Only the 2 valid pairs should be counted
-        assert!(svg.contains("2 events (1 ok, 1 fail)"));
+        // Only 2 valid pairs survive the finite filter.
+        let svg = build_reliability_chart(&pairs, None);
+        assert!(svg.contains("n=2"));
     }
 
     #[test]
-    fn renegade_chart_all_successes() {
-        let pairs: Vec<(f64, f64)> = vec![(0.1, 0.0), (0.2, 0.0), (0.3, 0.0)];
-        let svg = build_renegade_accuracy_chart(&pairs);
-        assert!(svg.contains("3 events (3 ok, 0 fail)"));
+    fn reliability_chart_boundary_values_no_panic() {
+        // p == 1.0 and p == 0.0 must clamp into a bin without panicking.
+        let svg = build_reliability_chart(&[(1.0, 0.0), (0.0, 1.0)], Some(0.5));
+        assert!(svg.contains("<svg"));
+        assert!(svg.contains("n=2"));
     }
 
     #[test]
-    fn renegade_chart_boundary_predicted_value() {
-        // p=1.0 should not panic (bin clamping)
-        let pairs = vec![(1.0, 0.0), (0.0, 1.0)];
-        let svg = build_renegade_accuracy_chart(&pairs);
-        assert!(svg.contains("2 events"));
+    fn regression_chart_sparse_is_placeholder() {
+        // Fewer than 2 valid (positive, finite) points -> placeholder.
+        let svg = build_regression_chart("Response time", RegKind::Time, &[(0.5, 0.4)]);
+        assert!(svg.contains("collecting data"));
+        assert!(svg.contains("Response time"));
+    }
+
+    #[test]
+    fn regression_chart_time_renders_scatter_and_metric() {
+        // predicted ~= actual, sub-second range -> ms axis labels, low error.
+        let pairs: Vec<(f64, f64)> = (1..=20)
+            .map(|i| {
+                let actual = i as f64 * 0.01; // 10ms..200ms
+                (actual * 1.1, actual) // 10% over-prediction
+            })
+            .collect();
+        let svg = build_regression_chart("Response time", RegKind::Time, &pairs);
+        assert!(svg.contains("Response time"));
+        assert!(svg.contains("median err"));
+        assert!(svg.contains("<circle"));
+        assert!(
+            svg.contains("ms"),
+            "sub-second axis should be labelled in ms"
+        );
+    }
+
+    #[test]
+    fn regression_chart_speed_uses_byte_units() {
+        let pairs: Vec<(f64, f64)> = (1..=20)
+            .map(|i| {
+                let actual = i as f64 * 100_000.0; // up to ~2 MB/s
+                (actual, actual)
+            })
+            .collect();
+        let svg = build_regression_chart("Transfer speed", RegKind::Speed, &pairs);
+        assert!(svg.contains("Transfer speed"));
+        assert!(
+            svg.contains("KB/s") || svg.contains("MB/s"),
+            "throughput axis should use byte-rate units"
+        );
+    }
+
+    #[test]
+    fn regression_chart_filters_nonpositive() {
+        // Zero/negative/non-finite values can't be plotted on a log axis and are
+        // dropped, leaving too few points -> placeholder.
+        let pairs = vec![(0.0, 1.0), (-1.0, 2.0), (f64::NAN, 3.0), (5.0, 0.0)];
+        let svg = build_regression_chart("Response time", RegKind::Time, &pairs);
+        assert!(svg.contains("collecting data"));
+    }
+
+    #[test]
+    fn accuracy_panel_empty_when_no_data() {
+        assert_eq!(
+            build_renegade_accuracy_panel(&[], None, &[], &[]),
+            String::new()
+        );
+    }
+
+    #[test]
+    fn accuracy_panel_renders_all_three_models() {
+        let failure: Vec<(f64, f64)> = (0..20)
+            .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
+            .collect();
+        let svg = build_renegade_accuracy_panel(&failure, Some(0.05), &[], &[]);
+        assert!(svg.contains("Prediction Accuracy"));
+        assert!(svg.contains("Failure (calibration)"));
+        // Timing models have no data yet -> their placeholders still appear.
+        assert!(svg.contains("Response time"));
+        assert!(svg.contains("Transfer speed"));
     }
 
     #[test]

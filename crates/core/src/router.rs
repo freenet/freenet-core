@@ -186,6 +186,14 @@ pub(crate) struct RouterSnapshotInfo {
     pub renegade_predictions_evaluated: u64,
     /// Recent (predicted_failure, actual_outcome) pairs for accuracy visualization.
     pub renegade_accuracy_pairs: Vec<(f64, f64)>,
+    /// Recent (predicted_secs, actual_secs) pairs for the response-time stage.
+    pub renegade_response_time_pairs: Vec<(f64, f64)>,
+    /// Recent (predicted_bps, actual_bps) pairs for the transfer-speed stage.
+    pub renegade_transfer_speed_pairs: Vec<(f64, f64)>,
+    /// Number of response-time predictions scored against actual outcomes.
+    pub renegade_response_time_evaluated: u64,
+    /// Number of transfer-speed predictions scored against actual outcomes.
+    pub renegade_transfer_speed_evaluated: u64,
 }
 
 /// Per-peer routing data for the dashboard detail page.
@@ -940,6 +948,24 @@ impl Router {
                 .iter()
                 .copied()
                 .collect(),
+            renegade_response_time_pairs: self
+                .renegade_predictor
+                .response_time_accuracy_pairs()
+                .iter()
+                .copied()
+                .collect(),
+            renegade_transfer_speed_pairs: self
+                .renegade_predictor
+                .transfer_speed_accuracy_pairs()
+                .iter()
+                .copied()
+                .collect(),
+            renegade_response_time_evaluated: self
+                .renegade_predictor
+                .response_time_predictions_evaluated(),
+            renegade_transfer_speed_evaluated: self
+                .renegade_predictor
+                .transfer_speed_predictions_evaluated(),
         }
     }
 
