@@ -26,6 +26,11 @@ INSTALL_PATH="${INSTALL_PATH:-/usr/local/bin/freenet}"
 GITHUB_REPO="${GITHUB_REPO:-freenet/freenet-core}"
 DOWNLOAD_DIR="${DOWNLOAD_DIR:-/tmp/freenet-update}"
 LOG_FILE="${LOG_FILE:-/var/log/freenet-auto-update.log}"
+# systemd unit (without .service) whose health we independently confirm after
+# deploy. Must match deploy-local-gateway.sh's --service default. Overridable
+# so a non-standard instance (e.g. vega's freenet-gateway-hector) can be
+# verified. See verify_service_active / #4492.
+SERVICE_NAME="${SERVICE_NAME:-freenet-gateway}"
 
 # Flags
 FORCE_UPDATE=false
@@ -374,7 +379,59 @@ deploy_update() {
         return 1
     fi
 
+    # Independent post-deploy service-health gate.
+    #
+    # WHY this is here even though deploy-local-gateway.sh already verifies:
+    # the release-agent spawns whatever deploy-local-gateway.sh is INSTALLED on
+    # the gateway, which can lag the repo. On 2026-06-18 nova ran a months-old
+    # deploy script that swallowed its own verify failure (`verify_service ...
+    # || true`) and printed "Deployment complete!" + exit 0 while the gateway
+    # service was dead — so this wrapper logged "Deployment successful" and the
+    # release was reported green for a down gateway (#4492). This gate does NOT
+    # trust the deploy script's exit code for liveness: it independently asks
+    # systemd whether the managed unit is active, and fails the update if it is
+    # not. That makes the wrapper robust regardless of which deploy script is
+    # installed. (Skipped on --all-instances, where the unit set is dynamic and
+    # the per-instance verification is the deploy script's job.)
+    if [[ "$ALL_INSTANCES" != "true" ]]; then
+        if ! verify_service_active "$SERVICE_NAME"; then
+            log ERROR "Deploy script exited 0 but service '$SERVICE_NAME' is NOT active after update; treating as a failed update"
+            return 1
+        fi
+    fi
+
     log INFO "Deployment successful"
+}
+
+# Independently confirm the managed systemd unit is `active`. Returns 0 only
+# when systemd reports `active`; any other state (inactive/failed/activating),
+# a missing unit, or a non-systemd host returns non-zero. `systemctl is-active`
+# is a read-only query and needs no root. Mirrors the release-agent's
+# version.rs::query_service_active so the script-side and HTTP-side gates agree.
+verify_service_active() {
+    local service_arg="$1"
+
+    # Only systemd is supported by the automated update path (nova/vega). On a
+    # host without systemctl we cannot confirm liveness; fail closed so a
+    # non-systemd gateway is never silently reported as a healthy update.
+    if ! command -v systemctl &> /dev/null; then
+        log ERROR "systemctl not found; cannot confirm '$service_arg' is running"
+        return 1
+    fi
+
+    # Give the unit a moment to settle after the deploy script's own start.
+    sleep 2
+
+    local state
+    state=$(systemctl is-active "$service_arg.service" 2>/dev/null || true)
+    if [[ "$state" == "active" ]]; then
+        log INFO "Service '$service_arg' is active"
+        return 0
+    fi
+
+    log ERROR "Service '$service_arg' is '${state:-unknown}' (expected 'active')"
+    log ERROR "Check logs with: sudo journalctl -u $service_arg.service -n 50"
+    return 1
 }
 
 # Cleanup temporary files
@@ -450,13 +507,17 @@ main() {
                 exit 1
             fi
 
-            # Verify update
+            # Verify update. A version mismatch here means the new binary did
+            # NOT actually land on disk — that is a FAILED update, not a
+            # warning. Previously this only WARNed, so an install that left the
+            # old binary in place still exited 0 and was reported as success.
             local new_version
             new_version=$(get_current_version)
             if [[ "$new_version" == "$latest_version" ]]; then
                 log INFO "Successfully updated to v$latest_version"
             else
-                log WARN "Update completed but version mismatch: expected $latest_version, got $new_version"
+                log ERROR "Update failed: expected v$latest_version on disk but found v$new_version"
+                exit 1
             fi
         else
             log INFO "[DRY RUN] Would deploy v$latest_version"
@@ -468,4 +529,10 @@ main() {
     log INFO "Auto-update check complete"
 }
 
-main "$@"
+# Only run main when executed directly, not when sourced. Sourcing is how the
+# regression test (gateway-auto-update_test.sh) exercises verify_service_active
+# and deploy_update in isolation without going through the network download
+# path. `${BASH_SOURCE[0]} == ${0}` is true only on direct execution.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

@@ -141,6 +141,15 @@ jobs:
       - name: Self-test gateway-update verify decision
         run: bash scripts/release-agent/verify-version-decision_test.sh
 
+      # Regression gate for the independent post-deploy service-health check in
+      # gateway-auto-update.sh (the 2026-06-18 v0.2.78 nova incident, #4492: a
+      # stale deploy-local-gateway.sh exited 0 on a DEAD service and the wrapper
+      # reported the update successful). The load-bearing case: a deploy script
+      # that lies (exits 0 while the service is down) must still fail the update
+      # via the independent `systemctl is-active` gate.
+      - name: Self-test gateway-auto-update service-health gate
+        run: bash scripts/release-agent/gateway-auto-update_test.sh
+
       - name: Check for old-style mod.rs files
         run: |
           # New modules must use foo.rs + foo/ style, not foo/mod.rs

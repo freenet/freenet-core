@@ -308,102 +308,136 @@ verify_service() {
 
     case "$SERVICE_MANAGER" in
         systemd)
-            # Check if unit file exists by querying systemctl directly
-            if systemctl list-unit-files "$service_arg.service" 2>/dev/null | grep -q "$service_arg.service"; then
-                echo -n "  Verifying service status ($service_arg)... "
-                sleep 3  # Give service time to start
+            # Check if unit file exists by querying systemctl directly.
+            #
+            # If the unit file is NOT found we must treat that as a verification
+            # FAILURE (return 1), not silently fall through to a 0 exit. A
+            # missing unit means the service this deploy is supposed to manage
+            # cannot be confirmed running — reporting success here is exactly
+            # the false-success class that left nova "deployed" with a dead
+            # gateway on 2026-06-18 (#4492).
+            if ! systemctl list-unit-files "$service_arg.service" 2>/dev/null | grep -q "$service_arg.service"; then
+                echo "  ⚠️  Service unit file not found for $service_arg; cannot verify it is running"
+                echo "     This deploy CANNOT be confirmed — treating as a verification failure."
+                return 1
+            fi
+            echo -n "  Verifying service status ($service_arg)... "
+            sleep 3  # Give service time to start
 
-                if systemctl is-active --quiet "$service_arg.service"; then
-                    # Find the actual freenet process, not the wrapper
-                    # MainPID may point to bash if service uses ExecStart with shell
-                    local freenet_pid=$(pgrep -f "freenet.*--is-gateway\|freenet.*network" | head -1)
+            if systemctl is-active --quiet "$service_arg.service"; then
+                # Declared up front (default "unknown") so the success
+                # summary's `✓ Binary: $running_binary` never trips
+                # `set -u` on the path where no freenet PID is found (e.g.
+                # MainPID 0, or pgrep misses the process). Previously this
+                # was only assigned inside the freenet_pid block, so that
+                # path aborted the whole deploy with an "unbound variable"
+                # error.
+                local running_binary="unknown"
+                # Find the actual freenet process, not the wrapper
+                # MainPID may point to bash if service uses ExecStart with shell
+                local freenet_pid=$(pgrep -f "freenet.*--is-gateway\|freenet.*network" | head -1)
 
-                    if [[ -z "$freenet_pid" ]]; then
-                        # Fallback to MainPID
-                        freenet_pid=$(systemctl show -p MainPID --value "$service_arg.service" 2>/dev/null)
-                    fi
+                if [[ -z "$freenet_pid" ]]; then
+                    # Fallback to MainPID
+                    freenet_pid=$(systemctl show -p MainPID --value "$service_arg.service" 2>/dev/null)
+                fi
 
-                    if [[ -n "$freenet_pid" ]] && [[ "$freenet_pid" != "0" ]]; then
-                        # CRITICAL: Verify the RUNNING process is using the correct binary
-                        local running_binary=$(sudo readlink -f /proc/$freenet_pid/exe 2>/dev/null || echo "unknown")
-                        local expected_binary=$(readlink -f "$INSTALL_PATH" 2>/dev/null || echo "$INSTALL_PATH")
+                if [[ -n "$freenet_pid" ]] && [[ "$freenet_pid" != "0" ]]; then
+                    # CRITICAL: Verify the RUNNING process is using the correct
+                    # binary. running_binary is already declared above; just
+                    # reassign it here.
+                    running_binary=$(sudo readlink -f /proc/$freenet_pid/exe 2>/dev/null || echo "unknown")
+                    local expected_binary=$(readlink -f "$INSTALL_PATH" 2>/dev/null || echo "$INSTALL_PATH")
 
-                        # Handle case where binary is bash (wrapper script) - look for freenet specifically
-                        if [[ "$running_binary" == *"/bash"* ]] || [[ "$running_binary" == *"/sh"* ]]; then
-                            # Find the actual freenet process spawned by the wrapper
-                            local child_pid=$(pgrep -P "$freenet_pid" -f freenet 2>/dev/null | head -1)
-                            if [[ -n "$child_pid" ]]; then
-                                running_binary=$(sudo readlink -f /proc/$child_pid/exe 2>/dev/null || echo "unknown")
-                                freenet_pid="$child_pid"
-                            else
-                                # Try to find any freenet process
-                                local any_freenet=$(pgrep -f "$INSTALL_PATH" | head -1)
-                                if [[ -n "$any_freenet" ]]; then
-                                    running_binary=$(sudo readlink -f /proc/$any_freenet/exe 2>/dev/null || echo "unknown")
-                                    freenet_pid="$any_freenet"
-                                fi
+                    # Handle case where binary is bash (wrapper script) - look for freenet specifically
+                    if [[ "$running_binary" == *"/bash"* ]] || [[ "$running_binary" == *"/sh"* ]]; then
+                        # Find the actual freenet process spawned by the wrapper
+                        local child_pid=$(pgrep -P "$freenet_pid" -f freenet 2>/dev/null | head -1)
+                        if [[ -n "$child_pid" ]]; then
+                            running_binary=$(sudo readlink -f /proc/$child_pid/exe 2>/dev/null || echo "unknown")
+                            freenet_pid="$child_pid"
+                        else
+                            # Try to find any freenet process
+                            local any_freenet=$(pgrep -f "$INSTALL_PATH" | head -1)
+                            if [[ -n "$any_freenet" ]]; then
+                                running_binary=$(sudo readlink -f /proc/$any_freenet/exe 2>/dev/null || echo "unknown")
+                                freenet_pid="$any_freenet"
                             fi
                         fi
-
-                        if [[ "$running_binary" != "unknown" ]] && [[ "$running_binary" != "$expected_binary" ]]; then
-                            echo "✗"
-                            echo "  ⚠️  CRITICAL: Running process using DIFFERENT binary!"
-                            echo "     Running process (PID $freenet_pid) uses: $running_binary"
-                            echo "     Expected (installed at):                 $expected_binary"
-
-                            if [[ $retry_count -lt $max_retries ]]; then
-                                echo "  🔄 Auto-restarting service to fix..."
-                                sudo systemctl restart "$service_arg.service"
-                                sleep 2
-                                # Recursive retry
-                                verify_service "$service_arg" "$expected_version" $((retry_count + 1))
-                                return $?
-                            else
-                                echo "  ❌ Failed after $max_retries restart attempts"
-                                echo "     Manual intervention required."
-                                return 1
-                            fi
-                        fi
                     fi
 
-                    # Verify the binary version on disk matches expected
-                    local disk_version=$("$INSTALL_PATH" --version 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1 || echo "unknown")
-
-                    # Verify version matches
-                    if [[ "$VERIFY_VERSION" == "true" ]] && [[ "$expected_version" != "unknown" ]] && [[ "$disk_version" != "$expected_version" ]]; then
+                    if [[ "$running_binary" != "unknown" ]] && [[ "$running_binary" != "$expected_binary" ]]; then
                         echo "✗"
-                        echo "  ⚠️  Version mismatch!"
-                        echo "     Expected: $expected_version"
-                        echo "     Got:      $disk_version"
-                        return 1
-                    fi
+                        echo "  ⚠️  CRITICAL: Running process using DIFFERENT binary!"
+                        echo "     Running process (PID $freenet_pid) uses: $running_binary"
+                        echo "     Expected (installed at):                 $expected_binary"
 
-                    echo "✓"
-                    echo "  ✓ Version: $disk_version"
-                    echo "  ✓ Service: Running (PID ${freenet_pid:-unknown})"
-                    echo "  ✓ Binary:  $running_binary"
-                else
+                        if [[ $retry_count -lt $max_retries ]]; then
+                            echo "  🔄 Auto-restarting service to fix..."
+                            sudo systemctl restart "$service_arg.service"
+                            sleep 2
+                            # Recursive retry
+                            verify_service "$service_arg" "$expected_version" $((retry_count + 1))
+                            return $?
+                        else
+                            echo "  ❌ Failed after $max_retries restart attempts"
+                            echo "     Manual intervention required."
+                            return 1
+                        fi
+                    fi
+                fi
+
+                # Verify the binary version on disk matches expected
+                local disk_version=$("$INSTALL_PATH" --version 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1 || echo "unknown")
+
+                # Verify version matches
+                if [[ "$VERIFY_VERSION" == "true" ]] && [[ "$expected_version" != "unknown" ]] && [[ "$disk_version" != "$expected_version" ]]; then
                     echo "✗"
-                    echo "  ⚠️  Service failed to start"
-                    echo "     Check logs with: sudo journalctl -u $service_arg.service -n 50"
-
-                    if [[ $retry_count -lt $max_retries ]]; then
-                        echo "  🔄 Retrying start..."
-                        sudo systemctl start "$service_arg.service"
-                        sleep 2
-                        verify_service "$service_arg" "$expected_version" $((retry_count + 1))
-                        return $?
-                    fi
+                    echo "  ⚠️  Version mismatch!"
+                    echo "     Expected: $expected_version"
+                    echo "     Got:      $disk_version"
                     return 1
                 fi
+
+                echo "✓"
+                echo "  ✓ Version: $disk_version"
+                echo "  ✓ Service: Running (PID ${freenet_pid:-unknown})"
+                echo "  ✓ Binary:  $running_binary"
+                # Positively confirmed: service active, correct binary,
+                # matching version. This is the ONLY success path — make
+                # the 0 exit explicit so a future edit can't accidentally
+                # fall through to it.
+                return 0
+            else
+                echo "✗"
+                echo "  ⚠️  Service failed to start"
+                echo "     Check logs with: sudo journalctl -u $service_arg.service -n 50"
+
+                if [[ $retry_count -lt $max_retries ]]; then
+                    echo "  🔄 Retrying start..."
+                    sudo systemctl start "$service_arg.service"
+                    sleep 2
+                    verify_service "$service_arg" "$expected_version" $((retry_count + 1))
+                    return $?
+                fi
+                return 1
             fi
             ;;
         launchd)
+            # launchd verification is not automated; we cannot positively
+            # confirm the service is running the new binary. Return success to
+            # preserve the existing manual-deploy behaviour on macOS, but make
+            # the lack of verification explicit. The automated release-agent
+            # path is systemd-only (nova/vega), and gateway-auto-update.sh adds
+            # an independent is-active gate on top of this (#4492), so the
+            # unverified launchd path is not on the automated update chain.
             echo "  ℹ️  Manual verification required for launchd"
             echo "     Check with: launchctl list | grep $SERVICE_NAME"
+            return 0
             ;;
         none)
-            echo "  ℹ️  Manual verification required"
+            echo "  ℹ️  Manual verification required (no service manager detected)"
+            return 0
             ;;
     esac
 }
