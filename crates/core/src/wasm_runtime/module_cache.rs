@@ -554,15 +554,22 @@ fn parse_meminfo_total_bytes(meminfo: &str) -> Option<usize> {
 /// when there is no readable limit (or the limit is the "unlimited" sentinel).
 ///
 /// Crucially, this resolves the **process's own** cgroup from
-/// `/proc/self/cgroup` rather than only reading the mount-root files. A process
-/// in a non-root cgroup *without* a private cgroup namespace — e.g. a systemd
-/// service with `MemoryMax=`, or a Docker/Kubernetes container sharing the host
-/// cgroup namespace — has its limit at `/sys/fs/cgroup<path>/memory.max`
-/// (v2) or `/sys/fs/cgroup/memory<path>/memory.limit_in_bytes` (v1), where
-/// `<path>` comes from `/proc/self/cgroup`. Reading only the mount root would
-/// miss that limit and size the cache from host RAM (Codex #4481 review). We try
-/// the resolved sub-path first, then fall back to the mount root (the
-/// private-namespace case, where `/proc/self/cgroup` reads `/`).
+/// `/proc/self/cgroup` rather than only reading the mount-root files, AND walks
+/// its ancestors. A process in a non-root cgroup *without* a private cgroup
+/// namespace — e.g. a systemd service with `MemoryMax=`, or a Docker/Kubernetes
+/// container sharing the host cgroup namespace — has its limit at
+/// `/sys/fs/cgroup<path>/memory.max` (v2) or
+/// `/sys/fs/cgroup/memory<path>/memory.limit_in_bytes` (v1), where `<path>`
+/// comes from `/proc/self/cgroup`. Reading only the mount root would miss that
+/// limit and size the cache from host RAM (Codex #4481 review).
+///
+/// cgroup memory limits are **hierarchical**: the effective cap is the tightest
+/// `memory.max` over the process's own cgroup and every ancestor up to the root.
+/// A child whose own `memory.max` is `max` can still be bounded by an ancestor
+/// (the common Docker/k8s/systemd-slice shape). So we walk leaf→root and take
+/// the MINIMUM real limit found (also covers the private-namespace case, where
+/// `/proc/self/cgroup` reads `/` and the walk is just the root). If both the v2
+/// and v1 hierarchies report a real limit (hybrid mount), the smaller binds.
 ///
 /// v2 (`memory.max`) uses the literal `max` for "no limit"; v1
 /// (`memory.limit_in_bytes`) uses a near-`u64::MAX` sentinel (e.g.
@@ -574,40 +581,66 @@ fn parse_meminfo_total_bytes(meminfo: &str) -> Option<usize> {
 fn read_cgroup_memory_limit_bytes() -> Option<usize> {
     let (v2_rel, v1_rel) = cgroup_relative_paths();
 
-    // cgroup v2 unified hierarchy: /sys/fs/cgroup<rel>/memory.max, where <rel>
-    // is the process's cgroup path (or "" at the root).
-    let v2_path = format!("/sys/fs/cgroup{v2_rel}/memory.max");
-    if let Ok(s) = std::fs::read_to_string(&v2_path) {
-        if let Some(v) = parse_cgroup_limit(&s) {
-            return Some(v);
-        }
-        // Present but "max"/unparseable → no v2 limit at this path; fall through.
-    }
-    // Fallback: mount root, for a private-cgroup-namespace process whose
-    // /proc/self/cgroup reads "/" but whose limit lives at the visible root.
-    if v2_rel != "/"
-        && !v2_rel.is_empty()
-        && let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
-        && let Some(v) = parse_cgroup_limit(&s)
-    {
-        return Some(v);
-    }
+    // cgroup v2 limits are HIERARCHICAL: a process is bound by the tightest
+    // `memory.max` among its own cgroup AND every ancestor. A child whose own
+    // `memory.max` is `max` can still be capped by an ancestor (a Docker/k8s
+    // container or systemd slice limit). Walk leaf→root under
+    // /sys/fs/cgroup<path> and take the MIN real limit found (Codex #4481).
+    let v2 = min_cgroup_limit_over_ancestors("/sys/fs/cgroup", "memory.max", &v2_rel);
 
-    // cgroup v1: /sys/fs/cgroup/memory<rel>/memory.limit_in_bytes.
-    let v1_path = format!("/sys/fs/cgroup/memory{v1_rel}/memory.limit_in_bytes");
-    if let Ok(s) = std::fs::read_to_string(&v1_path) {
-        if let Some(v) = parse_cgroup_limit(&s) {
-            return Some(v);
+    // cgroup v1 (memory controller): /sys/fs/cgroup/memory<path>/...; also
+    // hierarchical, so walk ancestors the same way.
+    let v1 =
+        min_cgroup_limit_over_ancestors("/sys/fs/cgroup/memory", "memory.limit_in_bytes", &v1_rel);
+
+    // A node is bound by whichever hierarchy actually applies; if both report a
+    // real limit (hybrid mount), the smaller binds.
+    match (v2, v1) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// Walk the cgroup path `rel` (e.g. `/system.slice/x`) from leaf to root under
+/// `mount` (e.g. `/sys/fs/cgroup`), reading `file` (e.g. `memory.max`) at each
+/// level, and return the **minimum** real limit found, or `None` if no level
+/// carries a real limit. This implements the hierarchical-min semantics of
+/// cgroup memory limits: the effective cap is the tightest limit on the chain.
+#[cfg(target_os = "linux")]
+fn min_cgroup_limit_over_ancestors(mount: &str, file: &str, rel: &str) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for path in cgroup_ancestor_limit_paths(mount, file, rel) {
+        if let Ok(s) = std::fs::read_to_string(&path) {
+            if let Some(v) = parse_cgroup_limit(&s) {
+                best = Some(best.map_or(v, |b: usize| b.min(v)));
+            }
         }
     }
-    if v1_rel != "/"
-        && !v1_rel.is_empty()
-        && let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
-        && let Some(v) = parse_cgroup_limit(&s)
-    {
-        return Some(v);
+    best
+}
+
+/// Build the leaf→root list of limit-file paths to check for a cgroup at `rel`
+/// under `mount`, reading `file` at each level. For `rel = "/a/b"` this yields
+/// `["{mount}/a/b/{file}", "{mount}/a/{file}", "{mount}/{file}"]` (own cgroup,
+/// then each ancestor up to the mount root). Pure (no I/O) so the ancestor walk
+/// is unit-testable.
+#[cfg(target_os = "linux")]
+fn cgroup_ancestor_limit_paths(mount: &str, file: &str, rel: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut current = rel.trim_end_matches('/').to_string();
+    loop {
+        paths.push(format!("{mount}{current}/{file}"));
+        if current.is_empty() {
+            break; // reached the mount root
+        }
+        match current.rfind('/') {
+            Some(idx) => current.truncate(idx),
+            None => current.clear(),
+        }
     }
-    None
+    paths
 }
 
 /// Resolve the process's cgroup paths (relative to the controller mount) for the
@@ -882,6 +915,30 @@ mod tests {
         }
     }
 
+    // Superseded: the combined default ceiling at the MAX clamp is no longer
+    // bounded by an absolute 512 MiB. PR #4481 raised
+    // MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES from 384 MiB to 1.5 GiB (so large
+    // gateways stop module-cache thrashing), making the combined ceiling
+    // 1.5 GiB + 384 MiB ≈ 1.9 GiB. The OLD invariant below (combined < 512 MiB)
+    // mistakenly pinned the MAX clamp as the small-box protection; the actual
+    // protection is the `total_ram / 8` divisor. Replaced by
+    // `combined_default_ceiling_is_safe_on_small_box` (divisor-relative, swept
+    // across RAM sizes) and `max_clamp_combined_ceiling_is_safe_at_binding_host`
+    // (upper bound at the smallest host where MAX binds). Kept as historical
+    // documentation of the old (incorrect) invariant per git-workflow.md.
+    #[ignore = "superseded by #4481: MAX raised 384 MiB -> 1.5 GiB; see replacement tests"]
+    #[test]
+    fn combined_default_ceiling_is_safe() {
+        let contract = MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES;
+        let delegate = contract / DELEGATE_MODULE_CACHE_BUDGET_DIVISOR;
+        let combined = contract + delegate;
+        assert!(
+            combined < 512 * 1024 * 1024,
+            "combined default ceiling {combined} must stay under 512 MiB so the \
+             #4441 OOM fix doesn't itself OOM a small box (was 768 MiB pre-fix)"
+        );
+    }
+
     /// Upper-bound guard (the other side of the net): the COMBINED default
     /// ceiling at the MAX clamp must stay a safe fraction of the smallest host
     /// where the MAX binds (`MAX × DEFAULT_MODULE_CACHE_RAM_DIVISOR` of RAM), so
@@ -1022,6 +1079,41 @@ mod tests {
         assert_eq!(
             parse_proc_self_cgroup(weird),
             ("/odd:name/x".to_string(), "/".to_string())
+        );
+    }
+
+    /// The cgroup ancestor walk yields the own cgroup's limit file first, then
+    /// each ancestor up to the mount root — so `min_cgroup_limit_over_ancestors`
+    /// honors the HIERARCHICAL nature of cgroup memory limits (a `max` leaf under
+    /// a limited ancestor is still bounded). Codex #4481 finding.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_ancestor_paths_walk_leaf_to_root() {
+        assert_eq!(
+            cgroup_ancestor_limit_paths("/sys/fs/cgroup", "memory.max", "/a/b/c"),
+            vec![
+                "/sys/fs/cgroup/a/b/c/memory.max".to_string(),
+                "/sys/fs/cgroup/a/b/memory.max".to_string(),
+                "/sys/fs/cgroup/a/memory.max".to_string(),
+                "/sys/fs/cgroup/memory.max".to_string(),
+            ]
+        );
+        // Root cgroup → only the mount-root file.
+        assert_eq!(
+            cgroup_ancestor_limit_paths("/sys/fs/cgroup", "memory.max", "/"),
+            vec!["/sys/fs/cgroup/memory.max".to_string()]
+        );
+        // A single-level cgroup → own file then root.
+        assert_eq!(
+            cgroup_ancestor_limit_paths(
+                "/sys/fs/cgroup/memory",
+                "memory.limit_in_bytes",
+                "/system.slice"
+            ),
+            vec![
+                "/sys/fs/cgroup/memory/system.slice/memory.limit_in_bytes".to_string(),
+                "/sys/fs/cgroup/memory/memory.limit_in_bytes".to_string(),
+            ]
         );
     }
 

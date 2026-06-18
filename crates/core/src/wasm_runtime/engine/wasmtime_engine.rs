@@ -1823,13 +1823,30 @@ mod tests {
         // the self-satisfying-pin failure mode. Splitting on the function
         // signature and the next fn restricts the scrape to production code.
         let src = include_str!("wasmtime_engine.rs");
-        let body = src
+        let after_sig = src
             .split("fn create_backend_engine(config: &RuntimeConfig) -> Result<Engine, ContractError> {")
             .nth(1)
-            .expect("create_backend_engine must exist")
-            .split("\n    fn recover_store(")
-            .next()
-            .expect("end of create_backend_engine");
+            .expect("create_backend_engine must exist");
+        // Truncate at the NEXT function so the scrape sees only production code,
+        // never this test's own assertion strings. `split().next()` always
+        // returns `Some` even when the delimiter is absent, so an `.expect()`
+        // here would NOT catch a renamed/removed `recover_store` — the body
+        // would silently extend to EOF and the test would self-satisfy. Assert
+        // the delimiter was actually present instead, so the safety is real.
+        const END_ANCHOR: &str = "\n    fn recover_store(";
+        assert!(
+            after_sig.contains(END_ANCHOR),
+            "end-of-function anchor `{END_ANCHOR}` not found — if recover_store \
+             was renamed/removed, re-point this anchor so the scrape stays \
+             scoped to create_backend_engine and can't self-satisfy"
+        );
+        let body = after_sig.split(END_ANCHOR).next().unwrap();
+        // Defense in depth: the scoped body must not contain this test's own
+        // function name, proving the scrape really excludes the test module.
+        assert!(
+            !body.contains("engine_enables_wasmtime_disk_compilation_cache"),
+            "scraped body leaked into the test module — the scope is not isolated"
+        );
         // The build path that constructs the wasmtime Config must install a
         // disk cache via `wasmtime_config.cache(Some(...))`.
         assert!(
