@@ -3147,8 +3147,11 @@ fn peer_detail_html(address_str: &str) -> String {
                     xfer_range,
                     if tab_name == "All" { xfer_adj } else { None },
                     ploc,
-                    "auto",
+                    // Transfer rate is a positive B/s value: floor at 0, auto-scale
+                    // the top. (Was "auto"/"0", which clamped the max to 0 and gave a
+                    // degenerate inverted range that also hid the scatter overlay.)
                     "0",
+                    "auto",
                     "No payload transfers have been observed from this peer yet.",
                 ));
             }
@@ -3939,11 +3942,20 @@ fn build_regression_chart(label: &str, kind: RegKind, pairs: &[(f64, f64)]) -> S
     )
     .ok();
 
-    // Power-of-ten gridlines + axis labels.
+    // Power-of-ten gridlines + axis labels. When all points fall within a single
+    // decade (the common steady-state case) there is no power-of-ten boundary in
+    // range, so fall back to labelling the axis endpoints rather than rendering an
+    // unlabelled axis.
     let first_decade = log_lo.ceil() as i32;
     let last_decade = log_hi.floor() as i32;
-    for d in first_decade..=last_decade {
-        let val = 10f64.powi(d);
+    let tick_vals: Vec<f64> = if first_decade <= last_decade {
+        (first_decade..=last_decade)
+            .map(|d| 10f64.powi(d))
+            .collect()
+    } else {
+        vec![10f64.powf(log_lo), 10f64.powf(log_hi)]
+    };
+    for val in tick_vals {
         let gx = to_x(val);
         let gy = to_y(val);
         write!(
@@ -4924,6 +4936,42 @@ mod tests {
     }
 
     #[test]
+    fn regression_chart_all_equal_points_render_finite() {
+        // Every point identical -> degenerate log range. Must pad the range and
+        // produce finite coordinates (no NaN) rather than dividing by a zero span.
+        let pairs = vec![(1000.0, 1000.0), (1000.0, 1000.0), (1000.0, 1000.0)];
+        let svg = build_regression_chart("Transfer speed", RegKind::Speed, &pairs);
+        assert!(svg.contains("<svg"));
+        assert!(
+            svg.contains("<circle"),
+            "should plot the overlapping points"
+        );
+        assert!(!svg.contains("NaN"), "no NaN coordinates, got: {svg}");
+        // Single-decade fallback must still produce axis labels.
+        assert!(svg.contains("B/s"), "endpoint axis labels should render");
+    }
+
+    #[test]
+    fn regression_chart_single_decade_labels_endpoints() {
+        // All points within one decade (no power-of-ten boundary lands in the
+        // padded range): the chart must fall back to labelling the axis endpoints
+        // rather than rendering an unlabelled axis.
+        let pairs: Vec<(f64, f64)> = (0..12)
+            .map(|i| {
+                let a = 0.16 + (i as f64) * 0.04; // 0.16..0.60 s, within one decade
+                (a, a)
+            })
+            .collect();
+        let svg = build_regression_chart("Response time", RegKind::Time, &pairs);
+        assert!(svg.contains("<svg"));
+        assert!(!svg.contains("NaN"), "no NaN coords, got: {svg}");
+        assert!(
+            svg.contains("ms"),
+            "endpoint axis labels should render in the single-decade case, got: {svg}"
+        );
+    }
+
+    #[test]
     fn accuracy_panel_empty_when_no_data() {
         assert_eq!(
             build_renegade_accuracy_panel(&[], None, &[], &[]),
@@ -5023,7 +5071,7 @@ mod tests {
         );
     }
 
-    /// Regression: the per-tab "Routing Predictions" panel must call
+    /// Regression: the per-tab "Outcomes vs Distance" panel must call
     /// `build_estimator_chart_or_placeholder` for all three
     /// prediction-component slots (Failure Probability, Response Time,
     /// Transfer Rate). Hiding empty slots previously masked the

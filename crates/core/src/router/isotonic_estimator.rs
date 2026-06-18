@@ -492,7 +492,15 @@ mod tests {
         // Fewer than the cap -> every retained point is returned.
         assert_eq!(estimator.sampled_raw_points(100).len(), 40);
         // More than the cap -> downsampled to exactly the cap.
-        assert_eq!(estimator.sampled_raw_points(10).len(), 10);
+        let strided = estimator.sampled_raw_points(10);
+        assert_eq!(strided.len(), 10);
+        // Striding preserves insertion order (outcomes were added monotonically
+        // 0..40), so a returned-first-before-returned-newest check catches a
+        // regression that returned the first N points or reversed the window.
+        assert!(
+            strided.first().unwrap().1 < strided.last().unwrap().1,
+            "downsample should span oldest..newest in order, got {strided:?}",
+        );
         // Degenerate cap.
         assert!(estimator.sampled_raw_points(0).is_empty());
     }

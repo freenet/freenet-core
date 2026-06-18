@@ -587,10 +587,14 @@ impl RoutingPredictor {
         &self.transfer_speed_accuracy.recent_pairs
     }
 
+    /// Count of response-time predictions scored against an actual outcome
+    /// (finite (predicted, actual) pairs recorded on timed successes).
     pub fn response_time_predictions_evaluated(&self) -> u64 {
         self.response_time_accuracy.total
     }
 
+    /// Count of transfer-speed predictions scored against an actual outcome
+    /// (finite (predicted, actual) pairs recorded on timed successes).
     pub fn transfer_speed_predictions_evaluated(&self) -> u64 {
         self.transfer_speed_accuracy.total
     }
@@ -1087,5 +1091,35 @@ mod tests {
         assert_eq!(predictor.transfer_speed_predictions_evaluated(), 0);
         assert!(predictor.response_time_accuracy_pairs().is_empty());
         assert!(predictor.transfer_speed_accuracy_pairs().is_empty());
+    }
+
+    #[test]
+    fn regression_accuracy_skips_untimed_successes() {
+        let mut predictor = RoutingPredictor::new(10000);
+        let peer = make_peer();
+        let contract = Location::try_from(0.5).unwrap();
+
+        // Warm the timing stages with timed successes so predict() returns Some.
+        for i in 0..60 {
+            predictor.record_at_time(
+                &peer,
+                contract,
+                0.1,
+                success_timed(0.1, 1000.0),
+                i as f64 * 0.01,
+            );
+        }
+        let rt_before = predictor.response_time_predictions_evaluated();
+        let ts_before = predictor.transfer_speed_predictions_evaluated();
+        assert!(rt_before > 0 && ts_before > 0, "stages should be warmed");
+
+        // An untimed success carries no response-time/transfer-speed ground truth,
+        // so it must NOT be scored even though the stages can now predict (guards
+        // against recording a garbage/zero actual into the scatter).
+        for i in 60..70 {
+            predictor.record_at_time(&peer, contract, 0.1, success_untimed(), i as f64 * 0.01);
+        }
+        assert_eq!(predictor.response_time_predictions_evaluated(), rt_before);
+        assert_eq!(predictor.transfer_speed_predictions_evaluated(), ts_before);
     }
 }

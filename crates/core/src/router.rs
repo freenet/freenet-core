@@ -113,7 +113,8 @@ pub(crate) struct PerOpCurves {
     pub transfer_rate_data_range: (f64, f64),
     pub transfer_rate_events: usize,
     /// Downsampled raw (distance, outcome) observations behind each isotonic fit,
-    /// for the scatter overlay. Defaulted so older serialized snapshots still load.
+    /// for the scatter overlay. `#[serde(default)]` keeps decode tolerant of
+    /// missing fields via self-describing formats (no-op under the bincode AOF).
     #[serde(default)]
     pub failure_points: Vec<(f64, f64)>,
     #[serde(default)]
@@ -147,7 +148,9 @@ pub(crate) struct RouterSnapshotInfo {
     /// X-range of actual regression data for the transfer rate estimator.
     pub transfer_rate_data_range: (f64, f64),
     /// Downsampled raw (distance, outcome) observations behind each aggregate
-    /// isotonic fit, for the scatter overlay. Defaulted for old snapshots.
+    /// isotonic fit, for the scatter overlay. `#[serde(default)]` keeps decode
+    /// tolerant of missing fields via self-describing formats; it is a no-op for
+    /// the positional bincode AOF (which skips records it can't decode).
     #[serde(default)]
     pub failure_points: Vec<(f64, f64)>,
     #[serde(default)]
@@ -189,7 +192,11 @@ pub(crate) struct RouterSnapshotInfo {
     pub delegate_module_cache_evictions_total: Option<u64>,
     /// Per-operation-type estimator curves, keyed by op type name (e.g., "GET").
     pub per_op_curves: HashMap<String, PerOpCurves>,
-    /// Renegade predictor diagnostics
+    /// Renegade predictor diagnostics. These (and `renegade_accuracy_pairs`) are
+    /// read by the in-process peer dashboard directly from this struct; they are
+    /// intentionally not mirrored into the hand-written OTLP `json!` block in
+    /// `tracing/telemetry.rs` (the dashboard is the only consumer). The per-op
+    /// scatter does reach OTLP, because `per_op_curves` is forwarded wholesale.
     pub renegade_failure_events: usize,
     pub renegade_response_time_events: usize,
     pub renegade_transfer_speed_events: usize,
@@ -203,12 +210,18 @@ pub(crate) struct RouterSnapshotInfo {
     /// Recent (predicted_failure, actual_outcome) pairs for accuracy visualization.
     pub renegade_accuracy_pairs: Vec<(f64, f64)>,
     /// Recent (predicted_secs, actual_secs) pairs for the response-time stage.
+    /// `#[serde(default)]` for decode consistency with the `*_points` fields
+    /// (no-op under the positional bincode AOF).
+    #[serde(default)]
     pub renegade_response_time_pairs: Vec<(f64, f64)>,
     /// Recent (predicted_bps, actual_bps) pairs for the transfer-speed stage.
+    #[serde(default)]
     pub renegade_transfer_speed_pairs: Vec<(f64, f64)>,
     /// Number of response-time predictions scored against actual outcomes.
+    #[serde(default)]
     pub renegade_response_time_evaluated: u64,
     /// Number of transfer-speed predictions scored against actual outcomes.
+    #[serde(default)]
     pub renegade_transfer_speed_evaluated: u64,
 }
 
