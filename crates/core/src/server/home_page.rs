@@ -2961,6 +2961,7 @@ fn peer_detail_html(address_str: &str) -> String {
                     <div class="info-label">This peer: transfer rate</div><div class="info-value">{pt} events</div>
                 </div>
                 <h3 style="margin-top: 1em;">Renegade ML Predictor</h3>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">Renegade is a k-nearest-neighbours predictor tuned for accurate estimates from small amounts of data, so routing improves after a handful of observations rather than thousands.</p>
                 <div class="info-grid">
                     <div class="info-label">Failure observations</div><div class="info-value">{rf}</div>
                     <div class="info-label">Response time observations</div><div class="info-value">{rr}</div>
@@ -3132,6 +3133,11 @@ fn peer_detail_html(address_str: &str) -> String {
         format!(
             r#"<div class="card">
                 <h2>Routing Predictions</h2>
+                <p style="font-size:0.8em;color:var(--text-muted);">
+                    What the model predicts for each outcome versus ring distance to the contract:
+                    the curves the router consults when choosing a next hop. The Prediction Accuracy
+                    panel below scores these predictions against what actually happened.
+                </p>
                 <p class="chart-legend">
                     <span class="chart-key"><span class="chart-dot chart-dot-global"></span> Global model</span>
                     <span class="chart-key"><span class="chart-dot chart-dot-peer"></span> Peer-adjusted</span>
@@ -3521,12 +3527,13 @@ fn build_estimator_chart(
         }
     };
 
-    // Global curve (blue)
+    // Global curve (teal, the brand accent)
     draw_curve(&mut svg, curve_points, 0.0, "var(--accent-primary)");
 
-    // Peer-adjusted curve (green)
+    // Peer-adjusted curve (violet — deliberately off the teal/green family so it
+    // is not confused with the teal global curve)
     if let Some(adj) = peer_adjustment {
-        draw_curve(&mut svg, curve_points, adj, "#34d399");
+        draw_curve(&mut svg, curve_points, adj, "#8b5cf6");
     }
 
     // Peer location marker (vertical dashed line)
@@ -3609,8 +3616,9 @@ fn build_renegade_accuracy_panel(
         r#"<div class="card">
         <h2>Prediction Accuracy</h2>
         <p style="font-size:0.8em;color:var(--text-muted);">
-            How well each routing model's recent predictions matched reality. Points on the
-            dashed diagonal are perfect: for failure, predicted probability equals the observed
+            How well each routing model's recent predictions matched reality (the Routing
+            Predictions panel above shows the predictions themselves). Points on the dashed
+            diagonal are perfect: for failure, predicted probability equals the observed
             failure rate (calibration); for the timing models, predicted equals actual.
         </p>
         <div style="display:flex;flex-wrap:wrap;gap:1rem;justify-content:flex-start;">
@@ -4055,7 +4063,7 @@ a.header-title {
     display: inline-block;
 }
 .chart-dot-global { background: var(--accent-primary); }
-.chart-dot-peer { background: #34d399; }
+.chart-dot-peer { background: #8b5cf6; }
 .chart-dot-loc { background: #fbbf24; }
 .chart-dot-ext {
     background: transparent;
