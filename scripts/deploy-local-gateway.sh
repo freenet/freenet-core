@@ -334,13 +334,37 @@ verify_service() {
                 #     freenet process", which the check below treats as a
                 #     verification FAILURE rather than success.
                 local running_binary="unknown"
-                # Find the actual freenet process, not the wrapper
-                # MainPID may point to bash if service uses ExecStart with shell
-                local freenet_pid=$(pgrep -f "freenet.*--is-gateway\|freenet.*network" | head -1)
+                # Identify the running process for THIS unit. Prefer the unit's
+                # own MainPID (authoritative and scoped to $service_arg) so a
+                # live process from a DIFFERENT instance can't bless this unit
+                # when it is active-but-exited — a real risk on multi-instance
+                # hosts, where a global `pgrep` would match the wrong process.
+                # Fall back to the global pgrep only when MainPID is
+                # unavailable/0 (e.g. an ExecStart wrapper whose MainPID points
+                # at the shell rather than the freenet child).
+                local freenet_pid
+                freenet_pid=$(systemctl show -p MainPID --value "$service_arg.service" 2>/dev/null)
 
-                if [[ -z "$freenet_pid" ]]; then
-                    # Fallback to MainPID
-                    freenet_pid=$(systemctl show -p MainPID --value "$service_arg.service" 2>/dev/null)
+                if [[ -z "$freenet_pid" ]] || [[ "$freenet_pid" == "0" ]]; then
+                    # Fallback: locate the freenet process by command line. This
+                    # is global, so on a multi-instance host it can match a
+                    # process belonging to a DIFFERENT unit. Attribute the match
+                    # to THIS unit via its cgroup (systemd places each unit's
+                    # processes under .../<unit>.service/...) before trusting it;
+                    # a match that isn't in $service_arg's cgroup is discarded so
+                    # a sibling instance can't bless this (active-but-exited)
+                    # unit. If we can't read the cgroup, we conservatively drop
+                    # the candidate (fail closed) rather than risk a cross-unit
+                    # false success.
+                    local candidate_pid
+                    candidate_pid=$(pgrep -f "freenet.*--is-gateway\|freenet.*network" | head -1)
+                    if [[ -n "$candidate_pid" ]] \
+                        && sudo cat "/proc/$candidate_pid/cgroup" 2>/dev/null \
+                            | grep -q "$service_arg.service"; then
+                        freenet_pid="$candidate_pid"
+                    else
+                        freenet_pid=""
+                    fi
                 fi
 
                 if [[ -n "$freenet_pid" ]] && [[ "$freenet_pid" != "0" ]]; then

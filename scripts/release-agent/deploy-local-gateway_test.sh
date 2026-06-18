@@ -32,9 +32,14 @@ FAILURES=0
 pass() { echo "ok   - $1"; }
 fail() { echo "FAIL - $1" >&2; FAILURES=$((FAILURES + 1)); }
 
-TMP="$(mktemp -d)"
+# Hard-fail on any fixture-setup error (e.g. a read-only /tmp where mktemp/mkdir
+# fail). The body intentionally avoids `set -e` (assertions run in `if`
+# conditions and must keep going after a failure), so a broken harness could
+# otherwise let a negative-case assertion pass vacuously — guard setup
+# explicitly.
+TMP="$(mktemp -d)" || { echo "FAIL: mktemp -d failed (is /tmp writable?)" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
-mkdir -p "$TMP/bin" "$TMP/install"
+mkdir -p "$TMP/bin" "$TMP/install" || { echo "FAIL: could not create $TMP dirs" >&2; exit 1; }
 
 # Fake freenet binary that reports the target version. Used both as the source
 # --binary and (after the script copies it) as the installed binary.
@@ -46,17 +51,28 @@ chmod +x "$TMP/source-binary"
 
 # Stub `sudo`: chown is a no-op (we are not root and INSTALL_PATH is in tmp);
 # `readlink` is intercepted to report the installed path so the running-binary
-# check matches; everything else execs through.
+# check matches; `cat /proc/<pid>/cgroup` is answered from $TMP/cgroup-content
+# so a test can control whether the pgrep-fallback candidate is attributed to
+# the target unit; everything else execs through.
 cat > "$TMP/bin/sudo" <<EOF
 #!/bin/bash
 [[ "\$1" == "-n" || "\$1" == "--non-interactive" ]] && shift
 case "\$1" in
   chown) exit 0 ;;
   readlink) echo "$TMP/install/freenet"; exit 0 ;;
+  cat)
+    # Only the cgroup read is modelled; echo whatever the test configured.
+    cat "$TMP/cgroup-content" 2>/dev/null || true
+    exit 0
+    ;;
   *) exec "\$@" ;;
 esac
 EOF
 chmod +x "$TMP/bin/sudo"
+# Default cgroup content: belongs to the target unit (so the fallback-path
+# candidate, if used, is attributed to this unit). Tests that exercise a
+# foreign process overwrite this.
+echo "0::/system.slice/freenet-gateway.service" > "$TMP/cgroup-content"
 
 # `lsof` stub: binary is never busy.
 printf '#!/bin/bash\nexit 1\n' > "$TMP/bin/lsof"
@@ -147,6 +163,36 @@ if [[ "$rc" != "0" ]]; then
     pass "verify_service: active-but-no-process → non-zero exit"
 else
     fail "verify_service: active-but-no-process must NOT exit 0 (got $rc)"
+fi
+
+# ── active-but-no-process for THIS unit, but ANOTHER freenet process is
+#    alive → still failure. Pins the MainPID-first + cgroup-attribution: a live
+#    process from a DIFFERENT instance (its cgroup names another unit) must NOT
+#    bless this unit's empty MainPID.
+write_systemctl 0 true 0      # THIS unit: active, MainPID 0 (no process)
+write_pgrep found             # a global pgrep WOULD find some freenet process
+# ...but that process belongs to a different unit's cgroup.
+echo "0::/system.slice/freenet-gateway-hector.service" > "$TMP/cgroup-content"
+rc=$(run_deploy)
+if [[ "$rc" != "0" ]]; then
+    pass "verify_service: MainPID 0 + foreign-cgroup freenet process → non-zero exit (no cross-unit bless)"
+else
+    fail "verify_service: a foreign-cgroup freenet process must NOT bless this unit's empty MainPID (got $rc)"
+fi
+# Restore the default (this-unit) cgroup for any later cases.
+echo "0::/system.slice/freenet-gateway.service" > "$TMP/cgroup-content"
+
+# ── MainPID 0 (wrapper ExecStart) but pgrep finds the unit's OWN freenet
+#    child (cgroup matches) → success. Pins that the cgroup-attributed
+#    fallback still blesses a legitimately-running wrapper-launched gateway.
+write_systemctl 0 true 0      # active, MainPID 0 (wrapper points MainPID at shell)
+write_pgrep found             # freenet child found by command line
+echo "0::/system.slice/freenet-gateway.service" > "$TMP/cgroup-content"  # belongs to this unit
+rc=$(run_deploy)
+if [[ "$rc" == "0" ]]; then
+    pass "verify_service: MainPID 0 + this-unit-cgroup freenet child → exit 0 (wrapper ExecStart still verifies)"
+else
+    fail "verify_service: a this-unit freenet child should verify even when MainPID is 0 (got $rc)"
 fi
 
 # ── result ────────────────────────────────────────────────────────────

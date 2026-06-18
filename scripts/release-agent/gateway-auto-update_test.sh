@@ -34,10 +34,15 @@ FAILURES=0
 pass() { echo "ok   - $1"; }
 fail() { echo "FAIL - $1" >&2; FAILURES=$((FAILURES + 1)); }
 
-# A throwaway tempdir holding stub binaries and the fake deploy script.
-TMP="$(mktemp -d)"
+# A throwaway tempdir holding stub binaries and the fake deploy script. Hard-
+# fail on any fixture-setup error (e.g. a read-only /tmp where mktemp/mkdir
+# fail) so a broken harness can NEVER let a negative-case assertion pass
+# vacuously. We deliberately do NOT `set -e` for the body (assertions run in
+# `if` conditions and must keep going after a failure), so guard setup
+# explicitly.
+TMP="$(mktemp -d)" || { echo "FAIL: mktemp -d failed (is /tmp writable?)" >&2; exit 1; }
 trap 'rm -rf "$TMP"' EXIT
-mkdir -p "$TMP/bin"
+mkdir -p "$TMP/bin" || { echo "FAIL: could not create $TMP/bin" >&2; exit 1; }
 
 # Stub `systemctl`: its `is-active` answer is whatever is written to the
 # SERVICE_STATE file. Everything else (start/stop/etc.) is a no-op success.

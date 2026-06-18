@@ -31,13 +31,20 @@ LOG_FILE="${LOG_FILE:-/var/log/freenet-auto-update.log}"
 # --service and by verify_service_active so the two always target the same
 # unit (#4492).
 #
-# Defaults to freenet-gateway. A non-default instance (e.g. vega's
-# freenet-gateway-hector) MUST set SERVICE_NAME in this script's environment.
-# The release-agent does not yet forward its `managed_service` config as
-# SERVICE_NAME, so on such an instance both the deploy and the gate currently
-# fall back to freenet-gateway — tracked as a follow-up to thread
-# managed_service through (see #4492). Setting SERVICE_NAME in the agent's
-# systemd unit Environment= is the interim fix.
+# Defaults to freenet-gateway (nova's unit, and the deploy-script default).
+#
+# A non-default instance (e.g. vega's freenet-gateway-hector) needs SERVICE_NAME
+# set, but the release-agent does NOT yet forward its `managed_service` config:
+# it spawns this script via `sudo --non-interactive <cmd> --force
+# --target-version vX.Y.Z` (updater.rs), and sudo strips the environment, so an
+# `Environment=SERVICE_NAME=...` on the agent's unit would NOT reach here unless
+# the sudoers policy also `env_keep`s it (it does not). The robust fix is to
+# forward `managed_service` as an argv flag the agent already passes through the
+# sudoers wildcard (like --target-version), then have the agent invoke this
+# script with `--service`/SERVICE_NAME. Until that lands, both the deploy and
+# the gate fall back to freenet-gateway on a non-default instance — tracked as a
+# follow-up to #4492. (nova, the host in the #4492 incident, IS freenet-gateway,
+# so the default path is correctly covered.)
 SERVICE_NAME="${SERVICE_NAME:-freenet-gateway}"
 
 # Flags
