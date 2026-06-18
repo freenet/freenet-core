@@ -27,6 +27,14 @@ pub use module_cache::default_module_cache_budget_bytes;
 pub(crate) use module_cache::{
     DELEGATE_MODULE_CACHE_BUDGET_DIVISOR, MODULE_CACHE_METRICS, ModuleCache,
 };
+// Clamp bounds are referenced only by the config-default round-trip test, which
+// asserts the resolved default lands within [MIN, MAX] without hardcoding the
+// byte values (so the test can't drift from the clamp). Gated to test builds so
+// the re-export isn't an unused import under `-D warnings` in release.
+#[cfg(test)]
+pub(crate) use module_cache::{
+    MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES, MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES,
+};
 pub(crate) use native_api::{
     CREATED_DELEGATES_COUNT, DELEGATE_INHERITED_ORIGINS, DELEGATE_SUBSCRIPTIONS,
     DelegateContextCache, new_delegate_context_cache,

@@ -1803,6 +1803,64 @@ mod tests {
         );
     }
 
+    /// Pin (issue #4441): the wasmtime disk **compilation** cache MUST stay
+    /// enabled on the engine config. This is the second half of the #4441 fix:
+    /// when a module is evicted from the in-memory `ModuleCache` and accessed
+    /// again, the recompile path (`prepare_contract_call` → `engine.compile` →
+    /// `compile_coalesced` → `Module::new`) hits this disk cache and
+    /// *deserializes* the already-compiled artifact (~100x faster) instead of
+    /// running Cranelift from scratch. Without it, eviction-reload would pay the
+    /// full compile cost every time, re-creating the thrash the byte budget is
+    /// meant to bound. A source-scrape pin (not a behavioral test) because the
+    /// disk cache writes to a shared user cache dir and its hit/miss timing is
+    /// not deterministic enough to assert on in CI.
+    #[test]
+    fn engine_enables_wasmtime_disk_compilation_cache() {
+        // Isolate ONLY the production `create_backend_engine` body before
+        // scraping. `include_str!` pulls in this test's own assertion strings,
+        // so a whole-file `contains` would be satisfied by the literals below
+        // and pass even if the real cache-enabling lines were deleted — exactly
+        // the self-satisfying-pin failure mode. Splitting on the function
+        // signature and the next fn restricts the scrape to production code.
+        let src = include_str!("wasmtime_engine.rs");
+        let after_sig = src
+            .split("fn create_backend_engine(config: &RuntimeConfig) -> Result<Engine, ContractError> {")
+            .nth(1)
+            .expect("create_backend_engine must exist");
+        // Truncate at the NEXT function so the scrape sees only production code,
+        // never this test's own assertion strings. `split().next()` always
+        // returns `Some` even when the delimiter is absent, so an `.expect()`
+        // here would NOT catch a renamed/removed `recover_store` — the body
+        // would silently extend to EOF and the test would self-satisfy. Assert
+        // the delimiter was actually present instead, so the safety is real.
+        const END_ANCHOR: &str = "\n    fn recover_store(";
+        assert!(
+            after_sig.contains(END_ANCHOR),
+            "end-of-function anchor `{END_ANCHOR}` not found — if recover_store \
+             was renamed/removed, re-point this anchor so the scrape stays \
+             scoped to create_backend_engine and can't self-satisfy"
+        );
+        let body = after_sig.split(END_ANCHOR).next().unwrap();
+        // Defense in depth: the scoped body must not contain this test's own
+        // function name, proving the scrape really excludes the test module.
+        assert!(
+            !body.contains("engine_enables_wasmtime_disk_compilation_cache"),
+            "scraped body leaked into the test module — the scope is not isolated"
+        );
+        // The build path that constructs the wasmtime Config must install a
+        // disk cache via `wasmtime_config.cache(Some(...))`.
+        assert!(
+            body.contains("Cache::new(CacheConfig::new())"),
+            "create_backend_engine must construct the wasmtime disk compilation cache"
+        );
+        assert!(
+            body.contains("wasmtime_config.cache(Some(cache))"),
+            "create_backend_engine must install the disk compilation cache so an \
+             evicted module deserializes from disk on reload instead of \
+             recompiling (issue #4441 fix #2)"
+        );
+    }
+
     /// Regression test for Report 2RDXTD: wasmtime's per-Store instance counter is
     /// monotonic (never decremented) with a default limit of 10,000. Our ResourceLimiter
     /// override sets instances() to usize::MAX so long-running gateways don't exhaust.
