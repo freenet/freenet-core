@@ -29,6 +29,18 @@ on:
         required: false
         type: boolean
         default: false
+      allow_binary_only_fallback:
+        description: >-
+          Accept a gateway whose release-agent predates the service_active
+          field (binary-version-only verification). OFF by default: without
+          service_active we cannot tell a running gateway from one whose binary
+          was swapped but whose service is dead (the 2026-06-18 nova incident,
+          #4492), so a missing field is treated as not-yet-converged and the
+          rollout fails at the deadline. Turn this on ONLY for a deliberate
+          rollout to a gateway you know runs an old agent.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -223,6 +235,9 @@ jobs:
         env:
           GATEWAY_URL: ${{ matrix.gateway.url }}
           VERSION: ${{ needs.plan.outputs.version }}
+          # Empty on the release-trigger path (no inputs) → defaults to the
+          # safe "false". See the allow_binary_only_fallback input docs.
+          ALLOW_BINARY_ONLY_FALLBACK: ${{ inputs.allow_binary_only_fallback }}
         run: |
           set -euo pipefail
           # The agent restarts the freenet service after the script
@@ -245,6 +260,9 @@ jobs:
           source scripts/release-agent/verify-version-decision.sh
 
           DEADLINE=$(( $(date +%s) + 120 ))
+          # Remember if we ever saw the old-agent (no service_active) response,
+          # so the deadline error can point at the real cause.
+          SAW_FALLBACK=false
           while (( $(date +%s) < DEADLINE )); do
             RESPONSE=$(curl -sS --max-time 5 "$GATEWAY_URL/version" || true)
             INSTALLED=$(printf '%s' "$RESPONSE" | jq -r '.version // empty' 2>/dev/null || echo "")
@@ -257,9 +275,25 @@ jobs:
                 exit 0
                 ;;
               success-fallback)
-                echo "::warning::Gateway ${{ matrix.gateway.name }} agent predates the service-health check (no 'service_active' in /version); falling back to binary-only verification. Update the release-agent on this gateway to enable the stronger check."
-                echo "✓ Gateway ${{ matrix.gateway.name }} now reports version $INSTALLED (binary-only check)"
-                exit 0
+                # The agent predates the service_active field, so we cannot
+                # confirm the SERVICE is up — only that the binary on disk is
+                # the new version. On 2026-06-18 (#4492) nova hit exactly this:
+                # binary swapped to the target but the gateway service was
+                # dead, and this branch reported the rollout green. So by
+                # default we DO NOT accept binary-only as success: treat it
+                # like `wait` (keep polling, fail at the deadline) and tell the
+                # operator to update the agent. Only the explicit
+                # allow_binary_only_fallback opt-in restores the old behaviour.
+                # The accept/hold policy lives in fallback_decision() (sourced
+                # above) so it is unit-tested rather than inline-untested.
+                if [[ "$(fallback_decision "$DECISION" "${ALLOW_BINARY_ONLY_FALLBACK:-false}")" == "accept" ]]; then
+                  echo "::warning::Gateway ${{ matrix.gateway.name }} agent predates the service-health check (no 'service_active' in /version); allow_binary_only_fallback=true, so accepting binary-only verification. Update the release-agent on this gateway to enable the stronger check."
+                  echo "✓ Gateway ${{ matrix.gateway.name }} now reports version $INSTALLED (binary-only check)"
+                  exit 0
+                fi
+                SAW_FALLBACK=true
+                echo "::warning::Gateway ${{ matrix.gateway.name }} agent predates the service-health check (no 'service_active' in /version); cannot confirm the service is actually running. Update the release-agent (>= the #4378 build) to enable the service-health gate, or re-run with allow_binary_only_fallback=true to accept binary-only verification."
+                echo "Binary is $INSTALLED but service health is UNVERIFIABLE on this agent; treating as not-yet-converged…"
                 ;;
               wait)
                 if [[ "$INSTALLED" == "$VERSION" ]]; then
@@ -275,5 +309,9 @@ jobs:
             esac
             sleep 5
           done
+          if [[ "$SAW_FALLBACK" == "true" ]]; then
+            echo "::error::Gateway ${{ matrix.gateway.name }} reported version $VERSION but its release-agent predates the service_active field, so service health could not be confirmed (binary-only). Failing closed (#4492). Update the release-agent on ${{ matrix.gateway.name }}, or re-run with allow_binary_only_fallback=true if you accept binary-only verification."
+            exit 1
+          fi
           echo "::error::Gateway ${{ matrix.gateway.name }} did not converge on $VERSION with an active service within 120s"
           exit 1

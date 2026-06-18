@@ -226,9 +226,14 @@ converge timeout now has two possible meanings:
   `inactive` unit with the new binary on disk is this failure mode.
 
 (Note: against a gateway running an OLD release-agent that predates the
-`service_active` field, the workflow logs a `::warning::` and falls back to the
-binary-only check, so the stronger signal is only enforced once the agent
-itself has been updated.)
+`service_active` field, the workflow can no longer confirm the service is
+running. As of #4492 it **fails closed** by default — the rollout step errors
+at the deadline telling you to update that gateway's release-agent. The old
+binary-only behaviour is available only via the explicit
+`allow_binary_only_fallback=true` `workflow_dispatch` input, for a deliberate
+rollout to a gateway you know runs an old agent. So on the normal
+release-triggered path, a gateway with an outdated agent will fail the rollout
+until its agent is upgraded.)
 
 Recovery:
 
