@@ -2145,6 +2145,8 @@ code {
 }
 .note a { color: var(--accent-light); }
 [data-theme="light"] .note a { color: var(--accent-primary); }
+.ext-link { color: var(--accent-light); }
+[data-theme="light"] .ext-link { color: var(--accent-primary); }
 p { margin-bottom: 0.5rem; }
 p:last-child { margin-bottom: 0; }
 .ring-wrap {
@@ -2961,7 +2963,7 @@ fn peer_detail_html(address_str: &str) -> String {
                     <div class="info-label">This peer: transfer rate</div><div class="info-value">{pt} events</div>
                 </div>
                 <h3 style="margin-top: 1em;">Renegade ML Predictor</h3>
-                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">Renegade is a zero-configuration k-nearest-neighbours model (it auto-selects K and learns which features matter). It predicts per-peer, per-contract outcomes from four features (peer, contract location, distance, time); the router blends its prediction with the distance-based estimate (a weighted average, Renegade's share growing with data up to half) to catch patterns distance alone misses, such as a peer that drops requests for specific contracts.</p>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;"><a href="https://github.com/sanity/renegade" target="_blank" rel="noopener noreferrer" class="ext-link">Renegade</a> is a zero-configuration k-nearest-neighbours model (it auto-selects K and learns which features matter). It predicts per-peer, per-contract outcomes from four features (peer, contract location, distance, time); the router blends its prediction with the distance-based estimate (a weighted average, Renegade's share growing with data up to half) to catch patterns distance alone misses, such as a peer that drops requests for specific contracts.</p>
                 <div class="info-grid">
                     <div class="info-label">Failure observations</div><div class="info-value">{rf}</div>
                     <div class="info-label">Response time observations</div><div class="info-value">{rr}</div>
@@ -3118,6 +3120,13 @@ fn peer_detail_html(address_str: &str) -> String {
                 // migration stopped feeding the response-time
                 // and transfer-rate estimators (the `Failure Probability`-only
                 // dashboard regression that surfaced this code path).
+                // Failure probabilities are tiny, so a fixed 0.0–1.0 axis
+                // squashes the curve flat against the bottom. Zoom the top of
+                // the axis to 2x the curve's value at the right edge of the
+                // plot so the line is legible. See failure_chart_y_max.
+                let fail_y_max =
+                    failure_chart_y_max(f_curve, if tab_name == "All" { fail_adj } else { None })
+                        .to_string();
                 panel_content.push_str(&build_estimator_chart_or_placeholder(
                     "Failure Probability",
                     f_curve,
@@ -3126,7 +3135,7 @@ fn peer_detail_html(address_str: &str) -> String {
                     if tab_name == "All" { fail_adj } else { None },
                     ploc,
                     "0.0",
-                    "1.0",
+                    &fail_y_max,
                     "No success/failure observations have routed through this peer yet.",
                 ));
                 panel_content.push_str(&build_estimator_chart_or_placeholder(
@@ -3286,6 +3295,35 @@ fn peer_detail_html(address_str: &str) -> String {
     )
 }
 
+/// Choose the top of the failure-probability chart's y-axis.
+///
+/// Failure probabilities for a healthy peer are tiny (often well under 0.1),
+/// so a fixed 0.0–1.0 axis squashes the fitted curve flat against the bottom
+/// and its shape is unreadable. Instead, scale the top of the axis to twice the
+/// curve's value at the right edge of the plot (the largest distance shown,
+/// 0.5), so the line occupies roughly the lower half of the chart. The PAV
+/// failure estimator is monotonically increasing in distance, so the right edge
+/// is the curve's maximum and 2x leaves headroom above the whole line.
+///
+/// Returns 1.0 (the original full-range axis) when there is no failure signal at
+/// the right edge, avoiding a degenerate zero-height axis. The result is capped
+/// at 1.0 since a probability can never exceed 1.0.
+fn failure_chart_y_max(curve_points: &[(f64, f64)], peer_adjustment: Option<f64>) -> f64 {
+    // y-value at the largest sampled distance (the right edge of the chart).
+    let right_edge = curve_points
+        .iter()
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|&(_, y)| y)
+        .unwrap_or(0.0);
+    // Keep the peer-adjusted line on-screen too: only an upward (positive)
+    // adjustment can push its right edge above the global curve's.
+    let right_edge = right_edge + peer_adjustment.unwrap_or(0.0).max(0.0);
+    if right_edge <= 1e-9 {
+        return 1.0;
+    }
+    (2.0 * right_edge).min(1.0)
+}
+
 /// Render the named estimator chart, or — when no data has been observed
 /// yet — a titled placeholder. The placeholder keeps the slot visible so
 /// users can always see every component of a routing prediction even when
@@ -3347,11 +3385,13 @@ fn build_estimator_chart(
     }
 
     let w: f64 = 560.0;
-    let h: f64 = 200.0;
+    // Bottom padding leaves room for both the distance tick numbers and the
+    // "Distance" axis title below them; plot height stays 160px.
+    let h: f64 = 210.0;
     let pad_l: f64 = 50.0;
     let pad_r: f64 = 10.0;
     let pad_t: f64 = 10.0;
-    let pad_b: f64 = 30.0;
+    let pad_b: f64 = 40.0;
     let plot_w = w - pad_l - pad_r;
     let plot_h = h - pad_t - pad_b;
 
@@ -3458,18 +3498,37 @@ fn build_estimator_chart(
         .ok();
     }
 
-    // Y-axis labels (3 ticks)
+    // X-axis title: the x-axis is always ring distance (peer ↔ contract).
+    write!(
+        svg,
+        r#"<text x="{x:.0}" y="{y:.0}" text-anchor="middle" class="axis-label">Distance</text>"#,
+        x = pad_l + plot_w / 2.0,
+        y = h - 6.0,
+    )
+    .ok();
+
+    // Y-axis labels (3 ticks).
+    //
+    // Pick decimal places from the tick step so adjacent ticks stay
+    // distinguishable. The failure chart now zooms to a very small range
+    // (probabilities are tiny), where a fixed 2-decimal format would collapse
+    // every tick to "0.00".
+    let step = y_range / 2.0;
+    let decimals: usize = if step <= 0.0 {
+        3
+    } else if step >= 10.0 {
+        0
+    } else if step >= 1.0 {
+        1
+    } else {
+        // step in (0, 1): enough places for ~2 significant figures of the step.
+        ((-step.log10()).ceil() as usize).saturating_add(1).min(9)
+    };
     for i in 0..=2 {
         let frac = i as f64 / 2.0;
         let y_val = y_min + frac * y_range;
         let sy = to_svg_y(y_val);
-        let label = if y_val.abs() < 1e-3 && y_range < 10.0 {
-            format!("{:.3}", y_val)
-        } else if y_range <= 1.0 {
-            format!("{:.2}", y_val)
-        } else {
-            format!("{:.0}", y_val)
-        };
+        let label = format!("{y_val:.decimals$}");
         write!(
             svg,
             r#"<text x="{x}" y="{sy:.0}" text-anchor="end" class="axis-label">{label}</text>"#,
@@ -3483,18 +3542,26 @@ fn build_estimator_chart(
     // Raw observed outcomes (drawn first, under the isotonic fit). Each dot is one
     // actual event at its (distance, outcome); the spread shows how isotonic the
     // relationship really is.
+    //
+    // The failure chart zooms its y-axis to the tiny fitted probabilities (see
+    // failure_chart_y_max), which would push the binary failure outcomes (y = 1.0)
+    // off the top of the plot. Rather than dropping off-scale points — which would
+    // hide every failure precisely on the healthy, low-probability peers the zoom
+    // is meant to illuminate — clamp them to the nearest edge so they remain
+    // visible as a row of dots at the boundary. (Auto-scaled charts always size
+    // their range to include the scatter, so the clamp is a no-op there.)
     for &(x, y) in scatter_points {
         if !(x.is_finite() && y.is_finite()) {
             continue;
         }
-        if !(x_min..=x_max).contains(&x) || !(y_min..=y_max).contains(&y) {
+        if !(x_min..=x_max).contains(&x) {
             continue;
         }
         write!(
             svg,
             r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="1.8" fill="var(--text-muted)" opacity="0.35"/>"#,
             cx = to_svg_x(x),
-            cy = to_svg_y(y),
+            cy = to_svg_y(y.clamp(y_min, y_max)),
         )
         .ok();
     }
@@ -5139,6 +5206,130 @@ mod tests {
         assert!(
             !html.contains("should not see this"),
             "non-empty curve must not show the empty-message text"
+        );
+    }
+
+    #[test]
+    fn failure_chart_y_max_zooms_to_twice_right_edge() {
+        // Monotonic, tiny failure curve: right edge is 0.04 → axis top 0.08, so
+        // the line sits around mid-height instead of hugging y=0.
+        let curve = vec![(0.0, 0.001), (0.25, 0.02), (0.5, 0.04)];
+        let y_max = failure_chart_y_max(&curve, None);
+        assert!((y_max - 0.08).abs() < 1e-9, "expected 0.08, got {y_max}");
+    }
+
+    #[test]
+    fn failure_chart_y_max_falls_back_to_full_range_without_signal() {
+        // No failures observed (all-zero curve) → keep the original 0..1 axis
+        // rather than collapsing to a degenerate zero-height range.
+        let curve = vec![(0.0, 0.0), (0.5, 0.0)];
+        assert_eq!(failure_chart_y_max(&curve, None), 1.0);
+        // An empty curve also falls back to the full range.
+        assert_eq!(failure_chart_y_max(&[], None), 1.0);
+    }
+
+    #[test]
+    fn failure_chart_y_max_capped_at_one() {
+        // A large right edge would give 2x > 1; a probability axis can't exceed 1.
+        let curve = vec![(0.0, 0.2), (0.5, 0.7)];
+        assert_eq!(failure_chart_y_max(&curve, None), 1.0);
+    }
+
+    #[test]
+    fn failure_chart_y_max_accounts_for_peer_adjustment() {
+        let curve = vec![(0.0, 0.001), (0.5, 0.02)];
+        // Upward adjustment lifts the peer-adjusted line, so the axis must grow
+        // to keep it on-screen: (0.02 + 0.03) * 2 = 0.10.
+        let up = failure_chart_y_max(&curve, Some(0.03));
+        assert!((up - 0.10).abs() < 1e-9, "expected 0.10, got {up}");
+        // A downward adjustment must not shrink the axis below the global edge.
+        let down = failure_chart_y_max(&curve, Some(-0.01));
+        assert!((down - 0.04).abs() < 1e-9, "expected 0.04, got {down}");
+    }
+
+    #[test]
+    fn estimator_chart_labels_x_axis_as_distance() {
+        // The x-axis is always ring distance; it must carry a "Distance" title.
+        let curve = vec![(0.0, 0.1), (0.25, 0.5), (0.5, 0.9)];
+        let html = build_estimator_chart(
+            "Failure Probability",
+            &curve,
+            &[],
+            (0.0, 0.5),
+            None,
+            None,
+            "0.0",
+            "1.0",
+        );
+        assert!(
+            html.contains(">Distance<"),
+            "estimator chart must label its x-axis 'Distance', got: {html}"
+        );
+    }
+
+    #[test]
+    fn estimator_chart_small_range_y_labels_stay_distinct() {
+        // Zoomed failure axis (0.0 .. 0.01): a fixed 2-decimal format collapsed
+        // the middle and top ticks to "0.00"/"0.01". Adaptive decimals must keep
+        // all three ticks readable and distinct.
+        let curve = vec![(0.0, 0.0), (0.25, 0.003), (0.5, 0.005)];
+        let html = build_estimator_chart(
+            "Failure Probability",
+            &curve,
+            &[],
+            (0.0, 0.5),
+            None,
+            None,
+            "0.0",
+            "0.01",
+        );
+        assert!(
+            html.contains(">0.0050<"),
+            "middle y-tick must remain readable at a small range, got: {html}"
+        );
+        assert!(
+            html.contains(">0.0100<"),
+            "top y-tick must remain readable at a small range, got: {html}"
+        );
+    }
+
+    #[test]
+    fn estimator_chart_keeps_offscale_failure_dots_when_zoomed() {
+        // With a zoomed failure axis (0.0 .. 0.08), raw failure outcomes at
+        // y=1.0 are off-scale-high. They must still render (clamped to the top
+        // edge) instead of vanishing, so failures stay visible on the
+        // low-probability peers the zoom targets. The fitted curve renders as a
+        // <path>, so every <circle> here is a scatter dot.
+        let curve = vec![(0.0, 0.001), (0.25, 0.02), (0.5, 0.04)];
+        let scatter = vec![(0.1, 0.0), (0.2, 1.0), (0.3, 1.0)];
+        let html = build_estimator_chart(
+            "Failure Probability",
+            &curve,
+            &scatter,
+            (0.0, 0.5),
+            None,
+            None,
+            "0.0",
+            "0.08",
+        );
+        let circles = html.matches("<circle").count();
+        assert!(
+            circles >= 3,
+            "all 3 scatter dots (incl. the 2 off-scale failures) must render, got {circles}: {html}"
+        );
+    }
+
+    #[test]
+    fn peer_detail_links_renegade_to_repo() {
+        // The "Renegade" label on the Routing Model card links to the project repo.
+        let src = include_str!("home_page.rs");
+        let cutoff = src
+            .find("#[cfg(test)]")
+            .expect("home_page.rs must have a #[cfg(test)] section");
+        let prod = &src[..cutoff];
+        assert!(
+            prod.contains(r#"href="https://github.com/sanity/renegade""#),
+            "the Renegade label must link to https://github.com/sanity/renegade"
         );
     }
 
