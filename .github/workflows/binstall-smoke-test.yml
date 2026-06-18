@@ -140,7 +140,7 @@ jobs:
     if: failure() && needs.binstall-smoke-test.result == 'failure'
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/river-dev-notify
         with:
           message: "🚨 Nightly binstall smoke test failed — cargo binstall of the latest published freenet/fdev release failed — ${{ github.repository }} — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

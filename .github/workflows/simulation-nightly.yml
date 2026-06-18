@@ -44,7 +44,7 @@ jobs:
       SIMULATION_SEED: ${{ github.event.inputs.seed || '0xDEADBEEF' }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
@@ -209,7 +209,7 @@ jobs:
     if: failure() && needs.large-scale-simulation.result == 'failure'
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/river-dev-notify
         with:
           message: "🚨 Nightly simulation tests failed — ${{ github.repository }} — branch ${{ github.ref_name }} — commit ${{ github.sha }} — seed ${{ github.event.inputs.seed || '0xDEADBEEF' }} — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

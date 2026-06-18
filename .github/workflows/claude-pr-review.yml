@@ -124,7 +124,7 @@ jobs:
     steps:
       - name: Checkout repository
         if: github.event_name != 'merge_group'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           # Explicitly checkout the PR head so the trusted "Compute PR diff"
           # step sees the fork's changes. Safe: we only run git locally and

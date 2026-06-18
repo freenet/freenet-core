@@ -38,7 +38,7 @@ jobs:
       RUST_LOG: error
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Need enough history to find merge-base with target branch
           fetch-depth: 0
