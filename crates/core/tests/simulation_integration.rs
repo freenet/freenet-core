@@ -10236,3 +10236,203 @@ fn test_get_dead_ends_at_close_cluster_without_migration() {
          and obtain NO state (the far host is off the greedy path toward the key)"
     );
 }
+
+/// Regression test for the GET (#4404) and SUBSCRIBE (#4414) placement-gap
+/// dead-ends and the terminus local-probe fallback that resolves BOTH without
+/// the placement migration.
+///
+/// Same placement-gap topology as `test_get_dead_ends_at_close_cluster_without_migration`:
+/// a dense cluster of peers sits on the contract's key location (none host it),
+/// one far peer hosts the seeded contract, and a far requester issues a
+/// GET-then-subscribe (the real "remote reader" flow). The migration is pinned
+/// OFF, so nothing seeds the contract toward its key.
+///
+/// Greedy routing — for GET *and* the auto-subscribe after it — routes toward
+/// the key and dead-ends in the non-hosting cluster: the closest peer does not
+/// host the contract and has no connection closer to the key, so without a
+/// fallback the GET returns NotFound and the subscribe times out at hop 0 (the
+/// #4404 / #4414 symptoms). The terminus local-probe fallback makes the
+/// originator, after greedy routing exhausts, probe its own remaining un-tried
+/// neighbours with an `htl = 0` Request — reaching the far host (a direct
+/// neighbour in this small topology), obtaining the body (GET) and joining the
+/// host's subscriber set (SUBSCRIBE).
+///
+/// Asserts BOTH fixes end-to-end: the requester obtains the state (GET
+/// fallback) and the host registers a downstream subscriber (SUBSCRIBE
+/// fallback). Without the fallback both signals are absent (the dead-end). This
+/// is the regression check #4404 / #4414 ask for.
+#[test_log::test]
+fn test_get_and_subscribe_dead_ends_resolved_by_terminus_probe_fallback() {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    // Reuse the seed proven to produce a genuine GET dead-end in
+    // `test_get_dead_ends_at_close_cluster_without_migration` (same topology),
+    // so greedy routing genuinely dead-ends here and the terminus probe
+    // fallback is what resolves it — rather than a seed where greedy multi-hop
+    // happens to reach the host on its own.
+    const SEED: u64 = 0xDEAD_F00D_0001;
+    const NETWORK_NAME: &str = "subscribe-deadend-fallback";
+    setup_deterministic_state(SEED);
+
+    let contract = SimOperation::create_test_contract(0xBE);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+
+    // Six peers clustered tightly around the key (none host it), one far host
+    // (seeded), one far requester — identical to the GET dead-end control so the
+    // two tests reproduce the same placement gap for GET and SUBSCRIBE.
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    let cluster: Vec<f64> = [-0.010, -0.006, -0.003, 0.003, 0.006, 0.010]
+        .iter()
+        .map(|o| wrap(key_loc + o))
+        .collect();
+    let host_loc = wrap(key_loc + 0.40);
+    let requester_loc = wrap(key_loc + 0.70);
+    let mut node_locations = cluster.clone();
+    node_locations.push(host_loc); // regular-node order 6 -> node_no 7
+    node_locations.push(requester_loc); // regular-node order 7 -> node_no 8
+    let num_nodes = node_locations.len(); // 8
+
+    let rt = create_runtime();
+    let mut sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            NETWORK_NAME,
+            1,         // 1 gateway
+            num_nodes, // 8 regular nodes
+            10,        // ring_max_htl
+            7,         // rnd_if_htl_above
+            8,         // max_connections
+            3,         // min_connections
+            SEED,
+            &node_locations,
+        )
+        .await
+    });
+    // Pin migration OFF: this test proves the *fallback* resolves the dead-end,
+    // not the placement migration. Without this, a build at/above the
+    // production SUBSCRIBE_HINT_MIN_VERSION floor would migrate the contract and
+    // mask the fallback under test.
+    sim.disable_placement_migration();
+
+    let host_label = NodeLabel::node(NETWORK_NAME, 7); // host_loc
+    let requester_label = NodeLabel::node(NETWORK_NAME, 8); // requester_loc
+
+    // Setup sanity: a cluster node must be strictly closer to the key than the
+    // host, so a key-routed SUBSCRIBE genuinely dead-ends in the (non-hosting)
+    // cluster rather than greedily reaching the holder.
+    let locs = sim.get_peer_locations();
+    let ring_dist = |a: f64, b: f64| {
+        let d = (a - b).abs();
+        d.min(1.0 - d)
+    };
+    let host_dist = ring_dist(locs[7], key_loc);
+    let cluster_min = (1..=6)
+        .map(|i| ring_dist(locs[i], key_loc))
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        cluster_min < host_dist,
+        "scenario setup wrong: a cluster node must be closer to the key than the host \
+         (cluster_min={cluster_min}, host_dist={host_dist})"
+    );
+
+    let operations = vec![
+        // Only the far host HOSTS the contract initially (genuine host: state +
+        // ring hosting manager, no network propagation), so it is the sole
+        // holder both the GET and the SUBSCRIBE must reach.
+        ScheduledOperation::new(
+            host_label.clone(),
+            SimOperation::SeedHostedContract {
+                contract: contract.clone(),
+                state: vec![10, 20, 30, 40],
+            },
+        ),
+        // The far requester first GETs the contract (no piggyback subscribe).
+        // A greedy GET toward the key dead-ends in the non-hosting near-key
+        // cluster; only the GET terminus probe fallback (#4404) reaches the far
+        // host and returns the body, which also caches the WASM locally so the
+        // subsequent explicit SUBSCRIBE passes the client-side WASM gate.
+        ScheduledOperation::new(
+            requester_label.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ),
+        // The far requester then issues an explicit SUBSCRIBE — the
+        // `drive_client_subscribe` originator path. It greedy-routes toward the
+        // key and dead-ends in the same non-hosting cluster; only the SUBSCRIBE
+        // terminus probe fallback (#4414) reaches the far host, which registers
+        // the requester as a downstream subscriber. This is the remote-reader
+        // flow whose silent failure #4414 documents.
+        ScheduledOperation::new(
+            requester_label.clone(),
+            SimOperation::Subscribe { contract_id },
+        ),
+    ];
+
+    let host_addr_dbg = sim.node_address(&host_label);
+    let req_addr_dbg = sim.node_address(&requester_label);
+    let cluster_addrs_dbg: Vec<(usize, Option<std::net::SocketAddr>)> = (1..=6usize)
+        .map(|n| (n, sim.node_address(&NodeLabel::node(NETWORK_NAME, n))))
+        .collect();
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(180),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+    let cluster_hosting_dbg: Vec<usize> = (1..=6usize)
+        .filter(|n| result.is_node_hosting(&NodeLabel::node(NETWORK_NAME, *n), &contract_key))
+        .collect();
+    let req_conns_dbg = result.node_connected_addrs(&requester_label);
+    let host_is_req_neighbor = host_addr_dbg.is_some_and(|h| req_conns_dbg.contains(&h));
+    eprintln!(
+        "DBG host_addr={host_addr_dbg:?} req_addr={req_addr_dbg:?} cluster_addrs={cluster_addrs_dbg:?} cluster_hosting={cluster_hosting_dbg:?} req_conns={req_conns_dbg:?} host_is_req_neighbor={host_is_req_neighbor}"
+    );
+
+    // The far host still hosts the seeded contract.
+    assert!(
+        result.is_node_hosting(&host_label, &contract_key),
+        "host should still host the seeded contract after the simulation"
+    );
+
+    // FIX SIGNAL 1 (GET, #4404): the requester obtained the state. A greedy GET
+    // toward the key dead-ends in the non-hosting near-key cluster; only the GET
+    // terminus probe fallback reaches the far host and returns the body.
+    let requester_has_state = result
+        .node_storages
+        .get(&requester_label)
+        .is_some_and(|s| s.get_stored_state(&contract_key).is_some());
+    assert!(
+        requester_has_state,
+        "GET dead-end NOT resolved: the requester obtained no state, so its greedy GET toward \
+         the key dead-ended in the non-hosting near-key cluster and the GET terminus probe \
+         fallback did not reach the far host. host_hosting={}",
+        result.is_node_hosting(&host_label, &contract_key),
+    );
+
+    // FIX SIGNAL 2 (SUBSCRIBE, #4414): the auto-subscribe after the GET landed
+    // on the far host via the SUBSCRIBE terminus probe fallback, so the host now
+    // has a downstream subscriber for the contract. Without the fallback the
+    // subscribe dead-ends in the non-hosting cluster and the host's subscriber
+    // set stays empty — the #4414 symptom where a remote reader never joins the
+    // update mesh and silently never receives updates.
+    let host_has_downstream =
+        result.node_has_downstream_subscribers(&host_label, &contract_key);
+    assert!(
+        host_has_downstream,
+        "SUBSCRIBE dead-end NOT resolved: the far host has no downstream subscriber for the \
+         contract, so the requester's auto-subscribe dead-ended in the non-hosting near-key \
+         cluster and the SUBSCRIBE terminus probe fallback did not reach the host. \
+         host_hosting={}, requester_has_state={requester_has_state}",
+        result.is_node_hosting(&host_label, &contract_key),
+    );
+}

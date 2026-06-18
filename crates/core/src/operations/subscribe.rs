@@ -44,6 +44,34 @@ pub(super) const MAX_RETRIES: usize = 10;
 /// Used when a subscription arrives before the contract has been propagated via PUT.
 pub(super) const CONTRACT_WAIT_TIMEOUT_MS: u64 = 2_000;
 
+/// Number of directly-connected neighbours an originator probes with an
+/// `htl = 0` Request after greedy routing has exhausted (the terminus
+/// local-probe fallback for the placement-gap dead-end, #4404 / #4414).
+///
+/// Greedy key-routing structurally cannot reach a host that is FARTHER
+/// from the key than the near-key terminus it dead-ends on. By the time
+/// the originator's retry loop exhausts it has already tried (and marked
+/// `visited`) its closest peers, so its remaining un-visited neighbours
+/// are precisely the farther ones where a placement-gap host is likely to
+/// sit. Probing a small, capped set of them with `htl = 0` asks "do you
+/// personally host this?" without starting a new route.
+///
+/// Kept small (linear, not exponential) on purpose: the amplification that
+/// disabled the placement migration came from *routable* fan-out that could
+/// recurse. An `htl = 0` probe cannot forward, so the worst-case extra load
+/// is exactly this many direct, one-hop messages per originating operation.
+pub(super) const FALLBACK_PROBE_DEGREE: usize = 3;
+
+/// Per-probe timeout for the terminus local-probe fallback.
+///
+/// Deliberately far below `OPERATION_TTL` (60s): a probed neighbour either
+/// hosts the contract (fast local hit) or does not (fast `htl = 0`
+/// NotFound). There is no downstream forwarding to wait on, so a long
+/// timeout would only delay the terminal client error on the common
+/// all-miss path. Probes run sequentially, so total added latency is at
+/// most `FALLBACK_PROBE_DEGREE * FALLBACK_PROBE_TIMEOUT`.
+pub(super) const FALLBACK_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Wait for a contract to become available, using channel-based notification.
 ///
 /// This handles the race condition where a subscription arrives before the contract

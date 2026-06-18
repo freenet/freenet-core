@@ -392,6 +392,29 @@ impl ControlledSimulationResult {
             .get(label)
             .is_some_and(|ring| ring.is_hosting_contract(key))
     }
+
+    /// Addresses `label`'s node was connected to (ring connections) at the end
+    /// of the simulation. Test-only introspection for placement/topology tests.
+    pub fn node_connected_addrs(&self, label: &NodeLabel) -> Vec<std::net::SocketAddr> {
+        self.node_rings
+            .get(label)
+            .map(|ring| ring.connection_manager.connected_peer_addrs())
+            .unwrap_or_default()
+    }
+
+    /// Whether `label`'s node had a downstream subscriber registered for `key`
+    /// in its live Ring at the end of the simulation.
+    ///
+    /// Reads `ring.has_downstream_subscribers` via the captured `shared_ring`
+    /// slots. Used by the SUBSCRIBE dead-end fallback test (#4414) to assert a
+    /// remote subscribe actually landed on the holder (the holder only
+    /// registers a downstream subscriber when a SUBSCRIBE reaches it). Returns
+    /// `false` if the node never started or never published its Ring.
+    pub fn node_has_downstream_subscribers(&self, label: &NodeLabel, key: &ContractKey) -> bool {
+        self.node_rings
+            .get(label)
+            .is_some_and(|ring| ring.has_downstream_subscribers(key))
+    }
 }
 
 #[derive(PartialEq, Eq, Hash, Clone, PartialOrd, Ord, Debug)]

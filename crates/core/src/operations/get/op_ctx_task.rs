@@ -322,7 +322,7 @@ async fn drive_client_get_inner(
         response_received_at: None,
     };
 
-    let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
+    let (mut loop_result, mut streaming_assembly) = drive_get_with_assembly_retry(
         op_manager,
         client_tx,
         "get",
@@ -330,6 +330,23 @@ async fn drive_client_get_inner(
         /* emit_route_failure_on_retry */ true,
     )
     .await;
+
+    // Terminus local-probe fallback (#4404). Greedy routing exhausted — every
+    // retry funneled through the same near-key cluster that does not host the
+    // contract, because greedy routing cannot reach a host FARTHER from the key
+    // than that cluster (the placement gap). Before returning NotFound, ask a
+    // small, capped set of our own remaining un-tried neighbours whether they
+    // personally host the contract via direct `htl = 0` GET probes. Only when
+    // the first pass genuinely exhausted (NotFound) — never override an
+    // InfraError/Unexpected.
+    if matches!(loop_result, RetryLoopOutcome::Exhausted(_)) {
+        if let Some((probe_result, probe_assembly)) =
+            try_get_terminus_probe_fallback(op_manager, client_tx, instance_id, &driver.tried).await
+        {
+            loop_result = probe_result;
+            streaming_assembly = probe_assembly;
+        }
+    }
 
     // `op_manager.completed(client_tx)` runs from the
     // `ClientGetCompletionGuard` in `run_client_get` AFTER this fn
@@ -1450,6 +1467,268 @@ async fn lookup_stored_key(
 /// streaming split PUT needed doesn't apply, and (b) renaming would
 /// touch unrelated code paths.
 const MAX_RETRIES: usize = 3;
+
+/// Number of directly-connected neighbours an originator probes with an
+/// `htl = 0` GET Request after greedy routing has exhausted (the terminus
+/// local-probe fallback for the placement-gap dead-end, #4404).
+///
+/// Mirror of SUBSCRIBE's `FALLBACK_PROBE_DEGREE`. Greedy key-routing
+/// structurally cannot reach a host that is FARTHER from the key than the
+/// near-key terminus a GET dead-ends on; by the time the originator's retry
+/// loop exhausts it has already tried (and marked `visited`) its closest
+/// peers, so its remaining un-tried neighbours are the farther ones where a
+/// placement-gap host is likely to sit. Probing a small, capped set of them
+/// with `htl = 0` asks "do you personally host this?" without starting a new
+/// route. `htl = 0` is the cascade bound (a probed peer cannot forward), so
+/// worst-case extra load is this many direct one-hop GETs per operation.
+const FALLBACK_PROBE_DEGREE: usize = 3;
+
+/// Select the directly-connected neighbours to probe in the GET terminus
+/// local-probe fallback, ordered CLOSEST-to-key first among the un-tried
+/// (#4404).
+///
+/// Mirror of SUBSCRIBE's `select_fallback_probe_targets`. Greedy routing
+/// already tried the peers CLOSEST to the key (the dead-end cluster); they are
+/// in `tried`. The placement gap leaves the real host just OUTSIDE that tried
+/// set — farther from the key than the exhausted cluster, but still the
+/// closest-to-key peer among the remaining un-tried neighbours. So order the
+/// un-tried candidates closest-to-key first (a maximally-far neighbour is the
+/// least likely placement-gap host). Filters mirror
+/// `k_closest_potentially_hosting`: skip self, transient, not-ready, and any
+/// already-`tried` address. Deterministic (sorted by ring distance, ties broken
+/// by socket address); returns at most [`FALLBACK_PROBE_DEGREE`] candidates.
+fn select_fallback_probe_targets(
+    op_manager: &OpManager,
+    instance_id: &ContractInstanceId,
+    tried: &[SocketAddr],
+) -> Vec<(PeerKeyLocation, SocketAddr)> {
+    let target_location = crate::ring::Location::from(instance_id);
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+    let connections = op_manager
+        .ring
+        .connection_manager
+        .get_connections_by_location();
+
+    let mut candidates: Vec<(PeerKeyLocation, SocketAddr)> = Vec::new();
+    for conns in connections.values() {
+        for conn in conns {
+            let Some(addr) = conn.location.socket_addr() else {
+                continue;
+            };
+            if Some(addr) == own_addr || tried.contains(&addr) {
+                continue;
+            }
+            if op_manager.ring.connection_manager.is_transient(addr) {
+                continue;
+            }
+            if !op_manager.ring.connection_manager.is_peer_ready(addr) {
+                continue;
+            }
+            candidates.push((conn.location.clone(), addr));
+        }
+    }
+
+    // Closest-to-key first among the un-tried; ties broken deterministically by
+    // socket addr. A peer with no known location sorts as maximally far (0.5 is
+    // the ring's maximum distance) so it is tried last.
+    let max_dist = crate::ring::Distance::new(0.5);
+    candidates.sort_by(|(a_pkl, a_addr), (b_pkl, b_addr)| {
+        let a_dist = a_pkl
+            .location()
+            .map(|l| l.distance(target_location))
+            .unwrap_or(max_dist);
+        let b_dist = b_pkl
+            .location()
+            .map(|l| l.distance(target_location))
+            .unwrap_or(max_dist);
+        a_dist
+            .partial_cmp(&b_dist)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a_addr.cmp(b_addr))
+    });
+    candidates.truncate(FALLBACK_PROBE_DEGREE);
+    candidates
+}
+
+/// Terminus local-probe fallback for a dead-ended originator GET (#4404).
+///
+/// Greedy routing has exhausted: every retry funneled through the same
+/// near-key cluster that does not host the contract, because greedy routing
+/// cannot reach a host FARTHER from the key than that cluster (the placement
+/// gap). Before surfacing NotFound to the client, ask a small, capped set of
+/// our own remaining un-tried neighbours whether they personally host the
+/// contract by sending a direct `GetMsg::Request` with `htl = 0`.
+///
+/// `htl = 0` is the cascade bound: a probed peer's relay driver does its
+/// local-hit check (which — after the reorder in `drive_relay_get_inner` —
+/// precedes the `htl == 0` forbid) and either answers `Found` (inline or
+/// streaming) or NotFound. It can NEVER forward the probe onward, so there is
+/// no `K^depth` amplification. Worst-case extra load is
+/// [`FALLBACK_PROBE_DEGREE`] direct one-hop GETs per originating operation.
+///
+/// Probes run sequentially (a fresh per-probe `Transaction`, distinct
+/// `pending_op_results` slots) with the normal operation timeout. Returns:
+/// - `Some((Done(InlineFound|Streaming), assembly))` on the first probe that
+///   yields the contract — the caller adopts it and runs the standard
+///   originator-side side effects (cache, auto-subscribe, client delivery);
+/// - `None` if every probe misses (or there are no eligible neighbours), so
+///   the caller keeps the original clean NotFound.
+async fn try_get_terminus_probe_fallback(
+    op_manager: &OpManager,
+    client_tx: Transaction,
+    instance_id: ContractInstanceId,
+    tried: &[SocketAddr],
+) -> Option<(RetryLoopOutcome<Terminal>, AssemblyOutcome)> {
+    let targets = select_fallback_probe_targets(op_manager, &instance_id, tried);
+    eprintln!(
+        "DBG-GET-PROBE tried={tried:?} probe_targets={:?}",
+        targets.iter().map(|(_, a)| *a).collect::<Vec<_>>()
+    );
+    if targets.is_empty() {
+        return None;
+    }
+
+    tracing::debug!(
+        tx = %client_tx,
+        %instance_id,
+        probe_count = targets.len(),
+        "GET client: greedy routing exhausted, trying terminus local-probe fallback (htl=0)"
+    );
+
+    for (target, target_addr) in targets {
+        let probe_tx = Transaction::new::<GetMsg>();
+        let request = GetMsg::Request {
+            id: probe_tx,
+            instance_id,
+            fetch_contract: true,
+            // htl = 0: ask the neighbour if it personally hosts the contract.
+            // It cannot forward this onward (cascade bound).
+            htl: 0,
+            // Fresh per-probe visited filter: a direct question to one
+            // neighbour, not a continuation of the greedy route.
+            visited: VisitedPeers::new(&probe_tx),
+            subscribe: false,
+        };
+
+        let mut ctx = op_manager.op_ctx(probe_tx);
+        let round_trip = tokio::time::timeout(
+            crate::config::OPERATION_TTL,
+            ctx.send_to_and_await(target_addr, NetMessage::from(request)),
+        )
+        .await;
+        op_manager.release_pending_op_slot(probe_tx).await;
+
+        let reply = match round_trip {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(err)) => {
+                tracing::debug!(
+                    tx = %client_tx, probe_tx = %probe_tx, target = %target_addr,
+                    outcome = "wire_error", error = %err,
+                    "GET: fallback probe failed; trying next neighbour"
+                );
+                continue;
+            }
+            Err(_) => {
+                tracing::debug!(
+                    tx = %client_tx, probe_tx = %probe_tx, target = %target_addr,
+                    outcome = "timeout",
+                    "GET: fallback probe timed out; trying next neighbour"
+                );
+                continue;
+            }
+        };
+
+        match classify(reply) {
+            AttemptOutcome::Terminal(Terminal::InlineFound {
+                key,
+                state,
+                contract,
+                hop_count,
+            }) => {
+                tracing::info!(
+                    tx = %client_tx, probe_tx = %probe_tx, contract = %key, target = %target_addr,
+                    "GET: terminus local-probe fallback found a host (inline)"
+                );
+                return Some((
+                    RetryLoopOutcome::Done(Terminal::InlineFound {
+                        key,
+                        state,
+                        contract,
+                        hop_count,
+                    }),
+                    AssemblyOutcome::default(),
+                ));
+            }
+            AttemptOutcome::Terminal(Terminal::Streaming {
+                key,
+                stream_id,
+                includes_contract,
+                total_size,
+            }) => {
+                // The probe reply is a streaming header; assemble + cache the
+                // payload from this neighbour (the immediate next hop).
+                let stream_start = tokio::time::Instant::now();
+                match assemble_and_cache_stream(
+                    op_manager,
+                    target_addr,
+                    stream_id,
+                    key,
+                    includes_contract,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        tracing::info!(
+                            tx = %client_tx, probe_tx = %probe_tx, contract = %key, target = %target_addr,
+                            "GET: terminus local-probe fallback found a host (streamed)"
+                        );
+                        let assembly = AssemblyOutcome {
+                            transfer_duration: Some(stream_start.elapsed()),
+                            error: None,
+                        };
+                        return Some((
+                            RetryLoopOutcome::Done(Terminal::Streaming {
+                                key,
+                                stream_id,
+                                includes_contract,
+                                total_size,
+                            }),
+                            assembly,
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            tx = %client_tx, probe_tx = %probe_tx, target = %target_addr,
+                            error = %e,
+                            "GET: fallback probe stream assembly failed; trying next neighbour"
+                        );
+                        continue;
+                    }
+                }
+            }
+            AttemptOutcome::Terminal(Terminal::LocalCompletion) => {
+                // A loopback request-echo should not arrive for a direct probe;
+                // treat as a miss and try the next neighbour.
+                let _ = &target;
+                continue;
+            }
+            AttemptOutcome::Retry | AttemptOutcome::Unexpected => {
+                tracing::debug!(
+                    tx = %client_tx, probe_tx = %probe_tx, target = %target_addr,
+                    "GET: fallback probe neighbour does not host contract; trying next"
+                );
+                continue;
+            }
+        }
+    }
+
+    tracing::debug!(
+        tx = %client_tx,
+        %instance_id,
+        "GET: terminus local-probe fallback exhausted, no neighbour hosts the contract"
+    );
+    None
+}
 
 /// Pure selection core for the bootstrap gateway fallback (#4361).
 ///
@@ -2637,8 +2916,36 @@ where
     let ring_max_htl = op_manager.ring.max_hops_to_live.max(1);
     let htl = htl.min(ring_max_htl);
 
-    // ── Short-circuit 1: HTL = 0 ────────────────────────────────────────
-    if htl == 0 {
+    // ── Update visited set: mark this peer and the upstream ─────────────
+    let mut new_visited = visited.with_transaction(&incoming_tx);
+    if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
+        new_visited.mark_visited(own_addr);
+    }
+    new_visited.mark_visited(upstream_addr);
+
+    // ── Short-circuit 1: Local cache hit with interest ───────────────────
+    //
+    // Checked BEFORE the HTL=0 forbid so a local hit is served regardless of
+    // HTL. This is required by the terminus local-probe fallback (#4404): an
+    // `htl = 0` probe GET asks a neighbour "do you personally host this?", and
+    // a hosting neighbour must answer Found rather than the HTL-exhausted
+    // NotFound. SUBSCRIBE's relay (`drive_relay_subscribe`) already does its
+    // local-hit check before the HTL=0 forbid; this aligns GET with it.
+    // HTL=0 only forbids FORWARDING (below), never local service.
+    let (local_value, local_fallback) =
+        check_local_with_interest_gate(op_manager, &instance_id, fetch_contract).await;
+
+    // ── Short-circuit 2: HTL = 0 (no active-interest local copy) ────────
+    //
+    // No local hit AND we may not forward: report NotFound. This preserves
+    // the original HTL=0 semantics (NotFound) for both the genuine
+    // max_htl-traversed Request and a fallback probe that landed on a
+    // neighbour which does not host the contract. The cached-no-interest
+    // `local_fallback` is intentionally NOT served here — it stays reserved
+    // for the downstream-exhaustion path below (unchanged behaviour), so this
+    // reordering does not alter what an HTL=0 hop returns when it lacks an
+    // active-interest copy.
+    if htl == 0 && local_value.is_none() {
         tracing::warn!(
             tx = %incoming_tx,
             %instance_id,
@@ -2672,17 +2979,6 @@ where
         .await;
         return Ok(());
     }
-
-    // ── Update visited set: mark this peer and the upstream ─────────────
-    let mut new_visited = visited.with_transaction(&incoming_tx);
-    if let Some(own_addr) = op_manager.ring.connection_manager.get_own_addr() {
-        new_visited.mark_visited(own_addr);
-    }
-    new_visited.mark_visited(upstream_addr);
-
-    // ── Short-circuit 2: Local cache hit with interest ───────────────────
-    let (local_value, local_fallback) =
-        check_local_with_interest_gate(op_manager, &instance_id, fetch_contract).await;
 
     if let Some((key, state, contract)) = local_value {
         tracing::info!(

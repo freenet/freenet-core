@@ -553,6 +553,266 @@ enum DriverOutcome {
     InfrastructureError(OpError),
 }
 
+/// Select the directly-connected neighbours to probe in the terminus
+/// local-probe fallback, ordered CLOSEST-to-key first among the un-tried.
+///
+/// Rationale (placement gap, #4404 / #4414): greedy routing already tried the
+/// peers CLOSEST to the key (the dead-end cluster) — they are in `tried_peers`
+/// / `visited`. The placement gap leaves the real host just OUTSIDE that tried
+/// set: it is farther from the key than the cluster greedy exhausted, but it is
+/// still the CLOSEST-to-key peer among the originator's remaining un-tried
+/// neighbours. So order the un-tried candidates closest-to-key first — a
+/// maximally-far neighbour (e.g. a gateway on the opposite side of the ring) is
+/// the LEAST likely placement-gap host, so it is probed last.
+///
+/// Filters mirror `k_closest_potentially_hosting`: skip self, skip
+/// transient connections, skip not-yet-ready peers, skip anything already
+/// `visited` or `tried`. Returns at most [`super::FALLBACK_PROBE_DEGREE`]
+/// candidates. Deterministic: sorted by ring distance (ties broken by
+/// socket address), so simulation runs are reproducible without consuming
+/// `GlobalRng`.
+fn select_fallback_probe_targets(
+    op_manager: &OpManager,
+    instance_id: &ContractInstanceId,
+    visited: &VisitedPeers,
+    tried_peers: &HashSet<std::net::SocketAddr>,
+) -> Vec<(PeerKeyLocation, std::net::SocketAddr)> {
+    let target_location = crate::ring::Location::from(instance_id);
+    let own_addr = op_manager.ring.connection_manager.get_own_addr();
+    let connections = op_manager
+        .ring
+        .connection_manager
+        .get_connections_by_location();
+
+    let mut candidates: Vec<(PeerKeyLocation, std::net::SocketAddr)> = Vec::new();
+    for conns in connections.values() {
+        for conn in conns {
+            let Some(addr) = conn.location.socket_addr() else {
+                continue;
+            };
+            if Some(addr) == own_addr {
+                continue;
+            }
+            if tried_peers.contains(&addr) || visited.probably_visited(addr) {
+                continue;
+            }
+            if op_manager.ring.connection_manager.is_transient(addr) {
+                continue;
+            }
+            if !op_manager.ring.connection_manager.is_peer_ready(addr) {
+                continue;
+            }
+            candidates.push((conn.location.clone(), addr));
+        }
+    }
+
+    // Closest-to-key first among the un-tried; ties broken deterministically by
+    // socket addr. A peer with no known location sorts as maximally far (0.5 is
+    // the ring's maximum distance) so it is tried last.
+    let max_dist = crate::ring::Distance::new(0.5);
+    candidates.sort_by(|(a_pkl, a_addr), (b_pkl, b_addr)| {
+        let a_dist = a_pkl
+            .location()
+            .map(|l| l.distance(target_location))
+            .unwrap_or(max_dist);
+        let b_dist = b_pkl
+            .location()
+            .map(|l| l.distance(target_location))
+            .unwrap_or(max_dist);
+        a_dist
+            .partial_cmp(&b_dist)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a_addr.cmp(b_addr))
+    });
+    candidates.truncate(super::FALLBACK_PROBE_DEGREE);
+    candidates
+}
+
+/// Terminus local-probe fallback for a dead-ended originator subscribe
+/// (#4404 / #4414).
+///
+/// Greedy routing has exhausted: every retry funneled through the same
+/// near-key cluster that does not host the contract, because greedy
+/// routing cannot reach a host that is FARTHER from the key than that
+/// cluster (the placement gap). Before surfacing the dead-end to the
+/// client, ask a small, capped set of our own remaining un-tried
+/// neighbours whether they personally host the contract, by sending a
+/// `SubscribeMsg::Request` with `htl = 0`.
+///
+/// `htl = 0` is the cascade bound: a probed peer's relay driver does its
+/// local-hit check (which precedes the `htl == 0` forbid in
+/// [`drive_relay_subscribe`]) and either answers `Subscribed` (it hosts
+/// the contract) or `NotFound` (it does not). It can NEVER forward the
+/// probe onward, so there is no `K^depth` amplification — the exact shape
+/// that forced the placement migration to be disabled. Worst-case extra
+/// load is [`super::FALLBACK_PROBE_DEGREE`] direct one-hop messages per
+/// originating operation.
+///
+/// Probes run sequentially (a fresh per-probe `Transaction`, so they never
+/// collide in `pending_op_results`) with a short [`super::FALLBACK_PROBE_TIMEOUT`].
+/// On the first `Subscribed` reply this runs the same
+/// `finalize_originator_subscribe` side-effects the greedy success path
+/// runs and returns `Some(success outcome)`. If every probe misses (or
+/// there are no eligible neighbours) it returns `None` and the caller
+/// surfaces the original dead-end error.
+async fn try_terminus_probe_fallback(
+    op_manager: &Arc<OpManager>,
+    instance_id: ContractInstanceId,
+    client_tx: Transaction,
+    is_renewal: bool,
+    visited: &VisitedPeers,
+    tried_peers: &HashSet<std::net::SocketAddr>,
+    directed_holder: &Option<PeerKeyLocation>,
+) -> Option<DriverOutcome> {
+    let targets = select_fallback_probe_targets(op_manager, &instance_id, visited, tried_peers);
+    if targets.is_empty() {
+        return None;
+    }
+
+    tracing::debug!(
+        tx = %client_tx,
+        contract = %instance_id,
+        probe_count = targets.len(),
+        "subscribe: greedy routing exhausted, trying terminus local-probe fallback (htl=0)"
+    );
+
+    for (target, target_addr) in targets {
+        // Fresh per-probe tx: single-use-per-tx for send_to_and_await, and
+        // distinct slots in pending_op_results so sequential probes never
+        // collide.
+        let probe_tx = Transaction::new::<SubscribeMsg>();
+        let request = SubscribeMsg::Request {
+            id: probe_tx,
+            instance_id,
+            // htl = 0: ask the neighbour if it personally hosts the
+            // contract. It cannot forward this onward (cascade bound).
+            htl: 0,
+            // A fresh per-probe visited filter: this is a direct question to
+            // one neighbour, not a continuation of the greedy route, so the
+            // accumulated route bloom is irrelevant. Seeding it on probe_tx
+            // keeps the bloom's transaction-derived hash keys consistent.
+            visited: VisitedPeers::new(&probe_tx),
+            is_renewal,
+        };
+
+        let mut ctx = op_manager.op_ctx(probe_tx);
+        let request_sent_at = tokio::time::Instant::now();
+        let round_trip = tokio::time::timeout(
+            super::FALLBACK_PROBE_TIMEOUT,
+            ctx.send_to_and_await(target_addr, NetMessage::from(request)),
+        )
+        .await;
+
+        // Release the per-probe pending_op_results slot before the next
+        // probe / return (same reasoning as the main retry loop).
+        op_manager.release_pending_op_slot(probe_tx).await;
+
+        let reply = match round_trip {
+            Ok(Ok(reply)) => reply,
+            Ok(Err(err)) => {
+                tracing::debug!(
+                    tx = %client_tx,
+                    probe_tx = %probe_tx,
+                    target = %target_addr,
+                    outcome = "wire_error",
+                    error = %err,
+                    "subscribe: fallback probe failed; trying next neighbour"
+                );
+                continue;
+            }
+            Err(_) => {
+                tracing::debug!(
+                    tx = %client_tx,
+                    probe_tx = %probe_tx,
+                    target = %target_addr,
+                    outcome = "timeout",
+                    timeout_secs = super::FALLBACK_PROBE_TIMEOUT.as_secs(),
+                    "subscribe: fallback probe timed out; trying next neighbour"
+                );
+                continue;
+            }
+        };
+
+        match classify_reply(&reply) {
+            ReplyClass::Subscribed { key } => {
+                let time_to_response_start = request_sent_at.elapsed();
+                tracing::info!(
+                    tx = %client_tx,
+                    probe_tx = %probe_tx,
+                    contract = %key,
+                    target = %target_addr,
+                    outcome = "subscribed",
+                    "subscribe: terminus local-probe fallback found a host"
+                );
+
+                // Mirror the greedy success path's router feedback so the
+                // estimator learns the responsive neighbour.
+                let contract_location = crate::ring::Location::from(&key);
+                let route_event = crate::router::RouteEvent {
+                    peer: target.clone(),
+                    contract_location,
+                    outcome: crate::router::RouteOutcome::Success {
+                        time_to_response_start,
+                        payload_size: 0,
+                        payload_transfer_time: std::time::Duration::ZERO,
+                    },
+                    op_type: Some(crate::node::network_status::OpType::Subscribe),
+                };
+                if let Some(log_event) =
+                    crate::tracing::NetEventLog::route_event(&client_tx, &op_manager.ring, &route_event)
+                {
+                    op_manager
+                        .ring
+                        .register_events(either::Either::Left(log_event))
+                        .await;
+                }
+                op_manager.ring.routing_finished(route_event);
+
+                super::finalize_originator_subscribe(
+                    op_manager,
+                    key,
+                    target_addr,
+                    is_renewal,
+                    directed_holder.clone(),
+                )
+                .await;
+                return Some(DriverOutcome::Publish(Ok(HostResponse::ContractResponse(
+                    ContractResponse::SubscribeResponse {
+                        key,
+                        subscribed: true,
+                    },
+                ))));
+            }
+            ReplyClass::NotFound => {
+                tracing::debug!(
+                    tx = %client_tx,
+                    probe_tx = %probe_tx,
+                    target = %target_addr,
+                    outcome = "not_found",
+                    "subscribe: fallback probe neighbour does not host contract; trying next"
+                );
+                continue;
+            }
+            ReplyClass::Unexpected => {
+                tracing::debug!(
+                    tx = %client_tx,
+                    probe_tx = %probe_tx,
+                    target = %target_addr,
+                    "subscribe: fallback probe got unexpected reply; trying next"
+                );
+                continue;
+            }
+        }
+    }
+
+    tracing::debug!(
+        tx = %client_tx,
+        contract = %instance_id,
+        "subscribe: terminus local-probe fallback exhausted, no neighbour hosts the contract"
+    );
+    None
+}
+
 /// The inner driver: returns a [`DriverOutcome`] describing how the
 /// subscribe terminated and whether the delivery side-effect has already
 /// been applied.
@@ -767,6 +1027,19 @@ async fn drive_client_subscribe_inner(
                         continue;
                     }
                     None => {
+                        if let Some(outcome) = try_terminus_probe_fallback(
+                            op_manager,
+                            instance_id,
+                            client_tx,
+                            is_renewal,
+                            &visited,
+                            &tried_peers,
+                            &directed_holder,
+                        )
+                        .await
+                        {
+                            return Ok(outcome);
+                        }
                         return Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                             cause: format!(
                                 "subscribe to {instance_id} failed after {} rounds (last peer error: {err})",
@@ -811,6 +1084,19 @@ async fn drive_client_subscribe_inner(
                         continue;
                     }
                     None => {
+                        if let Some(outcome) = try_terminus_probe_fallback(
+                            op_manager,
+                            instance_id,
+                            client_tx,
+                            is_renewal,
+                            &visited,
+                            &tried_peers,
+                            &directed_holder,
+                        )
+                        .await
+                        {
+                            return Ok(outcome);
+                        }
                         // #3445: emit a terminal telemetry event so a
                         // timed-out client subscribe is no longer invisible
                         // on the dashboard. Keyed on `client_tx` (the same
@@ -945,6 +1231,19 @@ async fn drive_client_subscribe_inner(
                         continue;
                     }
                     None => {
+                        if let Some(outcome) = try_terminus_probe_fallback(
+                            op_manager,
+                            instance_id,
+                            client_tx,
+                            is_renewal,
+                            &visited,
+                            &tried_peers,
+                            &directed_holder,
+                        )
+                        .await
+                        {
+                            return Ok(outcome);
+                        }
                         return Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                             cause: format!(
                                 "contract {instance_id} not found after exhaustive search"
