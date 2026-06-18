@@ -112,6 +112,14 @@ pub(crate) struct PerOpCurves {
     pub transfer_rate_curve: Vec<(f64, f64)>,
     pub transfer_rate_data_range: (f64, f64),
     pub transfer_rate_events: usize,
+    /// Downsampled raw (distance, outcome) observations behind each isotonic fit,
+    /// for the scatter overlay. Defaulted so older serialized snapshots still load.
+    #[serde(default)]
+    pub failure_points: Vec<(f64, f64)>,
+    #[serde(default)]
+    pub response_time_points: Vec<(f64, f64)>,
+    #[serde(default)]
+    pub transfer_rate_points: Vec<(f64, f64)>,
 }
 
 /// Periodic snapshot of the router model state for telemetry.
@@ -138,6 +146,14 @@ pub(crate) struct RouterSnapshotInfo {
     pub transfer_rate_curve: Vec<(f64, f64)>,
     /// X-range of actual regression data for the transfer rate estimator.
     pub transfer_rate_data_range: (f64, f64),
+    /// Downsampled raw (distance, outcome) observations behind each aggregate
+    /// isotonic fit, for the scatter overlay. Defaulted for old snapshots.
+    #[serde(default)]
+    pub failure_points: Vec<(f64, f64)>,
+    #[serde(default)]
+    pub response_time_points: Vec<(f64, f64)>,
+    #[serde(default)]
+    pub transfer_rate_points: Vec<(f64, f64)>,
     /// Connect forward estimator curve sampled across [0, 0.5], clamped to [0, 1].
     pub connect_forward_curve: Option<Vec<(f64, f64)>>,
     /// X-range of actual regression data for the connect forward estimator.
@@ -885,6 +901,11 @@ impl Router {
                 .transfer_rate_estimator
                 .sampled_curve(0.0, f64::INFINITY, 50),
             transfer_rate_data_range: self.transfer_rate_estimator.data_x_range(),
+            // Downsampled raw observations for the scatter overlay (cap keeps the
+            // serialized snapshot small; estimators retain up to 500 each).
+            failure_points: self.failure_estimator.sampled_raw_points(100),
+            response_time_points: self.response_start_time_estimator.sampled_raw_points(100),
+            transfer_rate_points: self.transfer_rate_estimator.sampled_raw_points(100),
             per_op_curves: {
                 let mut curves = HashMap::new();
                 // Collect all op types that have any data
@@ -901,18 +922,21 @@ impl Router {
                         c.failure_curve = p;
                         c.failure_data_range = est.data_x_range();
                         c.failure_events = est.len();
+                        c.failure_points = est.sampled_raw_points(100);
                     }
                     if let Some(est) = self.per_op_response_time.get(&ot) {
                         let p = est.sampled_curve(0.0, f64::INFINITY, 50);
                         c.response_time_curve = p;
                         c.response_time_data_range = est.data_x_range();
                         c.response_time_events = est.len();
+                        c.response_time_points = est.sampled_raw_points(100);
                     }
                     if let Some(est) = self.per_op_transfer_rate.get(&ot) {
                         let p = est.sampled_curve(0.0, f64::INFINITY, 50);
                         c.transfer_rate_curve = p;
                         c.transfer_rate_data_range = est.data_x_range();
                         c.transfer_rate_events = est.len();
+                        c.transfer_rate_points = est.sampled_raw_points(100);
                     }
                     curves.insert(ot.as_str().to_string(), c);
                 }

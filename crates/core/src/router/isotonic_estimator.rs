@@ -212,6 +212,28 @@ impl IsotonicEstimator {
 
         points
     }
+
+    /// Downsampled raw `(distance, outcome)` observations for visualization, in
+    /// insertion order, at most `max` points (evenly strided across the retained
+    /// window). These are the actual events the isotonic fit is computed from, so
+    /// the dashboard can show the scatter behind the curve. Empty when no data.
+    pub(crate) fn sampled_raw_points(&self, max: usize) -> Vec<(f64, f64)> {
+        let n = self.raw_points.len();
+        if n == 0 || max == 0 {
+            return Vec::new();
+        }
+        if n <= max {
+            return self.raw_points.iter().map(|p| (*p.x(), *p.y())).collect();
+        }
+        let stride = n as f64 / max as f64;
+        (0..max)
+            .map(|i| {
+                let idx = ((i as f64 * stride) as usize).min(n - 1);
+                let p = &self.raw_points[idx];
+                (*p.x(), *p.y())
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -448,6 +470,31 @@ mod tests {
             result.is_ok(),
             "Estimator should produce estimates after eviction"
         );
+    }
+
+    #[test]
+    fn sampled_raw_points_downsamples_and_bounds() {
+        let peer = PeerKeyLocation::random();
+        let contract = Location::random();
+        let mut estimator = IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive);
+
+        // No data yet.
+        assert!(estimator.sampled_raw_points(50).is_empty());
+
+        for i in 0..40 {
+            estimator.add_event(IsotonicEvent {
+                peer: peer.clone(),
+                contract_location: contract,
+                result: i as f64,
+            });
+        }
+
+        // Fewer than the cap -> every retained point is returned.
+        assert_eq!(estimator.sampled_raw_points(100).len(), 40);
+        // More than the cap -> downsampled to exactly the cap.
+        assert_eq!(estimator.sampled_raw_points(10).len(), 10);
+        // Degenerate cap.
+        assert!(estimator.sampled_raw_points(0).is_empty());
     }
 
     #[test]

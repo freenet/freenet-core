@@ -3017,39 +3017,70 @@ fn peer_detail_html(address_str: &str) -> String {
         for (i, &tab_name) in tab_names.iter().enumerate() {
             let tab_id = tab_name.to_lowercase().replace(' ', "-");
 
-            // Get curves for this tab
-            let (f_curve, f_range, rt_curve, rt_range, xfer_curve, xfer_range, event_count) =
-                if tab_name == "All" {
-                    (
-                        rs.failure_curve.as_slice(),
-                        rs.failure_data_range,
-                        rs.response_time_curve.as_slice(),
-                        rs.response_time_data_range,
-                        rs.transfer_rate_curve.as_slice(),
-                        rs.transfer_rate_data_range,
-                        rs.failure_events,
-                    )
-                } else if let Some(c) = rs.per_op_curves.get(tab_name) {
-                    (
-                        c.failure_curve.as_slice(),
-                        c.failure_data_range,
-                        c.response_time_curve.as_slice(),
-                        c.response_time_data_range,
-                        c.transfer_rate_curve.as_slice(),
-                        c.transfer_rate_data_range,
-                        c.failure_events,
-                    )
-                } else {
-                    (
-                        &[][..],
-                        (0.0, 0.0),
-                        &[][..],
-                        (0.0, 0.0),
-                        &[][..],
-                        (0.0, 0.0),
-                        0,
-                    )
-                };
+            // Get curves + raw scatter points for this tab
+            #[allow(clippy::type_complexity)]
+            let (
+                f_curve,
+                f_range,
+                f_points,
+                rt_curve,
+                rt_range,
+                rt_points,
+                xfer_curve,
+                xfer_range,
+                xfer_points,
+                event_count,
+            ): (
+                &[(f64, f64)],
+                (f64, f64),
+                &[(f64, f64)],
+                &[(f64, f64)],
+                (f64, f64),
+                &[(f64, f64)],
+                &[(f64, f64)],
+                (f64, f64),
+                &[(f64, f64)],
+                usize,
+            ) = if tab_name == "All" {
+                (
+                    rs.failure_curve.as_slice(),
+                    rs.failure_data_range,
+                    rs.failure_points.as_slice(),
+                    rs.response_time_curve.as_slice(),
+                    rs.response_time_data_range,
+                    rs.response_time_points.as_slice(),
+                    rs.transfer_rate_curve.as_slice(),
+                    rs.transfer_rate_data_range,
+                    rs.transfer_rate_points.as_slice(),
+                    rs.failure_events,
+                )
+            } else if let Some(c) = rs.per_op_curves.get(tab_name) {
+                (
+                    c.failure_curve.as_slice(),
+                    c.failure_data_range,
+                    c.failure_points.as_slice(),
+                    c.response_time_curve.as_slice(),
+                    c.response_time_data_range,
+                    c.response_time_points.as_slice(),
+                    c.transfer_rate_curve.as_slice(),
+                    c.transfer_rate_data_range,
+                    c.transfer_rate_points.as_slice(),
+                    c.failure_events,
+                )
+            } else {
+                (
+                    &[][..],
+                    (0.0, 0.0),
+                    &[][..],
+                    &[][..],
+                    (0.0, 0.0),
+                    &[][..],
+                    &[][..],
+                    (0.0, 0.0),
+                    &[][..],
+                    0,
+                )
+            };
 
             // Tab label with event count badge
             let count_badge = if event_count > 0 {
@@ -3090,6 +3121,7 @@ fn peer_detail_html(address_str: &str) -> String {
                 panel_content.push_str(&build_estimator_chart_or_placeholder(
                     "Failure Probability",
                     f_curve,
+                    f_points,
                     f_range,
                     if tab_name == "All" { fail_adj } else { None },
                     ploc,
@@ -3100,6 +3132,7 @@ fn peer_detail_html(address_str: &str) -> String {
                 panel_content.push_str(&build_estimator_chart_or_placeholder(
                     "Response Time (s)",
                     rt_curve,
+                    rt_points,
                     rt_range,
                     if tab_name == "All" { rt_adj } else { None },
                     ploc,
@@ -3110,6 +3143,7 @@ fn peer_detail_html(address_str: &str) -> String {
                 panel_content.push_str(&build_estimator_chart_or_placeholder(
                     "Transfer Rate (B/s)",
                     xfer_curve,
+                    xfer_points,
                     xfer_range,
                     if tab_name == "All" { xfer_adj } else { None },
                     ploc,
@@ -3132,14 +3166,16 @@ fn peer_detail_html(address_str: &str) -> String {
 
         format!(
             r#"<div class="card">
-                <h2>Routing Predictions</h2>
+                <h2>Outcomes vs Distance</h2>
                 <p style="font-size:0.8em;color:var(--text-muted);">
-                    What the model predicts for each outcome versus ring distance to the contract:
-                    the curves the router consults when choosing a next hop. The Prediction Accuracy
-                    panel below scores these predictions against what actually happened.
+                    Actual observed outcomes (dots) plotted against ring distance to the contract,
+                    with the isotonic fit the router consults overlaid. How tightly the dots hug a
+                    monotonic curve shows how well distance actually predicts the outcome. The
+                    Prediction Accuracy panel below scores that fit against what happened.
                 </p>
                 <p class="chart-legend">
-                    <span class="chart-key"><span class="chart-dot chart-dot-global"></span> Global model</span>
+                    <span class="chart-key"><span class="chart-dot chart-dot-actual"></span> Actual outcomes</span>
+                    <span class="chart-key"><span class="chart-dot chart-dot-global"></span> Isotonic fit</span>
                     <span class="chart-key"><span class="chart-dot chart-dot-peer"></span> Peer-adjusted</span>
                     <span class="chart-key"><span class="chart-dot chart-dot-loc"></span> Peer location</span>
                     <span class="chart-key"><span class="chart-dot chart-dot-ext"></span> Extrapolated</span>
@@ -3255,6 +3291,7 @@ fn peer_detail_html(address_str: &str) -> String {
 fn build_estimator_chart_or_placeholder(
     title: &str,
     curve_points: &[(f64, f64)],
+    scatter_points: &[(f64, f64)],
     data_range: (f64, f64),
     peer_adjustment: Option<f64>,
     peer_location: Option<f64>,
@@ -3272,6 +3309,7 @@ fn build_estimator_chart_or_placeholder(
     build_estimator_chart(
         title,
         curve_points,
+        scatter_points,
         data_range,
         peer_adjustment,
         peer_location,
@@ -3284,9 +3322,11 @@ fn build_estimator_chart_or_placeholder(
 ///
 /// `data_range` is `(data_x_min, data_x_max)` -- the x-range of actual regression data.
 /// Points outside this range are extrapolated by the PAV crate and drawn as dashed lines.
+#[allow(clippy::too_many_arguments)]
 fn build_estimator_chart(
     title: &str,
     curve_points: &[(f64, f64)],
+    scatter_points: &[(f64, f64)],
     data_range: (f64, f64),
     peer_adjustment: Option<f64>,
     peer_location: Option<f64>,
@@ -3323,6 +3363,14 @@ fn build_estimator_chart(
         let y_vals: Vec<f64> = curve_points.iter().map(|(_, y)| *y).collect();
         y_min = y_vals.iter().cloned().fold(f64::INFINITY, f64::min);
         y_max = y_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+        // Include the raw scatter so observed outliers aren't clipped.
+        for (_, y) in scatter_points {
+            if y.is_finite() {
+                y_min = y_min.min(*y);
+                y_max = y_max.max(*y);
+            }
+        }
 
         // Include peer-adjusted values in range if present
         if let Some(adj) = peer_adjustment {
@@ -3422,6 +3470,25 @@ fn build_estimator_chart(
             x = pad_l - 4.0,
             sy = sy,
             label = label,
+        )
+        .ok();
+    }
+
+    // Raw observed outcomes (drawn first, under the isotonic fit). Each dot is one
+    // actual event at its (distance, outcome); the spread shows how isotonic the
+    // relationship really is.
+    for &(x, y) in scatter_points {
+        if !(x.is_finite() && y.is_finite()) {
+            continue;
+        }
+        if !(x_min..=x_max).contains(&x) || !(y_min..=y_max).contains(&y) {
+            continue;
+        }
+        write!(
+            svg,
+            r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="1.8" fill="var(--text-muted)" opacity="0.35"/>"#,
+            cx = to_svg_x(x),
+            cy = to_svg_y(y),
         )
         .ok();
     }
@@ -3616,9 +3683,9 @@ fn build_renegade_accuracy_panel(
         r#"<div class="card">
         <h2>Prediction Accuracy</h2>
         <p style="font-size:0.8em;color:var(--text-muted);">
-            How well each routing model's recent predictions matched reality (the Routing
-            Predictions panel above shows the predictions themselves). Points on the dashed
-            diagonal are perfect: for failure, predicted probability equals the observed
+            How well each routing model's recent predictions matched reality (the Outcomes
+            vs Distance panel above shows the observed outcomes and the fit). Points on the
+            dashed diagonal are perfect: for failure, predicted probability equals the observed
             failure rate (calibration); for the timing models, predicted equals actual.
         </p>
         <div style="display:flex;flex-wrap:wrap;gap:1rem;justify-content:flex-start;">
@@ -4062,6 +4129,7 @@ a.header-title {
     border-radius: 50%;
     display: inline-block;
 }
+.chart-dot-actual { background: var(--text-muted); opacity: 0.55; }
 .chart-dot-global { background: var(--accent-primary); }
 .chart-dot-peer { background: #8b5cf6; }
 .chart-dot-loc { background: #fbbf24; }
@@ -4905,6 +4973,7 @@ mod tests {
         let html = build_estimator_chart_or_placeholder(
             "Response Time (s)",
             &[],
+            &[],
             (0.0, 0.0),
             None,
             None,
@@ -4923,6 +4992,30 @@ mod tests {
         assert!(
             !html.contains("<svg"),
             "empty placeholder must not render an SVG, got: {html}"
+        );
+    }
+
+    #[test]
+    fn estimator_chart_overlays_raw_scatter() {
+        // A fit curve plus raw observations: the chart must draw the scatter dots
+        // (circles) behind the isotonic curve so the spread is visible.
+        let curve = vec![(0.0, 0.1), (0.25, 0.5), (0.5, 0.9)];
+        let scatter = vec![(0.05, 0.0), (0.1, 1.0), (0.3, 0.0), (0.4, 1.0)];
+        let html = build_estimator_chart_or_placeholder(
+            "Failure Probability",
+            &curve,
+            &scatter,
+            (0.0, 0.5),
+            None,
+            None,
+            "0.0",
+            "1.0",
+            "no data",
+        );
+        assert!(html.contains("<svg"), "should render an SVG, got: {html}");
+        assert!(
+            html.contains("<circle"),
+            "raw observations should render as scatter circles, got: {html}"
         );
     }
 
@@ -4982,6 +5075,7 @@ mod tests {
         let html = build_estimator_chart_or_placeholder(
             "Failure Probability",
             &curve,
+            &[],
             (0.0, 0.5),
             None,
             None,
