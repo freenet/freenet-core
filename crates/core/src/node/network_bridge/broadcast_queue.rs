@@ -28,6 +28,39 @@ use super::p2p_protoc::P2pBridge;
 /// `queue` submodule.
 const STREAM_COMPLETION_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Whether we should broadcast a state change for `key` at all: only if we
+/// host it or are actively serving it (a live local-client or downstream
+/// subscriber). Mirrors `node.rs::summary_if_hosted_or_in_use` (#4475) for the
+/// broadcast fan-out path.
+///
+/// A node can be driven into `broadcast_state_to_peers` /
+/// `broadcast_to_single_peer` for a contract it neither hosts nor serves —
+/// "phantom" contracts it holds no local state for. For such a contract the
+/// per-peer body would call `get_contract_summary` (→
+/// `InterestManager::summarize_contract_state`), which issues a
+/// `GetSummaryQuery` round-trip on the single-threaded contract-handling loop
+/// that returns "Contract state not found in store" every time, and would then
+/// fall through to "send full state" with nothing real to send. #4475 gated the
+/// interest-sync summarize sites (path A); this is the residual path-B caller
+/// that drove the plateaued ~100k/hr summarize WARNs observed on nova after the
+/// #4475 rollout (#4473). With no local state there is nothing to broadcast to
+/// the peer, so skipping is the correct behavior, not just a throttle.
+///
+/// Gating on `is_hosting_contract || contract_in_use` is correct, not merely a
+/// heuristic — same reasoning as #4475: a phantom contract is neither hosted
+/// nor in use (skipped); a contract whose state we evicted from the hosting
+/// cache is only reachable while NOT in use, and has no live subscriber whose
+/// broadcast we'd be dropping; the moment a contract gains a live subscriber it
+/// is `contract_in_use`, so we resume broadcasting it.
+///
+/// NOTE: it is surprising the broadcast path runs at all for a contract we hold
+/// no state for — that points at a routing/subscription leak upstream of
+/// `broadcast_state_to_peers` (tracked separately on #4473). This gate stops the
+/// storm symptom; it does not fix that upstream question.
+pub(super) fn should_broadcast_contract(op_manager: &Arc<OpManager>, key: &ContractKey) -> bool {
+    op_manager.ring.is_hosting_contract(key) || op_manager.ring.contract_in_use(key)
+}
+
 // The `BroadcastQueue` struct (constants, types, impl) is only used in the
 // production `p2p_protoc` path. Under `simulation_tests` the code routes
 // through `broadcast_to_single_peer` directly (see p2p_protoc.rs), so the
@@ -444,6 +477,19 @@ pub(super) async fn broadcast_to_single_peer(
     let Some(peer_addr) = target.socket_addr() else {
         return;
     };
+
+    // Skip the summary/delta computation (and the per-peer send) entirely when
+    // we hold no local state for `key`. The expensive `get_contract_summary`
+    // call below is what drove the residual #4473 summarize storm on this
+    // path-B caller. See `should_broadcast_contract`.
+    if !should_broadcast_contract(op_manager, &key) {
+        tracing::trace!(
+            contract = %key,
+            peer = %peer_addr,
+            "Skipping broadcast - contract not hosted or in use"
+        );
+        return;
+    }
 
     let peer_key = PeerKey::from(target.pub_key().clone());
 
@@ -1002,5 +1048,68 @@ mod tests {
                  the state), or the next summary-mismatch resend is suppressed"
             );
         }
+    }
+
+    /// Regression pin for the #4473 path-B summarize storm (counterpart to
+    /// #4475's `interest_sync_periodic_arms_summarize_only_hosted_or_in_use_pin`).
+    ///
+    /// #4475 gated the interest-sync summarize sites (path A) but left the
+    /// broadcast fan-out caller ungated: `broadcast_to_single_peer` called
+    /// `get_contract_summary` (→ `summarize_contract_state`) once per
+    /// (broadcast × target) with NO hosting/in-use gate, driving the residual
+    /// ~100k/hr "Contract state not found in store" WARNs observed on nova for a
+    /// small phantom set of contracts the node holds no state for. The fix gates
+    /// the expensive summarize on `should_broadcast_contract`
+    /// (`is_hosting_contract || contract_in_use`) BEFORE the
+    /// `get_contract_summary` call.
+    ///
+    /// This pin fails on the pre-fix code (an ungated `get_contract_summary` in
+    /// `broadcast_to_single_peer`) and guards against a future migration
+    /// hand-inlining the per-peer body and dropping the gate again.
+    #[test]
+    fn broadcast_single_peer_gates_summarize_on_hosted_or_in_use_pin() {
+        let src = include_str!("broadcast_queue.rs");
+
+        // 1. The gate helper must check BOTH predicates: gating on hosting alone
+        //    wrongly drops the broadcast for an evicted-but-in-use stateful
+        //    contract (the #4475 Codex-P1 lesson, applied to this path).
+        let helper_start = src
+            .find("pub(super) fn should_broadcast_contract(")
+            .expect("should_broadcast_contract helper not found");
+        let helper_end = helper_start
+            + src[helper_start..]
+                .find("\n}\n")
+                .expect("should_broadcast_contract body end not found");
+        let helper_src = &src[helper_start..helper_end];
+        assert!(
+            helper_src.contains("is_hosting_contract"),
+            "should_broadcast_contract must gate on is_hosting_contract"
+        );
+        assert!(
+            helper_src.contains("contract_in_use"),
+            "should_broadcast_contract must ALSO gate on contract_in_use so an \
+             evicted-but-in-use stateful contract keeps being broadcast"
+        );
+
+        // 2. `broadcast_to_single_peer` must call the gate BEFORE the expensive
+        //    `get_contract_summary`. Slice the function body and assert the gate
+        //    call precedes the first `get_contract_summary(` in it.
+        let fn_start = src
+            .find("pub(super) async fn broadcast_to_single_peer(")
+            .expect("broadcast_to_single_peer not found");
+        let fn_src = &src[fn_start..];
+        let gate_off = fn_src.find("should_broadcast_contract(op_manager").expect(
+            "broadcast_to_single_peer must call should_broadcast_contract — a bare \
+             get_contract_summary here reintroduces the #4473 storm",
+        );
+        let summarize_off = fn_src
+            .find("get_contract_summary(")
+            .expect("broadcast_to_single_peer get_contract_summary call not found");
+        assert!(
+            gate_off < summarize_off,
+            "broadcast_to_single_peer must gate on should_broadcast_contract BEFORE \
+             calling get_contract_summary (#4473) — otherwise the summarize storm \
+             fires for every phantom contract before the gate can skip it"
+        );
     }
 }
