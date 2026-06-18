@@ -325,13 +325,14 @@ verify_service() {
             sleep 3  # Give service time to start
 
             if systemctl is-active --quiet "$service_arg.service"; then
-                # Declared up front (default "unknown") so the success
-                # summary's `✓ Binary: $running_binary` never trips
-                # `set -u` on the path where no freenet PID is found (e.g.
-                # MainPID 0, or pgrep misses the process). Previously this
-                # was only assigned inside the freenet_pid block, so that
-                # path aborted the whole deploy with an "unbound variable"
-                # error.
+                # Declared up front (default "unknown") for two reasons:
+                # (1) the success summary's `✓ Binary: $running_binary` no
+                #     longer trips `set -u` when no freenet PID is found
+                #     (previously this aborted the deploy with an "unbound
+                #     variable" error from inside the success path), and
+                # (2) "unknown" is the sentinel for "could not identify a live
+                #     freenet process", which the check below treats as a
+                #     verification FAILURE rather than success.
                 local running_binary="unknown"
                 # Find the actual freenet process, not the wrapper
                 # MainPID may point to bash if service uses ExecStart with shell
@@ -387,6 +388,31 @@ verify_service() {
                     fi
                 fi
 
+                # The unit is `active`, but `active` alone is NOT proof the
+                # gateway is actually running the new binary: a `Type=oneshot`
+                # / `RemainAfterExit` misconfig, or a unit whose ExecStart
+                # forked and exited, reads as `active (exited)` with no live
+                # process. We must positively identify a running freenet
+                # process (above) before blessing the deploy — otherwise we'd
+                # reproduce the very false-success this fix exists to close,
+                # just one rung up (#4492). If neither pgrep nor MainPID found
+                # a non-zero PID, running_binary is still "unknown": fail.
+                if [[ "$running_binary" == "unknown" ]]; then
+                    echo "✗"
+                    echo "  ⚠️  Service unit is active but no running freenet process could be found"
+                    echo "     (active-but-no-process, e.g. a unit that forked-and-exited)."
+                    echo "     Cannot confirm the gateway is running the new binary."
+
+                    if [[ $retry_count -lt $max_retries ]]; then
+                        echo "  🔄 Restarting and re-checking..."
+                        sudo systemctl restart "$service_arg.service"
+                        sleep 2
+                        verify_service "$service_arg" "$expected_version" $((retry_count + 1))
+                        return $?
+                    fi
+                    return 1
+                fi
+
                 # Verify the binary version on disk matches expected
                 local disk_version=$("$INSTALL_PATH" --version 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -1 || echo "unknown")
 
@@ -403,10 +429,10 @@ verify_service() {
                 echo "  ✓ Version: $disk_version"
                 echo "  ✓ Service: Running (PID ${freenet_pid:-unknown})"
                 echo "  ✓ Binary:  $running_binary"
-                # Positively confirmed: service active, correct binary,
-                # matching version. This is the ONLY success path — make
-                # the 0 exit explicit so a future edit can't accidentally
-                # fall through to it.
+                # Positively confirmed: service active, a live freenet process
+                # on the correct binary, matching version. This is the ONLY
+                # success path — make the 0 exit explicit so a future edit
+                # can't accidentally fall through to it.
                 return 0
             else
                 echo "✗"

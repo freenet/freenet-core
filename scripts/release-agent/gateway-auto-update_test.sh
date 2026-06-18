@@ -137,6 +137,19 @@ else
     fail "deploy_update: active service should succeed"
 fi
 
+# --all-instances deliberately skips the single-unit gate (the unit set is
+# dynamic there; deploy-local-gateway.sh verifies each instance and its exit
+# code is still checked). Pin the skip so a future edit can't accidentally
+# invert the condition and drop the gate on the common single-instance path.
+echo "failed" > "$TMP/service-state"
+ALL_INSTANCES=true
+if deploy_update "$TMP/fake-binary" 2>/dev/null; then
+    pass "deploy_update: --all-instances skips the single-unit gate (deploy exit code still gates)"
+else
+    fail "deploy_update: --all-instances should not be blocked by the single-unit gate"
+fi
+ALL_INSTANCES=false
+
 # ── result ────────────────────────────────────────────────────────────
 
 if (( FAILURES > 0 )); then

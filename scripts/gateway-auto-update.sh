@@ -26,10 +26,18 @@ INSTALL_PATH="${INSTALL_PATH:-/usr/local/bin/freenet}"
 GITHUB_REPO="${GITHUB_REPO:-freenet/freenet-core}"
 DOWNLOAD_DIR="${DOWNLOAD_DIR:-/tmp/freenet-update}"
 LOG_FILE="${LOG_FILE:-/var/log/freenet-auto-update.log}"
-# systemd unit (without .service) whose health we independently confirm after
-# deploy. Must match deploy-local-gateway.sh's --service default. Overridable
-# so a non-standard instance (e.g. vega's freenet-gateway-hector) can be
-# verified. See verify_service_active / #4492.
+# systemd unit (without .service) this run deploys to AND independently
+# confirms is active afterwards. Used both as deploy-local-gateway.sh's
+# --service and by verify_service_active so the two always target the same
+# unit (#4492).
+#
+# Defaults to freenet-gateway. A non-default instance (e.g. vega's
+# freenet-gateway-hector) MUST set SERVICE_NAME in this script's environment.
+# The release-agent does not yet forward its `managed_service` config as
+# SERVICE_NAME, so on such an instance both the deploy and the gate currently
+# fall back to freenet-gateway — tracked as a follow-up to thread
+# managed_service through (see #4492). Setting SERVICE_NAME in the agent's
+# systemd unit Environment= is the interim fix.
 SERVICE_NAME="${SERVICE_NAME:-freenet-gateway}"
 
 # Flags
@@ -140,7 +148,10 @@ Security:
 EOF
 }
 
-# Parse arguments
+# Parse arguments. In a function (called only on direct execution, from the
+# guard at the bottom) so that `source`-ing this script for unit tests does not
+# consume the test harness's positional args or exit it on an unknown option.
+parse_args() {
 while [[ $# -gt 0 ]]; do
     case $1 in
         --force)
@@ -192,6 +203,7 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+}
 
 # Check dependencies
 check_dependencies() {
@@ -366,6 +378,14 @@ deploy_update() {
 
     if [[ "$ALL_INSTANCES" == "true" ]]; then
         deploy_args+=("--all-instances")
+    else
+        # Deploy (stop/swap/start/verify) the SAME unit the post-deploy gate
+        # below checks. Without this, a non-default instance (e.g. vega's
+        # freenet-gateway-hector) would deploy the default freenet-gateway
+        # while verify_service_active checks freenet-gateway-hector — two
+        # different units, defeating the gate (#4492). --all-instances has its
+        # own fixed unit list, so --service does not apply there.
+        deploy_args+=("--service" "$SERVICE_NAME")
     fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -529,10 +549,12 @@ main() {
     log INFO "Auto-update check complete"
 }
 
-# Only run main when executed directly, not when sourced. Sourcing is how the
-# regression test (gateway-auto-update_test.sh) exercises verify_service_active
-# and deploy_update in isolation without going through the network download
-# path. `${BASH_SOURCE[0]} == ${0}` is true only on direct execution.
+# Only parse args and run main when executed directly, not when sourced.
+# Sourcing is how the regression test (gateway-auto-update_test.sh) exercises
+# verify_service_active and deploy_update in isolation without going through the
+# network download path; it must not have its own args parsed or be exited by
+# this script. `${BASH_SOURCE[0]} == ${0}` is true only on direct execution.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    parse_args "$@"
     main "$@"
 fi
