@@ -112,6 +112,15 @@ pub(crate) struct PerOpCurves {
     pub transfer_rate_curve: Vec<(f64, f64)>,
     pub transfer_rate_data_range: (f64, f64),
     pub transfer_rate_events: usize,
+    /// Downsampled raw (distance, outcome) observations behind each isotonic fit,
+    /// for the scatter overlay. `#[serde(default)]` keeps decode tolerant of
+    /// missing fields via self-describing formats (no-op under the bincode AOF).
+    #[serde(default)]
+    pub failure_points: Vec<(f64, f64)>,
+    #[serde(default)]
+    pub response_time_points: Vec<(f64, f64)>,
+    #[serde(default)]
+    pub transfer_rate_points: Vec<(f64, f64)>,
 }
 
 /// Periodic snapshot of the router model state for telemetry.
@@ -138,6 +147,16 @@ pub(crate) struct RouterSnapshotInfo {
     pub transfer_rate_curve: Vec<(f64, f64)>,
     /// X-range of actual regression data for the transfer rate estimator.
     pub transfer_rate_data_range: (f64, f64),
+    /// Downsampled raw (distance, outcome) observations behind each aggregate
+    /// isotonic fit, for the scatter overlay. `#[serde(default)]` keeps decode
+    /// tolerant of missing fields via self-describing formats; it is a no-op for
+    /// the positional bincode AOF (which skips records it can't decode).
+    #[serde(default)]
+    pub failure_points: Vec<(f64, f64)>,
+    #[serde(default)]
+    pub response_time_points: Vec<(f64, f64)>,
+    #[serde(default)]
+    pub transfer_rate_points: Vec<(f64, f64)>,
     /// Connect forward estimator curve sampled across [0, 0.5], clamped to [0, 1].
     pub connect_forward_curve: Option<Vec<(f64, f64)>>,
     /// X-range of actual regression data for the connect forward estimator.
@@ -173,7 +192,11 @@ pub(crate) struct RouterSnapshotInfo {
     pub delegate_module_cache_evictions_total: Option<u64>,
     /// Per-operation-type estimator curves, keyed by op type name (e.g., "GET").
     pub per_op_curves: HashMap<String, PerOpCurves>,
-    /// Renegade predictor diagnostics
+    /// Renegade predictor diagnostics. These (and `renegade_accuracy_pairs`) are
+    /// read by the in-process peer dashboard directly from this struct; they are
+    /// intentionally not mirrored into the hand-written OTLP `json!` block in
+    /// `tracing/telemetry.rs` (the dashboard is the only consumer). The per-op
+    /// scatter does reach OTLP, because `per_op_curves` is forwarded wholesale.
     pub renegade_failure_events: usize,
     pub renegade_response_time_events: usize,
     pub renegade_transfer_speed_events: usize,
@@ -186,6 +209,20 @@ pub(crate) struct RouterSnapshotInfo {
     pub renegade_predictions_evaluated: u64,
     /// Recent (predicted_failure, actual_outcome) pairs for accuracy visualization.
     pub renegade_accuracy_pairs: Vec<(f64, f64)>,
+    /// Recent (predicted_secs, actual_secs) pairs for the response-time stage.
+    /// `#[serde(default)]` for decode consistency with the `*_points` fields
+    /// (no-op under the positional bincode AOF).
+    #[serde(default)]
+    pub renegade_response_time_pairs: Vec<(f64, f64)>,
+    /// Recent (predicted_bps, actual_bps) pairs for the transfer-speed stage.
+    #[serde(default)]
+    pub renegade_transfer_speed_pairs: Vec<(f64, f64)>,
+    /// Number of response-time predictions scored against actual outcomes.
+    #[serde(default)]
+    pub renegade_response_time_evaluated: u64,
+    /// Number of transfer-speed predictions scored against actual outcomes.
+    #[serde(default)]
+    pub renegade_transfer_speed_evaluated: u64,
 }
 
 /// Per-peer routing data for the dashboard detail page.
@@ -877,6 +914,11 @@ impl Router {
                 .transfer_rate_estimator
                 .sampled_curve(0.0, f64::INFINITY, 50),
             transfer_rate_data_range: self.transfer_rate_estimator.data_x_range(),
+            // Downsampled raw observations for the scatter overlay (cap keeps the
+            // serialized snapshot small; estimators retain up to 500 each).
+            failure_points: self.failure_estimator.sampled_raw_points(100),
+            response_time_points: self.response_start_time_estimator.sampled_raw_points(100),
+            transfer_rate_points: self.transfer_rate_estimator.sampled_raw_points(100),
             per_op_curves: {
                 let mut curves = HashMap::new();
                 // Collect all op types that have any data
@@ -893,18 +935,21 @@ impl Router {
                         c.failure_curve = p;
                         c.failure_data_range = est.data_x_range();
                         c.failure_events = est.len();
+                        c.failure_points = est.sampled_raw_points(100);
                     }
                     if let Some(est) = self.per_op_response_time.get(&ot) {
                         let p = est.sampled_curve(0.0, f64::INFINITY, 50);
                         c.response_time_curve = p;
                         c.response_time_data_range = est.data_x_range();
                         c.response_time_events = est.len();
+                        c.response_time_points = est.sampled_raw_points(100);
                     }
                     if let Some(est) = self.per_op_transfer_rate.get(&ot) {
                         let p = est.sampled_curve(0.0, f64::INFINITY, 50);
                         c.transfer_rate_curve = p;
                         c.transfer_rate_data_range = est.data_x_range();
                         c.transfer_rate_events = est.len();
+                        c.transfer_rate_points = est.sampled_raw_points(100);
                     }
                     curves.insert(ot.as_str().to_string(), c);
                 }
@@ -940,6 +985,24 @@ impl Router {
                 .iter()
                 .copied()
                 .collect(),
+            renegade_response_time_pairs: self
+                .renegade_predictor
+                .response_time_accuracy_pairs()
+                .iter()
+                .copied()
+                .collect(),
+            renegade_transfer_speed_pairs: self
+                .renegade_predictor
+                .transfer_speed_accuracy_pairs()
+                .iter()
+                .copied()
+                .collect(),
+            renegade_response_time_evaluated: self
+                .renegade_predictor
+                .response_time_predictions_evaluated(),
+            renegade_transfer_speed_evaluated: self
+                .renegade_predictor
+                .transfer_speed_predictions_evaluated(),
         }
     }
 
