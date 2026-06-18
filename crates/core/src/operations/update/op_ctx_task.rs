@@ -1183,7 +1183,11 @@ async fn drive_relay_broadcast_to(
                 // Full state failed and the merge function did NOT reject it
                 // (so contract code is missing). Trigger self-healing GET.
                 // Inbound relay path → gated on `contract_in_use` (#4473).
-                op_manager.try_auto_fetch_contract(&key, sender_addr, AutoFetchReason::InboundRelay);
+                op_manager.try_auto_fetch_contract(
+                    &key,
+                    sender_addr,
+                    AutoFetchReason::InboundRelay,
+                );
             } else if queue_full {
                 tracing::debug!(
                     tx = %incoming_tx,
@@ -1827,7 +1831,11 @@ async fn drive_relay_broadcast_to_streaming(
             // update.rs:1336-1361.
             if super::log_broadcast_to_streaming_failure(&incoming_tx, &key, &err) {
                 // Inbound broadcast relay path → gated on `contract_in_use` (#4473).
-                op_manager.try_auto_fetch_contract(&key, sender_addr, AutoFetchReason::InboundRelay);
+                op_manager.try_auto_fetch_contract(
+                    &key,
+                    sender_addr,
+                    AutoFetchReason::InboundRelay,
+                );
             } else if err.is_invalid_update_rejection() {
                 let op_mgr = op_manager.clone();
                 let contract_key = key;
