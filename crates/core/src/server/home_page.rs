@@ -2961,7 +2961,7 @@ fn peer_detail_html(address_str: &str) -> String {
                     <div class="info-label">This peer: transfer rate</div><div class="info-value">{pt} events</div>
                 </div>
                 <h3 style="margin-top: 1em;">Renegade ML Predictor</h3>
-                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">Renegade is a k-nearest-neighbours predictor tuned for accurate estimates from small amounts of data, so routing improves after a handful of observations rather than thousands.</p>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;">Renegade is a zero-configuration k-nearest-neighbours model (it auto-selects K and learns which features matter). It predicts per-peer, per-contract outcomes from four features (peer, contract location, distance, time); the router blends its prediction with the distance-based estimate (a weighted average, Renegade's share growing with data up to half) to catch patterns distance alone misses, such as a peer that drops requests for specific contracts.</p>
                 <div class="info-grid">
                     <div class="info-label">Failure observations</div><div class="info-value">{rf}</div>
                     <div class="info-label">Response time observations</div><div class="info-value">{rr}</div>
@@ -3168,10 +3168,13 @@ fn peer_detail_html(address_str: &str) -> String {
             r#"<div class="card">
                 <h2>Outcomes vs Distance</h2>
                 <p style="font-size:0.8em;color:var(--text-muted);">
-                    Actual observed outcomes (dots) plotted against ring distance to the contract,
-                    with the isotonic fit the router consults overlaid. How tightly the dots hug a
-                    monotonic curve shows how well distance actually predicts the outcome. The
-                    Prediction Accuracy panel below scores that fit against what happened.
+                    Actual observed outcomes (dots) against ring distance to the contract, with the
+                    isotonic fit overlaid (the All tab is the aggregate the router uses; per-op tabs
+                    just break it down and are not consulted separately). "Peer-adjusted" adds this
+                    peer's running EWMA correction to that fit. How tightly the dots hug a monotonic
+                    curve shows how well distance alone predicts the outcome. A separate Renegade
+                    model is blended into the final estimate; its accuracy is in the Prediction
+                    Accuracy panel below.
                 </p>
                 <p class="chart-legend">
                     <span class="chart-key"><span class="chart-dot chart-dot-actual"></span> Actual outcomes</span>
@@ -3683,10 +3686,11 @@ fn build_renegade_accuracy_panel(
         r#"<div class="card">
         <h2>Prediction Accuracy</h2>
         <p style="font-size:0.8em;color:var(--text-muted);">
-            How well each routing model's recent predictions matched reality (the Outcomes
-            vs Distance panel above shows the observed outcomes and the fit). Points on the
-            dashed diagonal are perfect: for failure, predicted probability equals the observed
-            failure rate (calibration); for the timing models, predicted equals actual.
+            How well the Renegade predictor's recent predictions matched reality (this scores
+            the Renegade k-NN layer, not the distance-only fit in Outcomes vs Distance above).
+            On the dashed diagonal predictions are perfect: for failure, predicted probability
+            equals the observed failure rate (calibration); for the timing models, predicted
+            equals actual.
         </p>
         <div style="display:flex;flex-wrap:wrap;gap:1rem;justify-content:flex-start;">
             {failure}
