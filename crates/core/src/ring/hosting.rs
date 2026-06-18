@@ -3110,15 +3110,17 @@ mod tests {
 
     /// Behavioural regression for the #4473 UPDATE auto-fetch gate.
     ///
+    /// On the `AutoFetchReason::InboundRelay` path,
     /// `OpManager::try_auto_fetch_contract` self-heal-fetches a contract only
     /// when `self.ring.contract_in_use(key)` — i.e. a local client or a
-    /// downstream peer subscriber depends on it. Before the gate, an inbound
-    /// UPDATE/broadcast for a phantom-interest contract (the #4404
-    /// placement-migration after-effect: stale interest with no subscriber)
-    /// spawned a `fetch_contract` sub-op every time the 5-minute cooldown
-    /// lapsed — the residual #4473 churn. This drives the predicate the gate
-    /// keys on through real subscription registration/teardown and asserts the
-    /// decision the gate makes at each step:
+    /// downstream peer subscriber depends on it. (The `Originator` path is
+    /// demand-driven and bypasses this gate; see `AutoFetchReason`.) Before the
+    /// gate, an inbound UPDATE/broadcast for a phantom-interest contract (the
+    /// #4404 placement-migration after-effect: stale interest with no
+    /// subscriber) spawned a `fetch_contract` sub-op every time the 5-minute
+    /// cooldown lapsed — the residual #4473 churn. This drives the predicate
+    /// the gate keys on through real subscription registration/teardown and
+    /// asserts the decision the gate makes at each step:
     ///   phantom (no subscriber)            → gate skips  (would NOT auto-fetch)
     ///   live local client                  → gate passes (WOULD auto-fetch)
     ///   live downstream subscriber         → gate passes (WOULD auto-fetch)

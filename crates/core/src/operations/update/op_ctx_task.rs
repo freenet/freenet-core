@@ -26,7 +26,9 @@ use crate::operations::OpError;
 use crate::ring::{PeerKeyLocation, RingError};
 use crate::tracing::{NetEventLog, OperationFailure, state_hash_full};
 
-use super::{BroadcastStreamingPayload, UpdateExecution, UpdateMsg, UpdateStreamingPayload};
+use super::{
+    AutoFetchReason, BroadcastStreamingPayload, UpdateExecution, UpdateMsg, UpdateStreamingPayload,
+};
 use crate::transport::peer_connection::StreamId;
 
 /// Counter: number of times `start_relay_request_update` or
@@ -389,7 +391,14 @@ async fn drive_client_update(
                              code/params for this contract; triggering \
                              auto-fetch from target and asking client to retry"
                         );
-                        op_manager.try_auto_fetch_contract(&key, target_addr);
+                        // Originator self-heal: a local client is waiting on
+                        // the retry, so this is demand-driven and bypasses the
+                        // #4473 phantom-interest gate (Codex review on #4489).
+                        op_manager.try_auto_fetch_contract(
+                            &key,
+                            target_addr,
+                            AutoFetchReason::Originator,
+                        );
                         return Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                             cause: format!(
                                 "originator missing contract code/params for {key}; \
@@ -1173,7 +1182,8 @@ async fn drive_relay_broadcast_to(
             } else if !is_delta && !err.is_contract_exec_rejection() && !queue_full {
                 // Full state failed and the merge function did NOT reject it
                 // (so contract code is missing). Trigger self-healing GET.
-                op_manager.try_auto_fetch_contract(&key, sender_addr);
+                // Inbound relay path → gated on `contract_in_use` (#4473).
+                op_manager.try_auto_fetch_contract(&key, sender_addr, AutoFetchReason::InboundRelay);
             } else if queue_full {
                 tracing::debug!(
                     tx = %incoming_tx,
@@ -1816,7 +1826,8 @@ async fn drive_relay_broadcast_to_streaming(
             // send_summary_back_on_rejection. Mirrors legacy at
             // update.rs:1336-1361.
             if super::log_broadcast_to_streaming_failure(&incoming_tx, &key, &err) {
-                op_manager.try_auto_fetch_contract(&key, sender_addr);
+                // Inbound broadcast relay path → gated on `contract_in_use` (#4473).
+                op_manager.try_auto_fetch_contract(&key, sender_addr, AutoFetchReason::InboundRelay);
             } else if err.is_invalid_update_rejection() {
                 let op_mgr = op_manager.clone();
                 let contract_key = key;
