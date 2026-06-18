@@ -137,17 +137,87 @@ pub(crate) struct UpdateExecution {
 /// transient routing failure.
 pub(crate) const CONTRACT_FETCH_COOLDOWN_MS: u64 = 300_000;
 
+/// Why a `try_auto_fetch_contract` call was made — decides whether the
+/// phantom-interest gate applies.
+///
+/// The auto-fetch helper is reached from two kinds of site, and only one of
+/// them is the #4473 churn:
+///
+/// * [`AutoFetchReason::Originator`] — a *local client* submitted an UPDATE for
+///   a contract whose code/params we lack, and the driver is self-healing so
+///   the client's retry can succeed (the `phase = "auto_fetch_originator"`
+///   site). This is demand-driven: a real client is waiting on it, exactly
+///   like a subscribe-driven fetch, so it must NOT be gated even when no
+///   subscription exists yet (a one-shot updater need not be subscribed).
+///   Suppressing it would strand the client's UPDATE behind a contract that
+///   never gets fetched (Codex review on PR #4489).
+/// * [`AutoFetchReason::InboundRelay`] — an *inbound* relayed UPDATE / broadcast
+///   failed its merge because we lack the contract. A node carrying phantom
+///   interest (the #4404 placement-migration after-effect) hits this on every
+///   such message and would spawn a `fetch_contract` sub-op for state nothing
+///   on this node depends on — the residual #4473 churn. This is the path the
+///   `contract_in_use` gate suppresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AutoFetchReason {
+    /// Local-client UPDATE self-heal — demand-driven, never gated.
+    Originator,
+    /// Inbound relay/broadcast self-heal — gated on `contract_in_use`.
+    InboundRelay,
+}
+
 impl OpManager {
     /// Trigger a background GET when an UPDATE broadcast fails because the node
     /// doesn't have the contract's parameters (code + params). This self-heals
     /// the node by fetching the contract directly from the UPDATE sender, who
     /// is known to have the contract.
     ///
+    /// For [`AutoFetchReason::InboundRelay`] calls this is gated to contracts we
+    /// actually have a reason to hold: skipped unless a local client or a
+    /// downstream peer is subscribed (`contract_in_use`).
+    /// [`AutoFetchReason::Originator`] calls are demand-driven (a local client
+    /// is waiting on the retry) and bypass the gate.
     /// Rate-limited: at most one fetch attempt per contract per 5 minutes.
-    pub(crate) fn try_auto_fetch_contract(&self, key: &ContractKey, sender_addr: SocketAddr) {
+    pub(crate) fn try_auto_fetch_contract(
+        &self,
+        key: &ContractKey,
+        sender_addr: SocketAddr,
+        reason: AutoFetchReason,
+    ) {
         use crate::config::GlobalSimulationTime;
 
         let instance_id = *key.id();
+
+        // Don't self-heal-fetch a contract nothing on this node depends on —
+        // but ONLY for inbound relay/broadcast self-heal, never for the
+        // originator path (see `AutoFetchReason`). An inbound UPDATE/broadcast
+        // for a contract we carry only phantom interest in (e.g. the #4404
+        // placement migration left stale interest with no subscriber) reaches
+        // this path and would spawn a sub-op GET — a `fetch_contract` span
+        // burst against state we have no client or downstream subscriber to
+        // serve. The existing 5-minute cooldown only *throttles* that to one
+        // burst per contract per window; gating on `contract_in_use` (a live
+        // local-client subscription or a downstream peer subscriber) stops it
+        // at the source. This is the fetch-path analogue of the #4475 / #4482
+        // `is_hosting_contract || contract_in_use` summarize gates. We
+        // intentionally do NOT also accept `is_hosting_contract` here: on this
+        // path the merge already failed because we lack the contract, so
+        // hosting is moot; nor a bare upstream network subscription, which
+        // `contract_in_use` deliberately excludes (an orphaned upstream sub
+        // renews its lease unboundedly and is meant to be torn down, not kept
+        // alive by self-heal fetches — see `HostingManager::contract_in_use`).
+        // A contract that gains a real local client or downstream subscriber
+        // becomes `contract_in_use` and its next inbound UPDATE re-arms this
+        // fetch.
+        if reason == AutoFetchReason::InboundRelay && !self.ring.contract_in_use(key) {
+            tracing::debug!(
+                contract = %key,
+                sender = %sender_addr,
+                "Skipping inbound-relay auto-fetch: no local client or downstream \
+                 subscriber depends on this contract (phantom interest)"
+            );
+            return;
+        }
+
         let now_ms = GlobalSimulationTime::read_time_ms();
 
         // Atomic rate-limit: try to insert a new entry. If one exists and hasn't
@@ -1388,6 +1458,102 @@ mod tests {
             return_pos < notify_pos,
             "early return on inequality MUST precede the notify_node_event \
              send — otherwise mismatched summaries would still be transmitted"
+        );
+    }
+
+    /// Pin (#4473): `try_auto_fetch_contract` MUST gate on
+    /// `self.ring.contract_in_use(...)` and early-return BEFORE it spawns a
+    /// sub-op GET (`start_targeted_sub_op_get`) — but ONLY for the
+    /// `AutoFetchReason::InboundRelay` path. Without the gate, an inbound
+    /// relayed UPDATE for a contract this node carries only phantom interest in
+    /// (no client, no downstream subscriber) spawns a `fetch_contract` sub-op
+    /// every time the per-contract cooldown lapses — the residual #4473 churn
+    /// the gate stops at the source. The existing 5-minute cooldown only
+    /// throttles that; it does not prevent it. If a refactor drops this gate or
+    /// moves it after the spawn, the storm regresses silently (all behavioural
+    /// tests still pass), so pin the ordering at the source level.
+    ///
+    /// Equally important (Codex review on #4489): the gate MUST stay scoped to
+    /// `InboundRelay`, never unconditional. Making it unconditional again would
+    /// re-suppress the `Originator` self-heal path, stranding a local client's
+    /// UPDATE behind a contract that never gets fetched. Pin that the gate
+    /// condition mentions `AutoFetchReason::InboundRelay`.
+    #[test]
+    fn try_auto_fetch_contract_gates_on_contract_in_use_before_spawn() {
+        let src = include_str!("update.rs");
+        let fn_start = src
+            .find("pub(crate) fn try_auto_fetch_contract(")
+            .expect("try_auto_fetch_contract not found");
+        let fn_src = &src[fn_start..];
+
+        let gate_pos = fn_src.find("self.ring.contract_in_use(key)").expect(
+            "try_auto_fetch_contract MUST gate on self.ring.contract_in_use(key) \
+             so phantom-interest contracts are not auto-fetched (#4473)",
+        );
+        // The gate condition must be scoped to the inbound-relay reason so the
+        // originator self-heal path is never suppressed (#4489).
+        let reason_pos = fn_src.find("AutoFetchReason::InboundRelay").expect(
+            "the contract_in_use gate MUST be conditioned on \
+             AutoFetchReason::InboundRelay so Originator self-heal bypasses it (#4489)",
+        );
+        let return_pos = fn_src[gate_pos..]
+            .find("return;")
+            .map(|p| gate_pos + p)
+            .expect("the contract_in_use gate must early-return when not in use");
+        let spawn_pos = fn_src
+            .find("start_targeted_sub_op_get")
+            .expect("try_auto_fetch_contract must still spawn the sub-op GET on the in-use path");
+
+        assert!(
+            reason_pos < gate_pos,
+            "the AutoFetchReason::InboundRelay guard MUST precede the \
+             contract_in_use check, or the gate becomes unconditional and \
+             re-suppresses the Originator self-heal path (#4489)"
+        );
+        assert!(
+            gate_pos < return_pos && return_pos < spawn_pos,
+            "the contract_in_use gate + early return MUST precede the \
+             start_targeted_sub_op_get spawn, or phantom-interest contracts \
+             regress the #4473 fetch_contract churn"
+        );
+    }
+
+    /// Pin (#4489): the originator self-heal site MUST call
+    /// `try_auto_fetch_contract` with `AutoFetchReason::Originator`, and every
+    /// inbound relay/broadcast site MUST use `AutoFetchReason::InboundRelay`.
+    /// If a refactor flips the originator site to `InboundRelay`, a one-shot
+    /// client UPDATE for a contract we lack would be silently suppressed by the
+    /// phantom-interest gate (the Codex finding on #4489); if it flips a relay
+    /// site to `Originator`, the #4473 churn regresses. Pin both at the source.
+    #[test]
+    fn auto_fetch_call_sites_use_correct_reason() {
+        let driver_src = include_str!("update/op_ctx_task.rs");
+
+        // The originator site is the one paired with the `auto_fetch_originator`
+        // tracing phase; it must use the Originator (ungated) reason.
+        let originator_anchor = driver_src
+            .find("phase = \"auto_fetch_originator\"")
+            .expect("originator auto-fetch site (auto_fetch_originator phase) not found");
+        let originator_call = driver_src[originator_anchor..]
+            .find("try_auto_fetch_contract(")
+            .map(|p| originator_anchor + p)
+            .expect("originator site must still call try_auto_fetch_contract");
+        let originator_reason = driver_src[originator_call..]
+            .find("AutoFetchReason::")
+            .map(|p| originator_call + p)
+            .expect("originator try_auto_fetch_contract call must pass an AutoFetchReason");
+        assert!(
+            driver_src[originator_reason..].starts_with("AutoFetchReason::Originator"),
+            "the auto_fetch_originator site MUST pass AutoFetchReason::Originator \
+             so a local client's UPDATE self-heal is never gated (#4489)"
+        );
+
+        // No inbound relay/broadcast site may use Originator: those are the
+        // #4473 churn paths and must stay gated.
+        assert!(
+            !driver_src.contains("sender_addr, AutoFetchReason::Originator"),
+            "inbound relay/broadcast auto-fetch sites (keyed on sender_addr) MUST \
+             use AutoFetchReason::InboundRelay, not Originator, or #4473 regresses"
         );
     }
 }

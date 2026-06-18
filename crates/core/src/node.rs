@@ -1621,6 +1621,44 @@ where
                     );
                     continue;
                 }
+                // Skip the per-contract state fetch — a `GetQuery` that opens
+                // the `fetch_contract` span on the single-threaded
+                // contract-handling loop — for contracts we neither actively
+                // serve nor owe a deferred broadcast. A node carrying phantom
+                // interest (e.g. the #4404 placement migration left hundreds
+                // of not-held contracts) otherwise fetched state for EVERY
+                // overlapping contract on EVERY inbound NeighborHosting
+                // announce, only to discard it at the
+                // `is_receiving_updates() || has_downstream_subscribers()`
+                // gate below. That fetch-then-discard was the residual #4473
+                // `fetch_contract` churn on technic (the fetch-path sibling of
+                // the #4475 / #4482 summarize gates).
+                //
+                // The gate reuses the existing discard predicate
+                // (`is_receiving_updates || has_downstream_subscribers`), so it
+                // changes nothing for served contracts, and adds a
+                // `pending_broadcasts` clause so the #4359 fresh-PUT flush at
+                // the matching arm still runs for any contract that owes one.
+                // Skipping is safe for the flush because a deferred broadcast
+                // is only ever stashed for a contract THIS node originated
+                // (broadcast give-up), so the flush is a guaranteed no-op for
+                // every contract this gate skips. The predicates take a
+                // synthetic key with a zero code hash: `ContractKey` equality
+                // and hashing are instance-only (freenet-stdlib `key.rs`), so
+                // the hosting / subscription maps resolve correctly from the
+                // instance id alone — `get_contract_state_by_id` is the only
+                // path that recovers the full key here, and that is exactly the
+                // round-trip we are avoiding.
+                let probe_key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+                    instance_id,
+                    freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
+                );
+                if !op_manager.ring.is_receiving_updates(&probe_key)
+                    && !op_manager.ring.has_downstream_subscribers(&probe_key)
+                    && !op_manager.pending_broadcasts.contains(&instance_id)
+                {
+                    continue;
+                }
                 if let Some((key, state)) =
                     get_contract_state_by_id(&op_manager, &instance_id).await
                 {
@@ -3019,6 +3057,55 @@ mod tests {
             gated_calls >= 3,
             "expected the 3 periodic interest-sync arms to call \
              summary_if_hosted_or_in_use, found {gated_calls}"
+        );
+    }
+
+    /// Regression pin for the #4473 residual `fetch_contract` churn (the
+    /// fetch-path sibling of the summarize gate pinned above).
+    ///
+    /// The NeighborHosting overlap-sync loop fetched `get_contract_state_by_id`
+    /// for EVERY overlapping contract on EVERY inbound announce, only to discard
+    /// the result at the `is_receiving_updates || has_downstream_subscribers`
+    /// gate for contracts we don't actively serve — a `fetch_contract` span
+    /// burst on the serial `contract_handling` loop driven by phantom interest.
+    /// The activity gate (plus a `pending_broadcasts` clause that preserves the
+    /// #4359 fresh-PUT flush) MUST precede the `get_contract_state_by_id` fetch
+    /// so the span is never opened for a skipped contract. If a refactor moves
+    /// the gate after the fetch, the churn regresses silently, so pin the
+    /// ordering at the source level.
+    #[test]
+    fn neighbor_hosting_overlap_sync_gates_before_state_fetch_pin() {
+        let src = include_str!("node.rs");
+
+        // Bound the slice to the NeighborHosting overlap-sync loop so the
+        // ordering check can't false-pass on a neighbouring handler. The loop
+        // is the only site that iterates `result.overlapping_contracts`.
+        let loop_start = src
+            .find("for instance_id in result.overlapping_contracts {")
+            .expect("NeighborHosting overlap-sync loop not found");
+        let loop_src = &src[loop_start..];
+
+        let gate_pos = loop_src
+            .find("op_manager.pending_broadcasts.contains(&instance_id)")
+            .expect(
+                "overlap-sync loop MUST gate on the activity predicate + \
+                 pending_broadcasts.contains before fetching state (#4473)",
+            );
+        let recv_pos = loop_src
+            .find("is_receiving_updates(&probe_key)")
+            .expect("overlap-sync gate MUST check is_receiving_updates on the probe key");
+        let downstream_pos = loop_src
+            .find("has_downstream_subscribers(&probe_key)")
+            .expect("overlap-sync gate MUST check has_downstream_subscribers on the probe key");
+        let fetch_pos = loop_src
+            .find("get_contract_state_by_id(&op_manager, &instance_id)")
+            .expect("overlap-sync loop must still fetch state on the served path");
+
+        assert!(
+            recv_pos < fetch_pos && downstream_pos < fetch_pos && gate_pos < fetch_pos,
+            "the activity gate (is_receiving_updates || has_downstream_subscribers \
+             || pending_broadcasts.contains) MUST precede get_contract_state_by_id, \
+             or the #4473 fetch_contract churn regresses for phantom contracts"
         );
     }
 
