@@ -26,7 +26,7 @@ use crate::{
         op_state_manager::OpManager,
     },
     operations::connect,
-    ring::{ConnectionManager, PeerKeyLocation},
+    ring::{ConnectionManager, Location, PeerKeyLocation},
     transport::in_memory_socket::{SimulationSocket, register_address_network},
     wasm_runtime::MockStateStorage,
 };
@@ -129,6 +129,11 @@ impl<ER> Builder<ER> {
 
         // Append contracts before starting
         append_contracts(&op_manager, self.contracts, self.contract_subscribers).await?;
+
+        // Inject any pre-formed ring connections (topology preseed, #4233) before
+        // the event loop starts, so a wide direct star exists at t=0 without the
+        // organic CONNECT handshake. No-op (empty vec) for all existing tests.
+        apply_preseeded_connections(&op_manager, self.preseed_connections).await;
 
         // Start join procedure for non-gateway nodes
         let join_task = if !gateways.is_empty() && !self.config.is_gateway {
@@ -263,6 +268,11 @@ impl<ER> Builder<ER> {
         // Append contracts before starting
         append_contracts(&op_manager, self.contracts, self.contract_subscribers).await?;
 
+        // Inject any pre-formed ring connections (topology preseed, #4233) before
+        // the event loop starts, so a wide direct star exists at t=0 without the
+        // organic CONNECT handshake. No-op (empty vec) for all existing tests.
+        apply_preseeded_connections(&op_manager, self.preseed_connections).await;
+
         // Start join procedure for non-gateway nodes
         let join_task = if !gateways.is_empty() && !self.config.is_gateway {
             Some(connect::initial_join_procedure(op_manager.clone(), &gateways).await?)
@@ -395,6 +405,11 @@ impl<ER> Builder<ER> {
         // Append contracts before starting
         append_contracts(&op_manager, self.contracts, self.contract_subscribers).await?;
 
+        // Inject any pre-formed ring connections (topology preseed, #4233) before
+        // the event loop starts, so a wide direct star exists at t=0 without the
+        // organic CONNECT handshake. No-op (empty vec) for all existing tests.
+        apply_preseeded_connections(&op_manager, self.preseed_connections).await;
+
         // Start join procedure for non-gateway nodes
         let join_task = if !gateways.is_empty() && !self.config.is_gateway {
             Some(connect::initial_join_procedure(op_manager.clone(), &gateways).await?)
@@ -477,4 +492,79 @@ async fn append_contracts(
         // Neighbor hosting handles peer-to-peer awareness for update propagation.
     }
     Ok(())
+}
+
+/// Inject pre-formed ring connections at node startup, bypassing the organic
+/// CONNECT/NAT-traversal handshake.
+///
+/// ## Why this exists
+///
+/// The Turmoil simulation harness cannot organically bootstrap a wide direct
+/// star (one gateway with direct connections to 40-80 subscribers — the
+/// production-incident topology, #4233): ring-routed CONNECT cannot form that
+/// many direct connections within the virtual-time budget (subscribers hit "at
+/// terminus, no uphill peers available — rejecting" in the tiny 1-gateway star).
+/// N=8/16 form; N>=24 never finish, so the fan-out broadcast phase that actually
+/// exercises the event-loop saturation surface is never reached.
+///
+/// This primitive is the connection-side analogue of the `SeedHostedContract`
+/// contract preseed: it writes the ring `Connection`/`Location` state directly
+/// into each node's [`ConnectionManager`] before the event loop starts, so the
+/// gateway already believes it holds a direct connection to every subscriber
+/// (and vice-versa) at t=0.
+///
+/// ## What it does — and what it deliberately leaves to the organic path
+///
+/// For each preseeded peer this calls [`Ring::add_connection`], which is pure
+/// ring bookkeeping (it inserts into `location_for_peer` /
+/// `connections_by_location` and enforces the `max_connections` cap; it does NOT
+/// require a live transport connection). The underlying UDP/`SimulationSocket`
+/// connection is then materialized lazily by the production event loop on the
+/// first outbound message to that peer — the `OutboundMessageWithTarget` handler
+/// resolves a ring-known peer via `get_peer_location_by_addr` and dials it
+/// (`p2p_protoc.rs`). Both peers' addresses are already registered with the
+/// network (`register_address_network`), so the in-memory socket delivers.
+///
+/// It deliberately does NOT pre-register the subscriber's interest/subscription
+/// for any contract. Broadcast fan-out (`get_broadcast_targets_update`)
+/// enumerates the interest manager + proximity cache, not the raw connection
+/// set — and those are populated organically when each subscriber runs its real
+/// `Subscribe` operation, which now routes directly to the gateway over the
+/// injected connection (`subscribe.rs` calls `register_peer_interest` /
+/// `add_downstream_subscriber` on the host as it processes the inbound
+/// subscribe). So the scenario keeps using the genuine subscribe + interest +
+/// broadcast machinery; the ONLY thing replaced is the CONNECT handshake.
+///
+/// `was_reserved: false` is correct because no reservation was ever made for
+/// these synthetic connections. A peer that the cap rejects (over
+/// `max_connections`) is logged and skipped rather than panicking, so a
+/// mis-sized star surfaces as a connectivity shortfall in the test's own
+/// assertions rather than an opaque startup panic.
+async fn apply_preseeded_connections(
+    op_manager: &Arc<OpManager>,
+    connections: Vec<PeerKeyLocation>,
+) {
+    use crate::node::PeerId;
+
+    for peer in connections {
+        let Some(addr) = peer.socket_addr() else {
+            tracing::warn!("preseed_connections: skipping peer with unknown address: {peer}");
+            continue;
+        };
+        let loc = Location::from_address(&addr);
+        let peer_id = PeerId::new(peer.pub_key().clone(), addr);
+        // `add_connection` is idempotent-ish: the CM dedups by addr, so a
+        // double-injection is harmless. The bool return signals "just crossed
+        // the readiness threshold", which we don't need here.
+        let _ = op_manager.ring.add_connection(loc, peer_id, false).await;
+        tracing::debug!(
+            "preseed_connections: injected direct connection {} -> {peer} (@ {loc})",
+            op_manager
+                .ring
+                .connection_manager
+                .get_own_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "<no addr>".to_string()),
+        );
+    }
 }
