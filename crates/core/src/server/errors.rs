@@ -76,23 +76,27 @@ impl IntoResponse for WebSocketApiError {
         // will NOT match here.  Each new release must explicitly decide
         // whether the new variant is transient.  The wildcard `_` at the
         // bottom of the `match` falls through to 500.
+        // NOTE: `ErrorKind::OperationError` is deliberately NOT listed here.
+        // It is dual-use: the web GET path synthesizes it for transient
+        // timeouts AND the node emits it for terminal failures (e.g. a locally
+        // banned contract, exhausted GET). Treating it as transient would
+        // serve an infinite auto-refresh page for those terminal errors. The
+        // transient GET cases now use RequestError(Timeout) / ChannelClosed
+        // (see handle_get_response in path_handlers.rs), which are caught below.
         let is_transient = matches!(
             &self,
             WebSocketApiError::AxumError {
                 error:
-                    // Timeout from the 30s GET fetch wrapper.
-                    ErrorKind::OperationError { .. }
                     // Dead in current core (no raisers), but stdlib can emit
                     // it; defensive include so a stdlib bump doesn't silently
                     // lose retry behaviour.
-                    | ErrorKind::FailedOperation
+                    ErrorKind::FailedOperation
                     // Node-recovery races: channel teardown, cold-start.
                     | ErrorKind::ChannelClosed
                     | ErrorKind::TransportProtocolDisconnect
                     | ErrorKind::NodeUnavailable
-                    // Symmetric with OperationError("…timed out…") —
-                    // a RequestError(Timeout) is the same class of
-                    // transient failure during GET fetch (#3472).
+                    // The 30s GET fetch wrapper elapsed — the canonical #3472
+                    // transient case. Synthesized by handle_get_response.
                     | ErrorKind::RequestError(RequestError::Timeout)
             }
         );
@@ -279,35 +283,26 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn operation_error_returns_retry_page() {
-        // Transient errors during contract fetch return 503 + auto-refresh.
+    #[test]
+    fn operation_error_returns_internal_server_error() {
+        // OperationError is dual-use: the node emits it for TERMINAL failures
+        // (banned contract, exhausted GET) as well as transient ones, so it
+        // must NOT be classified transient — otherwise a banned contract would
+        // infinite-reload instead of showing an error. The transient GET cases
+        // use RequestError(Timeout)/ChannelClosed instead (#3472).
         let err = WebSocketApiError::AxumError {
             error: ErrorKind::OperationError {
-                cause: "timed out".into(),
+                cause: "contract banned".into(),
             },
         };
         let response = err.into_response();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(
-            response
-                .headers()
-                .get(axum::http::header::CACHE_CONTROL)
-                .is_some(),
-        );
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        // And it must NOT carry the retry-page caching headers.
         assert!(
             response
                 .headers()
                 .get(axum::http::header::RETRY_AFTER)
-                .is_some(),
-        );
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let text = String::from_utf8_lossy(&body);
-        assert!(
-            text.contains(r#"<meta http-equiv="refresh" content="60"#),
-            "retry page must contain meta-refresh tag"
+                .is_none(),
         );
     }
 

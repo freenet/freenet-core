@@ -19,7 +19,9 @@ use std::{
 use axum::response::{Html, IntoResponse};
 use dashmap::DashMap;
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse},
+    client_api::{
+        ClientRequest, ContractRequest, ContractResponse, ErrorKind, HostResponse, RequestError,
+    },
     prelude::*,
 };
 use tokio::time::Instant;
@@ -497,15 +499,18 @@ async fn handle_get_response(
     recv_result: Result<Option<HostCallbackResult>, tokio::time::error::Elapsed>,
 ) -> Result<(), WebSocketApiError> {
     match recv_result {
+        // Transient: the 30s fetch wrapper elapsed before the node answered.
+        // Use RequestError(Timeout) (not the dual-use OperationError) so the
+        // HTTP layer can serve the retry page without also catching terminal
+        // node-returned OperationErrors (e.g. banned contracts) — see #3472
+        // and the `is_transient` matcher in errors.rs.
         Err(_) => Err(WebSocketApiError::AxumError {
-            error: ErrorKind::OperationError {
-                cause: "GET request timed out after 30s".into(),
-            },
+            error: ErrorKind::RequestError(RequestError::Timeout),
         }),
+        // Transient: the response channel closed (node restarting / shutting
+        // down). ChannelClosed is unambiguously transient, unlike OperationError.
         Ok(None) => Err(WebSocketApiError::AxumError {
-            error: ErrorKind::OperationError {
-                cause: "GET response channel closed (node may be shutting down)".into(),
-            },
+            error: ErrorKind::ChannelClosed,
         }),
         Ok(Some(HostCallbackResult::Result {
             result:
@@ -3199,11 +3204,13 @@ mod tests {
     }
 
     /// Companion to the above: a `tokio::time::error::Elapsed` (30s fetch
-    /// timeout) surfaces as an `AxumError(OperationError)`, not a panic or
-    /// hang.  `WebSocketApiError::into_response` maps this to a 503 with
-    /// `<meta http-equiv="refresh">` — see #3472.
+    /// timeout) surfaces as an `AxumError(RequestError(Timeout))`, not a panic
+    /// or hang.  `WebSocketApiError::into_response` maps this to a 503 with
+    /// `<meta http-equiv="refresh">` — see #3472.  We use RequestError(Timeout)
+    /// rather than the dual-use OperationError so terminal node OperationErrors
+    /// (e.g. banned contracts) are NOT swept into the retry page.
     #[tokio::test]
-    async fn handle_get_response_maps_timeout_to_operation_error() {
+    async fn handle_get_response_maps_timeout_to_request_timeout() {
         let mut bytes = [0u8; 32];
         bytes[0] = 0x3a;
         bytes[1] = 0x43;
@@ -3223,10 +3230,34 @@ mod tests {
             matches!(
                 result,
                 Err(WebSocketApiError::AxumError {
-                    error: ErrorKind::OperationError { .. }
+                    error: ErrorKind::RequestError(RequestError::Timeout)
                 })
             ),
-            "30s timeout must map to OperationError (for retry page), got: {result:?}"
+            "30s timeout must map to RequestError(Timeout) (for retry page), got: {result:?}"
+        );
+    }
+
+    /// A closed response channel (`Ok(None)`, node shutting down) surfaces as
+    /// `AxumError(ChannelClosed)` — an unambiguously transient kind that maps
+    /// to the 503 retry page (#3472).
+    #[tokio::test]
+    async fn handle_get_response_maps_channel_closed_to_channel_closed() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x43;
+        let instance_id = ContractInstanceId::new(bytes);
+
+        let recv_result: Result<Option<HostCallbackResult>, tokio::time::error::Elapsed> = Ok(None);
+
+        let result = handle_get_response(instance_id, recv_result).await;
+        assert!(
+            matches!(
+                result,
+                Err(WebSocketApiError::AxumError {
+                    error: ErrorKind::ChannelClosed
+                })
+            ),
+            "closed channel must map to ChannelClosed (for retry page), got: {result:?}"
         );
     }
 
