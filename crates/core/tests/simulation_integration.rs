@@ -230,6 +230,20 @@ impl TestConfig {
         self
     }
 
+    /// Opt out of asserting convergence.
+    ///
+    /// For `run_direct()` tests this ALSO tells the runner to skip its
+    /// up-to-1800s post-event convergence-polling tail and do only a brief
+    /// settle instead. Use this for tests that analyze events produced during
+    /// the event phase and never assert final-state convergence — running the
+    /// advisory polling tail (which only warns, never fails) when the network
+    /// happens not to converge just burns wall-clock and risks a CI timeout.
+    /// See #3792.
+    fn no_convergence_wait(mut self) -> Self {
+        self.require_convergence = false;
+        self
+    }
+
     /// Add latency jitter simulation.
     #[allow(dead_code)]
     fn with_latency(mut self, min: Duration, max: Duration) -> Self {
@@ -345,6 +359,12 @@ impl TestConfig {
         let rt = create_runtime();
 
         let use_mock_wasm = self.use_mock_wasm;
+        // Tests that never assert convergence (require_convergence = false) skip the
+        // direct runner's up-to-1800s convergence-polling tail and do a brief settle
+        // instead. The tail is advisory (it only warns on failure), so skipping it
+        // changes no assertion but keeps wall-clock bounded when the network does not
+        // converge — the failure mode that timed out test_interest_renewal in CI (#3792).
+        let skip_convergence_wait = !self.require_convergence;
         let (sim, logs_handle) = rt.block_on(async {
             let mut sim = SimNetwork::new(
                 self.name,
@@ -358,6 +378,7 @@ impl TestConfig {
             )
             .await;
             sim.use_mock_wasm = use_mock_wasm;
+            sim.skip_convergence_wait = skip_convergence_wait;
 
             // Apply fault injection if configured (latency and/or message loss)
             let has_latency = self.latency_range.is_some();
@@ -2366,7 +2387,7 @@ fn test_subscribe_forwarding_ack_relay() {
 ///
 /// Note on turmoil vs production: in the turmoil simulation runner every
 /// peer shares one process, which means `pending_op_results` is effectively
-/// global. `node::try_forward_task_per_tx_reply` on an intermediate peer
+/// global. `node::try_forward_driver_reply` on an intermediate peer
 /// can therefore find the originator's task entry and short-circuit the
 /// Response before it reaches the legacy relay handler. In production each
 /// peer is an independent process with its own `pending_op_results`, so
@@ -3107,6 +3128,264 @@ fn test_pr2763_crdt_convergence_with_resync() {
     );
 
     // Clean up
+}
+
+/// Regression test for the #4233 full-state broadcast storm (issue #4145).
+///
+/// ## What this guards
+///
+/// Sustained UPDATE fan-out from one host to its direct subscribers of a CRDT
+/// contract. After each subscriber bootstraps on a single full state, every
+/// subsequent broadcast to that subscriber must be a small delta — not another
+/// full state. The #4145 fix caches the target peer's summary on ANY delivered
+/// broadcast (delta OR full state), not just deltas, so the host can compute a
+/// delta for the next broadcast instead of re-sending full state forever.
+///
+/// ## Scenario
+///
+/// 1 gateway (the contract host / broadcast source) + a small number of direct
+/// subscriber nodes. The gateway PUTs+subscribes, every node subscribes, then
+/// the gateway drives a burst of sequential UPDATEs that fan out to all
+/// subscribers.
+///
+/// ## Why a *small* star topology (1 gateway + 2 direct subscribers)
+///
+/// The chicken-and-egg the fix targets is per-(sender, target): a sender that
+/// lacks a target's cached summary must send full state. A LARGER topology
+/// (e.g. 5+ subscribers forming a multi-hop relay tree) does NOT make this test
+/// more sensitive — it makes it LESS sensitive. Relay nodes cache a downstream
+/// peer's *full state* as its "summary", and `compute_delta` then rejects the
+/// diff as "not efficient" (`is_delta_efficient`), emitting full state
+/// regardless of the #4145 gate. Those relay-tree full-states swamp the signal:
+/// at 5 subscribers, fix vs reverted is ~199 vs ~201 full-state sends — noise.
+///
+/// A clean star (the host broadcasts directly to its subscribers, no relay tree)
+/// removes that floor, so the metric isolates exactly the bug the fix addresses:
+/// with the fix `full_state_sends` collapses below `delta_sends` (the host caches
+/// each subscriber's summary after a delivered broadcast and switches to deltas)
+/// while `delta_sends` grows with the update count; reverted, `full_state_sends`
+/// scales with updates × subscribers and overtakes `delta_sends`. The unit tests
+/// in `broadcast_queue.rs` pin the gate logic directly; this sim pins the
+/// system-level consequence on the path simulation builds actually exercise
+/// (the `#[cfg(simulation_tests)]` inline broadcast loop in `p2p_protoc.rs`).
+///
+/// ## Assertions (the delta-dominance one FAILS if the #4145 gate is reverted)
+///
+/// - (a) Event-loop liveness: no `StalePeer` anomaly — every subscriber keeps
+///   receiving broadcasts; none goes silent under the fan-out.
+/// - (b) Full-state-send rate collapses: `delta_sends > full_state_sends`. With
+///   the fix the host caches each subscriber's summary after a delivered
+///   broadcast, so subsequent updates go out as deltas and deltas dominate.
+///   (Full-state sends are reduced below delta sends but NOT to one-per-
+///   subscriber — bootstrap + retry jitter mean several full states per
+///   subscriber.) Reverted, every update is full state to every subscriber and
+///   `delta_sends` stays low → this assertion fails. (Measured on this star
+///   topology: fix = 78 delta / 47 full; reverted = 40 delta / 85 full.)
+/// - (c) Broadcast delivery / update propagation stays high: all peers converge.
+#[test_log::test]
+fn test_sustained_update_fanout_no_full_state_storm() {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    const SEED: u64 = 0x4233_5701_0001;
+    const NETWORK_NAME: &str = "i4233-fanout-storm";
+    // Direct subscribers of the gateway (the broadcast fan-out width). Kept small
+    // so the host broadcasts directly to subscribers with no multi-hop relay tree
+    // — see the "Why a small star topology" note above.
+    const SUBSCRIBERS: usize = 2;
+    // UPDATEs driven into the hot contract AFTER all subscribers have bootstrapped.
+    // Enough that, reverted, the per-update full-state fan-out clearly overtakes
+    // the one-time bootstrap deltas.
+    const SUSTAINED_UPDATES: usize = 20;
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+    let rt = create_runtime();
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            NETWORK_NAME,
+            1,           // 1 gateway (the broadcast source / contract host)
+            SUBSCRIBERS, // subscriber nodes (the fan-out targets)
+            7,           // max_htl
+            3,           // rnd_if_htl_above
+            10,          // max_connections
+            2,           // min_connections
+            SEED,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // CRDT contract so post-bootstrap broadcasts compute real version-aware
+    // deltas (a plain hash contract's "delta" is full state, which would not
+    // exercise the delta transition this test is about).
+    let contract = SimOperation::create_test_contract(0x42);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let initial_state = SimOperation::create_crdt_state(1, 0x10);
+
+    let mut operations = Vec::new();
+
+    // Bootstrap: gateway PUTs + subscribes (becomes the host/source), then every
+    // node subscribes. Each subscriber's FIRST broadcast is full state — that is
+    // the one bootstrap full-state per subscriber the fix permits.
+    operations.push(ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: initial_state,
+            subscribe: true,
+        },
+    ));
+    for node_idx in 1..=SUBSCRIBERS {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, node_idx),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+
+    // Sustained UPDATE fan-out: a burst of UPDATEs from the gateway, each fanned
+    // out to all subscribers. With the fix every subscriber already has a cached
+    // summary after its bootstrap full state, so these all go out as deltas.
+    // Without the fix every one of these is another full state to every
+    // subscriber — the storm.
+    for v in 0..SUSTAINED_UPDATES {
+        let version = (v as u64) + 2; // versions 2.. (v1 was the PUT)
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(version, 0x20 + v as u8),
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(240), // simulation duration (virtual)
+        Duration::from_secs(90),  // post-op propagation wait (virtual)
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let convergence =
+        rt.block_on(async { freenet::dev_tool::check_convergence_from_logs(&logs_handle).await });
+    let delta_sends = GlobalTestMetrics::delta_sends();
+    let full_state_sends = GlobalTestMetrics::full_state_sends();
+    let resync_count = GlobalTestMetrics::resync_requests();
+    // Event-loop backlog proxy: the high-water mark of in-flight transactions
+    // awaiting a reply (`pending_op_results` map size). A full-state storm that
+    // pins the event loop lets replies pile up, pushing this mark up; a healthy
+    // run keeps it low. See `GlobalTestMetrics::pending_op_high_water_mark`.
+    let pending_op_hwm = GlobalTestMetrics::pending_op_high_water_mark();
+
+    // Anomaly report for liveness (StalePeer = a subscriber that stopped
+    // receiving broadcasts while others kept getting them).
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    });
+    let stale = report.stale_peers();
+
+    tracing::info!(
+        "i4233 fanout: delta_sends={}, full_state_sends={}, resyncs={}, pending_op_hwm={}, converged={}/{}, stale_peers={}",
+        delta_sends,
+        full_state_sends,
+        resync_count,
+        pending_op_hwm,
+        convergence.converged.len(),
+        convergence.total_contracts(),
+        stale.len(),
+    );
+
+    // Sanity: the scenario must actually have broadcast something, otherwise the
+    // collapse assertion below would pass vacuously.
+    assert!(
+        delta_sends + full_state_sends > 0,
+        "no broadcasts were recorded — the fan-out scenario did not run"
+    );
+
+    // (a) LIVENESS: no subscriber goes silent under the fan-out. A full-state
+    // storm that pins the event loop strands a subscriber, which surfaces as a
+    // StalePeer anomaly.
+    assert!(
+        stale.is_empty(),
+        "#4233 liveness: {} subscriber(s) went stale under sustained UPDATE \
+         fan-out (event loop starved by the broadcast storm): {:?}",
+        stale.len(),
+        stale,
+    );
+
+    // (a2) EVENT-LOOP BACKLOG STAYS BOUNDED. StalePeer is a content-divergence
+    // proxy for liveness; this is a more direct event-loop-backlog signal. The
+    // high-water mark of `pending_op_results` (in-flight transactions awaiting a
+    // reply) tracks how far the event loop falls behind: if the loop is pinned by
+    // a broadcast storm, replies pile up and the mark climbs. Measured steady
+    // state on this star is ~15 (identical on both the fixed and reverted gate —
+    // in this small deterministic harness the storm shows up as full-state-send
+    // volume, not as op-result backlog, so this bound is a SATURATION guard, not
+    // the fix-vs-revert discriminator; assertion (b) is that discriminator). The
+    // bound is set well above steady state but far below a level that would
+    // indicate the loop is wedged and replies are accumulating unboundedly.
+    const PENDING_OP_BACKLOG_BOUND: u64 = 200;
+    assert!(
+        pending_op_hwm < PENDING_OP_BACKLOG_BOUND,
+        "#4233 liveness: event-loop backlog high-water mark {pending_op_hwm} \
+         reached {PENDING_OP_BACKLOG_BOUND}+ in-flight op-results under sustained \
+         UPDATE fan-out — the event loop is falling behind (replies piling up), \
+         a sign the broadcast path is pinning the loop."
+    );
+
+    // (b) FULL-STATE-SEND RATE COLLAPSES — the load-bearing #4145 discriminator.
+    //
+    // With the fix the host caches a subscriber's summary after a delivered
+    // broadcast, so subsequent updates go out as deltas. Full-state sends collapse
+    // BELOW delta sends (not to one-per-subscriber — bootstrap plus retry jitter
+    // produce several full states per subscriber), so over SUSTAINED_UPDATES
+    // updates the delta sends dominate: delta_sends > full_state_sends.
+    //
+    // Reverted to `if sent_delta`, the host never caches a subscriber's summary,
+    // so EVERY update is full state to EVERY subscriber and delta_sends stays
+    // low — full_state_sends overtakes delta_sends and THIS assertion fails.
+    // (Measured on this star topology: fix = 78 delta / 47 full; reverted = 40
+    // delta / 85 full.)
+    //
+    // We assert the *direction* (deltas dominate) rather than an absolute
+    // full-state budget: a fixed numeric cap is brittle against topology/retry
+    // jitter, whereas the delta-vs-full crossover flips cleanly between the fixed
+    // and reverted gate.
+    assert!(
+        delta_sends > full_state_sends,
+        "#4145 REGRESSION: deltas must dominate after bootstrap, but \
+         delta_sends={delta_sends} <= full_state_sends={full_state_sends}. \
+         A reverted summary-cache gate traps every subscriber on full state \
+         (the #4233 storm): every update re-sends full state to every subscriber \
+         instead of a delta."
+    );
+
+    // (c) DELIVERY / PROPAGATION stays high: all peers converge to one state.
+    assert!(
+        convergence.is_converged(),
+        "#4233: broadcast delivery degraded — peers failed to converge under \
+         sustained fan-out. {} converged, {} diverged",
+        convergence.converged.len(),
+        convergence.diverged.len(),
+    );
+
+    tracing::info!(
+        "test_sustained_update_fanout_no_full_state_storm PASSED: \
+         delta_sends={} > full_state_sends={}, converged, no stale peers",
+        delta_sends,
+        full_state_sends,
+    );
 }
 
 // =============================================================================
@@ -6009,6 +6288,13 @@ fn test_router_learning() {
 /// Uses `run_direct()` (paused-time single-thread runtime) for efficiency.
 /// Virtual time is controlled by iterations * event_wait, not `with_duration()`.
 ///
+/// `no_convergence_wait()`: this test asserts only on broadcast-received events
+/// produced during the 1200s event phase, never on final-state convergence, so
+/// it skips the direct runner's advisory up-to-1800s convergence-polling tail.
+/// When the network happens not to converge, that tail would add 1800s of virtual
+/// time (processed in ~1ms quanta) on top of the event phase for no benefit — the
+/// exact failure mode that made this test consistently time out in CI (#3792).
+///
 /// Catches #3093 (interest TTL not refreshed on broadcast send).
 #[test_log::test]
 fn test_interest_renewal() {
@@ -6020,6 +6306,7 @@ fn test_interest_renewal() {
         .with_nodes(4)
         .with_iterations(400)
         .with_event_wait(Duration::from_secs(3))
+        .no_convergence_wait()
         .run_direct()
         .assert_ok();
 
@@ -6342,9 +6629,11 @@ async fn test_thundering_herd_connect_storm() {
     );
     // Note: The gateway rate limiter (GatewayConnectionRateLimiter) intentionally
     // throttles the thundering herd to 5 connections/sec initially, ramping up over
-    // 2 minutes. In simulation, RealTime-based rate limiting means fewer connections
-    // complete than the 20 peers attempting to reconnect. This is the desired behavior
-    // — the storm is prevented, not just survived.
+    // 2 minutes. Its admission ramp advances on the simulation clock
+    // (max(real_elapsed, virtual_elapsed); see GatewayConnectionRateLimiter), so the
+    // throttle still applies as virtual time advances but fewer connections complete
+    // per window than the 20 peers attempting to reconnect. This is the desired
+    // behavior: the storm is prevented, not just survived.
 
     // 6b: Verify network recovered (the actual regression check for #3207/#3208)
     sim.check_partial_connectivity(Duration::from_secs(20), 0.8)
@@ -7425,15 +7714,22 @@ fn test_get_routing_coverage_low_htl() {
     use std::sync::atomic::Ordering;
 
     use freenet::dev_tool::{
-        GET_RELAY_DRIVER_CALL_COUNT, NodeLabel, RELAY_GET_ROUTE_EVENT_COUNT,
-        RELAY_PUT_DRIVER_CALL_COUNT, RELAY_PUT_ROUTE_EVENT_COUNT,
-        RELAY_SUBSCRIBE_DRIVER_CALL_COUNT, RELAY_SUBSCRIBE_ROUTE_EVENT_COUNT, ScheduledOperation,
-        SimOperation, register_crdt_contract,
+        GET_RELAY_DRIVER_CALL_COUNT, NodeLabel, RELAY_PUT_DRIVER_CALL_COUNT,
+        RELAY_SUBSCRIBE_DRIVER_CALL_COUNT, ScheduledOperation, SimOperation,
+        register_crdt_contract,
     };
 
-    // Seed updated: per-peer acceptor reliability scoring replaces binary
-    // exclusion (PR #3659), changing the CONNECT routing code path and
-    // Turmoil scheduling. Previous seed: 0xC0DE_B0CA_0032 (PR #3621).
+    // NOTE: the relay-hop *route-event* assertions (RELAY_*_ROUTE_EVENT_COUNT)
+    // that used to live here were moved to `test_relay_route_events_multihop`.
+    // They require a SPARSE topology where a GET/PUT actually forwards a
+    // downstream response, but this test deliberately keeps the mesh well
+    // connected (max_connections=7) so the GET-coverage assertion (#3431)
+    // holds. Once the #4348 convergence fix let nodes reliably reach
+    // min_connections, a 15-node/max=7 net converged dense enough that ops
+    // resolved in 0-1 hops and the route-event counters stayed at 0 — a
+    // topology-coupling that the dedicated sparse test now owns. This test
+    // keeps the relay *driver-call* assertions (which fire even when a relay
+    // resolves locally) plus the coverage assertion.
     const SEED: u64 = 0xC0DE_B0CA_0032;
     const NETWORK_NAME: &str = "get-routing-coverage";
 
@@ -7449,19 +7745,6 @@ fn test_get_routing_coverage_low_htl() {
     let relay_baseline = GET_RELAY_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
     let relay_put_baseline = RELAY_PUT_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
     let relay_subscribe_baseline = RELAY_SUBSCRIBE_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
-
-    // Baselines for the relay-hop routing-event counters. Each fires when
-    // a relay forwards a downstream peer's response and feeds the result
-    // into the local Router via record_relay_route_event. Without these
-    // hooks the per-peer dashboard panels stay empty and the failure-
-    // probability model is trained only on originator-side events.
-    // The same workload that exercises the relay drivers above must
-    // also exercise these counters — drivers running without route-event
-    // emission would silently regress router quality.
-    let relay_get_route_event_baseline = RELAY_GET_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
-    let relay_put_route_event_baseline = RELAY_PUT_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
-    let relay_subscribe_route_event_baseline =
-        RELAY_SUBSCRIBE_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
 
     let rt = create_runtime();
 
@@ -7619,49 +7902,14 @@ fn test_get_routing_coverage_low_htl() {
          Baseline: {relay_subscribe_baseline}, after: {relay_subscribe_after}."
     );
 
-    // Relay-hop routing-event counters: every relay that forwards a
-    // downstream response should feed the local Router. Drivers running
-    // without route-event emission means the per-peer dashboard panels
-    // stay empty and the failure-probability model is undertrained on
-    // relay-heavy nodes (the bug this work fixes).
-    let relay_get_route_event_after = RELAY_GET_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
-    let relay_get_route_event_delta =
-        relay_get_route_event_after.saturating_sub(relay_get_route_event_baseline);
-    assert!(
-        relay_get_route_event_delta > 0,
-        "RELAY_GET_ROUTE_EVENT_COUNT did not advance — at least one \
-         relay-forwarded GET should have produced a routing event for \
-         the local Router. {num_nodes}-node / HTL=3 workload with 15 \
-         GETs must traverse at least one relay hop. \
-         Baseline: {relay_get_route_event_baseline}, after: {relay_get_route_event_after}."
-    );
-
-    let relay_put_route_event_after = RELAY_PUT_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
-    let relay_put_route_event_delta =
-        relay_put_route_event_after.saturating_sub(relay_put_route_event_baseline);
-    assert!(
-        relay_put_route_event_delta > 0,
-        "RELAY_PUT_ROUTE_EVENT_COUNT did not advance — the gateway PUT \
-         at HTL=3 should have produced a routing event at every relay \
-         hop. \
-         Baseline: {relay_put_route_event_baseline}, after: {relay_put_route_event_after}."
-    );
-
-    // SUBSCRIBE route-event coverage is intentionally NOT asserted in
-    // this test. With the gateway PUT seeded at HTL=3 and 12 nodes
-    // subscribing, every subscribe in this workload hits the local-hit
-    // fast path at `subscribe/op_ctx_task.rs::drive_relay_subscribe`
-    // step 1 — the first relay always has the contract cached and
-    // replies `Subscribed` without forwarding downstream. That's a
-    // correct zero for the route-event counter, since the route-event
-    // hook only fires on actual forwards. A dedicated SUBSCRIBE forward
-    // test (subscriber + sparse cache topology) belongs as a follow-up.
-    // The relay SUBSCRIBE driver itself is still exercised — see the
-    // RELAY_SUBSCRIBE_DRIVER_CALL_COUNT assertion above.
-    let _ = (
-        RELAY_SUBSCRIBE_ROUTE_EVENT_COUNT.load(Ordering::SeqCst),
-        relay_subscribe_route_event_baseline,
-    );
+    // Relay-hop *route-event* coverage (RELAY_*_ROUTE_EVENT_COUNT) is asserted
+    // separately in `test_relay_route_events_multihop`. Those counters only
+    // fire when a relay forwards a downstream response, which needs a sparse
+    // topology where an op actually traverses >=2 hops. This test keeps the
+    // mesh dense (max_connections=7) so the GET-coverage assertion above holds;
+    // post-#4348 that density makes ops resolve in 0-1 hops, so route events do
+    // not fire here (#4348). The relay *drivers* are still exercised — see the
+    // RELAY_*_DRIVER_CALL_COUNT assertions above.
 
     // StateVerifier anomaly check
     let rt = create_runtime();
@@ -7675,6 +7923,126 @@ fn test_get_routing_coverage_low_htl() {
          relay_driver_calls={relay_delta}",
         report.anomalies.len(),
         report.total_events,
+    );
+}
+
+/// Relay-hop route-event telemetry (#1454): a relay that forwards a downstream
+/// GET/PUT response must feed the result into the local Router via
+/// `record_relay_route_event`, or the per-peer dashboard panels stay empty and
+/// the failure-probability model is undertrained on relay-heavy nodes.
+///
+/// These assertions previously lived in `test_get_routing_coverage_low_htl`,
+/// but that test must keep a DENSE mesh so every node's GET resolves
+/// (its #3431 coverage assertion). The #4348 connection-convergence fix made
+/// that mesh converge dense enough that ops resolved in 0-1 hops, so
+/// `RELAY_*_ROUTE_EVENT_COUNT` never advanced — the test was implicitly relying
+/// on the under-connectivity bug #4348 fixed. This dedicated test instead uses a
+/// deliberately SPARSE topology where multi-hop forwarding is structural, and
+/// asserts ONLY that the route-event hooks fire. It makes NO GET-coverage claim
+/// (a NotFound reply still exercises the relay route-event hook), so improved
+/// connectivity can never invalidate it.
+///
+/// SUBSCRIBE route events are intentionally not asserted (subscribes hit the
+/// relay local-cache fast path without forwarding downstream — see the note in
+/// `test_get_routing_coverage_low_htl`); the relay SUBSCRIBE *driver* is still
+/// covered there.
+#[test_log::test]
+fn test_relay_route_events_multihop() {
+    use std::sync::atomic::Ordering;
+
+    use freenet::dev_tool::{
+        NodeLabel, RELAY_GET_ROUTE_EVENT_COUNT, RELAY_PUT_ROUTE_EVENT_COUNT, ScheduledOperation,
+        SimOperation, register_crdt_contract,
+    };
+
+    const SEED: u64 = 0xC0DE_B0CA_0040;
+    const NETWORK_NAME: &str = "relay-route-events";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+
+    let get_route_baseline = RELAY_GET_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
+    let put_route_baseline = RELAY_PUT_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
+
+    let rt = create_runtime();
+    let num_nodes = 15;
+
+    let sim = rt.block_on(async {
+        SimNetwork::new(
+            NETWORK_NAME,
+            1,         // gateways
+            num_nodes, // nodes
+            3,         // ring_max_htl
+            1,         // rnd_if_htl_above
+            // max_connections — deliberately LOW. A sparse mesh keeps requesters
+            // >=2 hops from the few holders, so GET/PUT requests forward through a
+            // non-holding relay and fire the route-event hooks. We assert only
+            // that the hooks fire, NOT that every GET resolves, so sparsity (which
+            // would fail a coverage assertion) is exactly what we want here.
+            4, // max_connections
+            3, // min_connections
+            SEED,
+        )
+        .await
+    });
+
+    let contract = SimOperation::create_test_contract(0xC0);
+    let contract_id = *contract.key().id();
+    register_crdt_contract(contract_id);
+
+    // Gateway seeds the contract; only a few nodes subscribe so the cache stays
+    // sparse and most requesters are several hops from a holder.
+    let mut operations = vec![ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_crdt_state(1, 0xC0),
+            subscribe: true,
+        },
+    )];
+    for i in 1..=4 {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, i),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+    for i in 1..=num_nodes {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(NETWORK_NAME, i),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(300),
+        Duration::from_secs(90),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "Simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let get_route_after = RELAY_GET_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
+    let put_route_after = RELAY_PUT_ROUTE_EVENT_COUNT.load(Ordering::SeqCst);
+    assert!(
+        get_route_after > get_route_baseline,
+        "RELAY_GET_ROUTE_EVENT_COUNT did not advance — in a sparse {num_nodes}-node \
+         mesh (max_connections=4) at least one GET must forward through a relay that \
+         feeds a route event to the local Router (a NotFound reply counts too). \
+         Baseline: {get_route_baseline}, after: {get_route_after}."
+    );
+    assert!(
+        put_route_after > put_route_baseline,
+        "RELAY_PUT_ROUTE_EVENT_COUNT did not advance — the gateway PUT at HTL=3 in a \
+         sparse {num_nodes}-node mesh must forward through at least one relay. \
+         Baseline: {put_route_baseline}, after: {put_route_after}."
     );
 }
 
@@ -7692,17 +8060,29 @@ fn test_get_routing_coverage_low_htl() {
 ///
 /// Exercises: `get.rs` alternative retry (line ~1521) and k_closest re-query (line ~1569)
 ///
-/// Ignored: freenet-stdlib 0.2.2 adds the StreamChunk variant to ClientRequest,
-/// changing bincode serialization sizes and altering RNG-dependent topology formation.
-/// The test's fixed seed produces a different topology under 0.2.2 where node-10 cannot
-/// reach caching nodes. The GET retry logic itself is unchanged and covered by
-/// test_get_routing_coverage_low_htl. See PR #3488.
-#[ignore]
+/// Seed history: this test was `#[ignore]`d in PR #3488 because the original
+/// seed (`0xBEEF_CAFE_0001`) stopped producing a sparse-but-reachable topology
+/// after a freenet-stdlib bump shifted RNG-dependent topology formation (the
+/// stdlib's enum layout changes bincode serialization sizes, which perturbs the
+/// seeded RNG stream). #3506 re-seeded it for the current stdlib: with
+/// `SEED = 0x3506_000B_0001` the gateway PUT at HTL=2 caches the contract at
+/// exactly 2 of the 10 nodes (verified with a PUT-only run of this same
+/// topology), so 8 of the 10 GET requesters must use the retry-with-alternatives
+/// path to reach a cacher, and all 10 do, deterministically across repeated
+/// runs. Like every seed-coupled topology test, a future stdlib/topology change
+/// could perturb the RNG stream again and require another re-seed; that is
+/// expected maintenance rather than a regression in the GET retry logic itself
+/// (which is also covered by `test_get_routing_coverage_low_htl`).
 #[test_log::test]
 fn test_get_retry_with_alternatives_sparse_topology() {
     use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
 
-    const SEED: u64 = 0xBEEF_CAFE_0001;
+    // Seed reselected for the current freenet-stdlib layout (see #3506). Under
+    // this seed the gateway PUT at HTL=2 caches the contract at exactly 2 of the
+    // 10 nodes, and all 10 GET requesters reach one of those 2 cachers via the
+    // GET retry-with-alternatives path. Verified sparse + reachable + deterministic
+    // before un-ignoring; see the doc comment above for the full rationale.
+    const SEED: u64 = 0x3506_000B_0001;
     const NETWORK_NAME: &str = "get-retry-sparse";
 
     GlobalTestMetrics::reset();
@@ -8178,6 +8558,7 @@ fn test_get_reliability_diagnostic() {
     const NETWORK_NAME: &str = "get-reliability-diag";
     const NUM_NODES: usize = 100;
     const NUM_GATEWAYS: usize = 3;
+    const RING_MAX_HTL: usize = 10;
 
     GlobalTestMetrics::reset();
     setup_deterministic_state(SEED);
@@ -8189,10 +8570,10 @@ fn test_get_reliability_diagnostic() {
             NETWORK_NAME,
             NUM_GATEWAYS,
             NUM_NODES,
-            10, // ring_max_htl — realistic for 100-node network
-            7,  // rnd_if_htl_above
-            12, // max_connections
-            4,  // min_connections
+            RING_MAX_HTL, // realistic for 100-node network
+            7,            // rnd_if_htl_above
+            12,           // max_connections
+            4,            // min_connections
             SEED,
         )
         .await;
@@ -8243,47 +8624,43 @@ fn test_get_reliability_diagnostic() {
         result.turmoil_result.err()
     );
 
-    // Analyze GET outcomes from event logs
+    // Analyze GET outcomes from event logs, deduplicated per attempt
+    // transaction (#4361): raw event counting double-counts every failed
+    // attempt (relay-direct + loopback-Response registration) and counts
+    // multi-hop outcomes once per hop traversed.
     let rt = create_runtime();
-    let (successes, not_found, failures, timeouts, elapsed_ms_list) = rt.block_on(async {
+    let (summary, dispatched_nodes) = rt.block_on(async {
         let logs = logs_handle.lock().await;
-        let mut successes = 0u64;
-        let mut not_found = 0u64;
-        let mut failures = 0u64;
-        let mut timeouts = 0u64;
-        let mut elapsed_list = Vec::new();
+        let summary = freenet::tracing::summarize_get_outcomes_per_tx(&logs);
 
-        for log in logs.iter() {
-            match log.kind.get_outcome() {
-                Some(true) => {
-                    successes += 1;
-                    if let Some(ms) = log.kind.get_elapsed_ms() {
-                        elapsed_list.push(ms);
-                    }
-                }
-                Some(false) => {
-                    if let Some(ms) = log.kind.get_elapsed_ms() {
-                        if ms >= 55_000 {
-                            // Likely a timeout (close to OPERATION_TTL of 60s)
-                            timeouts += 1;
-                        } else {
-                            not_found += 1;
-                        }
-                    } else {
-                        failures += 1;
-                    }
-                }
-                None => {}
-            }
-        }
-        (successes, not_found, failures, timeouts, elapsed_list)
+        // Dispatched-vs-scheduled accounting (#4361): the client driver's
+        // loopback Request is registered at the originating node with
+        // htl == ring_max_htl; relay-received Requests have already been
+        // decremented. Unique originating peers therefore counts how many
+        // nodes actually dispatched a GET (sub-op GETs can inflate this
+        // slightly, which is why it feeds a floor assertion, not an
+        // exact-match one).
+        let dispatched_nodes: HashSet<_> = logs
+            .iter()
+            .filter(|log| log.kind.get_request_htl() == Some(RING_MAX_HTL))
+            .map(|log| log.peer_id.clone())
+            .collect();
+
+        (summary, dispatched_nodes.len())
     });
 
-    let total_outcomes = successes + not_found + failures + timeouts;
+    let (successes, not_found, failures, timeouts) = (
+        summary.successes,
+        summary.not_found,
+        summary.failures,
+        summary.timeouts,
+    );
+    let network_successes = summary.network_successes;
+    let total_outcomes = summary.total();
 
     // Compute latency percentiles for successful GETs
-    let mut sorted_latencies = elapsed_ms_list.clone();
-    sorted_latencies.sort();
+    // (success_elapsed_ms is pre-sorted ascending).
+    let sorted_latencies = &summary.success_elapsed_ms;
 
     let p50 = sorted_latencies
         .get(sorted_latencies.len() / 2)
@@ -8364,9 +8741,11 @@ fn test_get_reliability_diagnostic() {
         NUM_GATEWAYS + NUM_NODES
     );
     tracing::info!(
-        "GET outcomes: {} total — {} success, {} not_found, {} failures, {} timeouts",
+        "GET outcomes (per attempt tx): {} total — {} success ({} network-traversed), \
+         {} not_found, {} failures, {} timeouts",
         total_outcomes,
         successes,
+        network_successes,
         not_found,
         failures,
         timeouts
@@ -8376,6 +8755,11 @@ fn test_get_reliability_diagnostic() {
         success_rate * 100.0,
         successes,
         total_outcomes
+    );
+    tracing::info!(
+        "GET dispatch: {}/{} nodes dispatched at least one GET attempt",
+        dispatched_nodes,
+        NUM_NODES
     );
     tracing::info!(
         "Latency (successful GETs): p50={}ms, p90={}ms, p99={}ms, max={}ms",
@@ -8435,7 +8819,7 @@ fn test_get_reliability_diagnostic() {
     // Soft assertion — this is diagnostic, but catastrophic failure should still fail the test
     assert!(
         total_outcomes >= 10,
-        "Only {} GET outcome events — too few for meaningful analysis",
+        "Only {} GET outcome transactions — too few for meaningful analysis",
         total_outcomes
     );
     assert!(
@@ -8449,6 +8833,33 @@ fn test_get_reliability_diagnostic() {
         failures,
         timeouts,
         total_outcomes
+    );
+    // Dispatch accounting (#4361): scheduled GETs that never dispatch an
+    // operation silently shrink the denominator, so the success rate can
+    // look healthy while most of the test never ran. Currently 42/100
+    // dispatch: the rest are rejected with an explicit PeerNotJoined
+    // (the node had no completed transport handshake when its signal
+    // arrived — a footprint of the bootstrap acceptance collapse, #4362)
+    // and the harness does not retry. Catastrophic floor only — raise it
+    // when #4362 is fixed.
+    assert!(
+        dispatched_nodes >= NUM_NODES / 3,
+        "Only {}/{} scheduled GETs dispatched an operation — the test \
+         exercised only a fraction of its workload (#4361)",
+        dispatched_nodes,
+        NUM_NODES
+    );
+    // Network-traversal floor (#4361): before this assertion existed, every
+    // "success" in the failing runs was a local cache hit (hop_count == 0)
+    // on a node that already held the contract — multi-hop GET was never
+    // exercised at all. Require that a meaningful number of successes
+    // actually traversed the network.
+    assert!(
+        network_successes >= 5,
+        "Only {} of {} successful GETs traversed the network (hop_count >= 1) \
+         — the success metric is measuring local availability, not routing (#4361)",
+        network_successes,
+        successes
     );
 
     // StateVerifier anomaly check
@@ -8564,45 +8975,22 @@ fn test_get_reliability_with_latency() {
         result.turmoil_result.err()
     );
 
-    // Analyze GET outcomes
+    // Analyze GET outcomes, deduplicated per attempt transaction (#4361).
     let rt = create_runtime();
-    let (successes, not_found, failures, timeouts, elapsed_ms_list) = rt.block_on(async {
+    let summary = rt.block_on(async {
         let logs = logs_handle.lock().await;
-        let mut successes = 0u64;
-        let mut not_found = 0u64;
-        let mut failures = 0u64;
-        let mut timeouts = 0u64;
-        let mut elapsed_list = Vec::new();
-
-        for log in logs.iter() {
-            match log.kind.get_outcome() {
-                Some(true) => {
-                    successes += 1;
-                    if let Some(ms) = log.kind.get_elapsed_ms() {
-                        elapsed_list.push(ms);
-                    }
-                }
-                Some(false) => {
-                    if let Some(ms) = log.kind.get_elapsed_ms() {
-                        if ms >= 55_000 {
-                            timeouts += 1;
-                        } else {
-                            not_found += 1;
-                        }
-                    } else {
-                        failures += 1;
-                    }
-                }
-                None => {}
-            }
-        }
-        (successes, not_found, failures, timeouts, elapsed_list)
+        freenet::tracing::summarize_get_outcomes_per_tx(&logs)
     });
+    let (successes, not_found, failures, timeouts) = (
+        summary.successes,
+        summary.not_found,
+        summary.failures,
+        summary.timeouts,
+    );
+    let total_outcomes = summary.total();
 
-    let total_outcomes = successes + not_found + failures + timeouts;
-
-    let mut sorted_latencies = elapsed_ms_list.clone();
-    sorted_latencies.sort();
+    // success_elapsed_ms is pre-sorted ascending.
+    let sorted_latencies = &summary.success_elapsed_ms;
 
     let p50 = sorted_latencies
         .get(sorted_latencies.len() / 2)
@@ -8631,9 +9019,11 @@ fn test_get_reliability_with_latency() {
         NUM_NODES
     );
     tracing::info!(
-        "GET outcomes: {} total — {} success, {} not_found, {} failures, {} timeouts",
+        "GET outcomes (per attempt tx): {} total — {} success ({} network-traversed), \
+         {} not_found, {} failures, {} timeouts",
         total_outcomes,
         successes,
+        summary.network_successes,
         not_found,
         failures,
         timeouts
@@ -8802,45 +9192,23 @@ fn test_get_reliability_with_churn() {
         tracing::warn!("Direct simulation completed with error (may be expected under churn): {e}");
     }
 
-    // Analyze GET outcomes from event logs
+    // Analyze GET outcomes from event logs, deduplicated per attempt
+    // transaction (#4361).
     let rt = create_runtime();
-    let (successes, not_found, failures, timeouts, elapsed_ms_list) = rt.block_on(async {
+    let summary = rt.block_on(async {
         let logs = logs_handle.lock().await;
-        let mut successes = 0u64;
-        let mut not_found = 0u64;
-        let mut failures = 0u64;
-        let mut timeouts = 0u64;
-        let mut elapsed_list = Vec::new();
-
-        for log in logs.iter() {
-            match log.kind.get_outcome() {
-                Some(true) => {
-                    successes += 1;
-                    if let Some(ms) = log.kind.get_elapsed_ms() {
-                        elapsed_list.push(ms);
-                    }
-                }
-                Some(false) => {
-                    if let Some(ms) = log.kind.get_elapsed_ms() {
-                        if ms >= 55_000 {
-                            timeouts += 1;
-                        } else {
-                            not_found += 1;
-                        }
-                    } else {
-                        failures += 1;
-                    }
-                }
-                None => {}
-            }
-        }
-        (successes, not_found, failures, timeouts, elapsed_list)
+        freenet::tracing::summarize_get_outcomes_per_tx(&logs)
     });
+    let (successes, not_found, failures, timeouts) = (
+        summary.successes,
+        summary.not_found,
+        summary.failures,
+        summary.timeouts,
+    );
+    let total_outcomes = summary.total();
 
-    let total_outcomes = successes + not_found + failures + timeouts;
-
-    let mut sorted_latencies = elapsed_ms_list.clone();
-    sorted_latencies.sort();
+    // success_elapsed_ms is pre-sorted ascending.
+    let sorted_latencies = &summary.success_elapsed_ms;
 
     let p50 = sorted_latencies
         .get(sorted_latencies.len() / 2)
@@ -8869,9 +9237,11 @@ fn test_get_reliability_with_churn() {
         NUM_NODES
     );
     tracing::info!(
-        "GET outcomes: {} total — {} success, {} not_found, {} failures, {} timeouts",
+        "GET outcomes (per attempt tx): {} total — {} success ({} network-traversed), \
+         {} not_found, {} failures, {} timeouts",
         total_outcomes,
         successes,
+        summary.network_successes,
         not_found,
         failures,
         timeouts
@@ -9572,5 +9942,297 @@ fn test_hop_count_populated_on_terminal_get_events() {
          value propagation rather than (max_htl - htl) accounting",
         max_hop,
         RING_MAX_HTL
+    );
+}
+
+/// Verifies the contract-placement migration (#4404): a contract held only by a
+/// peer FAR from its key migrates onto the cluster of peers CLOSEST to the key,
+/// resolving the GET dead-end.
+///
+/// Setup (peer ring locations controlled via `new_with_node_locations`):
+///   - a dense cluster of peers sits right on the contract's key location;
+///   - exactly one peer, far from the key, initially hosts the contract (seeded
+///     into its store AND Ring hosting manager, with no network propagation);
+///   - a requester, also far from the key, issues a GET.
+///
+/// GET is single-path greedy (k=1), so it routes toward the key and reaches the
+/// close cluster. WITHOUT the migration that cluster lacks the state, so the GET
+/// dead-ends with NotFound (the far host is never on the greedy path toward the
+/// key) — that is the placement gap #4404 describes. The migration nudges the
+/// contract from the far host toward the key: each hosting peer, on gaining a
+/// connected neighbor strictly closer to the key, sends a `SubscribeHint` so
+/// that neighbor directed-subscribes through the holder and begins hosting. The
+/// contract therefore climbs onto the close cluster, and a key-routed GET now
+/// lands on a host. (The dead-end itself is not asserted separately here; the
+/// migration trigger is always-on, so this test pins the resolved state.)
+///
+/// Asserts the migration outcome directly via each node's live Ring: the far
+/// host still hosts the contract, and at least one close-cluster peer (the peers
+/// a key-routed GET actually reaches) ends up hosting it via migration.
+#[test_log::test]
+fn test_contract_migrates_to_close_cluster_resolving_get_dead_end() {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    const SEED: u64 = 0xDEAD_F00D_0001;
+    const NETWORK_NAME: &str = "get-placement-deadend";
+    setup_deterministic_state(SEED);
+
+    // Pick a contract and read its ring location; place peers relative to it.
+    let contract = SimOperation::create_test_contract(0xBE);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+
+    // Six peers clustered tightly around the key (none will host it), then one
+    // far host (seeded) and one far requester. `rem_euclid` wraps onto the ring.
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    let cluster: Vec<f64> = [-0.010, -0.006, -0.003, 0.003, 0.006, 0.010]
+        .iter()
+        .map(|o| wrap(key_loc + o))
+        .collect();
+    let host_loc = wrap(key_loc + 0.40); // far from the key
+    let requester_loc = wrap(key_loc + 0.70); // far from the key, other side
+    let mut node_locations = cluster.clone();
+    node_locations.push(host_loc); // regular-node order 6 -> node_no 7
+    node_locations.push(requester_loc); // regular-node order 7 -> node_no 8
+    let num_nodes = node_locations.len(); // 8
+
+    let rt = create_runtime();
+    let mut sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            NETWORK_NAME,
+            1,         // 1 gateway
+            num_nodes, // 8 regular nodes
+            10,        // ring_max_htl
+            7,         // rnd_if_htl_above
+            8,         // max_connections
+            3,         // min_connections
+            SEED,
+            &node_locations,
+        )
+        .await
+    });
+    // Opt this simulation into the placement-migration cascade (off by default in
+    // sim so it can't perturb unrelated tests, e.g. the streaming assembly-retry
+    // test). This lowers the per-node SubscribeHint version floor to (0,0,0).
+    sim.enable_placement_migration();
+
+    // Regular nodes are node_no = 1..=8 (gateway is node 0); node_locations[i]
+    // maps to node_no i+1.
+    let host_label = NodeLabel::node(NETWORK_NAME, 7); // host_loc
+    let requester_label = NodeLabel::node(NETWORK_NAME, 8); // requester_loc
+
+    // Setup sanity: a cluster node must be strictly closer to the key than the
+    // host, so a key-routed GET genuinely lands in the (non-hosting) cluster
+    // rather than near the holder. get_peer_locations() is [gateway, node1..8].
+    let locs = sim.get_peer_locations();
+    let ring_dist = |a: f64, b: f64| {
+        let d = (a - b).abs();
+        d.min(1.0 - d)
+    };
+    let host_dist = ring_dist(locs[7], key_loc);
+    let cluster_min = (1..=6)
+        .map(|i| ring_dist(locs[i], key_loc))
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        cluster_min < host_dist,
+        "scenario setup wrong: a cluster node must be closer to the key than the host \
+         (cluster_min={cluster_min}, host_dist={host_dist})"
+    );
+
+    let operations = vec![
+        // Only the far host holds the contract initially — seeded into both its
+        // store and Ring hosting manager (no network propagation), so it is a
+        // genuine migration source (`ring.is_hosting_contract` is true).
+        ScheduledOperation::new(
+            host_label.clone(),
+            SimOperation::SeedHostedContract {
+                contract: contract.clone(),
+                state: vec![10, 20, 30, 40],
+            },
+        ),
+        // The far requester asks for it (greedy GET toward the key).
+        ScheduledOperation::new(
+            requester_label.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(180),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // The far host still hosts the seeded contract (it remains a source).
+    assert!(
+        result.is_node_hosting(&host_label, &contract_key),
+        "host should still host the seeded contract after the simulation"
+    );
+
+    // CORE OF THE FIX: the contract migrated onto the close cluster. At least
+    // one of the peers a key-routed GET actually reaches (node_no 1..=6) now
+    // hosts it. Before the migration NONE of them did — this test previously
+    // asserted exactly that dead-end (see git history). With the contract now
+    // present on a peer the greedy path lands on, the dead-end is resolved.
+    let migrated: Vec<usize> = (1..=6usize)
+        .filter(|n| result.is_node_hosting(&NodeLabel::node(NETWORK_NAME, *n), &contract_key))
+        .collect();
+    let requester_has_state = result
+        .node_storages
+        .get(&requester_label)
+        .is_some_and(|s| s.get_stored_state(&contract_key).is_some());
+    assert!(
+        !migrated.is_empty(),
+        "placement migration FAILED: no close-cluster peer (node_no 1..=6) hosts the \
+         contract after the simulation. The contract never migrated from the far host \
+         toward the key, so a key-routed GET would still dead-end. \
+         host_hosting={}, requester_has_state={requester_has_state}",
+        result.is_node_hosting(&host_label, &contract_key),
+    );
+
+    // End-to-end payoff: with the contract migrated onto the close cluster, the
+    // requester's greedy GET toward the key now lands on a host instead of
+    // dead-ending, so it obtains the state. This is the user-visible symptom
+    // from the original telemetry (a web GET that needed several retries before
+    // the contract had migrated onto the key-close peers).
+    assert!(
+        requester_has_state,
+        "requester GET should now succeed: with the contract migrated onto the close \
+         cluster, the greedy GET toward the key lands on a host instead of dead-ending \
+         (migrated cluster nodes: {migrated:?})"
+    );
+
+    tracing::info!(
+        migrated_cluster_nodes = ?migrated,
+        requester_has_state,
+        "placement migration converged onto the close cluster"
+    );
+}
+
+/// Negative control for `test_contract_migrates_to_close_cluster_resolving_get_dead_end`.
+///
+/// IDENTICAL scenario, but WITHOUT `enable_placement_migration()` — so the
+/// SubscribeHint cascade stays off (sim peers report a build version below the
+/// production floor). This reproduces the #4404 dead-end and, paired with the
+/// positive test, proves that the migration cascade (not some incidental GET
+/// caching path) is what makes the close cluster host the contract: same seed,
+/// same topology, the ONLY difference is whether migration is enabled.
+#[test_log::test]
+fn test_get_dead_ends_at_close_cluster_without_migration() {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    const SEED: u64 = 0xDEAD_F00D_0001;
+    const NETWORK_NAME: &str = "get-placement-deadend-control";
+    setup_deterministic_state(SEED);
+
+    let contract = SimOperation::create_test_contract(0xBE);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    let cluster: Vec<f64> = [-0.010, -0.006, -0.003, 0.003, 0.006, 0.010]
+        .iter()
+        .map(|o| wrap(key_loc + o))
+        .collect();
+    let host_loc = wrap(key_loc + 0.40);
+    let requester_loc = wrap(key_loc + 0.70);
+    let mut node_locations = cluster.clone();
+    node_locations.push(host_loc);
+    node_locations.push(requester_loc);
+    let num_nodes = node_locations.len();
+
+    let rt = create_runtime();
+    let mut sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            NETWORK_NAME,
+            1,
+            num_nodes,
+            10,
+            7,
+            8,
+            3,
+            SEED,
+            &node_locations,
+        )
+        .await
+    });
+    // This control asserts the GET dead-ends *because migration is off* — it
+    // deliberately does NOT call `enable_placement_migration()`. But "off by
+    // default" only holds on a build below the production
+    // SUBSCRIBE_HINT_MIN_VERSION floor; on the v0.2.73 release branch (#4404
+    // ships active) the default flips to ON and this control would falsely
+    // fail. Pin migration OFF explicitly so the control's premise holds at any
+    // build version — do not rely on build-version gating.
+    sim.disable_placement_migration();
+
+    let host_label = NodeLabel::node(NETWORK_NAME, 7);
+    let requester_label = NodeLabel::node(NETWORK_NAME, 8);
+
+    let operations = vec![
+        ScheduledOperation::new(
+            host_label.clone(),
+            SimOperation::SeedHostedContract {
+                contract: contract.clone(),
+                state: vec![10, 20, 30, 40],
+            },
+        ),
+        ScheduledOperation::new(
+            requester_label.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ),
+    ];
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(180),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+
+    // The far host still hosts the seeded contract.
+    assert!(
+        result.is_node_hosting(&host_label, &contract_key),
+        "host should hold the seeded contract"
+    );
+
+    // DEAD-END (expected without migration): no close-cluster peer hosts the
+    // contract, so a key-routed GET dead-ends and the requester gets nothing.
+    let migrated: Vec<usize> = (1..=6usize)
+        .filter(|n| result.is_node_hosting(&NodeLabel::node(NETWORK_NAME, *n), &contract_key))
+        .collect();
+    assert!(
+        migrated.is_empty(),
+        "without migration, no close-cluster peer should host the contract, but these do: \
+         {migrated:?} (cascade leaked into a migration-disabled sim?)"
+    );
+    let requester_has_state = result
+        .node_storages
+        .get(&requester_label)
+        .is_some_and(|s| s.get_stored_state(&contract_key).is_some());
+    assert!(
+        !requester_has_state,
+        "without migration the requester GET must dead-end at the close non-hosting cluster \
+         and obtain NO state (the far host is off the greedy path toward the key)"
     );
 }

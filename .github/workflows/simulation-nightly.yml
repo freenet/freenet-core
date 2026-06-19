@@ -199,3 +199,20 @@ jobs:
           done
           echo "::warning::Failed to send River notification after $max_attempts attempts (gateway may be restarting)"
           exit 0
+
+  # Mirror the nightly-failure notification into the private freenet-dev room
+  # (the existing notify-failure job above posts to the public official room).
+  notify-dev-room-failure:
+    name: Notify dev room on Failure
+    runs-on: ubuntu-latest
+    needs: large-scale-simulation
+    if: failure() && needs.large-scale-simulation.result == 'failure'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/river-dev-notify
+        with:
+          message: "🚨 Nightly simulation tests failed — ${{ github.repository }} — branch ${{ github.ref_name }} — commit ${{ github.sha }} — seed ${{ github.event.inputs.seed || '0xDEADBEEF' }} — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}

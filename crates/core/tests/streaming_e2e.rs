@@ -598,9 +598,13 @@ fn test_streaming_multi_hop_forwarding() {
 /// 2. A different node GETs the contract, routing through intermediate relay nodes
 /// 3. The relay uses pipe_stream to forward the streaming GET response
 ///
-/// With 1 gateway + 4 nodes, the GET request from a non-storing node must relay
-/// through at least one intermediate node, exercising the pipe_stream forwarding
-/// path that the cwnd timeout protects.
+/// With a sparse topology (1 gateway + 6 nodes, max_connections = 3, below
+/// the node count) the GET request from node 5 cannot mesh directly with the
+/// storer and must relay through at least one intermediate node, exercising
+/// the pipe_stream forwarding path that the cwnd timeout protects. The
+/// `RELAY_GET_STREAMING_FORWARD_COUNT` assertion below proves a streaming
+/// relay hop genuinely fired (the sim is deterministic per-seed, so this is
+/// not flaky once the seed + topology are locked in).
 #[test]
 fn test_streaming_get_through_relay() {
     const SEED: u64 = 0xDE1A_0008_FACE_B00C;
@@ -613,7 +617,39 @@ fn test_streaming_get_through_relay() {
         .build()
         .unwrap();
 
-    let sim = rt.block_on(setup_streaming_network(NETWORK_NAME, 1, 4, SEED, THRESHOLD));
+    // Sparse topology: 1 gateway + 6 nodes, max_connections = 3 (below the
+    // node count) forces the getter (node 5) to relay rather than connect
+    // directly to the storer. `setup_streaming_network` hardcodes
+    // max_connections = 10, which meshes a network this small and yields a
+    // direct GET with no relay hop (counter stays 0), so build the
+    // SimNetwork inline here with the sparse cap.
+    GlobalRng::set_seed(SEED);
+    const BASE_EPOCH_MS: u64 = 1577836800000;
+    const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
+    GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (SEED % RANGE_MS));
+    let mut sim = rt.block_on(async {
+        let mut sim = SimNetwork::new(
+            NETWORK_NAME,
+            1, // gateways
+            6, // nodes
+            7, // ring_max_htl
+            3, // rnd_if_htl_above
+            3, // max_connections (sparse: < node count → forces a relay hop)
+            2, // min_connections
+            SEED,
+        )
+        .await;
+        sim.with_streaming_threshold(THRESHOLD);
+        sim
+    });
+    // This test asserts a streaming relay-forward hop fires (node 5 must relay
+    // to reach the storer). Placement migration (#4404) spreads the contract
+    // toward the requester, so the relay hop never runs and the
+    // RELAY_GET_STREAMING_FORWARD_COUNT assertion fails. The test exercises the
+    // relay-streaming mechanic, not placement, so pin migration OFF — don't
+    // rely on build-version gating, which flips ON on the v0.2.73 release
+    // branch where #4404 ships active.
+    sim.disable_placement_migration();
 
     let contract = SimOperation::create_test_contract(0xAB);
     let large_state = SimOperation::create_large_state(LARGE_STATE_SIZE, 0xAB);
@@ -630,9 +666,9 @@ fn test_streaming_get_through_relay() {
                 subscribe: false,
             },
         ),
-        // A different node GETs the contract — must relay through network
+        // Node 5 GETs the contract — must relay through network
         ScheduledOperation::new(
-            NodeLabel::node(NETWORK_NAME, 3),
+            NodeLabel::node(NETWORK_NAME, 5),
             SimOperation::Get {
                 contract_id,
                 return_contract_code: false,
@@ -640,6 +676,12 @@ fn test_streaming_get_through_relay() {
             },
         ),
     ];
+
+    // Snapshot the streaming relay GET forward counter so we can assert the
+    // relay genuinely forked+piped a streaming response through a hop (vs.
+    // satisfying the GET via store-and-forward without the streaming path).
+    let forward_calls_before = freenet::dev_tool::RELAY_GET_STREAMING_FORWARD_COUNT
+        .load(std::sync::atomic::Ordering::SeqCst);
 
     let result = sim.run_controlled_simulation(
         SEED,
@@ -654,19 +696,29 @@ fn test_streaming_get_through_relay() {
         result.turmoil_result.err()
     );
 
+    let forward_calls_after = freenet::dev_tool::RELAY_GET_STREAMING_FORWARD_COUNT
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        forward_calls_after > forward_calls_before,
+        "Expected the relay GET streaming-forward path to run at least once \
+         during a 1MB relayed GET (before={forward_calls_before}, \
+         after={forward_calls_after}). Counter stuck → relay GET \
+         streaming-forward path did not run (fell back to store-and-forward)."
+    );
+
     // The GET-requesting node should have the contract state
-    let node3_label = NodeLabel::node(NETWORK_NAME, 3);
-    let node3_storage = result
+    let getter_label = NodeLabel::node(NETWORK_NAME, 5);
+    let getter_storage = result
         .node_storages
-        .get(&node3_label)
-        .expect("node 3 should have a storage handle");
-    let node3_state = node3_storage.get_stored_state(&contract_key);
+        .get(&getter_label)
+        .expect("node 5 should have a storage handle");
+    let getter_state = getter_storage.get_stored_state(&contract_key);
 
     assert!(
-        node3_state.is_some(),
-        "Node 3 should have 1MB contract state after streaming GET through relay"
+        getter_state.is_some(),
+        "Node 5 should have 1MB contract state after streaming GET through relay"
     );
-    let stored_bytes: Vec<u8> = node3_state.unwrap().as_ref().to_vec();
+    let stored_bytes: Vec<u8> = getter_state.unwrap().as_ref().to_vec();
     assert_eq!(
         stored_bytes, large_state,
         "Stored state bytes should match the original 1MB state after relay GET"
@@ -1243,5 +1295,287 @@ fn test_driver_inline_get_triggers_auto_subscribe() {
             .iter()
             .map(|s| (s.peer_addr, s.active_subscription_keys.clone()))
             .collect::<Vec<_>>()
+    );
+}
+
+// =============================================================================
+// Test: GET retries after stream-assembly failure (#4345)
+// =============================================================================
+
+/// Build the sparse-but-routable topology used by
+/// `test_streaming_get_retries_after_assembly_failure`. max_connections
+/// below the node count keeps the PUT fan-out from reaching every node
+/// (so a cold getter exists), while min_connections = 3 gives nodes
+/// enough ring candidates for the assembly-failure retry to advance to.
+async fn setup_assembly_retry_network(name: &str, seed: u64, threshold: usize) -> SimNetwork {
+    GlobalRng::set_seed(seed);
+    const BASE_EPOCH_MS: u64 = 1577836800000;
+    const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000;
+    GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + (seed % RANGE_MS));
+    let mut sim = SimNetwork::new(
+        name, 1,  // gateways
+        12, // nodes
+        7,  // ring_max_htl
+        3,  // rnd_if_htl_above
+        4,  // max_connections (sparse: < node count → cold getter exists)
+        3,  // min_connections (≥ 2 retry candidates per node)
+        seed,
+    )
+    .await;
+    sim.with_streaming_threshold(threshold);
+    // The #4345 assembly-retry test hand-builds a cold-node → holder routing
+    // scenario. Placement migration (#4404) moves the contract toward the
+    // requester, disrupting that scenario (the injected assembly failure no
+    // longer drives the retry path under test). This helper feeds both the
+    // phase-1 and phase-2 sims, so pin migration OFF here — the test exercises
+    // assembly-retry mechanics, not placement, and must not rely on
+    // build-version gating (which flips ON on the v0.2.73 release branch where
+    // #4404 ships active).
+    sim.disable_placement_migration();
+    sim
+}
+
+/// Regression test for #4345: a failed stream assembly must consume the
+/// GET retry budget and advance to the next candidate instead of
+/// synthesizing a client error with the budget untouched.
+///
+/// Production failure chain: packet loss → FixedRate loss-pause caps the
+/// cwnd → the sender aborts on the 3s cwnd-wait timeout → the receiver's
+/// stream assembly hits its inactivity timeout → the originator's GET
+/// driver (pre-fix) logged a WARN and synthesized "GET succeeded on wire
+/// but local store lookup failed" without retrying — one transport
+/// hiccup burned the whole GET even though `MAX_RETRIES` was untouched
+/// and other candidates could serve the contract.
+///
+/// Uses the two-phase cold-node isolation strategy from
+/// `test_driver_streaming_get_cold_cache`, but on a routable htl=7
+/// topology (the HTL=1 variant is not routable — see that test's
+/// #[ignore]): phase 1 runs the PUT alone to find the nodes the fan-out
+/// missed; phase 2 re-runs the same seed (same ring) and GETs from a
+/// cold node with exactly one injected assembly failure armed for this
+/// contract key (via `get_assembly_fault_injection`, which mirrors the
+/// production failure by leaving the inbound stream orphaned). The
+/// driver must advance to another candidate and still deliver the full
+/// state.
+///
+/// Not every fan-out-missed node can route a GET to a holder in a
+/// sparse topology (a routing property, not the #4345 assembly-retry
+/// property under test), so phase 2 iterates the cold candidates
+/// deterministically until one demonstrates the retry path end-to-end.
+/// On a regression every candidate fails and the test fails with the
+/// per-candidate diagnostics.
+#[test]
+fn test_streaming_get_retries_after_assembly_failure() {
+    use freenet::config::SimulationIdleTimeout;
+    use freenet::dev_tool::GET_DRIVER_CALL_COUNT;
+    use freenet::dev_tool::get_assembly_fault_injection;
+    use std::sync::atomic::Ordering;
+
+    // Root cause of this test's merge-queue flakiness (fix for the #4345
+    // follow-up): `run_controlled_simulation` drives Turmoil, whose hosts run
+    // their `start_paused(true)` runtimes on THIS thread. The transport's
+    // connection idle / keepalive deadline (`PeerConnection::recv`) is checked
+    // against `RealTime`, which under a paused runtime is tokio's
+    // auto-advancing virtual clock. While a host runs a real (non-mock) WASM
+    // contract via `spawn_blocking`, that clock can jump well past the
+    // production 120s idle timeout in a single step — and the jumps grow under
+    // CPU contention, e.g. the merge-queue runs this alongside four parallel
+    // `fdev` simulations that also execute real WASM, so the OS time-slices the
+    // blocking work and a starved host's real-time WASM step stretches out.
+    // A jump past 120s spuriously tears down otherwise-healthy connections, so
+    // the cold-node GET can no longer reach ANY holder. That is exactly the
+    // observed failure: under load every candidate reported
+    // `retry_path_taken=false` (holder unreachable), whereas in isolation
+    // several candidates reach a holder and one demonstrates the retry path.
+    //
+    // The idle-timeout flag is thread-local and Turmoil runs every host on this
+    // thread, so enabling it here (before any `run_controlled_simulation` call)
+    // extends the simulation idle timeout to 24h — matching VirtualTime and the
+    // documented "120s (RealTime), 24h (VirtualTime/simulation)" contract — and
+    // removes the spurious drops without changing what the test verifies (the
+    // assembly-failure retry is driven by deterministic fault injection, not by
+    // any real connection timing). `run_simulation_direct` enables the same
+    // flag for the same reason; we keep it scoped to this test rather than to
+    // all of `run_controlled_simulation`, because other controlled-sim tests
+    // (e.g. `test_six_peer_contract_lifecycle`) deliberately rely on the
+    // production 120s idle timeout to reap stale connections and break if it is
+    // extended globally.
+    SimulationIdleTimeout::enable();
+    // Restore production behaviour on this libtest worker thread when the test
+    // returns or unwinds, so the thread-local flag cannot leak into a later
+    // test reusing the same thread under plain `cargo test` (nextest isolates
+    // per process, so it never leaks there). This makes the "scoped to this
+    // test" guarantee above actually hold rather than only mostly hold.
+    struct RestoreIdleTimeout;
+    impl Drop for RestoreIdleTimeout {
+        fn drop(&mut self) {
+            freenet::config::SimulationIdleTimeout::disable();
+        }
+    }
+    let _restore_idle_timeout = RestoreIdleTimeout;
+
+    const SEED: u64 = 0xDE1A_4345_0000_0001;
+    const NETWORK_NAME_PHASE1: &str = "get-assembly-retry-p1";
+    const THRESHOLD: usize = 1024;
+    const LARGE_STATE_SIZE: usize = 100 * 1024; // 100KB, above THRESHOLD
+    const NODES: usize = 12;
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let contract = SimOperation::create_test_contract(0x45);
+    let large_state = SimOperation::create_large_state(LARGE_STATE_SIZE, 0x45);
+    let contract_key = contract.key();
+    let contract_id = *contract_key.id();
+
+    // Phase 1: run the PUT in isolation to discover the nodes that did
+    // NOT receive the state during fan-out.
+    let sim1 = rt.block_on(setup_assembly_retry_network(
+        NETWORK_NAME_PHASE1,
+        SEED,
+        THRESHOLD,
+    ));
+    let phase1_ops = vec![ScheduledOperation::new(
+        NodeLabel::gateway(NETWORK_NAME_PHASE1, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: large_state.clone(),
+            subscribe: false,
+        },
+    )];
+    let phase1 = sim1.run_controlled_simulation(
+        SEED,
+        phase1_ops,
+        Duration::from_secs(120),
+        Duration::from_secs(30),
+    );
+    assert!(
+        phase1.turmoil_result.is_ok(),
+        "Phase 1 (PUT only) should complete: {:?}",
+        phase1.turmoil_result.err()
+    );
+    let cold_nodes: Vec<usize> = (1..=NODES)
+        .filter(|i| {
+            let label = NodeLabel::node(NETWORK_NAME_PHASE1, *i);
+            phase1
+                .node_storages
+                .get(&label)
+                .is_some_and(|s| s.get_stored_state(&contract_key).is_none())
+        })
+        .collect();
+    assert!(
+        !cold_nodes.is_empty(),
+        "Test precondition: no cold-cache node exists after the PUT in \
+         this {NODES}-node sparse topology. All nodes received the state \
+         during fan-out. Pick a different SEED or sparser max_connections."
+    );
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut demonstrated = false;
+    // Cap the candidates tried: each iteration is a full phase-2 sim
+    // run (~15s), and under a regression EVERY candidate fails — an
+    // uncapped loop over up to 11 cold nodes would hit the nextest ci
+    // profile's termination timeout and lose the per-candidate
+    // diagnostics below. The sim is deterministic per seed; with this
+    // seed the first four cold candidates cannot route a GET to a
+    // holder at all (their retry exhausts on the wire) and the fifth
+    // demonstrates the property, so the cap leaves one spare.
+    for (attempt, cold_idx) in cold_nodes.iter().copied().take(6).enumerate() {
+        let network_name = format!("get-assembly-retry-p2-{attempt}");
+
+        // (Re-)arm exactly one injected assembly failure for THIS
+        // contract key — keying by contract makes this safe under
+        // parallel test execution in the same process. `inject_failures`
+        // overwrites, so a previous candidate that never streamed leaves
+        // no stale budget behind. (ASSEMBLY_RETRY_COUNT itself is
+        // process-global; the before/after delta below relies on
+        // nextest's process-per-test isolation in CI.)
+        get_assembly_fault_injection::inject_failures(contract_key, 1);
+        let retries_before =
+            get_assembly_fault_injection::ASSEMBLY_RETRY_COUNT.load(Ordering::SeqCst);
+        let baseline_calls = GET_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
+
+        let sim2 = rt.block_on(setup_assembly_retry_network(&network_name, SEED, THRESHOLD));
+        let cold_node_label = NodeLabel::node(&network_name, cold_idx);
+        let phase2_ops = vec![
+            ScheduledOperation::new(
+                NodeLabel::gateway(&network_name, 0),
+                SimOperation::Put {
+                    contract: contract.clone(),
+                    state: large_state.clone(),
+                    subscribe: false,
+                },
+            ),
+            ScheduledOperation::new(
+                cold_node_label.clone(),
+                SimOperation::Get {
+                    contract_id,
+                    return_contract_code: false,
+                    subscribe: false,
+                },
+            ),
+        ];
+        let phase2 = sim2.run_controlled_simulation(
+            SEED,
+            phase2_ops,
+            Duration::from_secs(300),
+            Duration::from_secs(120),
+        );
+        if let Err(e) = &phase2.turmoil_result {
+            failures.push(format!("node {cold_idx}: simulation error: {e:?}"));
+            continue;
+        }
+
+        // Driver-isolation probe: the GET must have gone through the
+        // task-per-tx driver (not the local-cache shortcut), otherwise
+        // the assembly-retry path was never reachable.
+        let driver_calls = GET_DRIVER_CALL_COUNT.load(Ordering::SeqCst);
+        if driver_calls == baseline_calls {
+            failures.push(format!(
+                "node {cold_idx}: GET never reached the driver (locally cached?)"
+            ));
+            continue;
+        }
+
+        let retries_after =
+            get_assembly_fault_injection::ASSEMBLY_RETRY_COUNT.load(Ordering::SeqCst);
+        let stored = phase2
+            .node_storages
+            .get(&cold_node_label)
+            .and_then(|s| s.get_stored_state(&contract_key));
+
+        match (retries_after > retries_before, stored) {
+            (true, Some(state)) => {
+                // The driver took the assembly-failure retry path AND
+                // the retry delivered the full, correct state.
+                let stored_bytes: Vec<u8> = state.as_ref().to_vec();
+                assert_eq!(
+                    stored_bytes, large_state,
+                    "Stored state bytes should match the original 100KB \
+                     state after the assembly-failure retry"
+                );
+                demonstrated = true;
+                break;
+            }
+            (took_retry, stored) => {
+                failures.push(format!(
+                    "node {cold_idx}: retry_path_taken={took_retry} \
+                     state_present={} (streaming GET likely never reached \
+                     a holder from this candidate, or the retry burned \
+                     the GET — #4345 regression if this repeats for every \
+                     candidate)",
+                    stored.is_some()
+                ));
+            }
+        }
+    }
+
+    assert!(
+        demonstrated,
+        "No cold candidate demonstrated the #4345 assembly-failure retry \
+         path (injected failure → driver.advance() → fresh attempt → \
+         state delivered). Per-candidate outcomes: {failures:#?}"
     );
 }

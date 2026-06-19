@@ -13,7 +13,7 @@ mod home_page;
 pub(crate) mod path_handlers;
 
 use std::collections::HashSet;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -103,15 +103,38 @@ pub(crate) enum HostCallbackResult {
     },
 }
 
-async fn serve(socket: SocketAddr, router: axum::Router) -> std::io::Result<()> {
-    serve_with_listener(socket, router, None).await
+/// For a wildcard or loopback bind address, returns the equivalent address in
+/// the other IP family so the client API can be served on a second, explicit
+/// socket and thus be reachable over both IPv4 and IPv6.
+///
+/// This is what makes `http://127.0.0.1:7509/` AND `http://[::1]:7509/` (and
+/// `localhost`, which resolves to either) work on every OS. A single IPv6
+/// socket is not enough: IPv4-mapped acceptance (`IPV6_V6ONLY=false`) applies
+/// only to the `::` wildcard — never to a specific address like `::1` — and is
+/// unreliable on Windows even for `::`, so the literal IPv4 loopback is refused
+/// there. See issue #4330.
+///
+/// Returns `None` for any specific (non-wildcard, non-loopback) address: an
+/// operator who binds the API to a particular interface IP gets exactly that
+/// one socket, with no companion in the other family.
+fn companion_bind_addr(addr: IpAddr) -> Option<IpAddr> {
+    match addr {
+        IpAddr::V6(v6) if v6 == Ipv6Addr::UNSPECIFIED => Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+        IpAddr::V6(v6) if v6 == Ipv6Addr::LOCALHOST => Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        IpAddr::V4(v4) if v4 == Ipv4Addr::UNSPECIFIED => Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+        IpAddr::V4(v4) if v4 == Ipv4Addr::LOCALHOST => Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        // A specific (non-wildcard, non-loopback) interface address is bound
+        // as-is, with no companion. Enumerate variants rather than `_` to
+        // satisfy `clippy::wildcard_enum_match_arm`.
+        IpAddr::V4(_) | IpAddr::V6(_) => None,
+    }
 }
 
 async fn serve_with_listener(
     socket: SocketAddr,
     router: axum::Router,
     pre_bound: Option<std::net::TcpListener>,
-) -> std::io::Result<()> {
+) -> std::io::Result<tokio::task::AbortHandle> {
     let listener = match pre_bound {
         Some(std_listener) => {
             std_listener.set_nonblocking(true)?;
@@ -134,10 +157,19 @@ async fn serve_with_listener(
                 .map_err(|e| {
                     std::io::Error::new(e.kind(), format!("Failed to create socket: {e}"))
                 })?;
-                // Enable dual-stack: accept both IPv4 and IPv6 on a single socket.
-                // IPv4 clients connect via IPv4-mapped addresses (::ffff:x.x.x.x).
+                // Bind IPv6 sockets v6-only. We do NOT rely on single-socket
+                // dual-stack (IPV6_V6ONLY=false / IPv4-mapped addresses) for the
+                // client API: that only delivers IPv4 to a socket bound to the
+                // `::` wildcard (never to a specific address like `::1`), and is
+                // unreliable on Windows even for `::`. Instead, `serve_client_api`
+                // binds an explicit companion socket in the other family (see
+                // `companion_bind_addr`) so literal `127.0.0.1` AND `::1` /
+                // `localhost` are reachable on every OS. v6-only here keeps the
+                // two sockets from contending for the IPv4 space (a v4-mapped
+                // `::` socket would make the companion `0.0.0.0` bind fail with
+                // AddrInUse on Linux).
                 if is_ipv6 {
-                    sock.set_only_v6(false)?;
+                    sock.set_only_v6(true)?;
                 }
                 sock.set_reuse_address(true)?;
                 sock.set_nonblocking(true)?;
@@ -162,7 +194,11 @@ async fn serve_with_listener(
         }
     };
     tracing::info!("HTTP client API listening on {}", socket);
-    GlobalExecutor::spawn(async move {
+    // Retain the spawn's AbortHandle so the node can tear the server down on
+    // graceful shutdown (issue #4401). Dropping the JoinHandle alone does NOT
+    // abort the task, so without this the server keeps serving on the bound
+    // port after the node has shut down.
+    let handle = GlobalExecutor::spawn(async move {
         axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -172,7 +208,7 @@ async fn serve_with_listener(
             tracing::error!("Error while running HTTP client API server: {e}");
         })
     });
-    Ok(())
+    Ok(handle.abort_handle())
 }
 
 /// Returns `true` if the IP is a private/local address suitable for LAN access.
@@ -217,7 +253,7 @@ pub mod local_node {
         contract::{Executor, ExecutorError},
     };
 
-    use super::{client_api::HttpClientApi, serve};
+    use super::{client_api::HttpClientApi, serve_dual_stack};
 
     pub async fn run_local_node(mut executor: Executor, socket: SocketAddr) -> anyhow::Result<()> {
         if !super::is_private_ip(&socket.ip()) {
@@ -229,7 +265,23 @@ pub mod local_node {
         let (mut gw, gw_router) = HttpClientApi::as_router(&socket);
         let (mut ws_proxy, ws_router) = WebSocketProxy::create_router(gw_router);
 
-        serve(socket, ws_router.layer(TraceLayer::new_for_http())).await?;
+        // Route through serve_dual_stack (not the bare single-socket bind) so
+        // this path also binds an IPv4+IPv6 companion pair for loopback/wildcard
+        // addresses — keeping every client-API serve path reachable over both
+        // families (#4330).
+        //
+        // `run_local_node` owns the server for the lifetime of the process (it
+        // loops forever below), so the abort guard is leaked deliberately: there
+        // is no graceful-shutdown hook on this path to hand it to.
+        let mut aborts = crate::util::AbortOnDrop::new();
+        serve_dual_stack(
+            socket,
+            ws_router.layer(TraceLayer::new_for_http()),
+            None,
+            &mut aborts,
+        )
+        .await?;
+        std::mem::forget(aborts);
 
         // TODO: use combinator instead
         // let mut all_clients =
@@ -542,15 +594,24 @@ async fn serve_client_api_in_impl(
 ) -> std::io::Result<(HttpClientApi, WebSocketProxy)> {
     let ws_socket = (config.address, config.port).into();
 
+    // Collects the AbortHandles of every detached task this function spawns
+    // (token cleanup + the `axum::serve` server socket(s)) so they are torn
+    // down when the returned `WebSocketProxy` is dropped. The proxy is one of
+    // the node's `BoxedClient`s, so aborting the node's client-events task on
+    // shutdown drops the proxy and, with it, these server tasks — releasing the
+    // bound ports instead of leaving a stale server answering requests meant
+    // for a restarted node. See issue #4401.
+    let mut server_aborts = crate::util::AbortOnDrop::new();
+
     // Create a shared origin_contracts map with token expiration support
     let origin_contracts: OriginContractMap = Arc::new(DashMap::new());
 
     // Spawn background task to clean up expired tokens
-    spawn_token_cleanup_task(
+    server_aborts.push(spawn_token_cleanup_task(
         origin_contracts.clone(),
         config.token_ttl_seconds,
         config.token_cleanup_interval_seconds,
-    );
+    ));
 
     // Pass the shared map to both the HTTP client API and WebSocketProxy
     let (gw, gw_router) = HttpClientApi::as_router_with_origin_contracts(
@@ -614,8 +675,55 @@ async fn serve_client_api_in_impl(
             .layer(TraceLayer::new_for_http())
     };
 
-    serve_with_listener(ws_socket, router, pre_bound).await?;
+    serve_dual_stack(ws_socket, router, pre_bound, &mut server_aborts).await?;
+
+    // Hand ownership of the server tasks' abort guard to the proxy so they are
+    // torn down when the proxy is dropped on node shutdown (issue #4401).
+    let ws_proxy = ws_proxy.with_server_aborts(server_aborts);
     Ok((gw, ws_proxy))
+}
+
+/// Serve `router` on `primary`, and — when `primary` is a wildcard/loopback
+/// address whose bind we own — also on a companion socket in the other IP
+/// family (see [`companion_bind_addr`]). This is what makes the client API
+/// reachable over both `127.0.0.1` and `::1`/`localhost` on every OS (#4330).
+///
+/// A caller-provided `pre_bound` listener is used as-is, with no companion: the
+/// caller chose that exact socket. The companion bind is best-effort — if the
+/// other family is unavailable on this host (e.g. IPv4 or IPv6 disabled), the
+/// node keeps serving on the primary rather than failing to start. A failure to
+/// bind the primary is still fatal.
+async fn serve_dual_stack(
+    primary: SocketAddr,
+    router: axum::Router,
+    pre_bound: Option<std::net::TcpListener>,
+    aborts: &mut crate::util::AbortOnDrop,
+) -> std::io::Result<()> {
+    let companion = if pre_bound.is_none() {
+        companion_bind_addr(primary.ip()).map(|ip| SocketAddr::from((ip, primary.port())))
+    } else {
+        None
+    };
+    match companion {
+        Some(companion) => {
+            aborts.push(serve_with_listener(primary, router.clone(), pre_bound).await?);
+            match serve_with_listener(companion, router, None).await {
+                Ok(handle) => aborts.push(handle),
+                Err(e) => tracing::warn!(
+                    %companion,
+                    primary = %primary,
+                    error = %e,
+                    "Could not bind companion {} listener for the client API; \
+                     continuing with the primary listener only",
+                    if companion.is_ipv4() { "IPv4" } else { "IPv6" },
+                ),
+            }
+        }
+        None => {
+            aborts.push(serve_with_listener(primary, router, pre_bound).await?);
+        }
+    }
+    Ok(())
 }
 
 /// Middleware that rejects requests from non-private IP addresses unless the
@@ -654,7 +762,7 @@ fn spawn_token_cleanup_task(
     origin_contracts: OriginContractMap,
     token_ttl_seconds: u64,
     cleanup_interval_seconds: u64,
-) {
+) -> tokio::task::AbortHandle {
     let token_ttl = Duration::from_secs(token_ttl_seconds);
     let cleanup_interval = Duration::from_secs(cleanup_interval_seconds);
 
@@ -696,7 +804,8 @@ fn spawn_token_cleanup_task(
                 );
             }
         }
-    });
+    })
+    .abort_handle()
 }
 
 #[cfg(test)]
@@ -1110,5 +1219,95 @@ mod tests {
         assert!(hosts.contains("localhost"));
         assert!(hosts.contains("[::1]"));
         assert!(hosts.contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn companion_bind_addr_maps_loopback_and_wildcard_across_families() {
+        // Loopback and wildcard get a companion in the other family so the API
+        // is reachable over both IPv4 and IPv6.
+        assert_eq!(
+            companion_bind_addr(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        );
+        assert_eq!(
+            companion_bind_addr(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+        );
+        assert_eq!(
+            companion_bind_addr(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        );
+        assert_eq!(
+            companion_bind_addr(IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
+            Some(IpAddr::V6(Ipv6Addr::UNSPECIFIED)),
+        );
+
+        // A specific interface address gets no companion: the operator chose
+        // exactly that socket.
+        assert_eq!(
+            companion_bind_addr(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50))),
+            None,
+        );
+        assert_eq!(
+            companion_bind_addr(IpAddr::V6(Ipv6Addr::new(
+                0xfd7a, 0x115c, 0xa1e0, 0, 0, 0, 0, 1
+            ))),
+            None,
+        );
+    }
+
+    /// Regression test for #4330: when the client API binds the local-mode
+    /// default (`::1`), the literal IPv4 loopback `127.0.0.1` must ALSO be
+    /// reachable. A single IPv6 socket bound to the *specific* address `::1`
+    /// never accepts IPv4 (IPv4-mapped acceptance is wildcard-only), so before
+    /// the dual-family bind a Windows browser opening `http://127.0.0.1:7509/`
+    /// got "can't access this site". This asserts both families connect on the
+    /// same port; it fails if the companion bind is dropped OR if the IPv6
+    /// socket reverts to relying on `IPV6_V6ONLY=false`.
+    #[tokio::test]
+    async fn client_api_reachable_on_both_ipv4_and_ipv6_loopback() {
+        use axum::{Router, routing::get};
+
+        // Distinctive marker so the assertion confirms OUR server answered, not
+        // some unrelated process that happens to hold the port.
+        const MARKER: &str = "dual-stack-marker-4330";
+        async fn handler() -> &'static str {
+            MARKER
+        }
+
+        // Grab an OS-assigned port on the IPv6 loopback, then reuse it for the
+        // dual-family bind (serve_with_listener sets SO_REUSEADDR).
+        let probe = std::net::TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let primary = SocketAddr::from((Ipv6Addr::LOCALHOST, port));
+        let router = Router::new().route("/", get(handler));
+        let mut aborts = crate::util::AbortOnDrop::new();
+        serve_dual_stack(primary, router, None, &mut aborts)
+            .await
+            .expect("binding the IPv6 loopback primary must succeed");
+        // Keep the servers alive for the duration of the assertions below; the
+        // guard would otherwise abort them as soon as this scope's locals drop.
+        std::mem::forget(aborts);
+
+        // GET over BOTH families and assert OUR handler answered. Checking the
+        // body (not just a TCP connect) rules out a false pass where an
+        // unrelated process holds 127.0.0.1:port and the best-effort companion
+        // bind silently failed: only our companion socket returns MARKER.
+        // `127.0.0.1` is the #4330 regression surface — connection refused (or a
+        // wrong body) here means the dual-family bind regressed.
+        for url in [
+            format!("http://127.0.0.1:{port}/"),
+            format!("http://[::1]:{port}/"),
+        ] {
+            let body = reqwest::get(&url)
+                .await
+                .unwrap_or_else(|e| panic!("GET {url} must connect ({e}); see #4330"))
+                .text()
+                .await
+                .unwrap();
+            assert_eq!(body, MARKER, "wrong server answered {url}");
+        }
     }
 }

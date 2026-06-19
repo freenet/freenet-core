@@ -246,6 +246,27 @@ impl TopologyManager {
         }
     }
 
+    /// Bound peer-attributed resource state to the set of live peers.
+    ///
+    /// Drops `source_creation_times` and meter entries for every
+    /// `AttributionSource::Peer` whose `PeerKeyLocation` is not in `live`.
+    /// Contract/Delegate sources are untouched. Called once per maintenance
+    /// tick by the bandwidth bridge so neither `source_creation_times` (which
+    /// `extrapolated_usage` iterates every tick) nor the meter grows without
+    /// bound as peers churn (#3453 review).
+    pub(crate) fn retain_peer_sources(
+        &mut self,
+        live: &std::collections::HashSet<PeerKeyLocation>,
+    ) {
+        self.source_creation_times.retain(|source, _| match source {
+            AttributionSource::Peer(peer) => live.contains(peer),
+            // Enumerated explicitly (not `_`) so a future AttributionSource
+            // variant must consciously decide its retention policy here.
+            AttributionSource::Delegate(_) | AttributionSource::Contract(_) => true,
+        });
+        self.meter.retain_peer_sources(live);
+    }
+
     pub(crate) fn report_resource_usage(
         &mut self,
         attribution: &AttributionSource,

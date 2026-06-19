@@ -16,16 +16,67 @@
 //!
 //! Reads (via [`BrokenInvariantsTracker::is_broken`]) gate the broadcast-
 //! emission path so a flagged contract's state changes never leave the
-//! node. A "fixed" version of the same contract has a different code hash
-//! → different `ContractKey` → unaffected, so this flag is intentionally
-//! permanent for the given instance id.
+//! node.
+//!
+//! ## Why the flag is TTL-bounded, not permanent
+//!
+//! An earlier revision made the flag permanent on the theory that a "fixed"
+//! contract has a different code hash → different `ContractKey`, so an
+//! instance id flagged once is broken forever. That reasoning is sound for a
+//! *true* violation, but the probe is a sampled heuristic that can
+//! false-positive: it ultimately rests on a byte-level comparison, and a
+//! correct contract whose serialization is non-canonical (HashMap/HashSet
+//! iteration order, float formatting, embedded timestamps) can be flagged
+//! even though its merge is logically idempotent. A permanent, silent,
+//! cross-restart-persistent flag turns a single false positive into a
+//! contract that stops propagating *forever* with no recovery — exactly the
+//! failure mode behind issue #4295 (`test_ping_multi_node` froze because the
+//! ping contract's `HashMap`-backed state byte-fluttered on re-merge).
+//!
+//! So the flag now expires after [`BROKEN_INVARIANT_TTL`]. The consequences:
+//!
+//! - **False positive:** self-heals within one TTL window. Combined with the
+//!   probe's own soundness hardening (it no longer flags benign byte-flutter
+//!   — see `Executor::maybe_probe_idempotency`), false positives should be
+//!   rare *and* recoverable rather than permanent.
+//! - **True violation:** suppressed for a TTL, then re-detected and re-flagged
+//!   (which refreshes the window, so a continuously-merging violator stays
+//!   suppressed). Re-detection is probabilistic: after expiry the probe samples
+//!   at [`crate::contract::executor`]'s `IDEMPOTENCY_PROBE_PROBABILITY` (1/32),
+//!   so the contract leaks the merges that occur between expiry and the next
+//!   sampled probe — in expectation ~32 merges, with a longer tail under a high
+//!   merge rate. That is a deliberately accepted, bounded periodic leak, not the
+//!   permanent re-engaged storm of the pre-#4279 baseline. We accept it because
+//!   the opposite failure — a permanent flag that a *false* positive can trigger,
+//!   silently bricking a correct contract forever (#4295) — is worse, and we
+//!   bias toward false-positive recovery. (A genuinely non-idempotent contract
+//!   has never been observed in production; the only flag ever seen fire was the
+//!   #4295 false positive.) To shorten the leak, raise `BROKEN_INVARIANT_TTL`
+//!   (fewer expiry windows) rather than lowering it.
+//!
+//! This also satisfies the project rule that GC/suppression exemptions must
+//! be time-bounded (see `.claude/rules/ring.md` "Cleanup Exemptions Must Be
+//! Time-Bounded"). Expired entries are swept by [`BrokenInvariantsTracker::cleanup`],
+//! hooked into the same reaper tick as the UPDATE rate limiter.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use dashmap::DashMap;
 use freenet_stdlib::prelude::ContractInstanceId;
+use tokio::time::Instant;
 
 use crate::contract::storages::Storage;
+use crate::util::time_source::TimeSource;
+
+/// How long a broken-invariant flag suppresses a contract before it expires
+/// and the contract is given a fresh chance (re-detected by the next sampled
+/// probe if genuinely still broken).
+///
+/// Chosen to be long enough that a genuinely non-convergent contract leaks at
+/// most ≈one merge per window (negligible amplification) yet short enough that
+/// a false positive recovers promptly rather than bricking the contract.
+pub(crate) const BROKEN_INVARIANT_TTL: Duration = Duration::from_secs(300);
 
 /// The kind of CRDT invariant a contract was observed to violate. Currently
 /// only one variant; future work may add violations like non-commutativity
@@ -53,43 +104,80 @@ impl BrokenInvariant {
     }
 }
 
+/// An in-memory flag together with the instant it was (re-)recorded, so the
+/// flag can expire after [`BROKEN_INVARIANT_TTL`].
+#[derive(Debug, Clone, Copy)]
+struct FlagEntry {
+    kind: BrokenInvariant,
+    recorded_at: Instant,
+}
+
 /// Tracks per-contract broken-invariant flags with optional persistent backing.
 ///
 /// `set_storage` is called once during node startup, at which point the
 /// tracker reads any previously-persisted flags into the in-memory map.
 /// Until storage is wired, reads still work (empty map) and writes are
 /// in-memory only — this matches the pattern used by `HostingManager`.
-#[derive(Default)]
 pub(crate) struct BrokenInvariantsTracker {
-    flags: Arc<DashMap<ContractInstanceId, BrokenInvariant>>,
-    storage: std::sync::OnceLock<Storage>,
+    flags: Arc<DashMap<ContractInstanceId, FlagEntry>>,
+    // `RwLock<Option<Storage>>` (mirroring `HostingManager`) rather than a
+    // `OnceLock` so the handle can be dropped on shutdown via `clear_storage`,
+    // releasing its redb `Database` clone (issue #4401). None of the readers
+    // are on a hot path: only `record`/`remove_from_storage`/`set_storage`
+    // touch the handle, all off the broadcast/commit fast path.
+    storage: parking_lot::RwLock<Option<Storage>>,
+    time_source: Arc<dyn TimeSource + Send + Sync>,
 }
 
 impl BrokenInvariantsTracker {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(time_source: Arc<dyn TimeSource + Send + Sync>) -> Self {
+        Self {
+            flags: Arc::new(DashMap::new()),
+            storage: parking_lot::RwLock::new(None),
+            time_source,
+        }
     }
 
-    /// Returns true if `id` has any broken-invariant flag set.
+    /// Returns true if `id` currently has a non-expired broken-invariant flag.
+    ///
+    /// Pure read: expired entries are reported as not-broken here and are
+    /// physically reclaimed by the periodic [`BrokenInvariantsTracker::cleanup`]
+    /// sweep, so this stays cheap on the broadcast/commit hot path.
     pub fn is_broken(&self, id: &ContractInstanceId) -> bool {
-        self.flags.contains_key(id)
+        let now = self.time_source.now();
+        match self.flags.get(id) {
+            Some(entry) => now.saturating_duration_since(entry.recorded_at) < BROKEN_INVARIANT_TTL,
+            None => false,
+        }
     }
 
-    /// Returns the broken-invariant flag for `id`, if any. Used by tests
-    /// and future detectors that distinguish kinds; production callers
-    /// only need `is_broken`.
+    /// Returns the broken-invariant flag for `id`, if any and not expired.
+    /// Used by tests and future detectors that distinguish kinds; production
+    /// callers only need `is_broken`.
     #[cfg(test)]
     pub fn get(&self, id: &ContractInstanceId) -> Option<BrokenInvariant> {
-        self.flags.get(id).map(|r| *r.value())
+        let now = self.time_source.now();
+        self.flags.get(id).and_then(|entry| {
+            if now.saturating_duration_since(entry.recorded_at) < BROKEN_INVARIANT_TTL {
+                Some(entry.kind)
+            } else {
+                None
+            }
+        })
     }
 
-    /// Mark `id` as broken with `kind`. Idempotent — repeat calls are no-ops
-    /// once the in-memory entry exists. Persists best-effort to storage if
-    /// wired; persistence errors are logged but never block the in-memory
-    /// flag from taking effect (we'd rather suppress the storm than crash
-    /// on a database hiccup).
+    /// Mark `id` as broken with `kind`, stamping the current time. Re-recording
+    /// an already-flagged contract refreshes its expiry (so a contract the
+    /// probe keeps re-detecting stays suppressed). Persists best-effort to
+    /// storage if wired; persistence errors are logged but never block the
+    /// in-memory flag from taking effect (we'd rather suppress the storm than
+    /// crash on a database hiccup).
     pub fn record(&self, id: ContractInstanceId, kind: BrokenInvariant) {
-        let was_new = self.flags.insert(id, kind).is_none();
+        let recorded_at = self.time_source.now();
+        let was_new = self
+            .flags
+            .insert(id, FlagEntry { kind, recorded_at })
+            .is_none();
         if was_new {
             tracing::warn!(
                 contract = %id,
@@ -103,7 +191,7 @@ impl BrokenInvariantsTracker {
             // `HostingManager` makes — see #4279 deferred follow-up to
             // add sqlite parity.
             #[cfg(feature = "redb")]
-            if let Some(storage) = self.storage.get() {
+            if let Some(storage) = self.storage.read().as_ref() {
                 if let Err(e) = storage.store_broken_invariant(&id, kind.to_byte()) {
                     tracing::warn!(
                         contract = %id,
@@ -127,22 +215,9 @@ impl BrokenInvariantsTracker {
     /// the previous flag if any.
     #[allow(dead_code)] // wired in follow-up PR
     pub fn clear(&self, id: &ContractInstanceId) -> Option<BrokenInvariant> {
-        let previous = self.flags.remove(id).map(|(_, v)| v);
+        let previous = self.flags.remove(id).map(|(_, v)| v.kind);
         if previous.is_some() {
-            #[cfg(feature = "redb")]
-            if let Some(storage) = self.storage.get() {
-                if let Err(e) = storage.remove_broken_invariant(id) {
-                    // Best-effort: in-memory is cleared regardless, but
-                    // warn loudly because a stale on-disk row will
-                    // re-flag on next restart.
-                    tracing::warn!(
-                        contract = %id,
-                        error = %e,
-                        "Cleared in-memory broken-invariant flag, but persistence remove failed — \
-                         flag will be re-loaded on next restart"
-                    );
-                }
-            }
+            self.remove_from_storage(id);
             tracing::warn!(
                 contract = %id,
                 event = "broken_invariant_cleared",
@@ -152,21 +227,80 @@ impl BrokenInvariantsTracker {
         previous
     }
 
-    /// Wire persistent storage. Called once at startup; idempotent on the
-    /// `OnceLock` so callers cannot accidentally re-init with a different
-    /// database. Hydrates the in-memory map from previously-persisted
-    /// entries on first wiring.
+    /// Sweep expired flags from the in-memory map (and best-effort from
+    /// storage). Hooked into the Ring reaper tick alongside the UPDATE rate
+    /// limiter's cleanup so expired suppressions are reclaimed promptly even
+    /// for contracts that are no longer being read on the hot path.
+    pub fn cleanup(&self) {
+        let now = self.time_source.now();
+        // Snapshot the currently-expired ids (read-only).
+        let candidates: Vec<ContractInstanceId> = self
+            .flags
+            .iter()
+            .filter(|e| {
+                now.saturating_duration_since(e.value().recorded_at) >= BROKEN_INVARIANT_TTL
+            })
+            .map(|e| *e.key())
+            .collect();
+        for id in candidates {
+            // Atomically re-check expiry under the shard guard and remove only
+            // if STILL expired. This closes a TOCTOU race: a concurrent
+            // `record()` (e.g. a probe re-detecting the same contract) may have
+            // refreshed `recorded_at` between the snapshot above and here — in
+            // which case `remove_if` keeps the fresh entry, and we must NOT
+            // purge its persisted row (a restart needs it to re-hydrate the
+            // active suppression). We only touch storage when we actually
+            // removed an expired entry.
+            let removed = self.flags.remove_if(&id, |_, entry| {
+                now.saturating_duration_since(entry.recorded_at) >= BROKEN_INVARIANT_TTL
+            });
+            if removed.is_some() {
+                self.remove_from_storage(&id);
+            }
+        }
+    }
+
+    /// Best-effort removal of a flag's persisted row. Shared by `clear` and
+    /// the expiry sweep so a stale row does not re-flag the contract on the
+    /// next restart.
+    fn remove_from_storage(&self, id: &ContractInstanceId) {
+        #[cfg(feature = "redb")]
+        if let Some(storage) = self.storage.read().as_ref() {
+            if let Err(e) = storage.remove_broken_invariant(id) {
+                tracing::warn!(
+                    contract = %id,
+                    error = %e,
+                    "Failed to remove persisted broken-invariant flag (in-memory flag already cleared)"
+                );
+            }
+        }
+        #[cfg(not(feature = "redb"))]
+        let _ = id;
+    }
+
+    /// Wire persistent storage. Called once at startup; ignores re-init so
+    /// callers cannot accidentally swap in a different database. Hydrates the
+    /// in-memory map from previously-persisted entries on first wiring.
+    ///
+    /// Loaded flags are stamped with the current time, so a node restart
+    /// gives each previously-flagged contract a fresh TTL window rather than
+    /// inheriting an unknown (and un-persisted) original timestamp.
     pub fn set_storage(&self, storage: Storage) {
-        if self.storage.set(storage.clone()).is_err() {
-            tracing::warn!("BrokenInvariantsTracker storage already set; ignoring re-init");
-            return;
+        {
+            let mut slot = self.storage.write();
+            if slot.is_some() {
+                tracing::warn!("BrokenInvariantsTracker storage already set; ignoring re-init");
+                return;
+            }
+            *slot = Some(storage.clone());
         }
         #[cfg(feature = "redb")]
         match storage.load_all_broken_invariants() {
             Ok(entries) => {
+                let recorded_at = self.time_source.now();
                 for (id, byte) in entries {
                     if let Some(kind) = BrokenInvariant::from_byte(byte) {
-                        self.flags.insert(id, kind);
+                        self.flags.insert(id, FlagEntry { kind, recorded_at });
                     } else {
                         tracing::warn!(
                             contract = %id,
@@ -185,11 +319,26 @@ impl BrokenInvariantsTracker {
             }
         }
     }
+
+    /// Drop the storage handle so its redb `Database` clone is released. Called
+    /// on node shutdown to help free the on-disk file lock (issue #4401). The
+    /// in-memory flags are left intact — only the persistence backing is
+    /// dropped, since the node is going away.
+    ///
+    /// Runs on the shutdown thread (`run_node`'s teardown) while `record` /
+    /// `remove_from_storage` run on the detached executor task. The write lock
+    /// taken here may briefly wait on an in-flight redb write held by those
+    /// readers, but cannot deadlock: the `RwLock` is non-reentrant and the
+    /// writer/readers are distinct tasks.
+    pub(crate) fn clear_storage(&self) {
+        *self.storage.write() = None;
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::time_source::SharedMockTimeSource;
 
     fn fake_id(seed: u8) -> ContractInstanceId {
         let mut bytes = [0u8; 32];
@@ -197,9 +346,14 @@ mod tests {
         ContractInstanceId::new(bytes)
     }
 
+    fn mk_tracker() -> (BrokenInvariantsTracker, SharedMockTimeSource) {
+        let ts = SharedMockTimeSource::new();
+        (BrokenInvariantsTracker::new(Arc::new(ts.clone())), ts)
+    }
+
     #[test]
     fn record_then_query_returns_true() {
-        let t = BrokenInvariantsTracker::new();
+        let (t, _ts) = mk_tracker();
         let id = fake_id(1);
         assert!(!t.is_broken(&id));
         t.record(id, BrokenInvariant::NonIdempotent);
@@ -209,7 +363,7 @@ mod tests {
 
     #[test]
     fn record_is_idempotent() {
-        let t = BrokenInvariantsTracker::new();
+        let (t, _ts) = mk_tracker();
         let id = fake_id(2);
         t.record(id, BrokenInvariant::NonIdempotent);
         t.record(id, BrokenInvariant::NonIdempotent);
@@ -219,7 +373,7 @@ mod tests {
 
     #[test]
     fn unrelated_contracts_unaffected() {
-        let t = BrokenInvariantsTracker::new();
+        let (t, _ts) = mk_tracker();
         let broken = fake_id(3);
         let healthy = fake_id(4);
         t.record(broken, BrokenInvariant::NonIdempotent);
@@ -229,7 +383,7 @@ mod tests {
 
     #[test]
     fn clear_returns_previous_and_unsets() {
-        let t = BrokenInvariantsTracker::new();
+        let (t, _ts) = mk_tracker();
         let id = fake_id(5);
 
         // Clearing an absent entry returns None and is a no-op.
@@ -247,6 +401,69 @@ mod tests {
 
         // Second clear is also a no-op, returns None.
         assert_eq!(t.clear(&id), None);
+    }
+
+    /// Regression test for #4295: a flag MUST NOT brick a contract forever.
+    /// After `BROKEN_INVARIANT_TTL` elapses, the flag expires so a false
+    /// positive self-heals and the contract resumes propagating.
+    #[test]
+    fn flag_expires_after_ttl() {
+        let (t, ts) = mk_tracker();
+        let id = fake_id(6);
+        t.record(id, BrokenInvariant::NonIdempotent);
+        assert!(t.is_broken(&id), "freshly recorded flag is active");
+
+        // Just before the TTL boundary it is still active.
+        ts.advance_time(BROKEN_INVARIANT_TTL - Duration::from_secs(1));
+        assert!(t.is_broken(&id), "flag still active just before TTL");
+
+        // Past the TTL boundary it has expired.
+        ts.advance_time(Duration::from_secs(2));
+        assert!(
+            !t.is_broken(&id),
+            "flag must expire after TTL so a false positive self-heals"
+        );
+        assert_eq!(t.get(&id), None, "expired flag reports no kind");
+    }
+
+    /// `cleanup` physically reclaims expired entries from the in-memory map.
+    #[test]
+    fn cleanup_reclaims_expired_entries() {
+        let (t, ts) = mk_tracker();
+        let id = fake_id(7);
+        t.record(id, BrokenInvariant::NonIdempotent);
+        assert_eq!(t.flags.len(), 1);
+
+        // Before expiry, cleanup keeps it.
+        ts.advance_time(BROKEN_INVARIANT_TTL / 2);
+        t.cleanup();
+        assert_eq!(t.flags.len(), 1, "non-expired entry retained by cleanup");
+
+        // After expiry, cleanup removes it.
+        ts.advance_time(BROKEN_INVARIANT_TTL);
+        t.cleanup();
+        assert_eq!(t.flags.len(), 0, "expired entry reclaimed by cleanup");
+    }
+
+    /// Re-recording refreshes the expiry window so a contract the probe keeps
+    /// re-detecting stays suppressed instead of flapping every TTL.
+    #[test]
+    fn record_refreshes_ttl() {
+        let (t, ts) = mk_tracker();
+        let id = fake_id(8);
+        t.record(id, BrokenInvariant::NonIdempotent);
+
+        // Advance most of the way through the TTL, then re-record.
+        ts.advance_time(BROKEN_INVARIANT_TTL - Duration::from_secs(1));
+        t.record(id, BrokenInvariant::NonIdempotent);
+
+        // Advance past where the ORIGINAL stamp would have expired; the
+        // refreshed stamp keeps it active.
+        ts.advance_time(Duration::from_secs(2));
+        assert!(
+            t.is_broken(&id),
+            "re-recording must refresh the expiry window"
+        );
     }
 
     #[test]

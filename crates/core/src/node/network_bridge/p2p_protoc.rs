@@ -27,12 +27,12 @@ use crate::node::network_bridge::handshake::{
 };
 use crate::node::network_bridge::priority_select;
 use crate::operations::connect::ConnectMsg;
-use crate::ring::Location;
 #[cfg(feature = "simulation_tests")]
 use crate::ring::PeerKey;
+use crate::ring::{Distance, Location};
 use crate::transport::{
-    CongestionControlConfig, ExpectedInboundTracker, PeerConnectionApi, Socket, TransportError,
-    TransportKeypair, TransportPublicKey, create_connection_handler,
+    BroadcastDeliveryOutcome, CongestionControlConfig, ExpectedInboundTracker, PeerConnectionApi,
+    Socket, TransportError, TransportKeypair, TransportPublicKey, create_connection_handler,
     global_bandwidth::GlobalBandwidthManager, peer_connection::StreamId,
 };
 use crate::{
@@ -40,7 +40,9 @@ use crate::{
     config::GlobalExecutor,
     contract::{ContractHandlerChannel, ExecutorTransactionStream, WaitingResolution},
     message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
-    node::{NetEventRegister, NodeConfig, OpManager, PeerId, process_message_decoupled},
+    node::{
+        NetEventRegister, NodeConfig, OpManager, PeerId, WaiterReply, process_message_decoupled,
+    },
     ring::{KnownPeerKeyLocation, PeerConnectionBackoff, PeerKeyLocation},
     tracing::NetEventLog,
 };
@@ -102,8 +104,10 @@ pub(crate) enum P2pBridgeEvent {
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
         /// Optional completion signal for broadcast queue concurrency control.
-        /// Signaled when the actual stream transfer finishes (not just enqueue).
-        completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        /// Signaled when the actual stream transfer finishes (not just enqueue),
+        /// carrying a [`BroadcastDeliveryOutcome`] so the queue distinguishes a
+        /// real delivery from a drop (#4235).
+        completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
     },
     /// Pipe an inbound stream to a target, forwarding fragments incrementally.
     PipeStream {
@@ -177,28 +181,31 @@ impl P2pBridge {
 
     /// Wake any drivers whose downstream peer just disconnected.
     ///
-    /// For each orphaned `tx` we emit
-    /// `NodeEvent::TransactionCompleted(tx)` via `try_send`. The event-
-    /// loop handler at `NodeEvent::TransactionCompleted` drops the
-    /// matching `pending_op_results` sender, which closes the channel
-    /// the driver is awaiting in `OpCtx::send_and_await`. The driver
-    /// then sees `Err(OpError::NotificationError)`; the shared retry
-    /// loop (`drive_retry_loop`) routes that to `advance()` and tries
-    /// the next peer.
+    /// For each orphaned tx, emit `NodeEvent::TransactionOrphaned`. The
+    /// event-loop handler delivers `WaiterReply::PeerDisconnected` into the
+    /// waiter channel *before* dropping the sender, so the parked driver
+    /// reads the cause deterministically and surfaces
+    /// `OpError::PeerDisconnected`, which the retry loop advances past to
+    /// the next peer (#4313).
     ///
-    /// Without this hop, a GET (or other relayed op) issued just before
-    /// its downstream peer disconnected would block for the full
-    /// `OPERATION_TTL` (60 s) before retrying — see #4154.
-    pub(crate) async fn handle_orphaned_transactions(&self, transactions: Vec<Transaction>) {
+    /// Without the wake at all, a GET issued just before its peer
+    /// disconnected stalls for `OPERATION_TTL` (60 s) — see #4154.
+    pub(crate) async fn handle_orphaned_transactions(
+        &self,
+        transactions: Vec<Transaction>,
+        disconnected_peer_addr: SocketAddr,
+    ) {
         if transactions.is_empty() {
             return;
         }
         tracing::debug!(
             count = transactions.len(),
+            peer = %disconnected_peer_addr,
             "Orphaned transactions from pruned connection — waking parked drivers"
         );
         for tx in transactions {
-            self.op_manager.try_release_pending_op_slot(tx);
+            self.op_manager
+                .notify_orphaned_transaction(tx, disconnected_peer_addr);
         }
     }
 
@@ -213,7 +220,7 @@ impl P2pBridge {
         stream_id: StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
-        completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
     ) -> super::ConnResult<()> {
         self.ev_listener_tx
             .send(P2pBridgeEvent::StreamSend {
@@ -389,6 +396,10 @@ struct ConnectionEntry {
     /// Used for zombie detection: connections not promoted to the ring
     /// within a timeout are considered zombies and dropped.
     created_at: Instant,
+    /// The remote peer's negotiated protocol version, if known.
+    /// `None` when the version wasn't exchanged (e.g. joiner->gateway path).
+    /// Used to gate version-dependent message types (e.g. SubscribeHint).
+    remote_version: Option<(u8, u8, u16)>,
 }
 
 /// Check whether a transport connection is a zombie: old enough but not
@@ -455,6 +466,95 @@ fn next_connection_id() -> u64 {
     NEXT_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The local-presence questions the `QueryNodeDiagnostics` handler asks the
+/// ring when building `contract_states`. Abstracted into a trait so the
+/// presence-filter logic in [`collect_contract_states`] can be unit-tested
+/// without standing up a full `Ring`/`OpManager` — the production handler
+/// passes `&op_manager.ring`, tests pass a fake oracle.
+trait ContractPresenceOracle {
+    fn is_hosting_contract(&self, key: &freenet_stdlib::prelude::ContractKey) -> bool;
+    fn is_subscribed(&self, key: &freenet_stdlib::prelude::ContractKey) -> bool;
+    fn hosting_contract_keys(&self) -> Vec<freenet_stdlib::prelude::ContractKey>;
+    fn hosting_contract_size(&self, key: &freenet_stdlib::prelude::ContractKey) -> u64;
+}
+
+impl ContractPresenceOracle for crate::ring::Ring {
+    fn is_hosting_contract(&self, key: &freenet_stdlib::prelude::ContractKey) -> bool {
+        crate::ring::Ring::is_hosting_contract(self, key)
+    }
+    fn is_subscribed(&self, key: &freenet_stdlib::prelude::ContractKey) -> bool {
+        crate::ring::Ring::is_subscribed(self, key)
+    }
+    fn hosting_contract_keys(&self) -> Vec<freenet_stdlib::prelude::ContractKey> {
+        crate::ring::Ring::hosting_contract_keys(self)
+    }
+    fn hosting_contract_size(&self, key: &freenet_stdlib::prelude::ContractKey) -> u64 {
+        crate::ring::Ring::hosting_contract_size(self, key)
+    }
+}
+
+/// Build the `contract_states` map for a `NodeDiagnostics` response.
+///
+/// When `contract_keys` is empty, returns ALL hosting contracts. When specific
+/// keys are provided, returns ONLY those the node has local presence for —
+/// hosts in its store, or holds an active subscription lease for. A requested
+/// key with neither is omitted (the `if !is_hosting && !is_subscribed`
+/// guard): the explicit-keys branch must NOT echo every requested key back as
+/// "present", or the response is useless as a local-presence signal and the
+/// web-subresource DoS gate (#3945, see `path_handlers::is_locally_known`)
+/// would treat every queried key as locally known. Absence here MUST mean
+/// "not locally present".
+fn collect_contract_states<O: ContractPresenceOracle + ?Sized>(
+    oracle: &O,
+    contract_keys: &[freenet_stdlib::prelude::ContractKey],
+) -> std::collections::HashMap<String, freenet_stdlib::client_api::ContractState> {
+    use freenet_stdlib::client_api::ContractState;
+
+    let mut states = std::collections::HashMap::new();
+    // stdlib 0.8.0 keyed contract_states by String
+    // (`fix!: stringify NodeDiagnosticsResponse.contract_states keys`).
+    if contract_keys.is_empty() {
+        for contract_key in oracle.hosting_contract_keys() {
+            let is_subscribed = oracle.is_subscribed(&contract_key);
+            let subscriber_count = if is_subscribed { 1 } else { 0 };
+            states.insert(
+                contract_key.to_string(),
+                ContractState {
+                    subscribers: subscriber_count as u32,
+                    subscriber_peer_ids: Vec::new(),
+                    size_bytes: oracle.hosting_contract_size(&contract_key),
+                },
+            );
+        }
+    } else {
+        for contract_key in contract_keys {
+            let is_hosting = oracle.is_hosting_contract(contract_key);
+            let is_subscribed = oracle.is_subscribed(contract_key);
+            // Only report a state entry for a contract the node actually has
+            // local presence for. Previously this branch inserted an entry for
+            // EVERY requested key unconditionally, which made `contract_states`
+            // claim the node hosted contracts it had never seen — and made the
+            // response useless as a local-presence signal. The web subresource
+            // DoS gate (#3945) relies on this being an accurate "do we know
+            // this contract locally" answer, so absence here must mean "not
+            // locally present".
+            if !is_hosting && !is_subscribed {
+                continue;
+            }
+            let subscriber_count = if is_subscribed { 1 } else { 0 };
+            states.insert(
+                contract_key.to_string(),
+                ContractState {
+                    subscribers: subscriber_count as u32,
+                    subscriber_peer_ids: Vec::new(),
+                    size_bytes: oracle.hosting_contract_size(contract_key),
+                },
+            );
+        }
+    }
+    states
+}
+
 pub(in crate::node) struct P2pConnManager {
     pub(in crate::node) gateways: Vec<PeerKeyLocation>,
     pub(in crate::node) bridge: P2pBridge,
@@ -503,7 +603,406 @@ pub(in crate::node) struct P2pConnManager {
     broadcast_queue: super::broadcast_queue::BroadcastQueue,
 }
 
+/// Minimum negotiated protocol version a peer must report before we send it a
+/// [`SubscribeHint`](crate::message::NetMessageV1::SubscribeHint).
+///
+/// DEACTIVATED after the v0.2.73 UPDATE-broadcast-degradation incident. Set to
+/// `(0, 3, 0)`, which is ABOVE every shipped 0.2.x release, so the gate
+/// (`remote.is_some_and(|v| v >= floor)`, fail-closed on unknown) evaluates to
+/// `false` for all 0.2.x peers and the placement-migration wire behavior never
+/// fires in production. The placement-migration path (directed subscribes plus
+/// the `ConsiderContractMigration` emits) amplified the #4145/#4231
+/// broadcast-backpressure surface and drove a network-wide UPDATE-broadcast
+/// degradation on 0.2.73. The migration code is intentionally left in place;
+/// re-enable it by LOWERING this floor back to the release that first ships a
+/// load-safe SubscribeHint once the broadcast-backpressure load issue is fixed.
+///
+/// Original (pre-deactivation) contract, still true mechanically: a peer is only
+/// sent SubscribeHint if its negotiated version is >= this; older peers cannot
+/// deserialize the new wire variant and would drop the connection. None (unknown,
+/// e.g. joiner->gateway) is treated as unsupported.
+///
+/// WHEN RE-ENABLING — UPDATE AT RELEASE TIME, then FREEZE: set this to the exact
+/// release version that first ships the load-safe SubscribeHint and do NOT keep
+/// bumping it afterward to track the crate version. Once shipped in release R,
+/// peers running R can deserialize the variant, so the floor must stay at R
+/// forever — raising it above R would silently stop sending hints to
+/// fully-capable R peers. (This is why there is no `floor` vs `CARGO_PKG_VERSION`
+/// unit test; see docs/RELEASING.md.)
+///
+/// This is a single non-cfg constant: deliberately NOT lowered under any test
+/// feature, because `testing` is pulled into the SHIPPED release binary (`fdev`
+/// depends on `freenet` with `features = ["testing"]` and the release builds
+/// `-p freenet -p fdev` together, unifying `testing` onto the freenet binary),
+/// so a cfg-gated test floor would defeat the wire-compat gate in production.
+/// Simulation tests that want the cascade lower the floor per-node at runtime via
+/// `NodeConfig::subscribe_hint_floor_override` (set by
+/// `SimNetwork::enable_placement_migration`), which never touches production.
+///
+/// `pub(crate)` so the INBOUND `SubscribeHint` receive handler in
+/// [`crate::node`] can share the same floor: the send-side gate alone is not
+/// enough, because a 0.2.74 node would otherwise still ACT on hints sent by a
+/// pre-floor 0.2.73 peer and keep the (deactivated) migration load alive during
+/// the staggered rollout.
+pub(crate) const SUBSCRIBE_HINT_MIN_VERSION: (u8, u8, u16) = (0, 3, 0);
+
+/// This node's own crate version as a `(major, minor, patch)` tuple, parsed at
+/// compile time from `CARGO_PKG_VERSION`.
+///
+/// Used by the INBOUND `SubscribeHint` receive gate (see [`crate::node`]) to ask
+/// "is the placement migration active for a node running THIS version?" via
+/// [`version_supports_subscribe_hint`]. With the floor parked at `(0, 3, 0)` and
+/// our own version on the 0.2.x line, the gate evaluates to "migration off →
+/// ignore inbound hints"; lowering the floor re-activates both the send and the
+/// receive side together.
+pub(crate) const fn own_crate_version() -> (u8, u8, u16) {
+    parse_crate_version(env!("CARGO_PKG_VERSION"))
+}
+
+/// `const` parser for `"X.Y.Z"` / `"X.Y.Z-pre"` into `(major, minor, patch)`.
+///
+/// Mirrors `connection_handler::parse_semver` (kept local so this gate does not
+/// reach into the transport module). Pre-release suffixes are ignored.
+const fn parse_crate_version(version: &str) -> (u8, u8, u16) {
+    let bytes = version.as_bytes();
+    let mut major = 0u8;
+    let mut minor = 0u8;
+    let mut patch = 0u16;
+    let mut state = 0u8; // 0: major, 1: minor, 2: patch
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if c == b'.' {
+            state += 1;
+        } else if c.is_ascii_digit() {
+            let digit = (c - b'0') as u16;
+            match state {
+                0 => major = (major as u16 * 10 + digit) as u8,
+                1 => minor = (minor as u16 * 10 + digit) as u8,
+                2 => patch = patch * 10 + digit,
+                _ => {}
+            }
+        } else {
+            break; // Pre-release suffix — ignored.
+        }
+        i += 1;
+    }
+    (major, minor, patch)
+}
+
+/// Pure version-gate decision, factored out so the comparison and the
+/// fail-closed-on-unknown-version (`None`) behavior are unit-testable with an
+/// explicit floor rather than the production [`SUBSCRIBE_HINT_MIN_VERSION`].
+///
+/// Returns `true` iff `remote` is known (`Some`) and at least `floor`. An
+/// unknown remote version is treated as unsupported: an older peer that cannot
+/// deserialize the appended `SubscribeHint` wire variant would drop the
+/// connection, so when in doubt we do not send the hint.
+///
+/// `pub(crate)` so the inbound `SubscribeHint` receive gate in [`crate::node`]
+/// can reuse the identical predicate (kept symmetric with the send side).
+pub(crate) fn version_supports_subscribe_hint(
+    remote: Option<(u8, u8, u16)>,
+    floor: (u8, u8, u16),
+) -> bool {
+    remote.is_some_and(|v| v >= floor)
+}
+
+/// Upper bound on the number of hosted contracts examined per new-peer
+/// migration trigger. Each examined contract may emit a best-effort
+/// non-blocking `try_send` (the SubscribeHint nudge), so an unbounded scan
+/// would still put O(hosted-contracts) work inline on the connection-handling
+/// path per connection (see `.claude/rules/channel-safety.md`). 32 keeps the
+/// per-event work bounded; remaining contracts are reconsidered on the next
+/// hosting/peer event.
+const MIGRATION_SCAN_CAP_PER_NEW_PEER: usize = 32;
+
+/// Pure selection core for directed-subscribe placement (#4404).
+///
+/// Given the contract's ring location, OUR distance to it (`my_dist`), the set
+/// of peers already known to host it, and an iterator over candidate
+/// neighbors, return the single best neighbor to nudge — or `None`.
+///
+/// A candidate qualifies iff it has a known socket address, a known ring
+/// location, is not already hosting (per `hosting`), and is STRICTLY closer to
+/// the contract than we are (`dist < my_dist`). Among qualifying candidates the
+/// closest wins; ties are broken deterministically by public-key bytes
+/// (`TransportPublicKey: Ord` compares `as_bytes()`), so the choice is
+/// reproducible regardless of iteration order.
+///
+/// Factored out of [`P2pConnManager::select_migration_target`] so the decision
+/// logic is unit-testable without constructing a full connection manager.
+fn pick_closest_migration_target<'a, I>(
+    contract_loc: Location,
+    my_dist: Distance,
+    hosting: &HashSet<TransportPublicKey>,
+    candidates: I,
+) -> Option<PeerKeyLocation>
+where
+    I: IntoIterator<Item = &'a PeerKeyLocation>,
+{
+    let mut best: Option<(Distance, &'a TransportPublicKey, &'a PeerKeyLocation)> = None;
+    for pkl in candidates {
+        if pkl.socket_addr().is_none() {
+            continue;
+        }
+        if hosting.contains(pkl.pub_key()) {
+            continue;
+        }
+        let Some(pkl_loc) = pkl.location() else {
+            continue;
+        };
+        let dist = contract_loc.distance(pkl_loc);
+        if dist >= my_dist {
+            continue;
+        }
+        let candidate_pk = pkl.pub_key();
+        let replace = match &best {
+            None => true,
+            Some((best_dist, best_pk, _)) => {
+                dist < *best_dist || (dist == *best_dist && candidate_pk < *best_pk)
+            }
+        };
+        if replace {
+            best = Some((dist, candidate_pk, pkl));
+        }
+    }
+    best.map(|(_, _, pkl)| pkl.clone())
+}
+
 impl P2pConnManager {
+    /// Whether the peer at `addr` reports a negotiated protocol version new
+    /// enough to understand [`SubscribeHint`](crate::message::NetMessageV1::SubscribeHint).
+    ///
+    /// `None` (unknown version) is treated as unsupported, since an older peer
+    /// would fail to deserialize the new wire variant and drop the connection.
+    fn peer_supports_subscribe_hint(&self, addr: &SocketAddr) -> bool {
+        let remote = self.connections.get(addr).and_then(|e| e.remote_version);
+        // Production floor, unless a sim test opted into the cascade by setting a
+        // per-node override (never set in production — see NodeConfig).
+        let floor = self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .subscribe_hint_floor_override()
+            .unwrap_or(SUBSCRIBE_HINT_MIN_VERSION);
+        version_supports_subscribe_hint(remote, floor)
+    }
+
+    /// Pick the single best peer to nudge into hosting `key`, or `None`.
+    ///
+    /// Directed-subscribe placement (#4404): we host `key` but a connected
+    /// neighbor may be strictly closer to the contract's key in the ring than
+    /// we are. Nudging that neighbor to subscribe-and-host migrates the
+    /// contract toward its ideal location. We pick ONLY the single closest
+    /// qualifying neighbor (not a fan-out), and ONLY when it is strictly
+    /// closer than us and not already hosting.
+    ///
+    /// A candidate qualifies iff it has a known socket address, a known ring
+    /// location, is not already hosting `key` (per neighbor-hosting state),
+    /// reports a protocol version new enough to understand `SubscribeHint`, and
+    /// is strictly closer to the contract location than we are. Returns the
+    /// qualifying candidate with the smallest distance to the contract, breaking
+    /// ties deterministically by public-key bytes.
+    ///
+    /// The version filter is applied HERE (before the pure selection core) so
+    /// that an old/unknown-version peer that happens to be closest does not
+    /// suppress migration: we fall through to the next-closest peer that CAN
+    /// receive the hint. This matters during a mixed-version rolling upgrade.
+    fn select_migration_target(
+        &self,
+        key: &freenet_stdlib::prelude::ContractKey,
+    ) -> Option<PeerKeyLocation> {
+        let contract_loc = Location::from(key);
+        let me = self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .own_location();
+        let my_dist = contract_loc.distance(me.location()?);
+
+        let hosting: HashSet<TransportPublicKey> = self
+            .bridge
+            .op_manager
+            .neighbor_hosting
+            .neighbors_with_contract(key)
+            .into_iter()
+            .collect();
+
+        let connections = self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .get_connections_by_location();
+
+        pick_closest_migration_target(
+            contract_loc,
+            my_dist,
+            &hosting,
+            connections
+                .values()
+                .flatten()
+                .map(|conn| &conn.location)
+                // Only peers that can understand the appended wire variant are
+                // eligible; a closer but too-old peer is skipped so the next
+                // eligible peer is chosen (mixed-version safety).
+                .filter(|pkl| {
+                    pkl.socket_addr()
+                        .is_some_and(|addr| self.peer_supports_subscribe_hint(&addr))
+                }),
+        )
+    }
+
+    /// Best-effort nudge for a single contract we host: if there is a closer,
+    /// non-hosting neighbor that understands `SubscribeHint`, tell it we are
+    /// the current holder so it can directed-subscribe and host `key`.
+    ///
+    /// No-op if we do not host `key` or if there is no qualifying target
+    /// (closer, non-hosting, AND version-supported — the selection skips peers
+    /// too old to understand the hint). Fire-and-forget and
+    /// NON-BLOCKING: the nudge is dispatched with `try_send`, so a congested
+    /// bridge channel drops the hint (logged at debug) rather than stalling the
+    /// connection-handling event loop — see `.claude/rules/channel-safety.md`.
+    /// Migration is reconsidered on the next hosting/peer event, so a dropped
+    /// hint is self-healing.
+    fn consider_contract_migration(&self, key: freenet_stdlib::prelude::ContractKey) {
+        if !self.bridge.op_manager.ring.is_hosting_contract(&key) {
+            return;
+        }
+        let Some(target) = self.select_migration_target(&key) else {
+            return;
+        };
+        let Some(addr) = target.socket_addr() else {
+            return;
+        };
+        // Defense-in-depth: `select_migration_target` already filters to
+        // version-supported peers, but re-gate here so a SubscribeHint can NEVER
+        // be sent to a peer too old to deserialize it (which would drop the
+        // connection) even if the selection path changes.
+        if !self.peer_supports_subscribe_hint(&addr) {
+            return;
+        }
+        // The migration target is a connected neighbor we just looked up and
+        // version-checked, so it resolves via `get_peer_by_addr`.
+        let Some(target_pkl) = self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .get_peer_by_addr(addr)
+        else {
+            return;
+        };
+        let me = self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .own_location();
+        let msg = NetMessage::V1(NetMessageV1::SubscribeHint(
+            crate::message::SubscribeHintMsg { key, holder: me },
+        ));
+        self.bridge
+            .op_manager
+            .sending_transaction(&target_pkl, &msg);
+        // Non-blocking dispatch: never `.send().await` from the event loop.
+        if let Err(e) = self
+            .bridge
+            .ev_listener_tx
+            .try_send(P2pBridgeEvent::Message(target_pkl, Box::new(msg)))
+        {
+            tracing::debug!(%addr, %key, error = %e, "SubscribeHint nudge dropped (bridge busy or closed)");
+        }
+    }
+
+    /// On gaining a new neighbor, reconsider migrating each contract we host.
+    ///
+    /// The new peer may be the closest non-hosting neighbor for some of our
+    /// contracts; `consider_contract_migration` recomputes the single best
+    /// target per contract, so we do not special-case `peer_addr` here beyond
+    /// an early skip when the new peer is not even closer than us. The number
+    /// of contracts examined per call is capped at
+    /// [`MIGRATION_SCAN_CAP_PER_NEW_PEER`] so we never do an unbounded inline
+    /// scan + nudge fan-out from the event loop (channel-safety).
+    fn consider_migration_for_new_peer(&self, peer_addr: SocketAddr) {
+        let new_peer_loc = self
+            .connections
+            .get(&peer_addr)
+            .and_then(|e| e.pub_key.as_ref())
+            .and_then(|pk| {
+                self.bridge
+                    .op_manager
+                    .ring
+                    .connection_manager
+                    .get_peer_by_addr(peer_addr)
+                    .filter(|p| p.pub_key() == pk)
+                    .and_then(|p| p.location())
+            })
+            .or_else(|| {
+                self.bridge
+                    .op_manager
+                    .ring
+                    .connection_manager
+                    .get_peer_by_addr(peer_addr)
+                    .and_then(|p| p.location())
+            });
+        let my_loc = self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .own_location()
+            .location();
+
+        let keys = self.bridge.op_manager.ring.hosting_contract_keys();
+        let total = keys.len();
+        if total == 0 {
+            return;
+        }
+        // Bound the per-event scan: examine at most
+        // MIGRATION_SCAN_CAP_PER_NEW_PEER keys even when most of them skip the
+        // cheap test below, so a node hosting thousands of contracts can't walk
+        // its entire hosting set on every new connection (unbounded work on the
+        // connection-handling path). A rotating start offset (the
+        // `migration_scan_cursor`) makes successive events cover different
+        // windows, so contracts past the cap are reached on later events rather
+        // than being starved in a fixed prefix.
+        let window = MIGRATION_SCAN_CAP_PER_NEW_PEER;
+        let start = self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .next_migration_scan_offset(window)
+            % total;
+        if total > window {
+            tracing::debug!(
+                cap = window,
+                total,
+                start,
+                %peer_addr,
+                "Capping migration scan for new peer; rotating window covers the rest on later events"
+            );
+        }
+        for i in 0..window.min(total) {
+            let key = keys[(start + i) % total];
+            // Optimization: if we know both locations and the new peer isn't
+            // strictly closer to this contract than we are, it can't become
+            // the migration target this contract gained from the new peer, so
+            // skip the full selection join.
+            if let (Some(new_loc), Some(my_loc)) = (new_peer_loc, my_loc) {
+                let contract_loc = Location::from(&key);
+                if contract_loc.distance(new_loc) >= contract_loc.distance(my_loc) {
+                    continue;
+                }
+            }
+            self.consider_contract_migration(key);
+        }
+    }
+
     pub(in crate::node) fn listening_port(&self) -> u16 {
         self.listening_port
     }
@@ -584,10 +1083,16 @@ impl P2pConnManager {
                 .network_api
                 .total_bandwidth_limit
                 .map(|total| {
-                    Arc::new(GlobalBandwidthManager::new(
+                    let manager = Arc::new(GlobalBandwidthManager::new(
                         total,
                         config.config.network_api.min_bandwidth_per_connection,
-                    ))
+                    ));
+                    // Phase 1.6 shadow telemetry (#4074): expose the
+                    // effective aggregate rate R to the demand aggregator.
+                    // Observation only — the manager is read, never written,
+                    // by the shadow side. See transport/shadow_demand.rs.
+                    crate::transport::shadow_demand::register_global_bandwidth(&manager);
+                    manager
                 }),
             ledbat_min_ssthresh: config.config.network_api.ledbat_min_ssthresh,
             congestion_config: config.config.network_api.build_congestion_config(),
@@ -1059,6 +1564,7 @@ impl P2pConnManager {
                                             }
                                             NetMessageV1::InterestSync { .. } => "InterestSync",
                                             NetMessageV1::ReadyState { .. } => "ReadyState",
+                                            NetMessageV1::SubscribeHint(_) => "SubscribeHint",
                                         },
                                     };
                                     match tokio::time::timeout(
@@ -1306,7 +1812,8 @@ impl P2pConnManager {
                                              cannot route stream fragment"
                                         );
                                         if let Some(tx) = completion_tx {
-                                            let _ignored = tx.send(());
+                                            let _ignored =
+                                                tx.send(BroadcastDeliveryOutcome::Dropped);
                                         }
                                     }
                                     Err(_timeout) => {
@@ -1319,7 +1826,8 @@ impl P2pConnManager {
                                              to keep event loop responsive"
                                         );
                                         if let Some(tx) = completion_tx {
-                                            let _ignored = tx.send(());
+                                            let _ignored =
+                                                tx.send(BroadcastDeliveryOutcome::Dropped);
                                         }
                                     }
                                 }
@@ -1331,9 +1839,10 @@ impl P2pConnManager {
                                     "No connection found for stream send target"
                                 );
                                 // Signal completion so the broadcast queue permit
-                                // is released immediately.
+                                // is released immediately. No connection means the
+                                // fragment was dropped, not delivered (#4235).
                                 if let Some(tx) = completion_tx {
-                                    let _ignored = tx.send(());
+                                    let _ignored = tx.send(BroadcastDeliveryOutcome::Dropped);
                                 }
                             }
                         }
@@ -1458,10 +1967,11 @@ impl P2pConnManager {
                                         // Note: In the simplified architecture (2026-01), subscriptions are lease-based
                                         // and don't require explicit pruning notifications. Just handle orphaned transactions.
 
-                                        // Handle orphaned transactions immediately (retry via alternate routes)
+                                        // Handle orphaned transactions immediately (retry via alternate routes).
                                         ctx.bridge
                                             .handle_orphaned_transactions(
                                                 prune_result.orphaned_transactions,
+                                                peer_addr,
                                             )
                                             .await;
 
@@ -1767,8 +2277,7 @@ impl P2pConnManager {
                             }
                             NodeEvent::QueryNodeDiagnostics { config, callback } => {
                                 use freenet_stdlib::client_api::{
-                                    ContractState, NetworkInfo, NodeDiagnosticsResponse, NodeInfo,
-                                    SystemMetrics,
+                                    NetworkInfo, NodeDiagnosticsResponse, NodeInfo, SystemMetrics,
                                 };
                                 use std::collections::HashMap;
 
@@ -1870,45 +2379,15 @@ impl P2pConnManager {
 
                                 // Collect contract states.
                                 // When contract_keys is empty, return ALL hosting contracts.
-                                // When specific keys are provided, return only those.
+                                // When specific keys are provided, return only those the
+                                // node has local presence for (see `collect_contract_states`
+                                // for the #3945 presence-filter rationale).
                                 // Note: subscriber_peer_ids is always empty because we use
                                 // lease-based subscriptions rather than explicit subscriber tracking.
-                                if config.contract_keys.is_empty() {
-                                    let hosting_contracts = op_manager.ring.hosting_contract_keys();
-                                    for contract_key in hosting_contracts {
-                                        let is_subscribed =
-                                            op_manager.ring.is_subscribed(&contract_key);
-                                        let subscriber_count = if is_subscribed { 1 } else { 0 };
-                                        // stdlib 0.8.0 keyed contract_states by String
-                                        // (`fix!: stringify NodeDiagnosticsResponse.contract_states keys`).
-                                        response.contract_states.insert(
-                                            contract_key.to_string(),
-                                            ContractState {
-                                                subscribers: subscriber_count as u32,
-                                                subscriber_peer_ids: Vec::new(),
-                                                size_bytes: op_manager
-                                                    .ring
-                                                    .hosting_contract_size(&contract_key),
-                                            },
-                                        );
-                                    }
-                                } else {
-                                    for contract_key in &config.contract_keys {
-                                        let is_subscribed =
-                                            op_manager.ring.is_subscribed(contract_key);
-                                        let subscriber_count = if is_subscribed { 1 } else { 0 };
-                                        response.contract_states.insert(
-                                            contract_key.to_string(),
-                                            ContractState {
-                                                subscribers: subscriber_count as u32,
-                                                subscriber_peer_ids: Vec::new(),
-                                                size_bytes: op_manager
-                                                    .ring
-                                                    .hosting_contract_size(contract_key),
-                                            },
-                                        );
-                                    }
-                                }
+                                response.contract_states = collect_contract_states(
+                                    op_manager.ring.as_ref(),
+                                    &config.contract_keys,
+                                );
 
                                 // Collect topology-backed connection info (exclude transient transports).
                                 let cm = &op_manager.ring.connection_manager;
@@ -2024,6 +2503,28 @@ impl P2pConnManager {
                                 // entries leak past op completion. Idempotent with
                                 // the `op_manager.completed(client_tx)` that
                                 // drivers call on terminal exit.
+                                ctx.bridge
+                                    .op_manager
+                                    .ring
+                                    .live_tx_tracker
+                                    .remove_finished_transaction(tx);
+                            }
+                            NodeEvent::TransactionOrphaned { tx, peer } => {
+                                // The awaited peer was pruned mid-flight (#4313).
+                                // Deliver the cause THROUGH the waiter channel
+                                // before the sender drops, so the parked driver's
+                                // recv() yields PeerDisconnected before None —
+                                // race-free, no side registry. Then clean up like
+                                // TransactionCompleted.
+                                state.tx_to_client.remove(&tx);
+                                if let Some(sender) = state.pending_op_results.remove(&tx) {
+                                    // Best-effort: a full channel means a real
+                                    // reply is already queued, a closed one means
+                                    // the driver already exited — both benign.
+                                    #[allow(clippy::let_underscore_must_use)]
+                                    let _ = sender.try_send(WaiterReply::PeerDisconnected { peer });
+                                    crate::config::GlobalTestMetrics::record_pending_op_remove();
+                                }
                                 ctx.bridge
                                     .op_manager
                                     .ring
@@ -2154,9 +2655,20 @@ impl P2pConnManager {
                                 graceful_shutdown = true;
                                 break;
                             }
-                            NodeEvent::BroadcastStateChange { key, new_state } => {
-                                ctx.handle_broadcast_state_change(&op_manager, key, new_state)
-                                    .await;
+                            NodeEvent::BroadcastStateChange {
+                                key,
+                                new_state,
+                                is_retry,
+                                is_reemit,
+                            } => {
+                                ctx.handle_broadcast_state_change(
+                                    &op_manager,
+                                    key,
+                                    new_state,
+                                    is_retry,
+                                    is_reemit,
+                                )
+                                .await;
                             }
                             NodeEvent::SyncStateToPeer {
                                 key,
@@ -2165,6 +2677,9 @@ impl P2pConnManager {
                             } => {
                                 ctx.handle_sync_state_to_peer(&op_manager, key, new_state, target)
                                     .await;
+                            }
+                            NodeEvent::ConsiderContractMigration { key } => {
+                                ctx.consider_contract_migration(key);
                             }
                         },
                     }
@@ -2231,9 +2746,9 @@ impl P2pConnManager {
             .prune_connection(PeerId::new(peer.pub_key().clone(), peer_addr))
             .await;
 
-        // Handle orphaned transactions immediately (retry via alternate routes)
+        // Handle orphaned transactions immediately (retry via alternate routes).
         self.bridge
-            .handle_orphaned_transactions(prune_result.orphaned_transactions)
+            .handle_orphaned_transactions(prune_result.orphaned_transactions, peer_addr)
             .await;
 
         // Broadcast unready if we dropped below the readiness threshold
@@ -2331,7 +2846,7 @@ impl P2pConnManager {
 
         // Handle orphaned transactions
         self.bridge
-            .handle_orphaned_transactions(prune_result.orphaned_transactions)
+            .handle_orphaned_transactions(prune_result.orphaned_transactions, peer_addr)
             .await;
 
         if prune_result.became_unready {
@@ -2706,6 +3221,10 @@ impl P2pConnManager {
                         );
                     }
                 }
+
+                // Directed-subscribe placement (#4404): the new neighbor may be
+                // the closest non-hosting peer for some contracts we host.
+                self.consider_migration_for_new_peer(peer_addr);
 
                 // Broadcast readiness if we just crossed the threshold
                 if just_became_ready {
@@ -3301,7 +3820,7 @@ impl P2pConnManager {
                     .prune_connection(PeerId::new(old_peer.pub_key().clone(), peer_addr))
                     .await;
                 self.bridge
-                    .handle_orphaned_transactions(prune_result.orphaned_transactions)
+                    .handle_orphaned_transactions(prune_result.orphaned_transactions, peer_addr)
                     .await;
                 if prune_result.became_unready {
                     // Deferred: broadcast after connection_manager borrow ends
@@ -3346,6 +3865,10 @@ impl P2pConnManager {
             }
         }
         let conn_id = next_connection_id();
+        // Capture the remote's negotiated protocol version BEFORE the connection
+        // is moved into the spawned listener task below. Used to gate
+        // version-dependent message types (e.g. SubscribeHint).
+        let remote_version = connection.remote_version();
         let (tx, rx) = mpsc::channel(10);
         tracing::debug!(
             self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key,
@@ -3364,6 +3887,7 @@ impl P2pConnManager {
                 pub_key: peer_id.as_ref().map(|p| p.pub_key().clone()),
                 connection_id: conn_id,
                 created_at: Instant::now(),
+                remote_version,
             },
         );
         // Only add to reverse lookup if we know the pub_key
@@ -3527,6 +4051,10 @@ impl P2pConnManager {
                         );
                     }
                 }
+
+                // Directed-subscribe placement (#4404): the new neighbor may be
+                // the closest non-hosting peer for some contracts we host.
+                self.consider_migration_for_new_peer(peer_addr);
 
                 // Broadcast readiness if we just crossed the threshold (deferred)
                 if just_became_ready {
@@ -3746,7 +4274,10 @@ impl P2pConnManager {
 
                     // Handle orphaned transactions immediately (retry via alternate routes)
                     self.bridge
-                        .handle_orphaned_transactions(prune_result.orphaned_transactions)
+                        .handle_orphaned_transactions(
+                            prune_result.orphaned_transactions,
+                            remote_addr,
+                        )
                         .await;
 
                     if prune_result.became_unready {
@@ -4219,12 +4750,50 @@ impl P2pConnManager {
         op_manager: &Arc<OpManager>,
         key: freenet_stdlib::prelude::ContractKey,
         new_state: freenet_stdlib::prelude::WrappedState,
+        // `false` for a fresh executor-emitted broadcast, `true` for a
+        // no-target retry re-emission this handler scheduled. Used only to
+        // count fresh logical broadcasts once for the #4281 summary.
+        is_retry: bool,
+        // `true` when this is a deferred re-emission of a stashed fresh-contract
+        // broadcast (issue #4359). Suppresses re-recording a `no_targets`
+        // propagation-summary event on give-up (the originating PUT already
+        // counted one when it first gave up) so a flush per interested peer
+        // does not inflate the #4281 stats.
+        is_reemit: bool,
     ) {
         tracing::debug!(
             contract = %key,
             state_size = new_state.size(),
             "BroadcastStateChange event received"
         );
+
+        // Phase 7 egress self-block (#4300). A locally-applied UPDATE
+        // (e.g. delegate-driven) drives this fan-out to subscribers who
+        // don't know about our ban. If we have banned the contract, skip
+        // the fan-out entirely — and the no-target retry re-emission with
+        // it — rather than push state for a contract we have decided is
+        // harmful. There is no client to notify here (this is the
+        // fire-and-forget broadcast path), so we skip with a debug log
+        // instead of returning a typed error. Complements the
+        // client-originated UPDATE gate in `start_client_update` and the
+        // receive-side `UpdateMsg::*` drop in node.rs (PR #4299).
+        if op_manager.ring.contract_ban_list.is_banned(key.id()) {
+            tracing::debug!(
+                contract = %key,
+                phase = "broadcast_state_change_banned_skip",
+                "skipping state-change broadcast for banned contract"
+            );
+            // Drop any in-flight retry/streak bookkeeping for this
+            // contract: if it was banned mid-retry-cycle, a previously
+            // scheduled re-emission would otherwise leave a stale entry
+            // here that nothing clears until the contract is unbanned and
+            // broadcast again. Mirrors the cleanup the targets-found and
+            // retries-exhausted paths perform.
+            self.broadcast_retries.remove(&key);
+            self.broadcast_no_target_streak.remove(&key);
+            return;
+        }
+
         let self_addr = op_manager.ring.connection_manager.get_own_addr();
         let Some(self_addr) = self_addr else {
             tracing::warn!(
@@ -4243,6 +4812,32 @@ impl P2pConnManager {
         );
 
         if target_result.targets.is_empty() {
+            // Record the NO_TARGETS outcome once per *fresh* no-target broadcast
+            // for the #4281 summary, but NOT for retry re-emissions. Gating on
+            // `is_retry` (carried on the event) rather than the per-contract
+            // `broadcast_retries` counter is what makes the count accurate:
+            // retries and fresh broadcasts share that counter, so a fresh
+            // broadcast arriving mid-retry-cycle would otherwise be absorbed
+            // and uncounted (Codex P2). With the explicit flag, every fresh
+            // no-target broadcast is counted exactly once and retries never
+            // double-count. If a later retry heals (finds targets), the
+            // targets-found path below additionally records that success — both
+            // the initial miss and the eventual propagation are surfaced.
+            //
+            // `is_reemit` (issue #4359) is also excluded: a deferred re-emission
+            // of a stashed fresh-contract broadcast that STILL finds no targets
+            // must not re-record a `no_targets` event — the originating PUT
+            // already counted one when it first gave up, and counting again per
+            // interested-peer flush would inflate the #4281 no_targets/targets_avg
+            // stats.
+            if !is_retry && !is_reemit {
+                op_manager.update_propagation_stats.record_broadcast(
+                    *key.id(),
+                    0,
+                    target_result.interest_resolve_failed,
+                );
+            }
+
             let retry_count = self.broadcast_retries.entry(key).or_insert(0);
             if *retry_count < Self::MAX_BROADCAST_RETRIES {
                 *retry_count += 1;
@@ -4279,6 +4874,8 @@ impl P2pConnManager {
                         .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
                             key,
                             new_state,
+                            is_retry: true,
+                            is_reemit: false,
                         })
                         .await
                     {
@@ -4293,6 +4890,65 @@ impl P2pConnManager {
                 // Retries exhausted. Track consecutive no-target cycles to
                 // suppress repetitive WARN logging after the first occurrence.
                 self.broadcast_retries.remove(&key);
+
+                // Issue #4359: a fresh contract id loses the race between this
+                // broadcast give-up (~6 s) and the much slower interest/
+                // subscription resolve for a never-before-seen key. Instead of
+                // permanently abandoning the state — which silently leaves it
+                // locally-hosted only while every other node GETs NotFound —
+                // stash it. When the first interested peer/subscriber for this
+                // contract appears later, the interest path drains the stash
+                // and re-emits a single BroadcastStateChange, which then finds
+                // the freshly-registered target and propagates. The store is
+                // bounded by size and TTL so a churn of fresh ids that never
+                // gain a subscriber cannot pin memory.
+                op_manager
+                    .pending_broadcasts
+                    .stash(*key.id(), new_state.clone());
+
+                // Lost-wakeup guard (#4359 re-review): stash() runs here on the
+                // event-loop task while the interest-resolve flush runs on the
+                // subscribe/op driver task — they are concurrent with no
+                // happens-before. An interested peer could have registered (and
+                // already flushed → found nothing to take) in the window between
+                // `get_broadcast_targets_update` above and this stash. That would
+                // leave the state stashed with the only interested peer already
+                // past its flush, draining nothing until the NEXT subscriber or
+                // the TTL. Re-resolve targets now that the stash is in place: if a
+                // target has appeared, take the stash back and re-emit
+                // immediately rather than waiting on a future flush.
+                let recheck = op_manager.get_broadcast_targets_update(&key, &self_addr);
+                if !recheck.targets.is_empty() {
+                    if let Some(stashed) = op_manager.pending_broadcasts.take(key.id()) {
+                        tracing::debug!(
+                            contract = %key,
+                            target_count = recheck.targets.len(),
+                            phase = "pending_broadcast_stash_recheck",
+                            "A target appeared while giving up; re-emitting the deferred \
+                             fresh-contract broadcast immediately instead of leaving it \
+                             stashed for a future flush (#4359)"
+                        );
+                        if let Err(e) = op_manager.try_notify_node_event(
+                            crate::message::NodeEvent::BroadcastStateChange {
+                                key,
+                                new_state: stashed.clone(),
+                                is_retry: false,
+                                is_reemit: true,
+                            },
+                        ) {
+                            // Channel full/closed: re-stash so the next interest
+                            // flush still recovers it. Losing it would re-open the
+                            // locally-hosted-only failure this fix closes.
+                            op_manager.pending_broadcasts.stash(*key.id(), stashed);
+                            tracing::debug!(
+                                contract = %key,
+                                error = %e,
+                                "pending_broadcast_stash_recheck: immediate re-emit dropped; \
+                                 re-stashed for the next interest signal"
+                            );
+                        }
+                    }
+                }
 
                 // Evict oldest entry if at capacity to prevent unbounded growth.
                 if !self.broadcast_no_target_streak.contains_key(&key)
@@ -4342,6 +4998,11 @@ impl P2pConnManager {
                             .await;
                     }
                 }
+                // The NO_TARGETS outcome was already recorded for the #4281
+                // summary at the start of this retry cycle (retry_count == 0
+                // above); retry exhaustion does not record again, so a stuck
+                // contract counts as one no_targets per fresh broadcast, not
+                // once per retry.
             }
             return;
         }
@@ -4349,6 +5010,22 @@ impl P2pConnManager {
         // Targets found - clear any pending retry and streak state for this contract
         self.broadcast_retries.remove(&key);
         self.broadcast_no_target_streak.remove(&key);
+        // Also drop any deferred re-broadcast stash (#4359): this fan-out is
+        // reaching targets now, so a previously-abandoned state for this
+        // contract is superseded and must not be re-emitted later as stale.
+        let _ = op_manager.pending_broadcasts.take(key.id());
+
+        // Record a successful fan-out for the #4281 propagation summary. Fires
+        // whether targets were found on the initial attempt or on a healing
+        // retry, so a recovered in-flight-subscription race is surfaced as a
+        // propagated update (with its real target count). A fresh broadcast
+        // that found targets on the first try has no `broadcast_retries` entry,
+        // so it is recorded exactly once here.
+        op_manager.update_propagation_stats.record_broadcast(
+            *key.id(),
+            target_result.targets.len(),
+            target_result.interest_resolve_failed,
+        );
 
         // In production, enqueue each target into the broadcast queue.
         // The queue worker handles delta computation and streaming with bounded
@@ -4466,6 +5143,19 @@ impl P2pConnManager {
         new_state: freenet_stdlib::prelude::WrappedState,
         target_result: crate::operations::update::BroadcastTargetResult,
     ) {
+        // Skip the whole fan-out when we hold no local state for `key`: there is
+        // nothing to broadcast, and the per-target `get_contract_summary` calls
+        // below are the residual #4473 summarize storm on this path. Mirrors the
+        // production `broadcast_to_single_peer` gate. See
+        // `broadcast_queue::should_broadcast_contract`.
+        if !super::broadcast_queue::should_broadcast_contract(op_manager, &key) {
+            tracing::trace!(
+                contract = %key,
+                "Skipping broadcast fan-out - contract not hosted or in use"
+            );
+            return;
+        }
+
         // Get our summary once for all targets
         let our_summary = op_manager
             .interest_manager
@@ -4619,21 +5309,37 @@ impl P2pConnManager {
                     }
                 };
                 let send_res = bridge.send(peer_addr, net_msg).await;
-                if send_res.is_ok() {
-                    // Send the stream data after the metadata message
-                    if let Err(err) = bridge
-                        .send_stream(peer_addr, sid, bytes::Bytes::from(payload_bytes), metadata)
-                        .await
-                    {
-                        tracing::warn!(
-                            tx = %update_tx,
-                            peer = %peer_addr,
-                            error = %err,
-                            "Failed to send broadcast stream data"
-                        );
+                match send_res {
+                    Ok(()) => {
+                        // The metadata message went out; the streamed full state is
+                        // the actual payload. The success arm below caches
+                        // `our_summary` for this peer (FIX 1 of #4145), which is only
+                        // correct if the STATE was sent — so this branch's result must
+                        // reflect the stream send, not just the metadata send. If
+                        // `send_stream` fails, a streamed full state that never landed
+                        // would otherwise be marked as delivered, recreating the
+                        // #2763/#4235 divergence hazard (a wrongly-cached summary makes
+                        // the next delta unappliable). Propagate the stream-send error.
+                        bridge
+                            .send_stream(
+                                peer_addr,
+                                sid,
+                                bytes::Bytes::from(payload_bytes),
+                                metadata,
+                            )
+                            .await
+                            .inspect_err(|err| {
+                                tracing::warn!(
+                                    tx = %update_tx,
+                                    peer = %peer_addr,
+                                    error = %err,
+                                    "Failed to send broadcast stream data"
+                                );
+                            })
                     }
+                    // Metadata send failed; nothing was streamed. Propagate the error.
+                    Err(err) => Err(err),
                 }
-                send_res
             } else {
                 let msg = crate::operations::update::UpdateMsg::BroadcastTo {
                     id: update_tx,
@@ -4678,13 +5384,35 @@ impl P2pConnManager {
                 op_manager
                     .interest_manager
                     .refresh_peer_interest(&key, &peer_key);
-            }
 
-            // PR #2763 FIX: Only update cached summary when we sent a delta.
-            // This is separate from the TTL refresh above — update_peer_summary
-            // sets the cached summary (used for delta computation), while
-            // refresh_peer_interest only extends the TTL.
-            if sent_delta {
+                // Issue #4145: Cache the peer summary on ANY successful broadcast
+                // send — delta OR full state — not just deltas. Separate from the
+                // TTL refresh above: update_peer_summary sets the cached summary
+                // (used for delta computation), refresh_peer_interest only extends
+                // the TTL.
+                //
+                // PR #2763 originally gated this on `sent_delta`, which created a
+                // chicken-and-egg: a delta needs the peer's cached summary, but the
+                // summary was only cached after a delta — so every NEW subscriber
+                // (or a peer whose summary was cleared) starts on full state and is
+                // trapped sending full state forever. Under sustained fan-out that
+                // is the #4233 full-state broadcast storm.
+                //
+                // Safe now because this runs only inside the send-success (`else`)
+                // arm. This is the inline non-streaming `BroadcastTo` path: a
+                // successful `bridge.send` is the terminal state we can observe
+                // (the same assumption the delta path already made). Caching on a
+                // delivered broadcast is safe even when the cache is momentarily
+                // wrong: a wrongly-cached summary is corrected by the periodic
+                // InterestSync summary exchange (~5 min, node.rs) and by the
+                // delta-apply-failure → ResyncRequest path that clears the
+                // sender's cached summary (node.rs ~2119). Caching here lets the
+                // NEXT broadcast to this peer be a small delta. The streaming
+                // (full-state) path is gated more strictly on a `Delivered`
+                // completion (#4235) in `broadcast_queue.rs` — note that signal is
+                // sender-side completion, not a receiver ack, so a lost stream
+                // tail is covered by the same two backstops.
+                // (Telemetry above still records delta-vs-full-state separately.)
                 if let Some(summary) = &our_summary {
                     op_manager.interest_manager.update_peer_summary(
                         &key,
@@ -4747,7 +5475,7 @@ struct EventListenerState {
     client_waiting_transaction: Vec<(WaitingTransaction, HashSet<ClientId>)>,
     awaiting_connection: HashMap<SocketAddr, Vec<Box<dyn ConnectResultSender>>>,
     awaiting_connection_txs: HashMap<SocketAddr, Vec<Transaction>>,
-    pending_op_results: HashMap<Transaction, Sender<NetMessage>>,
+    pending_op_results: HashMap<Transaction, Sender<WaiterReply>>,
     /// Last time pending_op_results was scanned for closed senders.
     last_pending_op_cleanup: Instant,
     /// Per-peer backoff tracking for failed connection attempts.
@@ -4824,8 +5552,9 @@ pub(super) enum ConnEvent {
         stream_id: StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
-        /// Optional completion signal for broadcast queue concurrency control.
-        completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        /// Optional completion signal for broadcast queue concurrency control,
+        /// carrying a [`BroadcastDeliveryOutcome`] (#4235).
+        completion_tx: Option<tokio::sync::oneshot::Sender<BroadcastDeliveryOutcome>>,
     },
     /// Pipe an inbound stream to a peer, forwarding fragments as they arrive.
     /// Used for low-latency forwarding at intermediate nodes.
@@ -5287,7 +6016,8 @@ fn extract_sender_from_message(msg: &NetMessage) -> Option<PeerKeyLocation> {
             NetMessageV1::Aborted(_)
             | NetMessageV1::NeighborHosting { .. }
             | NetMessageV1::InterestSync { .. }
-            | NetMessageV1::ReadyState { .. } => None,
+            | NetMessageV1::ReadyState { .. }
+            | NetMessageV1::SubscribeHint(_) => None,
         },
     }
 }
@@ -5305,7 +6035,8 @@ fn extract_sender_from_message_mut(msg: &mut NetMessage) -> Option<&mut PeerKeyL
             NetMessageV1::Aborted(_)
             | NetMessageV1::NeighborHosting { .. }
             | NetMessageV1::InterestSync { .. }
-            | NetMessageV1::ReadyState { .. } => None,
+            | NetMessageV1::ReadyState { .. }
+            | NetMessageV1::SubscribeHint(_) => None,
         },
     }
 }
@@ -5319,6 +6050,324 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::mpsc;
     use tokio::time::{Duration, Instant, sleep, timeout};
+
+    /// A fake [`super::ContractPresenceOracle`] for testing
+    /// [`super::collect_contract_states`] without standing up a real `Ring`.
+    /// `hosting` and `subscribed` are the sets the node "knows"; everything
+    /// else is locally unknown.
+    struct FakePresence {
+        hosting: std::collections::HashSet<freenet_stdlib::prelude::ContractKey>,
+        subscribed: std::collections::HashSet<freenet_stdlib::prelude::ContractKey>,
+    }
+
+    impl super::ContractPresenceOracle for FakePresence {
+        fn is_hosting_contract(&self, key: &freenet_stdlib::prelude::ContractKey) -> bool {
+            self.hosting.contains(key)
+        }
+        fn is_subscribed(&self, key: &freenet_stdlib::prelude::ContractKey) -> bool {
+            self.subscribed.contains(key)
+        }
+        fn hosting_contract_keys(&self) -> Vec<freenet_stdlib::prelude::ContractKey> {
+            self.hosting.iter().copied().collect()
+        }
+        fn hosting_contract_size(&self, _key: &freenet_stdlib::prelude::ContractKey) -> u64 {
+            42
+        }
+    }
+
+    fn contract_key_from_seed(seed: u8) -> freenet_stdlib::prelude::ContractKey {
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+        let mut bytes = [0u8; 32];
+        bytes[0] = seed;
+        ContractKey::from_id_and_code(ContractInstanceId::new(bytes), CodeHash::new([0u8; 32]))
+    }
+
+    /// Regression for the `QueryNodeDiagnostics` explicit-`contract_keys`
+    /// presence filter (companion to the #3945 web-subresource DoS gate).
+    ///
+    /// When the handler is asked about specific keys, `contract_states` must
+    /// contain ONLY the keys the node actually has local presence for (hosts
+    /// or subscribes) and must OMIT a requested key it neither hosts nor
+    /// subscribes to. This is the `if !is_hosting && !is_subscribed { continue }`
+    /// guard inside [`super::collect_contract_states`], which
+    /// `path_handlers::is_locally_known` depends on: without it the handler
+    /// would echo EVERY requested key back as "present", so the gate would
+    /// treat every queried key as locally known and the DoS protection would
+    /// be defeated. Load-bearing: reverting the guard to an unconditional
+    /// insert makes the `unknown` assertion below fail.
+    #[test]
+    fn collect_contract_states_filters_unknown_explicit_keys() {
+        let hosted = contract_key_from_seed(0x01);
+        let subscribed = contract_key_from_seed(0x02);
+        let unknown = contract_key_from_seed(0x03);
+
+        let oracle = FakePresence {
+            hosting: std::iter::once(hosted).collect(),
+            subscribed: std::iter::once(subscribed).collect(),
+        };
+
+        // Ask explicitly about all three: one hosted, one subscribed, one
+        // neither. The neither-key must be filtered out of the response.
+        let states = super::collect_contract_states(&oracle, &[hosted, subscribed, unknown]);
+
+        assert!(
+            states.contains_key(&hosted.to_string()),
+            "a hosted key must be reported as present (positive control)"
+        );
+        assert!(
+            states.contains_key(&subscribed.to_string()),
+            "a subscribed key must be reported as present (positive control)"
+        );
+        assert!(
+            !states.contains_key(&unknown.to_string()),
+            "a key the node neither hosts nor subscribes to MUST be omitted — \
+             reporting it would defeat the #3945 local-presence gate"
+        );
+        assert_eq!(
+            states.len(),
+            2,
+            "only the two locally-present keys may appear in contract_states"
+        );
+    }
+
+    /// The empty-`contract_keys` branch of [`super::collect_contract_states`]
+    /// still enumerates ALL hosting contracts (the pre-existing "dump
+    /// everything" behavior the presence filter must NOT regress). Guards
+    /// against a fix that over-filters and drops the empty-query enumeration.
+    #[test]
+    fn collect_contract_states_empty_query_returns_all_hosting() {
+        let a = contract_key_from_seed(0x11);
+        let b = contract_key_from_seed(0x12);
+        let oracle = FakePresence {
+            hosting: [a, b].into_iter().collect(),
+            subscribed: std::collections::HashSet::new(),
+        };
+
+        let states = super::collect_contract_states(&oracle, &[]);
+        assert_eq!(
+            states.len(),
+            2,
+            "empty query must dump all hosting contracts"
+        );
+        assert!(states.contains_key(&a.to_string()));
+        assert!(states.contains_key(&b.to_string()));
+    }
+
+    mod version_gate {
+        use super::super::{SUBSCRIBE_HINT_MIN_VERSION, version_supports_subscribe_hint};
+
+        const FLOOR: (u8, u8, u16) = (0, 2, 73);
+
+        // NOTE: there is deliberately NO test asserting the floor relative to
+        // CARGO_PKG_VERSION. The floor must be set to the EXACT release that
+        // first ships SubscribeHint and then FROZEN; the crate version keeps
+        // climbing afterward, so any `floor >= crate_version` / `floor <=
+        // crate_version` assertion would false-fail on a later release and
+        // invite the wrong "fix" (bumping the floor above the ship version,
+        // silently cutting off capable peers). The release coupling is enforced
+        // by docs/RELEASING.md + the const's "UPDATE AT RELEASE TIME" doc, not a
+        // unit test.
+
+        #[test]
+        fn unknown_remote_version_fails_closed() {
+            // A peer whose negotiated version we never captured (e.g. the
+            // joiner->gateway path) must NOT be sent the appended wire variant.
+            assert!(!version_supports_subscribe_hint(None, FLOOR));
+        }
+
+        #[test]
+        fn older_remote_version_is_rejected() {
+            assert!(!version_supports_subscribe_hint(Some((0, 2, 72)), FLOOR));
+            assert!(!version_supports_subscribe_hint(Some((0, 1, 99)), FLOOR));
+        }
+
+        #[test]
+        fn equal_or_newer_remote_version_is_accepted() {
+            // Exactly at the floor qualifies.
+            assert!(version_supports_subscribe_hint(Some((0, 2, 73)), FLOOR));
+            // Strictly newer (patch, minor, major) qualifies.
+            assert!(version_supports_subscribe_hint(Some((0, 2, 74)), FLOOR));
+            assert!(version_supports_subscribe_hint(Some((0, 3, 0)), FLOOR));
+            assert!(version_supports_subscribe_hint(Some((1, 0, 0)), FLOOR));
+        }
+
+        #[test]
+        fn tuple_ordering_is_major_then_minor_then_patch() {
+            // (0,3,0) >= (0,2,73) even though its patch is smaller: minor wins.
+            assert!(version_supports_subscribe_hint(Some((0, 3, 0)), FLOOR));
+            // A zero floor accepts any known version but still fails closed on None
+            // (this is the simulation/test floor behavior).
+            assert!(version_supports_subscribe_hint(Some((0, 0, 0)), (0, 0, 0)));
+            assert!(!version_supports_subscribe_hint(None, (0, 0, 0)));
+        }
+
+        /// Pin the PRODUCTION constant (not the local `FLOOR`): with
+        /// `SUBSCRIBE_HINT_MIN_VERSION` parked at `(0, 3, 0)` the placement
+        /// migration is dormant for EVERY shipped 0.2.x peer — both the lowest
+        /// shipped patch and any conceivable future 0.2.x — and stays fail-closed
+        /// on an unknown version. If someone lowers the floor to a 0.2.x release
+        /// (silently re-enabling the migration disabled in v0.2.74), this test
+        /// fails. See docs/RELEASING.md and issue #4145.
+        #[test]
+        fn placement_migration_deactivated_for_all_0_2_x() {
+            assert!(!version_supports_subscribe_hint(
+                Some((0, 2, 73)),
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+            assert!(!version_supports_subscribe_hint(
+                Some((0, 2, 255)),
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+            assert!(!version_supports_subscribe_hint(
+                None,
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+        }
+    }
+
+    mod migration_selection {
+        use super::super::pick_closest_migration_target;
+        use crate::ring::{Location, PeerKeyLocation};
+        use crate::transport::TransportPublicKey;
+        use std::collections::HashSet;
+        use std::net::SocketAddr;
+
+        /// Build a `PeerKeyLocation` with a deterministic public key (so the
+        /// tie-break is reproducible) and the given socket address (which
+        /// determines its ring `location()`).
+        fn pkl(pk_byte: u8, addr: &str) -> PeerKeyLocation {
+            let pub_key = TransportPublicKey::from_bytes([pk_byte; 32]);
+            let addr: SocketAddr = addr.parse().expect("valid socket addr");
+            PeerKeyLocation::new(pub_key, addr)
+        }
+
+        /// Distance from the contract location to a candidate's ring location.
+        fn dist_to(contract: Location, p: &PeerKeyLocation) -> crate::ring::Distance {
+            contract.distance(p.location().expect("known location"))
+        }
+
+        #[test]
+        fn picks_strictly_closest_non_hosting_candidate() {
+            let contract = Location::new(0.5);
+            // Three candidates at distinct ring locations.
+            let a = pkl(1, "10.0.0.1:1000");
+            let b = pkl(2, "10.0.0.2:1000");
+            let c = pkl(3, "10.0.0.3:1000");
+            let candidates = [a.clone(), b.clone(), c.clone()];
+
+            // Identify which candidate is actually closest to `contract`.
+            let closest = candidates
+                .iter()
+                .min_by_key(|p| dist_to(contract, p))
+                .unwrap()
+                .clone();
+
+            // `my_dist` is larger than every candidate's distance, so all
+            // qualify and the single closest must be chosen.
+            let my_dist = candidates
+                .iter()
+                .map(|p| dist_to(contract, p))
+                .max()
+                .unwrap();
+            // Make `my_dist` strictly larger than all candidates so each is
+            // strictly closer than us.
+            let my_dist = crate::ring::Distance::new(my_dist.as_f64() + 0.01);
+
+            let hosting = HashSet::new();
+            let chosen = pick_closest_migration_target(contract, my_dist, &hosting, &candidates)
+                .expect("a qualifying candidate exists");
+            assert_eq!(
+                chosen.pub_key(),
+                closest.pub_key(),
+                "must pick the candidate closest to the contract location"
+            );
+        }
+
+        #[test]
+        fn excludes_candidates_not_closer_than_us() {
+            let contract = Location::new(0.5);
+            let a = pkl(1, "10.0.0.1:1000");
+            let candidates = [a.clone()];
+            // `my_dist` smaller than the candidate's distance → it does NOT
+            // qualify (not strictly closer than us).
+            let my_dist = crate::ring::Distance::new(dist_to(contract, &a).as_f64() - 0.0001);
+            let hosting = HashSet::new();
+            assert!(
+                pick_closest_migration_target(contract, my_dist, &hosting, &candidates).is_none(),
+                "a candidate no closer than us must be excluded"
+            );
+        }
+
+        #[test]
+        fn excludes_already_hosting_candidates() {
+            let contract = Location::new(0.5);
+            let a = pkl(1, "10.0.0.1:1000");
+            let candidates = [a.clone()];
+            let my_dist = crate::ring::Distance::new(dist_to(contract, &a).as_f64() + 0.01);
+            let mut hosting = HashSet::new();
+            hosting.insert(a.pub_key().clone());
+            assert!(
+                pick_closest_migration_target(contract, my_dist, &hosting, &candidates).is_none(),
+                "a candidate already hosting the contract must be excluded"
+            );
+        }
+
+        #[test]
+        fn excludes_unknown_address_candidates() {
+            let contract = Location::new(0.5);
+            let unknown =
+                PeerKeyLocation::with_unknown_addr(TransportPublicKey::from_bytes([7; 32]));
+            let candidates = [unknown];
+            let my_dist = crate::ring::Distance::new(1.0);
+            let hosting = HashSet::new();
+            assert!(
+                pick_closest_migration_target(contract, my_dist, &hosting, &candidates).is_none(),
+                "a candidate without a known socket address must be excluded"
+            );
+        }
+
+        #[test]
+        fn breaks_ties_deterministically_by_pubkey() {
+            // Two candidates at the SAME ring location (same address) but
+            // different pub keys: the smaller pub-key bytes must win,
+            // regardless of input order.
+            let contract = Location::new(0.5);
+            let low = pkl(1, "10.0.0.9:1000");
+            let high = pkl(9, "10.0.0.9:1000");
+            assert_eq!(
+                dist_to(contract, &low),
+                dist_to(contract, &high),
+                "test setup: both candidates must be equidistant"
+            );
+            let my_dist = crate::ring::Distance::new(dist_to(contract, &low).as_f64() + 0.01);
+            let hosting = HashSet::new();
+
+            let forward = [low.clone(), high.clone()];
+            let reverse = [high.clone(), low.clone()];
+            let chosen_fwd =
+                pick_closest_migration_target(contract, my_dist, &hosting, &forward).unwrap();
+            let chosen_rev =
+                pick_closest_migration_target(contract, my_dist, &hosting, &reverse).unwrap();
+            assert_eq!(chosen_fwd.pub_key(), low.pub_key());
+            assert_eq!(chosen_rev.pub_key(), low.pub_key());
+        }
+
+        #[test]
+        fn returns_none_when_no_candidates() {
+            let contract = Location::new(0.5);
+            let candidates: [PeerKeyLocation; 0] = [];
+            let hosting = HashSet::new();
+            assert!(
+                pick_closest_migration_target(
+                    contract,
+                    crate::ring::Distance::new(1.0),
+                    &hosting,
+                    &candidates
+                )
+                .is_none()
+            );
+        }
+    }
 
     /// Regression test for message loss during shutdown.
     ///
@@ -5530,9 +6579,9 @@ mod tests {
             .expect("handle_orphaned_transactions must close cleanly");
         let body = &body_after[..end];
         assert!(
-            body.contains("try_release_pending_op_slot"),
+            body.contains("notify_orphaned_transaction"),
             "handle_orphaned_transactions must call \
-             try_release_pending_op_slot to wake parked drivers (#4154). \
+             notify_orphaned_transaction to wake parked drivers (#4154/#4313). \
              Found body:\n{body}"
         );
     }
@@ -5580,6 +6629,7 @@ mod tests {
                 pub_key: None,
                 connection_id: 10,
                 created_at: Instant::now(),
+                remote_version: None,
             },
         );
         let (tx2, _rx2) = mpsc::channel(1);
@@ -5590,6 +6640,7 @@ mod tests {
                 pub_key: None,
                 connection_id: 20,
                 created_at: Instant::now(),
+                remote_version: None,
             },
         );
 
@@ -5843,16 +6894,19 @@ mod tests {
     /// a 120 s production stall.
     #[tokio::test]
     async fn stream_send_pattern_fires_completion_tx_on_timeout() {
+        use crate::transport::BroadcastDeliveryOutcome;
         const SEND_TIMEOUT: Duration = Duration::from_millis(100);
         let (tx, _rx) = mpsc::channel::<u32>(1);
         tx.try_send(0).expect("first send must succeed");
 
-        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel::<()>();
+        let (completion_tx, completion_rx) =
+            tokio::sync::oneshot::channel::<BroadcastDeliveryOutcome>();
 
         // Mirror the StreamSend dispatch pattern:
         //   reserve() → permit OR closed OR timeout
         // The timeout branch MUST signal completion_tx (we retain
-        // ownership because reserve() never consumed it).
+        // ownership because reserve() never consumed it). Post-#4235 the
+        // signal carries `Dropped` because the fragment was NOT delivered.
         match tokio::time::timeout(SEND_TIMEOUT, tx.reserve()).await {
             Ok(Ok(_permit)) => {
                 // Wouldn't happen in this test (channel saturated), but
@@ -5861,16 +6915,16 @@ mod tests {
                 panic!("reserve unexpectedly succeeded on saturated channel");
             }
             Ok(Err(_closed)) => {
-                let _ignored = completion_tx.send(());
+                let _ignored = completion_tx.send(BroadcastDeliveryOutcome::Dropped);
             }
             Err(_timeout) => {
-                let _ignored = completion_tx.send(());
+                let _ignored = completion_tx.send(BroadcastDeliveryOutcome::Dropped);
             }
         }
 
         let signal = timeout(Duration::from_millis(50), completion_rx).await;
         assert!(
-            matches!(signal, Ok(Ok(()))),
+            matches!(signal, Ok(Ok(BroadcastDeliveryOutcome::Dropped))),
             "completion_tx must be fired on the dispatch timeout path so the \
              broadcast queue releases its permit immediately (not after \
              120s STREAM_COMPLETION_TIMEOUT). Got {signal:?}"
@@ -5930,22 +6984,30 @@ mod tests {
         // timeout / no-connection) MUST signal `completion_tx` so the
         // broadcast queue's semaphore permit releases immediately.
         // Per-arm count instead of a single match: a refactor that
-        // drops just the timeout arm's fire (the one this PR added)
+        // drops just the timeout arm's fire (the one #4145 added)
         // would otherwise silently reintroduce the 120 s
-        // STREAM_COMPLETION_TIMEOUT stall. Pre-fix the StreamSend
-        // branch had ONE `tx.send(())` (channel-closed only); the
-        // current PR adds two more (timeout + no-connection).
-        // Tested behaviourally by
-        // `stream_send_pattern_fires_completion_tx_on_timeout`.
-        let fire_count = body.matches("tx.send(())").count();
+        // STREAM_COMPLETION_TIMEOUT stall.
+        //
+        // Post-#4235 the signal carries a `BroadcastDeliveryOutcome` instead
+        // of `()`, and every drop arm reports `Dropped` so the broadcast queue
+        // releases the permit WITHOUT treating the drop as a delivery. Counting
+        // `Dropped` fires here pins both invariants at once: a regression that
+        // dropped an arm OR that mislabeled a drop arm as `Delivered` (the
+        // exact conflation #4235 fixed) trips this assertion. Tested
+        // behaviourally by `stream_send_pattern_fires_completion_tx_on_timeout`.
+        let fire_count = body
+            .matches("tx.send(BroadcastDeliveryOutcome::Dropped)")
+            .count();
         assert_eq!(
             fire_count, 3,
-            "StreamSend dispatch must signal completion_tx in all three \
-             non-success arms (closed / timeout / no-connection) — found \
-             {fire_count} `tx.send(())` occurrences, expected exactly 3. \
-             If you REMOVED one, a refactor reintroduced the 120 s \
-             STREAM_COMPLETION_TIMEOUT stall (#4145). If you ADDED a new \
-             arm with its own fire, bump this count to match. Body:\n{body}"
+            "StreamSend dispatch must signal completion_tx with \
+             BroadcastDeliveryOutcome::Dropped in all three non-success arms \
+             (closed / timeout / no-connection) — found {fire_count} such \
+             occurrences, expected exactly 3. If you REMOVED one, a refactor \
+             reintroduced the 120 s STREAM_COMPLETION_TIMEOUT stall (#4145). \
+             If you relabeled a drop arm as Delivered, you reintroduced the \
+             delivery/permit conflation (#4235). If you ADDED a new arm with \
+             its own fire, bump this count to match. Body:\n{body}"
         );
     }
 
@@ -5977,6 +7039,448 @@ mod tests {
             body.contains(".reserve()"),
             "PipeStream dispatch must use `reserve()` instead of `send().await` — \
              see #4145. Body:\n{body}"
+        );
+    }
+
+    /// Pin: the `TransactionOrphaned` handler must deliver the cause
+    /// THROUGH the waiter channel (`try_send(WaiterReply::PeerDisconnected ...)`)
+    /// before dropping the sender via `pending_op_results.remove`. A future
+    /// refactor that drops the sender without sending the signal re-opens the
+    /// #4313 race (driver wakes on close with no cause → FORBIDDEN_MARKER).
+    #[test]
+    fn transaction_orphaned_handler_sends_cause_before_dropping_sender() {
+        const SOURCE: &str = include_str!("p2p_protoc.rs");
+
+        let arm_anchor = "NodeEvent::TransactionOrphaned { tx, peer } => {";
+        let arm_start = SOURCE
+            .find(arm_anchor)
+            .expect("TransactionOrphaned handler renamed or removed");
+        let arm_end = SOURCE[arm_start..]
+            .find("\n                            }\n")
+            .map(|p| arm_start + p)
+            .expect("TransactionOrphaned arm closer not found");
+        let body = &SOURCE[arm_start..arm_end];
+
+        let send_pos = body
+            .find("WaiterReply::PeerDisconnected")
+            .expect("missing PeerDisconnected delivery — #4313 cause is dropped");
+        let remove_pos = body
+            .find("pending_op_results.remove(&tx)")
+            .expect("missing pending_op_results.remove — sender never dropped");
+        assert!(
+            send_pos > remove_pos,
+            "the PeerDisconnected send must happen on the sender taken out by \
+             pending_op_results.remove (send-before-drop). Arm body:\n{body}"
+        );
+    }
+
+    /// #4473 path-B summarize-storm pin (sim-inline counterpart of
+    /// `broadcast_queue::broadcast_single_peer_gates_summarize_on_hosted_or_in_use_pin`).
+    ///
+    /// The simulation-only `broadcast_state_to_peers` has its own inline
+    /// `get_contract_summary` (computed once for all targets). It must skip the
+    /// whole fan-out via `should_broadcast_contract` BEFORE that call, so the
+    /// sim path mirrors the production `broadcast_to_single_peer` gate and the
+    /// behavioral broadcast simulation tests can't silently regress the storm.
+    #[test]
+    fn broadcast_state_to_peers_gates_summarize_on_hosted_or_in_use() {
+        const SOURCE: &str = include_str!("p2p_protoc.rs");
+
+        let fn_anchor = "async fn broadcast_state_to_peers(";
+        let fn_start = SOURCE
+            .find(fn_anchor)
+            .expect("broadcast_state_to_peers renamed or removed");
+        // Bound the slice at the next `async fn ` so the assertion can't match a
+        // later function's body.
+        let after_header = &SOURCE[fn_start + fn_anchor.len()..];
+        let body_end = after_header
+            .find("\n    async fn ")
+            .map(|p| fn_start + fn_anchor.len() + p)
+            .unwrap_or(SOURCE.len());
+        let body = &SOURCE[fn_start..body_end];
+
+        let gate_pos = body.find("should_broadcast_contract(op_manager").expect(
+            "broadcast_state_to_peers must gate on should_broadcast_contract — a \
+             bare get_contract_summary here reintroduces the #4473 summarize storm \
+             on the sim-inline broadcast path",
+        );
+        let summarize_pos = body
+            .find("get_contract_summary(")
+            .expect("broadcast_state_to_peers get_contract_summary call not found");
+        assert!(
+            gate_pos < summarize_pos,
+            "broadcast_state_to_peers must call should_broadcast_contract (offset \
+             {gate_pos}) BEFORE get_contract_summary (offset {summarize_pos}) so the \
+             fan-out is skipped for a contract we hold no state for. Body:\n{body}"
+        );
+    }
+
+    /// Phase 7 egress self-block pin (#4300). `handle_broadcast_state_change`
+    /// MUST skip the fan-out for a banned contract — the egress
+    /// `contract_ban_list.is_banned(key.id())` check must appear BEFORE
+    /// the target resolution (`get_broadcast_targets_update`) so a
+    /// delegate-driven UPDATE for a banned contract is not fanned out to
+    /// subscribers who don't know about our ban, and so the no-target
+    /// retry re-emission is skipped too. Mirrors the receive-side
+    /// `update_dispatch_gates_banned_contracts` and the other egress
+    /// pins in the `start_client_*` entry points.
+    #[test]
+    fn handle_broadcast_state_change_gates_banned_egress() {
+        const SOURCE: &str = include_str!("p2p_protoc.rs");
+
+        let fn_anchor = "async fn handle_broadcast_state_change(";
+        let fn_start = SOURCE
+            .find(fn_anchor)
+            .expect("handle_broadcast_state_change renamed or removed");
+        // Bound the slice at the next `async fn ` so the assertion can't
+        // accidentally match a later function's body.
+        let after_header = &SOURCE[fn_start + fn_anchor.len()..];
+        let body_end = after_header
+            .find("\n    async fn ")
+            .map(|p| fn_start + fn_anchor.len() + p)
+            .unwrap_or(SOURCE.len());
+        let body = &SOURCE[fn_start..body_end];
+
+        let gate_pos = body.find("contract_ban_list.is_banned").expect(
+            "handle_broadcast_state_change is missing the ban-list egress gate — \
+             banned contracts would continue to be fanned out to subscribers \
+             (defeats the Phase 7 egress self-block, #4300)",
+        );
+        let target_pos = body
+            .find("get_broadcast_targets_update")
+            .expect("handle_broadcast_state_change is missing get_broadcast_targets_update");
+        assert!(
+            gate_pos < target_pos,
+            "BroadcastStateChange ban-list gate (offset {gate_pos}) must run \
+             BEFORE target resolution (offset {target_pos}) so a banned \
+             contract's broadcast is skipped — including the no-target retry \
+             re-emission. Body:\n{body}"
+        );
+
+        // Regression guard for the `fix(governance): clear broadcast retry
+        // state on banned-egress skip` commit: the banned-skip branch must
+        // also clear the per-contract retry/streak bookkeeping, otherwise a
+        // contract banned mid-retry-cycle leaves a stale entry that nothing
+        // clears until it is unbanned and broadcast again. We scope the
+        // assertion to the banned-skip branch (between the gate and its
+        // early `return;`) so deleting either `remove()` call fails this
+        // test — the gate-ordering assertion above passes even without
+        // them.
+        let banned_branch = &body[gate_pos..];
+        let return_pos = banned_branch
+            .find("return;")
+            .expect("banned-egress branch must early-return");
+        let banned_branch = &banned_branch[..return_pos];
+        assert!(
+            banned_branch.contains("self.broadcast_retries.remove(&key)"),
+            "banned-egress skip must clear broadcast_retries for the contract \
+             so a ban mid-retry-cycle doesn't leave a stale entry. Branch:\n{banned_branch}"
+        );
+        assert!(
+            banned_branch.contains("self.broadcast_no_target_streak.remove(&key)"),
+            "banned-egress skip must clear broadcast_no_target_streak for the \
+             contract so a ban mid-retry-cycle doesn't leave a stale entry. \
+             Branch:\n{banned_branch}"
+        );
+    }
+
+    /// #4359 wiring pin (MUST-FIX 2). The only behavioral unit tests for the
+    /// deferred-broadcast feature exercise the emit-core in isolation; they do
+    /// NOT drive `handle_broadcast_state_change`, so deleting the production
+    /// stash/take calls would re-open the bug with zero failing behavioral
+    /// tests. This source-grep pin (mirroring
+    /// `handle_broadcast_state_change_gates_banned_egress`) locks the wiring:
+    /// the give-up (retries-exhausted) branch MUST stash, and the targets-found
+    /// branch MUST take. Driving the full async handler needs a complete
+    /// OpManager + contract handler, hence the grep floor.
+    #[test]
+    fn handle_broadcast_state_change_stashes_on_giveup_and_takes_on_targets() {
+        const SOURCE: &str = include_str!("p2p_protoc.rs");
+
+        let fn_anchor = "async fn handle_broadcast_state_change(";
+        let fn_start = SOURCE
+            .find(fn_anchor)
+            .expect("handle_broadcast_state_change renamed or removed (#4359 wiring pin)");
+        let after_header = &SOURCE[fn_start + fn_anchor.len()..];
+        let body_end = after_header
+            .find("\n    async fn ")
+            .map(|p| fn_start + fn_anchor.len() + p)
+            .unwrap_or(SOURCE.len());
+        let body = &SOURCE[fn_start..body_end];
+
+        // The targets-empty branch (`if target_result.targets.is_empty() {`)
+        // ends at the `return;` that precedes the targets-found code. Everything
+        // after that return is the targets-found path.
+        let empty_branch_anchor = "if target_result.targets.is_empty() {";
+        let empty_start = body.find(empty_branch_anchor).expect(
+            "#4359: targets-empty branch anchor missing — give-up stash wiring cannot be located",
+        );
+        let empty_branch = &body[empty_start..];
+        let empty_return = empty_branch
+            .find("\n            return;")
+            .expect("#4359: targets-empty branch must early-return before the targets-found path");
+        let giveup_branch = &empty_branch[..empty_return];
+        let targets_found_branch = &empty_branch[empty_return..];
+
+        assert!(
+            giveup_branch.contains("pending_broadcasts\n                    .stash(")
+                || giveup_branch.contains("pending_broadcasts.stash("),
+            "#4359: the broadcast give-up (retries-exhausted) branch MUST stash the state in \
+             op_manager.pending_broadcasts — otherwise a fresh-contract PUT that loses the \
+             broadcast/interest-resolve race is permanently abandoned (locally-hosted only). \
+             Give-up branch:\n{giveup_branch}"
+        );
+        assert!(
+            giveup_branch.contains("pending_broadcast_stash_recheck"),
+            "#4359: the give-up branch MUST re-resolve targets after stashing (the \
+             pending_broadcast_stash_recheck guard) to close the stash-after-flush \
+             lost-wakeup race. Give-up branch:\n{giveup_branch}"
+        );
+        assert!(
+            targets_found_branch.contains("pending_broadcasts.take("),
+            "#4359: the targets-found branch MUST take()/clear any stashed deferred broadcast \
+             so a recovered contract is not later re-emitted with superseded state. \
+             Targets-found branch:\n{targets_found_branch}"
+        );
+    }
+
+    /// Strip every `#[cfg(test)]` region (single item *or* brace-delimited
+    /// module/block) from a Rust source string, leaving only production code.
+    ///
+    /// This is deliberately a small ad-hoc scanner rather than a real parser:
+    /// it only needs to be precise enough that test-only
+    /// `register_peer_interest(` calls (which all live under `#[cfg(test)]`)
+    /// don't count toward the production tally walked by
+    /// `pending_broadcast_flush_wired_at_all_interest_sites`. It handles the
+    /// two cfg(test) shapes that occur in this crate:
+    ///
+    /// * single item — `#[cfg(test)]\npub(crate) use ...;` / `mod foo;`
+    ///   (removed up to and including the terminating `;`), and
+    /// * block — `#[cfg(test)]\nmod tests { ... }` (removed with brace
+    ///   balancing, so nested `{}` inside the block don't end it early).
+    ///
+    /// Braces inside string/char literals or comments are ignored well enough
+    /// for this purpose because the only thing we measure afterward is the
+    /// count of two specific identifiers, and those never appear inside a
+    /// literal in production source.
+    fn strip_cfg_test_regions(src: &str) -> String {
+        const MARKER: &str = "#[cfg(test)]";
+        let bytes = src.as_bytes();
+        let mut out = String::with_capacity(src.len());
+        let mut i = 0usize;
+        while i < src.len() {
+            if src[i..].starts_with(MARKER) {
+                // Advance past the marker and any following attributes/whitespace
+                // until the first significant token of the gated item.
+                let mut j = i + MARKER.len();
+                // Skip whitespace and additional `#[...]` attribute lines.
+                loop {
+                    while j < src.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if src[j..].starts_with("#[") {
+                        // Skip a balanced `#[ ... ]` attribute.
+                        let mut depth = 0i32;
+                        while j < src.len() {
+                            match bytes[j] {
+                                b'[' => depth += 1,
+                                b']' => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        j += 1;
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            j += 1;
+                        }
+                        continue;
+                    }
+                    break;
+                }
+                // From `j`, find the end of this gated item: either the matching
+                // `}` of the first `{ ... }` block, or the terminating `;`.
+                let mut k = j;
+                let mut found_brace = false;
+                while k < src.len() {
+                    match bytes[k] {
+                        b'{' => {
+                            found_brace = true;
+                            break;
+                        }
+                        b';' => break,
+                        _ => {}
+                    }
+                    k += 1;
+                }
+                if found_brace {
+                    // Brace-balance to the matching close.
+                    let mut depth = 0i32;
+                    while k < src.len() {
+                        match bytes[k] {
+                            b'{' => depth += 1,
+                            b'}' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    k += 1;
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                        k += 1;
+                    }
+                } else if k < src.len() {
+                    // Consume the terminating `;`.
+                    k += 1;
+                }
+                i = k;
+                continue;
+            }
+            // Copy one byte of production source. `src` is valid UTF-8 and we
+            // only ever split on ASCII boundaries (markers/braces/`;`), so
+            // pushing the char at this index is safe.
+            let ch = src[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+        out
+    }
+
+    /// Recursively collect every `*.rs` file under `dir`.
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// #4359 trigger-completeness pin (MUST-FIX 1). The deferred broadcast only
+    /// drains when a viable target appears, signalled by
+    /// `flush_pending_broadcast_on_interest`. The interest-manager (Source 2)
+    /// path makes a peer a target via `register_peer_interest`; EVERY such call
+    /// site that can be the first viable target for a never-seen id must flush.
+    ///
+    /// Rather than trusting a static allow-list of files (the brittle shape the
+    /// re-review flagged — a NEW production `register_peer_interest` added in
+    /// some other module would silently escape the pin and re-open the
+    /// unflushed-target bug), this pin WALKS the entire crate source tree
+    /// (`$CARGO_MANIFEST_DIR/src/**/*.rs`), strips `#[cfg(test)]` regions, and
+    /// asserts that:
+    ///
+    ///   1. the SET of production files that contain a `register_peer_interest(`
+    ///      call equals the known-wired set (so a brand-new file with such a
+    ///      call trips the pin even before we reach the per-file count), and
+    ///   2. within each such file, production
+    ///      `flush_pending_broadcast_on_interest(` calls >= production
+    ///      `register_peer_interest(` calls (the pairing convention the fix
+    ///      established).
+    ///
+    /// Source 1 (proximity) is guarded by the node.rs assertion at the end.
+    #[test]
+    fn pending_broadcast_flush_wired_at_all_interest_sites() {
+        // The set of production files (relative to `src/`) that are known to
+        // make a peer a first-viable-target via `register_peer_interest` and
+        // are correctly flush-paired. A NEW production call site in any other
+        // file must FAIL this pin — see the set-equality assertion below.
+        let known_wired: std::collections::BTreeSet<&str> = [
+            "node.rs",
+            "operations.rs",
+            "operations/subscribe.rs",
+            "operations/get/op_ctx_task.rs",
+        ]
+        .into_iter()
+        .collect();
+
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs_files(&src_root, &mut files);
+        assert!(
+            !files.is_empty(),
+            "#4359 MUST-FIX 1: source walk found no .rs files under {} — the pin cannot \
+             guarantee completeness if it can't read the crate source.",
+            src_root.display()
+        );
+
+        let mut found_with_register: std::collections::BTreeSet<String> = Default::default();
+        // Per-file pairing failures: (relative path, reg_count, flush_count).
+        let mut pairing_failures: Vec<(String, usize, usize)> = Vec::new();
+
+        for path in &files {
+            let rel = path
+                .strip_prefix(&src_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let src = match std::fs::read_to_string(path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let prod = strip_cfg_test_regions(&src);
+            let reg_count = prod.matches("register_peer_interest(").count();
+            if reg_count == 0 {
+                continue;
+            }
+            // The interest-manager method *definition* itself lives in
+            // ring/interest.rs and is not a call site; ignore it. Detect by the
+            // presence of the `pub fn register_peer_interest` definition.
+            if prod.contains("fn register_peer_interest(") {
+                continue;
+            }
+            found_with_register.insert(rel.clone());
+            let flush_count = prod.matches("flush_pending_broadcast_on_interest(").count();
+            if flush_count < reg_count {
+                pairing_failures.push((rel, reg_count, flush_count));
+            }
+        }
+
+        // (1) Set equality: no NEW production file may carry a
+        // register_peer_interest call without being deliberately wired here.
+        let found_refs: std::collections::BTreeSet<&str> =
+            found_with_register.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            found_refs, known_wired,
+            "#4359 MUST-FIX 1: the set of production files that call \
+             register_peer_interest changed. Found {found_refs:?}, expected {known_wired:?}. \
+             A NEW register_peer_interest call site can be the first viable broadcast target \
+             for a cold id; it MUST flush the deferred broadcast (call \
+             flush_pending_broadcast_on_interest) or the #4359 fix silently fails for that \
+             path. Wire the flush, then add the file to `known_wired` in this pin. If the new \
+             site genuinely cannot be a first viable target, document why and adjust this pin."
+        );
+
+        // (2) Per-file pairing: every wired file's flush count covers its
+        // register count.
+        assert!(
+            pairing_failures.is_empty(),
+            "#4359 MUST-FIX 1: interest registration without a paired broadcast flush: \
+             {pairing_failures:?} (file, register_peer_interest count, \
+             flush_pending_broadcast_on_interest count). Every interest registration that can \
+             be the first viable broadcast target for a cold id must flush the deferred \
+             broadcast, or the fix silently fails for that path."
+        );
+
+        // Source 1 (proximity): the NeighborHosting overlap path must flush too,
+        // since a neighbor newly announcing it hosts our contract is a viable
+        // target with no interest_manager entry.
+        let node_path = src_root.join("node.rs");
+        let node_src = std::fs::read_to_string(&node_path).expect("node.rs must be readable");
+        let node_prod = strip_cfg_test_regions(&node_src);
+        assert!(
+            node_prod.contains("Source 1 / proximity")
+                && node_prod.contains("flush_pending_broadcast_on_interest(&key)"),
+            "#4359 MUST-FIX 1: the NeighborHosting proximity overlap path in node.rs must flush \
+             the deferred broadcast (Source 1 first-viable-target signal), or a cold-id PUT whose \
+             first target arrives via proximity announcement never drains."
         );
     }
 }

@@ -109,13 +109,110 @@ pub(crate) fn prune_expired_contexts(cache: &DelegateContextCache) {
     cache.retain(|_, entry| now.duration_since(entry.last_write) < DELEGATE_CONTEXT_TTL);
 }
 
+/// One entry in [`DELEGATE_INHERITED_ORIGINS`]: a child delegate's inherited
+/// contracts plus TTL metadata.
+///
+/// Why a TTL: the map is cleaned only on `UnregisterDelegate`, which children
+/// created via `create_delegate` rarely receive — they are spawned inside the
+/// parent's WASM and have no lifecycle owner. Without a TTL their entries pin
+/// forever, which the AGENTS.md "cleanup must be time-bounded" rule forbids.
+///
+/// How it expires: `last_access` is refreshed on every message delivered to the
+/// delegate (a sliding idle TTL), so an active child keeps its origin. The
+/// `created_at` cap drops the entry at a fixed age regardless, so an always-busy
+/// entry can't be refreshed forever.
+///
+/// Dropping an entry never loses identity: secrets live in the SecretsStore
+/// keyed by delegate key (not here) and the DEK is re-derived from the node KEK.
+/// `tokio::time::Instant` mirrors [`DelegateContextEntry`].
+#[derive(Clone)]
+pub(crate) struct InheritedOriginsEntry {
+    pub origins: Vec<ContractInstanceId>,
+    /// Creation time — anchors the absolute `MAX_AGE` cap.
+    pub created_at: tokio::time::Instant,
+    /// Last message delivered to this delegate; drives the sliding idle TTL.
+    pub last_access: tokio::time::Instant,
+}
+
+impl InheritedOriginsEntry {
+    /// Fresh entry whose creation and last-access stamps are both "now".
+    pub(crate) fn new(origins: Vec<ContractInstanceId>) -> Self {
+        let now = tokio::time::Instant::now();
+        Self {
+            origins,
+            created_at: now,
+            last_access: now,
+        }
+    }
+}
+
+/// Idle TTL: drop an entry after this long with no message delivered to the
+/// child. 7 days — a child messaged daily keeps its origin; one idle a full week
+/// is reclaimed. The interactive WebSocket path supplies the origin fresh and
+/// never reads this map, so only autonomous child messaging is affected.
+pub(crate) const DELEGATE_INHERITED_ORIGINS_TTL: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Absolute cap from `created_at`: drop the entry at this age no matter how
+/// active, so the sliding refresh can't keep it alive forever (AGENTS.md). 30
+/// days.
+pub(crate) const DELEGATE_INHERITED_ORIGINS_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
 /// Tracks message origins inherited by child delegates from their parent.
 /// When a delegate with an origin contract creates a child, the child inherits
 /// the same origin so it can interact with the same app context.
-/// DelegateKey (child) → Vec<ContractInstanceId> (inherited origins)
+/// DelegateKey (child) → inherited origins + TTL metadata.
 pub(crate) static DELEGATE_INHERITED_ORIGINS: LazyLock<
-    DashMap<DelegateKey, Vec<ContractInstanceId>>,
+    DashMap<DelegateKey, InheritedOriginsEntry>,
 > = LazyLock::new(DashMap::default);
+
+/// Drop entries idle past `..._TTL` or older than `..._MAX_AGE`, measured
+/// against `now`. Kept separate from `prune_expired_inherited_origins` so tests
+/// can pass their own map and their own `now` — they build old timestamps by
+/// adding to a base time, rather than subtracting days from `Instant::now()`,
+/// which can fail on a machine that has only been running a short time (e.g. CI).
+pub(crate) fn prune_inherited_origins_at(
+    map: &DashMap<DelegateKey, InheritedOriginsEntry>,
+    now: tokio::time::Instant,
+) {
+    map.retain(|_, entry| {
+        now.duration_since(entry.last_access) < DELEGATE_INHERITED_ORIGINS_TTL
+            && now.duration_since(entry.created_at) < DELEGATE_INHERITED_ORIGINS_MAX_AGE
+    });
+}
+
+/// Sweep the global map. Called amortised from `inbound_app_message` (no
+/// background task). O(n) per call, but n ≤ `MAX_CREATED_DELEGATES_PER_NODE`.
+pub(crate) fn prune_expired_inherited_origins() {
+    prune_inherited_origins_at(&DELEGATE_INHERITED_ORIGINS, tokio::time::Instant::now());
+}
+
+/// Set one delegate's `last_access` to `now`, if it has an entry. Kept separate
+/// from the global wrapper for the same testing reason as
+/// [`prune_inherited_origins_at`] (a caller-supplied `now`).
+pub(crate) fn touch_inherited_origin_at(
+    map: &DashMap<DelegateKey, InheritedOriginsEntry>,
+    delegate_key: &DelegateKey,
+    now: tokio::time::Instant,
+) {
+    if let Some(mut entry) = map.get_mut(delegate_key) {
+        entry.last_access = now;
+    }
+}
+
+/// Refresh a delegate's inherited-origin liveness. Called from
+/// `inbound_app_message` for every delivered message — including inter-delegate
+/// calls that never read the inherited origin — so any still-alive child keeps
+/// its origin. No-op if the delegate has no entry; still bounded by the MAX_AGE
+/// cap.
+pub(crate) fn touch_inherited_origin(delegate_key: &DelegateKey) {
+    touch_inherited_origin_at(
+        &DELEGATE_INHERITED_ORIGINS,
+        delegate_key,
+        tokio::time::Instant::now(),
+    );
+}
 
 /// Global counter of all delegates created via the `create_delegate` host function.
 /// Used to enforce `MAX_CREATED_DELEGATES_PER_NODE` regardless of attestation status.
@@ -502,7 +599,10 @@ impl DelegateCallEnv {
 
         // Propagate app attestation to child
         if !self.origin_contracts.is_empty() {
-            DELEGATE_INHERITED_ORIGINS.insert(child_key.clone(), self.origin_contracts.clone());
+            DELEGATE_INHERITED_ORIGINS.insert(
+                child_key.clone(),
+                InheritedOriginsEntry::new(self.origin_contracts.clone()),
+            );
         }
 
         tracing::info!(

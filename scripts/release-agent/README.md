@@ -65,6 +65,33 @@ will show a `dry-run: would invoke …` line. No update is actually performed.
 
 ## Response semantics
 
+`GET /version` returns JSON:
+
+```json
+{
+  "version": "0.2.71",
+  "binary_path": "/usr/local/bin/freenet",
+  "service_active": true,
+  "managed_service": "freenet-gateway"
+}
+```
+
+- **`version`** — the ON-DISK freenet binary version (`freenet --version`).
+  This alone is NOT proof the gateway is running it.
+- **`service_active`** — `true` iff `systemctl is-active <managed_service>`
+  reports `active`. Surfaces a gateway whose binary was swapped but whose
+  service failed to restart (the vega v0.2.71 incident, where `/version`
+  reported the new version while the gateway was down for ~5 minutes).
+  Consumers polling for a successful update MUST require `service_active == true`.
+  **Backward compatibility:** agents built before this field omit it entirely.
+  Its ABSENCE means "this agent cannot confirm service health", which is NOT the
+  same as success. As of #4492 the `gateway-update.yml` consumer **fails closed**
+  when the field is absent (the binary may have swapped while the service stayed
+  dead — the 2026-06-18 nova incident); accepting a binary-only check is now an
+  explicit, opt-in choice (`allow_binary_only_fallback=true`), not the default.
+- **`managed_service`** — the systemd unit name whose state `service_active`
+  reflects.
+
 `POST /update` returns:
 
 - **`200` + `no_op: true`** — the gateway is already on the requested version. The agent did NOT spawn the update script. Callers that poll `/version` to confirm the upgrade MUST inspect `no_op` to distinguish "already there" from "just kicked off".

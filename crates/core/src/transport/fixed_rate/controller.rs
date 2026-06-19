@@ -163,10 +163,28 @@ impl<T: TimeSource> FixedRateController<T> {
     }
 
     /// Called when a retransmission timeout occurs.
-    /// Activates the loss pause (same as on_loss).
+    /// Activates the loss pause (caps cwnd at the current flightsize). Flight
+    /// size is unchanged: the timed-out packet is immediately re-sent and stays
+    /// in flight.
     pub fn on_timeout(&self) {
         let fs = self.flightsize.load(Ordering::Relaxed);
         self.loss_pause_cwnd.store(fs.max(1), Ordering::Release);
+    }
+
+    /// Release an abandoned packet's bytes from flight size (issue #4345).
+    ///
+    /// Called when a packet is permanently abandoned after
+    /// `MAX_PACKET_RETRANSMITS`. This is what lets a flight size pinned by a
+    /// never-ACKed packet actually drain (otherwise the frozen
+    /// `loss_pause_cwnd + LOSS_PAUSE_MARGIN` ceiling stalls every subsequent
+    /// stream — 64% of live `cwnd wait timeout` failures). Saturating; does NOT
+    /// touch the loss pause (only an ACK clears that).
+    pub fn release_flightsize(&self, bytes: usize) {
+        self.flightsize
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(current.saturating_sub(bytes))
+            })
+            .ok();
     }
 
     /// Returns the effective congestion window.
@@ -383,6 +401,82 @@ mod tests {
             "loss_pause margin should allow at least 20 packets for recovery, \
              got {packets_allowed} (margin={margin}B). A 2-packet margin caused \
              production stream stalls when both trickle packets were lost."
+        );
+    }
+
+    /// Regression test for issue #4345: flightsize must be released when a
+    /// stream's packets are abandoned after repeated retransmission timeouts
+    /// with no ACK ever arriving.
+    ///
+    /// FixedRate is the production default. Live telemetry (issue #4345)
+    /// showed 64% of all `cwnd wait timeout` failures clustered at
+    /// `cwnd ≈ 60-70KB` (LOSS_PAUSE_MARGIN + a small frozen `loss_pause_cwnd`)
+    /// with the cwnd-flightsize gap pinned at ~110 bytes — below one packet.
+    ///
+    /// Mechanism: on a lossy path the reverse ACK channel is starved, so
+    /// `on_ack_without_rtt` (the ONLY place flightsize is decremented AND the
+    /// only place loss_pause is cleared) never runs. The sending stream keeps
+    /// calling `on_send`, flightsize climbs to the frozen cwnd ceiling, and
+    /// the cwnd-wait loop `flightsize + packet_size <= cwnd` can never find
+    /// headroom → 3s abort at ~39% of the stream. Worse, because flightsize
+    /// is never released, the NEXT stream on the same connection starts
+    /// already pinned (telemetry: `sent 0/2`).
+    ///
+    /// This test sends a burst that is never ACKed, then releases each packet
+    /// as abandonment would, and asserts a fresh packet can be sent — i.e.
+    /// flightsize was drained. Before the fix there was no release path, so
+    /// flightsize stayed at the full burst and the new packet could not fit.
+    #[test]
+    fn test_issue_4345_release_flightsize_drains_abandoned_bytes() {
+        let controller = FixedRateController::new(FixedRateConfig::default());
+
+        let packet_size = MAX_PACKET_SIZE;
+        let num_packets = 60usize; // > LOSS_PAUSE_MARGIN / MAX_PACKET_SIZE (50)
+
+        // Send a burst; none will ever be ACKed (dead reverse ACK path).
+        for _ in 0..num_packets {
+            controller.on_send(packet_size);
+        }
+        assert_eq!(
+            controller.flightsize(),
+            num_packets * packet_size,
+            "flightsize should account for every in-flight byte after send"
+        );
+
+        // on_timeout() (per-RTO) caps cwnd via loss_pause but must NOT change
+        // flight size — the packet is still in flight, being retransmitted.
+        controller.on_timeout();
+        assert_eq!(
+            controller.flightsize(),
+            num_packets * packet_size,
+            "on_timeout() must not change flight size; only abandonment/ACK does"
+        );
+
+        // After each packet is abandoned (MAX_PACKET_RETRANSMITS), the recv
+        // loop calls release_flightsize(). Without it, flightsize leaks for the
+        // life of the connection and stalls every subsequent stream.
+        for _ in 0..num_packets {
+            controller.release_flightsize(packet_size);
+        }
+
+        let leaked = controller.flightsize();
+        assert!(
+            leaked <= packet_size,
+            "issue #4345: flightsize leaked after abandonment — expected ~0, \
+             got {leaked} B ({} packets still counted in flight). \
+             release_flightsize() must drain abandoned in-flight bytes.",
+            leaked / packet_size,
+        );
+
+        // The connection must be usable again: a fresh packet must fit in cwnd.
+        let cwnd = controller.current_cwnd();
+        assert!(
+            controller.flightsize() + packet_size <= cwnd,
+            "issue #4345: after abandonment a fresh packet ({packet_size} B) \
+             must fit in cwnd ({cwnd} B) but flightsize is still {} B — the \
+             cwnd-wait loop would never open and every subsequent stream aborts \
+             with 'cwnd wait timeout'",
+            controller.flightsize(),
         );
     }
 

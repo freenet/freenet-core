@@ -21,14 +21,77 @@ const RELATED_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Sample selection uses `GlobalRng` (deterministic under a fixed seed
 /// for simulation tests). See `Executor::maybe_probe_idempotency`.
 const IDEMPOTENCY_PROBE_PROBABILITY: f64 = 1.0 / 32.0;
+
+/// Returns true if `a` and `b` contain the same multiset of bytes — i.e. one
+/// is a reordering of the other — and false if their byte content differs.
+///
+/// This is the discriminator the idempotency probe uses to tell benign
+/// serialization nondeterminism apart from a genuine non-idempotent merge:
+///
+/// - **Benign flutter** (the #4295 false-positive case): a correct contract
+///   with non-canonical serialization (`HashMap`/`HashSet` iteration order)
+///   re-serializes the SAME logical state in a different byte ORDER. Reordering
+///   permutes the serialized bytes but preserves their multiset, so this
+///   returns `true` → not flagged.
+/// - **Genuine non-idempotency** (the #4251/#4279 case the gate must catch):
+///   re-applying the update changes the state's CONTENT — a counter that churns
+///   in place, an embedded timestamp/signature regenerated each merge, an
+///   added/removed entry. Any content change alters the byte multiset (e.g. a
+///   464→465 counter flips digit bytes), so this returns `false` → flagged.
+///   Crucially this catches the *fixed-size* byte-different violator (the real
+///   #4251 incident was a constant-size ~464-byte state) that a size-only
+///   check would miss.
+///
+/// Residual false-negative: a content change that coincidentally preserves the
+/// exact byte multiset (e.g. swapping two equal bytes) evades detection. This
+/// is far narrower than the size-only heuristic's blind spot and far safer than
+/// byte-equality's false positives (which permanently suppressed propagation in
+/// #4295). O(n) in the state size; only runs on the sampled, byte-different
+/// probe path.
+fn byte_multiset_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut hist = [0i64; 256];
+    for &x in a {
+        hist[x as usize] += 1;
+    }
+    for &x in b {
+        hist[x as usize] -= 1;
+    }
+    hist.iter().all(|&c| c == 0)
+}
+
 use crate::node::OpManager;
 use crate::wasm_runtime::{
-    BackendEngine, DEFAULT_MODULE_CACHE_CAPACITY, MAX_STATE_SIZE, RuntimeConfig, SharedModuleCache,
+    BackendEngine, MAX_STATE_SIZE, ModuleCache, RuntimeConfig, SharedModuleCache,
 };
+
 use dashmap::DashMap;
 use freenet_stdlib::prelude::{MessageOrigin, RelatedContract};
-use lru::LruCache;
 use std::collections::{HashMap, HashSet};
+
+/// Whether the production `RuntimePool` requests offloading cache-miss WASM
+/// compiles to a blocking thread.
+///
+/// Always `true`: the production pool *opts in* to offload so a cold-contract
+/// Cranelift compile doesn't stall the current worker's other tasks (issue
+/// #4441's whole-node HANG). Whether the offload actually happens is decided
+/// at compile time from the LIVE runtime flavor inside
+/// `wasmtime_engine::compile_offloaded`: it offloads only on a multi-thread
+/// runtime and compiles INLINE under a current_thread runtime (the sim runner
+/// and `current_thread` integration tests) or with no runtime at all.
+///
+/// This is why correctness does NOT rest on `cfg!(test)`. The previous
+/// `!cfg!(test)` gate was wrong: in an integration-test crate the freenet lib
+/// is compiled *without* `cfg(test)`, so the gate evaluated to `true` and
+/// turned offload on under the `current_thread` runtime of
+/// `error_notification::test_connection_drop_error_notification`, panicking at
+/// `block_in_place`. The runtime-flavor check in the engine is the real safety
+/// net; this flag is just the explicit production opt-in.
+fn production_offload_compilation() -> bool {
+    true
+}
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -192,15 +255,31 @@ impl RuntimePool {
             tokio::sync::mpsc::channel(super::DELEGATE_NOTIFICATION_CHANNEL_SIZE);
 
         // Create shared module caches so all pool executors share one set of compiled WASM modules.
-        // Without this, each of the N executors would maintain its own LRU cache, causing
+        // Without this, each of the N executors would maintain its own cache, causing
         // the same contracts to be compiled and stored N times (e.g., 16 executors × 92 contracts
         // × ~500KB-1MB = ~1.2 GB of duplicate compiled modules on the nova gateway).
-        let cache_capacity =
-            NonZeroUsize::new(DEFAULT_MODULE_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN);
-        let shared_contract_modules: SharedModuleCache<ContractKey> =
-            Arc::new(Mutex::new(LruCache::new(cache_capacity)));
-        let shared_delegate_modules: SharedModuleCache<DelegateKey> =
-            Arc::new(Mutex::new(LruCache::new(cache_capacity)));
+        //
+        // The caches are bounded by total compiled BYTES, not entry count, so a
+        // gateway hosting thousands of contracts no longer thrashes the old
+        // 1024-entry count cap (issue #4441). The contract budget is
+        // operator-tunable via `Config::module_cache_budget_bytes`
+        // (FREENET_MODULE_CACHE_BUDGET_BYTES / `module-cache-budget-bytes`);
+        // when unset it scales with system RAM (see
+        // `wasm_runtime::default_module_cache_budget_bytes`). The DELEGATE cache
+        // gets only a fraction of the contract budget
+        // (`DELEGATE_MODULE_CACHE_BUDGET_DIVISOR`) — delegates are far fewer and
+        // smaller, and this keeps the COMBINED ceiling safe on a small VPS so
+        // the #4441 OOM fix doesn't itself OOM a small box.
+        let contract_cache_budget = config.module_cache_budget_bytes;
+        let delegate_cache_budget = (contract_cache_budget
+            / crate::wasm_runtime::DELEGATE_MODULE_CACHE_BUDGET_DIVISOR)
+            .max(1);
+        let shared_contract_modules: SharedModuleCache<ContractKey> = Arc::new(Mutex::new(
+            ModuleCache::with_label(contract_cache_budget, "contract"),
+        ));
+        let shared_delegate_modules: SharedModuleCache<DelegateKey> = Arc::new(Mutex::new(
+            ModuleCache::with_label(delegate_cache_budget, "delegate"),
+        ));
         // Shared delegate-context cache so a prompt round-trip routed to a
         // different pool executor still finds its `ctx.write()` blob.
         let shared_delegate_contexts = crate::wasm_runtime::new_delegate_context_cache();
@@ -341,7 +420,7 @@ impl RuntimePool {
     /// Observability-only — the sequential event loop means at most one contract
     /// is ever in flight at a time.
     ///
-    /// Panic safety: WASM panics are caught at the wasmer FFI boundary and
+    /// Panic safety: WASM traps are caught at the wasmtime boundary and
     /// converted to errors (not Rust panics), so `track_contract_return` is
     /// guaranteed to run after `track_contract_checkout` in the methods below.
     /// There are no `?` operators between the checkout/return calls.
@@ -518,6 +597,10 @@ impl ContractExecutor for RuntimePool {
                 .code_hash_from_id(instance_id)
                 .map(|key| ContractKey::from_id_and_code(*instance_id, key))
         })
+    }
+
+    fn op_manager_handle(&self) -> Option<Arc<crate::node::OpManager>> {
+        Some(self.op_manager.clone())
     }
 
     async fn fetch_contract(
@@ -732,6 +815,26 @@ impl ContractExecutor for RuntimePool {
             .upsert_contract_state(key, update, related_contracts, code)
             .await;
         self.return_checked(executor, "upsert_contract_state").await;
+        self.track_contract_return(&key);
+        result
+    }
+
+    async fn upsert_contract_state_deferrable(
+        &mut self,
+        key: ContractKey,
+        update: Either<WrappedState, StateDelta<'static>>,
+        related_contracts: RelatedContracts<'static>,
+        code: Option<ContractContainer>,
+    ) -> Result<UpsertOutcome, ExecutorError> {
+        self.track_contract_checkout(&key);
+        let mut executor = self.pop_executor().await;
+        let result = bridged_upsert_outcome(
+            executor
+                .bridged_upsert_contract_state_inner(key, update, related_contracts, code, true)
+                .await,
+        );
+        self.return_checked(executor, "upsert_contract_state_deferrable")
+            .await;
         self.track_contract_return(&key);
         result
     }
@@ -1000,6 +1103,29 @@ where
         related_contracts: RelatedContracts<'static>,
         code: Option<ContractContainer>,
     ) -> Result<UpsertResult, ExecutorError> {
+        self.bridged_upsert_contract_state_inner(key, update, related_contracts, code, false)
+            .await
+    }
+
+    /// Inner implementation of [`bridged_upsert_contract_state`].
+    ///
+    /// `defer_related_fetch` controls what happens when validation/merge needs
+    /// a related contract that is not held locally:
+    /// - `false` (the default, used by `upsert_contract_state`): fetch it from
+    ///   the network inline, awaiting the GET (legacy behavior).
+    /// - `true` (used by `upsert_contract_state_deferrable`): do NOT fetch
+    ///   inline. Roll back any partial work via the normal error path and
+    ///   return [`ExecutorError::defer_related_fetch`] carrying the missing ids,
+    ///   so the caller can off-load the GET from the serial event loop and
+    ///   re-run the upsert with the states supplied. See issue #4391.
+    pub(super) async fn bridged_upsert_contract_state_inner(
+        &mut self,
+        key: ContractKey,
+        update: Either<WrappedState, StateDelta<'static>>,
+        related_contracts: RelatedContracts<'static>,
+        code: Option<ContractContainer>,
+        defer_related_fetch: bool,
+    ) -> Result<UpsertResult, ExecutorError> {
         // CRITICAL: When a ContractContainer is provided, use its key instead of the passed-in key.
         let key = if let Some(ref container) = code {
             let container_key = container.key();
@@ -1238,6 +1364,7 @@ where
                         &params,
                         &incoming_state,
                         &related_contracts,
+                        defer_related_fetch,
                     )
                     .await
                     .inspect_err(|_| {
@@ -1591,63 +1718,107 @@ where
                     }));
                 }
 
-                // Parallel fetch: each related contract goes through its
-                // own GET sub-op concurrently. Previously this loop ran
-                // serially under a single 10s wall-clock budget, so a
-                // contract requesting N>1 related ids could time out at
-                // ~10s/N effective per fetch. Fan-out via `join_all`
-                // turns the budget back into 10s _per id_ in the common
-                // case (network bandwidth, not CPU, is the constraint).
-                // See freenet/freenet-core#4077.
                 let mut fetched_updates = updates.clone();
-                let fetch_results: Vec<(
-                    ContractInstanceId,
-                    Result<State<'static>, ExecutorError>,
-                )> = {
-                    // Reborrow as `&Self` so the per-id futures all share
-                    // an immutable borrow; this releases the outer
-                    // `&mut self` only for the duration of `fetch_all`,
-                    // which is fully awaited before the next `&mut self`
-                    // call (`attempt_state_update` below).
-                    let this: &Self = &*self;
-                    futures::future::join_all(unique_ids.iter().map(|id| {
-                        let id = *id;
-                        async move {
-                            if let Some(full_key) = this.bridged_lookup_key(&id) {
-                                if let Ok(state) = this.state_store.get(&full_key).await {
-                                    return (id, Ok(State::from(state.as_ref().to_vec())));
-                                }
-                            }
-                            let outcome = fetch_related_via_network(this.op_manager.as_ref(), &id)
-                                .await
-                                .map(|state| State::from(state.as_ref().to_vec()));
-                            (id, outcome)
-                        }
-                    }))
-                    .await
-                };
-                let mut failed_id: Option<ContractInstanceId> = None;
-                for (id, res) in fetch_results {
-                    match res {
-                        Ok(state) => fetched_updates.push(UpdateData::RelatedState {
-                            related_to: id,
-                            state,
-                        }),
-                        Err(err) => {
-                            tracing::warn!(
-                                contract = %key,
-                                related_id = %id,
-                                error = %err,
-                                "Failed to fetch related contract for update_state requires()"
-                            );
-                            failed_id.get_or_insert(id);
+
+                if defer_related_fetch {
+                    // DEFERRABLE mode (serial `contract_handling` loop): resolve
+                    // LOCAL-ONLY. This path MUST NEVER call
+                    // `fetch_related_via_network` (an inline network GET on the
+                    // serial loop). Resolve each id from the local state_store;
+                    // anything missing is surfaced via `DeferRelated` so the
+                    // caller off-loads the fetch. On resume this re-enters with
+                    // the state supplied as a `RelatedState` update entry (so
+                    // `requires()` no longer lists it), OR — if a misbehaving
+                    // contract keeps requiring it — hits the one-deferral cap →
+                    // MissingRelated, never an inline network GET. See #4391.
+                    //
+                    // Asymmetry with the validate-side deferrable block (which
+                    // ALSO consults the caller-supplied `initial_related`) is
+                    // INTENTIONAL: here, any related state the caller supplied
+                    // was already folded into `updates` as `UpdateData::RelatedState`
+                    // before `update_state` ran, so a well-behaved contract's
+                    // `requires()` never lists a supplied id. A misbehaving one
+                    // that re-requires it defers once, then the one-deferral cap
+                    // converts the second `DeferRelated` to `MissingRelated`.
+                    // Either way the no-inline-fetch invariant holds, so checking
+                    // only the state_store here is sufficient.
+                    let mut missing = Vec::new();
+                    for id in &unique_ids {
+                        let resolved = if let Some(full_key) = self.bridged_lookup_key(id) {
+                            self.state_store.get(&full_key).await.ok()
+                        } else {
+                            None
+                        };
+                        match resolved {
+                            Some(state) => fetched_updates.push(UpdateData::RelatedState {
+                                related_to: *id,
+                                state: State::from(state.as_ref().to_vec()),
+                            }),
+                            None => missing.push(*id),
                         }
                     }
-                }
-                if let Some(id) = failed_id {
-                    return Err(ExecutorError::request(StdContractError::MissingRelated {
-                        key: id,
-                    }));
+                    if !missing.is_empty() {
+                        return Err(ExecutorError::defer_related_fetch(missing));
+                    }
+                } else {
+                    // NON-deferrable mode: parallel fetch — each related contract
+                    // goes through its own GET sub-op concurrently. Previously
+                    // serial under a single 10s wall-clock budget, so a contract
+                    // requesting N>1 related ids could time out at ~10s/N
+                    // effective per fetch. Fan-out via `join_all` turns the
+                    // budget back into 10s _per id_ in the common case (network
+                    // bandwidth, not CPU, is the constraint). See
+                    // freenet/freenet-core#4077.
+                    let fetch_results: Vec<(
+                        ContractInstanceId,
+                        Result<State<'static>, ExecutorError>,
+                    )> = {
+                        // Reborrow as `&Self` so the per-id futures all share
+                        // an immutable borrow; this releases the outer
+                        // `&mut self` only for the duration of `fetch_all`,
+                        // which is fully awaited before the next `&mut self`
+                        // call (`attempt_state_update` below).
+                        let this: &Self = &*self;
+                        futures::future::join_all(unique_ids.iter().map(|id| {
+                            let id = *id;
+                            async move {
+                                if let Some(full_key) = this.bridged_lookup_key(&id) {
+                                    if let Ok(state) = this.state_store.get(&full_key).await {
+                                        return (id, Ok(State::from(state.as_ref().to_vec())));
+                                    }
+                                }
+                                let outcome =
+                                    fetch_related_via_network(this.op_manager.as_ref(), &id)
+                                        .await
+                                        .map(|state| State::from(state.as_ref().to_vec()));
+                                (id, outcome)
+                            }
+                        }))
+                        .await
+                    };
+                    let mut failed_id: Option<ContractInstanceId> = None;
+                    for (id, res) in fetch_results {
+                        match res {
+                            Ok(state) => fetched_updates.push(UpdateData::RelatedState {
+                                related_to: id,
+                                state,
+                            }),
+                            Err(err) => {
+                                tracing::warn!(
+                                    contract = %key,
+                                    related_id = %id,
+                                    error = %err,
+                                    "Failed to fetch related contract for update_state requires()"
+                                );
+                                failed_id.get_or_insert(id);
+                            }
+                        }
+                    }
+                    if let Some(id) = failed_id {
+                        return Err(ExecutorError::request(StdContractError::MissingRelated {
+                            key: id,
+                        }));
+                    }
                 }
                 match self
                     .attempt_state_update(&params, &current_state, &key, &fetched_updates)
@@ -1777,7 +1948,13 @@ where
         }
 
         let result = self
-            .fetch_related_for_validation(&key, &params, &updated_state, &related_contracts)
+            .fetch_related_for_validation(
+                &key,
+                &params,
+                &updated_state,
+                &related_contracts,
+                defer_related_fetch,
+            )
             .await?;
 
         if result != ValidateResult::Valid {
@@ -2136,7 +2313,11 @@ where
 
     /// Probe-sampled idempotency check. Re-runs `update_state` with the just-
     /// produced state as the current state and the same updates; flags the
-    /// contract as broken if the result differs.
+    /// contract as broken if the re-applied state's byte MULTISET differs from
+    /// the original (a genuine content change), but NOT if it is merely a
+    /// reordering of the same bytes (benign serialization nondeterminism such
+    /// as `HashMap` key order — the #4295 false-positive case). See
+    /// [`byte_multiset_eq`].
     ///
     /// Costs one extra WASM invocation per sampled merge. With the
     /// configured probability [`IDEMPOTENCY_PROBE_PROBABILITY`] (currently
@@ -2235,21 +2416,53 @@ where
         };
         let probe_state = WrappedState::new(probe_state.into_bytes());
 
-        if probe_state.as_ref() != post_merge_state.as_ref() {
-            if let Some(op_manager) = &self.op_manager {
-                tracing::warn!(
-                    contract = %key,
-                    post_merge_size = post_merge_state.size(),
-                    probe_size = probe_state.size(),
-                    event = "non_idempotent_merge_detected",
-                    "Contract violates update_state idempotency \
-                     (update_state(update_state(S, U), U) != update_state(S, U)). \
-                     Flagging contract; outbound BroadcastStateChange will be suppressed."
-                );
-                op_manager
-                    .ring
-                    .record_broken_invariant(*key, crate::ring::BrokenInvariant::NonIdempotent);
-            }
+        // Byte-identical re-application: definitively idempotent. Fast path
+        // for contracts with canonical serialization.
+        if probe_state.as_ref() == post_merge_state.as_ref() {
+            return;
+        }
+
+        // Bytes differ — but byte inequality alone does NOT prove a CRDT
+        // violation. A correct, logically-idempotent merge can still emit
+        // byte-different output for the SAME logical state when the contract's
+        // serialization is non-canonical (HashMap/HashSet iteration order):
+        // the re-serialized state is a REORDERING of the same bytes. Flagging
+        // on that byte flutter false-positives correct contracts and — because
+        // the broken-invariant flag gates ALL propagation — silently bricks
+        // them. That was the root cause of #4295: the ping contract's
+        // `HashMap`-backed state re-serialized in non-deterministic key order.
+        //
+        // Distinguish a benign reordering from a genuine content change by
+        // comparing the byte MULTISET (not the bytes, not just the size).
+        // Reordering preserves the multiset; a real non-idempotent merge
+        // changes content (a counter, timestamp, signature, added/removed
+        // entry), which changes the multiset — INCLUDING the fixed-size
+        // byte-churn shape of the #4251/#4279 production violator that a
+        // size-only check would miss.
+        if byte_multiset_eq(post_merge_state.as_ref(), probe_state.as_ref()) {
+            tracing::debug!(
+                contract = %key,
+                size = post_merge_state.size(),
+                event = "idempotency_probe_byte_flutter_ignored",
+                "Idempotency probe saw byte-different but same-multiset re-application \
+                 (serialization reordering); treating as benign, not a violation"
+            );
+            return;
+        }
+
+        if let Some(op_manager) = &self.op_manager {
+            tracing::warn!(
+                contract = %key,
+                post_merge_size = post_merge_state.size(),
+                probe_size = probe_state.size(),
+                event = "non_idempotent_merge_detected",
+                "Contract violates update_state idempotency: re-application changes \
+                 state content (different byte multiset, not a reordering). \
+                 Flagging contract; outbound BroadcastStateChange will be suppressed."
+            );
+            op_manager
+                .ring
+                .record_broken_invariant(*key, crate::ring::BrokenInvariant::NonIdempotent);
         }
     }
 
@@ -2365,6 +2578,8 @@ where
                 op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
                     key: *key,
                     new_state: new_state.clone(),
+                    is_retry: false,
+                    is_reemit: false,
                 })
             {
                 // Non-blocking emit: a 30-second `notify_node_event(...).await`
@@ -2481,6 +2696,7 @@ where
         params: &Parameters<'_>,
         state: &WrappedState,
         initial_related: &RelatedContracts<'_>,
+        defer_related_fetch: bool,
     ) -> Result<ValidateResult, ExecutorError> {
         let result = self
             .runtime
@@ -2539,88 +2755,129 @@ where
             }));
         }
 
-        tracing::debug!(
-            contract = %key,
-            related_count = unique_ids.len(),
-            "Fetching related contracts for validation"
-        );
+        let initial_owned = initial_related.clone().into_owned();
 
-        // Fetch each related contract: try local state_store first, escalate
-        // to network GET when the executor has an `op_manager` attached. The
-        // previous version was local-only, which silently failed cross-node
-        // UPDATE flows where the validating node was a fresh receiver that
-        // hadn't yet cached the related contract (see freenet/mail#80 — the
-        // recipient's inbox UPDATE always carried `RequestRelated` for the
-        // sender's AFT record, which the receiver hadn't seen before).
+        // `related_map` is the populated set fed to the second validate_state
+        // call. It is built differently per mode (see below), but both modes
+        // end at the same `populated_related` / re-validate.
         let mut related_map: HashMap<ContractInstanceId, Option<State<'static>>> =
             HashMap::with_capacity(unique_ids.len());
 
-        // Parallel fetch via `join_all`: previously serial under a single
-        // 10s wall-clock budget, so N related ids each got ~10s/N
-        // effective. Each id now races its own sub-op GET, so the budget
-        // is per-id in the common case. See freenet/freenet-core#4077.
-        //
-        // Reborrow as `&Self` so the per-id futures share an immutable
-        // borrow; the outer `&mut self` is reclaimed once `fetch_all`
-        // is awaited.
-        let this: &Self = &*self;
-        let fetch_all = async {
-            let results: Vec<(ContractInstanceId, Result<State<'static>, ExecutorError>)> =
-                futures::future::join_all(unique_ids.iter().map(|id| {
-                    let id = *id;
-                    async move {
-                        if let Some(full_key) = this.bridged_lookup_key(&id) {
-                            if let Ok(state) = this.state_store.get(&full_key).await {
-                                return (id, Ok(State::from(state.as_ref().to_vec())));
-                            }
-                        }
-                        // Local lookup miss → escalate via the
-                        // network-fallback helper (factored out so the
-                        // per-id branch logic is testable with a stubbed
-                        // fetcher). Mock executors that lack an
-                        // `op_manager` get the legacy MissingRelated.
-                        let outcome = fetch_related_via_network(this.op_manager.as_ref(), &id)
-                            .await
-                            .map(|state| State::from(state.as_ref().to_vec()));
-                        (id, outcome)
+        if defer_related_fetch {
+            // DEFERRABLE mode (serial `contract_handling` loop): resolve
+            // LOCAL-ONLY — caller-supplied `initial_related` states OR the local
+            // `state_store`. This path MUST NEVER call `fetch_related_via_network`
+            // (which awaits a network GET inline on the serial loop). Anything
+            // still unresolved is surfaced via `DeferRelated` so the caller
+            // off-loads the fetch; on resume that re-enters here with the state
+            // supplied, OR (if a misbehaving contract re-requests something never
+            // supplied) hits the one-deferral cap → MissingRelated — never an
+            // inline network GET. See #4391.
+            let mut missing = Vec::new();
+            for id in &unique_ids {
+                if let Some(s) = initial_owned
+                    .states()
+                    .find_map(|(rid, s)| if rid == id { s.as_ref() } else { None })
+                {
+                    related_map.insert(*id, Some(s.clone().into_owned()));
+                    continue;
+                }
+                if let Some(full_key) = self.bridged_lookup_key(id) {
+                    if let Ok(state) = self.state_store.get(&full_key).await {
+                        related_map.insert(*id, Some(State::from(state.as_ref().to_vec())));
+                        continue;
                     }
-                }))
-                .await;
-            for (id, res) in results {
-                related_map.insert(id, Some(res?));
+                }
+                missing.push(*id);
             }
-            Ok::<(), ExecutorError>(())
-        };
+            if !missing.is_empty() {
+                return Err(ExecutorError::defer_related_fetch(missing));
+            }
+        } else {
+            tracing::debug!(
+                contract = %key,
+                related_count = unique_ids.len(),
+                "Fetching related contracts for validation"
+            );
 
-        match tokio::time::timeout(RELATED_FETCH_TIMEOUT, fetch_all).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    contract = %key,
-                    error = %e,
-                    "Failed to fetch related contracts"
-                );
-                return Err(e);
-            }
-            Err(_elapsed) => {
-                tracing::warn!(
-                    contract = %key,
-                    timeout_secs = RELATED_FETCH_TIMEOUT.as_secs(),
-                    fetched = related_map.len(),
-                    total = unique_ids.len(),
-                    "Timed out fetching related contracts"
-                );
-                return Err(ExecutorError::request(StdContractError::Put {
-                    key: *key,
-                    cause: "timed out fetching related contracts".into(),
-                }));
+            // NON-deferrable mode (delegate-driven PUTs, direct callers): fetch
+            // each related contract — try the local state_store first, escalate
+            // to a network GET when the executor has an `op_manager` attached.
+            // The previous version was local-only, which silently failed
+            // cross-node UPDATE flows where the validating node was a fresh
+            // receiver that hadn't yet cached the related contract (see
+            // freenet/mail#80 — the recipient's inbox UPDATE always carried
+            // `RequestRelated` for the sender's AFT record, which the receiver
+            // hadn't seen before).
+            //
+            // Parallel fetch via `join_all`: previously serial under a single
+            // 10s wall-clock budget, so N related ids each got ~10s/N effective.
+            // Each id now races its own sub-op GET, so the budget is per-id in
+            // the common case. See freenet/freenet-core#4077.
+            //
+            // Reborrow as `&Self` so the per-id futures share an immutable
+            // borrow; the outer `&mut self` is reclaimed once `fetch_all`
+            // is awaited.
+            let this: &Self = &*self;
+            let fetch_all = async {
+                let results: Vec<(ContractInstanceId, Result<State<'static>, ExecutorError>)> =
+                    futures::future::join_all(unique_ids.iter().map(|id| {
+                        let id = *id;
+                        async move {
+                            if let Some(full_key) = this.bridged_lookup_key(&id) {
+                                if let Ok(state) = this.state_store.get(&full_key).await {
+                                    return (id, Ok(State::from(state.as_ref().to_vec())));
+                                }
+                            }
+                            // Local lookup miss → escalate via the
+                            // network-fallback helper (factored out so the
+                            // per-id branch logic is testable with a stubbed
+                            // fetcher). Mock executors that lack an
+                            // `op_manager` get the legacy MissingRelated.
+                            let outcome = fetch_related_via_network(this.op_manager.as_ref(), &id)
+                                .await
+                                .map(|state| State::from(state.as_ref().to_vec()));
+                            (id, outcome)
+                        }
+                    }))
+                    .await;
+                for (id, res) in results {
+                    related_map.insert(id, Some(res?));
+                }
+                Ok::<(), ExecutorError>(())
+            };
+
+            match tokio::time::timeout(RELATED_FETCH_TIMEOUT, fetch_all).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        contract = %key,
+                        error = %e,
+                        "Failed to fetch related contracts"
+                    );
+                    return Err(e);
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        contract = %key,
+                        timeout_secs = RELATED_FETCH_TIMEOUT.as_secs(),
+                        fetched = related_map.len(),
+                        total = unique_ids.len(),
+                        "Timed out fetching related contracts"
+                    );
+                    return Err(ExecutorError::request(StdContractError::Put {
+                        key: *key,
+                        cause: "timed out fetching related contracts".into(),
+                    }));
+                }
             }
         }
 
-        // Merge initial_related (caller-provided) with newly fetched states.
-        // The contract's first call saw initial_related; the second call should see
-        // both the original entries and the newly fetched ones.
-        let initial_owned = initial_related.clone().into_owned();
+        // Merge initial_related (caller-provided) with the resolved states.
+        // The contract's first call saw initial_related; the second call should
+        // see both the original entries and the resolved ones. (Deferrable mode
+        // already inserted supplied states above; `or_insert` makes this a no-op
+        // there and only fills gaps for the non-deferrable fetch path.)
         for (id, state) in initial_owned.states() {
             if let Some(s) = state {
                 related_map
@@ -2728,6 +2985,8 @@ where
                 op_manager.try_notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
                     key,
                     new_state,
+                    is_retry: false,
+                    is_reemit: false,
                 })
             {
                 // Best-effort by design — see #4145 and the sibling
@@ -2968,6 +3227,10 @@ impl ContractExecutor for Executor<Runtime> {
         self.bridged_lookup_key(instance_id)
     }
 
+    fn op_manager_handle(&self) -> Option<Arc<crate::node::OpManager>> {
+        self.op_manager.clone()
+    }
+
     async fn fetch_contract(
         &mut self,
         key: ContractKey,
@@ -2985,6 +3248,19 @@ impl ContractExecutor for Executor<Runtime> {
     ) -> Result<UpsertResult, ExecutorError> {
         self.bridged_upsert_contract_state(key, update, related_contracts, code)
             .await
+    }
+
+    async fn upsert_contract_state_deferrable(
+        &mut self,
+        key: ContractKey,
+        update: Either<WrappedState, StateDelta<'static>>,
+        related_contracts: RelatedContracts<'static>,
+        code: Option<ContractContainer>,
+    ) -> Result<UpsertOutcome, ExecutorError> {
+        bridged_upsert_outcome(
+            self.bridged_upsert_contract_state_inner(key, update, related_contracts, code, true)
+                .await,
+        )
     }
 
     fn register_contract_notifier(
@@ -3110,6 +3386,21 @@ impl Executor<Runtime> {
         let db = shared_state_store.storage();
         let (contract_store, delegate_store, secret_store) =
             Self::get_runtime_stores(&config, db.clone())?;
+        // Production RuntimeConfig: opt in to compile offload so a cold-contract
+        // Cranelift compile can run on a blocking thread instead of stalling the
+        // current worker's other tasks (issue #4441). Whether the offload
+        // actually happens is decided from the live runtime flavor inside
+        // `wasmtime_engine::compile_offloaded` — it offloads only on a
+        // multi-thread runtime and compiles inline under a current_thread / no
+        // runtime, so this stays deterministic in the sim runner and never
+        // panics in `current_thread` integration tests. The byte budget here
+        // also threads into the backend (though the *shared* cache size comes
+        // from the caches passed in by RuntimePool::new).
+        let runtime_config = RuntimeConfig {
+            offload_compilation: production_offload_compilation(),
+            module_cache_budget_bytes: config.module_cache_budget_bytes,
+            ..RuntimeConfig::default()
+        };
         let mut rt = Runtime::build_with_shared_module_caches(
             contract_store,
             delegate_store,
@@ -3121,11 +3412,10 @@ impl Executor<Runtime> {
             shared_backend.unwrap_or_else(|| {
                 // First executor — create a fresh backend engine; RuntimePool
                 // will extract and share it with subsequent executors.
-                crate::wasm_runtime::engine::Engine::create_backend_engine(
-                        &RuntimeConfig::default(),
-                    )
+                crate::wasm_runtime::engine::Engine::create_backend_engine(&runtime_config)
                     .expect("Failed to create WASM backend engine")
             }),
+            &runtime_config,
         )
         .unwrap();
         rt.set_state_store_db(db);
@@ -3230,6 +3520,30 @@ impl Executor<Runtime> {
                     state_size = state.as_ref().len(),
                     "putting contract"
                 );
+                // Reject debug-compiled contracts (#2257). The network
+                // client path guards this in `process_open_request`, but
+                // local-node mode (`run_local_node`, the local server
+                // loop, `preload`, `handle_request`) PUTs straight through
+                // here — and local development is the most likely place to
+                // hand the node a debug build. Debug WASM carries DWARF
+                // `.debug_*` sections and is 10-100x larger than release,
+                // so without this guard it surfaces as an opaque
+                // "Message too long" error instead of an actionable one.
+                let key = contract.key();
+                if crate::contract::contains_debug_sections(contract.data()) {
+                    let sections = crate::contract::debug_sections(contract.data()).join(", ");
+                    return Err(ExecutorError::request(StdContractError::Put {
+                        key,
+                        cause: format!(
+                            "contract appears to be compiled in debug mode \
+                             (contains {sections} section(s)). Debug WASM is \
+                             typically 10-100x larger than release builds and \
+                             may exceed message-size limits. Recompile the \
+                             contract with `--release` before publishing."
+                        )
+                        .into(),
+                    }));
+                }
                 self.perform_contract_put(contract, state, related_contracts)
                     .await
             }
@@ -4218,6 +4532,24 @@ async fn fetch_related_via_network(
     }
 }
 
+/// Map the result of a deferrable `bridged_upsert_contract_state_inner` call
+/// into an [`UpsertOutcome`].
+///
+/// A clean completion becomes [`UpsertOutcome::Completed`]; the typed
+/// [`ExecutorError::defer_related_fetch`] signal becomes
+/// [`UpsertOutcome::DeferRelated`]; any other error propagates unchanged.
+pub(super) fn bridged_upsert_outcome(
+    result: Result<UpsertResult, ExecutorError>,
+) -> Result<UpsertOutcome, ExecutorError> {
+    match result {
+        Ok(res) => Ok(UpsertOutcome::Completed(res)),
+        Err(err) => match err.into_defer_related_fetch() {
+            Ok(missing) => Ok(UpsertOutcome::DeferRelated(missing)),
+            Err(other) => Err(other),
+        },
+    }
+}
+
 #[cfg(test)]
 pub(crate) type NetworkFetchStub =
     std::rc::Rc<dyn Fn(ContractInstanceId) -> Result<WrappedState, ExecutorError>>;
@@ -4263,9 +4595,13 @@ fn resolve_message_origin(
     } else if let Some(contract_id) = origin_contract {
         Some(MessageOrigin::WebApp(*contract_id))
     } else {
+        // Plain read, no timestamp update. The "last used" time is refreshed in
+        // inbound_app_message instead, so a child that only ever gets messages
+        // from other delegates (those don't reach this branch) still counts as
+        // active and isn't dropped.
         crate::wasm_runtime::DELEGATE_INHERITED_ORIGINS
             .get(delegate_key)
-            .and_then(|ids| ids.first().map(|c| MessageOrigin::WebApp(*c)))
+            .and_then(|entry| entry.origins.first().copied().map(MessageOrigin::WebApp))
     }
 }
 
@@ -4338,10 +4674,10 @@ mod resolve_message_origin_tests {
 
         // Plant an inherited WebApp origin for the recipient so the
         // fallback branch would have something to return.
-        crate::wasm_runtime::DELEGATE_INHERITED_ORIGINS
-            .entry(recipient.clone())
-            .or_default()
-            .push(inherited_contract);
+        crate::wasm_runtime::DELEGATE_INHERITED_ORIGINS.insert(
+            recipient.clone(),
+            crate::wasm_runtime::InheritedOriginsEntry::new(vec![inherited_contract]),
+        );
 
         let origin = resolve_message_origin(Some(&caller), None, &recipient);
 
@@ -4353,6 +4689,30 @@ mod resolve_message_origin_tests {
             Some(MessageOrigin::Delegate(k)) => assert_eq!(k, caller),
             other => panic!("Expected Delegate(caller), got {other:?}"),
         }
+    }
+
+    /// Fallback branch (no live caller/origin) yields the child's inherited
+    /// WebApp origin via a pure read — it does not refresh `last_access`
+    /// (liveness lives in `inbound_app_message`). Pairs with
+    /// `no_arguments_and_no_inherited_yields_none`.
+    #[test]
+    fn inherited_origin_fallback_yields_webapp() {
+        use crate::wasm_runtime::{DELEGATE_INHERITED_ORIGINS, InheritedOriginsEntry};
+
+        let recipient = dkey(0xC5);
+        let contract = ContractInstanceId::new([0xC6; 32]);
+        DELEGATE_INHERITED_ORIGINS.insert(
+            recipient.clone(),
+            InheritedOriginsEntry::new(vec![contract]),
+        );
+
+        let origin = resolve_message_origin(None, None, &recipient);
+        DELEGATE_INHERITED_ORIGINS.remove(&recipient);
+
+        assert!(
+            matches!(origin, Some(MessageOrigin::WebApp(c)) if c == contract),
+            "fallback must yield the inherited WebApp origin, got {origin:?}"
+        );
     }
 }
 
@@ -4502,14 +4862,21 @@ mod executor_pin_tests {
                 "{name} must call futures::future::join_all — serial fetch \
                  regressed in freenet/freenet-core#4077; do not revert"
             );
-            // Spot-check the loop construct doesn't reappear: a plain
-            // `for id in &unique_ids` inside the function body almost
-            // certainly means the parallel fan-out is gone.
-            let serial_needle = ["for ", "id in &unique_ids"].concat();
+            // Spot-check the NETWORK fetch doesn't regress to a serial
+            // `for id in &unique_ids { ... fetch_related_via_network ... await }`
+            // loop (the exact pre-#4077 shape). NOTE: the deferrable-mode block
+            // (#4391) legitimately iterates `&unique_ids` to do a LOCAL-ONLY
+            // presence check that contains NO `fetch_related_via_network`, so
+            // the bare `for id in &unique_ids` form is no longer a reliable
+            // signal. Anchor instead on a serial `for` segment that calls the
+            // network helper — that is the actual #4077 regression shape.
+            let serial_network_fetch = body.split("for ").skip(1).any(|seg| {
+                seg.contains("id in &unique_ids") && seg.contains("fetch_related_via_network")
+            });
             assert!(
-                !body.contains(&serial_needle),
-                "{name} must not iterate serially over &unique_ids — \
-                 regressed to pre-#4077 behavior"
+                !serial_network_fetch,
+                "{name} must not iterate serially over &unique_ids to call \
+                 fetch_related_via_network — regressed to pre-#4077 behavior"
             );
         }
 
@@ -4567,6 +4934,123 @@ mod executor_pin_tests {
              (closest preceding macro is `tracing::{macro_name}!`). \
              Re-promotion to INFO/WARN restores the #4251 / #4272 log-volume regression.\n\
              Preceding source (last 200 bytes):\n{tail}"
+        );
+    }
+
+    /// Gate (issue #4441): the production pool OPTS IN to compile offload
+    /// (`production_offload_compilation()` is always `true`). Safety/determinism
+    /// no longer rests on this flag — it rests on the runtime-flavor check in
+    /// `wasmtime_engine::compile_offloaded`, which compiles inline under a
+    /// current_thread / no runtime and offloads only on a multi-thread runtime.
+    /// This is the fix for the old `!cfg!(test)` gate that wrongly turned
+    /// offload on in integration-test crates (compiled without `cfg(test)`) and
+    /// panicked at `block_in_place` on their current_thread runtimes.
+    #[test]
+    fn production_offload_is_opt_in() {
+        assert!(
+            super::production_offload_compilation(),
+            "production pool must opt in to offload; the runtime-flavor check in \
+             compile_offloaded keeps it safe/deterministic everywhere else"
+        );
+    }
+
+    /// Pin: `from_config_with_shared_modules` MUST build the engine with the
+    /// offload gate (`production_offload_compilation()`) and thread the byte
+    /// budget through, rather than the old hardcoded `RuntimeConfig::default()`
+    /// that left `offload_compilation` dead on the production pool path.
+    #[test]
+    fn from_config_with_shared_modules_wires_offload_and_budget() {
+        let src = include_str!("runtime.rs");
+        let body = src
+            .split("pub(crate) async fn from_config_with_shared_modules(")
+            .nth(1)
+            .expect("from_config_with_shared_modules must exist")
+            .split("\n    pub async fn preload(")
+            .next()
+            .expect("end of from_config_with_shared_modules");
+        assert!(
+            body.contains("offload_compilation: production_offload_compilation()"),
+            "must set offload_compilation from the production gate"
+        );
+        assert!(
+            body.contains("module_cache_budget_bytes: config.module_cache_budget_bytes"),
+            "must thread the operator-configured byte budget into the runtime config"
+        );
+        // The hardcoded default that previously dropped offload must be gone:
+        // the backend engine is now built from `runtime_config`, not a fresh
+        // `RuntimeConfig::default()`.
+        assert!(
+            body.contains("Engine::create_backend_engine(&runtime_config)"),
+            "backend engine must be built from the threaded runtime_config"
+        );
+    }
+
+    /// Pin: `RuntimePool::new` MUST size the shared module caches by the
+    /// operator-configured byte budget, not a hardcoded count constant.
+    #[test]
+    fn runtime_pool_sizes_caches_by_byte_budget() {
+        let src = include_str!("runtime.rs");
+        let body = src
+            .split("pub async fn new(")
+            .nth(1)
+            .expect("RuntimePool::new must exist")
+            .split("\n    ")
+            .take(60)
+            .collect::<String>();
+        assert!(
+            body.contains("config.module_cache_budget_bytes"),
+            "RuntimePool::new must size caches from config.module_cache_budget_bytes"
+        );
+        assert!(
+            body.contains("ModuleCache::with_label(contract_cache_budget, \"contract\")"),
+            "RuntimePool::new must build the contract cache from the contract byte budget"
+        );
+        assert!(
+            body.contains("ModuleCache::with_label(delegate_cache_budget, \"delegate\")"),
+            "RuntimePool::new must build the delegate cache from its own (smaller) budget"
+        );
+        assert!(
+            body.contains("DELEGATE_MODULE_CACHE_BUDGET_DIVISOR"),
+            "the delegate cache must be a fraction of the contract budget so the \
+             COMBINED default ceiling stays safe on a small box (issue #4441 fix-up)"
+        );
+        // The old count-cap constant must be gone from this path.
+        assert!(
+            !body.contains("DEFAULT_MODULE_CACHE_CAPACITY"),
+            "RuntimePool::new must no longer reference the removed count cap"
+        );
+    }
+
+    /// Pin (#2257): the `ContractRequest::Put` arm of `contract_requests`
+    /// MUST reject debug-compiled WASM (`contains_debug_sections`) BEFORE
+    /// delegating to `perform_contract_put`. This is the only debug-WASM
+    /// guard on the local-node PUT path (`run_local_node`, the local
+    /// server loop, `preload`, `handle_request`), which never touches
+    /// `process_open_request`. A migration that drops this call would
+    /// silently restore the opaque "Message too long" symptom for local
+    /// development — exactly the case #2257 targets. Source-scrape pin per
+    /// `.claude/rules/bug-prevention-patterns.md` (cheaper and more robust
+    /// than standing up a full `Executor<Runtime>` fixture for a one-line
+    /// guard).
+    #[test]
+    fn contract_requests_put_rejects_debug_wasm_before_perform_put() {
+        let src = include_str!("runtime.rs");
+        // Isolate the `contract_requests` function body.
+        let body = src
+            .split("pub async fn contract_requests(")
+            .nth(1)
+            .expect("contract_requests must exist");
+        let guard_pos = body
+            .find("contains_debug_sections")
+            .expect("contract_requests Put arm must call contains_debug_sections");
+        let put_pos = body
+            .find("self.perform_contract_put(")
+            .expect("contract_requests must call perform_contract_put");
+        assert!(
+            guard_pos < put_pos,
+            "the debug-WASM guard (contains_debug_sections) must run BEFORE \
+             perform_contract_put, so a debug build is rejected before any \
+             local storage/validation work"
         );
     }
 }
@@ -4980,6 +5464,63 @@ mod state_write_attribution_pin_tests {
              into store_state_sync would not compile, but a refactor \
              that moves state into an intermediate first could regress \
              this silently."
+        );
+    }
+}
+
+// NOTE: this module is placed at the END of the file on purpose. The
+// `production_gate_sites_consult_is_contract_broken` pin test in
+// `pool_tests/non_idempotent_detector_tests.rs` greps the production slice of
+// this file (everything before the FIRST `#[cfg(test)]`) for
+// `is_contract_broken`; a `#[cfg(test)]` placed above the gate sites would
+// truncate that slice and break the pin. Keep new test modules below all
+// production code.
+#[cfg(test)]
+mod idempotency_probe_convergence_tests {
+    use super::byte_multiset_eq;
+
+    /// Regression for #4295: the ping contract's `HashMap` state re-serialized
+    /// in a different key ORDER on re-merge — same bytes, permuted. That MUST
+    /// be treated as benign (same multiset), not flagged.
+    #[test]
+    fn reordered_bytes_are_benign_flutter() {
+        assert!(
+            byte_multiset_eq(b"{\"a\":1,\"b\":2}", b"{\"b\":2,\"a\":1}"),
+            "a key-order permutation has the same byte multiset and must not be flagged"
+        );
+        // Identical bytes are trivially benign.
+        assert!(byte_multiset_eq(b"same", b"same"));
+    }
+
+    /// Regression for the review finding: the #4251 production violator was a
+    /// FIXED-SIZE, byte-different non-idempotent merge (a ~464-byte state whose
+    /// counter prefix churns in place). A size-only check missed it; the
+    /// multiset check MUST flag it (different content => different multiset).
+    #[test]
+    fn fixed_size_content_change_is_flagged() {
+        // Same length, one byte of content differs (e.g. a counter 464 -> 465).
+        assert!(
+            !byte_multiset_eq(b"counter=464;payload", b"counter=465;payload"),
+            "a fixed-size content change must be detected as non-idempotent"
+        );
+        // Simulate the 464-byte fixed-size shape: equal length, differing bytes.
+        let mut s1 = vec![b'x'; 464];
+        let mut s2 = vec![b'x'; 464];
+        s1[0] = 0;
+        s2[0] = 1; // counter prefix churn at constant size
+        assert!(
+            !byte_multiset_eq(&s1, &s2),
+            "fixed-size (464-byte) counter churn must be flagged (the #4251 shape)"
+        );
+    }
+
+    /// A growing (accumulating) merge changes the length (and would also change
+    /// content); the length guard alone flags it. Non-convergent.
+    #[test]
+    fn growing_state_is_flagged() {
+        assert!(
+            !byte_multiset_eq(b"abc", b"abcd"),
+            "a state that grows on re-application is non-convergent"
         );
     }
 }

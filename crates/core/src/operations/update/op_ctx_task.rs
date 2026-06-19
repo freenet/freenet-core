@@ -26,7 +26,9 @@ use crate::operations::OpError;
 use crate::ring::{PeerKeyLocation, RingError};
 use crate::tracing::{NetEventLog, OperationFailure, state_hash_full};
 
-use super::{BroadcastStreamingPayload, UpdateExecution, UpdateMsg, UpdateStreamingPayload};
+use super::{
+    AutoFetchReason, BroadcastStreamingPayload, UpdateExecution, UpdateMsg, UpdateStreamingPayload,
+};
 use crate::transport::peer_connection::StreamId;
 
 /// Counter: number of times `start_relay_request_update` or
@@ -99,6 +101,14 @@ pub(crate) async fn start_client_update(
     update_data: UpdateData<'static>,
     related_contracts: RelatedContracts<'static>,
 ) -> Result<Transaction, OpError> {
+    // Phase 7 egress self-block (#4300): refuse to originate an UPDATE
+    // for a contract this node has banned, BEFORE spawning the driver.
+    // This covers the client-originated UPDATE path; the delegate-driven
+    // broadcast fan-out is gated separately at `handle_broadcast_state_change`
+    // in p2p_protoc.rs. Mirrors the receive-side `UpdateMsg::*` drop in
+    // node.rs (PR #4299). The client gets a typed `ContractBanned` error.
+    crate::operations::reject_if_contract_banned(&op_manager, key.id())?;
+
     tracing::debug!(
         tx = %client_tx,
         contract = %key,
@@ -115,13 +125,19 @@ pub(crate) async fn start_client_update(
     // Amplification ceiling: the client_events.rs UPDATE handler allocates
     // one task per client UPDATE request. Client request rate is bounded by
     // the WS connection handler's backpressure.
-    GlobalExecutor::spawn(run_client_update(
-        op_manager,
-        client_tx,
-        key,
-        update_data,
-        related_contracts,
-    ));
+    // Atomic admission gate + counter bump (closes the drain race
+    // window). See `OpManager::admit_client_op` for the race
+    // analysis. The guard is held by the driver task for its
+    // lifetime so `ShutdownHandle::shutdown` waits for in-flight
+    // client UPDATEs before tearing down peer connections.
+    let inflight_guard = match op_manager.admit_client_op() {
+        Some(g) => g,
+        None => return Err(OpError::NodeShuttingDown),
+    };
+    GlobalExecutor::spawn(async move {
+        let _inflight_guard = inflight_guard;
+        run_client_update(op_manager, client_tx, key, update_data, related_contracts).await;
+    });
 
     Ok(client_tx)
 }
@@ -375,7 +391,14 @@ async fn drive_client_update(
                              code/params for this contract; triggering \
                              auto-fetch from target and asking client to retry"
                         );
-                        op_manager.try_auto_fetch_contract(&key, target_addr);
+                        // Originator self-heal: a local client is waiting on
+                        // the retry, so this is demand-driven and bypasses the
+                        // #4473 phantom-interest gate (Codex review on #4489).
+                        op_manager.try_auto_fetch_contract(
+                            &key,
+                            target_addr,
+                            AutoFetchReason::Originator,
+                        );
                         return Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
                             cause: format!(
                                 "originator missing contract code/params for {key}; \
@@ -1159,7 +1182,12 @@ async fn drive_relay_broadcast_to(
             } else if !is_delta && !err.is_contract_exec_rejection() && !queue_full {
                 // Full state failed and the merge function did NOT reject it
                 // (so contract code is missing). Trigger self-healing GET.
-                op_manager.try_auto_fetch_contract(&key, sender_addr);
+                // Inbound relay path → gated on `contract_in_use` (#4473).
+                op_manager.try_auto_fetch_contract(
+                    &key,
+                    sender_addr,
+                    AutoFetchReason::InboundRelay,
+                );
             } else if queue_full {
                 tracing::debug!(
                     tx = %incoming_tx,
@@ -1802,7 +1830,12 @@ async fn drive_relay_broadcast_to_streaming(
             // send_summary_back_on_rejection. Mirrors legacy at
             // update.rs:1336-1361.
             if super::log_broadcast_to_streaming_failure(&incoming_tx, &key, &err) {
-                op_manager.try_auto_fetch_contract(&key, sender_addr);
+                // Inbound broadcast relay path → gated on `contract_in_use` (#4473).
+                op_manager.try_auto_fetch_contract(
+                    &key,
+                    sender_addr,
+                    AutoFetchReason::InboundRelay,
+                );
             } else if err.is_invalid_update_rejection() {
                 let op_mgr = op_manager.clone();
                 let contract_key = key;
@@ -1861,6 +1894,89 @@ async fn drive_relay_broadcast_to_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `start_client_update` must acquire a `ClientOpGuard` before
+    /// the `GlobalExecutor::spawn` and move it into the spawned
+    /// future. See the sibling pin in `put/op_ctx_task.rs` for the
+    /// full rationale (shutdown drain depends on the per-driver
+    /// counter; without it the gateway tears down peer connections
+    /// mid-UPDATE on auto-update).
+    #[test]
+    fn start_client_update_acquires_inflight_guard_before_spawn() {
+        let src = include_str!("op_ctx_task.rs");
+        let entry = src
+            .find("pub(crate) async fn start_client_update(")
+            .expect("start_client_update must exist");
+        let after_spawn = src[entry..]
+            .find("GlobalExecutor::spawn(")
+            .expect("start_client_update must spawn a driver task");
+        let before_spawn = &src[entry..entry + after_spawn];
+        assert!(
+            before_spawn.contains("op_manager.admit_client_op()"),
+            "start_client_update must call op_manager.admit_client_op() \
+             before GlobalExecutor::spawn (atomic admission gate + \
+             counter bump; closes the Codex r2 TOCTOU)."
+        );
+        assert!(
+            before_spawn.contains("OpError::NodeShuttingDown"),
+            "start_client_update must early-return OpError::NodeShuttingDown \
+             on a refused admission."
+        );
+        let spawned = &src[entry + after_spawn..];
+        let block_end = spawned
+            .find("\n    Ok(client_tx)")
+            .expect("start_client_update must return Ok(client_tx)");
+        let spawn_block = &spawned[..block_end];
+        assert!(
+            spawn_block.contains("let _inflight_guard = inflight_guard;"),
+            "the ClientOpGuard must be moved into the spawned future."
+        );
+    }
+
+    /// Phase 7 egress self-block pin (#4300). `start_client_update` MUST
+    /// reject a banned contract BEFORE spawning the driver. Mirrors the
+    /// receive-side `update_dispatch_gates_banned_contracts` pin in
+    /// `ring/contract_ban_list.rs`. See the sibling pin in
+    /// `put/op_ctx_task.rs` for the full rationale. The delegate-driven
+    /// broadcast fan-out is gated separately at
+    /// `handle_broadcast_state_change` in p2p_protoc.rs (pinned there).
+    #[test]
+    fn start_client_update_gates_banned_contracts_before_spawn() {
+        let src = include_str!("op_ctx_task.rs");
+        let entry = src
+            .find("pub(crate) async fn start_client_update(")
+            .expect("start_client_update must exist");
+        let after_spawn = src[entry..]
+            .find("GlobalExecutor::spawn(")
+            .expect("start_client_update must spawn a driver task");
+        let before_spawn = &src[entry..entry + after_spawn];
+        assert!(
+            before_spawn.contains("reject_if_contract_banned"),
+            "start_client_update must call reject_if_contract_banned() \
+             before GlobalExecutor::spawn so a banned contract's UPDATE \
+             is rejected with a typed error instead of being driven to \
+             peers (#4300 egress self-block)."
+        );
+    }
+
+    /// Phase 7 egress self-block pin (#4300). The typed
+    /// `OpError::ContractBanned` raised by the egress gate MUST be
+    /// translated to a client-visible error in `report_op_init_error`
+    /// (`client_events.rs`). The match there is exhaustive (no wildcard),
+    /// so a missing arm fails to compile — but this pin documents the
+    /// requirement and fails loudly if someone routes ContractBanned to
+    /// an inappropriate handler (e.g. silently swallows it).
+    #[test]
+    fn report_op_init_error_handles_contract_banned() {
+        let src = include_str!("../../client_events.rs");
+        assert!(
+            src.contains("OpError::ContractBanned"),
+            "report_op_init_error in client_events.rs must explicitly \
+             handle OpError::ContractBanned so the egress self-block \
+             (#4300) surfaces a typed error to the client instead of a \
+             silent proceed-then-timeout."
+        );
+    }
 
     /// Guard: `client_events.rs` must call `start_client_update` for both the
     /// routed and legacy UPDATE paths, not the legacy `request_update`.

@@ -166,6 +166,17 @@ pub enum ServiceCommand {
         #[arg(long)]
         system: bool,
     },
+    /// Recover a wedged service install: re-template the wrapper/unit to the
+    /// current binary, reap stale orphaned `freenet network` processes (PPID=1,
+    /// holding the port on an old binary), and restart cleanly. Use when the
+    /// node appears frozen on an old version (see issue #3967). Unlike
+    /// `restart`, this kills detached orphans and refreshes the wrapper, so it
+    /// closes the bootstrap gap that `restart` alone cannot.
+    Doctor {
+        /// Repair the system-wide service instead of the user service
+        #[arg(long)]
+        system: bool,
+    },
     /// View service logs (follows new output)
     Logs {
         /// Show only error logs
@@ -201,6 +212,7 @@ impl ServiceCommand {
             ServiceCommand::Start { system } => start_service(*system),
             ServiceCommand::Stop { system } => stop_service(*system),
             ServiceCommand::Restart { system } => restart_service(*system),
+            ServiceCommand::Doctor { system } => service_doctor(*system),
             ServiceCommand::Logs { err } => service_logs(*err),
             ServiceCommand::Report(cmd) => {
                 cmd.run(version, git_commit, git_dirty, build_timestamp, config_dirs)
@@ -276,6 +288,17 @@ fn mark_first_run_complete_at(marker: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::File::create(marker).map(|_| ())
+}
+
+/// Path of the legacy-install migration marker (issue #3943). DISTINCT from
+/// the first-run/onboarding marker: a user who already launched a DMG before
+/// this migration shipped has the first-run marker set but may still have the
+/// racing legacy launchd agent, so the migration must NOT be gated on
+/// onboarding state. The migration is its own one-shot, tracked by its own
+/// marker, so it runs once for existing DMG users too.
+#[allow(dead_code)]
+fn legacy_migration_marker_path() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|d| d.join("freenet").join(".legacy-migration-complete"))
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -815,6 +838,367 @@ pub(super) fn legacy_launchd_agent_present() -> bool {
         .unwrap_or(false)
 }
 
+// ── Legacy install.sh → DMG migration (issue #3943) ──
+//
+// Users who installed Freenet via the old `install.sh` path on macOS have a
+// legacy launchd agent (`~/Library/LaunchAgents/org.freenet.node.plist`) that
+// auto-starts a legacy CLI binary on login, plus that binary somewhere on
+// disk (`~/.local/bin/freenet` by default, `/usr/local/bin/freenet`, etc.).
+//
+// When such a user installs the signed DMG, both auto-starts race for port
+// 7509 on every login: launchd respawns the legacy backend, the DMG wrapper's
+// `kill_stale_freenet_processes` pkills it, launchd respawns it again, and the
+// new wrapper's backend loses the port race and exits 43.
+//
+// On first DMG launch we migrate by removing the legacy plist (after booting
+// out its launchd agent) and the legacy CLI binaries, then letting the normal
+// first-run flow register the new `org.freenet.Freenet` agent.
+//
+// The DECISION (what to remove) is a pure function so it is unit-testable on
+// Linux CI with a mock `$HOME`; the EXECUTION (launchctl bootout, fs::remove)
+// is the macOS-only side-effecting wrapper. This split follows the
+// deployment-rule pattern (`first_run_marker_*`, `compute_menu_state`).
+
+/// A side effect the legacy-install migration should perform, in the order
+/// listed by [`legacy_install_migration_plan`]. Each variant names exactly
+/// one filesystem object so the executor can attempt them independently and
+/// fall back to a manual-cleanup warning per object (e.g. a root-owned
+/// binary the user can't `rm` without `sudo`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(super) enum LegacyMigrationStep {
+    /// Boot out the legacy launchd agent for this plist, then remove the
+    /// plist file. Bootout must precede removal so launchd stops respawning
+    /// the legacy backend before we delete its definition.
+    BootOutAndRemovePlist(PathBuf),
+    /// Remove the legacy auto-update wrapper script the plist invoked
+    /// (`freenet-service-wrapper.sh`).
+    RemoveLegacyWrapperScript(PathBuf),
+    /// Remove a legacy CLI binary that THIS legacy install owned (derived
+    /// from the legacy install's own artifacts, never a guessed location —
+    /// see [`legacy_install_migration_plan`]).
+    RemoveLegacyBinary(PathBuf),
+}
+
+/// What to do about a detected legacy install. Pure value computed by
+/// [`legacy_install_migration_plan`]; the executor turns it into side
+/// effects. `NoMigration` is its own variant (rather than an empty step
+/// list) so the caller can log "nothing to migrate" distinctly from a
+/// plan that ended up empty by accident.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(super) enum LegacyMigrationPlan {
+    /// No legacy plist present, or not a first-run invocation: do nothing.
+    NoMigration,
+    /// A legacy install was detected; perform these steps in order.
+    Migrate(Vec<LegacyMigrationStep>),
+}
+
+/// The legacy install's own artifacts, resolved from its plist and wrapper
+/// script (NOT guessed from hard-coded locations). The caller resolves these
+/// by reading the legacy plist's `ProgramArguments` and the wrapper script it
+/// points at, so the plan only ever touches files THIS legacy install owned.
+///
+/// This is the input that lets [`legacy_install_migration_plan`] stay pure:
+/// the caller does the file I/O and existence checks, the planner just decides.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(super) struct ResolvedLegacyInstall {
+    /// The wrapper script path from the plist's `ProgramArguments`, if it was
+    /// parseable AND the file exists. Removed by the migration.
+    pub wrapper_script: Option<PathBuf>,
+    /// Legacy CLI binaries that exist AND were referenced by the legacy
+    /// install (the binary embedded in the wrapper script, plus its sibling
+    /// `fdev`). Empty when the wrapper couldn't be read/parsed.
+    pub binaries: Vec<PathBuf>,
+}
+
+/// Decide how to migrate a pre-existing `install.sh` legacy install. PURE:
+/// takes the relevant filesystem state as inputs and returns a plan, with no
+/// side effects, so it can be unit-tested on any platform with a mock `$HOME`.
+///
+/// Arguments:
+/// - `migration_already_done`: whether the dedicated legacy-migration marker
+///   is present (we already migrated on a previous launch). This is NOT the
+///   onboarding first-run marker: a user who already launched a DMG before
+///   this migration shipped has the first-run marker set but may still have
+///   the racing legacy agent, so gating on first-run would skip exactly the
+///   users who need the migration (Codex P1 on PR #4448). The migration is
+///   its own one-shot tracked by its own marker.
+/// - `legacy_plist`: the legacy plist path and whether it currently exists.
+///   `None` means `$HOME` was unresolvable (no migration possible).
+/// - `resolved`: the legacy install's OWN artifacts (wrapper script + the
+///   binaries it referenced), already resolved and existence-filtered by the
+///   caller. We deliberately do NOT remove binaries from guessed locations:
+///   a user may have an unrelated `freenet`/`fdev` (Homebrew, cargo, manual)
+///   in `/usr/local/bin` or `~/bin` while the legacy service used
+///   `~/.local/bin`, and deleting that unrelated binary would be a
+///   destructive side effect beyond fixing the launchd race (Codex P2 on
+///   PR #4448). Targeting only the legacy install's own artifacts avoids that.
+///
+/// Returns `NoMigration` unless the migration hasn't been done yet AND the
+/// legacy plist exists. We anchor migration on the plist (not on a stray
+/// binary) because the plist is the thing that actively races for the port on
+/// login; a lone legacy binary with no auto-start agent is harmless and left
+/// alone.
+#[allow(dead_code)]
+pub(super) fn legacy_install_migration_plan(
+    migration_already_done: bool,
+    legacy_plist: Option<(PathBuf, bool)>,
+    resolved: &ResolvedLegacyInstall,
+) -> LegacyMigrationPlan {
+    if migration_already_done {
+        return LegacyMigrationPlan::NoMigration;
+    }
+    let Some((plist_path, plist_exists)) = legacy_plist else {
+        return LegacyMigrationPlan::NoMigration;
+    };
+    if !plist_exists {
+        return LegacyMigrationPlan::NoMigration;
+    }
+
+    let mut steps = Vec::with_capacity(2 + resolved.binaries.len());
+    // Bootout + plist removal first: stop launchd respawning the legacy
+    // backend before anything else.
+    steps.push(LegacyMigrationStep::BootOutAndRemovePlist(plist_path));
+    if let Some(wrapper) = &resolved.wrapper_script {
+        steps.push(LegacyMigrationStep::RemoveLegacyWrapperScript(
+            wrapper.clone(),
+        ));
+    }
+    for bin in &resolved.binaries {
+        steps.push(LegacyMigrationStep::RemoveLegacyBinary(bin.clone()));
+    }
+    LegacyMigrationPlan::Migrate(steps)
+}
+
+/// Extract the first `ProgramArguments` entry from a launchd plist's XML.
+/// For the legacy `org.freenet.node` plist this is the auto-update wrapper
+/// script path (`~/.local/bin/freenet-service-wrapper.sh`); see
+/// [`generate_plist`]. Pure string parsing so it is unit-testable: the legacy
+/// plist's exact shape is asserted in the tests against [`generate_plist`]'s
+/// own output, so a format drift trips CI.
+///
+/// Returns `None` if the plist has no `ProgramArguments` array or no
+/// `<string>` inside it (a hand-edited or unexpected plist) — in which case
+/// the caller falls back to removing only the plist itself.
+#[allow(dead_code)]
+pub(super) fn legacy_program_path_from_plist(plist_xml: &str) -> Option<PathBuf> {
+    // Find the ProgramArguments array, then the first <string>…</string>.
+    let after_key = plist_xml.split("<key>ProgramArguments</key>").nth(1)?;
+    let array = after_key.split("<array>").nth(1)?;
+    let array = array.split("</array>").next()?;
+    let start = array.find("<string>")? + "<string>".len();
+    let end = array[start..].find("</string>")? + start;
+    let raw = array[start..end].trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(xml_unescape(raw)))
+}
+
+/// Extract the freenet binary path embedded in a legacy auto-update wrapper
+/// script. [`generate_wrapper_script`] writes the binary as `"{binary}" network`
+/// / `"{binary}" update` lines; we recover it from the `network` invocation.
+/// Pure string parsing, unit-tested against [`generate_wrapper_script`]'s own
+/// output so a format drift trips CI.
+///
+/// Returns `None` if the expected invocation line isn't found (e.g. a
+/// hand-written wrapper), in which case the caller removes only the wrapper
+/// script and plist, not a guessed binary.
+#[allow(dead_code)]
+pub(super) fn legacy_binary_path_from_wrapper(wrapper_sh: &str) -> Option<PathBuf> {
+    // Match the `"<binary>" network …` launch line. The path is quoted so an
+    // install path containing spaces survives.
+    for line in wrapper_sh.lines() {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('"') {
+            continue;
+        }
+        let rest = &trimmed[1..];
+        let Some(close) = rest.find('"') else {
+            continue;
+        };
+        let path = &rest[..close];
+        let after = rest[close + 1..].trim_start();
+        if after.starts_with("network") && !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    None
+}
+
+/// Basename of the auto-update wrapper script `freenet service install`
+/// writes (see [`wrapper_script_path`]). The migration only treats a plist's
+/// `ProgramArguments` target as a removable Freenet wrapper if it has this
+/// exact filename.
+const LEGACY_WRAPPER_SCRIPT_NAME: &str = "freenet-service-wrapper.sh";
+
+/// Distinctive header line [`generate_wrapper_script`] writes at the top of
+/// every wrapper. Used as a content signature so we never delete a
+/// hand-written or repurposed script that merely happens to be referenced by
+/// an `org.freenet.node` plist.
+const LEGACY_WRAPPER_SIGNATURE: &str = "# Freenet service wrapper for auto-update support.";
+
+/// Returns true if `(basename, contents)` look like a Freenet-generated
+/// auto-update wrapper script — i.e. it is safe for the migration to delete.
+/// PURE so the guard is unit-testable. We require BOTH the canonical filename
+/// AND the generated header signature, so a user who repurposed the legacy
+/// `org.freenet.node` label to launch an unrelated script does NOT have that
+/// script deleted (Codex P2, round 4 on PR #4448).
+#[allow(dead_code)]
+pub(super) fn is_legacy_freenet_wrapper(basename: Option<&str>, contents: &str) -> bool {
+    basename == Some(LEGACY_WRAPPER_SCRIPT_NAME) && contents.contains(LEGACY_WRAPPER_SIGNATURE)
+}
+
+/// Reverse of [`xml_escape`] for the entity set that function emits. Used to
+/// recover a real filesystem path from a plist `<string>` (e.g. a path with
+/// `&amp;` in it).
+#[allow(dead_code)]
+fn xml_unescape(s: &str) -> String {
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        // &amp; must be last so we don't double-decode the others.
+        .replace("&amp;", "&")
+}
+
+/// Execute a [`LegacyMigrationPlan`] on macOS. Best-effort and idempotent:
+/// each step is attempted independently and a failure (e.g. a root-owned
+/// binary the user can't `rm` without `sudo`) logs a manual-cleanup hint
+/// rather than aborting the whole migration or failing wrapper startup.
+///
+/// Returns `true` if a migration was attempted (so the caller knows the
+/// legacy plist is gone and the normal first-run agent registration should
+/// proceed), `false` if there was nothing to migrate.
+#[cfg(target_os = "macos")]
+fn run_legacy_install_migration(log_dir: &Path, plan: &LegacyMigrationPlan) -> bool {
+    let LegacyMigrationPlan::Migrate(steps) = plan else {
+        return false;
+    };
+    log_wrapper_event(
+        log_dir,
+        "Legacy install.sh install detected on first DMG launch; migrating to \
+         the DMG-managed launch agent (issue #3943).",
+    );
+    for step in steps {
+        match step {
+            LegacyMigrationStep::BootOutAndRemovePlist(plist) => {
+                // Bootout first so launchd stops auto-respawning the legacy
+                // backend; bootout is a no-op/non-fatal if not loaded.
+                launchctl_bootout(plist);
+                match remove_launch_agent_plist_at(plist) {
+                    Ok(()) => log_wrapper_event(
+                        log_dir,
+                        &format!("Migration: removed legacy launch agent {}", plist.display()),
+                    ),
+                    Err(e) => log_wrapper_event(
+                        log_dir,
+                        &format!(
+                            "Migration: could not remove legacy launch agent {} ({e}). \
+                             Please remove it manually: rm {}",
+                            plist.display(),
+                            plist.display()
+                        ),
+                    ),
+                }
+            }
+            LegacyMigrationStep::RemoveLegacyWrapperScript(wrapper) => {
+                remove_legacy_file(log_dir, "legacy wrapper script", wrapper);
+            }
+            LegacyMigrationStep::RemoveLegacyBinary(bin) => {
+                remove_legacy_file(log_dir, "legacy CLI binary", bin);
+            }
+        }
+    }
+    true
+}
+
+/// Remove a single legacy file as part of the migration, logging the outcome.
+/// Idempotent: a missing file is a no-op (it raced away between the caller's
+/// existence check and now). A permission failure (e.g. a root-owned binary
+/// the user can't `rm` without `sudo`) logs a manual-cleanup hint rather than
+/// failing the migration.
+#[cfg(target_os = "macos")]
+fn remove_legacy_file(log_dir: &Path, kind: &str, path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => log_wrapper_event(
+            log_dir,
+            &format!("Migration: removed {kind} {}", path.display()),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Raced away between the existence check and now; fine.
+        }
+        Err(e) => log_wrapper_event(
+            log_dir,
+            &format!(
+                "Migration: could not remove {kind} {} ({e}). \
+                 If it persists, remove it manually: sudo rm {}",
+                path.display(),
+                path.display()
+            ),
+        ),
+    }
+}
+
+/// Resolve a legacy install's own artifacts by reading its plist and the
+/// wrapper script the plist invokes. Side-effecting (file I/O) but does NOT
+/// mutate anything; the pure decision still lives in
+/// [`legacy_install_migration_plan`]. Only artifacts that exist on disk are
+/// returned, so the planner's output matches what is actually present.
+///
+/// We deliberately derive the binary from the wrapper script rather than
+/// guessing install locations, so we never remove an unrelated user-installed
+/// `freenet`/`fdev` (Codex P2, round 1 on PR #4448). We also VALIDATE that the
+/// referenced script is actually a Freenet-generated wrapper (canonical
+/// filename + header signature) before scheduling it — or its binary — for
+/// removal, so a hand-edited or repurposed `org.freenet.node` plist pointing
+/// at an unrelated script cannot cause that script/binary to be deleted
+/// (Codex P2, round 4).
+#[cfg(target_os = "macos")]
+fn resolve_legacy_install(legacy_plist: &Path) -> ResolvedLegacyInstall {
+    let Ok(plist_xml) = std::fs::read_to_string(legacy_plist) else {
+        return ResolvedLegacyInstall::default();
+    };
+    let Some(wrapper_path) = legacy_program_path_from_plist(&plist_xml) else {
+        return ResolvedLegacyInstall::default();
+    };
+
+    // Only act on the wrapper if it is genuinely a Freenet-generated script.
+    // If we can't read it, or it doesn't look like ours, remove nothing here
+    // (the caller still removes the plist itself, which is the race cause).
+    let Ok(wrapper_sh) = std::fs::read_to_string(&wrapper_path) else {
+        return ResolvedLegacyInstall::default();
+    };
+    let basename = wrapper_path.file_name().and_then(|n| n.to_str());
+    if !is_legacy_freenet_wrapper(basename, &wrapper_sh) {
+        return ResolvedLegacyInstall::default();
+    }
+
+    // The plist's ProgramArguments points at the auto-update wrapper script,
+    // not the binary directly (see `generate_plist`). Recover the binary from
+    // the wrapper, then offer its sibling `fdev` too (install.sh ships both).
+    // Constrain to the canonical `freenet`/`fdev` basenames as a second guard.
+    let mut binaries = Vec::new();
+    if let Some(bin) = legacy_binary_path_from_wrapper(&wrapper_sh) {
+        if bin.file_name().and_then(|n| n.to_str()) == Some("freenet") && bin.exists() {
+            if let Some(dir) = bin.parent() {
+                let fdev = dir.join("fdev");
+                if fdev.exists() {
+                    binaries.push(fdev);
+                }
+            }
+            binaries.push(bin);
+        }
+    }
+
+    ResolvedLegacyInstall {
+        wrapper_script: wrapper_path.exists().then_some(wrapper_path),
+        binaries,
+    }
+}
+
 /// Run all the macOS-only Launch-at-Login housekeeping that must happen
 /// before the tray is built. Specifically:
 ///
@@ -824,9 +1208,12 @@ pub(super) fn legacy_launchd_agent_present() -> bool {
 ///   Launch at Login but the plist's embedded executable path no longer
 ///   matches the current one (user moved the .app, upgraded via a new
 ///   DMG installed elsewhere, etc.), rewrite it.
-/// - If the legacy `org.freenet.node` LaunchAgent from the install.sh
-///   era is still present, log a prominent warning so migrating users
-///   know to clean it up before the two agents race for port 7509.
+/// - If a legacy `org.freenet.node` LaunchAgent from the install.sh era is
+///   present, migrate away from it (issue #3943): boot it out, remove its
+///   plist + wrapper + the binaries that install owned, then register our own
+///   agent. If migration can't remove the legacy plist (rare), fall back to
+///   logging a prominent manual-cleanup warning so the user knows the two
+///   agents race for port 7509.
 ///
 /// Called synchronously (not from the wrapper thread) so the tray's
 /// Launch-at-Login check item reads the final filesystem state when
@@ -836,14 +1223,109 @@ pub(super) fn legacy_launchd_agent_present() -> bool {
 /// on first launch even though Launch at Login had been enabled.
 #[cfg(target_os = "macos")]
 pub(super) fn macos_launch_at_login_startup(log_dir: &Path) {
-    // Legacy-agent warning: fire once per startup regardless of first-run.
-    // If users see this, they have an auto-start from the old install.sh
-    // flow still configured; if we also write our own plist below, both
-    // agents race for port 7509 on every login. To avoid that race we
-    // treat the legacy plist's presence as "already enabled" for the
-    // first-run decision, so we don't layer a second auto-start on top.
-    // User is still instructed to clean up the legacy one manually.
-    let legacy_present = legacy_launchd_agent_present();
+    // Resolve the onboarding first-run marker up front: the auto-register
+    // decision below uses it. (The legacy migration is gated on its OWN marker,
+    // not this one — see below.)
+    let Some(marker) = first_run_marker_path() else {
+        return;
+    };
+    let is_first_run = is_first_run_at(&marker);
+
+    // Legacy-install migration (issue #3943). If a pre-existing install.sh
+    // launch agent is present, boot it out, remove its plist + auto-update
+    // wrapper script, and remove the CLI binaries THAT legacy install owned,
+    // so the two installs stop racing for port 7509. We resolve the legacy
+    // install's own artifacts from its plist and wrapper (never guessed
+    // locations) so we don't delete an unrelated `freenet`/`fdev` a user
+    // installed separately. The decision is computed by the pure
+    // `legacy_install_migration_plan` so it is unit-testable on Linux.
+    //
+    // Gated on a DEDICATED migration marker, NOT the onboarding first-run
+    // marker: existing DMG users have the first-run marker set but may still
+    // have the racing legacy agent, and must still get migrated (Codex P1).
+    let migration_done = legacy_migration_marker_path()
+        .map(|m| m.exists())
+        .unwrap_or(false);
+    let legacy_plist_path = launch_agent_plist_path_for(LEGACY_SERVICE_LAUNCHD_LABEL);
+    let legacy_present = legacy_plist_path
+        .as_ref()
+        .map(|p| p.exists())
+        .unwrap_or(false);
+    let resolved = legacy_plist_path
+        .as_ref()
+        .filter(|_| !migration_done && legacy_present)
+        .map(|p| resolve_legacy_install(p))
+        .unwrap_or_default();
+    let legacy_plist = legacy_plist_path.map(|p| (p, legacy_present));
+    let plan = legacy_install_migration_plan(migration_done, legacy_plist, &resolved);
+    let migrated = run_legacy_install_migration(log_dir, &plan);
+
+    // Re-evaluate legacy presence after migration: a successful migration
+    // removed the legacy plist.
+    let legacy_present = if migrated {
+        legacy_launchd_agent_present()
+    } else {
+        legacy_present
+    };
+
+    // If we migrated an existing user who had no DMG agent of their own (the
+    // pre-migration code treated the legacy plist as already-enabled, so an
+    // already-onboarded user never got ours), register the replacement NOW —
+    // in the same launch as the migration — so they aren't left with Launch
+    // at Login silently off (Codex P2, round 2).
+    //
+    // This is intentionally a ONE-SHOT tied to the migrating launch, NOT a
+    // durable "re-register whenever our plist is absent" rule: once the
+    // migration marker is written (below), a migrated user who later DISABLES
+    // Launch at Login via the tray must keep it disabled — we must not
+    // recreate the plist against their explicit choice (Codex P2, round 5).
+    let migrated_off_legacy = migrated && !legacy_present;
+    if migrated_off_legacy && !is_launch_at_login_enabled() {
+        match std::env::current_exe() {
+            Ok(exe) => match enable_launch_at_login(&exe) {
+                Ok(()) => log_wrapper_event(
+                    log_dir,
+                    "Migration: registered replacement Launch at Login agent",
+                ),
+                Err(e) => log_wrapper_event(
+                    log_dir,
+                    &format!(
+                        "Migration: replacement Launch at Login registration failed ({e}). \
+                         Enable it from the Freenet tray menu if you want auto-start on login."
+                    ),
+                ),
+            },
+            Err(e) => log_wrapper_event(
+                log_dir,
+                &format!("Migration: could not resolve current exe for replacement agent: {e}"),
+            ),
+        }
+    }
+
+    // Mark the migration done ONLY once the legacy plist is actually gone, so
+    // a launch where plist removal was denied (rare; the plist is user-owned)
+    // retries next time rather than giving up permanently. The marker means
+    // "the legacy race is resolved": once written we never auto-manage Launch
+    // at Login off the migration path again, so a later user disable sticks
+    // (Codex P2, round 5).
+    if migrated && !legacy_present {
+        if let Some(m) = legacy_migration_marker_path() {
+            if let Err(e) = mark_first_run_complete_at(&m) {
+                log_wrapper_event(
+                    log_dir,
+                    &format!(
+                        "Migration: failed to write migration marker {}: {e}",
+                        m.display()
+                    ),
+                );
+            }
+        }
+    }
+
+    // Legacy-agent warning: if the legacy plist is STILL present (we either
+    // didn't migrate this launch, or removal was denied), warn the user.
+    // Treating the legacy plist's presence as "already enabled" below avoids
+    // layering a second auto-start on top of one we couldn't remove.
     if legacy_present {
         log_wrapper_event(
             log_dir,
@@ -856,13 +1338,12 @@ pub(super) fn macos_launch_at_login_startup(log_dir: &Path) {
         );
     }
 
-    // First-run auto-register. Treat the legacy plist as already-enabled
-    // so migrating users don't end up with two plists (Codex P2).
-    let Some(marker) = first_run_marker_path() else {
-        return;
-    };
+    // First-run onboarding auto-register: register unless something already
+    // auto-starts Freenet (our own plist, or a legacy plist we couldn't
+    // remove). The post-migration replacement registration is handled above;
+    // here we only handle genuine first-run and the stale-plist self-heal.
     let already_enabled = is_launch_at_login_enabled() || legacy_present;
-    match first_run_launch_at_login_action(is_first_run_at(&marker), already_enabled) {
+    match first_run_launch_at_login_action(is_first_run, already_enabled) {
         FirstRunLaunchAtLoginAction::Register => match std::env::current_exe() {
             Ok(exe) => match enable_launch_at_login(&exe) {
                 Ok(()) => log_wrapper_event(log_dir, "First-run: registered Launch at Login agent"),
@@ -876,15 +1357,11 @@ pub(super) fn macos_launch_at_login_startup(log_dir: &Path) {
                 &format!("First-run Launch at Login: could not resolve current exe: {e}"),
             ),
         },
-        FirstRunLaunchAtLoginAction::AlreadyEnabled => {
-            // Nothing to do for first-run, but the plist may still be stale.
-            // Only refresh if our OWN plist is present — don't resurrect
-            // a rewrite cycle on a legacy-only install.
-            if is_launch_at_login_enabled() {
-                refresh_launch_at_login_plist_if_stale();
-            }
-        }
-        FirstRunLaunchAtLoginAction::NotFirstRun => {
+        FirstRunLaunchAtLoginAction::AlreadyEnabled | FirstRunLaunchAtLoginAction::NotFirstRun => {
+            // Nothing to register; if our OWN plist is present it may be stale
+            // (user moved the .app, new DMG location). Refresh it. Don't
+            // resurrect a rewrite cycle on a legacy-only install (own plist
+            // absent), and don't fight a user who deliberately disabled it.
             if is_launch_at_login_enabled() {
                 refresh_launch_at_login_plist_if_stale();
             }
@@ -2035,6 +2512,166 @@ fn kill_stale_freenet_processes(log_dir: &Path) {
     }
 }
 
+/// Per-platform directory the wrapper writes its lifecycle log to. Mirrors the
+/// path `service_logs` tails, so `doctor`'s reap events land in the same place a
+/// user would already be looking.
+fn doctor_log_dir() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library/Logs/freenet")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        home.join(".local/state/freenet")
+    }
+}
+
+/// Reap stale `freenet network` processes, escalating to SIGKILL for any that
+/// ignore the initial SIGTERM.
+///
+/// `kill_stale_freenet_processes` (the wrapper-startup reaper) sends a single
+/// `pkill` (SIGTERM) and returns. That is right for the startup path — the
+/// wrapper is about to relaunch and a lingering drainer will exit on its own —
+/// but `doctor` is invoked precisely because a node is WEDGED, and the original
+/// incident's orphan ignored SIGTERM for >11s (see `heal_stale_orphan_or_defer`
+/// in `generate_wrapper_script`). So here we SIGTERM, wait, then SIGKILL the
+/// holdouts. Returns the number of processes that were still matching after the
+/// SIGTERM pass (i.e. needed escalation), for the summary output.
+#[cfg(unix)]
+fn reap_stale_freenet_processes_escalating(log_dir: &Path) -> usize {
+    let uid = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .unwrap_or_default();
+    let escalated = kill_pattern_escalating(uid.trim(), "freenet network", 12);
+    if escalated > 0 {
+        log_wrapper_event(
+            log_dir,
+            "doctor: stale freenet network process(es) ignored SIGTERM, sent SIGKILL",
+        );
+    } else {
+        log_wrapper_event(log_dir, "doctor: reaped stale freenet network process(es)");
+    }
+    escalated
+}
+
+/// SIGTERM a user-scoped process set matched by `pattern` (a `pgrep -f`
+/// substring), wait up to `grace_secs` for graceful exit polling once a second,
+/// then SIGKILL any survivor. Returns the count of survivors that needed the
+/// SIGKILL escalation.
+///
+/// Parameterized on `pattern` (not hardcoded to "freenet network") purely so the
+/// escalation timing/decision is unit-testable against a controllable child;
+/// production callers always pass "freenet network".
+#[cfg(unix)]
+fn kill_pattern_escalating(uid: &str, pattern: &str, grace_secs: usize) -> usize {
+    use std::time::Duration;
+
+    // SIGTERM pass. Ignore the result: a non-match (nothing to kill) is the
+    // common, healthy case, and we re-check liveness via pgrep below regardless.
+    std::process::Command::new("pkill")
+        .args(["-f", "-u", uid, pattern])
+        .status()
+        .ok();
+
+    // Wait for graceful exit, escalating as soon as the survivors are quiet.
+    for _ in 0..grace_secs {
+        std::thread::sleep(Duration::from_secs(1));
+        if pids_matching(uid, pattern).is_empty() {
+            return 0;
+        }
+    }
+
+    // SIGKILL any survivor.
+    let survivors = pids_matching(uid, pattern).len();
+    if survivors > 0 {
+        std::process::Command::new("pkill")
+            .args(["-9", "-f", "-u", uid, pattern])
+            .status()
+            .ok();
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    survivors
+}
+
+/// PIDs of user-scoped processes whose command line matches `pattern`
+/// (`pgrep -f`). Empty on any error.
+#[cfg(unix)]
+fn pids_matching(uid: &str, pattern: &str) -> Vec<u32> {
+    std::process::Command::new("pgrep")
+        .args(["-f", "-u", uid, pattern])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| {
+            s.split_whitespace()
+                .filter_map(|p| p.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Recover a wedged service install (issue #3967). Orchestrates the manual
+/// recovery that `restart` cannot do:
+///
+///   1. Re-template the wrapper/unit to the CURRENT binary via the install
+///      path. This closes the bootstrap gap: the self-heal wrapper (#4408) can
+///      only reach disk through `freenet update`, which a node wedged on a
+///      stale orphan never runs — so an already-wedged install never adopts the
+///      fix on its own. Idempotent on a healthy install.
+///   2. Stop the managed service so launchd/systemd releases its child cleanly.
+///   3. Reap stale orphaned `freenet network` processes (PPID=1, holding the
+///      port on an old binary), escalating SIGTERM -> SIGKILL for holdouts.
+///   4. Start the service so the freshly-templated wrapper launches on a clean
+///      port.
+///
+/// Cross-platform: it calls the cfg-gated install/stop/start helpers and the
+/// unix reaper, so it compiles on every target.
+fn service_doctor(system: bool) -> Result<()> {
+    println!("freenet service doctor: recovering service install...");
+
+    // 1. Re-template wrapper/unit to the current binary.
+    println!("  - Re-templating service wrapper/unit to the current binary...");
+    install_service(system)?;
+
+    // 2. Stop the managed service (best-effort: a wedged install may show the
+    //    agent as not-running, in which case stop is a no-op we don't want to
+    //    abort on).
+    println!("  - Stopping the managed service...");
+    if let Err(e) = stop_service(system) {
+        println!("    (stop reported: {e} — continuing; the service may already be down)");
+    }
+
+    // 3. Reap stale orphans (the step `restart` lacks).
+    #[cfg(unix)]
+    {
+        let log_dir = doctor_log_dir();
+        println!("  - Reaping stale 'freenet network' processes...");
+        let escalated = reap_stale_freenet_processes_escalating(&log_dir);
+        if escalated > 0 {
+            println!("    ({escalated} process(es) ignored SIGTERM and were force-killed)");
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        println!("  - Reaping stale 'freenet network' processes...");
+        kill_stale_freenet_processes(&doctor_log_dir());
+    }
+
+    // 4. Start fresh so the new wrapper text loads on a clean port.
+    println!("  - Starting the service...");
+    start_service(system)?;
+
+    println!("freenet service doctor: done. The service has been re-templated and restarted.");
+    println!(
+        "If the dashboard still shows an old version, hard-refresh the page to clear cached assets."
+    );
+    Ok(())
+}
+
 /// Determine whether the user wants to purge data directories.
 ///
 /// - `--purge` → true
@@ -2135,22 +2772,45 @@ fn purge_data_dirs(#[allow(unused_variables)] system_mode: bool) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     let home_override: Option<std::path::PathBuf> = None;
 
-    // If we have a home override (system mode), construct paths manually using
-    // XDG defaults. Otherwise use ProjectDirs which resolves from the current user.
+    // If we have a home override (system mode on Linux), purge the service
+    // user's XDG dirs via the manually-constructed paths. Otherwise use
+    // ProjectDirs, which resolves from the current user.
     if let Some(ref home) = home_override {
-        // XDG defaults for the service user
-        remove_if_exists("data", &home.join(".local/share/Freenet"))?;
-        remove_if_exists("config", &home.join(".config/Freenet"))?;
-        remove_if_exists("cache", &home.join(".cache/Freenet"))?;
-        // Also remove lowercase cache dir used by webapp cache
-        remove_if_exists("cache", &home.join(".cache/freenet"))?;
-        remove_if_exists("logs", &home.join(".local/state/freenet"))?;
+        for (label, dir) in linux_system_purge_dirs(home) {
+            remove_if_exists(label, &dir)?;
+        }
     } else {
         let leaves = DataLeaves::from_project_dirs();
         purge_leaves_and_collapse(&leaves)?;
     }
 
     Ok(())
+}
+
+/// XDG leaf directories that `--system` mode must purge for the service user.
+///
+/// These MUST match the paths the running node actually creates. On Linux the
+/// `directories` crate lowercases the application name when building
+/// `ProjectDirs` (`ProjectDirs::from("", "The Freenet Project Inc", "Freenet")`
+/// yields `~/.local/share/freenet`, not `~/.local/share/Freenet`), and
+/// `get_log_dir` uses `~/.local/state/freenet`. The previous hardcoded
+/// uppercase `Freenet` paths matched nothing on disk, so
+/// `sudo freenet uninstall --purge --system` reported success while silently
+/// leaving all of the user's contracts, delegates, and database behind (#3907).
+///
+/// Extracted as a pure function (parameterised on `home`) so the path logic is
+/// unit-testable without mutating process-level `SUDO_USER`/home state. This is
+/// only reached in `--system` mode, which only resolves a `home_override` on
+/// Linux; the `cfg_attr` suppresses the dead-code lint on macOS/Windows, where
+/// `home_override` is always `None` so the function is never called.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_system_purge_dirs(home: &Path) -> [(&'static str, PathBuf); 4] {
+    [
+        ("data", home.join(".local/share/freenet")),
+        ("config", home.join(".config/freenet")),
+        ("cache", home.join(".cache/freenet")),
+        ("logs", home.join(".local/state/freenet")),
+    ]
 }
 
 /// The full set of leaf directories `purge_data_dirs` needs to touch in
@@ -2200,13 +2860,15 @@ struct DataLeaves {
     /// and `get_log_dir` returns `%LOCALAPPDATA%\freenet\logs`; the
     /// immediate parents (`...\Freenet`, `...\freenet`) exist only for us.
     ///
-    /// False on Linux/macOS — `ProjectDirs` builds `~/.local/share/Freenet`,
-    /// `~/.config/Freenet`, `~/.cache/Freenet` (Linux) and analogous paths
-    /// on macOS. The parents of those leaves are shared XDG/OS hierarchies
-    /// used by every other app on the system — collapsing them would at
-    /// best no-op (by luck) and at worst delete an otherwise-empty shared
-    /// root on a fresh account. The safety must be enforced at the type
-    /// level, not left to `remove_dir_if_empty`'s runtime check.
+    /// False on Linux/macOS. On Linux the `directories` crate lowercases the
+    /// application name, so `ProjectDirs` builds `~/.local/share/freenet`,
+    /// `~/.config/freenet`, `~/.cache/freenet` (note the lowercase `freenet`,
+    /// not `Freenet`); macOS uses its own `~/Library/...` scheme. The parents
+    /// of those leaves are shared XDG/OS hierarchies used by every other app
+    /// on the system — collapsing them would at best no-op (by luck) and at
+    /// worst delete an otherwise-empty shared root on a fresh account. The
+    /// safety must be enforced at the type level, not left to
+    /// `remove_dir_if_empty`'s runtime check.
     collapse_parents: bool,
 }
 
@@ -2453,7 +3115,21 @@ fn install_user_service() -> Result<()> {
     let service_content = generate_user_service_file(&exe_path, &log_dir);
     let service_path = service_dir.join("freenet.service");
 
-    fs::write(&service_path, service_content).context("Failed to write service file")?;
+    fs::write(&service_path, &service_content).context("Failed to write service file")?;
+
+    // Sidecar records the unit's SHA-256 so a later `freenet update` can
+    // distinguish "Freenet's unit" from a hand-edited one before
+    // overwriting (#4287). A failed sidecar write only weakens future
+    // user-modification protection — warn and continue.
+    let hash_path = service_path.with_extension("service.hash");
+    let unit_hash = super::update::wrapper_content_hash(&service_content);
+    if let Err(e) = super::update::write_wrapper_hash_sidecar(&hash_path, &unit_hash) {
+        eprintln!(
+            "Warning: failed to write service hash sidecar at {}: {}.",
+            hash_path.display(),
+            e
+        );
+    }
 
     // Reload systemd user daemon
     systemctl_with_hint(false, &["daemon-reload"], "reload systemd daemon")?;
@@ -2515,6 +3191,22 @@ fn install_system_service() -> Result<()> {
         )
     })?;
 
+    // Sidecar records the unit's SHA-256 so a later `freenet update` can
+    // distinguish "Freenet's unit" from a hand-edited one before
+    // overwriting (#4287). Lives next to the root-owned unit and is
+    // written by the same root process, so root owns it too. A failed
+    // sidecar write only weakens future user-modification protection —
+    // warn and continue.
+    let system_hash_path = Path::new(SYSTEM_SERVICE_PATH).with_extension("service.hash");
+    let unit_hash = super::update::wrapper_content_hash(&service_content);
+    if let Err(e) = super::update::write_wrapper_hash_sidecar(&system_hash_path, &unit_hash) {
+        eprintln!(
+            "Warning: failed to write service hash sidecar at {}: {}.",
+            system_hash_path.display(),
+            e
+        );
+    }
+
     // Reload systemd daemon (system-level, no --user)
     let status = systemctl(true, &["daemon-reload"])?;
     if !status.success() {
@@ -2550,6 +3242,31 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Stale-orphan self-heal (issue #3967): RestartPreventExitStatus=43 below
+# means an exit 43 ("another instance already running") never restarts the
+# unit. That is correct for a legitimate second instance, but if the port
+# holder is an ORPHANED `freenet network` (PPID=1) still running an OLD
+# binary, the unit would stand down and the orphan would serve stale assets
+# forever. This pre-flight runs before every start: it finds the port
+# holder, and kills it ONLY when it is an init-adopted orphan (PPID==1) whose
+# `Freenet version:` line differs from the binary this unit would launch (or
+# whose version can't be read). A user-run `freenet network` (parented by a
+# shell, PPID!=1) is always left alone, as is a current-version orphan.
+#
+# systemd performs its own $VAR/${{VAR}} expansion on Exec* lines BEFORE handing
+# the string to /bin/sh, so every dollar the SHELL must see is written as $$
+# here (systemd collapses $$ -> a single $ for sh). Self-match guards: the
+# pre-flight sh's OWN argv contains the literal "freenet network" (it is the
+# substring `pgrep -f` matches), so the pre-flight excludes its own PID ($$$$ ->
+# the sh's $$) and PID 1 from the holder loop. We deliberately do NOT anchor on
+# the holder's exe equalling THIS unit's on-disk binary: a #3967 orphan is, by
+# definition, running an OLD/DIFFERENT binary, so an `exe == on-disk binary`
+# guard would skip exactly the orphan we must kill. The PPID==1 + version-line
+# checks below are what distinguish a stale orphan from a legitimate holder.
+# PPID is read after the final ')' in /proc/PID/stat (comm is parenthesized) so
+# a comm containing whitespace can't shift the field. The '-' prefix means a
+# failure here never blocks the start.
+ExecStartPre=-/bin/sh -c 'self=$$$$; ondisk=$$(timeout 5 {binary} --version 2>/dev/null | grep "^Freenet version:"); for pid in $$(pgrep -f -u "$$(id -u)" "freenet network" 2>/dev/null); do [ "$$pid" = "$$self" ] && continue; [ "$$pid" = "1" ] && continue; exe=$$(readlink -f /proc/$$pid/exe 2>/dev/null); hv=""; [ -x "$$exe" ] && hv=$$(timeout 5 "$$exe" --version 2>/dev/null | grep "^Freenet version:"); ppid=$$(sed "s/.*) //" /proc/$$pid/stat 2>/dev/null | awk "{{print \$$2}}"); mismatch=1; [ -n "$$ondisk" ] && [ -n "$$hv" ] && [ "$$hv" != "$$ondisk" ] && mismatch=0; if [ "$$ppid" = "1" ] && {{ [ "$$mismatch" = "0" ] || [ -z "$$hv" ]; }}; then kill -TERM "$$pid" 2>/dev/null || true; w=0; while kill -0 "$$pid" 2>/dev/null && [ $$w -lt 12 ]; do sleep 1; w=$$((w+1)); done; kill -0 "$$pid" 2>/dev/null && kill -KILL "$$pid" 2>/dev/null || true; fi; done'
 ExecStart={binary} network
 Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops
@@ -2559,14 +3276,20 @@ RestartSec=10
 # SuccessExitStatus=42 ensures auto-update exits don't count as failures.
 StartLimitBurst=5
 StartLimitIntervalSec=120
-# Allow 15 seconds for graceful shutdown before SIGKILL
-# The node handles SIGTERM to properly close peer connections
-TimeoutStopSec=15
+# Allow 45 seconds for graceful shutdown before SIGKILL.
+# The node handles SIGTERM by (1) waiting up to `shutdown-drain-secs`
+# (default 30s) for in-flight client PUT/GET/UPDATE/SUBSCRIBE drivers
+# to finish, then (2) closing peer connections. The 15s headroom over
+# the default drain covers peer-connection teardown + spawn-task
+# cleanup. If you raise `shutdown-drain-secs`, raise this in lockstep.
+TimeoutStopSec=45
 
 # Auto-update: if peer exits with code 42 (version mismatch with gateway),
 # run update before systemd restarts the service. The '-' prefix means
-# ExecStopPost failure won't affect service restart.
-ExecStopPost=-/bin/sh -c '[ "$EXIT_STATUS" = "42" ] && {binary} update --quiet || true'
+# ExecStopPost failure won't affect service restart. $$EXIT_STATUS is doubled
+# so systemd passes a literal $EXIT_STATUS through to sh (which systemd itself
+# sets in the ExecStopPost environment).
+ExecStopPost=-/bin/sh -c '[ "$$EXIT_STATUS" = "42" ] && {binary} update --quiet || true'
 # Treat exit code 42 as success so it doesn't count against StartLimitBurst.
 # Without this, rapid update cycles (exit 42 → ExecStopPost → restart) can
 # exhaust the burst limit and permanently kill the service.
@@ -2624,6 +3347,19 @@ Wants=network-online.target
 Type=simple
 User={username}
 Environment=HOME={home}
+# Stale-orphan self-heal (issue #3967): see the matching comment in the user
+# unit (including the systemd $$-escaping, the PPID-after-final-')' parse, and
+# why we do NOT anchor on the holder's exe equalling this unit's on-disk binary
+# — a #3967 orphan runs an OLD/DIFFERENT binary, so that anchor would skip the
+# very process we must kill). The self-PID and PID-1 skips exclude the
+# pre-flight's own sh (whose argv contains the literal "freenet network").
+# RestartPreventExitStatus=43 means an exit 43 never restarts the unit, so an
+# init-adopted orphan (PPID==1) running an OLD binary would hold the port
+# forever. This pre-flight kills the holder ONLY when it is such an orphan whose
+# `Freenet version:` differs from (or can't be read against) the binary this
+# unit launches; a user-run instance (PPID!=1) is always left alone. The '-'
+# prefix means a failure here never blocks the start.
+ExecStartPre=-/bin/sh -c 'self=$$$$; ondisk=$$(timeout 5 {binary} --version 2>/dev/null | grep "^Freenet version:"); for pid in $$(pgrep -f -u "$$(id -u)" "freenet network" 2>/dev/null); do [ "$$pid" = "$$self" ] && continue; [ "$$pid" = "1" ] && continue; exe=$$(readlink -f /proc/$$pid/exe 2>/dev/null); hv=""; [ -x "$$exe" ] && hv=$$(timeout 5 "$$exe" --version 2>/dev/null | grep "^Freenet version:"); ppid=$$(sed "s/.*) //" /proc/$$pid/stat 2>/dev/null | awk "{{print \$$2}}"); mismatch=1; [ -n "$$ondisk" ] && [ -n "$$hv" ] && [ "$$hv" != "$$ondisk" ] && mismatch=0; if [ "$$ppid" = "1" ] && {{ [ "$$mismatch" = "0" ] || [ -z "$$hv" ]; }}; then kill -TERM "$$pid" 2>/dev/null || true; w=0; while kill -0 "$$pid" 2>/dev/null && [ $$w -lt 12 ]; do sleep 1; w=$$((w+1)); done; kill -0 "$$pid" 2>/dev/null && kill -KILL "$$pid" 2>/dev/null || true; fi; done'
 ExecStart={binary} network
 Restart=always
 # Wait 10 seconds before restart to avoid rapid restart loops
@@ -2633,14 +3369,20 @@ RestartSec=10
 # SuccessExitStatus=42 ensures auto-update exits don't count as failures.
 StartLimitBurst=5
 StartLimitIntervalSec=120
-# Allow 15 seconds for graceful shutdown before SIGKILL
-# The node handles SIGTERM to properly close peer connections
-TimeoutStopSec=15
+# Allow 45 seconds for graceful shutdown before SIGKILL.
+# The node handles SIGTERM by (1) waiting up to `shutdown-drain-secs`
+# (default 30s) for in-flight client PUT/GET/UPDATE/SUBSCRIBE drivers
+# to finish, then (2) closing peer connections. The 15s headroom over
+# the default drain covers peer-connection teardown + spawn-task
+# cleanup. If you raise `shutdown-drain-secs`, raise this in lockstep.
+TimeoutStopSec=45
 
 # Auto-update: if peer exits with code 42 (version mismatch with gateway),
 # run update before systemd restarts the service. The '-' prefix means
-# ExecStopPost failure won't affect service restart.
-ExecStopPost=-/bin/sh -c '[ "$EXIT_STATUS" = "42" ] && {binary} update --quiet || true'
+# ExecStopPost failure won't affect service restart. $$EXIT_STATUS is doubled
+# so systemd passes a literal $EXIT_STATUS through to sh (which systemd itself
+# sets in the ExecStopPost environment).
+ExecStopPost=-/bin/sh -c '[ "$$EXIT_STATUS" = "42" ] && {binary} update --quiet || true'
 # Treat exit code 42 as success so it doesn't count against StartLimitBurst.
 # Without this, rapid update cycles (exit 42 → ExecStopPost → restart) can
 # exhaust the burst limit and permanently kill the service.
@@ -2792,6 +3534,52 @@ fn install_service(system: bool) -> Result<()> {
     install_macos_service()
 }
 
+/// Derive the path of the macOS auto-update wrapper script from a home
+/// directory. Single source of truth shared by the install path (which
+/// writes the script), the update path, and the uninstall path (which
+/// removes it). Keep this in sync with `update.rs`'s wrapper derivation.
+#[cfg(target_os = "macos")]
+fn wrapper_script_path(home_dir: &Path) -> PathBuf {
+    home_dir.join(".local/bin/freenet-service-wrapper.sh")
+}
+
+/// Remove the wrapper script and its sidecar/backup files written by the
+/// install (`*.sh`, `*.sh.hash`) and update (`*.sh.bak`) paths.
+///
+/// Idempotent: a missing file is not an error, so uninstalling twice (or
+/// uninstalling an install that never ran an update) succeeds cleanly.
+/// Returns an error only if a present file cannot be removed.
+///
+/// Regression target for #4290: install wrote three files, uninstall
+/// removed zero, leaving stale wrapper artifacts in `~/.local/bin`.
+#[cfg(target_os = "macos")]
+fn remove_wrapper_files(wrapper_path: &Path) -> Result<()> {
+    use std::fs;
+
+    // `.sh` itself, plus the `.sh.hash` sidecar (#4286) and any `.sh.bak`
+    // backup left by `freenet update`. Derived via `with_extension` so they
+    // track the wrapper path rather than being independently hardcoded.
+    let targets = [
+        wrapper_path.to_path_buf(),
+        wrapper_path.with_extension("sh.hash"),
+        wrapper_path.with_extension("sh.bak"),
+    ];
+
+    for target in &targets {
+        match fs::remove_file(target) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("Failed to remove wrapper file {}", target.display())
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(target_os = "macos")]
 fn install_macos_service() -> Result<()> {
     use std::fs;
@@ -2810,9 +3598,11 @@ fn install_macos_service() -> Result<()> {
     // Create wrapper script for auto-update support.
     // launchd doesn't have ExecStopPost like systemd, so we use a wrapper
     // that checks exit code 42 (update needed) and runs update before restart.
-    let wrapper_dir = home_dir.join(".local/bin");
-    fs::create_dir_all(&wrapper_dir).context("Failed to create wrapper directory")?;
-    let wrapper_path = wrapper_dir.join("freenet-service-wrapper.sh");
+    let wrapper_path = wrapper_script_path(&home_dir);
+    let wrapper_dir = wrapper_path
+        .parent()
+        .context("wrapper path has no parent directory")?;
+    fs::create_dir_all(wrapper_dir).context("Failed to create wrapper directory")?;
     let wrapper_content = generate_wrapper_script(&exe_path);
     fs::write(&wrapper_path, &wrapper_content).context("Failed to write wrapper script")?;
     fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))
@@ -2875,6 +3665,110 @@ log_event() {{
     logger -t freenet "$1"
 }}
 
+# Print a binary's full version identity line, e.g.
+#   Freenet version: 0.2.71 (abc1234)
+# Bounded by a 5s timeout so a wedged binary can't stall the whole self-heal
+# before ExecStart. `timeout` may be absent on a bare macOS box, so fall back
+# to invoking the binary directly when it isn't on PATH.
+version_line() {{
+    if command -v timeout >/dev/null 2>&1; then
+        timeout 5 "$1" --version 2>/dev/null | grep '^Freenet version:'
+    else
+        "$1" --version 2>/dev/null | grep '^Freenet version:'
+    fi
+}}
+
+# Print the on-disk binary's full version identity line. Used on the exit-43
+# self-heal path to tell a stale orphan apart from a legitimate second
+# instance running the SAME binary we would launch.
+ondisk_version() {{
+    version_line "{binary}"
+}}
+
+# Enumerate PIDs of `freenet network` processes owned by the current user.
+holder_pids() {{
+    pgrep -f -u "$(id -u)" "freenet network" 2>/dev/null
+}}
+
+# Resolve a PID's executable path on macOS. `ps -o command=` yields the full
+# argv. The wrapper launches the node as `<binary> network`, so the image path
+# is everything up to the trailing ` network` argument. We strip that suffix
+# rather than `awk '{{print $1}}'`-splitting on whitespace, because an install
+# path that contains a space (e.g. `/Users/Some User/bin/freenet`) would be
+# re-truncated by whitespace splitting — the exact regression that switching
+# from `ps -o comm=` to `-o command=` was meant to avoid. Empty if the process
+# is gone. (If the holder's argv ever stops ending in ` network` this yields the
+# full command line, which still drives the version comparison correctly.)
+holder_exe() {{
+    ps -o command= -p "$1" 2>/dev/null | sed 's/ network$//'
+}}
+
+# Stale-orphan self-heal for exit 43.
+#
+# WHY this exists: the binary returns exit 43 ("another instance is already
+# running") whenever it cleanly detects something already holding the
+# service port. launchd's plist sets KeepAlive.SuccessfulExit=false, so if
+# this wrapper responds with `exit 0`, launchd treats it as an intentional
+# stop and NEVER respawns us. (systemd has the same trap via
+# RestartPreventExitStatus=43.) That is correct for a real second instance,
+# but catastrophic when the port holder is an ORPHANED `freenet network`
+# (PPID=1, detached from any wrapper) still running a STALE OLD binary: every
+# new spawn detects it, exits 43, we stand down, and the orphan serves stale
+# assets forever (issue #3967).
+#
+# So before deferring, decide per holder. We ONLY kill a process that is an
+# ORPHAN (PPID==1, adopted by launchd/init and not this wrapper's own child) —
+# a deliberately hand-run `freenet network` is parented by a user shell, so its
+# PPID != 1 and we always defer to it (never SIGKILL a developer's instance or
+# truncate a supervised upgrade's drain). Among orphans we kill when EITHER:
+#   * its version line differs from the binary we would launch (stale binary),
+#     but only when we can actually read our own on-disk version (a non-empty
+#     ondisk); if ondisk is unreadable mid-update we must NOT treat "differs"
+#     as a kill signal, or we'd cull a healthy current node, OR
+#   * we cannot read the holder's own version at all (binary gone/unreadable),
+#     in which case an init-adopted orphan is presumed stale.
+# Kill is SIGTERM, then SIGKILL (the original incident's orphan ignored SIGTERM
+# for >11s). Returns 0 = killed a stale orphan, relaunch; 1 = defer.
+heal_stale_orphan_or_defer() {{
+    local ondisk pid exe holder_ver ppid version_mismatch killed=1
+    ondisk="$(ondisk_version)"
+    for pid in $(holder_pids); do
+        # Never touch our own child (the instance we just ran in this loop).
+        [ "$pid" = "$WRAPPER_CHILD_PID" ] && continue
+        ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+        exe="$(holder_exe "$pid")"
+        holder_ver=""
+        if [ -n "$exe" ] && [ -x "$exe" ]; then
+            holder_ver="$(version_line "$exe")"
+        fi
+        # Orphan-only: a non-init-adopted holder is a real second instance (or a
+        # user-run node) and is always deferred to, regardless of version.
+        version_mismatch=1
+        if [ -n "$ondisk" ] && [ -n "$holder_ver" ] && [ "$holder_ver" != "$ondisk" ]; then
+            version_mismatch=0
+        fi
+        if [ "$ppid" = "1" ] && {{ [ "$version_mismatch" = "0" ] || [ -z "$holder_ver" ]; }}; then
+            log_event "Exit 43: port holder PID $pid is a STALE orphan (holder='$holder_ver' ondisk='$ondisk' ppid=$ppid). Killing and relaunching."
+            kill -TERM "$pid" 2>/dev/null || true
+            # Wait up to ~12s for graceful exit, then escalate to SIGKILL.
+            local waited=0
+            while kill -0 "$pid" 2>/dev/null && [ $waited -lt 12 ]; do
+                sleep 1
+                waited=$((waited + 1))
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+                log_event "Exit 43: stale orphan PID $pid ignored SIGTERM after ${{waited}}s, sending SIGKILL"
+                kill -KILL "$pid" 2>/dev/null || true
+                sleep 1
+            fi
+            killed=0
+        else
+            log_event "Exit 43: deferring to port holder PID $pid (holder='$holder_ver' ondisk='$ondisk' ppid=$ppid) — current version, user-supervised, or version undeterminable"
+        fi
+    done
+    return $killed
+}}
+
 # Kill any stale freenet network processes before starting.
 # This handles the case where a previous launch daemon restart left a child
 # process still holding the port (e.g. port 7509).
@@ -2884,9 +3778,31 @@ if pkill -f -u "$(id -u)" "freenet network" 2>/dev/null; then
     sleep 2
 fi
 
+# Forward a SIGTERM (sent by launchd on stop / restart) to the node so it can
+# run its graceful drain, rather than relying solely on launchd group-signaling
+# the whole process group. The node handles SIGTERM by draining in-flight
+# client drivers before closing peer connections. Harmless if launchd already
+# group-signals — the child just receives a (deduplicated) TERM either way.
+forward_term() {{
+    [ -n "$WRAPPER_CHILD_PID" ] && kill -TERM "$WRAPPER_CHILD_PID" 2>/dev/null || true
+}}
+trap forward_term TERM
+
 while true; do
-    "{binary}" network 2>"$HOME/Library/Logs/freenet/freenet.error.log.last"
+    # Launch in the background so we know our own child's PID. This lets the
+    # exit-43 self-heal path avoid mistaking our just-exited child for a
+    # stale orphan still holding the port, and lets the TERM trap above forward
+    # launchd's stop signal to the node for a graceful drain.
+    "{binary}" network 2>"$HOME/Library/Logs/freenet/freenet.error.log.last" &
+    WRAPPER_CHILD_PID=$!
+    # `wait` is interrupted by the trapped TERM; re-wait so we collect the
+    # child's real exit status after it finishes draining.
+    wait $WRAPPER_CHILD_PID
     EXIT_CODE=$?
+    while kill -0 "$WRAPPER_CHILD_PID" 2>/dev/null; do
+        wait $WRAPPER_CHILD_PID
+        EXIT_CODE=$?
+    done
 
     if [ $EXIT_CODE -eq 42 ]; then
         log_event "Update needed, running freenet update..."
@@ -2905,7 +3821,19 @@ while true; do
         fi
         continue
     elif [ $EXIT_CODE -eq 43 ]; then
-        log_event "Another instance is already running, exiting cleanly"
+        # Another instance holds the port. Before standing down (which under
+        # launchd SuccessfulExit=false would stop us forever), check whether
+        # the holder is a stale orphan running an old binary and, if so, kill
+        # it and relaunch instead of deferring. See heal_stale_orphan_or_defer.
+        if heal_stale_orphan_or_defer; then
+            log_event "Killed stale orphan holding the port on exit 43, relaunching"
+            CONSECUTIVE_FAILURES=0
+            PORT_CONFLICT_KILLS=0
+            BACKOFF=10
+            sleep 2
+            continue
+        fi
+        log_event "Another instance (current version) is already running, exiting cleanly"
         exit 0
     elif [ $EXIT_CODE -eq 0 ]; then
         log_event "Normal shutdown"
@@ -3010,11 +3938,27 @@ fn check_no_system_flag(system: bool) -> Result<()> {
 /// Returns true if a service was found and removed.
 #[cfg(target_os = "macos")]
 pub fn stop_and_remove_service(_system: bool) -> Result<bool> {
+    let home_dir = dirs::home_dir().context("Failed to get home directory")?;
+    stop_and_remove_service_at(&home_dir)
+}
+
+/// Core of macOS uninstall, parametrized on the home directory so the
+/// cleanup-ordering invariant is unit-testable without touching the real
+/// `$HOME` or shelling out to `launchctl` (which only runs when the plist is
+/// present).
+#[cfg(target_os = "macos")]
+fn stop_and_remove_service_at(home_dir: &Path) -> Result<bool> {
     use std::fs;
 
-    let plist_path = dirs::home_dir()
-        .context("Failed to get home directory")?
-        .join("Library/LaunchAgents/org.freenet.node.plist");
+    let plist_path = home_dir.join("Library/LaunchAgents/org.freenet.node.plist");
+
+    // Remove the auto-update wrapper script and its sidecar/backup files
+    // (#4290). install writes `*.sh` + `*.sh.hash`; `freenet update` may
+    // leave a `*.sh.bak`. Missing files are not an error (idempotent), so we
+    // run this BEFORE the plist early-return: a partial or repeated uninstall
+    // can leave the plist already gone while the wrapper artifacts remain, and
+    // those must still be cleaned up.
+    remove_wrapper_files(&wrapper_script_path(home_dir))?;
 
     if !plist_path.exists() {
         return Ok(false);
@@ -4021,6 +4965,221 @@ mod tests {
         );
     }
 
+    // ── Legacy install.sh → DMG migration (issue #3943) ──
+
+    fn legacy_plist(exists: bool) -> Option<(PathBuf, bool)> {
+        Some((
+            PathBuf::from("/u/Library/LaunchAgents/org.freenet.node.plist"),
+            exists,
+        ))
+    }
+
+    #[test]
+    fn legacy_install_migration_plan_skips_when_already_migrated() {
+        // Migration marker present (we already migrated on a previous launch):
+        // never re-migrate, even with a legacy plist + binaries still present.
+        let resolved = ResolvedLegacyInstall {
+            wrapper_script: Some(PathBuf::from("/u/.local/bin/freenet-service-wrapper.sh")),
+            binaries: vec![PathBuf::from("/u/.local/bin/freenet")],
+        };
+        let plan = legacy_install_migration_plan(
+            /* migration_already_done */ true,
+            legacy_plist(true),
+            &resolved,
+        );
+        assert_eq!(plan, LegacyMigrationPlan::NoMigration);
+    }
+
+    #[test]
+    fn legacy_install_migration_plan_skips_when_no_legacy_plist() {
+        // Clean (new-user) DMG install: no legacy plist, so there is nothing
+        // to migrate even if a stray binary somehow exists. A lone binary with
+        // no auto-start agent is harmless.
+        let resolved = ResolvedLegacyInstall {
+            wrapper_script: None,
+            binaries: vec![PathBuf::from("/u/.local/bin/freenet")],
+        };
+        assert_eq!(
+            legacy_install_migration_plan(false, None, &resolved),
+            LegacyMigrationPlan::NoMigration
+        );
+        assert_eq!(
+            legacy_install_migration_plan(false, legacy_plist(false), &resolved),
+            LegacyMigrationPlan::NoMigration
+        );
+    }
+
+    /// Regression test for issue #3943. Before the fix, a DMG launch with a
+    /// pre-existing install.sh legacy install only LOGGED a warning; it did
+    /// NOT remove the legacy plist, wrapper, or CLI binaries, so the two
+    /// installs raced for port 7509 on every login. This asserts the plan
+    /// boots out + removes the legacy plist first, then the wrapper script,
+    /// then each legacy binary, in order. `migration_already_done = false`
+    /// (covers existing DMG users, not just brand-new onboarding — Codex P1).
+    #[test]
+    fn legacy_install_migration_plan_removes_plist_wrapper_and_binaries() {
+        let plist = PathBuf::from("/u/Library/LaunchAgents/org.freenet.node.plist");
+        let resolved = ResolvedLegacyInstall {
+            wrapper_script: Some(PathBuf::from("/u/.local/bin/freenet-service-wrapper.sh")),
+            binaries: vec![
+                PathBuf::from("/u/.local/bin/fdev"),
+                PathBuf::from("/u/.local/bin/freenet"),
+            ],
+        };
+        let plan = legacy_install_migration_plan(false, Some((plist.clone(), true)), &resolved);
+
+        assert_eq!(
+            plan,
+            LegacyMigrationPlan::Migrate(vec![
+                // Bootout + plist removal first so launchd stops respawning
+                // the legacy backend before we remove anything else.
+                LegacyMigrationStep::BootOutAndRemovePlist(plist),
+                LegacyMigrationStep::RemoveLegacyWrapperScript(PathBuf::from(
+                    "/u/.local/bin/freenet-service-wrapper.sh"
+                )),
+                LegacyMigrationStep::RemoveLegacyBinary(PathBuf::from("/u/.local/bin/fdev")),
+                LegacyMigrationStep::RemoveLegacyBinary(PathBuf::from("/u/.local/bin/freenet")),
+            ])
+        );
+    }
+
+    #[test]
+    fn legacy_install_migration_plan_handles_plist_only() {
+        // Legacy plist present but the wrapper/binary couldn't be resolved
+        // (e.g. wrapper already deleted, or plist hand-edited). We still boot
+        // out + remove the plist — that is the thing racing for the port —
+        // and the plan contains exactly that one step. Crucially we do NOT
+        // fabricate binary-removal steps for guessed locations.
+        let plist = PathBuf::from("/u/Library/LaunchAgents/org.freenet.node.plist");
+        let plan = legacy_install_migration_plan(
+            false,
+            Some((plist.clone(), true)),
+            &ResolvedLegacyInstall::default(),
+        );
+        assert_eq!(
+            plan,
+            LegacyMigrationPlan::Migrate(vec![LegacyMigrationStep::BootOutAndRemovePlist(plist)])
+        );
+    }
+
+    /// Plist-path extractor against representative launchd-plist XML (the
+    /// shape `generate_plist` emits). Runs on every platform — Linux CI
+    /// exercises the parsing logic here; the macOS-only
+    /// `legacy_extractors_match_generators` test below additionally pins the
+    /// coupling to the generator's exact output.
+    #[test]
+    fn legacy_program_path_from_plist_parses_program_arguments() {
+        let xml = "\
+<plist version=\"1.0\"><dict>
+  <key>Label</key><string>org.freenet.node</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/u/.local/bin/freenet-service-wrapper.sh</string>
+  </array>
+</dict></plist>";
+        assert_eq!(
+            legacy_program_path_from_plist(xml),
+            Some(PathBuf::from("/u/.local/bin/freenet-service-wrapper.sh"))
+        );
+
+        // XML-escaped ampersand in the path round-trips through unescape.
+        let xml = "<key>ProgramArguments</key><array><string>/u/A &amp; B/w.sh</string></array>";
+        assert_eq!(
+            legacy_program_path_from_plist(xml),
+            Some(PathBuf::from("/u/A & B/w.sh"))
+        );
+
+        // No ProgramArguments, empty array, empty string → None (caller then
+        // removes only the plist itself).
+        assert_eq!(legacy_program_path_from_plist("<plist></plist>"), None);
+        assert_eq!(
+            legacy_program_path_from_plist("<key>ProgramArguments</key><array></array>"),
+            None
+        );
+        assert_eq!(
+            legacy_program_path_from_plist(
+                "<key>ProgramArguments</key><array><string></string></array>"
+            ),
+            None
+        );
+    }
+
+    /// Wrapper-binary extractor against representative wrapper-script content
+    /// (the shape `generate_wrapper_script` emits), including a path with a
+    /// space. Runs on every platform.
+    #[test]
+    fn legacy_binary_path_from_wrapper_parses_launch_line() {
+        let sh = "#!/bin/bash\n# preamble\n    \"/u/.local/bin/freenet\" network 2>/dev/null &\n";
+        assert_eq!(
+            legacy_binary_path_from_wrapper(sh),
+            Some(PathBuf::from("/u/.local/bin/freenet"))
+        );
+
+        // Quoted path with a space survives (the `-o command=` regression).
+        let sh = "\"/Users/Some User/bin/freenet\" network &\n";
+        assert_eq!(
+            legacy_binary_path_from_wrapper(sh),
+            Some(PathBuf::from("/Users/Some User/bin/freenet"))
+        );
+
+        // No recognizable launch line → None (no guessed binary removed).
+        assert_eq!(
+            legacy_binary_path_from_wrapper("#!/bin/bash\necho hi\n"),
+            None
+        );
+    }
+
+    /// The wrapper-ownership guard (Codex P2, round 4): we only delete a script
+    /// that is BOTH named `freenet-service-wrapper.sh` AND carries the
+    /// generated header. A hand-edited/repurposed `org.freenet.node` plist
+    /// pointing at an unrelated script must not get that script deleted.
+    #[test]
+    fn is_legacy_freenet_wrapper_requires_name_and_signature() {
+        let real = "#!/bin/bash\n# Freenet service wrapper for auto-update support.\n…";
+        assert!(is_legacy_freenet_wrapper(
+            Some("freenet-service-wrapper.sh"),
+            real
+        ));
+
+        // Right content but wrong filename (repurposed plist target).
+        assert!(!is_legacy_freenet_wrapper(Some("my-script.sh"), real));
+        // Right filename but not our content (user overwrote it).
+        assert!(!is_legacy_freenet_wrapper(
+            Some("freenet-service-wrapper.sh"),
+            "#!/bin/bash\nrm -rf ~\n"
+        ));
+        // No basename at all.
+        assert!(!is_legacy_freenet_wrapper(None, real));
+    }
+
+    /// macOS-only: pin the extractors to `generate_plist` /
+    /// `generate_wrapper_script`'s EXACT output so a format drift in either
+    /// generator (which only compiles on macOS) trips CI. Also confirm the
+    /// real generated wrapper passes the ownership guard.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn legacy_extractors_match_generators() {
+        let wrapper = PathBuf::from("/u/.local/bin/freenet-service-wrapper.sh");
+        let log_dir = PathBuf::from("/u/.local/state/freenet");
+        let xml = generate_plist(&wrapper, &log_dir);
+        assert_eq!(legacy_program_path_from_plist(&xml), Some(wrapper));
+
+        let bin = PathBuf::from("/u/.local/bin/freenet");
+        let sh = generate_wrapper_script(&bin);
+        assert_eq!(legacy_binary_path_from_wrapper(&sh), Some(bin));
+        // The real generated wrapper must satisfy the ownership guard, or the
+        // migration would never act on a genuine legacy install.
+        assert!(is_legacy_freenet_wrapper(
+            Some("freenet-service-wrapper.sh"),
+            &sh
+        ));
+
+        // End-to-end: plist → wrapper path → wrapper script → binary path.
+        let spacey = PathBuf::from("/Users/Some User/bin/freenet");
+        let sh = generate_wrapper_script(&spacey);
+        assert_eq!(legacy_binary_path_from_wrapper(&sh), Some(spacey));
+    }
+
     #[test]
     fn toggle_launch_at_login_outcome_inverts_current_state() {
         assert_eq!(
@@ -4134,8 +5293,18 @@ mod tests {
         assert!(service_content.contains("StartLimitBurst=5"));
         assert!(service_content.contains("StartLimitIntervalSec=120"));
 
-        // Verify auto-update support via ExecStopPost
-        assert!(service_content.contains("ExecStopPost="));
+        // Verify auto-update support via ExecStopPost. The `$EXIT_STATUS` systemd
+        // sets in the ExecStopPost environment must reach /bin/sh as a literal
+        // `$EXIT_STATUS`, so it is written doubled (`$$EXIT_STATUS`) in the unit —
+        // systemd collapses `$$` -> `$`. A single-`$` revert silently breaks
+        // auto-update (systemd eats the bare var before sh sees it) with no other
+        // signal, so assert the doubled form, not just the directive's presence.
+        assert!(
+            service_content.contains("ExecStopPost=")
+                && service_content.contains("\"$$EXIT_STATUS\""),
+            "ExecStopPost must use the doubled $$EXIT_STATUS so systemd passes a \
+             literal $EXIT_STATUS to sh (a single-$ revert silently breaks auto-update)"
+        );
 
         // Verify exit code 42 is treated as success (doesn't count against StartLimitBurst)
         assert!(service_content.contains("SuccessExitStatus=42 43"));
@@ -4143,8 +5312,21 @@ mod tests {
         // Verify exit code 43 prevents restart (another instance already running)
         assert!(service_content.contains("RestartPreventExitStatus=43"));
 
-        // Verify graceful shutdown timeout is set
-        assert!(service_content.contains("TimeoutStopSec=15"));
+        // Regression for #3967: stale-orphan self-heal pre-flight. Because
+        // RestartPreventExitStatus=43 blocks restart on exit 43, the
+        // version-compare-and-kill must run as an ExecStartPre before the main
+        // ExecStart so a stale orphan can't hold the port forever.
+        assert!(
+            service_content.contains("ExecStartPre=")
+                && service_content.contains("Freenet version:")
+                && service_content.contains("kill -TERM")
+                && service_content.contains("kill -KILL"),
+            "systemd unit must run a stale-orphan version-compare-and-kill pre-flight (#3967)"
+        );
+
+        // Verify graceful shutdown timeout is set. 45s = 30s drain
+        // (default `shutdown-drain-secs`) + 15s peer-teardown headroom.
+        assert!(service_content.contains("TimeoutStopSec=45"));
 
         // Verify user service targets default.target
         assert!(service_content.contains("WantedBy=default.target"));
@@ -4181,13 +5363,28 @@ mod tests {
         assert!(service_content.contains("StartLimitBurst=5"));
         assert!(service_content.contains("StartLimitIntervalSec=120"));
         assert!(service_content.contains("LimitNOFILE=65536"));
-        assert!(service_content.contains("ExecStopPost="));
+        // ExecStopPost must double the env var (`$$EXIT_STATUS`) so systemd passes a
+        // literal `$EXIT_STATUS` to sh; a single-`$` revert silently breaks auto-update.
+        assert!(
+            service_content.contains("ExecStopPost=")
+                && service_content.contains("\"$$EXIT_STATUS\""),
+            "ExecStopPost must use the doubled $$EXIT_STATUS (single-$ revert breaks auto-update)"
+        );
 
         // Verify exit code 42 is treated as success (doesn't count against StartLimitBurst)
         assert!(service_content.contains("SuccessExitStatus=42 43"));
 
         // Verify exit code 43 prevents restart (another instance already running)
         assert!(service_content.contains("RestartPreventExitStatus=43"));
+
+        // Regression for #3967: stale-orphan self-heal pre-flight (system unit).
+        assert!(
+            service_content.contains("ExecStartPre=")
+                && service_content.contains("Freenet version:")
+                && service_content.contains("kill -TERM")
+                && service_content.contains("kill -KILL"),
+            "system systemd unit must run a stale-orphan version-compare-and-kill pre-flight (#3967)"
+        );
 
         // Logging routes to journal (same reasoning as the user-unit test).
         assert!(service_content.contains("StandardOutput=journal"));
@@ -4268,6 +5465,668 @@ mod tests {
             script.contains("EXIT_CODE -eq 42"),
             "wrapper must handle exit code 42 for auto-update"
         );
+    }
+
+    /// Regression for issue #3967: on exit 43 the wrapper must self-heal a
+    /// STALE ORPHAN holding the service port instead of unconditionally
+    /// standing down. Standing down (`exit 0`) under launchd
+    /// SuccessfulExit=false means launchd never respawns us, so an orphaned
+    /// `freenet network` running an OLD binary would serve stale assets
+    /// forever. The fix compares the holder's `Freenet version:` line against
+    /// the on-disk binary and kills a stale orphan (SIGTERM→SIGKILL) before
+    /// relaunching, while still deferring to a genuine current-version
+    /// instance.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_macos_wrapper_exit43_self_heals_stale_orphan() {
+        let binary_path = PathBuf::from("/usr/local/bin/freenet");
+        let script = generate_wrapper_script(&binary_path);
+
+        // The exit-43 branch must invoke the self-heal routine BEFORE the
+        // polite `exit 0`. Without the fix the branch was just a log + exit 0.
+        assert!(
+            script.contains("heal_stale_orphan_or_defer"),
+            "exit-43 path must call the stale-orphan self-heal routine"
+        );
+
+        // It must detect the port holder. We reuse the existing user-scoped
+        // `freenet network` detection rather than needing the port plumbed in.
+        assert!(
+            script.contains("holder_pids")
+                && script.contains("pgrep -f -u \"$(id -u)\" \"freenet network\""),
+            "self-heal must enumerate the port holder process(es)"
+        );
+
+        // It must compare versions: query the holder binary's --version and
+        // the on-disk binary's --version, matching the `Freenet version:` line.
+        assert!(
+            script.contains("--version") && script.contains("Freenet version:"),
+            "self-heal must compare holder vs on-disk `Freenet version:` lines"
+        );
+        assert!(
+            script.contains("ondisk_version"),
+            "self-heal must compute the on-disk binary version for comparison"
+        );
+
+        // MUST-FIX #3: the kill is gated on the holder being an init-adopted
+        // ORPHAN (PPID==1). A user-run `freenet network` (PPID!=1) is never
+        // killed even on a version mismatch. The decision is `[ "$ppid" = "1" ]
+        // && { mismatch || no-holder-version }`, so PPID==1 is a REQUIRED
+        // conjunct, not a mere fallback.
+        assert!(
+            script.contains("[ \"$ppid\" = \"1\" ] && {"),
+            "self-heal must REQUIRE PPID==1 (orphan) before killing, not just as a fallback"
+        );
+
+        // MUST-FIX #4: an unreadable on-disk version ($ondisk empty) must NOT
+        // make every holder look mismatched. version_mismatch is only set when
+        // ondisk is non-empty AND holder_ver is non-empty AND they differ.
+        assert!(
+            script.contains(
+                "[ -n \"$ondisk\" ] && [ -n \"$holder_ver\" ] && [ \"$holder_ver\" != \"$ondisk\" ]"
+            ),
+            "version-mismatch kill signal must require a readable on-disk version (#4 guard)"
+        );
+
+        // Escalation: SIGTERM, wait, then SIGKILL (the incident's orphan
+        // ignored SIGTERM for >11s and needed -9).
+        assert!(
+            script.contains("kill -TERM") && script.contains("kill -KILL"),
+            "self-heal must escalate SIGTERM -> SIGKILL"
+        );
+        assert!(
+            script.contains("kill -0"),
+            "self-heal must poll for liveness between SIGTERM and SIGKILL"
+        );
+
+        // On a detected stale orphan it must RELAUNCH (continue), not exit 0.
+        assert!(
+            script.contains("if heal_stale_orphan_or_defer; then"),
+            "exit-43 path must branch on the self-heal result"
+        );
+        let exit43_idx = script
+            .find("EXIT_CODE -eq 43")
+            .expect("exit-43 branch must exist");
+        let exit43_block = &script[exit43_idx..];
+        let continue_idx = exit43_block
+            .find("continue")
+            .expect("exit-43 path must relaunch (continue) on a killed stale orphan");
+        let exit0_idx = exit43_block
+            .find("exit 0")
+            .expect("exit-43 path must still defer (exit 0) for a current-version instance");
+        assert!(
+            continue_idx < exit0_idx,
+            "relaunch (continue) must come before the polite exit 0 in the exit-43 branch"
+        );
+
+        // Negative assertion (polite path preserved): a current-version holder,
+        // a user-supervised holder, or one whose version can't be determined
+        // still defers. The routine logs a defer and the branch falls through
+        // to `exit 0`.
+        assert!(
+            script.contains("deferring to port holder PID"),
+            "a current-version / user-supervised holder must still be deferred to (polite path preserved)"
+        );
+
+        // The own-child guard prevents mistaking our just-exited child for an
+        // orphan: the wrapper tracks WRAPPER_CHILD_PID and skips it.
+        assert!(
+            script.contains("WRAPPER_CHILD_PID"),
+            "self-heal must skip the wrapper's own child to avoid false positives"
+        );
+
+        // Load-bearing: the generated script must be syntactically valid bash.
+        // If our heredoc escaping is wrong this catches it.
+        let tmp = tempfile::tempdir().unwrap();
+        let script_path = tmp.path().join("wrapper.sh");
+        std::fs::write(&script_path, &script).unwrap();
+        let status = std::process::Command::new("bash")
+            .arg("-n")
+            .arg(&script_path)
+            .status()
+            .expect("failed to run bash -n");
+        assert!(
+            status.success(),
+            "generated wrapper script must be syntactically valid bash"
+        );
+    }
+
+    /// MUST-FIX #1 regression: systemd performs its OWN `$VAR`/`${VAR}`
+    /// expansion on `Exec*` lines BEFORE handing the string to `/bin/sh`, so
+    /// every dollar the SHELL must see has to be written as `$$` in the unit
+    /// file (systemd collapses `$$` -> `$`). A single `$ident` is silently
+    /// eaten to empty and the whole self-heal becomes a no-op that LOOKS
+    /// installed (the `-` prefix swallows the failure). The old
+    /// `.contains("Freenet version:")` smoke tests could not catch that. This
+    /// test renders BOTH units and asserts the on-disk `ExecStartPre` text uses
+    /// the `$$`-doubled form and contains NO bare single-`$` shell identifier
+    /// that systemd would strip, then collapses `$$` -> `$` (emulating systemd)
+    /// and runs `sh -n` on the resulting script body.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_systemd_execstartpre_doubles_shell_dollars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let binary_path = PathBuf::from("/usr/local/bin/freenet");
+        let log_dir = PathBuf::from("/home/test/.local/state/freenet");
+        let username = "test";
+        let home_dir = PathBuf::from("/home/test");
+
+        let units = [
+            ("user", generate_user_service_file(&binary_path, &log_dir)),
+            (
+                "system",
+                generate_system_service_file(&binary_path, &log_dir, username, &home_dir),
+            ),
+        ];
+
+        for (which, unit) in units {
+            let pre = unit
+                .lines()
+                .find(|l| l.starts_with("ExecStartPre=-/bin/sh -c "))
+                .unwrap_or_else(|| panic!("{which} unit must have a self-heal ExecStartPre"));
+
+            // Post-render the file on disk MUST carry the systemd-level `$$`
+            // form for the shell identifiers the pre-flight relies on.
+            for needle in ["$$pid", "$$exe", "$$ondisk", "$$self", "$$(id -u)"] {
+                assert!(
+                    pre.contains(needle),
+                    "{which} ExecStartPre must double shell dollars (missing `{needle}`); \
+                     a single `$` is eaten by systemd's own expansion and the self-heal \
+                     silently no-ops (#3967 MUST-FIX 1)"
+                );
+            }
+
+            // And it must NOT contain the bare single-`$` forms that systemd
+            // would strip to empty. These are the exact identifiers from the
+            // pre-flight; if any appears single-`$` the escaping regressed.
+            // NB: we cannot blanket-assert absence of `$(id -u)` because the
+            // VALID doubled form `$$(id -u)` contains it as a substring; the
+            // `$$(id -u)` presence check above covers that identifier instead.
+            for bad in [
+                "/proc/$pid/",
+                "\"$pid\"",
+                "\"$exe\"",
+                "\"$ondisk\"",
+                "\"$self\"",
+            ] {
+                assert!(
+                    !pre.contains(bad),
+                    "{which} ExecStartPre contains bare single-`$` `{bad}` that systemd \
+                     would strip; it must be doubled to `$$` (#3967 MUST-FIX 1)"
+                );
+            }
+
+            // MUST-FIX #6: PPID is parsed after the FINAL ')' of
+            // /proc/PID/stat, not as a fixed awk field of the raw line (a comm
+            // with whitespace would shift fields).
+            assert!(
+                pre.contains("sed \"s/.*) //\""),
+                "{which} ExecStartPre must parse PPID after the final ')' in \
+                 /proc/PID/stat, not by fixed field index (#3967 MUST-FIX 6)"
+            );
+
+            // MUST-FIX #5: the pre-flight must exclude its own sh PID (`$$$$`
+            // -> the sh's `$$`) and PID 1. The pre-flight's own argv contains
+            // the literal "freenet network" (the substring `pgrep -f` matches),
+            // so the self-PID + PID-1 skips are what keep it from killing
+            // itself.
+            assert!(
+                pre.contains("self=$$$$") && pre.contains("[ \"$$pid\" = \"$$self\" ] && continue"),
+                "{which} ExecStartPre must skip its own sh PID (#3967 MUST-FIX 5)"
+            );
+            assert!(
+                pre.contains("[ \"$$pid\" = \"1\" ] && continue"),
+                "{which} ExecStartPre must skip PID 1 (#3967 MUST-FIX 5)"
+            );
+            // MUST-FIX (round-2 RE-REVIEW): the pre-flight must NOT anchor on
+            // the holder's exe equalling this unit's on-disk binary. A #3967
+            // orphan is by definition running an OLD/DIFFERENT binary, so an
+            // `exe == on-disk binary` guard skips exactly the process we must
+            // kill — defeating the whole self-heal. The earlier round-1 form
+            // `[ -n "$$bin" ] && [ "$$exe" != "$$bin" ] && continue` is the
+            // broken guard and must never come back.
+            assert!(
+                !pre.contains("[ \"$$exe\" != \"$$bin\" ]"),
+                "{which} ExecStartPre must NOT anchor on exe == current on-disk \
+                 binary; that guard skips the old-binary orphan it must kill \
+                 (#3967 round-2 RE-REVIEW)"
+            );
+
+            // MUST-FIX #3/#4: kill is gated on PPID==1 AND (readable-version
+            // mismatch OR unreadable holder version). Render-level check.
+            assert!(
+                pre.contains("[ \"$$ppid\" = \"1\" ] &&"),
+                "{which} ExecStartPre must require PPID==1 before killing (#3967 MUST-FIX 3)"
+            );
+
+            // Now emulate systemd's `$$` -> `$` collapse and confirm the body
+            // is valid POSIX sh. This is the load-bearing end-to-end check that
+            // the escaping produces a runnable script (the bug shipped because
+            // nothing rendered + lexed the post-systemd form).
+            let on_disk = pre
+                .strip_prefix("ExecStartPre=-/bin/sh -c '")
+                .and_then(|s| s.strip_suffix('\''))
+                .unwrap_or_else(|| panic!("{which} ExecStartPre quoting unexpected"));
+            let sh_body = on_disk.replace("$$", "$");
+
+            let body_path = tmp.path().join(format!("{which}_execstartpre.sh"));
+            std::fs::write(&body_path, &sh_body).unwrap();
+            let status = std::process::Command::new("sh")
+                .arg("-n")
+                .arg(&body_path)
+                .status()
+                .expect("failed to run sh -n");
+            assert!(
+                status.success(),
+                "{which} ExecStartPre body must be valid POSIX sh after systemd \
+                 collapses `$$` -> `$` (#3967 MUST-FIX 1)"
+            );
+        }
+    }
+
+    /// Behavioral regression for the exit-43 self-heal DECISION (#3967). The
+    /// render/`sh -n` tests prove the script PARSES; this proves it DECIDES
+    /// correctly. We extract the heal routine from the generated wrapper, point
+    /// it at a REAL on-disk fake binary (so `ondisk_version` is non-empty), and
+    /// shim `pgrep`/`ps`/`kill`/`readlink`/`timeout` plus a separate holder
+    /// binary via PATH. Cases:
+    ///   (a) version-mismatched PPID==1 orphan      -> KILLED (relaunch),
+    ///   (b) same-version PPID==1 holder            -> DEFERRED (polite path),
+    ///   (c) version-mismatched but PPID!=1 holder  -> DEFERRED (MUST-FIX #3:
+    ///       never SIGKILL a hand-run / supervised node),
+    ///   (d) version-mismatched orphan but UNREADABLE on-disk version
+    ///       -> DEFERRED (MUST-FIX #4: don't cull a healthy node mid-update),
+    ///   (e) the holder pid == our own child       -> SKIPPED / DEFERRED.
+    ///
+    /// macOS-only because it extracts the heal helpers from the macOS wrapper
+    /// (`generate_wrapper_script`); the systemd inline path is covered by the
+    /// render + `sh -n` test above.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_exit43_heal_decision_behavior() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        let chmod_x = |p: &std::path::Path| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+
+        // Real on-disk binary baked into the wrapper. Prints a FIXED version.
+        // Its readability is toggled per-case via the ONDISK_READABLE env that
+        // the script consults (see wrapper-version override below); when the
+        // file itself is non-executable, ondisk_version() returns empty.
+        let ondisk_bin = dir.join("freenet");
+        std::fs::write(
+            &ondisk_bin,
+            "#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo \"Freenet version: 1.0.0 (current)\"\nexit 0\n",
+        )
+        .unwrap();
+        chmod_x(&ondisk_bin);
+
+        // Holder binary: a DIFFERENT path whose version is env-controlled, so
+        // we can drive match vs mismatch independently of the on-disk binary.
+        let holder_bin = dir.join("holder-freenet");
+        std::fs::write(
+            &holder_bin,
+            "#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo \"Freenet version: ${HOLDER_VER}\"\nexit 0\n",
+        )
+        .unwrap();
+        chmod_x(&holder_bin);
+
+        // Extract the heal helpers from the REAL generated wrapper so the test
+        // exercises rendered logic, not a copy. The wrapper bakes in the
+        // on-disk binary path, so ondisk_version() points at `ondisk_bin`.
+        let wrapper = generate_wrapper_script(&ondisk_bin);
+        let start = wrapper
+            .find("version_line() {")
+            .expect("wrapper must define version_line");
+        let end_marker = "# Kill any stale freenet network processes before starting.";
+        let end = wrapper.find(end_marker).expect("wrapper layout changed");
+        let helpers = &wrapper[start..end];
+
+        // `kill` and `sleep` are shell builtins, so a PATH shim wouldn't be
+        // consulted. Override them as shell FUNCTIONS (functions beat builtins)
+        // so we can observe the kill and skip the real up-to-12s wait. `kill`
+        // records SIGTERM/SIGKILL to a marker; `kill -0` reports the holder
+        // alive until that marker exists (so the TERM->poll->KILL loop ends).
+        let killed_marker = dir.join("killed");
+        let harness = format!(
+            r#"#!/bin/sh
+log_event() {{ :; }}
+sleep() {{ :; }}
+kill() {{
+  sig=""
+  case "$1" in -*) sig="$1"; shift;; esac
+  case "$sig" in
+    -0) [ -f "{marker}" ] && return 1; return 0;;
+    -TERM|-15|-KILL|-9) : > "{marker}"; return 0;;
+    *) return 0;;
+  esac
+}}
+WRAPPER_CHILD_PID=999999
+{helpers}
+heal_stale_orphan_or_defer
+echo "RC=$?"
+"#,
+            marker = killed_marker.display()
+        );
+        let harness_path = dir.join("harness.sh");
+        std::fs::write(&harness_path, harness).unwrap();
+        chmod_x(&harness_path);
+
+        // PATH shims. Holder pid fixed at 4242 (unless overridden by PGREP_PID).
+        let bin = dir.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let write_shim = |name: &str, body: String| {
+            let p = bin.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}")).unwrap();
+            chmod_x(&p);
+        };
+
+        // pgrep: emit the holder pid (env-overridable to test self-exclusion).
+        write_shim("pgrep", "echo \"${PGREP_PID:-4242}\"\n".to_string());
+        // ps: -o ppid= -> $HOLDER_PPID ; -o command=/comm= -> the holder's full
+        // argv, which (like the real wrapper) is `<binary> network`. The
+        // $HOLDER_BIN env lets a case drive a spaced install path so the
+        // holder_exe sed-strip (not awk whitespace-split) is exercised. We emit
+        // the ` network` suffix so the strip has something to remove, mirroring
+        // production argv.
+        write_shim(
+            "ps",
+            "for a in \"$@\"; do case \"$a\" in \
+             ppid=) echo \"$HOLDER_PPID\"; exit 0;; \
+             command=|comm=) echo \"$HOLDER_BIN network\"; exit 0;; esac; done\nexit 0\n"
+                .to_string(),
+        );
+        // readlink -f: map any /proc/PID/exe to the holder binary; passthrough.
+        write_shim(
+            "readlink",
+            format!(
+                "last=\"\"; for a in \"$@\"; do last=\"$a\"; done; \
+                 case \"$last\" in */proc/*/exe) echo \"{}\";; *) echo \"$last\";; esac\n",
+                holder_bin.display()
+            ),
+        );
+        // timeout: drop the leading duration arg and exec the rest.
+        write_shim("timeout", "shift\nexec \"$@\"\n".to_string());
+
+        let path_env = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+
+        // Returns (stdout, holder_was_killed). `holder_bin_override` lets a case
+        // point the holder at a DIFFERENT (e.g. space-containing) install path
+        // so we exercise `holder_exe`'s suffix-strip; defaults to `holder_bin`.
+        let default_holder_bin = holder_bin.display().to_string();
+        let run = |holder_ver: &str,
+                   holder_ppid: &str,
+                   pgrep_pid: Option<&str>,
+                   holder_bin_override: Option<&str>|
+         -> (String, bool) {
+            std::fs::remove_file(&killed_marker).ok();
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg(&harness_path)
+                .env("PATH", &path_env)
+                .env("HOLDER_VER", holder_ver)
+                .env("HOLDER_PPID", holder_ppid)
+                .env(
+                    "HOLDER_BIN",
+                    holder_bin_override.unwrap_or(&default_holder_bin),
+                );
+            if let Some(p) = pgrep_pid {
+                cmd.env("PGREP_PID", p);
+            }
+            let out = cmd.output().expect("failed to run heal harness");
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            (stdout, killed_marker.exists())
+        };
+
+        // (a) orphan (PPID==1) on an OLD version vs the current on-disk 1.0.0.
+        // NOTE: holder_bin is a DIFFERENT path from the on-disk binary, so this
+        // also locks the round-2 RE-REVIEW invariant: a holder whose resolved
+        // exe path differs from the unit's on-disk binary is STILL a kill target
+        // when it is an old-version PPID==1 orphan (the systemd exe==bin anchor
+        // wrongly skipped exactly this case).
+        let (out_a, killed_a) = run("0.9.0 (old)", "1", None, None);
+        assert!(
+            out_a.contains("RC=0") && killed_a,
+            "version-mismatched PPID==1 orphan must be KILLED + relaunch (RC=0), got: {out_a}"
+        );
+
+        // (b) orphan (PPID==1) running the SAME current version -> defer.
+        let (out_b, killed_b) = run("1.0.0 (current)", "1", None, None);
+        assert!(
+            out_b.contains("RC=1") && !killed_b,
+            "same-version holder must be DEFERRED, not killed (polite path), got: {out_b}"
+        );
+
+        // (c) MUST-FIX #3: version-mismatched but USER-parented (PPID!=1) -> defer.
+        let (out_c, killed_c) = run("0.9.0 (old)", "4321", None, None);
+        assert!(
+            out_c.contains("RC=1") && !killed_c,
+            "version-mismatched but user-parented (PPID!=1) holder must be DEFERRED (#3967 MUST-FIX 3), got: {out_c}"
+        );
+
+        // (d) MUST-FIX #4: same mismatch + orphan, but on-disk version UNREADABLE.
+        // Make the baked-in binary non-executable so ondisk_version() is empty;
+        // the mismatch signal must then be suppressed and a readable holder
+        // deferred to (don't cull a healthy node mid-update).
+        std::fs::set_permissions(&ondisk_bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (out_d, killed_d) = run("0.9.0 (old)", "1", None, None);
+        assert!(
+            out_d.contains("RC=1") && !killed_d,
+            "unreadable on-disk version must suppress the mismatch kill signal (#3967 MUST-FIX 4), got: {out_d}"
+        );
+        chmod_x(&ondisk_bin); // restore
+
+        // (e) self-exclusion: the only holder pid IS our own child -> skip/defer.
+        let (out_e, killed_e) = run("0.9.0 (old)", "1", Some("999999"), None);
+        assert!(
+            out_e.contains("RC=1") && !killed_e,
+            "the routine must never target its own child PID (#3967), got: {out_e}"
+        );
+
+        // (f) NIT 2 regression: an install path that contains a SPACE must still
+        // resolve cleanly so version comparison works. `holder_exe` strips the
+        // trailing ` network` argv rather than awk-splitting on whitespace; the
+        // old `awk '{print $1}'` would have truncated this to `/Some` and made
+        // the holder version unreadable. We place a real old-version binary at a
+        // spaced path and assert the orphan is still KILLED (its version is read
+        // and seen to differ), proving the path was recovered intact.
+        let spaced_dir = dir.join("Some User").join("bin");
+        std::fs::create_dir_all(&spaced_dir).unwrap();
+        let spaced_holder = spaced_dir.join("freenet");
+        std::fs::write(
+            &spaced_holder,
+            "#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo \"Freenet version: 0.9.0 (old)\"\nexit 0\n",
+        )
+        .unwrap();
+        chmod_x(&spaced_holder);
+        let (out_f, killed_f) = run(
+            "ignored-uses-real-binary",
+            "1",
+            None,
+            Some(&spaced_holder.display().to_string()),
+        );
+        assert!(
+            out_f.contains("RC=0") && killed_f,
+            "old-version PPID==1 orphan at a space-containing install path must be \
+             KILLED — holder_exe must recover the full path, not truncate at the \
+             first space (NIT 2), got: {out_f}"
+        );
+    }
+
+    /// Behavioral regression for the SYSTEMD inline self-heal DECISION (#3967,
+    /// round-2 RE-REVIEW). The render + `sh -n` test proves the inline body
+    /// PARSES; this proves it DECIDES correctly. Crucially it locks the round-2
+    /// fix: the round-1 unit anchored the holder loop on
+    /// `[ "$exe" != "$bin" ] && continue`, which skipped every holder whose exe
+    /// differed from the unit's on-disk binary — i.e. exactly the stale orphan
+    /// (running an OLD binary) the self-heal exists to kill. Here the fake
+    /// holder's exe path is DIFFERENT from the on-disk binary, and we assert it
+    /// IS killed.
+    ///
+    /// We extract the `ExecStartPre` `/bin/sh -c '...'` body from the rendered
+    /// unit, collapse systemd's `$$` -> `$`, and run it under `sh` with
+    /// PATH-shimmed `pgrep`/`readlink`/`timeout` and a `kill` shell function
+    /// (functions beat the builtin) that records targets to a marker.
+    ///
+    /// Linux-only because it exercises the `/proc`-based systemd inline path
+    /// and the unit generators are `#[cfg(target_os = "linux")]`.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_systemd_execstartpre_heal_decision_behavior() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let chmod_x = |p: &std::path::Path| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+
+        // On-disk binary baked into the unit (the binary the unit would launch).
+        // Prints a FIXED current version. Lives at one path...
+        let ondisk_bin = dir.join("freenet");
+        std::fs::write(
+            &ondisk_bin,
+            "#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo \"Freenet version: 1.0.0 (current)\"\nexit 0\n",
+        )
+        .unwrap();
+        chmod_x(&ondisk_bin);
+
+        // ...the holder binary lives at a DIFFERENT path (this is the whole
+        // point: a #3967 orphan runs an old/different binary). Its version is
+        // env-controlled so we can drive match vs mismatch.
+        let holder_bin = dir.join("old").join("freenet");
+        std::fs::create_dir_all(holder_bin.parent().unwrap()).unwrap();
+        std::fs::write(
+            &holder_bin,
+            "#!/bin/sh\n[ \"$1\" = \"--version\" ] && echo \"Freenet version: ${HOLDER_VER}\"\nexit 0\n",
+        )
+        .unwrap();
+        chmod_x(&holder_bin);
+
+        // Render the user unit and carve out the ExecStartPre `/bin/sh -c '...'`
+        // body, then collapse `$$` -> `$` exactly as systemd does before exec.
+        let log_dir = dir.join("logs");
+        let unit = generate_user_service_file(&ondisk_bin, &log_dir);
+        let pre = unit
+            .lines()
+            .find(|l| l.starts_with("ExecStartPre=-/bin/sh -c "))
+            .expect("unit must have a self-heal ExecStartPre");
+        let body = pre
+            .strip_prefix("ExecStartPre=-/bin/sh -c '")
+            .and_then(|s| s.strip_suffix('\''))
+            .expect("ExecStartPre quoting unexpected")
+            .replace("$$", "$");
+
+        // PATH shims. `pgrep` emits the holder pid; `readlink -f /proc/PID/exe`
+        // maps to the holder binary; `timeout` drops the duration and execs the
+        // rest. `kill`/`sleep` are overridden as shell FUNCTIONS in the harness.
+        let bin = dir.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let write_shim = |name: &str, src: String| {
+            let p = bin.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{src}")).unwrap();
+            chmod_x(&p);
+        };
+        write_shim("pgrep", "echo \"${PGREP_PID:-4242}\"\n".to_string());
+        // readlink: -f <on-disk binary path> passes through (so `bin=` would
+        // resolve if it existed); /proc/PID/exe -> the holder binary; otherwise
+        // echo the last arg. The exe!=bin path is what the round-1 anchor broke.
+        write_shim(
+            "readlink",
+            format!(
+                "last=\"\"; for a in \"$@\"; do last=\"$a\"; done; \
+                 case \"$last\" in */proc/*/exe) echo \"{}\";; *) echo \"$last\";; esac\n",
+                holder_bin.display()
+            ),
+        );
+        write_shim("timeout", "shift\nexec \"$@\"\n".to_string());
+
+        // `sed`/`awk`/`grep`/`id` come from the real PATH; the /proc/PID/stat
+        // read is shimmed via a fake stat file the body reads. Replace the
+        // `/proc/$pid/stat` literal with our fixture so PPID is controllable.
+        let stat_file = dir.join("stat");
+        // Format mirrors /proc/PID/stat: "PID (comm) STATE PPID ...". The body
+        // does `sed "s/.*) //"` then `awk '{print $2}'`, so PPID must be field 2
+        // AFTER the final ')'. We park a comm WITH spaces to also keep the
+        // round-1 MUST-FIX 6 (whitespace-comm) honest.
+        let body = body.replace("/proc/$pid/stat", &stat_file.display().to_string());
+        // The readlink call also references /proc/$pid/exe; leave it so the
+        // shim's */proc/*/exe arm fires.
+
+        let killed_marker = dir.join("killed");
+        let path_env = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+
+        // Returns (holder_was_killed). HOLDER_PPID drives the fake stat file's
+        // PPID field; HOLDER_VER drives the holder binary's version.
+        let run = |holder_ver: &str, holder_ppid: &str, pgrep_pid: Option<&str>| -> bool {
+            std::fs::remove_file(&killed_marker).ok();
+            std::fs::write(
+                &stat_file,
+                format!("4242 (freenet network) S {holder_ppid} 1 1 0 -1\n"),
+            )
+            .unwrap();
+            let harness = format!(
+                "#!/bin/sh\nkill() {{ sig=\"\"; case \"$1\" in -*) sig=\"$1\"; shift;; esac; \
+                 case \"$sig\" in -0) [ -f \"{marker}\" ] && return 1; return 0;; \
+                 -TERM|-15|-KILL|-9) : > \"{marker}\"; return 0;; *) return 0;; esac; }}\n\
+                 sleep() {{ :; }}\n{body}\n",
+                marker = killed_marker.display(),
+                body = body,
+            );
+            let harness_path = dir.join("harness.sh");
+            std::fs::write(&harness_path, harness).unwrap();
+            let mut cmd = std::process::Command::new("sh");
+            cmd.arg(&harness_path)
+                .env("PATH", &path_env)
+                .env("HOLDER_VER", holder_ver);
+            if let Some(p) = pgrep_pid {
+                cmd.env("PGREP_PID", p);
+            }
+            cmd.output().expect("failed to run systemd heal harness");
+            killed_marker.exists()
+        };
+
+        // (a) ROUND-2 CORE: orphan (PPID==1) running an OLD version at a
+        // DIFFERENT exe path than the on-disk binary -> MUST be KILLED. The
+        // round-1 `exe != bin` anchor skipped exactly this case.
+        assert!(
+            run("0.9.0 (old)", "1", None),
+            "systemd self-heal must KILL an old-version PPID==1 orphan whose exe \
+             path differs from the on-disk binary (round-2 RE-REVIEW: the \
+             exe==bin anchor wrongly skipped it)"
+        );
+
+        // (b) orphan (PPID==1) running the SAME current version -> DEFER.
+        assert!(
+            !run("1.0.0 (current)", "1", None),
+            "systemd self-heal must DEFER to a same-version holder (polite path)"
+        );
+
+        // (c) version-mismatched but USER-parented (PPID!=1) -> DEFER.
+        assert!(
+            !run("0.9.0 (old)", "4321", None),
+            "systemd self-heal must DEFER to a user-parented (PPID!=1) holder (#3967 MUST-FIX 3)"
+        );
+
+        // (d) on-disk binary version UNREADABLE (`$ondisk` empty) -> DEFER even for
+        // a PPID==1 orphan whose own version IS readable. With no trustworthy
+        // baseline we must not version-compare; killing here would reap a healthy
+        // current node during an update window when the binary is momentarily
+        // unreadable. Mirrors the macOS test's chmod-644 case (#3967 MUST-FIX 4),
+        // which the systemd path's `[ -n "$$ondisk" ]` guard implements but had no
+        // behavioral coverage on Linux (rule-review Info on #4408).
+        std::fs::set_permissions(&ondisk_bin, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            !run("0.9.0 (old)", "1", None),
+            "systemd self-heal must DEFER when the on-disk version is unreadable, even \
+             for a readable-version PPID==1 orphan (#3967 MUST-FIX 4: empty $ondisk \
+             must not drive a kill)"
+        );
+        chmod_x(&ondisk_bin); // restore for any later use
     }
 
     #[test]
@@ -4561,13 +6420,15 @@ mod tests {
     #[test]
     fn test_purge_leaves_never_collapses_shared_parents_on_unix() {
         // Reproduces the codex-caught bug: on Linux `ProjectDirs` builds
-        // `~/.local/share/Freenet`, `~/.config/Freenet`, `~/.cache/Freenet`
-        // (and analogous macOS paths), whose parents are shared across
-        // every app on the system. Collapsing any of them, even when the
-        // `remove_dir_if_empty` non-empty check makes it safe in practice
-        // on an active system, would wipe a shared XDG root on a fresh
-        // account where Freenet was the only inhabitant. The
-        // `collapse_parents: false` setting must suppress every collapse.
+        // `~/.local/share/freenet`, `~/.config/freenet`, `~/.cache/freenet`
+        // (lowercase `freenet`; macOS uses its own `~/Library/...` scheme),
+        // whose parents are shared across every app on the system. Collapsing
+        // any of them, even when the `remove_dir_if_empty` non-empty check
+        // makes it safe in practice on an active system, would wipe a shared
+        // XDG root on a fresh account where Freenet was the only inhabitant.
+        // The `collapse_parents: false` setting must suppress every collapse.
+        // (The leaf basenames below are arbitrary — this test exercises the
+        // parent-collapse suppression, not the leaf-name resolution.)
         let tmp = tempfile::tempdir().unwrap();
 
         // Each leaf sits in its own dedicated parent to verify each
@@ -4708,6 +6569,87 @@ mod tests {
             !leaves.collapse_parents,
             "collapse_parents must stay false off Windows so shared XDG roots are never collapsed",
         );
+    }
+
+    /// Regression for #3907: `freenet uninstall --purge --system` on Linux
+    /// resolves the service user's data via a hardcoded XDG layout. The leaf
+    /// directories MUST be lowercase `freenet`, matching what the running node
+    /// actually creates — `ProjectDirs::from("", "The Freenet Project Inc",
+    /// "Freenet")` lowercases the application name on Linux, and
+    /// `get_log_dir()` uses `~/.local/state/freenet`. The pre-fix code
+    /// hardcoded uppercase `Freenet` for data/config/cache, so the purge
+    /// matched nothing on disk and returned "success" while leaving every
+    /// contract, delegate, and the database behind.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_system_purge_uses_lowercase_freenet_paths() {
+        let home = PathBuf::from("/home/svc");
+        let dirs = linux_system_purge_dirs(&home);
+
+        // Pin the exact leaves. Each entry must be lowercase `freenet`; an
+        // uppercase `Freenet` (the #3907 bug) would never match the directories
+        // the node created.
+        assert_eq!(
+            dirs,
+            [
+                ("data", home.join(".local/share/freenet")),
+                ("config", home.join(".config/freenet")),
+                ("cache", home.join(".cache/freenet")),
+                ("logs", home.join(".local/state/freenet")),
+            ],
+            "system-mode purge must target lowercase `freenet` XDG dirs (#3907)",
+        );
+
+        // Defensive: assert no leaf contains the uppercase project name, which
+        // is what the directories crate never produces on Linux.
+        for (_label, dir) in &dirs {
+            assert!(
+                !dir.to_string_lossy().contains("/Freenet"),
+                "leaf {} must not use uppercase `Freenet` (#3907)",
+                dir.display(),
+            );
+        }
+    }
+
+    /// End-to-end check that the resolved leaves actually remove on-disk data
+    /// seeded at the lowercase paths a real Linux install uses. This exercises
+    /// the same `linux_system_purge_dirs` → `remove_if_exists` chain that
+    /// `purge_data_dirs` runs in `--system` mode, but rooted at a tempdir so it
+    /// never touches a real home. With the pre-fix uppercase paths the seeded
+    /// lowercase directories would survive and this test would fail.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_system_purge_removes_seeded_lowercase_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+
+        let data = home.join(".local/share/freenet");
+        let config = home.join(".config/freenet");
+        let cache = home.join(".cache/freenet");
+        let logs = home.join(".local/state/freenet");
+
+        // Seed the directories with realistic contents the purge must remove.
+        std::fs::create_dir_all(data.join("contracts")).unwrap();
+        std::fs::create_dir_all(data.join("delegates")).unwrap();
+        std::fs::create_dir_all(data.join("db")).unwrap();
+        std::fs::write(data.join("db").join("freenet.redb"), b"x").unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("config.toml"), b"x").unwrap();
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("freenet.2026-06-02.log"), b"x").unwrap();
+
+        for (label, dir) in linux_system_purge_dirs(home) {
+            remove_if_exists(label, &dir).unwrap();
+        }
+
+        for leaf in [&data, &config, &cache, &logs] {
+            assert!(
+                !leaf.exists(),
+                "system purge must remove lowercase leaf {} (#3907)",
+                leaf.display(),
+            );
+        }
     }
 
     // ── Wrapper backoff state machine tests ──
@@ -5080,5 +7022,242 @@ mod tests {
                 pattern
             );
         }
+    }
+
+    /// Regression test for #4290: macOS uninstall must remove the wrapper
+    /// script plus its `.sh.hash` sidecar (#4286) and any `.sh.bak` backup
+    /// left by `freenet update`. Previously install wrote three files and
+    /// uninstall removed zero, leaving stale artifacts in `~/.local/bin`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn remove_wrapper_files_removes_script_sidecar_and_backup() {
+        use std::fs;
+
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let home = tmp.path();
+
+        let wrapper_path = wrapper_script_path(home);
+        let bin_dir = wrapper_path.parent().unwrap();
+        fs::create_dir_all(bin_dir).expect("create .local/bin");
+
+        let hash_path = wrapper_path.with_extension("sh.hash");
+        let bak_path = wrapper_path.with_extension("sh.bak");
+
+        // Stand-in for the launchd plist that the wrapper cleanup must NOT touch.
+        let plist_path = home.join("org.freenet.node.plist");
+
+        for path in [&wrapper_path, &hash_path, &bak_path, &plist_path] {
+            fs::write(path, b"x").expect("write fixture file");
+            assert!(path.exists(), "fixture {} should exist", path.display());
+        }
+
+        remove_wrapper_files(&wrapper_path).expect("cleanup should succeed");
+
+        assert!(!wrapper_path.exists(), "wrapper script must be removed");
+        assert!(!hash_path.exists(), "hash sidecar must be removed");
+        assert!(!bak_path.exists(), "bak backup must be removed");
+        // The cleanup helper is scoped to wrapper artifacts only.
+        assert!(
+            plist_path.exists(),
+            "unrelated files (plist) must be left untouched"
+        );
+    }
+
+    /// Edge case for #4290: missing files are not an error — uninstalling
+    /// twice, or uninstalling an install that never ran an update (no
+    /// `.sh.bak`), must still succeed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn remove_wrapper_files_is_idempotent_when_files_absent() {
+        use std::fs;
+
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let home = tmp.path();
+
+        let wrapper_path = wrapper_script_path(home);
+        let bin_dir = wrapper_path.parent().unwrap();
+        fs::create_dir_all(bin_dir).expect("create .local/bin");
+
+        // Only the script exists; no sidecar, no backup.
+        fs::write(&wrapper_path, b"x").expect("write wrapper");
+
+        // First removal clears the script.
+        remove_wrapper_files(&wrapper_path).expect("first cleanup should succeed");
+        assert!(!wrapper_path.exists());
+
+        // Second removal with every target already gone is still Ok.
+        remove_wrapper_files(&wrapper_path).expect("second cleanup should be a no-op");
+    }
+
+    /// Regression test for the #4290 bug *site* (not just the leaf helper):
+    /// `stop_and_remove_service` must clean up the wrapper artifacts even when
+    /// the launchd plist is already gone. The original bug was a missing call
+    /// at the uninstall edge; a follow-up review found the cleanup was placed
+    /// AFTER an early `return Ok(false)` taken when the plist is absent, so a
+    /// partial or repeated uninstall still leaked the wrapper files. This test
+    /// drives the actual uninstall entry point (via the home-parametrized core)
+    /// with the plist absent and asserts the artifacts are removed anyway.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn stop_and_remove_service_cleans_wrapper_when_plist_absent() {
+        use std::fs;
+
+        let tmp = tempfile::TempDir::new().expect("create temp dir");
+        let home = tmp.path();
+
+        let wrapper_path = wrapper_script_path(home);
+        let bin_dir = wrapper_path.parent().unwrap();
+        fs::create_dir_all(bin_dir).expect("create .local/bin");
+
+        let hash_path = wrapper_path.with_extension("sh.hash");
+        let bak_path = wrapper_path.with_extension("sh.bak");
+        for path in [&wrapper_path, &hash_path, &bak_path] {
+            fs::write(path, b"x").expect("write fixture file");
+        }
+
+        // No plist exists under this home: the uninstall hits the early-return
+        // path. Pre-fix, that returned before wrapper cleanup ran.
+        let plist_path = home.join("Library/LaunchAgents/org.freenet.node.plist");
+        assert!(!plist_path.exists(), "plist must be absent for this case");
+
+        let found = stop_and_remove_service_at(home).expect("uninstall should succeed");
+
+        assert!(
+            !found,
+            "no service was present, so it must report not-found"
+        );
+        assert!(
+            !wrapper_path.exists(),
+            "wrapper script must be removed even when the plist is already gone"
+        );
+        assert!(!hash_path.exists(), "hash sidecar must be removed");
+        assert!(!bak_path.exists(), "bak backup must be removed");
+    }
+
+    // Regression for #3967: `freenet service doctor` must exist as a parseable
+    // subcommand (both user and --system forms). It is the one-shot recovery
+    // for a wedged install that `restart` cannot perform.
+    #[test]
+    fn service_doctor_subcommand_parses() {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct TestCli {
+            #[command(subcommand)]
+            cmd: ServiceCommand,
+        }
+
+        let user = TestCli::try_parse_from(["freenet", "doctor"]).expect("`doctor` must parse");
+        assert!(
+            matches!(user.cmd, ServiceCommand::Doctor { system: false }),
+            "bare `doctor` must be the user-mode variant"
+        );
+
+        let sys = TestCli::try_parse_from(["freenet", "doctor", "--system"])
+            .expect("`doctor --system` must parse");
+        assert!(
+            matches!(sys.cmd, ServiceCommand::Doctor { system: true }),
+            "`doctor --system` must set system=true"
+        );
+    }
+
+    // Behavioral regression for the doctor reap step (#3967): the original
+    // incident's orphan ignored SIGTERM for >11s and needed SIGKILL. This proves
+    // `kill_pattern_escalating` actually escalates: a child that traps and
+    // ignores SIGTERM must still be reaped (via SIGKILL) and counted as a
+    // survivor. Uses a real child whose argv carries a unique marker so the
+    // user-scoped `pgrep -f` matches exactly this process and nothing else.
+    #[test]
+    #[cfg(unix)]
+    fn kill_pattern_escalating_force_kills_sigterm_ignorer() {
+        use std::time::Duration;
+
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .unwrap_or_default();
+        let uid = uid.trim().to_string();
+
+        // Unique marker in the command line so pgrep -f matches only this child.
+        let marker = format!("freenet-doctor-test-{}", std::process::id());
+        // `trap '' TERM` makes the child ignore SIGTERM entirely; it only dies on
+        // SIGKILL. The marker is embedded in the script text (a `:` no-op with the
+        // marker as an argument) so it is unambiguously part of the command line
+        // `pgrep -f` inspects, regardless of how the OS reports argv[0].
+        // Trailing `; :` defeats the shell's exec-the-last-command optimization,
+        // so the trap-installing `sh` stays the live process (an exec would
+        // replace it with bare `sleep`, dropping both the TERM trap and the
+        // marker from argv).
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("trap '' TERM; : {marker}; sleep 60; :"))
+            .spawn()
+            .expect("spawn sigterm-ignoring child");
+
+        // Give it a moment to install the trap and be visible to pgrep.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !pids_matching(&uid, &marker).is_empty(),
+            "test child must be discoverable via pgrep -f before reaping"
+        );
+
+        // Short grace window (2s) keeps the test fast; the child ignores SIGTERM
+        // so escalation to SIGKILL is the only thing that can reap it.
+        let escalated = kill_pattern_escalating(&uid, &marker, 2);
+
+        assert_eq!(
+            escalated, 1,
+            "the SIGTERM-ignoring child must be counted as a force-killed survivor"
+        );
+        assert!(
+            pids_matching(&uid, &marker).is_empty(),
+            "the SIGTERM-ignoring child must be gone after SIGKILL escalation"
+        );
+        // Reap the zombie so we don't leak it.
+        child.wait().ok();
+    }
+
+    // Complementary case: a child that exits promptly on SIGTERM must be reaped
+    // WITHOUT escalation (escalated count == 0), confirming we don't SIGKILL
+    // (or miscount) a well-behaved process that drains on the polite signal.
+    #[test]
+    #[cfg(unix)]
+    fn kill_pattern_escalating_no_escalation_for_graceful_exit() {
+        use std::time::Duration;
+
+        let uid = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .unwrap_or_default();
+        let uid = uid.trim().to_string();
+
+        let marker = format!("freenet-doctor-graceful-{}", std::process::id());
+        // No TERM trap: default disposition terminates the process on SIGTERM.
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!(": {marker}; sleep 60; :"))
+            .spawn()
+            .expect("spawn graceful child");
+
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !pids_matching(&uid, &marker).is_empty(),
+            "graceful test child must be discoverable before reaping"
+        );
+
+        let escalated = kill_pattern_escalating(&uid, &marker, 12);
+        assert_eq!(
+            escalated, 0,
+            "a child that exits on SIGTERM must not need SIGKILL escalation"
+        );
+        assert!(
+            pids_matching(&uid, &marker).is_empty(),
+            "graceful child must be gone after SIGTERM"
+        );
+        child.wait().ok();
     }
 }

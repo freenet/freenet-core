@@ -1,0 +1,28 @@
+[package]
+name = "replay-harness"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+description = """
+Offline replay harness for evaluating shadow-RTT controllers against
+synthetic scenarios and OTLP telemetry. Phase 2 of #4074 design tool.
+Not a production component.
+"""
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "replay-harness"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]

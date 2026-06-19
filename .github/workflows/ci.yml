@@ -132,6 +132,31 @@ jobs:
           check "build: replace local release build"           "non-release"
           check ""                                             "non-release"
 
+      # Regression gate for the gateway-update verify decision (the vega
+      # v0.2.71 incident: binary swapped, service down, workflow falsely
+      # reported success). The decision logic in
+      # scripts/release-agent/verify-version-decision.sh is sourced both by
+      # gateway-update.yml and by this test, so they cannot drift. The
+      # load-bearing case is "service_active:false must NOT report success".
+      - name: Self-test gateway-update verify decision
+        run: bash scripts/release-agent/verify-version-decision_test.sh
+
+      # Regression gate for the independent post-deploy service-health check in
+      # gateway-auto-update.sh (the 2026-06-18 v0.2.78 nova incident, #4492: a
+      # stale deploy-local-gateway.sh exited 0 on a DEAD service and the wrapper
+      # reported the update successful). The load-bearing case: a deploy script
+      # that lies (exits 0 while the service is down) must still fail the update
+      # via the independent `systemctl is-active` gate.
+      - name: Self-test gateway-auto-update service-health gate
+        run: bash scripts/release-agent/gateway-auto-update_test.sh
+
+      # Regression gate for deploy-local-gateway.sh::verify_service — the
+      # function that actually regressed on nova (#4492). Pins that a dead
+      # service, a missing unit, and an active-but-no-process unit each cause a
+      # non-zero exit, and that a healthy deploy exits 0.
+      - name: Self-test deploy-local-gateway verify_service
+        run: bash scripts/release-agent/deploy-local-gateway_test.sh
+
       - name: Check for old-style mod.rs files
         run: |
           # New modules must use foo.rs + foo/ style, not foo/mod.rs
@@ -472,7 +497,7 @@ jobs:
     # slots on every queue entry — the runner stays cheap there since every step
     # is gated off (see skip_check below).
     runs-on: "${{ (github.event_name == 'merge_group' && !startsWith(github.event.merge_group.head_commit.message, 'build: release')) && 'ubuntu-latest' || 'ubicloud-standard-16' }}"
-    timeout-minutes: 30
+    timeout-minutes: 40
     needs: fmt_check
     # Same skip conditions as test_unit (see test_unit comment for details)
     if: |
@@ -536,7 +561,19 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
         run: |
+          # `--lib` is included so the in-crate simulation tests gated behind
+          # `#[cfg(all(test, feature = "simulation_tests"))]` (e.g. the
+          # governance ban-chain e2e module in
+          # crates/core/src/contract/governance.rs) are built and run. They use
+          # `pub(crate)` accessors (Ring::governance, Ring::contract_ban_list,
+          # the test-only hosting_manager_* counters) that an external
+          # tests/ integration binary cannot reach, so they MUST live in the
+          # lib. Without `--lib` here this whole class of tests was compiled
+          # out of the workspace test step (no simulation_tests feature) AND
+          # excluded from this simulation step (only --test binaries), so it
+          # never ran in CI. See issue #4301.
           cargo nextest run -p freenet --locked --no-run \
+            --lib \
             --test simulation_integration \
             --test simulation_smoke \
             --test streaming_e2e \
@@ -544,7 +581,7 @@ jobs:
             --features simulation_tests,testing --profile ci
           cargo build -p fdev --release --locked
 
-      - name: Run simulation tests (nextest + fdev in parallel)
+      - name: Run simulation tests (nextest first, then fdev load sims)
         if: steps.skip_check.outputs.skip != 'true'
         env:
           RUST_LOG: info,turmoil=warn
@@ -554,27 +591,51 @@ jobs:
           # we can upload them as artifacts and tell which one wedged.
           mkdir -p sim-logs
 
-          # Nextest simulation tests (already built above with --no-run).
-          {
+          # Phase 1: run the precise nextest simulation tests FIRST and ALONE
+          # (already built above with --no-run). Previously these ran
+          # concurrently with the fdev load sims below; under a high-contention
+          # runner the Turmoil `start_paused` clock auto-advances past the 120s
+          # RealTime connection idle timeout during `spawn_blocking` (WASM
+          # execution), spuriously tearing down healthy connections and flaking
+          # the precise streaming/GET sim tests on EVERY nextest retry (the fdev
+          # sims run ~8-15m, overlapping all 3 retries). Running nextest uncontended
+          # first removes that interference; the fdev load sims run afterwards
+          # (still parallel among themselves). Use a ( ) subshell so `exit $rc`
+          # ends the subshell, not this whole step.
+          NEXTEST_FAILED=0
+          (
             echo "== $(date -u +%H:%M:%S) nextest starting"
+            # `--lib` makes the in-crate simulation_tests-gated tests (see the
+            # build step above and issue #4301) available to run alongside the
+            # integration binaries. The filterset then restricts execution to
+            # ALL integration tests (`kind(test)`) PLUS only the simulation
+            # e2e lib tests (`kind(lib) & test(sim_e2e_tests)`) — so the ~3000
+            # ordinary freenet lib unit tests (already covered by the
+            # workspace test job) are NOT re-run here. They were all built with
+            # --no-run above.
             cargo nextest run -p freenet --locked \
+              --lib \
               --test simulation_integration \
               --test simulation_smoke \
               --test streaming_e2e \
               --test state_verification \
+              -E 'kind(test) | (kind(lib) & test(sim_e2e_tests))' \
               --features simulation_tests,testing --profile ci 2>&1
             rc=$?
             echo "== $(date -u +%H:%M:%S) nextest done rc=${rc}"
             exit $rc
-          } > sim-logs/nextest.log 2>&1 &
-          NEXTEST_PID=$!
+          ) > sim-logs/nextest.log 2>&1 || NEXTEST_FAILED=1
+          echo "nextest phase done (failed=${NEXTEST_FAILED}) — starting fdev load sims"
 
-          # 8 minute cap per sim, SIGKILL 30s later if it refuses to die.
+          # 15 minute cap per sim, SIGKILL 30s later if it refuses to die.
+          # (#4404 placement migration roughly doubles per-sim cost when active,
+          # so 8m could be exceeded on a slow release-branch runner; the job's
+          # 40m timeout-minutes still covers the four sims running in parallel.)
           # Background directly (no function) so $! refers to the actual child
           # of this shell, which `wait` can then reap.
           {
             echo "== $(date -u +%H:%M:%S) ci-medium-50 starting"
-            timeout --kill-after=30s 8m target/release/fdev test \
+            timeout --kill-after=30s 15m target/release/fdev test \
               --name "ci-medium-50" \
               --seed 0xDEADBEEF \
               --gateways 4 --nodes 46 --events 2000 \
@@ -591,7 +652,7 @@ jobs:
 
           {
             echo "== $(date -u +%H:%M:%S) ci-fault-loss starting"
-            timeout --kill-after=30s 8m target/release/fdev test \
+            timeout --kill-after=30s 15m target/release/fdev test \
               --name "ci-fault-loss" \
               --seed 0xFA017001 \
               --gateways 3 --nodes 27 --events 1000 \
@@ -608,7 +669,7 @@ jobs:
 
           {
             echo "== $(date -u +%H:%M:%S) ci-high-latency starting"
-            timeout --kill-after=30s 8m target/release/fdev test \
+            timeout --kill-after=30s 15m target/release/fdev test \
               --name "ci-high-latency" \
               --seed 0x1A7E0C71 \
               --gateways 2 --nodes 12 --events 500 \
@@ -624,7 +685,7 @@ jobs:
 
           {
             echo "== $(date -u +%H:%M:%S) ci-churn-20 starting"
-            timeout --kill-after=30s 8m target/release/fdev test \
+            timeout --kill-after=30s 15m target/release/fdev test \
               --name "ci-churn-20" \
               --seed 0xC102FEED \
               --gateways 2 --nodes 18 --events 500 \
@@ -641,11 +702,11 @@ jobs:
           } > sim-logs/ci-churn-20.log 2>&1 &
           PID4=$!
 
-          echo "Started: nextest=$NEXTEST_PID medium=$PID1 fault=$PID2 latency=$PID3 churn=$PID4"
+          echo "Started fdev: medium=$PID1 fault=$PID2 latency=$PID3 churn=$PID4"
 
-          # Wait for all and fail if any failed
-          FAILED=0
-          wait $NEXTEST_PID || { echo "nextest FAILED"; FAILED=1; }
+          # Wait for the fdev sims and fail if any (or nextest above) failed
+          FAILED=$NEXTEST_FAILED
+          [ "$NEXTEST_FAILED" -eq 1 ] && echo "nextest FAILED"
           wait $PID1 || { echo "ci-medium-50 FAILED"; FAILED=1; }
           wait $PID2 || { echo "ci-fault-loss FAILED"; FAILED=1; }
           wait $PID3 || { echo "ci-high-latency FAILED"; FAILED=1; }
@@ -848,3 +909,26 @@ jobs:
             - After pushing, CI will run automatically
 
           claude_args: '--allowed-tools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr comment:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh api:*),Bash(gh run view:*),Bash(git status:*),Bash(git diff:*),Bash(git add:*),Bash(git commit:*),Bash(git push:*),Bash(git log:*)"'
+
+  # Notify the private freenet-dev River room when CI fails on the main branch.
+  # Only fires on push to main (post-merge): the merge queue already gates PRs,
+  # so a failure on the main run means main is red — a bad merge, or a transient
+  # infra/toolchain flake (the linked run shows which). On push to main only
+  # fmt_check + clippy_check run (the heavy jobs are PR/merge_group-gated), so
+  # those are the dependencies that define "main CI".
+  notify_dev_room_main_failure:
+    name: Notify dev room on main CI failure
+    runs-on: ubuntu-latest
+    needs: [fmt_check, clippy_check]
+    if: failure() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Best-effort: a failure in this notifier itself must not add a second red
+    # job to an already-red run (parity with the nightly notify job).
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/river-dev-notify
+        with:
+          message: "🚨 main CI failed — ${{ github.repository }}@${{ github.sha }} — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}

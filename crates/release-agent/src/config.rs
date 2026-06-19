@@ -36,6 +36,17 @@ pub struct Config {
     /// the owner of `~/.config/freenet-river-official/`. Default empty.
     #[serde(default)]
     pub river_announce_user: String,
+
+    /// systemd unit name of the gateway service this agent manages, WITHOUT
+    /// the `.service` suffix (e.g. `freenet-gateway`, or `freenet-gateway-hector`
+    /// on vega's secondary instance). `GET /version` queries
+    /// `systemctl is-active <managed_service>` and reports the result as
+    /// `service_active`, so the release workflow can tell a successful binary
+    /// swap apart from a gateway whose service failed to restart. Defaults to
+    /// `freenet-gateway`, matching the unit name used by
+    /// `deploy-local-gateway.sh` and the gateway setup guide.
+    #[serde(default = "default_managed_service")]
+    pub managed_service: String,
 }
 
 fn default_repo() -> String {
@@ -50,12 +61,40 @@ fn default_rate_limit() -> u64 {
 fn default_skew() -> u32 {
     300
 }
+fn default_managed_service() -> String {
+    "freenet-gateway".to_string()
+}
 
 impl Config {
     pub fn from_path(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("read config {}", path.display()))?;
         toml::from_str(&raw).context("parse config TOML")
+    }
+
+    /// Warn (at load time) if `rate_limit_seconds` is configured below the
+    /// updater's `MAX_UPDATE_HOLD`. The rate-limit window is the second
+    /// backstop for the in-flight overlap guard: if a real update runs past
+    /// `MAX_UPDATE_HOLD`, the guard frees the slot while the child is still
+    /// running, and only the rate-limiter then stops a second POST from racing
+    /// the in-flight restart (the #4271 double-stop). With the prod default
+    /// (`rate_limit_seconds = 600 > 300`) that backstop holds; a misconfig that
+    /// sets it lower silently removes it. Surface that to the operator rather
+    /// than failing closed — the agent still functions, it's just lost a
+    /// defense-in-depth layer.
+    pub fn warn_if_rate_limit_below_max_hold(&self) {
+        let max_hold = crate::updater::MAX_UPDATE_HOLD.as_secs();
+        if self.rate_limit_seconds < max_hold {
+            tracing::warn!(
+                rate_limit_seconds = self.rate_limit_seconds,
+                max_update_hold_seconds = max_hold,
+                "rate_limit_seconds is below the updater max-hold; the rate-limit \
+                 backstop for the in-flight overlap guard is disabled. If an update \
+                 runs longer than {max_hold}s, a second update could race its \
+                 restart and trigger the #4271 double-stop. Set rate_limit_seconds \
+                 >= {max_hold} (prod default is 600)."
+            );
+        }
     }
 
     /// Load the HMAC secret. The file is always parsed as hex (matching
@@ -108,6 +147,24 @@ hmac_secret_path = "/etc/freenet-release-agent/hmac.key"
             cfg.dry_run,
             "missing dry_run must default to true (safe-by-default)"
         );
+        assert_eq!(
+            cfg.managed_service, "freenet-gateway",
+            "missing managed_service must default to the standard gateway unit"
+        );
+    }
+
+    #[test]
+    fn parses_custom_managed_service() {
+        // vega's secondary instance runs as `freenet-gateway-hector`.
+        let toml_src = r#"
+listen_addr = "127.0.0.1:9876"
+binary_path = "/usr/local/bin/freenet"
+update_command = "/usr/local/bin/gateway-auto-update.sh"
+hmac_secret_path = "/etc/freenet-release-agent/hmac.key"
+managed_service = "freenet-gateway-hector"
+"#;
+        let cfg: Config = toml::from_str(toml_src).unwrap();
+        assert_eq!(cfg.managed_service, "freenet-gateway-hector");
     }
 
     #[test]
@@ -185,6 +242,7 @@ dry-run = false
             clock_skew_tolerance_seconds: 0,
             river_announce_command: PathBuf::new(),
             river_announce_user: String::new(),
+            managed_service: "freenet-gateway".into(),
         }
     }
 }

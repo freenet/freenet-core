@@ -29,8 +29,8 @@ use crate::contract::storages::Storage;
 
 use super::RuntimeResult;
 use super::secret_snapshots::{
-    RetentionPolicy, SNAPSHOTS_DIR, SnapshotMetadata, list_snapshots, next_snapshot_path,
-    snapshot_dir_for, thin_snapshots,
+    RestoreError, RetentionPolicy, SnapshotMetadata, list_snapshots, restore_snapshot_file,
+    snapshot_active_value, snapshot_dir_for, thin_snapshots,
 };
 
 /// Environment variable that disables snapshot-on-write for delegate secrets.
@@ -176,7 +176,7 @@ const DEK_HKDF_INFO: &[u8] = b"freenet-delegate-dek-v1";
 /// before this helper landed. Belt-and-suspenders: unlink any
 /// pre-existing inode at `path` so the open always lands on a fresh
 /// 0o600 file.
-fn create_owner_only(path: &Path) -> std::io::Result<File> {
+pub(super) fn create_owner_only(path: &Path) -> std::io::Result<File> {
     match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -198,7 +198,7 @@ fn create_owner_only(path: &Path) -> std::io::Result<File> {
 /// We `chmod` it down on every `SecretsStore::new` so a single restart
 /// is sufficient to migrate. Windows: no-op.
 #[cfg(unix)]
-fn ensure_owner_only_dir(path: &Path) -> std::io::Result<()> {
+pub(super) fn ensure_owner_only_dir(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mut perms = std::fs::metadata(path)?.permissions();
     let mode = perms.mode() & 0o777;
@@ -215,7 +215,7 @@ fn ensure_owner_only_dir(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn ensure_owner_only_dir(_path: &Path) -> std::io::Result<()> {
+pub(super) fn ensure_owner_only_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -557,47 +557,20 @@ impl SecretsStore {
         Ok(())
     }
 
-    /// Capture the existing active secret file as a snapshot. Uses
-    /// hard-link so the active inode and snapshot inode coexist; the
-    /// subsequent `rename(tmp → active)` updates the active dir-entry to
-    /// a different inode without touching the snapshot.
-    ///
-    /// On filesystems that do not support hard links (FAT, some network
-    /// mounts), falls back to `fs::copy`. The active file is unchanged
-    /// either way, so callers that crash mid-snapshot just lose the
-    /// snapshot, never the live value.
+    /// Capture the existing active secret file as a snapshot so the
+    /// subsequent overwrite is reversible. Thin wrapper over the shared
+    /// [`snapshot_active_value`] (keyed on the encoded secret id), which
+    /// owns the hard-link/copy + owner-only-perms discipline reused by
+    /// both `store_secret` and the `freenet secrets snapshot-restore`
+    /// CLI. Keeping one implementation prevents the two paths from
+    /// drifting on a durability-critical operation.
     fn snapshot_prior_value(
         &self,
         delegate_path: &Path,
         key: &SecretsId,
         secret_file_path: &Path,
     ) -> std::io::Result<()> {
-        let snap_dir = snapshot_dir_for(delegate_path, key);
-        fs::create_dir_all(&snap_dir)?;
-        // Snapshot dirs hold prior ciphertexts; tighten BOTH the
-        // intermediate `.snapshots/` umbrella AND the per-secret
-        // `.snapshots/{secret_id}/` leaf. Only chmodding the leaf
-        // leaves `.snapshots/` at the process umask (typically 0o755),
-        // which lets any local user enumerate per-secret subdir names,
-        // write counts (epoch_ms filenames), and write timing.
-        let snap_parent = delegate_path.join(SNAPSHOTS_DIR);
-        if let Err(e) = ensure_owner_only_dir(&snap_parent) {
-            tracing::warn!(path = %snap_parent.display(), error = %e, "chmod snapshots parent dir failed");
-        }
-        if let Err(e) = ensure_owner_only_dir(&snap_dir) {
-            tracing::warn!(path = %snap_dir.display(), error = %e, "chmod snapshot dir failed");
-        }
-        let snap_path = next_snapshot_path(&snap_dir)?;
-        match fs::hard_link(secret_file_path, &snap_path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(_) => {
-                // Hard-link unsupported (FAT, cross-device, etc.). Copy
-                // is slower but always works. The active file is not
-                // mutated in this code path so the copy can't tear.
-                fs::copy(secret_file_path, &snap_path).map(|_| ())
-            }
-        }
+        snapshot_active_value(delegate_path, &key.encode(), secret_file_path)
     }
 
     pub fn remove_secret(
@@ -702,6 +675,14 @@ impl SecretsStore {
     /// rename and the index update still leaves the active value
     /// readable on the next `get_secret`.
     ///
+    /// The find / reversibility-snapshot / atomic-write sequence is
+    /// delegated to the shared [`restore_snapshot_file`] (so the node
+    /// runtime and the `freenet secrets snapshot-restore` CLI can't
+    /// drift); this wrapper then adds the index repair and the
+    /// best-effort history thin, in that order — matching the
+    /// pre-extraction inline implementation exactly, so a failed index
+    /// repair never prunes snapshot history a retry would need.
+    ///
     /// If multiple snapshots share `timestamp_ms` (collision suffixes
     /// from same-millisecond writes), the unsuffixed file wins; absent
     /// that, the lowest-numbered suffix wins. To restore a specific
@@ -723,72 +704,42 @@ impl SecretsStore {
         timestamp_ms: u64,
     ) -> Result<(), SecretStoreError> {
         let delegate_path = self.base_path.join(delegate.encode());
-        let secret_file_path = delegate_path.join(key.encode());
-        let snap_dir = snapshot_dir_for(&delegate_path, key);
 
-        // Find the requested snapshot. Disambiguation rule: unsuffixed
-        // file wins, then lowest-numbered suffix. `list_snapshots`
-        // already sorts by (timestamp_ms, suffix.unwrap_or(0)), and
-        // `None` < `Some(_)` is encoded via that 0-default — fine because
-        // collision suffixes start at 0, so the unsuffixed entry sorts
-        // alongside `.0`; we explicitly prefer unsuffixed below.
-        let entries = list_snapshots(&snap_dir)?;
-        let chosen = entries
-            .iter()
-            .filter(|m| m.timestamp_ms == timestamp_ms)
-            .min_by_key(|m| match m.suffix {
-                None => (0u32, 0u32),
-                Some(s) => (1, s),
-            })
-            .ok_or_else(|| SecretStoreError::SnapshotNotFound {
-                key: key.clone(),
-                timestamp_ms,
-            })?;
-        let chosen_path = chosen.path.clone();
-        // Snapshot the value currently at the active path so the restore
-        // operation is itself reversible. Mirrors store_secret's
-        // best-effort logging — the primary operation (restore) must
-        // not fail just because we couldn't preserve the value being
-        // replaced.
-        if self.snapshots_enabled
-            && secret_file_path.exists()
-            && let Err(e) = self.snapshot_prior_value(&delegate_path, key, &secret_file_path)
-        {
-            tracing::warn!(
-                "failed to snapshot active value before restore for delegate {}: {e}",
-                delegate.encode()
-            );
-        }
-
-        // Read snapshot ciphertext, write through a sibling tmp file with
-        // an atomic rename so the active path never tears. `&mut self`
-        // makes concurrent in-process restore impossible. `create_owner_only`
-        // unlinks any surviving `.tmp` from a prior crashed run so the
-        // new inode always lands at mode 0o600.
-        let ciphertext = fs::read(&chosen_path)?;
-        fs::create_dir_all(&delegate_path)?;
-        if let Err(e) = ensure_owner_only_dir(&delegate_path) {
-            tracing::warn!(path = %delegate_path.display(), error = %e, "chmod delegate dir failed");
-        }
-        let tmp_path = secret_file_path.with_extension("tmp");
-        {
-            let mut file = create_owner_only(&tmp_path)?;
-            file.write_all(&ciphertext)?;
-            file.sync_all()?;
-        }
-        if let Err(err) = fs::rename(&tmp_path, &secret_file_path) {
-            if let Err(rm_err) = fs::remove_file(&tmp_path) {
-                tracing::debug!(
-                    "failed to clean up tmp file {tmp_path:?} after rename failure: {rm_err}"
-                );
+        // Byte-level restore: find the snapshot, reversibly snapshot the
+        // current active value, atomic tmp+fsync+rename onto the active
+        // path. This durability discipline lives in exactly one place
+        // ([`restore_snapshot_file`]) so the node runtime and the
+        // `freenet secrets snapshot-restore` CLI cannot drift. The CLI
+        // cannot reconstruct a `SecretsId` from the on-disk name (the
+        // pre-image bytes are not persisted), so the shared core is keyed
+        // on the encoded secret id rather than the typed `key`. Thinning
+        // is deliberately NOT part of the core — we thin below, after the
+        // index repair, to preserve the pre-extraction order.
+        match restore_snapshot_file(
+            &delegate_path,
+            &key.encode(),
+            timestamp_ms,
+            // The runtime API selects by timestamp only (unsuffixed-wins);
+            // explicit collision-suffix selection is a CLI affordance.
+            None,
+            self.snapshots_enabled,
+        ) {
+            Ok(()) => {}
+            Err(RestoreError::NotFound(timestamp_ms)) => {
+                return Err(SecretStoreError::SnapshotNotFound {
+                    key: key.clone(),
+                    timestamp_ms,
+                });
             }
-            return Err(err.into());
+            Err(RestoreError::Io(e)) => return Err(e.into()),
         }
 
-        // Index update: only needed if the entry was previously removed
+        // Index repair: only needed if the entry was previously removed
         // (e.g. user called `remove_secret` then realized they wanted a
         // value back). In the common case the secret is already in the
-        // index and the write below is idempotent.
+        // index and the block below is a no-op. This is the only part of
+        // restore that needs the in-memory map + ReDb, so it stays here
+        // rather than in the shared filesystem core.
         let secret_key = *key.hash();
         let mut current_secrets: Vec<[u8; 32]> = self
             .key_to_secret_part
@@ -806,13 +757,19 @@ impl SecretsStore {
             self.key_to_secret_part.insert(delegate.clone(), secret_set);
         }
 
-        // Best-effort thin: we may have just doubled the snapshot count
-        // (active-value snapshot above). Failures here only mean we keep
-        // more snapshots than the policy targets, self-correcting on the
-        // next write.
-        if self.snapshots_enabled && snap_dir.exists() {
-            thin_snapshots(&snap_dir, &self.retention, SystemTime::now());
+        // Best-effort thin LAST — only after the index repair above has
+        // committed. Mirrors the pre-extraction order: a failed
+        // `store_secrets_index` early-returns above, so the snapshot
+        // history is left intact for a clean retry instead of having
+        // already pruned source snapshots. Thinning touches only
+        // `.snapshots/`; a failure here self-corrects on the next write.
+        if self.snapshots_enabled {
+            let snap_dir = snapshot_dir_for(&delegate_path, key);
+            if snap_dir.exists() {
+                thin_snapshots(&snap_dir, &self.retention, SystemTime::now());
+            }
         }
+
         Ok(())
     }
 }

@@ -108,6 +108,12 @@ pub mod dev_tool {
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::get::op_ctx_task::RELAY_DRIVER_CALL_COUNT as GET_RELAY_DRIVER_CALL_COUNT;
     #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::get::op_ctx_task::RELAY_GET_STREAMING_FORWARD_COUNT;
+    // Deterministic stream-assembly fault injection + retry counter for
+    // the GET driver's assembly-retry path (#4345).
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::get::op_ctx_task::assembly_fault_injection as get_assembly_fault_injection;
+    #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::put::op_ctx_task::RELAY_PUT_DRIVER_CALL_COUNT;
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::put::op_ctx_task::RELAY_PUT_STREAMING_DRIVER_CALL_COUNT;
@@ -137,7 +143,10 @@ pub mod dev_tool {
         register_topology_snapshot, set_current_network_name, validate_topology,
         validate_topology_from_snapshots,
     };
-    pub use wasm_runtime::secret_snapshots::SnapshotMetadata;
+    pub use wasm_runtime::secret_snapshots::{
+        RestoreError, RetentionPolicy, SnapshotMetadata, list_snapshots, restore_snapshot_file,
+        snapshot_dir_for_encoded, thin_snapshots,
+    };
     pub use wasm_runtime::{
         ContractStore, DelegateStore, MockStateStorage, Runtime, SecretStoreError, SecretsStore,
         StateStore,

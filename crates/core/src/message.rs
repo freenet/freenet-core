@@ -367,6 +367,24 @@ pub(crate) enum NetMessageV1 {
     ReadyState {
         ready: bool,
     },
+    /// Fire-and-forget hint nudging the recipient to host a contract.
+    ///
+    /// A host sends this to a connected neighbor that is closer to the
+    /// contract's key but isn't hosting it. The recipient should subscribe to
+    /// `key` directed through `holder` (the sender), thereby fetching and
+    /// hosting it. There is no reply: the recipient may act on it or ignore it.
+    SubscribeHint(SubscribeHintMsg),
+}
+
+/// Payload for [`NetMessageV1::SubscribeHint`]: a directed nudge to host a contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscribeHintMsg {
+    /// The contract the recipient is being nudged to host.
+    pub key: ContractKey,
+    /// The peer that currently holds (hosts) the contract — the sender of this
+    /// hint. The recipient subscribes to `key` directed through `holder` (a
+    /// plain greedy subscribe would route away from it), thereby hosting it.
+    pub holder: PeerKeyLocation,
 }
 
 /// Messages for the neighbor hosting protocol.
@@ -584,6 +602,7 @@ impl Versioned for NetMessageV1 {
             // Version 1.1.0 for delta-based interest sync
             NetMessageV1::InterestSync { .. } => semver::Version::new(1, 1, 0),
             NetMessageV1::ReadyState { .. } => semver::Version::new(1, 2, 0),
+            NetMessageV1::SubscribeHint(_) => semver::Version::new(1, 3, 0),
         }
     }
 }
@@ -634,6 +653,13 @@ pub(crate) enum NodeEvent {
     TransactionTimedOut(Transaction),
     /// Transaction completed successfully - cleanup client subscription
     TransactionCompleted(Transaction),
+    /// A parked op whose awaited peer was just pruned (#4313). The event-loop
+    /// handler delivers `WaiterReply::PeerDisconnected` into the waiter channel
+    /// before dropping the sender, then cleans up like `TransactionCompleted`.
+    TransactionOrphaned {
+        tx: Transaction,
+        peer: SocketAddr,
+    },
     /// **Standalone** subscription completed - deliver SubscribeResponse to client via result router.
     ///
     /// **IMPORTANT:** This event is ONLY used for standalone subscriptions (no remote peers available).
@@ -694,6 +720,23 @@ pub(crate) enum NodeEvent {
     BroadcastStateChange {
         key: ContractKey,
         new_state: WrappedState,
+        /// `false` for a fresh broadcast emitted by the executor on a local
+        /// state change; `true` for a no-target retry re-emission scheduled by
+        /// `handle_broadcast_state_change`. Lets the handler count each fresh
+        /// logical broadcast once for the #4281 propagation summary without
+        /// re-counting (or being confused by) retries that share the
+        /// per-contract `broadcast_retries` state.
+        is_retry: bool,
+        /// `true` when this broadcast is a deferred re-emission of a
+        /// fresh-contract state that earlier found no targets and was stashed
+        /// in `PendingBroadcastStore`, now re-driven because an interested
+        /// peer appeared (issue #4359). The handler treats it like a fresh
+        /// broadcast for fan-out, but must NOT re-record a `no_targets`
+        /// propagation-summary event for it: the originating PUT already
+        /// counted one `no_targets` when it first gave up, and counting again
+        /// per flush would inflate the #4281 stats. `false` for executor-fresh
+        /// and retry re-emissions.
+        is_reemit: bool,
     },
     /// Send state to a specific peer that reported a stale summary.
     /// Unlike BroadcastStateChange (which fans out to ALL subscribers),
@@ -702,6 +745,13 @@ pub(crate) enum NodeEvent {
         key: ContractKey,
         new_state: WrappedState,
         target: SocketAddr,
+    },
+    /// Nudge the node to consider migrating a contract we host toward a
+    /// closer, non-hosting neighbor (directed-subscribe placement). Emitted
+    /// best-effort when we begin hosting a contract or gain a new neighbor;
+    /// handled in `p2p_protoc` where the connection table and version gate live.
+    ConsiderContractMigration {
+        key: ContractKey,
     },
 }
 
@@ -772,6 +822,9 @@ impl Display for NodeEvent {
             NodeEvent::TransactionCompleted(transaction) => {
                 write!(f, "Transaction completed ({transaction})")
             }
+            NodeEvent::TransactionOrphaned { tx, peer } => {
+                write!(f, "Transaction orphaned (tx: {tx}, peer: {peer})")
+            }
             NodeEvent::LocalSubscribeComplete {
                 tx,
                 key,
@@ -832,6 +885,9 @@ impl Display for NodeEvent {
             NodeEvent::SyncStateToPeer { key, target, .. } => {
                 write!(f, "SyncStateToPeer (contract: {key}, target: {target})")
             }
+            NodeEvent::ConsiderContractMigration { key } => {
+                write!(f, "ConsiderContractMigration (contract: {key})")
+            }
         }
     }
 }
@@ -862,6 +918,7 @@ impl MessageStats for NetMessageV1 {
             NetMessageV1::NeighborHosting { .. } => Transaction::NULL,
             NetMessageV1::InterestSync { .. } => Transaction::NULL,
             NetMessageV1::ReadyState { .. } => Transaction::NULL,
+            NetMessageV1::SubscribeHint(_) => Transaction::NULL,
         }
     }
 
@@ -876,6 +933,7 @@ impl MessageStats for NetMessageV1 {
             NetMessageV1::NeighborHosting { .. } => None,
             NetMessageV1::InterestSync { .. } => None,
             NetMessageV1::ReadyState { .. } => None,
+            NetMessageV1::SubscribeHint(_) => None,
         }
     }
 }
@@ -900,6 +958,9 @@ impl Display for NetMessage {
                 }
                 ReadyState { ready } => {
                     write!(f, "ReadyState {{ ready: {ready} }}")?;
+                }
+                SubscribeHint(msg) => {
+                    write!(f, "SubscribeHint(key: {}, holder: {})", msg.key, msg.holder)?;
                 }
             },
         };
@@ -940,6 +1001,34 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscribe_hint_wire_roundtrip_and_version() {
+        use freenet_stdlib::prelude::CodeHash;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([7u8; 32]),
+            CodeHash::new([8u8; 32]),
+        );
+        let holder = PeerKeyLocation::random();
+        // `ContractKey` is `Copy`; `holder` is not, so it is cloned.
+        let msg = NetMessageV1::SubscribeHint(SubscribeHintMsg {
+            key,
+            holder: holder.clone(),
+        });
+        let bytes = bincode::serialize(&msg).expect("serialize SubscribeHint");
+        let decoded: NetMessageV1 =
+            bincode::deserialize(&bytes).expect("deserialize SubscribeHint");
+        // `matches!` with a guard avoids a wildcard match arm over NetMessageV1.
+        assert!(
+            matches!(&decoded, NetMessageV1::SubscribeHint(m) if m.key == key && m.holder == holder),
+            "SubscribeHint did not round-trip: {decoded:?}"
+        );
+        // Pin the per-variant entry in the NetMessageV1 version map so an
+        // accidental reorder/bump is caught. (This map has no production
+        // consumer today; the live wire-compat gate is the negotiated build
+        // version vs SUBSCRIBE_HINT_MIN_VERSION.)
+        assert_eq!(msg.version(), semver::Version::new(1, 3, 0));
+    }
 
     #[test]
     fn pack_transaction_type() {

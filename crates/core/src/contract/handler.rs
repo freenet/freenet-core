@@ -206,6 +206,42 @@ pub(crate) struct ContractHandlerHalve {
     waiting_response: BTreeMap<u64, tokio::sync::oneshot::Sender<(EventId, ContractHandlerEvent)>>,
 }
 
+/// Ownership of a client's response oneshot, removed from `waiting_response`
+/// so it can outlive a single `handle_contract_event` call.
+///
+/// Created by [`ContractHandlerChannel::take_waiting_response`] when a PUT/UPDATE
+/// defers its related-contract fetch off the serial loop (#4391). The loop holds
+/// this until the deferred upsert resumes, then calls [`respond`](Self::respond)
+/// to deliver the result to the original client — the same delivery
+/// `send_to_sender` performs for the inline path.
+pub(crate) struct StashedResponder {
+    id: u64,
+    sender: tokio::sync::oneshot::Sender<(EventId, ContractHandlerEvent)>,
+}
+
+impl StashedResponder {
+    /// Deliver `ev` to the original client. Returns `Err` if the client
+    /// already disconnected (its receiver was dropped) — non-fatal, the
+    /// upsert side effects have already been applied.
+    pub fn respond(self, ev: ContractHandlerEvent) -> Result<(), ContractError> {
+        self.sender
+            .send((EventId { id: self.id }, ev))
+            .map_err(|_| ContractError::NoEvHandlerResponse)
+    }
+
+    /// Construct a `StashedResponder` directly from a oneshot sender, for unit
+    /// tests of the deferral machinery (e.g. the drop-guard delivering a
+    /// `MissingRelated` resume) that need to observe the response a stranded
+    /// client receives without standing up the full channel + loop.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        id: u64,
+        sender: tokio::sync::oneshot::Sender<(EventId, ContractHandlerEvent)>,
+    ) -> Self {
+        Self { id, sender }
+    }
+}
+
 pub(crate) struct SenderHalve {
     event_sender: mpsc::UnboundedSender<InternalCHEvent>,
     wait_for_res_tx: mpsc::Sender<(ClientId, WaitingTransaction)>,
@@ -555,6 +591,22 @@ impl ContractHandlerChannel<ContractHandlerHalve> {
     /// the `waiting_response` map.
     pub fn drop_waiting_response(&mut self, id: EventId) {
         self.end.waiting_response.remove(&id.id);
+    }
+
+    /// Remove and return the response oneshot for `id` so the caller can hold
+    /// it across an off-loop wait and answer the original client later.
+    ///
+    /// Used by the `contract_handling` loop when a PUT/UPDATE must defer its
+    /// related-contract network fetch off the serial loop (#4391): the loop
+    /// takes ownership of the oneshot here, drives the fetch on a background
+    /// task, re-runs the upsert, and finally fires the stashed oneshot via
+    /// [`StashedResponder::respond`]. Returns `None` if no entry exists (e.g. a
+    /// fire-and-forget event whose receiver was already dropped).
+    pub fn take_waiting_response(&mut self, id: &EventId) -> Option<StashedResponder> {
+        self.end
+            .waiting_response
+            .remove(&id.id)
+            .map(|sender| StashedResponder { id: id.id, sender })
     }
 
     /// Check if a waiting_response entry exists for the given event ID.
@@ -1271,6 +1323,31 @@ pub(super) mod in_memory {
     pub(crate) struct MockWasmContractHandler {
         channel: ContractHandlerChannel<ContractHandlerHalve>,
         runtime: Executor<MockWasmRuntime, MockStateStorage>,
+    }
+
+    #[cfg(test)]
+    impl MockWasmContractHandler {
+        /// Construct a handler over a `MockWasmRuntime` executor with an
+        /// optional `op_manager`. Used by the head-of-line-blocking regression
+        /// test (#4391) to drive the real `contract_handling` loop without
+        /// standing up a full network `OpManager`.
+        pub(crate) async fn new_test(
+            channel: ContractHandlerChannel<ContractHandlerHalve>,
+            op_manager: Option<Arc<OpManager>>,
+            identifier: &str,
+        ) -> Self {
+            let runtime =
+                Executor::new_mock_wasm(identifier, MockStateStorage::new(), None, op_manager)
+                    .await
+                    .expect("create MockWasmRuntime executor for test");
+            Self { channel, runtime }
+        }
+
+        /// Mutable access to the executor's `MockWasmRuntime` so a test can
+        /// install per-contract `validate_overrides` / `update_overrides`.
+        pub(crate) fn runtime_mut(&mut self) -> &mut MockWasmRuntime {
+            self.runtime.mock_runtime_mut()
+        }
     }
 
     /// Builder for MockWasmContractHandler.

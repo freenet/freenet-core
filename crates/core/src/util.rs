@@ -286,8 +286,54 @@ where
     }
 }
 
+/// Aborts a set of spawned tasks when dropped.
+///
+/// Holds the [`AbortHandle`](tokio::task::AbortHandle)s of detached
+/// `GlobalExecutor::spawn` tasks (e.g. the WebSocket `axum::serve` server and
+/// its companion socket, plus the token-cleanup loop) so they are torn down
+/// when the owner is dropped, rather than leaking past a node's shutdown.
+///
+/// This is what makes graceful shutdown actually release resources held by
+/// fire-and-forget server tasks: the tasks keep their own `op_manager` /
+/// listener / redb references alive for as long as they run, so dropping their
+/// only handle is not enough — the handle does not abort the task on drop.
+/// Aborting on drop does. See issue #4401.
+///
+/// Move-only / single-owner: the guard is not `Clone`, so exactly one owner is
+/// responsible for the tracked tasks. Moving it (e.g. into a struct field or
+/// `std::mem::forget`-ing it on a never-shutting-down path) transfers that
+/// responsibility; dropping it aborts every tracked task.
+pub(crate) struct AbortOnDrop {
+    handles: Vec<tokio::task::AbortHandle>,
+}
+
+impl AbortOnDrop {
+    pub(crate) fn new() -> Self {
+        Self {
+            handles: Vec::new(),
+        }
+    }
+
+    /// Track a task's abort handle so it is aborted when `self` is dropped.
+    pub(crate) fn push(&mut self, handle: tokio::task::AbortHandle) {
+        self.handles.push(handle);
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::AbortOnDrop;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     /// Use this to guarantee unique directory names in case you are running multiple tests in parallel.
@@ -296,5 +342,51 @@ pub(crate) mod tests {
         tempfile::Builder::new()
             .tempdir()
             .expect("Failed to create a temporary directory")
+    }
+
+    /// Locks the load-bearing contract of `AbortOnDrop`: dropping the guard
+    /// aborts every task whose `AbortHandle` it holds. The integration test
+    /// (`tests/in_process_restart.rs`) exercises this only indirectly via the
+    /// WS-server teardown; this asserts it directly, so a regression that
+    /// neuters `Drop` (back to a no-op) fails here even if the integration test
+    /// happens to pass. See issue #4401.
+    #[tokio::test]
+    async fn abort_on_drop_cancels_tracked_task() {
+        let counter = Arc::new(AtomicU64::new(0));
+        let task_counter = counter.clone();
+
+        // A task that advances a counter forever unless cancelled.
+        let handle = tokio::spawn(async move {
+            loop {
+                task_counter.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+        let mut guard = AbortOnDrop::new();
+        guard.push(handle.abort_handle());
+
+        // Let the task advance, then drop the guard to abort it.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            counter.load(Ordering::SeqCst) > 0,
+            "task should have advanced before abort"
+        );
+        drop(guard);
+
+        // The JoinHandle must resolve to a cancelled error once the abort lands.
+        let result = handle.await;
+        assert!(
+            result.is_err() && result.as_ref().unwrap_err().is_cancelled(),
+            "dropping AbortOnDrop must cancel the task; got {result:?}"
+        );
+
+        // And the sentinel must stop advancing: capture, wait, re-read.
+        let after_abort = counter.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            after_abort,
+            "task kept running after AbortOnDrop was dropped"
+        );
     }
 }

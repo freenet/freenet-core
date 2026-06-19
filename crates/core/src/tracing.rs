@@ -698,6 +698,35 @@ impl<'a> NetEventLog<'a> {
         })
     }
 
+    /// Create a Subscribe timeout event (#3445).
+    ///
+    /// Emitted from the client-initiated subscribe driver when it exhausts
+    /// all candidate peers without ever receiving a terminal reply (every
+    /// attempt timed out or errored). Mirrors [`Self::subscribe_not_found`]
+    /// but records the timeout outcome so the dashboard pairs every
+    /// `subscribe_request` with an outcome instead of leaving it dangling.
+    pub fn subscribe_timeout(
+        tx: &'a Transaction,
+        ring: &'a Ring,
+        instance_id: ContractInstanceId,
+        retries: usize,
+    ) -> Option<Self> {
+        let peer_id = Self::get_own_peer_id(ring)?;
+        let own_loc = ring.connection_manager.own_location();
+        Some(NetEventLog {
+            tx,
+            peer_id,
+            kind: EventKind::Subscribe(SubscribeEvent::SubscribeTimeout {
+                id: *tx,
+                requester: own_loc,
+                instance_id,
+                retries,
+                elapsed_ms: tx.elapsed().as_millis() as u64,
+                timestamp: chrono::Utc::now().timestamp() as u64,
+            }),
+        })
+    }
+
     // ==================== UPDATE Operation Helpers ====================
 
     /// Create an Update request event.
@@ -1077,7 +1106,7 @@ impl<'a> NetEventLog<'a> {
         Some(NetEventLog {
             tx: Transaction::NULL,
             peer_id,
-            kind: EventKind::RouterSnapshot(snapshot),
+            kind: EventKind::RouterSnapshot(Box::new(snapshot)),
         })
     }
 
@@ -1480,7 +1509,8 @@ impl<'a> NetEventLog<'a> {
             | NetMessageV1::Aborted(_)
             | NetMessageV1::NeighborHosting { .. }
             | NetMessageV1::InterestSync { .. }
-            | NetMessageV1::ReadyState { .. } => EventKind::Ignored,
+            | NetMessageV1::ReadyState { .. }
+            | NetMessageV1::SubscribeHint(_) => EventKind::Ignored,
         };
         let own_loc = op_manager.ring.connection_manager.own_location();
         let Some(own_addr) = own_loc.socket_addr() else {
@@ -1589,7 +1619,9 @@ impl NetLogMessage {
             EventKind::Get(GetEvent::GetSuccess { .. } | GetEvent::GetNotFound { .. }) => true,
             EventKind::Get(_) => false,
             EventKind::Subscribe(
-                SubscribeEvent::SubscribeSuccess { .. } | SubscribeEvent::SubscribeNotFound { .. },
+                SubscribeEvent::SubscribeSuccess { .. }
+                | SubscribeEvent::SubscribeNotFound { .. }
+                | SubscribeEvent::SubscribeTimeout { .. },
             ) => true,
             EventKind::Subscribe(_) => false,
             _ => false,
@@ -1685,6 +1717,12 @@ impl EventFlushHandle {
     /// Request a flush and wait for completion
     pub async fn flush(&self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
+        // DELIBERATE blocking send (channel-safety.md "same-runtime internal
+        // consumer" exception): `flush` is a shutdown/test synchronization
+        // barrier — it MUST wait for `record_logs` to drain, not drop. It is
+        // never called from the network event loop (only shutdown/test paths),
+        // and the reply wait below is timeout-bounded. This is intentionally
+        // NOT converted to `try_send` like the hot-path event-log sends.
         if self.sender.send(EventLogCommand::Flush(tx)).await.is_ok() {
             // Best-effort flush: timeout or channel error is acceptable
             let _flush_result = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await;
@@ -1728,6 +1766,23 @@ impl EventRegister {
     /// Get a handle for flushing this EventRegister (for testing)
     pub fn flush_handle(&self) -> EventFlushHandle {
         self.flush_handle.clone()
+    }
+
+    /// Build a register around an existing sender WITHOUT spawning the
+    /// `record_logs` drain task. Tests use this to saturate the bounded log
+    /// channel and assert `register_events` never blocks the caller (the
+    /// event-log backpressure deadlock regression).
+    #[cfg(test)]
+    fn from_sender_for_test(log_sender: mpsc::Sender<EventLogCommand>) -> Self {
+        let flush_handle = EventFlushHandle {
+            sender: log_sender.clone(),
+        };
+        Self {
+            log_sender,
+            log_file: Arc::new(PathBuf::from("event-log-no-drain-test")),
+            clone_count: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            flush_handle,
+        }
     }
 
     async fn record_logs(
@@ -1843,6 +1898,32 @@ impl Drop for EventRegister {
     }
 }
 
+/// Count of telemetry event-log messages dropped because the bounded
+/// `record_logs` channel was full. Telemetry is best-effort: dropping under
+/// load keeps the node alive, whereas blocking the event loop on a stalled log
+/// consumer deadlocked the entire node (every thread parked on a futex at 0%
+/// CPU). Logged at power-of-two milestones so a persistent stall stays visible
+/// without spamming the log.
+static DROPPED_EVENT_LOGS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_dropped_event_log() {
+    use std::sync::atomic::Ordering;
+    let dropped = DROPPED_EVENT_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+    if dropped.is_power_of_two() {
+        tracing::warn!(
+            dropped_total = dropped,
+            "event log channel full; dropping telemetry event(s). The node is \
+             healthy — telemetry is intentionally lossy under load rather than \
+             blocking the event loop (see .claude/rules/channel-safety.md)."
+        );
+    }
+}
+
+#[cfg(test)]
+fn dropped_event_log_count() -> u64 {
+    DROPPED_EVENT_LOGS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl NetEventRegister for EventRegister {
     fn register_events<'a>(
         &'a self,
@@ -1850,9 +1931,21 @@ impl NetEventRegister for EventRegister {
     ) -> BoxFuture<'a, ()> {
         async {
             for log_msg in NetLogMessage::to_log_message(logs) {
-                if let Err(e) = self.log_sender.send(EventLogCommand::Log(log_msg)).await {
-                    tracing::debug!(error = %e, "event log channel closed");
-                    break;
+                // Best-effort telemetry MUST NOT block the caller. This future is
+                // awaited from the network event loop's hot outbound path (see the
+                // `OutboundMessageWithTarget` and disconnect handlers in
+                // p2p_protoc.rs). A blocking `.send().await` on the bounded log
+                // channel wedged the whole node when `record_logs` stalled on its
+                // metrics WebSocket or AOF write: the channel filled, the event
+                // loop blocked here forever, and every thread parked on a futex at
+                // 0% CPU. Drop on full instead (see channel-safety.md).
+                match self.log_sender.try_send(EventLogCommand::Log(log_msg)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => note_dropped_event_log(),
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::debug!("event log channel closed");
+                        break;
+                    }
                 }
             }
         }
@@ -1882,8 +1975,15 @@ impl NetEventRegister for EventRegister {
         };
         let sender = self.log_sender.clone();
         async move {
-            if let Err(e) = sender.send(EventLogCommand::Log(log_msg)).await {
-                tracing::debug!(error = %e, "event log channel closed during timeout notification");
+            // Non-blocking for the same reason as `register_events`: a stalled
+            // log consumer must never wedge a caller on the bounded log channel
+            // (see channel-safety.md). Best-effort telemetry — drop on full.
+            match sender.try_send(EventLogCommand::Log(log_msg)) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => note_dropped_event_log(),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::debug!("event log channel closed during timeout notification");
+                }
             }
         }
         .boxed()
@@ -1891,6 +1991,127 @@ impl NetEventRegister for EventRegister {
 
     fn get_router_events(&self, number: usize) -> BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
         async move { aof::LogFile::get_router_events(number, &self.log_file).await }.boxed()
+    }
+}
+
+#[cfg(test)]
+mod eventlog_backpressure_tests {
+    use super::*;
+
+    /// A self-contained `Disconnected` event for backpressure tests. It borrows
+    /// nothing: `Transaction::NULL` is a `&'static Transaction` and the other
+    /// fields are owned, so the log is `NetEventLog<'static>`.
+    fn dummy_event() -> NetEventLog<'static> {
+        NetEventLog {
+            tx: Transaction::NULL,
+            peer_id: PeerId::random(),
+            kind: EventKind::Disconnected {
+                from: PeerId::random(),
+                reason: DisconnectReason::RemoteDropped,
+                connection_duration_ms: None,
+                bytes_sent: None,
+                bytes_received: None,
+            },
+        }
+    }
+
+    /// A capacity-1 log channel that is full but still OPEN: the single slot is
+    /// pre-filled and the receiver is returned so the caller can keep it alive
+    /// (dropping it would close the channel and mask the deadlock as an early
+    /// `Closed` return). Returns `(register, rx_guard, filler_guard)`.
+    fn saturated_register() -> (
+        EventRegister,
+        mpsc::Receiver<EventLogCommand>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (tx, rx) = mpsc::channel::<EventLogCommand>(1);
+        let (filler_tx, filler_rx) = tokio::sync::oneshot::channel::<()>();
+        tx.try_send(EventLogCommand::Flush(filler_tx))
+            .expect("first slot accepts the filler");
+        (EventRegister::from_sender_for_test(tx), rx, filler_rx)
+    }
+
+    /// Regression: the network event loop awaits `register_events` on the hot
+    /// outbound path (`p2p_protoc.rs` `OutboundMessageWithTarget`). When
+    /// `record_logs` stalled on its metrics WebSocket or AOF write, a blocking
+    /// `.send().await` on the bounded log channel filled the buffer and wedged
+    /// the entire node — every thread parked on a futex at 0% CPU. The send
+    /// must drop on full instead of blocking. Without the fix the loop parks on
+    /// the full channel; under `start_paused` the runtime then auto-advances
+    /// virtual time to the 5s timeout, so the test fails deterministically
+    /// (`Elapsed`) in ~0ms rather than hanging in wall-clock time.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn register_events_does_not_block_when_log_channel_full() {
+        let (register, _rx, _filler) = saturated_register();
+
+        let fire_many = async {
+            for _ in 0..2_000 {
+                register.register_events(Either::Left(dummy_event())).await;
+            }
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), fire_many)
+            .await
+            .expect("register_events must never block when the log channel is full");
+    }
+
+    /// `notify_of_time_out` writes to the same bounded log channel and is also
+    /// reachable from hot paths, so it must drop on full rather than block.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn notify_of_time_out_does_not_block_when_log_channel_full() {
+        let (mut register, _rx, _filler) = saturated_register();
+
+        let fire_many = async {
+            for _ in 0..2_000 {
+                register
+                    .notify_of_time_out(*Transaction::NULL, "get", None)
+                    .await;
+            }
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), fire_many)
+            .await
+            .expect("notify_of_time_out must never block when the log channel is full");
+    }
+
+    /// The `Full` arm must count the drop so a persistent stall is observable.
+    /// `DROPPED_EVENT_LOGS` is a process-global counter, so other tests in the
+    /// same binary may also increment it concurrently; assert a lower bound
+    /// (our K drops are always counted; concurrent drops only add to it) so the
+    /// test stays order-independent under parallel execution.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn register_events_counts_dropped_messages_when_full() {
+        let (register, _rx, _filler) = saturated_register();
+
+        const K: u64 = 16;
+        let before = dropped_event_log_count();
+        for _ in 0..K {
+            register.register_events(Either::Left(dummy_event())).await;
+        }
+        let after = dropped_event_log_count();
+        assert!(
+            after >= before + K,
+            "expected >= {K} new drops counted, saw {}",
+            after.saturating_sub(before)
+        );
+    }
+
+    /// A closed channel must not block or panic: `register_events` returns
+    /// promptly (its loop `break`s on `Closed`), exercising the non-`Full`
+    /// error arm over a multi-event batch.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn register_events_handles_closed_channel() {
+        let (tx, rx) = mpsc::channel::<EventLogCommand>(4);
+        drop(rx); // channel now closed
+        let register = EventRegister::from_sender_for_test(tx);
+
+        let batch = vec![dummy_event(), dummy_event(), dummy_event()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            register.register_events(Either::Right(batch)),
+        )
+        .await
+        .expect("register_events must return promptly on a closed channel");
     }
 }
 
@@ -2233,8 +2454,8 @@ mod opentelemetry_tracer {
 
     use dashmap::DashMap;
     use opentelemetry::{
-        KeyValue, global,
-        trace::{self, Span},
+        Context, KeyValue, global,
+        trace::{self, Span, TraceContextExt},
     };
 
     use super::*;
@@ -2253,17 +2474,31 @@ mod opentelemetry_tracer {
             let mut span_id = [0; 8];
             span_id.copy_from_slice(&tx_bytes[8..]);
             let start_time = transaction.started();
-            let inner = tracer.build(trace::SpanBuilder {
-                name: transaction.transaction_type().description().into(),
-                start_time: Some(start_time),
-                span_id: Some(trace::SpanId::from_bytes(span_id)),
-                trace_id: Some(trace::TraceId::from_bytes(tx_bytes)),
-                attributes: Some(vec![
-                    KeyValue::new("transaction", transaction.to_string()),
-                    KeyValue::new("tx_type", transaction.transaction_type().description()),
-                ]),
-                ..Default::default()
-            });
+            // opentelemetry 0.32 removed the `trace_id`/`span_id` fields from
+            // `SpanBuilder`; trace identity is now seeded from the parent
+            // `Context`. We anchor the span on a deterministic remote
+            // `SpanContext` derived from the transaction bytes so all events of
+            // a transaction continue to share a stable trace_id. The child span
+            // receives a fresh span_id from the SDK id generator (no longer
+            // settable through the public API), with our deterministic span_id
+            // recorded as the parent span_id.
+            let parent_span_context = trace::SpanContext::new(
+                trace::TraceId::from_bytes(tx_bytes),
+                trace::SpanId::from_bytes(span_id),
+                trace::TraceFlags::SAMPLED,
+                true,
+                trace::TraceState::default(),
+            );
+            let parent_cx = Context::current().with_remote_span_context(parent_span_context);
+            let builder = trace::SpanBuilder::from_name(
+                transaction.transaction_type().description().to_string(),
+            )
+            .with_start_time(start_time)
+            .with_attributes(vec![
+                KeyValue::new("transaction", transaction.to_string()),
+                KeyValue::new("tx_type", transaction.transaction_type().description()),
+            ]);
+            let inner = tracer.build_with_context(builder, &parent_cx);
             OTSpan {
                 inner,
                 last_log: SystemTime::now(),
@@ -2461,7 +2696,18 @@ mod opentelemetry_tracer {
         ) -> BoxFuture<'a, ()> {
             async {
                 for log_msg in NetLogMessage::to_log_message(logs) {
-                    let _sent = self.log_sender.send(log_msg).await;
+                    // Non-blocking, same rationale as `EventRegister`: this is
+                    // awaited from the network event loop's hot path via
+                    // `DynamicRegister`, so a blocking `.send().await` here would
+                    // wedge the loop if the consumer stalls. Drop on full
+                    // (channel-safety.md). Best-effort OT telemetry; `trace-ot`
+                    // is a non-default debug build. `match` (not `let _ =`)
+                    // satisfies the crate's `let_underscore_must_use` deny lint.
+                    match self.log_sender.try_send(log_msg) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {}
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                    }
                 }
             }
             .boxed()
@@ -2479,7 +2725,12 @@ mod opentelemetry_tracer {
         ) -> BoxFuture<'_, ()> {
             async move {
                 if cfg!(test) {
-                    let _sent = self.finished_tx_notifier.send(tx).await;
+                    // Non-blocking, same rationale as `register_events` above.
+                    // Best-effort; intentionally discard the result (drop on
+                    // full or closed). `#[allow]` per the crate convention for
+                    // deliberate `must_use` discards (e.g. tracing.rs:1831).
+                    #[allow(clippy::let_underscore_must_use)]
+                    let _ = self.finished_tx_notifier.try_send(tx);
                 }
             }
             .boxed()
@@ -2552,7 +2803,12 @@ pub enum EventKind {
     /// that want to emit routing decisions through OTLP with sampling.
     RoutingDecision(crate::router::RoutingDecisionInfo),
     /// Periodic snapshot of the router model (isotonic regression curves, event counts).
-    RouterSnapshot(crate::router::RouterSnapshotInfo),
+    ///
+    /// Boxed because `RouterSnapshotInfo` is by far the largest `EventKind`
+    /// payload (regression curves + per-op maps + the #4440 node-health gauges);
+    /// inlining it would bloat every other variant (`clippy::large_enum_variant`).
+    /// `Box` serializes transparently, so the AOF/OTLP wire format is unchanged.
+    RouterSnapshot(Box<crate::router::RouterSnapshotInfo>),
 }
 
 impl EventKind {
@@ -2813,14 +3069,34 @@ impl EventKind {
         matches!(self, EventKind::Get(GetEvent::Request { .. }))
     }
 
-    /// Returns whether this is a subscribe outcome event (success or not-found).
+    /// Returns the HTL carried by a GET request event, `None` for all
+    /// other events.
     ///
-    /// Returns `Some(true)` for `SubscribeSuccess`, `Some(false)` for `SubscribeNotFound`,
+    /// Useful for distinguishing originator-side dispatch from relay
+    /// hops in test analysis: the client driver's loopback Request is
+    /// registered at the originating node with `htl == max_hops_to_live`,
+    /// while every relay-received Request has already been decremented
+    /// (#4361 — dispatched-vs-scheduled accounting).
+    // Wildcard is deliberate, mirroring `hop_count`: this accessor cares
+    // about exactly one variant; new variants should not require updates.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub fn get_request_htl(&self) -> Option<usize> {
+        match self {
+            EventKind::Get(GetEvent::Request { htl, .. }) => Some(*htl),
+            _ => None,
+        }
+    }
+
+    /// Returns whether this is a subscribe outcome event (success or failure).
+    ///
+    /// Returns `Some(true)` for `SubscribeSuccess`, `Some(false)` for the
+    /// failure outcomes `SubscribeNotFound` and `SubscribeTimeout` (#3445),
     /// `None` for all other events (including subscribe requests/responses).
     pub fn subscribe_outcome(&self) -> Option<bool> {
         match self {
             EventKind::Subscribe(SubscribeEvent::SubscribeSuccess { .. }) => Some(true),
-            EventKind::Subscribe(SubscribeEvent::SubscribeNotFound { .. }) => Some(false),
+            EventKind::Subscribe(SubscribeEvent::SubscribeNotFound { .. })
+            | EventKind::Subscribe(SubscribeEvent::SubscribeTimeout { .. }) => Some(false),
             EventKind::Connect(_)
             | EventKind::Put(_)
             | EventKind::Get(_)
@@ -3792,6 +4068,29 @@ pub(crate) enum SubscribeEvent {
         at: PeerKeyLocation,
         timestamp: u64,
     },
+    /// A client-initiated Subscribe operation gave up without a terminal
+    /// reply (every candidate peer timed out / errored before any of them
+    /// returned Subscribed or NotFound). This is a terminal outcome, like
+    /// `SubscribeSuccess`/`SubscribeNotFound`, but distinct because the
+    /// originator never heard back from the network at all.
+    ///
+    /// Issue #3445: without this event a timed-out subscribe left a
+    /// `subscribe_request` on the dashboard with no paired outcome, making
+    /// the failure invisible (the River container contract showed 196
+    /// requests and 0 outcomes — all silent timeouts).
+    SubscribeTimeout {
+        id: Transaction,
+        /// The peer that initiated the subscribe (this node).
+        requester: PeerKeyLocation,
+        /// Contract instance that was being subscribed to (the full key is
+        /// not known on the originator until a successful Subscribed reply).
+        instance_id: ContractInstanceId,
+        /// Number of routing rounds attempted before giving up.
+        retries: usize,
+        /// Time elapsed since the operation started (milliseconds).
+        elapsed_ms: u64,
+        timestamp: u64,
+    },
 }
 
 impl SubscribeEvent {
@@ -3811,7 +4110,8 @@ impl SubscribeEvent {
             | SubscribeEvent::_Reserved9
             | SubscribeEvent::_Reserved10
             | SubscribeEvent::UnsubscribeSent { .. }
-            | SubscribeEvent::UnsubscribeReceived { .. } => None,
+            | SubscribeEvent::UnsubscribeReceived { .. }
+            | SubscribeEvent::SubscribeTimeout { .. } => None,
         }
     }
 }
@@ -4944,5 +5244,351 @@ pub(super) mod test {
             8,
             "Empty state should still produce 8-char hash"
         );
+    }
+}
+
+/// Per-attempt-transaction GET outcome summary (#4361).
+///
+/// The raw event stream multi-counts GET outcomes:
+///
+/// - a failed attempt registers a `GetNotFound` TWICE on the originator's
+///   own node — once directly from the relay driver's exhaustion branch
+///   and once when the loopback `Response{NotFound}` re-enters inbound
+///   dispatch (`from_inbound_msg_v1`);
+/// - multi-hop responses register one outcome event at every hop they
+///   bubble through, so a single terminal outcome can appear N times.
+///
+/// Counting raw events therefore measures message traversal, not
+/// operation outcomes. Grouping by attempt transaction — with success
+/// dominating any co-registered failure events — yields exactly one
+/// outcome per attempt.
+///
+/// Per-tx classification precedence: success > failure (any
+/// `GetFailure` event) > timeout (max elapsed >=
+/// [`GET_TIMEOUT_CLASSIFICATION_MS`]) > not_found.
+///
+/// Semantics caveat: these are WIRE-level attempt outcomes, not
+/// client-visible outcomes. A `Found` that bubbles up after the
+/// originator's per-attempt timeout still registers `GetSuccess` for
+/// that attempt tx and counts as a success here, even though the
+/// client saw NotFound; conversely each failed attempt of an
+/// ultimately-successful GET counts as its own not_found. Suitable for
+/// reliability diagnostics; not a client-SLA metric.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GetOutcomeSummary {
+    pub successes: u64,
+    pub not_found: u64,
+    pub failures: u64,
+    pub timeouts: u64,
+    /// Subset of `successes` whose wire `hop_count >= 1` — the GET
+    /// actually traversed the network rather than completing on a node
+    /// that already held the contract locally.
+    pub network_successes: u64,
+    /// Elapsed ms per successful attempt (max across the hops that
+    /// registered the success — the originator registers last, with the
+    /// largest elapsed). Sorted ascending for deterministic output.
+    pub success_elapsed_ms: Vec<u64>,
+}
+
+impl GetOutcomeSummary {
+    pub fn total(&self) -> u64 {
+        self.successes + self.not_found + self.failures + self.timeouts
+    }
+}
+
+/// Failed GET outcomes with elapsed time at or above this threshold are
+/// classified as timeouts rather than NotFound (close to the 60s
+/// `OPERATION_TTL`).
+pub const GET_TIMEOUT_CLASSIFICATION_MS: u64 = 55_000;
+
+/// Summarize GET outcomes from an event log, deduplicated per attempt
+/// transaction. See [`GetOutcomeSummary`] for why raw event counting is
+/// wrong.
+// Wildcard is deliberate, mirroring `hop_count`: only the three terminal
+// GET variants matter here; new variants should not require updates.
+#[allow(clippy::wildcard_enum_match_arm)]
+pub fn summarize_get_outcomes_per_tx(logs: &[NetLogMessage]) -> GetOutcomeSummary {
+    use std::collections::HashMap;
+
+    #[derive(Default)]
+    struct TxAgg {
+        success: bool,
+        success_elapsed: Option<u64>,
+        max_hop: Option<usize>,
+        saw_failure: bool,
+        max_failure_elapsed: Option<u64>,
+    }
+
+    let mut per_tx: HashMap<Transaction, TxAgg> = HashMap::new();
+    for log in logs {
+        // Match variants directly rather than going through
+        // `get_outcome()`, which collapses `GetNotFound` and `GetFailure`
+        // into the same bucket — classifying genuine network/system
+        // failures as contract absence (Codex review of #4364).
+        let agg = match &log.kind {
+            EventKind::Get(GetEvent::GetSuccess { .. }) => {
+                let agg = per_tx.entry(log.tx).or_default();
+                agg.success = true;
+                if let Some(ms) = log.kind.get_elapsed_ms() {
+                    agg.success_elapsed = Some(agg.success_elapsed.map_or(ms, |cur| cur.max(ms)));
+                }
+                if let Some(hops) = log.kind.hop_count() {
+                    agg.max_hop = Some(agg.max_hop.map_or(hops, |cur| cur.max(hops)));
+                }
+                continue;
+            }
+            EventKind::Get(GetEvent::GetNotFound { .. }) => per_tx.entry(log.tx).or_default(),
+            EventKind::Get(GetEvent::GetFailure { .. }) => {
+                let agg = per_tx.entry(log.tx).or_default();
+                agg.saw_failure = true;
+                agg
+            }
+            _ => continue,
+        };
+        if let Some(ms) = log.kind.get_elapsed_ms() {
+            agg.max_failure_elapsed = Some(agg.max_failure_elapsed.map_or(ms, |cur| cur.max(ms)));
+        }
+    }
+
+    let mut summary = GetOutcomeSummary::default();
+    for agg in per_tx.values() {
+        if agg.success {
+            summary.successes += 1;
+            if agg.max_hop.unwrap_or(0) >= 1 {
+                summary.network_successes += 1;
+            }
+            if let Some(ms) = agg.success_elapsed {
+                summary.success_elapsed_ms.push(ms);
+            }
+        } else if agg.saw_failure {
+            summary.failures += 1;
+        } else if let Some(ms) = agg.max_failure_elapsed {
+            if ms >= GET_TIMEOUT_CLASSIFICATION_MS {
+                summary.timeouts += 1;
+            } else {
+                summary.not_found += 1;
+            }
+        } else {
+            // Unreachable today (all three terminal GET events carry
+            // elapsed_ms) but kept as a defensive bucket.
+            summary.failures += 1;
+        }
+    }
+    summary.success_elapsed_ms.sort_unstable();
+    summary
+}
+
+#[cfg(test)]
+mod get_outcome_summary_tests {
+    use super::*;
+    use crate::operations::get::GetMsg;
+    use crate::ring::PeerKeyLocation;
+    use crate::transport::TransportPublicKey;
+    use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+    use std::net::SocketAddr;
+
+    fn make_peer_id(port: u16) -> PeerId {
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let key = TransportPublicKey::from_bytes([port as u8; 32]);
+        PeerId::new(key, addr)
+    }
+
+    fn make_pkl(port: u16) -> PeerKeyLocation {
+        let key = TransportPublicKey::from_bytes([port as u8; 32]);
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        PeerKeyLocation::new(key, addr)
+    }
+
+    fn make_key() -> ContractKey {
+        ContractKey::from_id_and_code(ContractInstanceId::new([1u8; 32]), CodeHash::new([2u8; 32]))
+    }
+
+    fn base_time() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn not_found_event(tx: Transaction, port: u16, elapsed_ms: u64) -> NetLogMessage {
+        NetLogMessage {
+            tx,
+            datetime: base_time(),
+            peer_id: make_peer_id(port),
+            kind: EventKind::Get(GetEvent::GetNotFound {
+                id: tx,
+                requester: make_pkl(port),
+                instance_id: *make_key().id(),
+                target: make_pkl(port),
+                hop_count: Some(0),
+                elapsed_ms,
+                timestamp: 100,
+            }),
+        }
+    }
+
+    fn success_event(
+        tx: Transaction,
+        port: u16,
+        hop_count: Option<usize>,
+        elapsed_ms: u64,
+    ) -> NetLogMessage {
+        NetLogMessage {
+            tx,
+            datetime: base_time(),
+            peer_id: make_peer_id(port),
+            kind: EventKind::Get(GetEvent::GetSuccess {
+                id: tx,
+                requester: make_pkl(port),
+                target: make_pkl(port),
+                key: make_key(),
+                hop_count,
+                elapsed_ms,
+                timestamp: 100,
+                state_hash: None,
+            }),
+        }
+    }
+
+    /// Regression for #4361: one failed GET attempt registers TWO
+    /// `GetNotFound` events on the originator node (relay-direct +
+    /// loopback-Response inbound). Per-tx dedup must count it once.
+    #[test]
+    fn failed_attempt_double_registration_counts_once() {
+        let tx = Transaction::new::<GetMsg>();
+        let logs = vec![not_found_event(tx, 3001, 5), not_found_event(tx, 3001, 6)];
+        let summary = summarize_get_outcomes_per_tx(&logs);
+        assert_eq!(
+            summary.not_found, 1,
+            "double-registered NotFound must dedup"
+        );
+        assert_eq!(summary.total(), 1);
+    }
+
+    /// A success bubbling through multiple hops registers one event per
+    /// hop; it is still one outcome — and success dominates any
+    /// co-registered NotFound on the same tx (a relay that exhausted one
+    /// branch before another found the contract).
+    #[test]
+    fn multi_hop_success_counts_once_and_dominates() {
+        let tx = Transaction::new::<GetMsg>();
+        let logs = vec![
+            not_found_event(tx, 3003, 4),
+            success_event(tx, 3002, Some(2), 10),
+            success_event(tx, 3001, Some(2), 15),
+        ];
+        let summary = summarize_get_outcomes_per_tx(&logs);
+        assert_eq!(summary.successes, 1);
+        assert_eq!(summary.not_found, 0, "success must dominate per tx");
+        assert_eq!(
+            summary.network_successes, 1,
+            "hop_count >= 1 is a network success"
+        );
+        assert_eq!(
+            summary.success_elapsed_ms,
+            vec![15],
+            "originator-side (max) elapsed wins"
+        );
+    }
+
+    /// hop_count == 0 means the GET completed on a node that already had
+    /// the contract — counted as success but NOT as a network success.
+    #[test]
+    fn local_hit_is_not_a_network_success() {
+        let tx = Transaction::new::<GetMsg>();
+        let logs = vec![success_event(tx, 3001, Some(0), 1)];
+        let summary = summarize_get_outcomes_per_tx(&logs);
+        assert_eq!(summary.successes, 1);
+        assert_eq!(summary.network_successes, 0);
+    }
+
+    fn failure_event(tx: Transaction, port: u16, elapsed_ms: u64) -> NetLogMessage {
+        NetLogMessage {
+            tx,
+            datetime: base_time(),
+            peer_id: make_peer_id(port),
+            kind: EventKind::Get(GetEvent::GetFailure {
+                id: tx,
+                requester: make_pkl(port),
+                instance_id: *make_key().id(),
+                target: make_pkl(port),
+                hop_count: Some(0),
+                reason: OperationFailure::ConnectionDropped,
+                elapsed_ms,
+                timestamp: 100,
+            }),
+        }
+    }
+
+    /// `GetFailure` events classify as failures — not as not_found —
+    /// regardless of elapsed time. Regression for the Codex review
+    /// finding on #4364: classifying by elapsed time alone collapsed
+    /// genuine network/system failures into "contract absent".
+    #[test]
+    fn get_failure_classifies_as_failure_not_not_found() {
+        let tx = Transaction::new::<GetMsg>();
+        let logs = vec![failure_event(tx, 3001, 10)];
+        let summary = summarize_get_outcomes_per_tx(&logs);
+        assert_eq!(summary.failures, 1, "GetFailure must land in failures");
+        assert_eq!(summary.not_found, 0);
+        assert_eq!(summary.total(), 1);
+    }
+
+    /// failure > timeout precedence: a `GetFailure` at or above the
+    /// timeout threshold is still a failure — the timeout bucket is a
+    /// heuristic for NotFound without an explicit reason. Pins the
+    /// branch order in the per-tx fold (#4364 testing review).
+    #[test]
+    fn get_failure_above_timeout_threshold_stays_failure() {
+        let tx = Transaction::new::<GetMsg>();
+        let logs = vec![failure_event(
+            tx,
+            3001,
+            GET_TIMEOUT_CLASSIFICATION_MS + 1_000,
+        )];
+        let summary = summarize_get_outcomes_per_tx(&logs);
+        assert_eq!(
+            summary.failures, 1,
+            "failure must outrank the timeout heuristic"
+        );
+        assert_eq!(summary.timeouts, 0);
+        assert_eq!(summary.total(), 1);
+    }
+
+    /// success > failure precedence on the same tx — and a mixed
+    /// NotFound + Failure tx resolves to failure.
+    #[test]
+    fn success_dominates_failure_and_failure_dominates_not_found() {
+        let tx1 = Transaction::new::<GetMsg>();
+        let tx2 = Transaction::new::<GetMsg>();
+        let logs = vec![
+            failure_event(tx1, 3002, 5),
+            success_event(tx1, 3001, Some(2), 20),
+            not_found_event(tx2, 3003, 5),
+            failure_event(tx2, 3003, 6),
+        ];
+        let summary = summarize_get_outcomes_per_tx(&logs);
+        assert_eq!(summary.successes, 1, "success must dominate failure per tx");
+        assert_eq!(
+            summary.failures, 1,
+            "failure must dominate not_found per tx"
+        );
+        assert_eq!(summary.not_found, 0);
+        assert_eq!(summary.total(), 2);
+    }
+
+    /// Failed outcomes at or above the timeout threshold classify as
+    /// timeouts; distinct transactions stay distinct.
+    #[test]
+    fn timeout_classification_and_distinct_txs() {
+        let tx1 = Transaction::new::<GetMsg>();
+        let tx2 = Transaction::new::<GetMsg>();
+        let logs = vec![
+            not_found_event(tx1, 3001, GET_TIMEOUT_CLASSIFICATION_MS),
+            not_found_event(tx2, 3002, 10),
+        ];
+        let summary = summarize_get_outcomes_per_tx(&logs);
+        assert_eq!(summary.timeouts, 1);
+        assert_eq!(summary.not_found, 1);
+        assert_eq!(summary.total(), 2);
     }
 }

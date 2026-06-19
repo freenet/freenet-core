@@ -496,6 +496,87 @@ fn test_timeout_storm_prevents_recovery() {
     );
 }
 
+/// Regression test for issue #4345: BBR flightsize leak on retransmission
+/// timeout.
+///
+/// Before the fix, `flightsize` was decremented ONLY on ACK. A packet that is
+/// never ACKed but retransmitted forever (lossy path / starved reverse-ACK
+/// channel) kept its initial `on_send` bytes counted in flight size for the
+/// life of the connection. `on_timeout()` resets cwnd/state/bounds but does
+/// not (and should not) touch flight size, since the timed-out packet is
+/// immediately re-sent and stays in flight.
+///
+/// The fix adds an explicit release path: once `SentPacketTracker` abandons a
+/// packet after `MAX_PACKET_RETRANSMITS`, the recv loop calls
+/// `release_flightsize(len)`. This test verifies the BBR controller's
+/// `release_flightsize` actually drains flight size and re-opens cwnd.
+///
+/// Symptom on the live network (issue #4345): `flightsize` pins at `cwnd`
+/// (telemetry showed `flightsize=59436B, cwnd=60398B`), the cwnd-wait loop
+/// `flightsize + packet_size <= cwnd` never finds headroom, every subsequent
+/// stream on the connection aborts with "cwnd wait timeout" (90% of all
+/// transfer failures), and large multi-fragment GETs (freenet-email inbox
+/// state) fail with "no fragments received within inactivity timeout".
+#[test]
+fn test_issue_4345_release_flightsize_drains_abandoned_bytes() {
+    let time = VirtualTime::new();
+    let controller = BbrController::new_with_time_source(BbrConfig::default(), time.clone());
+
+    let packet_size = 1400usize;
+    let num_packets = 40usize;
+
+    // Send a burst; none of these will ever be ACKed (the receiver / reverse
+    // ACK path is dead, exactly the lossy-stream scenario).
+    for _ in 0..num_packets {
+        let _token = controller.on_send(packet_size);
+    }
+    let flight_after_send = controller.flightsize();
+    assert_eq!(
+        flight_after_send,
+        num_packets * packet_size,
+        "flightsize should account for every in-flight byte after send"
+    );
+
+    // on_timeout() alone (the per-RTO call) must NOT change flight size —
+    // the packet is still in flight, being retransmitted.
+    controller.on_timeout();
+    assert_eq!(
+        controller.flightsize(),
+        num_packets * packet_size,
+        "on_timeout() must not change flight size; only abandonment/ACK does"
+    );
+
+    // Each packet is eventually abandoned after MAX_PACKET_RETRANSMITS — the
+    // recv loop calls release_flightsize() for each. Without this release the
+    // bytes leak for the life of the connection.
+    for _ in 0..num_packets {
+        time.advance(Duration::from_secs(1));
+        controller.release_flightsize(packet_size);
+    }
+
+    let flight_after_giveup = controller.flightsize();
+    assert!(
+        flight_after_giveup <= packet_size,
+        "issue #4345: flightsize leaked after abandonment — expected ~0, got \
+         {} bytes ({} packets still counted as in-flight). release_flightsize() \
+         must drain abandoned in-flight bytes.",
+        flight_after_giveup,
+        flight_after_giveup / packet_size,
+    );
+
+    // The connection must be usable again: a fresh packet should fit in cwnd.
+    let cwnd = controller.current_cwnd();
+    assert!(
+        controller.flightsize() + packet_size <= cwnd,
+        "issue #4345: after abandonment a new packet ({} B) must fit in cwnd \
+         ({} B) but flightsize is still {} B — the cwnd-wait loop would never \
+         open and every subsequent stream aborts",
+        packet_size,
+        cwnd,
+        controller.flightsize(),
+    );
+}
+
 /// Test that BBR's adaptive timeout floor kicks in with high BDP.
 ///
 /// When max_bdp_seen is high enough (>4x initial_cwnd), the adaptive floor

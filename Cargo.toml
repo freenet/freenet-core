@@ -42,7 +42,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1.18"
 tokio-tungstenite = "0.27.0"
-tower-http = { version = "0.6", features = ["fs", "trace"] }
+tower-http = { version = "0.7", features = ["fs", "trace"] }
 
 # Crypto
 aes-gcm = "0.10"
@@ -109,6 +109,11 @@ wasmtime = { version = "45", default-features = false, features = [
     "gc", "gc-drc", "gc-null", "parallel-compilation", "pooling-allocator",
     "profiling", "runtime", "std", "threads", "wat",
 ] }
+# Lightweight WASM section parser used to reject debug-compiled contracts at
+# PUT time (see crates/core/src/client_events.rs::contains_debug_sections).
+# Pinned to the same minor wasmtime 45 already resolves transitively so cargo
+# reuses one copy rather than locking a second wasmparser build.
+wasmparser = "0.248"
 
 # Testing/simulation
 arbitrary = { version = "1", features = ["derive"] }

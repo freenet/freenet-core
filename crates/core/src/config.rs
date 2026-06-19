@@ -45,6 +45,15 @@ pub const DEFAULT_RANDOM_PEER_CONN_THRESHOLD: usize = 7;
 /// (if it applies, e.g. connect requests).
 pub const DEFAULT_MAX_HOPS_TO_LIVE: usize = 10;
 
+/// Default UDP port a gateway listens on.
+///
+/// Used as the fallback when a gateway address in `gateways.toml` specifies a
+/// host without an explicit port. This is a fixed, well-known value (NOT a
+/// randomly chosen free port like [`default_network_api_port`]): a gateway we
+/// are trying to *reach* must be addressed at its real listening port, and a
+/// random local port would make the gateway unreachable (issue #1388).
+pub const DEFAULT_GATEWAY_PORT: u16 = 31337;
+
 /// How long an operation (GET, PUT, SUBSCRIBE, etc.) can run before timing out.
 pub(crate) const OPERATION_TTL: Duration = Duration::from_secs(60);
 
@@ -111,6 +120,25 @@ pub struct ConfigArgs {
     #[arg(long, env = "MAX_HOSTING_STORAGE")]
     pub max_hosting_storage: Option<u64>,
 
+    /// Byte budget for the compiled-WASM **contract** module cache. The
+    /// **delegate** cache gets a fraction of this value
+    /// (`DELEGATE_MODULE_CACHE_BUDGET_DIVISOR`, currently 1/4), so the combined
+    /// ceiling is ~1.25× this. When a cache's tracked compiled-byte total would
+    /// exceed its budget on insert, least-recently-used modules are evicted
+    /// until it fits. Bounding by bytes (not entry count) stops a node hosting
+    /// many contracts from thrashing the cache and recompiling on every access
+    /// (issue #4441). When unset, the default scales with system RAM
+    /// (`clamp(total_ram / 8, 64 MiB, 1.5 GiB)`); set this to override.
+    #[arg(long, env = "FREENET_MODULE_CACHE_BUDGET_BYTES")]
+    pub module_cache_budget_bytes: Option<usize>,
+
+    /// Seconds to wait on graceful shutdown for in-flight client
+    /// PUT/GET/UPDATE/SUBSCRIBE operations to finish before tearing
+    /// down peer connections. Set to 0 to disable. Default: 30s. See
+    /// `Config::shutdown_drain_secs` for the full rationale.
+    #[arg(long, env = "SHUTDOWN_DRAIN_SECS")]
+    pub shutdown_drain_secs: Option<u64>,
+
     #[command(flatten)]
     pub telemetry: TelemetryArgs,
 }
@@ -159,6 +187,8 @@ impl Default for ConfigArgs {
             version: false,
             max_blocking_threads: None,
             max_hosting_storage: None,
+            module_cache_budget_bytes: None,
+            shutdown_drain_secs: None,
             telemetry: Default::default(),
         }
     }
@@ -242,7 +272,18 @@ impl ConfigArgs {
     }
 
     /// Parse the command line arguments and return the configuration.
-    pub async fn build(mut self) -> anyhow::Result<Config> {
+    pub async fn build(self) -> anyhow::Result<Config> {
+        self.build_with_gateways_index(FREENET_GATEWAYS_INDEX).await
+    }
+
+    /// Build the configuration, fetching the remote gateway index from
+    /// `gateways_index` when `--skip-load-from-network` is not set.
+    ///
+    /// The public [`build`](Self::build) wrapper passes the production
+    /// [`FREENET_GATEWAYS_INDEX`] constant. Tests inject a local mock-server
+    /// URL so the remote-fetch path is exercised deterministically without
+    /// reaching out to `freenet.org` (which would be slow and flaky in CI).
+    async fn build_with_gateways_index(mut self, gateways_index: &str) -> anyhow::Result<Config> {
         // Validate gateway configuration
         self.network_api.validate()?;
 
@@ -365,6 +406,10 @@ impl ConfigArgs {
             self.log_level.get_or_insert(cfg.log_level);
             self.max_hosting_storage
                 .get_or_insert(cfg.max_hosting_storage);
+            self.module_cache_budget_bytes
+                .get_or_insert(cfg.module_cache_budget_bytes);
+            self.shutdown_drain_secs
+                .get_or_insert(cfg.shutdown_drain_secs);
             self.config_paths.merge(cfg.config_paths.as_ref().clone());
             // Merge telemetry config - CLI args override file config
             // Note: enabled defaults to true via clap, so we only override
@@ -376,6 +421,17 @@ impl ConfigArgs {
                 self.telemetry
                     .endpoint
                     .get_or_insert(cfg.telemetry.endpoint);
+            }
+            // reference-ping-enabled defaults to false via clap; override
+            // if the config file sets it to true. The inverse direction
+            // doesn't need handling — the clap default is already false.
+            if cfg.telemetry.reference_ping_enabled {
+                self.telemetry.reference_ping_enabled = true;
+            }
+            // iface-tx-enabled: same one-directional override as
+            // reference-ping (clap default is already false).
+            if cfg.telemetry.iface_tx_enabled {
+                self.telemetry.iface_tx_enabled = true;
             }
         }
 
@@ -400,12 +456,12 @@ impl ConfigArgs {
         let remotely_loaded_gateways = if mode == OperationMode::Local {
             Gateways::default()
         } else if !self.network_api.skip_load_from_network {
-            load_gateways_from_index(FREENET_GATEWAYS_INDEX, &config_paths.secrets_dir)
+            load_gateways_from_index(gateways_index, &config_paths.secrets_dir)
                 .await
                 .inspect_err(|error| {
                     tracing::error!(
                         error = %error,
-                        index = FREENET_GATEWAYS_INDEX,
+                        index = gateways_index,
                         "Failed to load gateways from index"
                     );
                 })
@@ -522,7 +578,28 @@ impl ConfigArgs {
                     })?
                 }
                 Err(err) => {
+                    // A gateway is allowed to start with an empty bootstrap
+                    // list (an isolated gateway is a valid configuration), so
+                    // exempt `is_gateway` nodes from this guard. A gateway
+                    // started with `--is-gateway --public-network-address X
+                    // --network-port Y` (and no `--public-network-port`) has
+                    // `peer_id == None`, because `peer_id` is derived from
+                    // `public_address.zip(public_port)` above. Keying the guard
+                    // on `peer_id.is_none()` alone would therefore wrongly
+                    // reject such a gateway on first boot when the remote index
+                    // is unreachable, no on-disk gateways.toml exists, and no
+                    // `--gateway`/`--gateways` is supplied. See issue #4268.
+                    //
+                    // The original `peer_id.is_none()` condition is preserved:
+                    // a non-gateway peer that DOES have a public identity
+                    // (`--public-network-address` + `--public-network-port`, so
+                    // `peer_id == Some`) is still allowed to initialize as a
+                    // disjoint bootstrap node with no gateways (see the
+                    // "initializing disjoint gateway" warning below). Only a
+                    // non-gateway with no public identity and no gateways is
+                    // rejected, as before.
                     if peer_id.is_none()
+                        && !self.network_api.is_gateway
                         && mode == OperationMode::Network
                         && remotely_loaded_gateways.gateways.is_empty()
                         && !has_cli_gateways
@@ -732,6 +809,12 @@ impl ConfigArgs {
             max_hosting_storage: self
                 .max_hosting_storage
                 .unwrap_or(crate::ring::DEFAULT_HOSTING_BUDGET_BYTES),
+            module_cache_budget_bytes: self
+                .module_cache_budget_bytes
+                .unwrap_or_else(crate::wasm_runtime::default_module_cache_budget_bytes),
+            shutdown_drain_secs: self
+                .shutdown_drain_secs
+                .unwrap_or_else(default_shutdown_drain_secs),
             telemetry: TelemetryConfig {
                 enabled: self.telemetry.enabled,
                 endpoint: self
@@ -746,6 +829,8 @@ impl ConfigArgs {
                 // simulated networks and integration tests. We disable telemetry in these
                 // environments to avoid flooding the collector with test data.
                 is_test_environment: self.id.is_some(),
+                reference_ping_enabled: self.telemetry.reference_ping_enabled,
+                iface_tx_enabled: self.telemetry.iface_tx_enabled,
             },
         };
 
@@ -847,9 +932,49 @@ pub struct Config {
         rename = "max-hosting-storage"
     )]
     pub max_hosting_storage: u64,
+    /// Byte budget for the compiled-WASM **contract** module cache. The
+    /// delegate cache gets a fraction of this
+    /// (`DELEGATE_MODULE_CACHE_BUDGET_DIVISOR`), so the combined ceiling is
+    /// ~1.25× this value. Bounds the cache by total compiled bytes rather than
+    /// entry count, so a node hosting many contracts doesn't thrash (issue
+    /// #4441). When unset, the default scales with system RAM
+    /// (`clamp(total_ram / 8, 64 MiB, 1.5 GiB)`) so a small VPS doesn't OOM and
+    /// a big gateway still caches a large working set.
+    #[serde(
+        default = "default_module_cache_budget_bytes",
+        rename = "module-cache-budget-bytes"
+    )]
+    pub module_cache_budget_bytes: usize,
     /// Telemetry configuration
     #[serde(flatten)]
     pub telemetry: TelemetryConfig,
+    /// Maximum seconds to wait on graceful shutdown for in-flight
+    /// client-originated operations (PUT/UPDATE/GET/SUBSCRIBE) to
+    /// finish before tearing down peer connections.
+    ///
+    /// Set to `0` to disable the drain entirely (legacy behaviour:
+    /// disconnect immediately on SIGTERM). Default is 30s, which
+    /// covers a typical `freenet-git` mirror push (~3 MiB pack split
+    /// into 4 chunks) plus headroom. systemd's `TimeoutStopSec` is
+    /// set to 45s in this PR (30s drain + 15s peer-teardown
+    /// headroom) — raise both in lockstep if you raise this value;
+    /// `TimeoutStopSec` is the hard ceiling at which systemd
+    /// SIGKILLs the process.
+    ///
+    /// Motivation: release-driven auto-update was killing in-flight
+    /// `freenet-git` mirror PUTs on the nova gateway, producing
+    /// repeated `Mirror to Freenet` failure alerts to
+    /// `#freenet-dev:matrix.org`.
+    #[serde(
+        default = "default_shutdown_drain_secs",
+        rename = "shutdown-drain-secs"
+    )]
+    pub shutdown_drain_secs: u64,
+}
+
+/// Default graceful-shutdown drain window.
+fn default_shutdown_drain_secs() -> u64 {
+    30
 }
 
 /// Default max blocking threads: 2x CPU cores, clamped to 4-32.
@@ -867,6 +992,16 @@ fn default_max_blocking_threads() -> usize {
 /// default and the in-code default from ever drifting apart.
 fn default_max_hosting_storage() -> u64 {
     crate::ring::DEFAULT_HOSTING_BUDGET_BYTES
+}
+
+/// Default contract-module cache byte budget, scaled to system RAM
+/// (`clamp(total_ram / 8, 64 MiB, 1.5 GiB)`).
+///
+/// Resolves to [`crate::wasm_runtime::default_module_cache_budget_bytes`], the
+/// single source of truth, so the operator-facing default and the in-code
+/// default never drift.
+fn default_module_cache_budget_bytes() -> usize {
+    crate::wasm_runtime::default_module_cache_budget_bytes()
 }
 
 impl Config {
@@ -1472,6 +1607,39 @@ pub struct TelemetryArgs {
         skip_serializing_if = "Option::is_none"
     )]
     pub transport_snapshot_interval_secs: Option<u64>,
+
+    /// Enable the Phase 1.5 reference-ping shadow probe (#4074): a 1Hz
+    /// UDP DNS query to a fixed external target (default 1.1.1.1:53)
+    /// whose RTT is recorded alongside the per-peer overlay RTT so the
+    /// collector can disentangle overlay queueing from local uplink
+    /// contention. Opt-in: defaults to false. Production gateway
+    /// configs set this to true; developer machines and integration
+    /// tests leave it off so they don't fire DNS traffic from CI.
+    #[arg(
+        long = "reference-ping-enabled",
+        env = "FREENET_REFERENCE_PING_ENABLED",
+        default_value = "false"
+    )]
+    #[serde(
+        rename = "reference-ping-enabled",
+        default = "default_reference_ping_enabled"
+    )]
+    pub reference_ping_enabled: bool,
+
+    /// Enable the Phase 1.6 OS-interface-tx shadow probe (#4074): a 1Hz
+    /// read of `/proc/net/dev` (Linux) that emits aggregate interface tx
+    /// bytes and the derived `op = total - freenet_own` so the floor
+    /// analysis can attribute uplink saturation to Freenet vs the
+    /// operator's other traffic. Best-effort and opt-in: defaults to
+    /// false; production gateway configs set this to true. Like
+    /// reference-ping, it stays off on developer machines and in tests.
+    #[arg(
+        long = "iface-tx-enabled",
+        env = "FREENET_IFACE_TX_ENABLED",
+        default_value = "false"
+    )]
+    #[serde(rename = "iface-tx-enabled", default = "default_iface_tx_enabled")]
+    pub iface_tx_enabled: bool,
 }
 
 impl Default for TelemetryArgs {
@@ -1480,6 +1648,8 @@ impl Default for TelemetryArgs {
             enabled: true,
             endpoint: None,
             transport_snapshot_interval_secs: None,
+            reference_ping_enabled: false,
+            iface_tx_enabled: false,
         }
     }
 }
@@ -1511,6 +1681,21 @@ pub struct TelemetryConfig {
     /// When true, telemetry is disabled to avoid flooding the collector with test data.
     #[serde(skip)]
     pub is_test_environment: bool,
+
+    /// Enable the Phase 1.5 reference-ping shadow probe (#4074).
+    /// Opt-in: defaults to false; production gateway configs set
+    /// this to true. See `TelemetryArgs::reference_ping_enabled`.
+    #[serde(
+        default = "default_reference_ping_enabled",
+        rename = "reference-ping-enabled"
+    )]
+    pub reference_ping_enabled: bool,
+
+    /// Enable the Phase 1.6 OS-interface-tx shadow probe (#4074).
+    /// Opt-in: defaults to false; production gateway configs set this to
+    /// true. See `TelemetryArgs::iface_tx_enabled`.
+    #[serde(default = "default_iface_tx_enabled", rename = "iface-tx-enabled")]
+    pub iface_tx_enabled: bool,
 }
 
 fn default_transport_snapshot_interval_secs() -> u64 {
@@ -1521,6 +1706,14 @@ fn default_telemetry_endpoint() -> String {
     DEFAULT_TELEMETRY_ENDPOINT.to_string()
 }
 
+fn default_reference_ping_enabled() -> bool {
+    false
+}
+
+fn default_iface_tx_enabled() -> bool {
+    false
+}
+
 impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
@@ -1528,6 +1721,8 @@ impl Default for TelemetryConfig {
             endpoint: DEFAULT_TELEMETRY_ENDPOINT.to_string(),
             transport_snapshot_interval_secs: default_transport_snapshot_interval_secs(),
             is_test_environment: false,
+            reference_ping_enabled: false,
+            iface_tx_enabled: false,
         }
     }
 }
@@ -2007,12 +2202,127 @@ impl std::hash::Hash for GatewayConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Hash, Clone)]
+/// A gateway address as it appears in `gateways.toml`.
+///
+/// # On-disk formats (all accepted on deserialize, see [`Address`]'s
+/// `Deserialize` impl)
+///
+/// New, preferred form — host and port as separate fields, port optional and
+/// defaulting to [`DEFAULT_GATEWAY_PORT`]:
+///
+/// ```toml
+/// [gateways.address]
+/// host = "vega.locut.us"
+/// port = 31337            # optional; defaults to 31337 when omitted
+/// ```
+///
+/// Legacy forms (still parsed so existing deployments keep working):
+///
+/// ```toml
+/// [gateways.address]
+/// hostname = "vega.locut.us:31337"   # host[:port] packed into one string
+/// ```
+///
+/// ```toml
+/// [gateways.address]
+/// host_address = "203.0.113.1:31337" # a fully-resolved socket address
+/// ```
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum Address {
-    #[serde(rename = "hostname")]
+    /// Separate host and port. This is the canonical form emitted on serialize.
+    ///
+    /// `port` is always populated (defaulted to [`DEFAULT_GATEWAY_PORT`] when
+    /// omitted on the wire) so the serialized form is unambiguous and
+    /// round-trips.
+    Host { host: String, port: u16 },
+    /// Legacy: host with an optional `:port` suffix packed into one string.
     Hostname(String),
-    #[serde(rename = "host_address")]
+    /// Legacy: a fully-resolved socket address.
     HostAddress(SocketAddr),
+}
+
+// Custom `Serialize` emits each variant as a *flat* table so the on-disk form
+// is symmetric with `Deserialize` (below) and matches the legacy wire format
+// exactly (e.g. `hostname = "..."`). The derived enum `Serialize` would instead
+// nest the struct variant under its own key (`[address.host]`), which neither
+// the deserializer nor old binaries expect.
+impl Serialize for Address {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        match self {
+            Address::Host { host, port } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("host", host)?;
+                map.serialize_entry("port", port)?;
+                map.end()
+            }
+            Address::Hostname(hostname) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry("hostname", hostname)?;
+                map.end()
+            }
+            Address::HostAddress(addr) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                // SocketAddr serializes as its string form ("ip:port") here,
+                // matching the legacy `host_address = "..."` representation.
+                map.serialize_entry("host_address", &addr.to_string())?;
+                map.end()
+            }
+        }
+    }
+}
+
+// Custom `Deserialize` so a single `Address` table can be one of three shapes:
+//   { host = "...", port = N? }  (new)
+//   { hostname = "host[:port]" } (legacy)
+//   { host_address = "ip:port" } (legacy)
+//
+// We deserialize into an intermediate that captures whichever key is present,
+// then validate that exactly one address form was supplied. A hand-written
+// impl (rather than `#[serde(untagged)]`) keeps the error messages precise and
+// lets `port` default to `DEFAULT_GATEWAY_PORT` for the new `host` form.
+impl<'de> Deserialize<'de> for Address {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct AddressRepr {
+            host: Option<String>,
+            port: Option<u16>,
+            hostname: Option<String>,
+            host_address: Option<SocketAddr>,
+        }
+
+        let repr = AddressRepr::deserialize(deserializer)?;
+
+        // `port` is only meaningful alongside `host`.
+        if repr.port.is_some() && repr.host.is_none() {
+            return Err(serde::de::Error::custom(
+                "gateway address `port` is only valid together with `host`; \
+                 for the legacy single-string form put the port inside `hostname` \
+                 (e.g. hostname = \"example.com:31337\")",
+            ));
+        }
+
+        match (repr.host, repr.hostname, repr.host_address) {
+            (Some(host), None, None) => Ok(Address::Host {
+                host,
+                port: repr.port.unwrap_or(DEFAULT_GATEWAY_PORT),
+            }),
+            (None, Some(hostname), None) => Ok(Address::Hostname(hostname)),
+            (None, None, Some(addr)) => Ok(Address::HostAddress(addr)),
+            (None, None, None) => Err(serde::de::Error::custom(
+                "gateway address must specify one of `host`, `hostname`, or `host_address`",
+            )),
+            _ => Err(serde::de::Error::custom(
+                "gateway address must specify exactly one of `host`, `hostname`, or `host_address`",
+            )),
+        }
+    }
 }
 
 /// Global async executor abstraction for spawning tasks.
@@ -2827,6 +3137,62 @@ mod tests {
         assert_eq!(deserialized.max_hosting_storage, custom);
     }
 
+    #[tokio::test]
+    async fn module_cache_budget_defaults_to_ram_scaled_clamped() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            ..Default::default()
+        };
+        let cfg = args.build().await.unwrap();
+        // The default is RAM-scaled and clamped to [MIN, MAX]. It must resolve to
+        // the wasm_runtime single-source-of-truth default and land within the
+        // documented clamp range on any host. Reference the constants rather than
+        // hardcoded byte values so this test never drifts from the clamp.
+        let min = crate::wasm_runtime::MIN_DEFAULT_MODULE_CACHE_BUDGET_BYTES;
+        let max = crate::wasm_runtime::MAX_DEFAULT_MODULE_CACHE_BUDGET_BYTES;
+        assert_eq!(
+            cfg.module_cache_budget_bytes,
+            crate::wasm_runtime::default_module_cache_budget_bytes(),
+            "default module cache budget should resolve to the wasm_runtime \
+             single-source-of-truth default"
+        );
+        assert!(
+            (min..=max).contains(&cfg.module_cache_budget_bytes),
+            "default budget {} must be within the [{min}, {max}] clamp",
+            cfg.module_cache_budget_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn module_cache_budget_explicit_value_round_trips() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let custom = 768 * 1024 * 1024_usize;
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            module_cache_budget_bytes: Some(custom),
+            ..Default::default()
+        };
+        let cfg = args.build().await.unwrap();
+        assert_eq!(cfg.module_cache_budget_bytes, custom);
+
+        // Round-trips through TOML serialization.
+        let serialized = toml::to_string(&cfg).unwrap();
+        assert!(serialized.contains("module-cache-budget-bytes"));
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.module_cache_budget_bytes, custom);
+    }
+
     /// Build a minimal local-mode ConfigArgs with the given CIDR list and
     /// return the result of `build().await`. The allowed_source_cidrs path
     /// is the only interesting variation; everything else is defaulted.
@@ -3087,6 +3453,220 @@ mod tests {
 
         let serialized = toml::to_string(&gateways).unwrap();
         let _: Gateways = toml::from_str(&serialized).unwrap();
+    }
+
+    // ---- Address deserialization: backward compat + new host/port form (#1388) ----
+
+    /// Legacy single-string form, exactly as it appears in the deployed
+    /// `https://freenet.org/keys/gateways.toml` today. MUST keep parsing.
+    #[test]
+    fn test_address_deser_legacy_hostname_string() {
+        let toml_str = r#"
+            [[gateways]]
+            public_key = "keys/public.vega.gw.pem"
+            [gateways.address]
+            hostname = "vega.locut.us:31337"
+        "#;
+        let gateways: Gateways = toml::from_str(toml_str).unwrap();
+        assert_eq!(gateways.gateways.len(), 1);
+        assert_eq!(
+            gateways.gateways[0].address,
+            Address::Hostname("vega.locut.us:31337".to_string())
+        );
+    }
+
+    /// Legacy single-string form without a port still parses (port is resolved
+    /// later by `parse_socket_addr`, which now defaults to 31337).
+    #[test]
+    fn test_address_deser_legacy_hostname_string_no_port() {
+        let toml_str = r#"
+            [[gateways]]
+            public_key = "keys/public.vega.gw.pem"
+            [gateways.address]
+            hostname = "vega.locut.us"
+        "#;
+        let gateways: Gateways = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            gateways.gateways[0].address,
+            Address::Hostname("vega.locut.us".to_string())
+        );
+    }
+
+    /// Legacy fully-resolved socket-address form. MUST keep parsing.
+    #[test]
+    fn test_address_deser_legacy_host_address() {
+        let toml_str = r#"
+            [[gateways]]
+            public_key = "keys/k.pem"
+            [gateways.address]
+            host_address = "203.0.113.1:31337"
+        "#;
+        let gateways: Gateways = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            gateways.gateways[0].address,
+            Address::HostAddress("203.0.113.1:31337".parse().unwrap())
+        );
+    }
+
+    /// New form with explicit host and port.
+    #[test]
+    fn test_address_deser_new_host_port() {
+        let toml_str = r#"
+            [[gateways]]
+            public_key = "keys/public.vega.gw.pem"
+            [gateways.address]
+            host = "vega.locut.us"
+            port = 31337
+        "#;
+        let gateways: Gateways = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            gateways.gateways[0].address,
+            Address::Host {
+                host: "vega.locut.us".to_string(),
+                port: 31337
+            }
+        );
+    }
+
+    /// New form with host and a non-default explicit port.
+    #[test]
+    fn test_address_deser_new_host_explicit_nondefault_port() {
+        let toml_str = r#"
+            [[gateways]]
+            public_key = "keys/k.pem"
+            [gateways.address]
+            host = "example.com"
+            port = 12345
+        "#;
+        let gateways: Gateways = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            gateways.gateways[0].address,
+            Address::Host {
+                host: "example.com".to_string(),
+                port: 12345
+            }
+        );
+    }
+
+    /// New form with host but NO port: must default to 31337, not a random port.
+    #[test]
+    fn test_address_deser_new_host_default_port() {
+        let toml_str = r#"
+            [[gateways]]
+            public_key = "keys/public.vega.gw.pem"
+            [gateways.address]
+            host = "vega.locut.us"
+        "#;
+        let gateways: Gateways = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            gateways.gateways[0].address,
+            Address::Host {
+                host: "vega.locut.us".to_string(),
+                port: DEFAULT_GATEWAY_PORT
+            }
+        );
+        assert_eq!(DEFAULT_GATEWAY_PORT, 31337);
+    }
+
+    /// `port` without `host` is rejected (it would silently be lost otherwise).
+    #[test]
+    fn test_address_deser_port_without_host_is_error() {
+        let toml_str = r#"
+            [[gateways]]
+            public_key = "keys/k.pem"
+            [gateways.address]
+            hostname = "example.com:80"
+            port = 31337
+        "#;
+        assert!(toml::from_str::<Gateways>(toml_str).is_err());
+    }
+
+    /// An address table with none of the recognized keys is rejected.
+    #[test]
+    fn test_address_deser_empty_is_error() {
+        let toml_str = r#"
+            [[gateways]]
+            public_key = "keys/k.pem"
+            [gateways.address]
+        "#;
+        assert!(toml::from_str::<Gateways>(toml_str).is_err());
+    }
+
+    /// Specifying more than one address form at once is rejected.
+    #[test]
+    fn test_address_deser_conflicting_forms_is_error() {
+        let toml_str = r#"
+            [[gateways]]
+            public_key = "keys/k.pem"
+            [gateways.address]
+            host = "example.com"
+            hostname = "example.com:31337"
+        "#;
+        assert!(toml::from_str::<Gateways>(toml_str).is_err());
+    }
+
+    /// The new `Host` variant round-trips through serialize -> deserialize.
+    #[test]
+    fn test_address_host_variant_roundtrip() {
+        let gateways = Gateways {
+            gateways: vec![GatewayConfig {
+                address: Address::Host {
+                    host: "vega.locut.us".to_string(),
+                    port: 31337,
+                },
+                public_key_path: PathBuf::from("keys/k.pem"),
+                location: None,
+            }],
+        };
+        let serialized = toml::to_string(&gateways).unwrap();
+        // The `Host` variant must serialize as a FLAT table (host/port as
+        // sibling keys), matching the new wire form in the issue — not nested
+        // under a `[gateways.address.host]` sub-table (the derived enum form).
+        assert!(
+            serialized.contains("host = \"vega.locut.us\"") && serialized.contains("port = 31337"),
+            "unexpected serialized form:\n{serialized}"
+        );
+        assert!(
+            !serialized.contains("[gateways.address.host]"),
+            "Host variant must not nest under its own sub-table:\n{serialized}"
+        );
+        let deserialized: Gateways = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            deserialized.gateways[0].address,
+            gateways.gateways[0].address
+        );
+    }
+
+    /// Pin the legacy serialized wire forms so a future refactor can't silently
+    /// change what we write to `gateways.toml` (old binaries must keep reading
+    /// files this build writes).
+    #[test]
+    fn test_address_legacy_variants_serialize_unchanged() {
+        let hostname = Gateways {
+            gateways: vec![GatewayConfig {
+                address: Address::Hostname("vega.locut.us:31337".to_string()),
+                public_key_path: PathBuf::from("keys/k.pem"),
+                location: None,
+            }],
+        };
+        let s = toml::to_string(&hostname).unwrap();
+        assert!(
+            s.contains("hostname = \"vega.locut.us:31337\""),
+            "legacy hostname form changed:\n{s}"
+        );
+
+        let host_addr = Gateways {
+            gateways: vec![GatewayConfig {
+                address: Address::HostAddress("203.0.113.1:31337".parse().unwrap()),
+                public_key_path: PathBuf::from("keys/k.pem"),
+                location: None,
+            }],
+        };
+        let s = toml::to_string(&host_addr).unwrap();
+        assert!(
+            s.contains("host_address = \"203.0.113.1:31337\""),
+            "legacy host_address form changed:\n{s}"
+        );
     }
 
     #[tokio::test]
@@ -3477,6 +4057,176 @@ mod tests {
             err.to_string()
                 .contains("Cannot initialize node without gateways"),
             "Expected 'Cannot initialize node without gateways', got: {err}"
+        );
+    }
+
+    /// Serve an empty gateway index from a local mock server. Used to drive the
+    /// remote-fetch path (i.e. `--skip-load-from-network` is NOT set) into the
+    /// file-load fallback branch deterministically, without reaching out to the
+    /// real `freenet.org` index (which would be slow and flaky in CI).
+    fn empty_gateways_index_server() -> (Server, String) {
+        let server = Server::run();
+        server.expect(
+            Expectation::matching(request::method("GET"))
+                .times(..)
+                .respond_with(status_code(200).body("")),
+        );
+        let url = server.url_str("/gateways.toml");
+        (server, url)
+    }
+
+    /// Regression test for #4268: an isolated gateway started with
+    /// `--is-gateway --public-network-address X --network-port Y` (and no
+    /// `--public-network-port`) has a `None` `peer_id`, because `peer_id` is
+    /// derived from `public_address.zip(public_port)`. On first boot — remote
+    /// index unreachable/empty, no on-disk `gateways.toml`, and no
+    /// `--gateway`/`--gateways` — the file-load fallback branch must still
+    /// allow the gateway to start with an empty bootstrap list.
+    ///
+    /// Before the fix, the branch guarded on `peer_id.is_none()`, so this
+    /// configuration was wrongly rejected with "Cannot initialize node without
+    /// gateways". This is the file-load analogue of the
+    /// `--skip-load-from-network` guard fixed in PR #4264.
+    ///
+    /// Note: `skip_load_from_network` is intentionally NOT set here — that flag
+    /// would route an `is_gateway` node through the earlier
+    /// `skip_load && is_gateway` branch and never reach the file-load guard
+    /// this test exercises.
+    #[tokio::test]
+    async fn test_file_load_branch_isolated_gateway_without_public_port_succeeds() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path();
+        // No gateways.toml is written: the config_dir is empty, so File::open
+        // fails and we hit the guard under test.
+        assert!(!config_dir.join("gateways.toml").exists());
+
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir.to_path_buf()),
+                data_dir: Some(config_dir.to_path_buf()),
+                log_dir: Some(config_dir.to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                is_gateway: true,
+                // public_address + network_port (NOT public_port) is the valid
+                // isolated-gateway configuration that yields peer_id == None.
+                public_address: Some("203.0.113.10".parse().unwrap()),
+                network_port: Some(31337),
+                public_port: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let cfg = args
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("isolated gateway with no bootstrap gateways must be allowed to start");
+
+        assert!(cfg.is_gateway);
+        assert!(
+            cfg.gateways.is_empty(),
+            "isolated gateway should start with no bootstrap gateways, got {:?}",
+            cfg.gateways
+        );
+        // This PR intentionally does NOT change peer_id derivation: a gateway
+        // configured with --network-port but no --public-network-port still has
+        // peer_id == None (peer_id = public_address.zip(public_port)). That
+        // pre-existing behavior is out of scope here; whether such a gateway
+        // should derive peer_id from network_port is tracked separately. The
+        // fix only ensures build() no longer rejects this valid configuration.
+        assert!(
+            cfg.peer_id.is_none(),
+            "expected peer_id to remain None for a gateway without --public-network-port"
+        );
+    }
+
+    /// Companion to #4268: the widened guard must NOT let a *non-gateway* peer
+    /// start with no bootstrap gateways. A regular peer with `peer_id == None`,
+    /// an empty config_dir, an empty remote index, and no `--gateway` entries
+    /// has nothing to connect to and must still be rejected with "Cannot
+    /// initialize node without gateways". This pins that the fix only relaxes
+    /// the guard for gateways, not for peers.
+    #[tokio::test]
+    async fn test_file_load_branch_non_gateway_without_gateways_is_rejected() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path();
+        assert!(!config_dir.join("gateways.toml").exists());
+
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir.to_path_buf()),
+                data_dir: Some(config_dir.to_path_buf()),
+                log_dir: Some(config_dir.to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                is_gateway: false,
+                // No public_port -> peer_id == None, mirroring the gateway case,
+                // but as a non-gateway this peer genuinely cannot bootstrap.
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = args
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect_err("non-gateway peer without any gateways must be rejected");
+        assert!(
+            err.to_string()
+                .contains("Cannot initialize node without gateways"),
+            "Expected 'Cannot initialize node without gateways', got: {err}"
+        );
+    }
+
+    /// Pin for #4268: the guard must keep its original `peer_id.is_none()`
+    /// condition so a non-gateway peer that DOES have a public identity
+    /// (`--public-network-address` + `--public-network-port`, hence
+    /// `peer_id == Some`) is still allowed to initialize as a disjoint
+    /// bootstrap node when no gateways are available. The first draft of the
+    /// #4268 fix gated solely on `!is_gateway`, which would have wrongly
+    /// rejected this previously-supported startup path; this test locks it in.
+    #[tokio::test]
+    async fn test_file_load_branch_public_non_gateway_bootstraps_disjoint() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path();
+        assert!(!config_dir.join("gateways.toml").exists());
+
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir.to_path_buf()),
+                data_dir: Some(config_dir.to_path_buf()),
+                log_dir: Some(config_dir.to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                is_gateway: false,
+                // Public identity set -> peer_id == Some, so the node may start
+                // disjoint even though no gateways are available.
+                public_address: Some("198.51.100.7".parse().unwrap()),
+                public_port: Some(31337),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let cfg = args
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect("public non-gateway peer must be allowed to bootstrap disjoint");
+        assert!(!cfg.is_gateway);
+        assert!(
+            cfg.gateways.is_empty(),
+            "disjoint peer should start with no gateways, got {:?}",
+            cfg.gateways
         );
     }
 

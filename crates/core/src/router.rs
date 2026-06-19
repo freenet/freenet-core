@@ -112,6 +112,15 @@ pub(crate) struct PerOpCurves {
     pub transfer_rate_curve: Vec<(f64, f64)>,
     pub transfer_rate_data_range: (f64, f64),
     pub transfer_rate_events: usize,
+    /// Downsampled raw (distance, outcome) observations behind each isotonic fit,
+    /// for the scatter overlay. `#[serde(default)]` keeps decode tolerant of
+    /// missing fields via self-describing formats (no-op under the bincode AOF).
+    #[serde(default)]
+    pub failure_points: Vec<(f64, f64)>,
+    #[serde(default)]
+    pub response_time_points: Vec<(f64, f64)>,
+    #[serde(default)]
+    pub transfer_rate_points: Vec<(f64, f64)>,
 }
 
 /// Periodic snapshot of the router model state for telemetry.
@@ -138,15 +147,56 @@ pub(crate) struct RouterSnapshotInfo {
     pub transfer_rate_curve: Vec<(f64, f64)>,
     /// X-range of actual regression data for the transfer rate estimator.
     pub transfer_rate_data_range: (f64, f64),
+    /// Downsampled raw (distance, outcome) observations behind each aggregate
+    /// isotonic fit, for the scatter overlay. `#[serde(default)]` keeps decode
+    /// tolerant of missing fields via self-describing formats; it is a no-op for
+    /// the positional bincode AOF (which skips records it can't decode).
+    #[serde(default)]
+    pub failure_points: Vec<(f64, f64)>,
+    #[serde(default)]
+    pub response_time_points: Vec<(f64, f64)>,
+    #[serde(default)]
+    pub transfer_rate_points: Vec<(f64, f64)>,
     /// Connect forward estimator curve sampled across [0, 0.5], clamped to [0, 1].
     pub connect_forward_curve: Option<Vec<(f64, f64)>>,
     /// X-range of actual regression data for the connect forward estimator.
     pub connect_forward_data_range: Option<(f64, f64)>,
     pub connect_forward_events: Option<usize>,
     pub connect_forward_peer_adjustments: Option<usize>,
+    /// Current number of open file descriptors held by this process, or `None`
+    /// where it can't be read cheaply (Linux-only, via `/proc/self/fd`).
+    ///
+    /// Populated by `Ring` on the `router_snapshot` cadence, not by the router
+    /// model. Paired with [`fd_soft_limit`](Self::fd_soft_limit) it makes
+    /// fd-exhaustion headroom observable in central telemetry: open fds reaching
+    /// the soft limit (`EMFILE`) drove the v0.2.73 gateway crash-loop and was
+    /// invisible to the collector at the time. See #4440.
+    pub open_fds: Option<u64>,
+    /// The `RLIMIT_NOFILE` soft limit (the ceiling that triggers `EMFILE`), or
+    /// `None` on non-unix. Populated by `Ring`; see [`open_fds`](Self::open_fds).
+    pub fd_soft_limit: Option<u64>,
+    /// Compiled-WASM module-cache gauges (#4440), populated by `Ring` from the
+    /// process-global `MODULE_CACHE_METRICS`. `None` until the WASM runtime has
+    /// touched the cache. The contract-cache thrash (eviction → recompile) that
+    /// drove the #4441 incident was invisible to central telemetry; these make
+    /// occupancy and eviction pressure observable on the snapshot cadence. The
+    /// `*_evictions_total` fields are monotonic counters — the collector
+    /// differences them across the cadence to derive an eviction rate.
+    pub contract_module_cache_entries: Option<u64>,
+    pub contract_module_cache_total_bytes: Option<u64>,
+    pub contract_module_cache_budget_bytes: Option<u64>,
+    pub contract_module_cache_evictions_total: Option<u64>,
+    pub delegate_module_cache_entries: Option<u64>,
+    pub delegate_module_cache_total_bytes: Option<u64>,
+    pub delegate_module_cache_budget_bytes: Option<u64>,
+    pub delegate_module_cache_evictions_total: Option<u64>,
     /// Per-operation-type estimator curves, keyed by op type name (e.g., "GET").
     pub per_op_curves: HashMap<String, PerOpCurves>,
-    /// Renegade predictor diagnostics
+    /// Renegade predictor diagnostics. These (and `renegade_accuracy_pairs`) are
+    /// read by the in-process peer dashboard directly from this struct; they are
+    /// intentionally not mirrored into the hand-written OTLP `json!` block in
+    /// `tracing/telemetry.rs` (the dashboard is the only consumer). The per-op
+    /// scatter does reach OTLP, because `per_op_curves` is forwarded wholesale.
     pub renegade_failure_events: usize,
     pub renegade_response_time_events: usize,
     pub renegade_transfer_speed_events: usize,
@@ -159,6 +209,20 @@ pub(crate) struct RouterSnapshotInfo {
     pub renegade_predictions_evaluated: u64,
     /// Recent (predicted_failure, actual_outcome) pairs for accuracy visualization.
     pub renegade_accuracy_pairs: Vec<(f64, f64)>,
+    /// Recent (predicted_secs, actual_secs) pairs for the response-time stage.
+    /// `#[serde(default)]` for decode consistency with the `*_points` fields
+    /// (no-op under the positional bincode AOF).
+    #[serde(default)]
+    pub renegade_response_time_pairs: Vec<(f64, f64)>,
+    /// Recent (predicted_bps, actual_bps) pairs for the transfer-speed stage.
+    #[serde(default)]
+    pub renegade_transfer_speed_pairs: Vec<(f64, f64)>,
+    /// Number of response-time predictions scored against actual outcomes.
+    #[serde(default)]
+    pub renegade_response_time_evaluated: u64,
+    /// Number of transfer-speed predictions scored against actual outcomes.
+    #[serde(default)]
+    pub renegade_transfer_speed_evaluated: u64,
 }
 
 /// Per-peer routing data for the dashboard detail page.
@@ -261,11 +325,19 @@ impl Router {
                     payload_transfer_time,
                 } = re.outcome
                 {
-                    Some(IsotonicEvent {
-                        peer: re.peer.clone(),
-                        contract_location: re.contract_location,
-                        result: payload_size as f64 / payload_transfer_time.as_secs_f64(),
-                    })
+                    // Mirror the per-op / add_event guard: SUBSCRIBE successes
+                    // report payload_size=0 and payload_transfer_time=ZERO, so
+                    // 0/0 = NaN. Skip those so NaN never enters the isotonic
+                    // regression (a single NaN poisons interpolation).
+                    if payload_size > 0 && !payload_transfer_time.is_zero() {
+                        Some(IsotonicEvent {
+                            peer: re.peer.clone(),
+                            contract_location: re.contract_location,
+                            result: payload_size as f64 / payload_transfer_time.as_secs_f64(),
+                        })
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -281,10 +353,17 @@ impl Router {
             if let RouteOutcome::Success {
                 time_to_response_start: _,
                 payload_size,
-                payload_transfer_time: _,
+                payload_transfer_time,
             } = event.outcome
             {
-                mean_transfer_size.add(payload_size as f64);
+                // Only feed transfer size estimator when there's actual payload
+                // data. Operations like SUBSCRIBE report payload_size=0 and
+                // payload_transfer_time=ZERO; counting those would bias
+                // mean_transfer_size downward on a router reload. Mirrors the
+                // incremental `add_event` guard.
+                if payload_size > 0 && !payload_transfer_time.is_zero() {
+                    mean_transfer_size.add(payload_size as f64);
+                }
             }
         }
 
@@ -835,6 +914,11 @@ impl Router {
                 .transfer_rate_estimator
                 .sampled_curve(0.0, f64::INFINITY, 50),
             transfer_rate_data_range: self.transfer_rate_estimator.data_x_range(),
+            // Downsampled raw observations for the scatter overlay (cap keeps the
+            // serialized snapshot small; estimators retain up to 500 each).
+            failure_points: self.failure_estimator.sampled_raw_points(100),
+            response_time_points: self.response_start_time_estimator.sampled_raw_points(100),
+            transfer_rate_points: self.transfer_rate_estimator.sampled_raw_points(100),
             per_op_curves: {
                 let mut curves = HashMap::new();
                 // Collect all op types that have any data
@@ -851,18 +935,21 @@ impl Router {
                         c.failure_curve = p;
                         c.failure_data_range = est.data_x_range();
                         c.failure_events = est.len();
+                        c.failure_points = est.sampled_raw_points(100);
                     }
                     if let Some(est) = self.per_op_response_time.get(&ot) {
                         let p = est.sampled_curve(0.0, f64::INFINITY, 50);
                         c.response_time_curve = p;
                         c.response_time_data_range = est.data_x_range();
                         c.response_time_events = est.len();
+                        c.response_time_points = est.sampled_raw_points(100);
                     }
                     if let Some(est) = self.per_op_transfer_rate.get(&ot) {
                         let p = est.sampled_curve(0.0, f64::INFINITY, 50);
                         c.transfer_rate_curve = p;
                         c.transfer_rate_data_range = est.data_x_range();
                         c.transfer_rate_events = est.len();
+                        c.transfer_rate_points = est.sampled_raw_points(100);
                     }
                     curves.insert(ot.as_str().to_string(), c);
                 }
@@ -873,6 +960,17 @@ impl Router {
             connect_forward_data_range: None,
             connect_forward_events: None,
             connect_forward_peer_adjustments: None,
+            // Node-health gauges populated by Ring on the snapshot cadence (#4440).
+            open_fds: None,
+            fd_soft_limit: None,
+            contract_module_cache_entries: None,
+            contract_module_cache_total_bytes: None,
+            contract_module_cache_budget_bytes: None,
+            contract_module_cache_evictions_total: None,
+            delegate_module_cache_entries: None,
+            delegate_module_cache_total_bytes: None,
+            delegate_module_cache_budget_bytes: None,
+            delegate_module_cache_evictions_total: None,
             // Renegade predictor diagnostics
             renegade_failure_events: self.renegade_predictor.len(),
             renegade_response_time_events: self.renegade_predictor.stage_sizes().1,
@@ -887,6 +985,24 @@ impl Router {
                 .iter()
                 .copied()
                 .collect(),
+            renegade_response_time_pairs: self
+                .renegade_predictor
+                .response_time_accuracy_pairs()
+                .iter()
+                .copied()
+                .collect(),
+            renegade_transfer_speed_pairs: self
+                .renegade_predictor
+                .transfer_speed_accuracy_pairs()
+                .iter()
+                .copied()
+                .collect(),
+            renegade_response_time_evaluated: self
+                .renegade_predictor
+                .response_time_predictions_evaluated(),
+            renegade_transfer_speed_evaluated: self
+                .renegade_predictor
+                .transfer_speed_predictions_evaluated(),
         }
     }
 
@@ -1231,6 +1347,360 @@ mod tests {
             NUM_SUBSCRIBERS,
             NUM_CONNECTIONS,
         );
+    }
+
+    // ===================== issue #4230 support =====================
+    //
+    // Follow-up to #4222. #4222 widened the candidate window from 5 to 25 and
+    // proved (via `select_closest_peers_includes_subscribers_4222`) that the
+    // wider window is wide enough to *surface* subscribers. #4230 asks the
+    // converse question: does the wider window *degrade routing quality* for
+    // ordinary (non-subscriber) GETs by letting the isotonic predictor pick a
+    // distant peer that happens to have slightly better per-peer EWMA history
+    // than the closest peer?
+    //
+    // The predictor's scoring (`predict_routing_outcome`) has no direct
+    // distance term; distance enters only via (a) the global isotonic
+    // regression (`isotonic_estimator.rs`) and (b) as a feature handed to the
+    // renegade predictor. Once a peer has >= ADJUSTMENT_PRIOR_SIZE (10) events,
+    // its per-peer EWMA adjustment can shift its failure estimate away from the
+    // global distance curve. At window=5 the truncation was self-limiting; at
+    // window=25 there are 5x more candidates whose per-peer history can compete
+    // against geographic locality.
+    //
+    // The window only controls which peers are VISIBLE to the predictor, not
+    // the pairwise ranking of any two fixed peers, so the meaningful question
+    // is an aggregate one: over many random targets against a realistically
+    // trained router, does the chosen next hop stay in the closest tail of the
+    // candidate pool (small-world progress), or does it drift toward the median
+    // (no progress) as the window widens? `measure_convergence` answers this
+    // via the chosen hop's rank-percentile. These tests pin that aggregate
+    // convergence property at the shipped window and across a window sweep (the
+    // historical 5 -> shipped 25 -> beyond), so a future change that lets
+    // per-peer history override locality — lengthening routes — trips CI.
+
+    /// Build a peer whose ring location is `Location::from_address` of a
+    /// deterministic non-loopback address with a unique masked IP. `Location`
+    /// is address-derived (it masks the low IP byte and ignores the port for
+    /// non-loopback addresses), so distinct values in the upper three octets
+    /// yield distinct, stable ring locations. The hash is not invertible, so
+    /// callers do not control the exact location — they generate a pool and
+    /// measure distances to a chosen target. `seed` in [0, 65535] (16 bits)
+    /// keeps the octets in range.
+    fn peer_in_subnet(seed: u32) -> PeerKeyLocation {
+        use crate::transport::TransportKeypair;
+        use std::net::SocketAddr;
+        // Vary the second and third octets (the low octet is masked out by
+        // `Location::from_address`, so it can stay 0). First octet fixed at
+        // 198 (RFC 2544 benchmark range, non-loopback). 16 bits of `seed`
+        // give 65536 distinct masked IPs — more than any test below needs.
+        let b = ((seed >> 8) & 0xFF) as u8;
+        let c = (seed & 0xFF) as u8;
+        let addr: SocketAddr = format!("198.{b}.{c}.0:9000").parse().unwrap();
+        PeerKeyLocation::new(TransportKeypair::new().public().clone(), addr)
+    }
+
+    /// Train a `Router` on a synthetic history whose global shape matches what
+    /// the production isotonic regression learns — a distance->failure gradient
+    /// (closer peers succeed more, farther peers fail more) — but with each peer
+    /// *also* carrying an individual reliability bias that is INDEPENDENT of its
+    /// distance. The per-peer bias is what populates mature, divergent per-peer
+    /// EWMA adjustments: a far peer can be individually reliable (adjustment well
+    /// below the global curve) and a near peer individually unreliable. This is
+    /// exactly the regime issue #4230 worries about — a distant-but-good peer
+    /// competing against a close-but-unlucky one — so the convergence metric is
+    /// stressed, not just rubber-stamped against a clean monotone gradient.
+    ///
+    /// `bias_mag` controls the per-peer reliability bias magnitude (the EWMA
+    /// adjustment strength); the sweep test varies it to map the EWMA-magnitude
+    /// dimension the issue asks about. Larger `bias_mag` = individual records
+    /// diverge harder from the distance curve, i.e. the strongest test of
+    /// whether per-peer history can override locality.
+    ///
+    /// To exercise MATURE per-peer history (`>= ADJUSTMENT_PRIOR_SIZE = 10`
+    /// retained events per peer) within `IsotonicEstimator`'s 500-point rolling
+    /// window, keep `pool.len() * rounds <= MAX_REGRESSION_POINTS (500)` and
+    /// `rounds >= ~12`; every round touches every peer once, so each peer ends
+    /// with `rounds` retained observations. Returns the event history (the
+    /// caller builds a `Router` per candidate window from it, since `Router` is
+    /// not `Clone`). Deterministic under the caller's seed guard.
+    fn gradient_history(pool: &[PeerKeyLocation], rounds: usize, bias_mag: f64) -> Vec<RouteEvent> {
+        // Per-peer reliability bias in [-bias_mag, +bias_mag], independent of
+        // distance. Positive = the peer fails MORE than its distance predicts
+        // (bad individual record); negative = fails LESS (good individual
+        // record). Drawn once per peer so the bias is stable across rounds and
+        // the EWMA converges to a mature, peer-specific adjustment.
+        let bias: Vec<f64> = pool
+            .iter()
+            .map(|_| GlobalRng::random_range(-bias_mag..bias_mag))
+            .collect();
+
+        let mut events: Vec<RouteEvent> = Vec::new();
+        for _ in 0..rounds {
+            // Fresh random target each round so the gradient is learned across
+            // the whole ring, not just one contract location.
+            let contract = Location::random();
+            for (i, p) in pool.iter().enumerate() {
+                let d = contract.distance(p.location().unwrap()).as_f64(); // [0, 0.5]
+                // Failure probability rises with distance (the global curve) and
+                // is shifted by the peer's individual bias, then clamped to a
+                // valid probability. d*2 maps [0,0.5] -> [0,1].
+                let p_fail = (d * 2.0 + bias[i]).clamp(0.0, 1.0);
+                let fail = GlobalRng::random_range(0.0..1.0) < p_fail;
+                events.push(RouteEvent {
+                    peer: p.clone(),
+                    contract_location: contract,
+                    outcome: if fail {
+                        RouteOutcome::Failure
+                    } else {
+                        RouteOutcome::SuccessUntimed
+                    },
+                    op_type: None,
+                });
+            }
+        }
+        events
+    }
+
+    /// Measure routing convergence at a given candidate window over many random
+    /// targets, against a fixed trained router and peer pool.
+    ///
+    /// For each target we ask the router (with `consider_n_closest_peers =
+    /// window`) for its single best next hop, then compute that hop's
+    /// *rank-percentile*: the fraction of the pool that is STRICTLY closer to
+    /// the target than the chosen hop. 0.0 = the chosen hop is the closest peer
+    /// (perfect greedy routing); 0.5 = it is the median peer (no progress, like
+    /// a random choice); 1.0 = it is the farthest.
+    ///
+    /// We use rank-percentile rather than a distance ratio because the ratio's
+    /// denominator (the closest peer's distance) is near zero whenever a peer
+    /// sits almost on the target, which makes a mean-ratio metric explode on
+    /// outliers and measure denominator noise instead of routing quality.
+    /// Rank-percentile is bounded in [0, 1] and directly captures small-world
+    /// progress: a router that consistently picks peers in the closest tail
+    /// converges in O(log n) hops; one that drifts toward the median does not.
+    ///
+    /// Returns `(mean_rank_percentile, p90_rank_percentile)`. Lower is better.
+    /// Deterministic under the caller's seed.
+    fn measure_convergence(
+        history: &[RouteEvent],
+        pool: &[PeerKeyLocation],
+        window: usize,
+        trials: usize,
+    ) -> (f64, f64) {
+        let router = Router::new(history).considering_n_closest_peers(window as u32);
+        assert!(
+            router.has_sufficient_routing_events(),
+            "trained router below prediction threshold ({} events)",
+            router.failure_estimator.len()
+        );
+        let mut percentiles: Vec<f64> = Vec::with_capacity(trials);
+        for _ in 0..trials {
+            let target = Location::random();
+            let selected = router
+                .select_peer(pool, target)
+                .expect("non-empty pool must yield a hop");
+            let sel_d = target.distance(selected.location().unwrap()).as_f64();
+            // Count peers strictly closer than the chosen hop. Use a tiny
+            // epsilon so a peer tied with the chosen one (e.g. the chosen peer
+            // itself) is not counted as "closer".
+            let closer = pool
+                .iter()
+                .filter(|p| target.distance(p.location().unwrap()).as_f64() < sel_d - 1e-12)
+                .count();
+            percentiles.push(closer as f64 / pool.len() as f64);
+        }
+        let mean = percentiles.iter().sum::<f64>() / percentiles.len() as f64;
+        percentiles.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let p90 = percentiles[(percentiles.len() as f64 * 0.9) as usize];
+        (mean, p90)
+    }
+
+    /// #4230 (steady state): at the SHIPPED window of 25, small-world routing
+    /// convergence is preserved. Over many random targets against a router
+    /// trained on a realistic distance->failure gradient, the chosen next hop
+    /// lands deep in the closest tail of the candidate pool — far from the
+    /// median (which would mean no progress / non-convergence). If the widened
+    /// window had let per-peer EWMA history routinely override geographic
+    /// locality (the #4230 worry), the chosen hop's rank-percentile would drift
+    /// toward 0.5; instead it stays near zero.
+    ///
+    /// Empirical basis for the thresholds: across a 12-seed x 2-bias-magnitude
+    /// robustness scan (40-peer pool, MATURE per-peer history with per-peer
+    /// reliability biases independent of distance), the window=25 mean
+    /// rank-percentile ranged 0.037..0.159 and p90 ranged 0.10..0.35. The bounds
+    /// below for this steady-state case (bias_mag 0.35: mean < 0.18, p90 < 0.40)
+    /// sit above the observed worst case while remaining far below the
+    /// no-convergence value of 0.5, so a real degradation (history overriding
+    /// distance) trips CI but seed jitter does not. The companion sweep test
+    /// uses slightly wider bounds because it also exercises bias_mag 0.5.
+    /// Deterministic.
+    #[test]
+    fn routing_convergence_preserved_at_window_25_4230() {
+        let _guard = crate::config::GlobalRng::seed_guard(0x4230_C0DE);
+
+        // Pin the shipped window so a silent default change surfaces here too
+        // (mirrors the pin in the #4222 test).
+        assert_eq!(
+            Router::new(&[]).consider_n_closest_peers,
+            25,
+            "issue #4230: expected DEFAULT_CONSIDER_N_CLOSEST_PEERS = 25"
+        );
+
+        // 40 peers x 12 rounds = 480 events (<= the estimator's 500-point
+        // window), giving every peer 12 retained observations. Combined with
+        // the per-peer reliability bias in `gradient_history`, this drives each
+        // peer's EWMA adjustment to a mature, peer-specific value that diverges
+        // from the global distance curve — the regime #4230 cares about, where
+        // a peer's individual record competes against geographic locality.
+        let pool: Vec<PeerKeyLocation> = (0..40u32).map(peer_in_subnet).collect();
+        // The pool must contain 40 distinct ring locations; if `peer_in_subnet`
+        // ever collided them the metrics below would silently lose meaning.
+        let distinct_locs: std::collections::HashSet<_> = pool
+            .iter()
+            .map(|p| p.location().unwrap().as_f64().to_bits())
+            .collect();
+        assert_eq!(distinct_locs.len(), pool.len(), "peer pool has collisions");
+
+        let history = gradient_history(&pool, 12, 0.35); // 40 * 12 = 480 events
+
+        // Prove the divergent-per-peer-history regime is actually exercised, so
+        // these tests aren't false comfort. Two checks:
+        //   (a) every peer has an active per-peer adjustment (the global
+        //       regression reached ADJUSTMENT_PRIOR_SIZE, so adjustments were
+        //       created and, since the seeded effective_count >=
+        //       MIN_POINTS_FOR_REGRESSION, are actually APPLIED in scoring), and
+        //   (b) the per-peer adjustment VALUES span a meaningful range — i.e.
+        //       individual records genuinely diverge from the global distance
+        //       curve rather than all collapsing onto it. (We assert on the
+        //       adjustment *value* spread, NOT effective_count: effective_count
+        //       is seeded at the EWMA fixed point ~10 and stays there regardless
+        //       of how many real events accrue, so it cannot witness divergence.)
+        let router_probe = Router::new(&history);
+        assert_eq!(
+            router_probe.failure_estimator.peer_adjustments.len(),
+            pool.len(),
+            "every peer must have a per-peer failure adjustment applied"
+        );
+        let adj_values: Vec<f64> = router_probe
+            .failure_estimator
+            .peer_adjustments
+            .values()
+            .map(|a| a.value())
+            .collect();
+        let adj_min = adj_values.iter().cloned().fold(f64::INFINITY, f64::min);
+        let adj_max = adj_values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            adj_max - adj_min > 0.2,
+            "per-peer history did not diverge (adjustment value spread \
+             {:.3} too small) — the test would not exercise the regime where \
+             per-peer history competes against distance",
+            adj_max - adj_min
+        );
+
+        let (mean_pct, p90_pct) = measure_convergence(&history, &pool, 25, 400);
+
+        assert!(
+            mean_pct < 0.18,
+            "issue #4230 regression: at window=25 the chosen next hop's mean \
+             rank-percentile is {mean_pct:.3} — the predictor is drifting away \
+             from the closest tail (0.5 = median = no progress), so per-peer \
+             history is overriding geographic locality and small-world routing \
+             convergence has degraded"
+        );
+        assert!(
+            p90_pct < 0.40,
+            "issue #4230 regression: at window=25 the 90th-percentile chosen-hop \
+             rank-percentile is {p90_pct:.3} — the routing tail has degraded; \
+             too many hops are landing far from the target"
+        );
+    }
+
+    /// #4230 (threshold map): sweep the candidate window from the historical 5
+    /// through the shipped 25 and beyond, and confirm widening does NOT push
+    /// routing toward non-convergence. The issue asks for this sweep
+    /// explicitly: if window=25 sits comfortably inside the safe region the
+    /// test is a regression guard; if widening had driven the chosen-hop
+    /// rank-percentile toward the median, the fix would have needed a soft
+    /// distance bias in the predictor rather than truncation alone.
+    ///
+    /// Finding: widening DOES raise the chosen-hop rank-percentile modestly
+    /// (more near-equidistant candidates become visible, so per-peer history
+    /// breaks more ties), but it plateaus well inside the convergent regime —
+    /// it never drifts toward 0.5, even when per-peer histories diverge hard
+    /// from the distance curve. So the #4222 widening is safe; this test pins
+    /// that across both the window dimension and the EWMA-magnitude dimension
+    /// the issue calls out. Deterministic.
+    ///
+    /// Note on the structural cap: `select_closest_peers` truncates to the
+    /// `window` closest peers BEFORE the predictor reranks, so at small windows
+    /// the chosen-hop rank-percentile is mechanically bounded near `window /
+    /// pool_len` (e.g. ~0.125 at window=5 in a 40-peer pool) and the assertions
+    /// there essentially cannot fail. The load-bearing checks are therefore at
+    /// the wide windows (25 and 40, where the whole near-cluster — or the whole
+    /// pool — is visible and per-peer history has the most room to override
+    /// locality) plus the bounded 5->25 increase.
+    #[test]
+    fn routing_convergence_window_sweep_does_not_degrade_4230() {
+        let _guard = crate::config::GlobalRng::seed_guard(0x4230_5EED);
+
+        // 40 peers x 12 rounds = 480 events: mature per-peer EWMA within the
+        // 500-point window. See the companion steady-state test for the
+        // divergence assertion. The sweep tops out at window=40 (the pool size);
+        // windows beyond that are equivalent since truncation can't exceed the
+        // candidate count.
+        //
+        // Second sweep dimension: per-peer bias magnitude (EWMA-adjustment
+        // strength). 0.35 is the steady-state value; 0.5 pushes individual
+        // records to diverge maximally from the distance curve — the strongest
+        // stress on "can per-peer history override locality?".
+        let pool: Vec<PeerKeyLocation> = (0..40u32).map(peer_in_subnet).collect();
+
+        for &bias_mag in &[0.35f64, 0.5] {
+            let history = gradient_history(&pool, 12, bias_mag);
+
+            // (window, mean_pct, p90_pct) for each swept window.
+            let mut results: Vec<(usize, f64, f64)> = Vec::new();
+            for &window in &[5usize, 10, 25, 40] {
+                let (mean_pct, p90_pct) = measure_convergence(&history, &pool, window, 300);
+                results.push((window, mean_pct, p90_pct));
+            }
+
+            // At EVERY swept window the chosen hop stays deep in the closest
+            // tail — never near the median. This is the load-bearing
+            // convergence property: widening the candidate window (at any EWMA
+            // magnitude) does not break small-world routing.
+            for &(window, mean_pct, p90_pct) in &results {
+                assert!(
+                    mean_pct < 0.20,
+                    "issue #4230: at window={window} bias_mag={bias_mag} mean \
+                     chosen-hop rank-percentile {mean_pct:.3} drifted toward the \
+                     median — routing convergence degraded by candidate-window size"
+                );
+                assert!(
+                    p90_pct < 0.42,
+                    "issue #4230: at window={window} bias_mag={bias_mag} p90 \
+                     chosen-hop rank-percentile {p90_pct:.3} is too high — the \
+                     routing tail degraded"
+                );
+            }
+
+            // Widening from the historical 5 to the shipped 25 must keep the
+            // chosen hop firmly in the closest tail. We do NOT require window=25
+            // to equal window=5 (it is expected to be higher — more visible
+            // candidates means per-peer history breaks more near-equidistant
+            // ties), only that the increase is bounded and stays convergent.
+            let m5 = results.iter().find(|r| r.0 == 5).unwrap().1;
+            let m25 = results.iter().find(|r| r.0 == 25).unwrap().1;
+            assert!(
+                m25 < 0.20 && m25 - m5 < 0.15,
+                "issue #4230: at bias_mag={bias_mag} widening the candidate \
+                 window from 5 to 25 raised the mean chosen-hop rank-percentile \
+                 from {m5:.3} to {m25:.3} — the widening pushed routing \
+                 materially toward the median and may need a soft distance bias \
+                 in the predictor (see issue #4230)"
+            );
+        }
     }
 
     #[test]
@@ -2911,6 +3381,106 @@ mod tests {
                 pred.expected_total_time.is_finite(),
                 "expected_total_time must be finite, got {}",
                 pred.expected_total_time
+            );
+        }
+    }
+
+    /// Regression test for the latent NaN bug in the GLOBAL `transfer_rates`
+    /// batch path of `Router::new`. A SUBSCRIBE success reports payload_size=0
+    /// and payload_transfer_time=ZERO, so the rate is 0/0 = NaN. Without the
+    /// guard, that NaN flows into the `transfer_rate_estimator` isotonic
+    /// regression and poisons it: `interpolate()` at the affected distance then
+    /// returns NaN (verified against pav_regression 0.7.0). The per-op and
+    /// `add_event` paths already screen these events out; this test pins the
+    /// equivalent guard on the batch path.
+    ///
+    /// To exercise the bug the events must land at the SAME route distance (so
+    /// the NaN and finite points share an x in the regression) with enough
+    /// interleaved NaN/finite events to populate the estimator. We use DISTINCT
+    /// peers that nonetheless share a ring location: `Location::from_address`
+    /// masks the low byte of the IP and ignores the port for non-loopback
+    /// addresses, so peers on the same /24 map to one location while remaining
+    /// distinct `PeerKeyLocation`s. Interleaving ≥40 NaN-producing subscribe
+    /// successes with finite-rate GET successes at that shared location is what
+    /// actually exercises the NaN path; a single homogeneous event does not.
+    ///
+    /// Asserts: (1) `Router::new` completes, and (2) the resulting
+    /// `transfer_rate_estimator`'s raw regression curve is entirely finite —
+    /// which fails (NaN) if the NaN subscribe events are not screened out of
+    /// the batch path. (`Router::new` itself does not panic on this NaN; the
+    /// load-bearing assertion is regression finiteness, hence the name.)
+    #[test]
+    fn router_new_does_not_poison_transfer_rate_regression_with_nan() {
+        use crate::transport::TransportKeypair;
+        use std::net::SocketAddr;
+
+        let contract_location = Location::random();
+
+        // Build distinct peers that all share the SAME ring location: same /24
+        // (so the masked IP is identical), varying only the host byte/port.
+        // Distinct pub keys + distinct addresses make them distinct peers, while
+        // the masked location (and thus route_distance) is identical for all.
+        let make_peer = |i: usize| {
+            let pub_key = TransportKeypair::new().public().clone();
+            // 203.0.113.0/24 (TEST-NET-3, non-loopback): low byte is masked out,
+            // so every host in this /24 hashes to the same Location.
+            let addr: SocketAddr = format!("203.0.113.{}:{}", i % 250, 9000 + i)
+                .parse()
+                .unwrap();
+            PeerKeyLocation::new(pub_key, addr)
+        };
+
+        // Interleave NaN-producing SUBSCRIBE successes with finite-rate GET
+        // successes — all at the shared location so their points share x.
+        let events: Vec<RouteEvent> = (0..120)
+            .map(|i| {
+                let peer = make_peer(i);
+                if i % 2 == 0 {
+                    // SUBSCRIBE success: payload_size=0, transfer_time=ZERO -> 0/0 = NaN
+                    RouteEvent {
+                        peer,
+                        contract_location,
+                        outcome: RouteOutcome::Success {
+                            time_to_response_start: Duration::from_millis(40),
+                            payload_size: 0,
+                            payload_transfer_time: Duration::ZERO,
+                        },
+                        op_type: Some(OpType::Subscribe),
+                    }
+                } else {
+                    // GET success with a finite transfer rate.
+                    RouteEvent {
+                        peer,
+                        contract_location,
+                        outcome: RouteOutcome::Success {
+                            time_to_response_start: Duration::from_millis(40),
+                            payload_size: 4096,
+                            payload_transfer_time: Duration::from_millis(20),
+                        },
+                        op_type: Some(OpType::Get),
+                    }
+                }
+            })
+            .collect();
+
+        // (1) Must not panic: the guard keeps the NaN out of the global isotonic
+        // regression, mirroring the per-op / add_event paths.
+        let router = Router::new(&events);
+
+        // (2) The transfer-rate estimator must not be NaN-poisoned. Sample its
+        // raw regression curve (which exposes `interpolate()` outputs directly,
+        // unlike `estimate_retrieval_time` which masks NaN via `.max(0.0)`).
+        // Without the guard, the NaN subscribe points poison the regression and
+        // at least one sampled y comes back NaN.
+        let curve = router
+            .transfer_rate_estimator
+            .sampled_curve(0.0, f64::MAX, 64);
+        for (x, y) in &curve {
+            assert!(
+                y.is_finite(),
+                "transfer_rate regression produced a non-finite value {y} at \
+                 distance {x} — NaN subscribe events leaked into the batch \
+                 regression"
             );
         }
     }

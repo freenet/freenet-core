@@ -39,11 +39,104 @@ pub(crate) struct NodeP2P {
     should_try_connect: bool,
     client_events_task: BoxFuture<'static, anyhow::Error>,
     contract_executor_task: BoxFuture<'static, anyhow::Error>,
+    /// Abort handles for the detached client-events and contract-executor tasks.
+    /// `run_node` selects on the tasks' result futures (which only *observe*
+    /// completion); aborting via these handles on the way out is what actually
+    /// stops the tasks, dropping their `op_manager` clones and the contract
+    /// executor's redb `Database` handle.
+    ///
+    /// Aborting the client-events task tears down the WebSocket server through a
+    /// load-bearing channel-close chain (NOT a direct drop): abort drops the
+    /// `ClientEventsCombinator` → drops the per-slot `Sender` it holds →
+    /// `client_fn`'s `rx.recv()` returns `None` → `client_fn` breaks its loop →
+    /// drops the `WebSocketProxy` → the proxy's `AbortOnDrop` fires, aborting the
+    /// detached `axum::serve` server + token-cleanup tasks. The "client_fn breaks
+    /// on rx close" step is the load-bearing link.
+    ///
+    /// Without these aborts, those tasks keep running — and holding the redb file
+    /// lock and the bound ports — after a graceful shutdown. See issue #4401.
+    detached_task_aborts: Vec<tokio::task::AbortHandle>,
     initial_join_task: Option<JoinHandle<()>>,
     session_actor_task: JoinHandle<()>,
     result_router_task: JoinHandle<()>,
     /// Monitor for background tasks spawned during node construction (Ring, OpManager, etc.)
     background_task_monitor: BackgroundTaskMonitor,
+}
+
+/// Fires the node's shutdown teardown on *every* `run_node` exit path — both the
+/// normal post-event-loop return and any early `?`/return during setup (e.g. a
+/// failed initial join). Without a Drop-based guard the teardown only ran on the
+/// happy path, so an early return would leave the detached executor task running
+/// and the redb file lock held for the process lifetime (issue #4401).
+///
+/// On drop it:
+///   1. aborts the stored detached task handles (executor + client-events, plus
+///      the session-actor / result-router / initial-join / aggressive-connect
+///      tasks once they exist), and
+///   2. clears the ring's redb `Storage` clones via `clear_redb_storage()`.
+///
+/// ## Exhaustive redb `Arc<Database>` holder set (verified for #4401)
+///
+/// The redb file lock releases only once *all* of these drop. Aborting the
+/// executor task drops (1)+(2); `clear_redb_storage()` drops (3)+(4):
+///   1. `RuntimePool::shared_state_store` — the one shared `StateStore<Storage>`.
+///   2. Each `Executor<Runtime>` in the pool's `runtimes` Vec — every executor's
+///      contract/state/delegate/secret stores clone the same `Storage`.
+///      Both (1) and (2) live inside `NetworkContractHandler`, which is owned by
+///      the detached **contract-executor task** (`contract_executor_abort`).
+///   3. `ring.hosting_manager.storage`.
+///   4. `ring.broken_invariants.storage`.
+///
+/// The session-actor, result-router, client-events, and background-monitor tasks
+/// hold channels / in-memory maps only — verified to hold **no** `Storage` /
+/// `Arc<Database>` clone. If a future change moves a `Storage`/`Arc<Database>`
+/// clone into any other long-lived task, it MUST either be aborted here or its
+/// handle dropped on shutdown, or the lock will never release.
+struct ShutdownTeardown {
+    aborts: Vec<tokio::task::AbortHandle>,
+    ring: Arc<crate::ring::Ring>,
+    fired: bool,
+}
+
+impl ShutdownTeardown {
+    fn new(aborts: Vec<tokio::task::AbortHandle>, ring: Arc<crate::ring::Ring>) -> Self {
+        Self {
+            aborts,
+            ring,
+            fired: false,
+        }
+    }
+
+    /// Track an abort handle for a task spawned after the guard was created
+    /// (e.g. the initial-join and aggressive-connect tasks).
+    fn track(&mut self, handle: tokio::task::AbortHandle) {
+        self.aborts.push(handle);
+    }
+}
+
+impl Drop for ShutdownTeardown {
+    fn drop(&mut self) {
+        if self.fired {
+            return;
+        }
+        self.fired = true;
+        for abort in &self.aborts {
+            abort.abort();
+        }
+        // Drop the ring's clones of the redb `Storage` handle so the only
+        // remaining references live in the (now-aborted) executor task. These
+        // are the hosting-metadata and broken-invariants persistence handles
+        // wired in `NetworkContractHandler::build`.
+        //
+        // NOTE: lock release is ASYNCHRONOUS. `AbortHandle::abort()` only
+        // *signals* cancellation — the executor task's redb clones drop when the
+        // runtime next polls that task to completion, which can lag by any
+        // in-flight `block_in_place` WASM execution. So the OS file lock is not
+        // guaranteed free the instant `run_node` returns; a caller reopening the
+        // same data dir should tolerate a brief delay (the #4401 regression test
+        // polls up to 10s).
+        self.ring.clear_redb_storage();
+    }
 }
 
 impl NodeP2P {
@@ -123,6 +216,20 @@ impl NodeP2P {
         // Record the start time for uptime tracking in shutdown event
         let start_time = tokio::time::Instant::now();
 
+        // Install the shutdown teardown guard BEFORE any fallible setup so the
+        // detached executor/client-events tasks are aborted and the ring's redb
+        // `Storage` clones are dropped on EVERY exit path — including an early
+        // `?` return (e.g. a failed initial join). The session-actor and
+        // result-router abort handles are folded in too so those tasks don't
+        // leak on an early return; later-spawned tasks (initial-join,
+        // aggressive-connect) are added via `track`. See issue #4401.
+        let mut teardown = {
+            let mut aborts = std::mem::take(&mut self.detached_task_aborts);
+            aborts.push(self.session_actor_task.abort_handle());
+            aborts.push(self.result_router_task.abort_handle());
+            ShutdownTeardown::new(aborts, self.op_manager.ring.clone())
+        };
+
         // Initialize network status tracking for the connecting page diagnostics
         let gateway_addrs: std::collections::HashSet<std::net::SocketAddr> = self
             .conn_manager
@@ -149,6 +256,13 @@ impl NodeP2P {
         super::network_status::set_governance_provider(std::sync::Arc::new(move || {
             ring.dashboard_governance_snapshot()
         }));
+        // Same pattern for the contract ban list (#4302) — dashboard
+        // reads the canonical `Ring::contract_ban_list` so the count
+        // tile + entry list can't drift from a mirrored counter.
+        let ban_list_ring = self.op_manager.ring.clone();
+        super::network_status::set_ban_list_provider(std::sync::Arc::new(move || {
+            ban_list_ring.dashboard_ban_list_snapshot()
+        }));
 
         // Wire live ring stats for the dashboard: connection count +
         // hosted contracts + own public key, read on every homepage
@@ -162,11 +276,15 @@ impl NodeP2P {
                 let own_pub_key = bs58::encode(key_bytes).into_string(); // full 32-byte
                 (peer_id, own_pub_key)
             };
+            let rate_limiter = &ring_stats.update_rate_limiter;
             super::network_status::RingStatsSnapshot {
                 connection_count: ring_stats.connection_manager.connection_count() as u32,
                 hosted_contracts: ring_stats.hosting_contracts_count() as u32,
                 peer_id,
                 own_pub_key,
+                updates_accepted: rate_limiter.accepted_total(),
+                updates_rate_limited: rate_limiter.rejected_total(),
+                updates_capacity_dropped: rate_limiter.capacity_rejected_total(),
             }
         }));
 
@@ -204,18 +322,26 @@ impl NodeP2P {
             // connection phase concurrently with the event listener below.
         }
 
+        // The initial-join task (spawned above when connecting) outlives this
+        // setup phase too; fold its abort handle into the teardown guard so an
+        // early return below also stops it. The `JoinHandle` itself is detached
+        // (dropping it does not cancel the task) — the guard's abort handle is
+        // what tears it down.
+        if let Some(join_handle) = self.initial_join_task.take() {
+            teardown.track(join_handle.abort_handle());
+        }
+
         // Spawn aggressive connection task to run concurrently with event listener.
         // This is needed because connection handshakes are processed by the event
         // listener, so we can't block waiting for connections before it starts.
-        let aggressive_conn_task = if self.should_try_connect {
+        if self.should_try_connect {
             let op_manager = self.op_manager.clone();
             let min_connections = op_manager.ring.connection_manager.min_connections;
-            Some(GlobalExecutor::spawn(async move {
+            let aggressive_conn_task = GlobalExecutor::spawn(async move {
                 Self::aggressive_initial_connections_impl(&op_manager, min_connections).await;
-            }))
-        } else {
-            None
-        };
+            });
+            teardown.track(aggressive_conn_task.abort_handle());
+        }
 
         let f = self.conn_manager.run_event_listener(
             self.op_manager.clone(),
@@ -227,9 +353,9 @@ impl NodeP2P {
         // Monitor spawned infrastructure tasks (session actor, result router).
         // If any of these panics or exits unexpectedly, the node runs degraded with no
         // logs or detection. Combine into a single future that produces an error.
-        // Keep AbortHandles for cleanup since the JoinHandles are moved into the future.
-        let session_abort = self.session_actor_task.abort_handle();
-        let router_abort = self.result_router_task.abort_handle();
+        // Their abort handles already live in the teardown guard (folded in at
+        // the top of `run_node`), so the JoinHandles can be moved into the future
+        // here without losing the ability to cancel them on shutdown.
         let infra_monitor = {
             let mut session_handle = self.session_actor_task;
             let mut router_handle = self.result_router_task;
@@ -257,7 +383,6 @@ impl NodeP2P {
         // (Ring maintenance, garbage cleanup, etc.)
         let background_monitor = self.background_task_monitor.wait_for_any_exit();
 
-        let join_task = self.initial_join_task.take();
         let result = crate::deterministic_select! {
             r = f => {
                let Err(e) = r;
@@ -287,14 +412,26 @@ impl NodeP2P {
             },
         };
 
-        if let Some(handle) = join_task {
-            handle.abort();
-        }
-        if let Some(handle) = aggressive_conn_task {
-            handle.abort();
-        }
-        session_abort.abort();
-        router_abort.abort();
+        // Tear down the detached executor + client-events tasks and clear the
+        // ring's redb `Storage` clones (issue #4401).
+        //
+        // `deterministic_select!` above only *observed* one of these futures
+        // completing — the other detached tasks are still running on the
+        // process-wide `GlobalExecutor`. Until they stop they keep their
+        // `op_manager` clones, the `ClientEventsCombinator` (which, via the
+        // channel-close chain documented on `detached_task_aborts`, owns the
+        // WebSocket `axum::serve` server), and the contract executor's redb
+        // `Database` handle alive — so a graceful shutdown would leave the
+        // on-disk redb file locked and a stale WS server answering requests.
+        //
+        // The teardown now runs through `ShutdownTeardown::drop`, which also
+        // fires on any early `?`/return during setup above. Fire it explicitly
+        // here (idempotent) so the tasks are aborted and the redb `Storage`
+        // clones dropped BEFORE we emit the shutdown event below, preserving the
+        // original ordering on the happy path. Lock release is asynchronous (see
+        // the guard's docs): abort only signals, so the executor task's redb
+        // clones drop when the runtime next polls it to completion.
+        drop(teardown);
 
         // Emit peer shutdown event
         let (graceful, reason) = match &result {
@@ -373,10 +510,84 @@ impl NodeP2P {
         tracing::info!("Actor-based client management infrastructure installed with result router");
 
         let background_task_monitor = BackgroundTaskMonitor::new();
-        // Phase 1 of the outer-loop rate-controller RFC (#4074):
-        // start the cross-connection RTT shadow aggregator. Pure
-        // observation; never read by the production data path.
-        crate::transport::rolling_rtt_stats::spawn_aggregator(&background_task_monitor);
+        // Phase 1 / Phase 1.5 of the outer-loop rate-controller RFC
+        // (#4074): start the cross-connection RTT shadow aggregator
+        // and the out-of-band reference-path probe. Both are pure
+        // observation — never read by the production data path.
+        //
+        // The local peer id is tagged onto every emitted event so the
+        // collector can disaggregate samples by reporting node. We
+        // construct it as `PeerId::new(pub_key, addr).to_string()` to
+        // match the *format* used by other OTLP events (set elsewhere
+        // from `KnownPeerKeyLocation::Display`).
+        //
+        // Caveat: for non-gateway nodes the external `own_addr` is
+        // not known at build time, so we fall back to the listener
+        // address (typically `0.0.0.0:<port>`). Other OTLP events
+        // emitted later read the up-to-date `Ring::own_location()`,
+        // so cross-correlation with the rest of the event stream by
+        // peer_id alone works for gateways but is best-effort for
+        // leaf nodes until they learn their external address. Phase
+        // 1.5 accepts this; a refresh path is tracked in #4294.
+        //
+        // Gate on telemetry being enabled AND reference-ping being
+        // explicitly opted in: when telemetry is off
+        // (`telemetry-enabled = false`) or in test environments
+        // (detected by `--id` flag), `TelemetryReporter::new` returns
+        // `None` and `send_standalone_event_with_peer_id` silently
+        // drops events. The shadow aggregator is cheap to leave
+        // running (no I/O), but reference-ping issues a real UDP DNS
+        // query at 1Hz, so we must not fire that traffic by default.
+        //
+        // `reference_ping_enabled` defaults to `false`; production
+        // gateway configs set it to `true` via
+        // `telemetry.reference-ping-enabled = true` in the config
+        // file (or `FREENET_REFERENCE_PING_ENABLED=true`). This keeps
+        // CI integration tests (which build `NodeConfig` directly
+        // without `--id`, so `is_test_environment` stays false) from
+        // accidentally firing DNS traffic and perturbing
+        // timing-sensitive multi-node tests. It also avoids
+        // surprising opt-out operators with default Cloudflare hits.
+        let reference_ping_enabled = config.config.telemetry.enabled
+            && !config.config.telemetry.is_test_environment
+            && config.config.telemetry.reference_ping_enabled;
+        // Phase 1.6 OS-interface-tx probe (#4074): same opt-in gating as
+        // reference-ping (telemetry on + not a test env + flag set). It
+        // reads /proc/net/dev at 1Hz, so it must not fire on dev machines
+        // or in CI by default.
+        let iface_tx_enabled = config.config.telemetry.enabled
+            && !config.config.telemetry.is_test_environment
+            && config.config.telemetry.iface_tx_enabled;
+        let local_peer_id = config.local_peer_id_string();
+        crate::transport::rolling_rtt_stats::spawn_aggregator(
+            local_peer_id.clone(),
+            &background_task_monitor,
+        );
+        // Phase 1.6 demand + outbound-class aggregators (#4074). Both are
+        // always-on like the RTT aggregator: they only read atomics + the
+        // bandwidth handle and emit one OTLP event per second each (no
+        // I/O). Observation only.
+        crate::transport::shadow_demand::spawn_demand_aggregator(
+            local_peer_id.clone(),
+            &background_task_monitor,
+        );
+        crate::transport::shadow_demand::spawn_outbound_class_aggregator(
+            local_peer_id.clone(),
+            &background_task_monitor,
+        );
+        if reference_ping_enabled {
+            crate::transport::reference_ping::spawn_reference_ping(
+                local_peer_id.clone(),
+                crate::transport::reference_ping::DEFAULT_REFERENCE_TARGET,
+                &background_task_monitor,
+            );
+        }
+        if iface_tx_enabled {
+            crate::transport::shadow_iface_tx::spawn_iface_tx_monitor(
+                local_peer_id,
+                &background_task_monitor,
+            );
+        }
         let connection_manager = ConnectionManager::new(&config);
         let op_manager = Arc::new(OpManager::new(
             notification_tx,
@@ -397,7 +608,7 @@ impl NodeP2P {
             P2pConnManager::build(&config, op_manager.clone(), event_register).await?;
 
         let parent_span = tracing::Span::current();
-        let contract_executor_task = GlobalExecutor::spawn({
+        let contract_executor_handle = GlobalExecutor::spawn({
             let task = async move {
                 tracing::info!("Contract executor task starting");
                 let result = contract::contract_handling(
@@ -414,20 +625,24 @@ impl NodeP2P {
                 result
             };
             task.instrument(tracing::info_span!(parent: parent_span.clone(), "contract_handling"))
-        })
-        .map(|r| match r {
-            Ok(Err(e)) => anyhow::anyhow!("Error in contract handling task: {e}"),
-            Ok(Ok(_)) => anyhow::anyhow!("Contract handling task exited unexpectedly"),
-            Err(e) => anyhow::anyhow!(e),
-        })
-        .boxed();
+        });
+        // Retain the abort handle so shutdown can stop the executor task and
+        // drop its redb `Database` clone (issue #4401).
+        let contract_executor_abort = contract_executor_handle.abort_handle();
+        let contract_executor_task = contract_executor_handle
+            .map(|r| match r {
+                Ok(Err(e)) => anyhow::anyhow!("Error in contract handling task: {e}"),
+                Ok(Ok(_)) => anyhow::anyhow!("Contract handling task exited unexpectedly"),
+                Err(e) => anyhow::anyhow!(e),
+            })
+            .boxed();
         // Slot 0 = HTTP client API, Slot 1 = WebSocket proxy (from serve_client_api).
         let clients = ClientEventsCombinator::new(clients).with_slot_names(&["http", "websocket"]);
         // Create node controller channel with capacity for shutdown signal
         // We clone the sender to return it for external shutdown triggering
         let (node_controller_tx, node_controller_rx) = tokio::sync::mpsc::channel(1);
         let shutdown_tx = node_controller_tx.clone();
-        let client_events_task = GlobalExecutor::spawn({
+        let client_events_handle = GlobalExecutor::spawn({
             let op_manager_clone = op_manager.clone();
             let task = async move {
                 tracing::info!("Client events task starting");
@@ -442,12 +657,20 @@ impl NodeP2P {
                 result
             };
             task.instrument(tracing::info_span!(parent: parent_span, "client_event_handling"))
-        })
-        .map(|r| match r {
-            Ok(_) => anyhow::anyhow!("Client event handling task exited unexpectedly"),
-            Err(e) => anyhow::anyhow!(e),
-        })
-        .boxed();
+        });
+        // Retain the abort handle so shutdown can stop this task and drop the
+        // `ClientEventsCombinator` it owns. That drops the combinator's per-slot
+        // `Sender`, which closes `client_fn`'s `rx`; `client_fn` then breaks its
+        // loop and drops the `WebSocketProxy`, whose `AbortOnDrop` tears down the
+        // detached `axum::serve` server + token-cleanup tasks (issue #4401). See
+        // `detached_task_aborts` for the full channel-close chain.
+        let client_events_abort = client_events_handle.abort_handle();
+        let client_events_task = client_events_handle
+            .map(|r| match r {
+                Ok(_) => anyhow::anyhow!("Client event handling task exited unexpectedly"),
+                Err(e) => anyhow::anyhow!(e),
+            })
+            .boxed();
 
         Ok((
             NodeP2P {
@@ -462,6 +685,7 @@ impl NodeP2P {
                 location: config.location,
                 client_events_task,
                 contract_executor_task,
+                detached_task_aborts: vec![client_events_abort, contract_executor_abort],
                 initial_join_task: None,
                 session_actor_task,
                 result_router_task,

@@ -284,6 +284,18 @@ pub(crate) struct ConnectionManager {
     /// Our own socket address, set once we know it (e.g., from gateway observation).
     own_addr: Arc<Mutex<Option<SocketAddr>>>,
     is_gateway: bool,
+    /// Test-only override for the placement-migration version floor. `None` in
+    /// production (the real `SUBSCRIBE_HINT_MIN_VERSION` applies); `Some(floor)`
+    /// only in a sim test that opted into the migration cascade via
+    /// `SimNetwork::enable_placement_migration`. See `NodeConfig`.
+    subscribe_hint_floor_override: Option<(u8, u8, u16)>,
+    /// Rotating start offset for the per-new-peer migration scan. The scan
+    /// examines at most `MIGRATION_SCAN_CAP_PER_NEW_PEER` hosted contracts per
+    /// event; advancing this cursor each event makes successive events cover
+    /// different windows of the hosting set, so a node hosting more contracts
+    /// than the cap doesn't repeatedly examine the same prefix (which would
+    /// starve the rest of new-peer-triggered migration).
+    migration_scan_cursor: Arc<AtomicUsize>,
     /// Transient connections keyed by socket address.
     transient_connections: Arc<DashMap<SocketAddr, TransientEntry>>,
     transient_in_use: Arc<AtomicUsize>,
@@ -379,7 +391,7 @@ impl ConnectionManager {
 
         let min_ready_connections = config.relay_ready_connections.unwrap_or(0);
 
-        Self::init(
+        let mut cm = Self::init(
             max_upstream_bandwidth,
             max_downstream_bandwidth,
             min_connections,
@@ -394,7 +406,12 @@ impl ConnectionManager {
             config.transient_budget,
             config.transient_ttl,
             min_ready_connections,
-        )
+        );
+        // Set after init (rather than threading through init's many call sites):
+        // None for all the test-helper constructions, Some(floor) only when a
+        // sim opted into the migration cascade.
+        cm.subscribe_hint_floor_override = config.subscribe_hint_floor_override;
+        cm
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -425,6 +442,9 @@ impl ConnectionManager {
             own_location: own_location.into(),
             own_addr: Arc::new(Mutex::new(own_addr)),
             is_gateway,
+            // Default off; `new(config)` overrides from config after init.
+            subscribe_hint_floor_override: None,
+            migration_scan_cursor: Arc::new(AtomicUsize::new(0)),
             transient_connections: Arc::new(DashMap::new()),
             transient_in_use: Arc::new(AtomicUsize::new(0)),
             transient_budget,
@@ -773,6 +793,22 @@ impl ConnectionManager {
     /// If the node's external address is not yet known (e.g., peer behind NAT
     /// that hasn't received ObservedAddress yet), returns a PeerKeyLocation
     /// with PeerAddr::Unknown.
+    /// Test-only placement-migration version-floor override (`None` in
+    /// production). See `NodeConfig::subscribe_hint_floor_override`.
+    pub(crate) fn subscribe_hint_floor_override(&self) -> Option<(u8, u8, u16)> {
+        self.subscribe_hint_floor_override
+    }
+
+    /// Reserve the next `window`-sized slice of the hosting set for a migration
+    /// scan and advance the rotating cursor by `window`. Returns the start
+    /// offset (callers should take it modulo the current hosting-set size). Over
+    /// successive new-peer events this rotates coverage across all hosted
+    /// contracts rather than repeatedly scanning the same prefix.
+    pub(crate) fn next_migration_scan_offset(&self, window: usize) -> usize {
+        self.migration_scan_cursor
+            .fetch_add(window, Ordering::Relaxed)
+    }
+
     pub fn own_location(&self) -> PeerKeyLocation {
         match self.get_own_addr() {
             Some(addr) => PeerKeyLocation::new((*self.pub_key).clone(), addr),
@@ -2426,8 +2462,9 @@ mod tests {
         // test acquires below for its entire body.
         //
         // `network_status::set_external_address` is a no-op until `init()` has
-        // run. `init()` is idempotent (OnceLock — first caller wins), so this
-        // is safe even if another test already initialized the global.
+        // run. `init()` is idempotent-overwrite (installs the tracker on the
+        // first call, overwrites it in place on later calls), so this is safe
+        // even if another test already initialized the global.
         let _global = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
             .lock()
             .expect("TEST_GLOBAL_STATE_LOCK poisoned by an earlier test panic");

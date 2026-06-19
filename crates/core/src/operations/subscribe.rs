@@ -31,11 +31,13 @@ use serde::{Deserialize, Serialize};
 use tokio::time::{Duration, sleep};
 
 /// Maximum peers to try per hop (breadth search).
-/// Matches GET operation's DEFAULT_MAX_BREADTH; change both together.
+/// (GET's former DEFAULT_MAX_BREADTH no longer exists — its selection
+/// uses k=1 per advance; this constant is now SUBSCRIBE-only.)
 pub(super) const MAX_BREADTH: usize = 3;
 
 /// Maximum retry rounds (each round queries k_closest for new candidates).
-/// Matches GET operation's MAX_RETRIES; change both together.
+/// (No longer tied to GET's MAX_RETRIES, which is 3; this constant is
+/// SUBSCRIBE-only.)
 pub(super) const MAX_RETRIES: usize = 10;
 
 /// Timeout for waiting on contract storage notification.
@@ -148,11 +150,17 @@ pub(super) enum InitialRequest {
 /// 4. If no fallback is available either, check local contract availability
 ///    one more time (standalone node / sole holder case) and either complete
 ///    locally or return `NoHostingPeers`.
+///
+/// When `first_hop` is `Some(holder)`, the ring-selection block (branches 2–4)
+/// is bypassed entirely and `holder` is used as the target directly (a directed
+/// subscribe, e.g. driven by a received `SubscribeHint`). The peer-not-joined
+/// check still applies. There are no alternatives in this mode.
 pub(super) async fn prepare_initial_request(
     op_manager: &OpManager,
     id: Transaction,
     instance_id: ContractInstanceId,
     is_renewal: bool,
+    first_hop: Option<PeerKeyLocation>,
 ) -> Result<InitialRequest, OpError> {
     let own_addr = match op_manager.ring.connection_manager.peer_addr() {
         Ok(addr) => addr,
@@ -190,66 +198,83 @@ pub(super) async fn prepare_initial_request(
     let mut visited = super::VisitedPeers::new(&id);
     visited.mark_visited(own_addr);
 
-    let mut candidates =
-        op_manager
-            .ring
-            .k_closest_potentially_hosting(&instance_id, &visited, MAX_BREADTH);
-
-    // First try the best candidates from k_closest_potentially_hosting.
-    // If that returns empty, fall back to any available connection.
-    // This ensures we join the subscription tree even when the routing algorithm
-    // can't find ideal candidates (e.g., due to timing or location filtering).
-    let target = if !candidates.is_empty() {
-        candidates.remove(0)
+    // Directed subscribe: a caller (e.g. a received SubscribeHint) named the
+    // first hop explicitly. Bypass ring selection and target `holder` directly,
+    // with no alternatives.
+    let (target, candidates): (PeerKeyLocation, Vec<PeerKeyLocation>) = if let Some(holder) =
+        first_hop
+    {
+        tracing::debug!(
+            tx = %id,
+            contract = %instance_id,
+            target = ?holder.socket_addr(),
+            phase = "directed_first_hop",
+            "Using caller-supplied first hop for subscription (bypassing ring selection)"
+        );
+        (holder, Vec::new())
     } else {
-        // k_closest_potentially_hosting returned empty - try any connected peer as fallback.
-        // The subscription will be forwarded toward the contract location.
-        let connections = op_manager
-            .ring
-            .connection_manager
-            .get_connections_by_location();
-        // Sort keys for deterministic iteration order (HashMap iteration is non-deterministic)
-        let mut sorted_keys: Vec<_> = connections.keys().collect();
-        sorted_keys.sort();
-        let fallback_target = sorted_keys
-            .into_iter()
-            .filter_map(|loc| connections.get(loc))
-            .flatten()
-            .find(|conn| {
-                conn.location
-                    .socket_addr()
-                    .map(|addr| !visited.probably_visited(addr))
-                    .unwrap_or(false)
-            })
-            .map(|conn| conn.location.clone());
+        let mut candidates =
+            op_manager
+                .ring
+                .k_closest_potentially_hosting(&instance_id, &visited, MAX_BREADTH);
 
-        match fallback_target {
-            Some(target) => {
-                tracing::debug!(
-                    tx = %id,
-                    contract = %instance_id,
-                    target = ?target.socket_addr(),
-                    phase = "fallback_routing",
-                    "Using fallback connection for subscription (k_closest returned empty)"
-                );
-                target
-            }
-            None => {
-                // Truly no connections available - fall back to local completion only if isolated.
-                // This handles the case of a standalone node or when we're the only node with the contract.
-                if let Some(key) = super::has_contract(op_manager, instance_id).await? {
-                    tracing::info!(
+        // First try the best candidates from k_closest_potentially_hosting.
+        // If that returns empty, fall back to any available connection.
+        // This ensures we join the subscription tree even when the routing algorithm
+        // can't find ideal candidates (e.g., due to timing or location filtering).
+        let target = if !candidates.is_empty() {
+            candidates.remove(0)
+        } else {
+            // k_closest_potentially_hosting returned empty - try any connected peer as fallback.
+            // The subscription will be forwarded toward the contract location.
+            let connections = op_manager
+                .ring
+                .connection_manager
+                .get_connections_by_location();
+            // Sort keys for deterministic iteration order (HashMap iteration is non-deterministic)
+            let mut sorted_keys: Vec<_> = connections.keys().collect();
+            sorted_keys.sort();
+            let fallback_target = sorted_keys
+                .into_iter()
+                .filter_map(|loc| connections.get(loc))
+                .flatten()
+                .find(|conn| {
+                    conn.location
+                        .socket_addr()
+                        .map(|addr| !visited.probably_visited(addr))
+                        .unwrap_or(false)
+                })
+                .map(|conn| conn.location.clone());
+
+            match fallback_target {
+                Some(target) => {
+                    tracing::debug!(
                         tx = %id,
-                        contract = %key,
-                        phase = "local_complete",
-                        "Contract available locally and no network connections, completing subscription locally"
+                        contract = %instance_id,
+                        target = ?target.socket_addr(),
+                        phase = "fallback_routing",
+                        "Using fallback connection for subscription (k_closest returned empty)"
                     );
-                    return Ok(InitialRequest::LocallyComplete { key });
+                    target
                 }
-                tracing::warn!(tx = %id, contract = %instance_id, phase = "error", "No remote peers available for subscription");
-                return Ok(InitialRequest::NoHostingPeers);
+                None => {
+                    // Truly no connections available - fall back to local completion only if isolated.
+                    // This handles the case of a standalone node or when we're the only node with the contract.
+                    if let Some(key) = super::has_contract(op_manager, instance_id).await? {
+                        tracing::info!(
+                            tx = %id,
+                            contract = %key,
+                            phase = "local_complete",
+                            "Contract available locally and no network connections, completing subscription locally"
+                        );
+                        return Ok(InitialRequest::LocallyComplete { key });
+                    }
+                    tracing::warn!(tx = %id, contract = %instance_id, phase = "error", "No remote peers available for subscription");
+                    return Ok(InitialRequest::NoHostingPeers);
+                }
             }
-        }
+        };
+        (target, candidates)
     };
 
     let target_addr = target
@@ -360,16 +385,30 @@ async fn complete_local_subscription(
 pub(super) async fn fetch_contract_if_missing(
     op_manager: &OpManager,
     instance_id: ContractInstanceId,
+    directed_holder: Option<PeerKeyLocation>,
 ) -> Result<Option<ContractKey>, OpError> {
     if let Some(key) = super::has_contract(op_manager, instance_id).await? {
         return Ok(Some(key));
     }
 
-    // Spawn the sub-op GET. We drop the receiver — we don't care about
-    // the structured `SubOpGetOutcome`, only the side effect of caching
-    // the contract locally. `wait_for_contract_with_timeout` (storage
-    // poll + wait_for_contract channel + timeout) detects arrival.
-    let (_tx, _rx) = super::get::op_ctx_task::start_sub_op_get(op_manager, instance_id, true);
+    // Spawn the sub-op GET. We drop the receiver/transaction — we don't care
+    // about the structured `SubOpGetOutcome`, only the side effect of caching
+    // the contract locally. `wait_for_contract_with_timeout` (storage poll +
+    // wait_for_contract channel + timeout) detects arrival.
+    match directed_holder {
+        // Placement nudge: fetch the body THROUGH the holder, not greedily.
+        // A greedy GET toward the key could dead-end at the close non-hosting
+        // cluster (the very failure the migration resolves), leaving this peer
+        // subscribed-but-bodyless.
+        Some(holder) => {
+            let _tx =
+                super::get::op_ctx_task::start_targeted_sub_op_get(op_manager, instance_id, holder);
+        }
+        None => {
+            let (_tx, _rx) =
+                super::get::op_ctx_task::start_sub_op_get(op_manager, instance_id, true);
+        }
+    }
 
     wait_for_contract_with_timeout(op_manager, instance_id, CONTRACT_WAIT_TIMEOUT_MS).await
 }
@@ -432,6 +471,13 @@ pub(super) async fn finalize_originator_subscribe(
     key: ContractKey,
     upstream_addr: std::net::SocketAddr,
     is_renewal: bool,
+    // `Some(_)` marks a directed placement nudge (`SubscribeHint`) subscribe;
+    // `None` marks an ordinary subscribe. When `Some`, the body fetch is routed
+    // through the peer that accepted the subscription (`upstream_addr`) so it
+    // cannot dead-end the way a greedy GET would; when `None` the fetch is
+    // greedy. (The value is only used as the directed/ordinary marker — the
+    // actual fetch target is the responder, resolved below.)
+    directed_holder: Option<PeerKeyLocation>,
 ) {
     if let Some(pkl) = op_manager
         .ring
@@ -439,9 +485,15 @@ pub(super) async fn finalize_originator_subscribe(
         .get_peer_by_addr(upstream_addr)
     {
         let peer_key = crate::ring::interest::PeerKey::from(pkl.pub_key);
-        op_manager
+        let is_new = op_manager
             .interest_manager
             .register_peer_interest(&key, peer_key, None, true);
+        if is_new {
+            // #4359 (MUST-FIX 1): this upstream peer is now a viable broadcast
+            // target. If a fresh-contract PUT gave up with no targets and is
+            // stashed, flush it so the deferred state reaches the network.
+            op_manager.flush_pending_broadcast_on_interest(&key).await;
+        }
     }
 
     op_manager.ring.subscribe(key);
@@ -455,33 +507,51 @@ pub(super) async fn finalize_originator_subscribe(
     // later via UPDATE propagation or the sub-op GET completing past
     // the 2 s wait window, at which point the GET driver's own
     // `announce_contract_hosted` call fires.
-    let have_body = match fetch_contract_if_missing(op_manager, *key.id()).await {
-        Ok(Some(_)) => true,
-        Ok(None) => {
-            tracing::debug!(
-                contract = %key,
-                timeout_ms = CONTRACT_WAIT_TIMEOUT_MS,
-                "subscribe: contract body did not arrive within timeout; \
-                 deferring announce_contract_hosted — the sub-op GET will \
-                 announce when it caches, or UPDATE delivery will fill the gap"
-            );
-            false
-        }
-        Err(err) => {
-            // Infrastructure failure (notification channel closed,
-            // contract handler down). `warn` rather than `debug`
-            // because this signals broken local plumbing, not a
-            // routine cache miss.
-            tracing::warn!(
-                contract = %key,
-                error = %err,
-                "subscribe: fetch_contract_if_missing returned infra error; \
-                 deferring announce_contract_hosted — operator should \
-                 investigate (contract handler / notification channel)"
-            );
-            false
-        }
-    };
+    //
+    // For a directed (migration) subscribe, route the body fetch through the
+    // peer that ACTUALLY accepted the subscription (`upstream_addr`) — which
+    // holds the contract — rather than the original hint holder. In the common
+    // case the responder IS the hint holder; but if the hinted holder went away
+    // and the subscribe fell back to a greedy peer, the responder is that peer,
+    // so the targeted fetch still goes to a peer that has the body instead of
+    // the stale holder (which would dead-end the fetch). A greedy GET toward the
+    // key could dead-end at the same close non-hosting cluster the migration is
+    // resolving, hence the targeted fetch. `None` (ordinary subscribe) keeps the
+    // greedy fetch.
+    let directed_fetch_target = directed_holder.as_ref().and_then(|_| {
+        op_manager
+            .ring
+            .connection_manager
+            .get_peer_by_addr(upstream_addr)
+    });
+    let have_body =
+        match fetch_contract_if_missing(op_manager, *key.id(), directed_fetch_target).await {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                tracing::debug!(
+                    contract = %key,
+                    timeout_ms = CONTRACT_WAIT_TIMEOUT_MS,
+                    "subscribe: contract body did not arrive within timeout; \
+                     deferring announce_contract_hosted — the sub-op GET will \
+                     announce when it caches, or UPDATE delivery will fill the gap"
+                );
+                false
+            }
+            Err(err) => {
+                // Infrastructure failure (notification channel closed,
+                // contract handler down). `warn` rather than `debug`
+                // because this signals broken local plumbing, not a
+                // routine cache miss.
+                tracing::warn!(
+                    contract = %key,
+                    error = %err,
+                    "subscribe: fetch_contract_if_missing returned infra error; \
+                     deferring announce_contract_hosted — operator should \
+                     investigate (contract handler / notification channel)"
+                );
+                false
+            }
+        };
 
     if have_body {
         super::announce_contract_hosted(op_manager, &key).await;
@@ -537,6 +607,12 @@ pub(crate) async fn register_downstream_subscriber(
             // both new and renewed peers, so use register_peer_interest's
             // is_new return to avoid over-counting on renewal cycles.
             if is_new_peer {
+                // #4359: a fresh-contract PUT whose initial broadcast found no
+                // targets is stashed by the fan-out handler. This new
+                // downstream subscriber is the first viable target — flush the
+                // deferred state to it so the never-before-seen id reaches the
+                // network instead of staying locally-hosted only.
+                op_manager.flush_pending_broadcast_on_interest(key).await;
                 let became_interested = op_manager.interest_manager.add_downstream_subscriber(key);
                 if became_interested {
                     super::broadcast_change_interests(op_manager, vec![*key], vec![]).await;
@@ -656,7 +732,7 @@ pub(crate) mod op_ctx_task;
 
 pub(crate) use op_ctx_task::{
     RenewalOutcome, run_client_subscribe, run_executor_subscribe, run_renewal_subscribe,
-    start_client_subscribe,
+    start_client_subscribe, start_directed_subscribe,
 };
 
 mod messages {

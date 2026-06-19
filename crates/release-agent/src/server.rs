@@ -1,5 +1,7 @@
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -19,8 +21,8 @@ use crate::announcer::Announcer;
 use crate::auth::{HEADER_SIGNATURE, check_clock_skew, verify_signature};
 use crate::config::Config;
 use crate::github::LatestSource;
-use crate::updater::Updater;
-use crate::version::VersionCache;
+use crate::updater::{InFlightGuard, Updater};
+use crate::version::{ServiceHealthCache, VersionCache};
 
 /// Cap on the request body for `POST /update`. The legitimate body is ~60
 /// bytes (a small JSON object). 4 KiB is generous and rejects megabyte
@@ -45,14 +47,46 @@ pub struct AppState {
     pub updater: Updater,
     pub announcer: Announcer,
     pub version_cache: VersionCache,
+    /// Short-TTL cache of `systemctl is-active <managed_service>`, so the
+    /// unauthenticated `/version` endpoint doesn't fork a subprocess on every
+    /// request (the same self-DoS concern that motivates `version_cache`).
+    pub service_health_cache: ServiceHealthCache,
+    /// Path to the `systemctl` binary. Production is `systemctl` (resolved via
+    /// PATH); tests point this at a stub script so the `/version` service-health
+    /// reporting can be exercised over the HTTP layer without real systemd.
+    pub systemctl_path: PathBuf,
     pub last_update_attempt: Arc<Mutex<Option<Instant>>>,
     pub last_announce_attempt: Arc<Mutex<Option<Instant>>>,
+    /// In-flight guard for `POST /update`. `true` while an update's
+    /// stop/restart of the gateway service is in progress. A second update
+    /// POST that arrives during that window is rejected with `409 Conflict`
+    /// rather than spawning a racing `systemctl stop/restart` that could
+    /// SIGKILL the freshly started process (the nova 0.2.65 outage; issue
+    /// #4271). This is ADDITIONAL to `last_update_attempt`, which only
+    /// rate-limits *timing*, not concurrent *overlap*.
+    pub update_in_flight: Arc<AtomicBool>,
 }
 
 #[derive(Serialize)]
 pub struct VersionResponse {
+    /// On-disk version of the freenet binary (`freenet --version`). This is
+    /// NOT proof the gateway service is running it — see `service_active`.
     pub version: String,
     pub binary_path: String,
+    /// Whether the managed gateway systemd unit is currently `active`
+    /// (`systemctl is-active <managed_service>`). Added after the v0.2.71
+    /// release, where vega's binary was swapped successfully but the service
+    /// failed to restart, leaving `/version` reporting the new version while
+    /// the gateway was DOWN. The release workflow MUST require this be `true`
+    /// before declaring an update successful.
+    ///
+    /// NOTE: backward compatibility — older release-agent builds omit this
+    /// field entirely, so consumers must treat its ABSENCE as "agent predates
+    /// the check" (fall back to the binary-only check) rather than a failure.
+    pub service_active: bool,
+    /// The systemd unit name whose state `service_active` reflects. Surfaced so
+    /// the workflow log records which unit was checked.
+    pub managed_service: String,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -107,11 +141,24 @@ pub fn build_router(state: AppState) -> Router {
 
 async fn version_handler(State(state): State<AppState>) -> Response {
     match state.version_cache.current(&state.config.binary_path).await {
-        Ok(v) => Json(VersionResponse {
-            version: v.to_string(),
-            binary_path: state.config.binary_path.display().to_string(),
-        })
-        .into_response(),
+        Ok(v) => {
+            // Report the SERVICE's health, not just the on-disk binary: a
+            // gateway whose binary was swapped but whose service failed to
+            // restart must NOT look like a successful update (vega v0.2.71).
+            // Cached with a short TTL so this unauthenticated endpoint doesn't
+            // fork systemctl on every hit.
+            let service_active = state
+                .service_health_cache
+                .is_active_with(&state.systemctl_path, &state.config.managed_service)
+                .await;
+            Json(VersionResponse {
+                version: v.to_string(),
+                binary_path: state.config.binary_path.display().to_string(),
+                service_active,
+                managed_service: state.config.managed_service.clone(),
+            })
+            .into_response()
+        }
         Err(e) => {
             tracing::warn!(error = %e, "failed to read freenet --version");
             (
@@ -246,8 +293,35 @@ async fn update_handler(
         }
     }
 
-    if let Err(e) = state.updater.run(&target).await {
+    // 10. In-flight guard. The rate-limit window above only bounds how OFTEN
+    //     updates may start; it does not stop a second update from racing a
+    //     restart already in progress. During the nova 0.2.65 rollout two
+    //     updates landed ~1s apart: the second's `systemctl stop` SIGKILLed
+    //     the process the first had just started, leaving the gateway DOWN.
+    //     Claim the in-flight slot here (held across the whole restart window
+    //     by `Updater::run`, bounded by a max-hold timeout) and reject any
+    //     overlapping update with 409 instead of spawning a racing restart.
+    //     See issue #4271.
+    let in_flight = match InFlightGuard::try_acquire(&state.update_in_flight) {
+        Some(g) => g,
+        None => {
+            tracing::warn!(
+                target = %target,
+                "rejecting overlapping update: an update is already in progress"
+            );
+            return (
+                StatusCode::CONFLICT,
+                "update already in progress; retry after it completes",
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(e) = state.updater.run(&target, in_flight).await {
         tracing::error!(error = %e, "updater spawn failed");
+        // `in_flight` was moved into `run` and dropped there on the failure
+        // path, so the slot is already free for a retry.
+        //
         // Deliberately do NOT update last_update_attempt — the caller
         // should be able to retry once the underlying problem is fixed,
         // without waiting out the full rate-limit window.

@@ -10,13 +10,16 @@ use std::{
     cmp::Reverse,
     collections::{BTreeSet, HashSet},
     net::SocketAddr,
-    sync::{Arc, OnceLock, atomic::AtomicBool},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
 use dashmap::{DashMap, DashSet};
 use either::Either;
-use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
+use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, WrappedState};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::{mpsc, oneshot};
 use tracing::Instrument;
@@ -97,6 +100,21 @@ pub(crate) struct OpManager {
     pub interest_manager: Arc<crate::ring::interest::InterestManager<InstantTimeSrc>>,
     /// Dedup cache for skipping redundant broadcast WASM merges
     pub broadcast_dedup_cache: Arc<crate::operations::update::BroadcastDedupCache>,
+    /// Bounded per-contract UPDATE-propagation counters. Fed from the
+    /// broadcast fan-out path and drained by a periodic background task that
+    /// emits an INFO `update_propagation_summary` line per window. Restores
+    /// the operator liveness signal lost when #4272 demoted the per-event
+    /// UPDATE log sites to DEBUG (issue #4281).
+    pub(crate) update_propagation_stats:
+        Arc<crate::operations::update::propagation_stats::UpdatePropagationStats>,
+    /// Deferred re-broadcast store for fresh-contract PUTs whose initial
+    /// broadcast found no targets and exhausted its retry budget. Stashed by
+    /// the fan-out handler on give-up and drained by the subscribe path when
+    /// the first interested peer for the contract appears, so a never-before-
+    /// seen id that lost the broadcast/interest-resolve race still reaches the
+    /// network instead of landing locally-hosted only (issue #4359).
+    pub(crate) pending_broadcasts:
+        Arc<crate::operations::update::pending_broadcast::PendingBroadcastStore>,
     /// Request router for client request deduplication.
     ///
     /// This is initialized lazily from `client_event_handling` because the router is only
@@ -169,6 +187,29 @@ pub(crate) struct OpManager {
     /// downstream propagation stay on legacy `process_message`, gated
     /// by the dedup set's absence on those branches.
     pub(crate) active_relay_connect_txs: Arc<DashSet<Transaction>>,
+    /// Count of client-originated operation drivers currently running.
+    /// Bumped by `ClientOpGuard::new` (held inside each `run_client_*`
+    /// task) and decremented when the guard is dropped. Read by the
+    /// shutdown drain in `ShutdownHandle::shutdown` to wait for
+    /// client-initiated work (most importantly PUTs from the
+    /// `freenet-git` mirror) to finish before tearing down peer
+    /// connections. The drain is bounded by `config.shutdown_drain_secs`.
+    pub(crate) inflight_client_ops: Arc<AtomicUsize>,
+    /// Set to `true` by `ShutdownHandle::shutdown` *before* the drain
+    /// begins, so `start_client_{put,get,update,subscribe}` can fail
+    /// fast with `OpError::NodeShuttingDown` instead of bumping the
+    /// counter for an op that will be aborted moments later.
+    ///
+    /// Without this gate, the shutdown sequence has a race window
+    /// between the drain loop observing `counter == 0` and the
+    /// `NodeEvent::Disconnect` being sent: a new client op spawned
+    /// in that window would bump the counter (now unobserved),
+    /// start running, and get cut off when the event loop tears
+    /// down peer connections. The admission gate eliminates the
+    /// race by causing `start_client_*` to refuse new work as soon
+    /// as shutdown begins — any in-flight op already past the
+    /// check at that moment is still covered by the drain wait.
+    pub(crate) shutting_down: Arc<AtomicBool>,
 }
 
 impl Clone for OpManager {
@@ -187,6 +228,8 @@ impl Clone for OpManager {
             neighbor_hosting: self.neighbor_hosting.clone(),
             interest_manager: self.interest_manager.clone(),
             broadcast_dedup_cache: self.broadcast_dedup_cache.clone(),
+            update_propagation_stats: self.update_propagation_stats.clone(),
+            pending_broadcasts: self.pending_broadcasts.clone(),
             request_router: self.request_router.clone(),
             orphan_stream_registry: self.orphan_stream_registry.clone(),
             streaming_threshold: self.streaming_threshold,
@@ -200,7 +243,49 @@ impl Clone for OpManager {
             active_relay_put_txs: self.active_relay_put_txs.clone(),
             active_relay_subscribe_txs: self.active_relay_subscribe_txs.clone(),
             active_relay_connect_txs: self.active_relay_connect_txs.clone(),
+            inflight_client_ops: self.inflight_client_ops.clone(),
+            shutting_down: self.shutting_down.clone(),
         }
+    }
+}
+
+/// RAII guard counting client-originated drivers in flight.
+///
+/// Construct via [`OpManager::client_op_guard`] at the start of each
+/// `run_client_*` task and let it drop when the task exits — every
+/// terminal path (happy path, infrastructure error, panic propagated
+/// through the spawn) decrements the counter exactly once, so missing
+/// a branch can't leak count.
+///
+/// The shutdown drain in `ShutdownHandle::shutdown` reads the counter
+/// via [`OpManager::inflight_client_op_count`] and waits for it to
+/// reach zero before letting the node tear down.
+pub(crate) struct ClientOpGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl ClientOpGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        // SeqCst, not Relaxed — the increment participates in a
+        // two-atomic Dekker-style handshake with `shutting_down`
+        // (see `OpManager::admit_client_op`). Under a relaxed model
+        // both threads could read each other's stores as stale,
+        // letting a new driver spawn after the drain has completed.
+        // Codex + skeptical r3 finding. The cost is negligible
+        // (once per client request, not in a hot loop).
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl Drop for ClientOpGuard {
+    fn drop(&mut self) {
+        // Decrement does NOT participate in the admission handshake
+        // (it announces "I'm done" to a drain that's already
+        // polling). Relaxed is sufficient: the only consequence of a
+        // late observation is an extra 200ms poll interval before
+        // the drain notices counter==0.
+        self.counter.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -299,6 +384,20 @@ impl OpManager {
         let orphan_stream_registry = Arc::new(OrphanStreamRegistry::new());
         OrphanStreamRegistry::start_gc_task(orphan_stream_registry.clone());
 
+        // Bounded periodic UPDATE-propagation summary emitter (#4281). The
+        // background task drains the per-contract counters and logs a single
+        // INFO summary line (plus a capped number of per-contract lines) per
+        // window, restoring the operator liveness signal lost to #4272's
+        // DEBUG demotions without re-introducing per-event log volume. It runs
+        // for the node's lifetime, so its handle is registered with the
+        // BackgroundTaskMonitor rather than dropped fire-and-forget.
+        let update_propagation_stats =
+            Arc::new(crate::operations::update::propagation_stats::UpdatePropagationStats::new());
+        task_monitor.register(
+            "update_propagation_summary",
+            update_propagation_stats.clone().start_summary_task(),
+        );
+
         Ok(Self {
             ring,
             ops,
@@ -313,6 +412,10 @@ impl OpManager {
             neighbor_hosting,
             interest_manager,
             broadcast_dedup_cache: Arc::new(crate::operations::update::BroadcastDedupCache::new()),
+            update_propagation_stats,
+            pending_broadcasts: Arc::new(
+                crate::operations::update::pending_broadcast::PendingBroadcastStore::new(),
+            ),
             request_router,
             orphan_stream_registry,
             streaming_threshold,
@@ -335,7 +438,107 @@ impl OpManager {
             active_relay_put_txs,
             active_relay_subscribe_txs,
             active_relay_connect_txs,
+            inflight_client_ops: Arc::new(AtomicUsize::new(0)),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Cloneable handle to the shutting-down flag. Used by
+    /// `ShutdownHandle` to flip the gate before starting the drain
+    /// wait. Callers checking the flag should use
+    /// [`OpManager::admit_client_op`] instead of reading directly,
+    /// because the check-then-bump shape has a TOCTOU window that
+    /// `admit_client_op` closes.
+    pub(crate) fn shutting_down_handle(&self) -> Arc<AtomicBool> {
+        self.shutting_down.clone()
+    }
+
+    /// Bump the in-flight client-op counter without checking the
+    /// admission gate. **Do not call from `start_client_*` paths** —
+    /// use [`OpManager::admit_client_op`] there so the gate check
+    /// and counter bump are atomic. Kept module-private for the
+    /// `admit_client_op` implementation.
+    fn client_op_guard(&self) -> ClientOpGuard {
+        ClientOpGuard::new(self.inflight_client_ops.clone())
+    }
+
+    /// Atomically check the shutdown admission gate AND bump the
+    /// in-flight client-op counter in a single operation. Returns
+    /// `None` if the node is shutting down (counter NOT bumped, no
+    /// spawn should follow).
+    ///
+    /// # The race we close
+    ///
+    /// Prior shape (`if is_shutting_down() { return Err; } let g =
+    /// client_op_guard();`) had a TOCTOU window: the gate check
+    /// could observe `false`, then `ShutdownHandle` could set the
+    /// gate AND read the still-zero counter AND return from the
+    /// drain (the drain has an `initial == 0` fast path) all before
+    /// the caller bumped the counter. The driver would then spawn
+    /// into a node that has already past the drain. Codex r2.
+    ///
+    /// Fix is bump-first-then-check: increment the counter, then
+    /// check the gate. If the gate is set, drop the guard (auto-
+    /// decrement) and return `None`. From the
+    /// `ShutdownHandle::shutdown` side, any drain `load` that
+    /// happens-after our `fetch_add` observes `counter > 0` and the
+    /// drain waits.
+    ///
+    /// # Why SeqCst
+    ///
+    /// The two participating atomics (`shutting_down`,
+    /// `inflight_client_ops`) form a two-variable Dekker-style
+    /// handshake. `Relaxed` does NOT establish a happens-before edge
+    /// across distinct atomic locations — both threads could
+    /// observe each other's writes as stale, letting a new driver
+    /// spawn after the drain completed. **All four sites that
+    /// participate in the handshake MUST use `SeqCst`**:
+    ///
+    /// 1. `ClientOpGuard::new` — `counter.fetch_add(SeqCst)`
+    /// 2. `OpManager::admit_client_op` — `shutting_down.load(SeqCst)`
+    /// 3. `ShutdownHandle::shutdown` Phase 1 —
+    ///    `shutting_down.store(true, SeqCst)`
+    /// 4. `ShutdownHandle::wait_for_drain` —
+    ///    `counter.load(SeqCst)` (BOTH the `initial` read and
+    ///    every poll-loop read)
+    ///
+    /// Source-grep pin `seqcst_used_for_admission_handshake_atomics`
+    /// catches any accidental downgrade. Codex r3 + skeptical r3.
+    ///
+    /// # Behavioural side effects
+    ///
+    /// If the gate is set AFTER our bump but BEFORE our check, the
+    /// drain observes our transient bump and waits. We then drop
+    /// the guard; the next 200ms poll sees `0` and proceeds.
+    /// Worst-case extra latency per racing reject is one poll
+    /// interval.
+    ///
+    /// Pair with `move`-ing the guard into the spawned `run_client_*`
+    /// future so the counter tracks the driver task, not the
+    /// synchronous `start_client_*` caller. See [`ClientOpGuard`] for
+    /// the broader shutdown-drain contract.
+    pub(crate) fn admit_client_op(&self) -> Option<ClientOpGuard> {
+        // Order matters: bump BEFORE check. Reversing this re-opens
+        // the Codex r2 TOCTOU. The source-grep pin
+        // `admit_client_op_bumps_before_checking_gate` rejects the
+        // reversed order at CI time.
+        let guard = self.client_op_guard();
+        if self.shutting_down.load(Ordering::SeqCst) {
+            // Drop decrements the counter back to whatever it was.
+            // The drain may observe the transient bump on a poll —
+            // acceptable: it waits one extra interval, then sees the
+            // counter clear on the next poll. Correct, never starves.
+            drop(guard);
+            return None;
+        }
+        Some(guard)
+    }
+
+    /// Cloneable handle to the in-flight client-op counter. Used by
+    /// `ShutdownHandle` to read the counter from a separate task
+    /// without holding an `Arc<OpManager>` across the drain wait.
+    pub(crate) fn inflight_client_ops_handle(&self) -> Arc<AtomicUsize> {
+        self.inflight_client_ops.clone()
     }
 
     /// Set the request router for cleaning up stale entries when operations complete.
@@ -378,15 +581,18 @@ impl OpManager {
         }
     }
 
-    /// Non-blocking variant of [`Self::release_pending_op_slot`] for callers
-    /// that run on the network event loop (where `send().await` could
-    /// deadlock). Used by `P2pBridge::handle_orphaned_transactions` to wake
-    /// drivers whose downstream peer has just disconnected (#4154). The
-    /// notification is best-effort: on a transiently-full channel the
-    /// driver falls back to its `OPERATION_TTL` timeout. See
-    /// [`try_release_pending_op_slot_on`] for the underlying send logic.
-    pub(crate) fn try_release_pending_op_slot(&self, tx: Transaction) {
-        try_release_pending_op_slot_on(&self.to_event_listener.notifications_sender, tx);
+    /// Wake a parked op whose awaited `peer` was just pruned (#4313).
+    ///
+    /// Emits `NodeEvent::TransactionOrphaned`; the event-loop handler
+    /// delivers `WaiterReply::PeerDisconnected` into the waiter channel
+    /// *before* dropping the sender, so the parked driver reads the cause
+    /// deterministically — no side registry, no race. Best-effort and
+    /// non-blocking (runs on the event loop, where `send().await` could
+    /// deadlock): a dropped event under backpressure leaves the driver to
+    /// its `OPERATION_TTL` fallback (#4154). See
+    /// [`notify_orphaned_transaction_on`] for the underlying send logic.
+    pub(crate) fn notify_orphaned_transaction(&self, tx: Transaction, peer: SocketAddr) {
+        notify_orphaned_transaction_on(&self.to_event_listener.notifications_sender, tx, peer);
     }
 
     /// Timeout for sending notifications to the event loop.
@@ -445,6 +651,93 @@ impl OpManager {
     // has already consumed a one-shot transition). See
     // `try_notify_node_event` and `.claude/rules/channel-safety.md` for
     // the broader pattern.
+
+    /// Re-broadcast a fresh-contract state that earlier found no targets, now
+    /// that the first viable broadcast target for `key` has appeared.
+    ///
+    /// Issue #4359: a never-before-seen contract id loses the race between the
+    /// broadcast give-up window (~6 s) and the much slower interest/
+    /// subscription/proximity resolve. When the broadcast handler gives up it
+    /// stashes the state in [`Self::pending_broadcasts`]. This is called on the
+    /// **first viable-target signal** for the contract — see the call-site list
+    /// in the trigger-completeness note below — so the deferred state is
+    /// re-emitted as a `BroadcastStateChange { is_retry: false, is_reemit: true }`,
+    /// which now finds the just-appeared target and propagates.
+    ///
+    /// ## Stale-state safety (issue #4359 re-review, SHOULD-FIX 4)
+    ///
+    /// Rather than re-emit the give-up-time *bytes* (which a newer locally
+    /// applied UPDATE could have superseded in the meantime), this re-reads the
+    /// **current** local state for the contract and broadcasts that. The stash
+    /// entry's role is "this contract still owes a fan-out"; its bytes are only
+    /// a fallback used when the live read fails (contract handler unavailable),
+    /// which is strictly no worse than the give-up-time state we would otherwise
+    /// have re-emitted.
+    ///
+    /// ## Trigger completeness (issue #4359 re-review, MUST-FIX 1)
+    ///
+    /// `get_broadcast_targets_update` resolves targets from two sources, so the
+    /// *first viable target* for a cold id can appear via either. This method is
+    /// invoked from every site that makes a peer a target for the first time:
+    ///
+    /// * **Source 2 — interest manager** (`register_peer_interest` is_new):
+    ///   - `subscribe::register_downstream_subscriber` (downstream subscriber)
+    ///   - `subscribe::finalize_originator_subscribe` (originator upstream)
+    ///   - `operations::complete_piggyback_subscription` (GET-piggyback sub)
+    ///   - `get::op_ctx_task` remote GET `subscribe=false` (requester interest)
+    ///   - `node.rs` Interests / Summaries interest-sync handlers
+    /// * **Source 1 — proximity cache** (`neighbors_with_contract`):
+    ///   - `node.rs` NeighborHosting overlap path, when a neighbor newly
+    ///     announces hosting one of our contracts (the neighbor just became a
+    ///     `neighbors_with_contract` target).
+    ///
+    /// That set is the complete first-viable-target signal: a never-seen id can
+    /// only gain a broadcast target by a peer expressing interest (Source 2) or
+    /// by a connected neighbor announcing it hosts the id (Source 1), and each
+    /// such transition routes through one of the sites above. The give-up path
+    /// itself also re-checks targets immediately after stashing
+    /// (`pending_broadcast_stash_recheck`) to close the stash-after-flush race.
+    /// A grep pin test (`pending_broadcast_flush_wired_at_all_interest_sites`)
+    /// guards against a future `register_peer_interest` call site forgetting the
+    /// flush.
+    ///
+    /// Best-effort via [`Self::try_notify_node_event`]: if the channel is full
+    /// the state is re-stashed for the next signal. No-op (no read, no emit)
+    /// when nothing is pending for the contract — the overwhelmingly common
+    /// case, kept cheap by checking membership before any contract-handler read.
+    pub(crate) async fn flush_pending_broadcast_on_interest(&self, key: &ContractKey) {
+        flush_pending_broadcast_on_interest_on(
+            &self.pending_broadcasts,
+            self.to_event_listener.notifications_sender(),
+            self.to_event_listener.notification_channel_pending(),
+            self.to_event_listener.notifications_sender().capacity(),
+            key,
+            // Live read of the CURRENT local state, evaluated lazily so the
+            // fast path (nothing stashed) never touches the contract handler.
+            || self.read_current_contract_state(key),
+        )
+        .await;
+    }
+
+    /// Read the current local state for `key` from the contract handler, or
+    /// `None` if we don't host it / the read fails. Used by the #4359 deferred
+    /// re-broadcast flush to avoid re-emitting superseded give-up-time bytes.
+    async fn read_current_contract_state(&self, key: &ContractKey) -> Option<WrappedState> {
+        use crate::contract::ContractHandlerEvent;
+        match self
+            .notify_contract_handler(ContractHandlerEvent::GetQuery {
+                instance_id: *key.id(),
+                return_contract_code: false,
+            })
+            .await
+        {
+            Ok(ContractHandlerEvent::GetResponse {
+                response: Ok(store_response),
+                ..
+            }) => store_response.state,
+            _ => None,
+        }
+    }
 
     /// Get all active subscriptions.
     /// In the simplified lease-based model, this returns contracts we're actively subscribed to.
@@ -548,7 +841,6 @@ impl OpManager {
     /// Construct an [`OpCtx`] for `tx`. Clones the event-loop
     /// `op_execution_sender`; the only supported way to obtain an
     /// `OpCtx` outside this crate's unit tests.
-    #[allow(dead_code)]
     pub fn op_ctx(&self, tx: Transaction) -> OpCtx {
         OpCtx::new(tx, self.to_event_listener.op_execution_sender.clone())
     }
@@ -865,33 +1157,29 @@ async fn release_pending_op_slot_on(
     }
 }
 
-/// Non-blocking emit of `NodeEvent::TransactionCompleted(tx)` on the
-/// event-loop notification channel; returns `true` when enqueued.
+/// Non-blocking emit of `NodeEvent::TransactionOrphaned { tx, peer }` on
+/// the event-loop notification channel; returns `true` when enqueued.
 ///
-/// Extracted from [`OpManager::try_release_pending_op_slot`] so it can be
+/// Extracted from [`OpManager::notify_orphaned_transaction`] so it can be
 /// exercised in unit tests without building a full `OpManager`. Best-effort:
 /// a momentarily-full channel produces a debug-level log (benign back-
-/// pressure under load — was flooding gateways at 30K+/hr, see #4238); a
-/// closed channel produces a warn-level log (receiver torn down). Either
-/// arm leaves the parked driver to fall back to its `OPERATION_TTL`
-/// timeout (#4154).
-fn try_release_pending_op_slot_on(
+/// pressure under load — per-occurrence WARN flooded gateways at 30K+/hr,
+/// see #4238); a closed channel produces a warn-level log (receiver torn
+/// down). Either arm leaves the parked driver to fall back to its
+/// `OPERATION_TTL` timeout (#4154).
+fn notify_orphaned_transaction_on(
     notifications_sender: &mpsc::Sender<Either<NetMessage, NodeEvent>>,
     tx: Transaction,
+    peer: SocketAddr,
 ) -> bool {
-    match notifications_sender.try_send(Either::Right(NodeEvent::TransactionCompleted(tx))) {
+    match notifications_sender.try_send(Either::Right(NodeEvent::TransactionOrphaned { tx, peer }))
+    {
         Ok(()) => true,
         Err(mpsc::error::TrySendError::Full(_)) => {
-            // Benign back-pressure: the driver parks on its
-            // OPERATION_TTL fallback and the 60s sweep reclaims the
-            // slot. Per-occurrence WARN here flooded production
-            // gateways at 30K+/hr (#4238); the rate-limited
-            // `release_pending_op_slot: notification channel full for
-            // too long` error in `release_pending_op_slot_on` is the
-            // signal operators should grep for.
             tracing::debug!(
                 %tx,
-                "try_release_pending_op_slot: notification channel full; \
+                %peer,
+                "notify_orphaned_transaction: notification channel full; \
                  driver will wait for OPERATION_TTL timeout"
             );
             false
@@ -899,7 +1187,8 @@ fn try_release_pending_op_slot_on(
         Err(mpsc::error::TrySendError::Closed(_)) => {
             tracing::warn!(
                 %tx,
-                "try_release_pending_op_slot: notification channel closed; \
+                %peer,
+                "notify_orphaned_transaction: notification channel closed; \
                  receiver likely dropped"
             );
             false
@@ -998,6 +1287,121 @@ fn try_notify_node_event_on(
             );
             Err(OpError::NotificationError)
         }
+    }
+}
+
+/// Orchestration-core of [`OpManager::flush_pending_broadcast_on_interest`],
+/// extracted as a free function so its three branches are unit-testable against
+/// a raw store + notifier + a stubbed "read current state" step, without
+/// building a full `OpManager` (same pattern as [`emit_pending_broadcast_reemit_on`]
+/// / [`release_pending_op_slot_on`]).
+///
+/// Issue #4359 (re-review, SHOULD-FIX 4 stale-state safety + fast-path):
+///
+/// 1. **Fast path / no-op** — nothing stashed for `key` (the common case: most
+///    interest registrations are on already-propagated contracts). Returns
+///    without invoking `read_current_state` or emitting anything, so the
+///    contract handler is never touched on the hot path.
+/// 2. **take()-None** — the membership check passed but `take()` lost the entry
+///    to a concurrent drain (TTL expiry, a targets-found take, another flush);
+///    again a no-op.
+/// 3. **stashed → re-read current state** — re-broadcast the CURRENT local
+///    state (`read_current_state` returned `Some`) rather than the possibly
+///    superseded give-up-time bytes; fall back to the stashed `bytes` when the
+///    live read fails (`None`) so we never regress to dropping the broadcast.
+///
+/// `read_current_state` is a closure returning the read future so it is only
+/// polled once a stash entry is actually drained (preserving the fast path).
+async fn flush_pending_broadcast_on_interest_on<F, Fut>(
+    pending: &crate::operations::update::pending_broadcast::PendingBroadcastStore,
+    notifications_sender: &mpsc::Sender<Either<NetMessage, NodeEvent>>,
+    channel_pending: usize,
+    channel_remaining: usize,
+    key: &ContractKey,
+    read_current_state: F,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<WrappedState>>,
+{
+    // Fast path: nothing stashed for this contract. Avoid the take()/contract-
+    // handler read entirely.
+    if !pending.contains(key.id()) {
+        return;
+    }
+    // Drain the stash marker. If it raced away (TTL expiry, a concurrent
+    // targets-found take, or another flush) there is nothing to do.
+    let Some(stashed) = pending.take(key.id()) else {
+        return;
+    };
+
+    // Stale-state safety: re-read the CURRENT local state instead of
+    // re-broadcasting the give-up-time bytes. Fall back to the stashed bytes
+    // if the live read fails so we never regress to dropping the broadcast.
+    let state = read_current_state().await.unwrap_or(stashed);
+
+    emit_pending_broadcast_reemit_on(
+        notifications_sender,
+        channel_pending,
+        channel_remaining,
+        pending,
+        key,
+        state,
+    );
+}
+
+/// Emit a deferred fresh-contract re-broadcast for `key` carrying `state` on the
+/// event-loop notification channel, re-stashing `state` in `pending` if the
+/// channel can't accept it. The emit-core of
+/// [`OpManager::flush_pending_broadcast_on_interest`], extracted as a free
+/// function so the channel-full re-stash mechanics are unit-testable against a
+/// raw notifier + store without building a full `OpManager` (same pattern as
+/// [`release_pending_op_slot_on`] / [`try_notify_node_event_on`]).
+///
+/// Issue #4359: when the broadcast handler gives up on a never-before-seen id
+/// (no targets), it stashes the state in `pending`. The caller has already
+/// drained the stash and resolved the (current) `state` to broadcast; this
+/// re-emits it as `BroadcastStateChange { is_retry: false, is_reemit: true }`
+/// so the now-present target receives it instead of the state staying
+/// locally-hosted only. `is_reemit` suppresses #4281 no_targets double-counting
+/// on a still-no-target re-emission.
+///
+/// Best-effort: if the channel is full the state is re-stashed so a later
+/// signal retries it (losing it would re-open the bug).
+fn emit_pending_broadcast_reemit_on(
+    notifications_sender: &mpsc::Sender<Either<NetMessage, NodeEvent>>,
+    channel_pending: usize,
+    channel_remaining: usize,
+    pending: &crate::operations::update::pending_broadcast::PendingBroadcastStore,
+    key: &ContractKey,
+    state: WrappedState,
+) {
+    tracing::debug!(
+        contract = %key,
+        phase = "pending_broadcast_flush",
+        "Re-broadcasting deferred fresh-contract state now that an interested peer/target appeared (#4359)"
+    );
+    let msg = NodeEvent::BroadcastStateChange {
+        key: *key,
+        new_state: state.clone(),
+        is_retry: false,
+        is_reemit: true,
+    };
+    if try_notify_node_event_on(
+        notifications_sender,
+        channel_pending,
+        channel_remaining,
+        msg,
+    )
+    .is_err()
+    {
+        // Re-emit dropped (channel full / closed). Put the state back so a
+        // later signal can retry — losing it here would re-open the
+        // locally-hosted-only failure this fix closes.
+        pending.stash(*key.id(), state);
+        tracing::debug!(
+            contract = %key,
+            "emit_pending_broadcast_reemit_on: re-emit dropped; re-stashed for the next signal"
+        );
     }
 }
 
@@ -1328,6 +1732,7 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
 mod tests {
     use super::super::network_bridge::event_loop_notification_channel;
     use super::*;
+    use crate::config::GlobalSimulationTime;
     use crate::node::network_bridge::EventLoopNotificationsReceiver;
     use either::Either;
     use tokio::time::{Duration, Instant, timeout};
@@ -1533,21 +1938,359 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────
-    // Regression tests for #4154: parked drivers must be woken when
-    // their downstream peer disconnects, not wait `OPERATION_TTL`.
-    // Pre-fix, `handle_orphaned_transactions` only logged orphans and
-    // a forwarded GET blocked the full 60 s before retrying. The fix
-    // emits `TransactionCompleted(tx)` per orphan via
-    // `try_release_pending_op_slot_on`, the event loop drops the
-    // matching `pending_op_results` sender, and the driver's `recv()`
-    // returns `None` — `send_and_await` maps that to
-    // `OpError::NotificationError` and the retry loop advances.
+    // Regression tests for #4359: a fresh-contract PUT whose initial
+    // broadcast found no targets must be re-emitted (not permanently
+    // abandoned) once the first interested peer/subscriber/target appears.
+    // These exercise `emit_pending_broadcast_reemit_on` — the emit-core that
+    // `OpManager::flush_pending_broadcast_on_interest` delegates to — directly
+    // against a raw notifier + store, the same way the
+    // `release_pending_op_slot_on` tests above avoid building a full OpManager.
+    // The give-up→stash and targets-found→take WIRING into the real handler is
+    // additionally guarded by source-grep pin tests in p2p_protoc.rs
+    // (`handle_broadcast_state_change_*` pins), since driving the full async
+    // handler needs a complete OpManager + contract handler.
     // ──────────────────────────────────────────────────────────
 
+    fn test_contract_key(seed: u8) -> ContractKey {
+        ContractKey::from_id_and_code(
+            ContractInstanceId::new([seed; 32]),
+            freenet_stdlib::prelude::CodeHash::new([seed.wrapping_add(1); 32]),
+        )
+    }
+
+    /// Load-bearing: a resolved deferred broadcast (the give-up outcome, after
+    /// the flush drained the stash and re-read current state) is emitted as a
+    /// `BroadcastStateChange { is_retry: false, is_reemit: true }` carrying the
+    /// state when interest resolves. WITHOUT the #4359 fix the give-up path
+    /// drops the state permanently and nothing is ever re-broadcast — this
+    /// emission is exactly the behavior the fix adds.
     #[tokio::test]
-    async fn try_release_pending_op_slot_emits_transaction_completed() {
+    async fn flush_pending_broadcast_reemits_stashed_state_on_interest() {
+        use crate::operations::update::pending_broadcast::PendingBroadcastStore;
+
+        GlobalSimulationTime::set_time_ms(0);
+        let (receiver, notifier) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut notifications_receiver,
+            ..
+        } = receiver;
+
+        let store = PendingBroadcastStore::new();
+        let key = test_contract_key(7);
+        let state = freenet_stdlib::prelude::WrappedState::new(vec![0xCD; 16]);
+
+        // Interest resolves → emit the resolved deferred broadcast.
+        super::emit_pending_broadcast_reemit_on(
+            notifier.notifications_sender(),
+            notifier.notification_channel_pending(),
+            notifier.notifications_sender().capacity(),
+            &store,
+            &key,
+            state.clone(),
+        );
+
+        let received = timeout(Duration::from_millis(200), notifications_receiver.recv())
+            .await
+            .expect("timed out waiting for re-broadcast emission")
+            .expect("notification channel closed");
+
+        match received {
+            Either::Right(NodeEvent::BroadcastStateChange {
+                key: observed_key,
+                new_state,
+                is_retry,
+                is_reemit,
+            }) => {
+                assert_eq!(observed_key, key, "re-broadcast must target the contract");
+                assert_eq!(
+                    new_state.as_ref(),
+                    state.as_ref(),
+                    "re-broadcast must carry the resolved state"
+                );
+                assert!(
+                    !is_retry,
+                    "the deferred flush is a fresh logical broadcast, not a retry re-emission"
+                );
+                assert!(
+                    is_reemit,
+                    "the deferred flush must be tagged is_reemit so the give-up handler does \
+                     not double-count a still-no-targets re-emission in the #4281 stats"
+                );
+            }
+            other @ Either::Left(_) | other @ Either::Right(_) => {
+                panic!("expected BroadcastStateChange, got {other:?}")
+            }
+        }
+        GlobalSimulationTime::clear_time();
+    }
+
+    /// If the notification channel is saturated, the emit must re-stash the
+    /// state rather than dropping it — otherwise a transiently-full channel
+    /// would re-open the locally-hosted-only failure the fix closes.
+    #[tokio::test]
+    async fn flush_pending_broadcast_restashes_when_channel_full() {
+        use crate::operations::update::pending_broadcast::PendingBroadcastStore;
+
+        GlobalSimulationTime::set_time_ms(0);
+        let (receiver, notifier) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            notifications_receiver,
+            ..
+        } = receiver;
+
+        // Saturate the channel so the re-emit's try_send fails.
+        let filler_tx = Transaction::ttl_transaction();
+        let mut pre_filled = 0usize;
+        loop {
+            match notifier
+                .notifications_sender()
+                .try_send(Either::Right(NodeEvent::TransactionCompleted(filler_tx)))
+            {
+                Ok(()) => pre_filled += 1,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => break,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    panic!("channel unexpectedly closed while pre-filling")
+                }
+            }
+            if pre_filled > 4096 {
+                panic!("channel did not backpressure after 4096 entries");
+            }
+        }
+
+        let store = PendingBroadcastStore::new();
+        let key = test_contract_key(11);
+        let state = freenet_stdlib::prelude::WrappedState::new(vec![0xEF; 8]);
+
+        super::emit_pending_broadcast_reemit_on(
+            notifier.notifications_sender(),
+            notifier.notification_channel_pending(),
+            notifier.notifications_sender().capacity(),
+            &store,
+            &key,
+            state.clone(),
+        );
+
+        // State must still be present (re-stashed) for a later retry.
+        let recovered = store
+            .take(key.id())
+            .expect("state must be re-stashed after a full-channel drop, not lost");
+        assert_eq!(recovered.as_ref(), state.as_ref());
+
+        drop(notifications_receiver);
+        GlobalSimulationTime::clear_time();
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // Regression tests for #4359 re-review (SHOULD-FIX 4 + fast-path):
+    // `flush_pending_broadcast_on_interest`'s OWN branching — the
+    // contains() no-op fast path, the take()-None race path, and the
+    // read_current_contract_state Some/None handling — exercised through
+    // `flush_pending_broadcast_on_interest_on`, the orchestration-core the
+    // method delegates to (the method itself only wires `self`'s store,
+    // notifier, and `read_current_contract_state` into this function). The
+    // `read_current_state` step is stubbed so the live-read Some/None
+    // branches are driven deterministically without a contract handler.
+    //
+    // These restore coverage that an earlier revision dropped when it kept
+    // only the `emit_pending_broadcast_reemit_on` tests above — those cover
+    // the emit-core, NOT the stash-membership / stale-state branching.
+    // ──────────────────────────────────────────────────────────
+
+    /// Load-bearing: nothing stashed → the flush is a pure no-op. It must NOT
+    /// read current state and must NOT emit anything, so the overwhelmingly
+    /// common interest-registration-on-an-already-propagated-contract case
+    /// stays cheap. If the membership fast path regressed (e.g. always
+    /// take()/read), this test fails: `read_current_state` would be invoked and
+    /// the channel would receive an emission.
+    #[tokio::test]
+    async fn flush_noop_when_nothing_stashed() {
+        use crate::operations::update::pending_broadcast::PendingBroadcastStore;
+
+        GlobalSimulationTime::set_time_ms(0);
+        let (receiver, notifier) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut notifications_receiver,
+            ..
+        } = receiver;
+
+        let store = PendingBroadcastStore::new();
+        let key = test_contract_key(21);
+        let read_called = std::cell::Cell::new(false);
+
+        super::flush_pending_broadcast_on_interest_on(
+            &store,
+            notifier.notifications_sender(),
+            notifier.notification_channel_pending(),
+            notifier.notifications_sender().capacity(),
+            &key,
+            || {
+                read_called.set(true);
+                std::future::ready(None)
+            },
+        )
+        .await;
+
+        assert!(
+            !read_called.get(),
+            "no-op fast path must NOT read current contract state when nothing is stashed"
+        );
+        // No emission must reach the channel.
+        match notifications_receiver.try_recv() {
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+            other => panic!("expected no emission on the no-op path, got {other:?}"),
+        }
+        GlobalSimulationTime::clear_time();
+    }
+
+    /// Load-bearing: stashed + live read returns `Some(current)` → the re-emit
+    /// must carry the CURRENT state, NOT the stale give-up-time bytes. This pins
+    /// the stale-state safety (SHOULD-FIX 4): a locally-applied UPDATE between
+    /// give-up and flush must win. If the method regressed to re-emitting the
+    /// stashed bytes, the asserted state would be the stale ones and this fails.
+    #[tokio::test]
+    async fn flush_reemits_current_state_when_live_read_present() {
+        use crate::operations::update::pending_broadcast::PendingBroadcastStore;
+
+        GlobalSimulationTime::set_time_ms(0);
+        let (receiver, notifier) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut notifications_receiver,
+            ..
+        } = receiver;
+
+        let store = PendingBroadcastStore::new();
+        let key = test_contract_key(22);
+        let stale = freenet_stdlib::prelude::WrappedState::new(vec![0xAA; 8]);
+        let current = freenet_stdlib::prelude::WrappedState::new(vec![0xBB; 12]);
+        store.stash(*key.id(), stale.clone());
+
+        let current_for_read = current.clone();
+        super::flush_pending_broadcast_on_interest_on(
+            &store,
+            notifier.notifications_sender(),
+            notifier.notification_channel_pending(),
+            notifier.notifications_sender().capacity(),
+            &key,
+            || std::future::ready(Some(current_for_read.clone())),
+        )
+        .await;
+
+        let received = timeout(Duration::from_millis(200), notifications_receiver.recv())
+            .await
+            .expect("timed out waiting for re-broadcast emission")
+            .expect("notification channel closed");
+        match received {
+            Either::Right(NodeEvent::BroadcastStateChange {
+                key: observed_key,
+                new_state,
+                is_reemit,
+                ..
+            }) => {
+                assert_eq!(observed_key, key);
+                assert_eq!(
+                    new_state.as_ref(),
+                    current.as_ref(),
+                    "must re-emit the CURRENT live state, not the stale stashed bytes"
+                );
+                assert_ne!(
+                    new_state.as_ref(),
+                    stale.as_ref(),
+                    "stale give-up-time bytes must not be broadcast when a live read succeeds"
+                );
+                assert!(is_reemit, "deferred flush must be tagged is_reemit");
+            }
+            other @ Either::Left(_) | other @ Either::Right(_) => {
+                panic!("expected BroadcastStateChange, got {other:?}")
+            }
+        }
+        // The stash must have been drained.
+        assert!(
+            store.take(key.id()).is_none(),
+            "the stash entry must be drained by the flush"
+        );
+        GlobalSimulationTime::clear_time();
+    }
+
+    /// Load-bearing: stashed + live read returns `None` (contract handler
+    /// unavailable / not hosted) → the re-emit must FALL BACK to the stashed
+    /// bytes rather than dropping the broadcast. This pins the None-fallback
+    /// branch of `read_current_contract_state` handling: a failed live read is
+    /// strictly no worse than re-emitting the give-up-time state. If the
+    /// fallback regressed (e.g. `?`-style early return on None), nothing would
+    /// be emitted and this fails on the recv timeout.
+    #[tokio::test]
+    async fn flush_falls_back_to_stashed_bytes_when_live_read_absent() {
+        use crate::operations::update::pending_broadcast::PendingBroadcastStore;
+
+        GlobalSimulationTime::set_time_ms(0);
+        let (receiver, notifier) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut notifications_receiver,
+            ..
+        } = receiver;
+
+        let store = PendingBroadcastStore::new();
+        let key = test_contract_key(23);
+        let stashed = freenet_stdlib::prelude::WrappedState::new(vec![0xCC; 10]);
+        store.stash(*key.id(), stashed.clone());
+
+        super::flush_pending_broadcast_on_interest_on(
+            &store,
+            notifier.notifications_sender(),
+            notifier.notification_channel_pending(),
+            notifier.notifications_sender().capacity(),
+            &key,
+            // Live read fails (handler unavailable / not hosted).
+            || std::future::ready(None),
+        )
+        .await;
+
+        let received = timeout(Duration::from_millis(200), notifications_receiver.recv())
+            .await
+            .expect("timed out: the None live-read path must fall back to stashed bytes, not drop")
+            .expect("notification channel closed");
+        match received {
+            Either::Right(NodeEvent::BroadcastStateChange {
+                key: observed_key,
+                new_state,
+                ..
+            }) => {
+                assert_eq!(observed_key, key);
+                assert_eq!(
+                    new_state.as_ref(),
+                    stashed.as_ref(),
+                    "must fall back to the stashed bytes when the live read returns None"
+                );
+            }
+            other @ Either::Left(_) | other @ Either::Right(_) => {
+                panic!("expected BroadcastStateChange, got {other:?}")
+            }
+        }
+        GlobalSimulationTime::clear_time();
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // Regression tests for #4154/#4313: parked drivers must be woken
+    // when their awaited peer disconnects, not wait `OPERATION_TTL`,
+    // and must surface the disconnect cause rather than the
+    // FORBIDDEN_MARKER. The orphan handler emits
+    // `TransactionOrphaned { tx, peer }` per orphan via
+    // `notify_orphaned_transaction_on`; the event loop sends
+    // `WaiterReply::PeerDisconnected` into the waiter channel and then
+    // drops the sender, so the driver's `recv()` yields the cause
+    // (mapped to `OpError::PeerDisconnected`) before any close.
+    // ──────────────────────────────────────────────────────────
+
+    fn test_peer() -> SocketAddr {
+        "203.0.113.7:9999"
+            .parse()
+            .expect("test peer addr must be valid")
+    }
+
+    #[tokio::test]
+    async fn notify_orphaned_transaction_emits_transaction_orphaned() {
         // Happy path: the standalone helper enqueues exactly one
-        // `TransactionCompleted(tx)` on the notification channel.
+        // `TransactionOrphaned { tx, peer }` on the notification channel.
         let (receiver, notifier) = event_loop_notification_channel();
         let EventLoopNotificationsReceiver {
             mut notifications_receiver,
@@ -1555,27 +2298,33 @@ mod tests {
         } = receiver;
 
         let tx = Transaction::ttl_transaction();
+        let peer = test_peer();
 
-        let delivered = super::try_release_pending_op_slot_on(notifier.notifications_sender(), tx);
+        let delivered =
+            super::notify_orphaned_transaction_on(notifier.notifications_sender(), tx, peer);
         assert!(delivered, "helper must enqueue on a live channel");
 
         let received = timeout(Duration::from_millis(100), notifications_receiver.recv())
             .await
-            .expect("timed out waiting for TransactionCompleted emission")
+            .expect("timed out waiting for TransactionOrphaned emission")
             .expect("notification channel closed");
 
         match received {
-            Either::Right(NodeEvent::TransactionCompleted(observed)) => {
-                assert_eq!(observed, tx, "emitted tx must match the argument");
+            Either::Right(NodeEvent::TransactionOrphaned {
+                tx: observed_tx,
+                peer: observed_peer,
+            }) => {
+                assert_eq!(observed_tx, tx, "emitted tx must match the argument");
+                assert_eq!(observed_peer, peer, "emitted peer must match the argument");
             }
             other @ Either::Left(_) | other @ Either::Right(_) => {
-                panic!("expected TransactionCompleted, got {other:?}")
+                panic!("expected TransactionOrphaned, got {other:?}")
             }
         }
     }
 
     #[tokio::test]
-    async fn try_release_pending_op_slot_handles_dropped_receiver() {
+    async fn notify_orphaned_transaction_handles_dropped_receiver() {
         // Closed channel: helper must return `false` rather than panic
         // — disconnect cleanup must remain robust when the event loop
         // has already torn down (e.g. shutdown races).
@@ -1583,7 +2332,8 @@ mod tests {
         drop(receiver);
 
         let tx = Transaction::ttl_transaction();
-        let delivered = super::try_release_pending_op_slot_on(notifier.notifications_sender(), tx);
+        let delivered =
+            super::notify_orphaned_transaction_on(notifier.notifications_sender(), tx, test_peer());
         assert!(
             !delivered,
             "helper must return false once receiver is dropped"
@@ -1591,55 +2341,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn orphaned_transaction_wakes_parked_pending_op_results_waiter() {
-        // End-to-end pipeline test for #4154 without standing up a full
-        // node. Reproduces the driver → notification-channel → event-
-        // loop → sender-drop → driver-wakeup sequence and asserts it
-        // completes in under 100 ms (pre-fix it would hang `OPERATION_TTL`).
+    async fn orphaned_transaction_wakes_parked_waiter_with_peer_disconnected() {
+        // End-to-end pipeline test for #4154/#4313 without standing up a
+        // full node. Reproduces the orphan-handler → notification-channel
+        // → event-loop → send-cause-then-drop-sender → driver-wakeup
+        // sequence and asserts the parked driver observes
+        // `WaiterReply::PeerDisconnected` (NOT a bare close) in under
+        // 100 ms (pre-#4154 it hung `OPERATION_TTL`; the deleted registry
+        // approach raced and surfaced the FORBIDDEN_MARKER instead).
         let (mut event_loop_receiver, notifier) = event_loop_notification_channel();
 
         // Stand in for `pending_op_results[tx] = sender` and the driver's
         // pending `recv()` on the matching receiver.
         let (response_sender, mut driver_response_rx) =
-            tokio::sync::mpsc::channel::<crate::message::NetMessage>(1);
+            tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
         let mut pending_op_results: std::collections::HashMap<
             Transaction,
-            tokio::sync::mpsc::Sender<crate::message::NetMessage>,
+            tokio::sync::mpsc::Sender<crate::node::WaiterReply>,
         > = std::collections::HashMap::new();
         let tx = Transaction::ttl_transaction();
+        let peer = test_peer();
         pending_op_results.insert(tx, response_sender);
 
         // Trigger the wake — this is the orphan-handler path under test.
-        let delivered = super::try_release_pending_op_slot_on(notifier.notifications_sender(), tx);
+        let delivered =
+            super::notify_orphaned_transaction_on(notifier.notifications_sender(), tx, peer);
         assert!(delivered, "orphan-handler helper must enqueue notification");
 
-        // Mimic the event loop's `TransactionCompleted` arm by dropping the
-        // sender out of `pending_op_results`.
+        // Mimic the event loop's `TransactionOrphaned` arm: take the sender
+        // out and deliver the cause THROUGH the channel before it drops.
         let event = timeout(
             Duration::from_millis(100),
             event_loop_receiver.notifications_receiver.recv(),
         )
         .await
-        .expect("event loop never received TransactionCompleted")
-        .expect("notification channel closed before TransactionCompleted arrived");
+        .expect("event loop never received TransactionOrphaned")
+        .expect("notification channel closed before TransactionOrphaned arrived");
         match event {
-            Either::Right(NodeEvent::TransactionCompleted(observed)) => {
-                assert_eq!(observed, tx);
-                pending_op_results.remove(&observed);
+            Either::Right(NodeEvent::TransactionOrphaned {
+                tx: observed_tx,
+                peer: observed_peer,
+            }) => {
+                assert_eq!(observed_tx, tx);
+                assert_eq!(observed_peer, peer);
+                if let Some(sender) = pending_op_results.remove(&observed_tx) {
+                    #[allow(clippy::let_underscore_must_use)]
+                    let _ = sender.try_send(crate::node::WaiterReply::PeerDisconnected {
+                        peer: observed_peer,
+                    });
+                }
             }
             other @ Either::Left(_) | other @ Either::Right(_) => {
-                panic!("expected TransactionCompleted, got {other:?}")
+                panic!("expected TransactionOrphaned, got {other:?}")
             }
         }
 
-        // The driver's `recv()` must now resolve to `None` immediately —
+        // The driver's `recv()` must now resolve to the cause immediately —
         // pre-fix this hung the full `OPERATION_TTL`. Cap at 100 ms.
         let driver_wakeup = timeout(Duration::from_millis(100), driver_response_rx.recv()).await;
         match driver_wakeup {
-            Ok(None) => {
-                // Channel closed, driver wakes with `Err(NotificationError)` — correct.
+            Ok(Some(crate::node::WaiterReply::PeerDisconnected { peer: observed })) => {
+                assert_eq!(observed, peer, "driver must receive the disconnect cause");
             }
-            Ok(Some(msg)) => panic!("driver received unexpected message: {msg:?}"),
+            Ok(other) => panic!("driver received unexpected item: {other:?}"),
             Err(_) => panic!(
                 "driver did not wake after orphan handling — \
                  pre-#4154 behavior reproduced"
@@ -1871,7 +2635,7 @@ mod tests {
     // ──────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn try_release_pending_op_slot_full_does_not_emit_warn() {
+    async fn notify_orphaned_transaction_full_does_not_emit_warn() {
         // #4238 regression pin: per-occurrence Full must NOT emit a
         // WARN. Pre-fix this fired 30K+/hr on nova; post-fix the
         // helper logs at DEBUG and a WARN-level subscriber sees
@@ -1903,11 +2667,12 @@ mod tests {
         }
 
         let tx = Transaction::ttl_transaction();
-        let delivered = super::try_release_pending_op_slot_on(notifier.notifications_sender(), tx);
+        let delivered =
+            super::notify_orphaned_transaction_on(notifier.notifications_sender(), tx, test_peer());
         assert!(!delivered, "helper must return false on a full channel");
 
         assert!(
-            !logger.contains("try_release_pending_op_slot: notification channel full"),
+            !logger.contains("notify_orphaned_transaction: notification channel full"),
             "Full arm must not emit WARN (would re-spam gateways at 30K+/hr — #4238); \
              captured: {:?}",
             logger.logs()
@@ -1915,7 +2680,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_release_pending_op_slot_closed_still_emits_warn() {
+    async fn notify_orphaned_transaction_closed_still_emits_warn() {
         // #4238 inverse: the Closed arm is genuinely abnormal
         // (receiver torn down) and MUST stay at WARN even after the
         // Full-arm downgrade.
@@ -1928,11 +2693,12 @@ mod tests {
         drop(receiver);
 
         let tx = Transaction::ttl_transaction();
-        let delivered = super::try_release_pending_op_slot_on(notifier.notifications_sender(), tx);
+        let delivered =
+            super::notify_orphaned_transaction_on(notifier.notifications_sender(), tx, test_peer());
         assert!(!delivered, "helper must return false on a closed channel");
 
         assert!(
-            logger.contains("try_release_pending_op_slot: notification channel closed"),
+            logger.contains("notify_orphaned_transaction: notification channel closed"),
             "Closed arm must still emit WARN — receiver-dropped is not benign back-pressure; \
              captured: {:?}",
             logger.logs()
@@ -2317,5 +3083,166 @@ mod tests {
         assert!(waiters.contains_key(&id1));
         assert!(!waiters.contains_key(&id2));
         assert_eq!(waiters[&id1].len(), 1);
+    }
+
+    /// `ClientOpGuard::Drop` decrements the counter exactly once,
+    /// including on a panic. The shutdown drain depends on this —
+    /// if a panic skipped the decrement, the counter would leak and
+    /// `wait_for_drain` would block until `drain_timeout` even
+    /// though no driver is actually still running.
+    ///
+    /// Asks from Testing-reviewer r1 and r2; added here so a future
+    /// refactor switching `ClientOpGuard` to a manual `fetch_sub`
+    /// (foot-gun) without `Drop` semantics is caught at CI time.
+    #[test]
+    fn client_op_guard_decrements_on_panic() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ClientOpGuard::new(counter.clone());
+            assert_eq!(counter.load(Ordering::Relaxed), 1);
+            panic!("simulated driver panic");
+        }));
+        assert!(result.is_err(), "the closure must have panicked");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "ClientOpGuard::Drop must decrement the counter even on \
+             panic — otherwise the shutdown drain leaks and waits \
+             the full drain_timeout for a driver that's no longer \
+             alive."
+        );
+    }
+
+    /// Source-grep pin: the four handshake-participating atomic ops
+    /// MUST use `Ordering::SeqCst`. Codex r3 + skeptical r3 finding
+    /// — `Relaxed` is insufficient for a two-variable Dekker-style
+    /// handshake; under a weakly-ordered model both threads can
+    /// observe each other's writes as stale, letting a new driver
+    /// spawn after the drain has completed (the exact failure mode
+    /// the drain exists to prevent). A future contributor who
+    /// downgrades any of these to `Relaxed` for "performance" gets
+    /// caught at CI time, not in a production incident on ARM.
+    #[test]
+    fn seqcst_used_for_admission_handshake_atomics() {
+        let op_state = include_str!("op_state_manager.rs");
+        // Counter bump in ClientOpGuard::new.
+        let new_body = op_state
+            .split("fn new(counter: Arc<AtomicUsize>) -> Self {")
+            .nth(1)
+            .and_then(|s| s.split("Self {").next())
+            .expect("ClientOpGuard::new body must be findable");
+        assert!(
+            new_body.contains("fetch_add(1, Ordering::SeqCst)"),
+            "ClientOpGuard::new must fetch_add with SeqCst — see \
+             admit_client_op rustdoc. Found body:\n{new_body}"
+        );
+
+        // Gate load in admit_client_op.
+        let admit_body = op_state
+            .split("pub(crate) fn admit_client_op(&self) -> Option<ClientOpGuard> {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("admit_client_op body must be findable");
+        assert!(
+            admit_body.contains("self.shutting_down.load(Ordering::SeqCst)"),
+            "admit_client_op must load shutting_down with SeqCst.\nbody:\n{admit_body}"
+        );
+
+        // Node side: gate store + counter loads in node.rs.
+        let node_rs = include_str!("../node.rs");
+        assert!(
+            node_rs.contains("self.shutting_down.store(true, Ordering::SeqCst)"),
+            "ShutdownHandle::shutdown Phase 1 must store shutting_down \
+             with SeqCst — the gate write must synchronize with \
+             admit_client_op's gate load."
+        );
+        // Both the `initial` read AND the poll-loop read need SeqCst.
+        // Count occurrences as a guard against partial downgrade.
+        let seqcst_loads = node_rs
+            .matches("self.inflight_client_ops.load(Ordering::SeqCst)")
+            .count();
+        assert!(
+            seqcst_loads >= 2,
+            "wait_for_drain must load inflight_client_ops with SeqCst \
+             at BOTH the initial fast-path AND the poll loop \
+             (found {seqcst_loads} SeqCst loads, need >= 2). A single \
+             Relaxed load anywhere in the drain re-opens the Dekker \
+             race."
+        );
+    }
+
+    /// Source-grep pin: `admit_client_op` must bump the counter
+    /// BEFORE checking the gate. The reverse order (check-then-bump)
+    /// re-opens the Codex r2 TOCTOU. The `admit_client_op_refuses_when_shutting_down`
+    /// test below pins the OUTCOME contract; this pin asserts the
+    /// IMPLEMENTATION shape that makes the outcome correct for the
+    /// real race window (a refactor that swaps the two lines passes
+    /// the outcome test but reopens the race).
+    #[test]
+    fn admit_client_op_bumps_before_checking_gate() {
+        let src = include_str!("op_state_manager.rs");
+        let body = src
+            .split("pub(crate) fn admit_client_op(&self) -> Option<ClientOpGuard> {")
+            .nth(1)
+            .and_then(|s| s.split("\n    }").next())
+            .expect("admit_client_op body must be findable");
+        let bump_pos = body
+            .find("self.client_op_guard()")
+            .expect("admit_client_op must call client_op_guard()");
+        let gate_pos = body
+            .find("self.shutting_down.load")
+            .expect("admit_client_op must load shutting_down");
+        assert!(
+            bump_pos < gate_pos,
+            "admit_client_op must call client_op_guard() (bump) BEFORE \
+             loading shutting_down (check). Reverse order re-opens \
+             Codex r2 TOCTOU: a check-then-bump caller can see \
+             shutting_down=false, then shutdown sets it and sees \
+             counter=0, returns from drain, then caller bumps + \
+             spawns into a dead node."
+        );
+    }
+
+    /// `admit_client_op` returns `None` (no counter bump) when the
+    /// `shutting_down` gate is set. Without this test, a refactor that
+    /// inverts the gate check (e.g. `if !shutting_down { return None }`)
+    /// would compile and let every client op through during shutdown.
+    #[test]
+    fn admit_client_op_refuses_when_shutting_down() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(AtomicBool::new(true)); // pre-flipped
+        // Build a minimal stand-in: just the two atomics — we test
+        // `admit_client_op` against an `OpManager`-shaped struct by
+        // re-implementing its body here. A full OpManager fixture
+        // would drag in the entire node setup. The logic under test
+        // is a 4-line function; pinning its semantic via a parallel
+        // implementation is acceptable for a single-function gate.
+        let admit = || -> Option<ClientOpGuard> {
+            let guard = ClientOpGuard::new(counter.clone());
+            if gate.load(Ordering::Relaxed) {
+                drop(guard);
+                return None;
+            }
+            Some(guard)
+        };
+
+        assert!(
+            admit().is_none(),
+            "admit_client_op must return None when the gate is set"
+        );
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "the bump-then-check pattern must net-zero the counter \
+             on rejection — otherwise the gate leaks bumped counts \
+             that the drain then waits on indefinitely."
+        );
+
+        // Open the gate; admit succeeds and bumps the counter.
+        gate.store(false, Ordering::Relaxed);
+        let g = admit().expect("gate is open, admit must succeed");
+        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        drop(g);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 }

@@ -9,8 +9,14 @@ fail-fast = false
 # Terminate tests that hang (2 periods of 120s = 4 min max per test).
 slow-timeout = { period = "120s", terminate-after = 2 }
 
-# Interest renewal runs a full simulation with contract operations and needs
-# extra time when competing with parallel fdev tests for CPU (#3792).
+# Interest renewal drives a 2-gateway / 4-node / 8-contract simulation for ~1200s
+# of virtual time (paused-time direct runner, advanced in ~1ms quanta), so its wall-clock
+# scales with runner CPU and can be 2-3x slower under load. The original CI
+# timeout (#3792) was a 1800s convergence-polling tail stacked on top of that
+# whenever the network didn't fully converge; that tail is now skipped for this
+# test (it never asserts convergence — see test_interest_renewal's
+# no_convergence_wait()). This generous timeout remains as headroom for the fixed
+# event-phase cost on slow/contended runners.
 [[profile.ci.overrides]]
 filter = "test(test_interest_renewal)"
 slow-timeout = { period = "300s", terminate-after = 2 }
@@ -21,6 +27,22 @@ slow-timeout = { period = "300s", terminate-after = 2 }
 [[profile.ci.overrides]]
 filter = "package(freenet-ping-app)"
 slow-timeout = { period = "300s", terminate-after = 3 }
+
+# test_ping_blocked_peers is the canary for the CONNECT promotion-drop bug
+# class (#3838, fixed in #3893). The profile-wide retries = 2 masked a ~40%
+# per-run failure rate as ~6% effective during the flaky period, making an
+# "actively broken" test look "flaky but mostly passing". Run it with no
+# nextest retries so any re-emergence of that bug class surfaces on the first
+# run instead of being hidden (#3895).
+#
+# This does NOT reintroduce environmental flakiness: the only legitimately
+# transient failure mode (loopback port collisions with parallel tests) is
+# already handled inside the test itself by an in-process retry loop with
+# jitter (MAX_PORT_RETRY_ATTEMPTS in run_app_blocked_peers.rs), so it never
+# needed nextest-level retries to absorb port races.
+[[profile.ci.overrides]]
+filter = "test(test_ping_blocked_peers)"
+retries = 0
 
 [profile.nightly]
 # Nightly tests run longer by design; no retries since failures need investigation.

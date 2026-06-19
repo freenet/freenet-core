@@ -16,7 +16,7 @@ use crate::{
         congestion_control::{CongestionControl, CongestionController},
         metrics::{emit_transfer_completed, emit_transfer_failed, emit_transfer_started},
         packet_data,
-        sent_packet_tracker::SentPacketTracker,
+        sent_packet_tracker::{PacketStream, SentPacketTracker},
         symmetric_message::{self},
     },
 };
@@ -35,6 +35,47 @@ use super::streaming::StreamHandle;
 /// With STREAM_INACTIVITY_TIMEOUT at 5s, a 3s cwnd wait gives the sender 2s headroom
 /// to fail and report before the receiver's inactivity timeout fires.
 const CWND_WAIT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Release the in-flight bytes of an aborting outbound stream from the
+/// connection's flight size (issue #4345).
+///
+/// When a stream aborts (cwnd-wait timeout, upstream stall/error, or a mid-send
+/// `packet_sending` failure) its already-sent, unacked fragments are still
+/// counted in the connection-wide flight size. Without this they stay pinned
+/// until each fragment is independently ACKed or ages out via
+/// `MAX_PACKET_RETRANSMITS` (~6s) — and FixedRate's loss-pause caps cwnd at the
+/// frozen flight size, so a single aborted stream starves every subsequent
+/// stream on the connection (the #4345 symptom). `drop_stream` removes the
+/// stream's packets from the tracker and returns their exact byte total, which
+/// we hand to `release_flightsize` so the next stream sees an open cwnd.
+///
+/// # Locking
+///
+/// Mirrors the ACK path's ordering (`peer_connection.rs`): the tracker lock is
+/// dropped BEFORE calling into the congestion controller, so the tracker mutex
+/// is never held across a `release_flightsize` call (and never across an
+/// `.await` — neither call awaits). This avoids any tracker↔controller
+/// lock-ordering hazard.
+///
+/// Idempotent and cheap on the common path: a stream with no in-flight packets
+/// (already fully ACKed, or zero fragments sent) drops nothing and releases 0.
+fn release_aborted_stream_flightsize<T: TimeSource>(
+    stream_id: StreamId,
+    sent_packet_tracker: &parking_lot::Mutex<SentPacketTracker<T>>,
+    congestion_controller: &CongestionController<T>,
+) {
+    let released = sent_packet_tracker.lock().drop_stream(stream_id);
+    if released > 0 {
+        // u64 -> usize: a connection's in-flight bytes never approach usize::MAX
+        // on any supported platform; saturate defensively rather than wrap.
+        congestion_controller.release_flightsize(released.min(usize::MAX as u64) as usize);
+        tracing::debug!(
+            stream_id = %stream_id.0,
+            released_bytes = released,
+            "Released aborted stream's in-flight bytes from flight size (#4345)"
+        );
+    }
+}
 
 // Compile-time guard: sender must fail before receiver so the failure is diagnostic.
 const _: () = assert!(
@@ -71,7 +112,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
     congestion_controller: Arc<CongestionController<T>>,
     time_source: T,
     metadata: Option<Bytes>,
-    completion_tx: Option<oneshot::Sender<()>>,
+    completion_tx: Option<oneshot::Sender<crate::transport::BroadcastDeliveryOutcome>>,
 ) -> Result<TransferStats, TransportError> {
     let start_time = time_source.now();
     let bytes_to_send = stream_to_send.len() as u64;
@@ -177,7 +218,29 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                     elapsed.as_millis() as u64,
                     TransferDirection::Send,
                 );
-                return Err(TransportError::ConnectionClosed(destination_addr));
+                // Fail only this stream, not the connection (#4345). A cwnd-wait
+                // timeout means ACKs stopped arriving for this transfer; tearing
+                // down the whole connection would kill every other operation
+                // multiplexed on it. The op layer times out and retries against
+                // another candidate; the idle timeout decides connection liveness.
+                //
+                // Release this stream's already-sent in-flight bytes so the
+                // frozen flight size doesn't starve the next stream (#4345).
+                release_aborted_stream_flightsize(
+                    stream_id,
+                    sent_packet_tracker.as_ref(),
+                    congestion_controller.as_ref(),
+                );
+                //
+                // NOTE: `completion_tx` is intentionally NOT signaled here — it
+                // is dropped by this early return. broadcast_queue awaits it with
+                // a timeout and treats the resulting oneshot RecvError as a
+                // *drop, not a delivery* (broadcast_queue.rs: `Ok(Err(_))` arm,
+                // #4235), releasing the permit immediately without refreshing
+                // peer interest. Do NOT "fix" this by adding a blocking
+                // `tx.send(..)` here — a blocking send in this stream task is the
+                // backpressure pattern channel-safety.md warns against.
+                return Err(TransportError::OutboundStreamFailed(destination_addr));
             }
 
             // Exponential backoff to balance responsiveness and CPU usage
@@ -268,6 +331,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
             },
             sent_packet_tracker.as_ref(),
             token,
+            PacketStream::Stream(stream_id),
         )
         .await
         {
@@ -282,10 +346,40 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                 elapsed.as_millis() as u64,
                 TransferDirection::Send,
             );
-            // Signal completion (error path) so broadcast queue can release permit
+            // Release this stream's in-flight bytes (#4345). Two parts:
+            // (1) drop_stream releases the already-sent, tracked fragments;
+            // (2) the CURRENT fragment's on_send bytes were added to flight size
+            //     just above (`on_send_with_token`) but the send failed, so the
+            //     packet was never registered in the tracker — drop_stream can't
+            //     see it. Release packet_size explicitly so those bytes don't leak.
+            //
+            // CORRECTNESS GUARD: step (2) is correct ONLY because a failed send
+            // never registers the packet. `packet_sending` registers per
+            // successfully-sent packet; with the empty `confirm_receipt` used
+            // here it takes the single-packet path, so a send error means ZERO
+            // registrations and drop_stream cannot have already released this
+            // packet_id. If a future caller passes non-empty receipts (multi-
+            // packet path) some sub-packets could register before a later one
+            // fails — then drop_stream would release them AND this explicit call
+            // would double-count. The debug_assert pins the invariant so that
+            // change trips tests.
+            debug_assert!(
+                !sent_packet_tracker.lock().contains_packet(packet_id),
+                "mid-send failure: failed packet {packet_id} must be absent from \
+                 the tracker before explicit release (else double-release, #4345)"
+            );
+            release_aborted_stream_flightsize(
+                stream_id,
+                sent_packet_tracker.as_ref(),
+                congestion_controller.as_ref(),
+            );
+            congestion_controller.release_flightsize(packet_size);
+            // Signal completion (error path) so broadcast queue can release the
+            // permit. The transfer failed mid-flight, so report a drop (#4235):
+            // the queue must NOT treat this as a delivery.
             if let Some(tx) = completion_tx {
                 // Receiver may be dropped if queue timed out; ignore the error.
-                let _ignored = tx.send(());
+                let _ignored = tx.send(crate::transport::BroadcastDeliveryOutcome::Dropped);
             }
             return Err(e);
         }
@@ -334,10 +428,12 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         TransferDirection::Send,
     );
 
-    // Signal completion (success path) so broadcast queue can release permit
+    // Signal completion (success path) so broadcast queue can release the
+    // permit. The transfer completed end-to-end, so report a real delivery
+    // (#4235) — only this case refreshes peer interest / caches the summary.
     if let Some(tx) = completion_tx {
         // Receiver may be dropped if queue timed out; ignore the error.
-        let _ignored = tx.send(());
+        let _ignored = tx.send(crate::transport::BroadcastDeliveryOutcome::Delivered);
     }
 
     Ok(TransferStats {
@@ -448,7 +544,18 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                     elapsed.as_millis() as u64,
                     TransferDirection::Send,
                 );
-                return Err(TransportError::ConnectionClosed(destination_addr));
+                // Stall is in the UPSTREAM inbound feed, not the downstream
+                // connection — fail only this stream so other ops multiplexed
+                // on the downstream connection survive (#4345). The op layer
+                // times out and retries; the idle timeout decides connection
+                // liveness. Release the bytes already forwarded for this stream
+                // so the frozen flight size doesn't starve the next stream.
+                release_aborted_stream_flightsize(
+                    outbound_stream_id,
+                    sent_packet_tracker.as_ref(),
+                    congestion_controller.as_ref(),
+                );
+                return Err(TransportError::OutboundStreamFailed(destination_addr));
             }
         };
         let payload = match next_fragment {
@@ -463,7 +570,15 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                     elapsed.as_millis() as u64,
                     TransferDirection::Send,
                 );
-                return Err(TransportError::ConnectionClosed(destination_addr));
+                // Error is on the UPSTREAM inbound stream, not the downstream
+                // connection — fail only this stream (#4345), same rationale as
+                // the inactivity-stall arm above. Release already-forwarded bytes.
+                release_aborted_stream_flightsize(
+                    outbound_stream_id,
+                    sent_packet_tracker.as_ref(),
+                    congestion_controller.as_ref(),
+                );
+                return Err(TransportError::OutboundStreamFailed(destination_addr));
             }
         };
 
@@ -478,8 +593,9 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
         // relay GET streaming path (#3586) lost ACKs mid-transfer.
         //
         // Safety: the loop is bounded by CWND_WAIT_TIMEOUT. If cwnd space doesn't
-        // open within the timeout, the pipe fails with ConnectionClosed rather than
-        // hanging indefinitely.
+        // open within the timeout, the pipe fails with OutboundStreamFailed
+        // (stream-scoped, connection survives — #4345) rather than hanging
+        // indefinitely.
         let cwnd_wait_start = time_source.now();
         let mut cwnd_wait_iterations = 0;
         loop {
@@ -530,7 +646,16 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                     elapsed.as_millis() as u64,
                     TransferDirection::Send,
                 );
-                return Err(TransportError::ConnectionClosed(destination_addr));
+                // Fail only this stream, not the connection (#4345). See the
+                // matching site in send_stream for the rationale. Release the
+                // bytes already forwarded for this stream so the frozen flight
+                // size doesn't starve the next stream.
+                release_aborted_stream_flightsize(
+                    outbound_stream_id,
+                    sent_packet_tracker.as_ref(),
+                    congestion_controller.as_ref(),
+                );
+                return Err(TransportError::OutboundStreamFailed(destination_addr));
             }
 
             if cwnd_wait_iterations <= 10 {
@@ -595,6 +720,7 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
             },
             sent_packet_tracker.as_ref(),
             token,
+            PacketStream::Stream(outbound_stream_id),
         )
         .await
         {
@@ -607,6 +733,29 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                 elapsed.as_millis() as u64,
                 TransferDirection::Send,
             );
+            // Release this stream's in-flight bytes (#4345): drop_stream for the
+            // already-forwarded tracked fragments, plus packet_size for the
+            // CURRENT fragment whose on_send bytes were added just above but
+            // whose send failed (so it was never registered in the tracker).
+            //
+            // CORRECTNESS GUARD (same as send_stream's mid-send site): the
+            // explicit packet_size release is correct ONLY because a failed send
+            // never registers the packet — the empty `confirm_receipt` here
+            // forces the single-packet path, so a send error means ZERO
+            // registrations and drop_stream cannot have already released this
+            // packet_id. A future multi-packet wiring would break this; the
+            // debug_assert pins the invariant.
+            debug_assert!(
+                !sent_packet_tracker.lock().contains_packet(packet_id),
+                "mid-send failure: failed packet {packet_id} must be absent from \
+                 the tracker before explicit release (else double-release, #4345)"
+            );
+            release_aborted_stream_flightsize(
+                outbound_stream_id,
+                sent_packet_tracker.as_ref(),
+                congestion_controller.as_ref(),
+            );
+            congestion_controller.release_flightsize(packet_size);
             return Err(e);
         }
 
@@ -913,8 +1062,17 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_send_stream_without_bandwidth_limit() -> Result<(), Box<dyn std::error::Error>> {
+    /// Run a single 10KB stream transfer with the given token-bucket
+    /// (burst capacity, rate bytes/s) and return the wall-clock duration plus
+    /// the number of packets the receiver observed.
+    ///
+    /// Shared between the rate-limited and unlimited measurements in
+    /// [`test_send_stream_without_bandwidth_limit`] so both paths run through
+    /// identical setup; only the token-bucket parameters differ.
+    async fn measure_stream_transfer(
+        burst_capacity: usize,
+        rate_bytes_per_sec: usize,
+    ) -> Result<(Duration, usize), Box<dyn std::error::Error>> {
         let (outbound_sender, mut outbound_receiver) = mpsc::channel(100);
         let destination_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 1234));
         let key = Aes128Gcm::new_from_slice(&[0u8; 16])?;
@@ -924,13 +1082,11 @@ mod tests {
         // Create a large message (10KB)
         let message = vec![0u8; 10_000];
 
-        // Use real time for integration testing without bandwidth limiting
         let time_source = RealTime::new();
         let sent_tracker = Arc::new(parking_lot::Mutex::new(
             SentPacketTracker::new_with_time_source(time_source.clone()),
         ));
 
-        // Initialize congestion controller and TokenBucket with very high rate (effectively unlimited)
         // Use large cwnd since unit tests don't simulate ACKs to reduce flightsize
         let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
             initial_cwnd: 1_000_000,
@@ -940,8 +1096,8 @@ mod tests {
         })
         .build_arc();
         let token_bucket = Arc::new(TokenBucket::new_with_time_source(
-            100_000,       // 100 KB burst capacity
-            1_000_000_000, // 1 GB/s rate (effectively unlimited)
+            burst_capacity,
+            rate_bytes_per_sec,
             time_source.clone(),
         ));
 
@@ -990,19 +1146,54 @@ mod tests {
         let expected_packets = message.len().div_ceil(MAX_DATA_SIZE);
         assert_eq!(packet_count, expected_packets);
 
-        // Without rate limiting, should complete very quickly (< 50ms)
+        Ok((elapsed, packet_count))
+    }
+
+    #[tokio::test]
+    async fn test_send_stream_without_bandwidth_limit() -> Result<(), Box<dyn std::error::Error>> {
+        // The unlimited path is bounded ABOVE by the rate-limited path, so we
+        // co-measure both transfers and assert a RATIO rather than an absolute
+        // wall-clock cap. An absolute cap (the old `< 50ms`) is inherently
+        // flaky: under CI/CPU pressure the same unthrottled transfer can take
+        // 60-70ms+ even though it is still far faster than a throttled one.
+        // Comparing the two measurements in the same process cancels out that
+        // shared scheduling noise.
+
+        // Rate-limited: 10KB over 100KB/s with a 1KB burst. The first 1KB goes
+        // out immediately, the remaining 9KB is paced at 100KB/s (~90ms).
+        let (limited_elapsed, _) = measure_stream_transfer(1_000, 100_000).await?;
+
+        // Unlimited: 100KB burst + 1GB/s rate means the token bucket never
+        // throttles; the transfer is bounded only by per-packet processing.
+        let (unlimited_elapsed, _) = measure_stream_transfer(100_000, 1_000_000_000).await?;
+
+        // Sanity floor: rate limiting must actually have an observable effect.
+        // Without this, a regression that silently disabled throttling could
+        // make both timings ~0 and still satisfy the ratio below.
         assert!(
-            elapsed.as_millis() < 50,
-            "Transfer took too long without rate limit: {elapsed:?}"
+            limited_elapsed.as_millis() >= 50,
+            "Rate-limited transfer completed too quickly to be a meaningful \
+             baseline: {limited_elapsed:?}"
+        );
+
+        // Core invariant: the unlimited transfer must be dramatically faster
+        // than the rate-limited one. Use a 4x safety margin so the assertion
+        // tolerates wide platform/scheduling variance while still failing if
+        // the unlimited path ever approaches rate-limited timings.
+        assert!(
+            unlimited_elapsed * 4 < limited_elapsed,
+            "Unlimited transfer ({unlimited_elapsed:?}) was not meaningfully \
+             faster than the rate-limited transfer ({limited_elapsed:?}); \
+             expected unlimited * 4 < rate-limited"
         );
 
         Ok(())
     }
 
-    /// Test that fragment #1 with embedded metadata never exceeds MAX_DATA_SIZE.
-    /// Test that send_stream aborts with ConnectionClosed when the cwnd wait
-    /// exceeds CWND_WAIT_TIMEOUT. Simulates a dead outbound connection where
-    /// cwnd is too small for any packet (#3608).
+    /// Test that send_stream aborts with OutboundStreamFailed when the cwnd
+    /// wait exceeds CWND_WAIT_TIMEOUT. Simulates a dead outbound connection
+    /// where cwnd is too small for any packet (#3608). Per #4345 this is a
+    /// stream-scoped failure that must not tear down the connection.
     #[tokio::test(start_paused = true)]
     async fn test_send_stream_cwnd_wait_timeout() -> Result<(), Box<dyn std::error::Error>> {
         let (outbound_sender, _outbound_receiver) = mpsc::channel(100);
@@ -1049,14 +1240,495 @@ mod tests {
         ));
 
         // With start_paused=true, tokio auto-advances time through sleep calls.
-        // The cwnd wait loop sleeps in 1ms increments, and the timeout is 15s,
-        // so tokio will auto-advance through ~15,000 iterations instantly.
+        // The cwnd wait loop sleeps in 1ms increments, and the timeout is
+        // CWND_WAIT_TIMEOUT (3s), so tokio auto-advances through the iterations
+        // instantly.
         let result = send_task.await.expect("join error");
         assert!(
-            matches!(result, Err(TransportError::ConnectionClosed(_))),
-            "Expected ConnectionClosed after cwnd wait timeout, got: {result:?}",
+            matches!(result, Err(TransportError::OutboundStreamFailed(_))),
+            "Expected OutboundStreamFailed after cwnd wait timeout, got: {result:?}",
         );
 
+        Ok(())
+    }
+
+    /// Regression test for #4345: a cwnd-wait timeout must fail only the stream,
+    /// NOT the connection.
+    ///
+    /// When an outbound stream's congestion-window wait times out, `send_stream`
+    /// returns an error. Before this fix it returned
+    /// `TransportError::ConnectionClosed`, which the connection recv loop in
+    /// `peer_connection.rs` treats as fatal — tearing the whole connection down
+    /// and killing every other operation multiplexed on it, forcing a
+    /// re-handshake. The fix returns `TransportError::OutboundStreamFailed`,
+    /// which `is_transient_send_failure()` classifies as non-fatal, so the recv
+    /// loop logs and lets the op layer retry while the connection survives (the
+    /// idle timeout remains the sole authority on connection liveness).
+    ///
+    /// This test drives the real `send_stream` to the cwnd-wait timeout with a
+    /// 1-byte cwnd (no packet ever fits, so the wait loop never breaks) and
+    /// asserts:
+    ///   1. the error IS `OutboundStreamFailed` (not `ConnectionClosed`), and
+    ///   2. `is_transient_send_failure()` is `true`, i.e. the recv loop takes
+    ///      the connection-survival arm.
+    ///
+    /// Asserting on `is_transient_send_failure()` is the load-bearing check:
+    /// the recv-loop classification (`peer_connection.rs`) is exactly
+    /// `Err(e) if e.is_transient_send_failure() => /* connection survives */`
+    /// vs the catch-all `Err(e) => return Err(e) /* connection torn down */`.
+    /// `send_failure_returns_transient_error` in `peer_connection.rs` exercises
+    /// the symmetric SendFailed case the same way. A full `PeerConnection::recv`
+    /// teardown harness would require substantial new scaffolding that the
+    /// stream-level unit harness here does not expose; the error-classification
+    /// assertions below pin the behavior the recv loop branches on.
+    #[tokio::test(start_paused = true)]
+    async fn cwnd_wait_timeout_fails_stream_not_connection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (outbound_sender, _outbound_receiver) = mpsc::channel(100);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let message = vec![0u8; 10_000];
+        let cipher = {
+            let mut key = [0u8; 16];
+            crate::config::GlobalRng::fill_bytes(&mut key);
+            Aes128Gcm::new(&key.into())
+        };
+
+        // RealTime under tokio's paused clock auto-advances through the cwnd
+        // wait loop's sleeps deterministically (same pattern as
+        // test_send_stream_cwnd_wait_timeout).
+        let time_source = RealTime::new();
+
+        // cwnd of 1 byte: every real packet exceeds it, so the cwnd wait loop
+        // never breaks and must hit CWND_WAIT_TIMEOUT.
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1,
+            min_cwnd: 1,
+            max_cwnd: 1,
+            ..Default::default()
+        })
+        .build_arc();
+
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+        let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
+
+        let send_task = GlobalExecutor::spawn(send_stream(
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            Bytes::from(message),
+            cipher,
+            sent_tracker,
+            token_bucket,
+            congestion_controller,
+            time_source,
+            None,
+            None,
+        ));
+
+        let err = send_task
+            .await
+            .expect("join error")
+            .expect_err("cwnd wait should time out");
+
+        // (1) The new stream-scoped variant, carrying the destination addr.
+        assert!(
+            matches!(err, TransportError::OutboundStreamFailed(addr) if addr == remote_addr),
+            "expected OutboundStreamFailed({remote_addr}), got: {err:?}"
+        );
+
+        // (2) It must NOT be ConnectionClosed — that is the fatal arm the recv
+        // loop would tear the connection down on.
+        assert!(
+            !matches!(err, TransportError::ConnectionClosed(_)),
+            "cwnd timeout must NOT be ConnectionClosed (would kill the connection): {err:?}"
+        );
+
+        // (3) The recv loop branches on is_transient_send_failure(); true means
+        // it logs and lets the op layer retry while the connection survives.
+        assert!(
+            err.is_transient_send_failure(),
+            "cwnd timeout must be classified transient so the connection survives: {err:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Core regression for issue #4345: when an outbound stream aborts on a
+    /// cwnd-wait timeout, the fragments it already put in flight MUST be released
+    /// from the connection's flight size immediately — not left pinned until each
+    /// ages out via `MAX_PACKET_RETRANSMITS` (~6s).
+    ///
+    /// Reproduces the stranded-flightsize symptom: a cwnd just large enough for a
+    /// couple of fragments, a socket that accepts sends but NO ACKs ever arrive,
+    /// so flight size climbs to ~cwnd and the next fragment's cwnd wait times out.
+    /// Before the stage-2 wiring, `send_stream` returned the error while leaving
+    /// those bytes in flight; FixedRate/LEDBAT then keep cwnd pinned at the frozen
+    /// flight size and every subsequent stream starves. This test asserts:
+    ///   1. flight size is > 0 at the moment of abort (fragments are stranded),
+    ///   2. flight size is back to 0 once `send_stream` returns (abort released
+    ///      the stream's in-flight bytes via drop_stream + release_flightsize).
+    #[tokio::test(start_paused = true)]
+    async fn cwnd_wait_timeout_releases_stranded_flightsize()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Generous channel + a drain task so sends never block; we never ACK.
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(1024);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        // ~7 fragments worth of data, but cwnd only admits a couple.
+        let message = vec![0u8; 10_000];
+        let cipher = {
+            let mut key = [0u8; 16];
+            crate::config::GlobalRng::fill_bytes(&mut key);
+            Aes128Gcm::new(&key.into())
+        };
+
+        let time_source = RealTime::new();
+
+        // cwnd admits ~2 fragments (2 * MAX_DATA_SIZE), so a few fragments go out
+        // and fill flight size, then the next fragment's cwnd wait times out.
+        let cwnd = 2 * MAX_DATA_SIZE;
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: cwnd,
+            min_cwnd: cwnd,
+            max_cwnd: cwnd,
+            ..Default::default()
+        })
+        .build_arc();
+
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+        let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
+
+        // Drain the socket so send_to never blocks; deliberately never ACK, so
+        // flight size only ever grows until the abort releases it.
+        let drain =
+            GlobalExecutor::spawn(async move { while outbound_receiver.recv().await.is_some() {} });
+
+        let cc_for_send = congestion_controller.clone();
+        let send_task = GlobalExecutor::spawn(send_stream(
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            Bytes::from(message),
+            cipher,
+            sent_tracker,
+            token_bucket,
+            cc_for_send,
+            time_source,
+            None,
+            None,
+        ));
+
+        let err = send_task
+            .await
+            .expect("join error")
+            .expect_err("cwnd wait should time out");
+        assert!(
+            matches!(err, TransportError::OutboundStreamFailed(addr) if addr == remote_addr),
+            "expected OutboundStreamFailed, got: {err:?}"
+        );
+
+        // The stranded fragments must have been released on abort. With no ACKs,
+        // the ONLY release path is the #4345 abort wiring; without it this reads
+        // ~cwnd (pinned) instead of 0.
+        assert_eq!(
+            congestion_controller.flightsize(),
+            0,
+            "issue #4345: aborting the stream must release its in-flight bytes \
+             (flight size should be drained, was {})",
+            congestion_controller.flightsize()
+        );
+
+        drain.abort();
+        Ok(())
+    }
+
+    /// Issue #4345 (stage 2): aborting a stream that has NO in-flight packets
+    /// (cwnd too small for even the first fragment, so nothing was ever sent)
+    /// must be a clean no-op — drop_stream releases 0 and flight size stays 0.
+    /// Guards against the abort wiring panicking or mis-releasing on the empty
+    /// case.
+    #[tokio::test(start_paused = true)]
+    async fn cwnd_wait_timeout_zero_inflight_is_noop() -> Result<(), Box<dyn std::error::Error>> {
+        let (outbound_sender, _outbound_receiver) = mpsc::channel(100);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let message = vec![0u8; 10_000];
+        let cipher = {
+            let mut key = [0u8; 16];
+            crate::config::GlobalRng::fill_bytes(&mut key);
+            Aes128Gcm::new(&key.into())
+        };
+
+        let time_source = RealTime::new();
+
+        // 1-byte cwnd: no fragment ever fits, so the FIRST cwnd wait times out
+        // before anything is sent. Flight size is 0 the whole time.
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1,
+            min_cwnd: 1,
+            max_cwnd: 1,
+            ..Default::default()
+        })
+        .build_arc();
+
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+        let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
+
+        let cc_for_send = congestion_controller.clone();
+        let send_task = GlobalExecutor::spawn(send_stream(
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            Bytes::from(message),
+            cipher,
+            sent_tracker,
+            token_bucket,
+            cc_for_send,
+            time_source,
+            None,
+            None,
+        ));
+
+        let err = send_task
+            .await
+            .expect("join error")
+            .expect_err("cwnd wait should time out");
+        assert!(
+            matches!(err, TransportError::OutboundStreamFailed(_)),
+            "expected OutboundStreamFailed, got: {err:?}"
+        );
+        assert_eq!(
+            congestion_controller.flightsize(),
+            0,
+            "aborting a stream with zero in-flight packets must keep flight size 0"
+        );
+        Ok(())
+    }
+
+    /// Issue #4235 — producer-side emission: a `send_stream` that runs to a
+    /// successful completion MUST signal `BroadcastDeliveryOutcome::Delivered`
+    /// on its `completion_tx`.
+    ///
+    /// The broadcast queue gates interest-refresh / summary-cache on this exact
+    /// outcome. If the success arm regressed to emit `Dropped` (or stopped
+    /// emitting), the queue would suppress interest refresh on real deliveries —
+    /// the inverse of #4235's symptom — and silently stop re-converging peers.
+    #[tokio::test]
+    async fn send_stream_success_signals_delivered() -> Result<(), Box<dyn std::error::Error>> {
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(1);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let mut message = vec![0u8; 100_000];
+        crate::config::GlobalRng::fill_bytes(&mut message);
+        let cipher = {
+            let mut key = [0u8; 16];
+            crate::config::GlobalRng::fill_bytes(&mut key);
+            Aes128Gcm::new(&key.into())
+        };
+
+        // VirtualTime + a cwnd/token bucket large enough that no sleeping or
+        // cwnd waiting is needed (mirrors test_send_stream_success).
+        let time_source = VirtualTime::new();
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(
+            SentPacketTracker::new_with_time_source(time_source.clone()),
+        ));
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1_000_000,
+            min_cwnd: 1_000_000,
+            max_cwnd: 1_000_000_000,
+            ..Default::default()
+        })
+        .build_arc_with_time_source(time_source.clone());
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            1_000_000,
+            10_000_000,
+            time_source.clone(),
+        ));
+
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let background_task = GlobalExecutor::spawn(send_stream(
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            Bytes::from(message.clone()),
+            cipher.clone(),
+            sent_tracker,
+            token_bucket,
+            congestion_controller,
+            time_source,
+            None,
+            Some(completion_tx),
+        ));
+
+        // Drain the socket so the stream can run to completion.
+        while outbound_receiver.recv().await.is_some() {}
+
+        let result = background_task.await?;
+        assert!(result.is_ok(), "send_stream should succeed: {result:?}");
+        assert_eq!(
+            completion_rx.await,
+            Ok(crate::transport::BroadcastDeliveryOutcome::Delivered),
+            "a successful stream MUST signal Delivered (#4235)"
+        );
+        Ok(())
+    }
+
+    /// Issue #4235 — producer-side emission: a `send_stream` that fails mid-flight
+    /// (a `packet_sending` error) MUST signal `BroadcastDeliveryOutcome::Dropped`
+    /// on its `completion_tx`, so the broadcast queue releases the permit WITHOUT
+    /// refreshing interest or caching the summary.
+    ///
+    /// The failure is induced by dropping the outbound socket receiver before the
+    /// stream starts: `TestSocket::send_to` then returns `ConnectionAborted`, so
+    /// the first `packet_sending` call errors and the error arm runs. A large
+    /// cwnd ensures the cwnd-wait early return (which drops the oneshot instead
+    /// of signaling) is NOT taken — we want the explicit `Dropped` send.
+    #[tokio::test]
+    async fn send_stream_failure_signals_dropped() -> Result<(), Box<dyn std::error::Error>> {
+        let (outbound_sender, outbound_receiver) = mpsc::channel(1);
+        // Drop the receiver: every TestSocket::send_to now fails with
+        // ConnectionAborted, so the first packet_sending() errors out.
+        drop(outbound_receiver);
+
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let message = vec![0u8; 10_000];
+        let cipher = {
+            let mut key = [0u8; 16];
+            crate::config::GlobalRng::fill_bytes(&mut key);
+            Aes128Gcm::new(&key.into())
+        };
+
+        let time_source = VirtualTime::new();
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(
+            SentPacketTracker::new_with_time_source(time_source.clone()),
+        ));
+        // Large cwnd so we reach packet_sending immediately rather than the
+        // cwnd-wait early return (which would drop the oneshot, not send Dropped).
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1_000_000,
+            min_cwnd: 1_000_000,
+            max_cwnd: 1_000_000_000,
+            ..Default::default()
+        })
+        .build_arc_with_time_source(time_source.clone());
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            1_000_000,
+            10_000_000,
+            time_source.clone(),
+        ));
+
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let cc_handle = congestion_controller.clone();
+        let background_task = GlobalExecutor::spawn(send_stream(
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            Bytes::from(message),
+            cipher,
+            sent_tracker,
+            token_bucket,
+            congestion_controller,
+            time_source,
+            None,
+            Some(completion_tx),
+        ));
+
+        let result = background_task.await?;
+        assert!(
+            result.is_err(),
+            "send_stream should fail when the socket is closed: {result:?}"
+        );
+        assert_eq!(
+            completion_rx.await,
+            Ok(crate::transport::BroadcastDeliveryOutcome::Dropped),
+            "a mid-flight send failure MUST signal Dropped (#4235)"
+        );
+        // #4345 mid-send-failure release: the first fragment's on_send bytes were
+        // added to flight size, then its send failed (so it was NEVER registered
+        // in the tracker). The mid-send error path must release exactly those
+        // bytes — once, via the explicit release_flightsize(packet_size) — so
+        // flight size returns to 0. A double-release would saturate to 0 too, but
+        // a future multi-packet wiring (non-empty confirm_receipt) could register
+        // a packet AND hit this path, so the dedicated single-packet guard at the
+        // call site (debug_assert) protects against that; here we pin the net-0.
+        assert_eq!(
+            cc_handle.flightsize(),
+            0,
+            "send_stream mid-send failure must release the failed fragment's bytes (net 0)"
+        );
+        Ok(())
+    }
+
+    /// #4345 mid-send-failure release for the PIPE path (outbound_stream.rs:692).
+    /// Mirror of `send_stream_failure_signals_dropped`'s flight-size assertion
+    /// but driving `pipe_stream`: a fragment is buffered, the socket fails on
+    /// send, and the mid-send error path must release the failed fragment's
+    /// on_send bytes exactly once so flight size returns to 0.
+    #[tokio::test]
+    async fn pipe_stream_mid_send_failure_releases_flightsize()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::transport::peer_connection::streaming::StreamHandle;
+
+        let (outbound_sender, outbound_receiver) = mpsc::channel(1);
+        // Drop the receiver so TestSocket::send_to returns ConnectionAborted on
+        // the first send — the mid-send error path runs.
+        drop(outbound_receiver);
+
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let cipher = {
+            let mut key = [0u8; 16];
+            crate::config::GlobalRng::fill_bytes(&mut key);
+            Aes128Gcm::new(&key.into())
+        };
+
+        let time_source = RealTime::new();
+
+        // One buffered fragment (<= FRAGMENT_PAYLOAD_SIZE, 1130 bytes).
+        let stream_id = StreamId::next();
+        let handle = StreamHandle::new(stream_id, 1000);
+        handle
+            .push_fragment(1, Bytes::from(vec![0u8; 1000]))
+            .unwrap();
+
+        // Large cwnd so the cwnd wait passes immediately and we reach
+        // packet_sending (which then fails on the dead socket).
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1_000_000,
+            min_cwnd: 1_000_000,
+            max_cwnd: 1_000_000_000,
+            ..Default::default()
+        })
+        .build_arc();
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+        let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
+
+        let cc_handle = congestion_controller.clone();
+        let pipe_task = GlobalExecutor::spawn(pipe_stream(
+            handle,
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            cipher,
+            sent_tracker,
+            token_bucket,
+            congestion_controller,
+            time_source,
+            None,
+        ));
+
+        let result = pipe_task.await.expect("join error");
+        assert!(
+            result.is_err(),
+            "pipe_stream should fail when the socket is closed: {result:?}"
+        );
+        assert_eq!(
+            cc_handle.flightsize(),
+            0,
+            "pipe_stream mid-send failure must release the failed fragment's bytes (net 0)"
+        );
         Ok(())
     }
 
@@ -1148,8 +1820,8 @@ mod tests {
         );
     }
 
-    /// Test that pipe_stream aborts with ConnectionClosed when the cwnd wait
-    /// exceeds CWND_WAIT_TIMEOUT. This exercises the same timeout logic as
+    /// Test that pipe_stream aborts with OutboundStreamFailed when the cwnd
+    /// wait exceeds CWND_WAIT_TIMEOUT. This exercises the same timeout logic as
     /// send_stream but through the pipe_stream code path with different state
     /// variables (sent_so_far as u64 bytes, no completion_tx).
     #[tokio::test(start_paused = true)]
@@ -1166,8 +1838,10 @@ mod tests {
 
         let time_source = RealTime::new();
 
-        // Create a StreamHandle with a fragment already buffered so the
-        // inactivity timeout (30s) doesn't fire before the cwnd timeout (20s).
+        // Create a StreamHandle with a fragment already buffered so the cwnd
+        // wait loop has work to do. The fragment is never ACKed (no recv task),
+        // so the cwnd wait (CWND_WAIT_TIMEOUT = 3s) fires before the inactivity
+        // timeout (STREAM_INACTIVITY_TIMEOUT = 5s).
         // Fragment must be <= FRAGMENT_PAYLOAD_SIZE (1130 bytes).
         let stream_id = StreamId::next();
         let handle = StreamHandle::new(stream_id, 10_000);
@@ -1175,17 +1849,24 @@ mod tests {
             .push_fragment(1, Bytes::from(vec![0u8; 1000]))
             .unwrap();
 
-        // Stuck congestion controller: flightsize is very large so even with
-        // LOSS_PAUSE_MARGIN the pipe can send a few packets but the receiver
-        // never ACKs (no ACK task running), so flightsize keeps growing until
-        // the margin is consumed and the cwnd wait times out.
-        let congestion_controller = CongestionControlConfig::default().build_arc();
-        congestion_controller.on_send(1_000_000);
-        congestion_controller.on_timeout();
+        // LEDBAT controller with a 1-byte cwnd: every real packet exceeds it,
+        // so the cwnd wait loop never breaks and must hit CWND_WAIT_TIMEOUT.
+        // (The previous version used CongestionControlConfig::default(), which
+        // is FixedRate with current_cwnd() == usize::MAX/2 — the cwnd loop
+        // never blocked, so the test silently exercised the inactivity-timeout
+        // path instead of the cwnd-wait path it claims to test.)
+        let congestion_controller = CongestionControlConfig::from_ledbat_config(LedbatConfig {
+            initial_cwnd: 1,
+            min_cwnd: 1,
+            max_cwnd: 1,
+            ..Default::default()
+        })
+        .build_arc();
 
         let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
         let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
 
+        let cc_handle = congestion_controller.clone();
         let pipe_task = GlobalExecutor::spawn(pipe_stream(
             handle,
             StreamId::next(),
@@ -1202,9 +1883,179 @@ mod tests {
 
         let result = pipe_task.await.expect("join error");
         assert!(
-            matches!(result, Err(TransportError::ConnectionClosed(_))),
-            "Expected ConnectionClosed after pipe_stream cwnd wait timeout, got: {:?}",
+            matches!(result, Err(TransportError::OutboundStreamFailed(_))),
+            "Expected OutboundStreamFailed after pipe_stream cwnd wait timeout, got: {:?}",
             result
+        );
+        // #4345: the abort must leave flight size released. Here a 1-byte cwnd
+        // means no fragment ever went out, so this guards that the abort's
+        // drop_stream is a clean no-op (0) rather than mis-releasing or panicking.
+        assert_eq!(
+            cc_handle.flightsize(),
+            0,
+            "pipe_stream cwnd-wait abort must leave flight size at 0"
+        );
+
+        Ok(())
+    }
+
+    /// Regression test for #4345 (relay-pipe inactivity-stall path,
+    /// outbound_stream.rs:456): when the UPSTREAM inbound feed produces no
+    /// fragment within STREAM_INACTIVITY_TIMEOUT, pipe_stream must fail only
+    /// THIS stream — not tear down the DOWNSTREAM connection that carries other
+    /// multiplexed ops. Before this PR the site returned ConnectionClosed
+    /// (is_transient_send_failure() == false → recv loop's fatal arm).
+    ///
+    /// Drives the stall by registering a StreamHandle with NO fragment ever
+    /// pushed, so `stream.next()` stays Pending and the select!'s
+    /// inactivity-timeout arm fires. Asserts the error is OutboundStreamFailed,
+    /// is_transient_send_failure() is true, and it is NOT ConnectionClosed.
+    #[tokio::test(start_paused = true)]
+    async fn pipe_stream_inactivity_stall_fails_stream_not_connection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::transport::peer_connection::streaming::StreamHandle;
+
+        let (outbound_sender, _outbound_receiver) = mpsc::channel(100);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let cipher = {
+            let mut key = [0u8; 16];
+            crate::config::GlobalRng::fill_bytes(&mut key);
+            Aes128Gcm::new(&key.into())
+        };
+
+        let time_source = RealTime::new();
+
+        // StreamHandle with NO fragment pushed: stream.next() stays Pending, so
+        // the inactivity timeout (STREAM_INACTIVITY_TIMEOUT) fires before any
+        // fragment can be sent. The stall is reached before the cwnd loop, so
+        // the congestion-control config is irrelevant; use the default.
+        let stream_id = StreamId::next();
+        let handle = StreamHandle::new(stream_id, 10_000);
+
+        let congestion_controller = CongestionControlConfig::default().build_arc();
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+        let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
+
+        let cc_handle = congestion_controller.clone();
+        let pipe_task = GlobalExecutor::spawn(pipe_stream(
+            handle,
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            cipher,
+            sent_tracker,
+            token_bucket,
+            congestion_controller,
+            time_source,
+            None,
+        ));
+
+        let err = pipe_task
+            .await
+            .expect("join error")
+            .expect_err("inactivity stall should fail the stream");
+
+        assert!(
+            matches!(err, TransportError::OutboundStreamFailed(addr) if addr == remote_addr),
+            "expected OutboundStreamFailed({remote_addr}) on inactivity stall, got: {err:?}"
+        );
+        assert!(
+            !matches!(err, TransportError::ConnectionClosed(_)),
+            "inactivity stall must NOT be ConnectionClosed (would kill the connection): {err:?}"
+        );
+        assert!(
+            err.is_transient_send_failure(),
+            "inactivity stall must be classified transient so the connection survives: {err:?}"
+        );
+        // #4345: the stall fires before any fragment is sent, so the abort's
+        // drop_stream is a clean no-op and flight size stays 0.
+        assert_eq!(
+            cc_handle.flightsize(),
+            0,
+            "pipe_stream inactivity-stall abort must leave flight size at 0"
+        );
+
+        Ok(())
+    }
+
+    /// Regression test for #4345 (relay-pipe inbound-stream-error path,
+    /// outbound_stream.rs:471): when the UPSTREAM inbound stream yields an
+    /// error, pipe_stream must fail only THIS stream — not the DOWNSTREAM
+    /// connection. Before this PR the site returned ConnectionClosed
+    /// (is_transient_send_failure() == false → recv loop's fatal arm).
+    ///
+    /// Drives the error by cancelling the StreamHandle so the inbound stream
+    /// yields Err(StreamError::Cancelled). Asserts the error is
+    /// OutboundStreamFailed, is_transient_send_failure() is true, and it is NOT
+    /// ConnectionClosed.
+    #[tokio::test(start_paused = true)]
+    async fn pipe_stream_inbound_error_fails_stream_not_connection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::transport::peer_connection::streaming::StreamHandle;
+
+        let (outbound_sender, _outbound_receiver) = mpsc::channel(100);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let cipher = {
+            let mut key = [0u8; 16];
+            crate::config::GlobalRng::fill_bytes(&mut key);
+            Aes128Gcm::new(&key.into())
+        };
+
+        let time_source = RealTime::new();
+
+        // Cancel the handle so the inbound stream yields Err(Cancelled). The
+        // poll_next cancelled-check fires before any cwnd wait, so the
+        // congestion-control config is irrelevant; use the default.
+        let stream_id = StreamId::next();
+        let handle = StreamHandle::new(stream_id, 10_000);
+        handle
+            .push_fragment(1, Bytes::from(vec![0u8; 1000]))
+            .unwrap();
+        handle.cancel();
+
+        let congestion_controller = CongestionControlConfig::default().build_arc();
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+        let token_bucket = Arc::new(TokenBucket::new(1_000_000, 100_000_000));
+
+        let cc_handle = congestion_controller.clone();
+        let pipe_task = GlobalExecutor::spawn(pipe_stream(
+            handle,
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            cipher,
+            sent_tracker,
+            token_bucket,
+            congestion_controller,
+            time_source,
+            None,
+        ));
+
+        let err = pipe_task
+            .await
+            .expect("join error")
+            .expect_err("inbound stream error should fail the stream");
+
+        assert!(
+            matches!(err, TransportError::OutboundStreamFailed(addr) if addr == remote_addr),
+            "expected OutboundStreamFailed({remote_addr}) on inbound error, got: {err:?}"
+        );
+        assert!(
+            !matches!(err, TransportError::ConnectionClosed(_)),
+            "inbound error must NOT be ConnectionClosed (would kill the connection): {err:?}"
+        );
+        assert!(
+            err.is_transient_send_failure(),
+            "inbound error must be classified transient so the connection survives: {err:?}"
+        );
+        // #4345: the inbound error fires before any fragment is sent, so the
+        // abort's drop_stream is a clean no-op and flight size stays 0.
+        assert_eq!(
+            cc_handle.flightsize(),
+            0,
+            "pipe_stream inbound-error abort must leave flight size at 0"
         );
 
         Ok(())

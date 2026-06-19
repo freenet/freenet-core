@@ -22,11 +22,17 @@ Driver entry points:
 | GET | `get/op_ctx_task.rs::start_client_get`, `start_relay_get`, `start_sub_op_get`, `start_targeted_sub_op_get` |
 | PUT | `put/op_ctx_task.rs::start_client_put`, `start_relay_put`, `start_relay_put_streaming` |
 | UPDATE | `update/op_ctx_task.rs::start_client_update`, `start_relay_request_update`, `start_relay_broadcast_to`, `start_relay_request_update_streaming`, `start_relay_broadcast_to_streaming` |
-| SUBSCRIBE | `subscribe/op_ctx_task.rs::start_client_subscribe`, `run_executor_subscribe`, `run_renewal_subscribe`, `start_relay_subscribe`; `subscribe.rs::handle_unsubscribe_inbound` for `Unsubscribe` |
+| SUBSCRIBE | `subscribe/op_ctx_task.rs::start_client_subscribe`, `start_directed_subscribe` (SubscribeHint placement nudge, #4404), `run_executor_subscribe`, `run_renewal_subscribe`, `start_relay_subscribe`; `subscribe.rs::handle_unsubscribe_inbound` for `Unsubscribe` |
 
 The shared retry-loop driver lives in `op_ctx.rs` (`RetryDriver` trait
 + `drive_retry_loop`). UPDATE is fire-and-forget (no retry loop, no
-upstream reply); GET/PUT/SUBSCRIBE share the retry driver.
+upstream reply); GET/PUT/SUBSCRIBE share the retry driver. GET's
+client and sub-op drivers enter the loop via
+`get/op_ctx_task.rs::drive_get_with_assembly_retry`, which treats a
+post-terminal stream-assembly failure as a retryable attempt failure
+(#4345) — post-terminal side effects that can fail retryably belong in
+such a wrapper, never inside the loop's Terminal arm (pinned by
+`drive_retry_loop_terminal_arm_does_not_call_advance`).
 
 ## Wire-variant dispatch
 
@@ -35,8 +41,12 @@ for every inbound wire message. Pattern per op:
 
 1. **Reply bypass.** If a terminal reply variant arrives and a
    `pending_op_results` callback is registered, forward it via
-   `try_forward_task_per_tx_reply` and return. For GET/PUT/SUBSCRIBE
-   the gate is `Response | ResponseStreaming` only. CONNECT forwards
+   `try_forward_driver_reply` and return. For GET/PUT/SUBSCRIBE the
+   gate is `Response | ResponseStreaming` only. PUT additionally
+   accepts `PutMsg::Error` so the originator-loopback failure path
+   (issue #4111) delivers the contract-side cause via the same bypass
+   instead of timing out the retry loop on a closed reply channel.
+   CONNECT forwards
    all four non-`Request` variants (multi-reply fan-in).
 2. **Relay dispatch.** Spawn the matching `start_relay_*` driver.
    Originator-loopback (`source_addr=None`) is mapped to
@@ -69,8 +79,18 @@ On a relay driver's response path, any operation that enqueues on the
 single-threaded `contract_handling` event loop (GetQuery, PutQuery,
 validate_state, `RequestRelated` recursion, etc.) MUST be sequenced
 AFTER the upstream forward. Reversing this puts WASM `validate_state`
-and the 10s `RELATED_FETCH_TIMEOUT` directly on the upstream-visible
-critical path, where they stack across multi-hop traversals.
+directly on the upstream-visible critical path, where it stacks across
+multi-hop traversals.
+
+Note (#4391): the related-contract NETWORK fetch's 10s
+`RELATED_FETCH_TIMEOUT` is no longer awaited inline on the
+`contract_handling` loop — a PUT/UPDATE that needs a related contract
+not held locally now off-loads that fetch to a background task and
+re-enqueues a continuation (see `contract.rs::maybe_defer_upsert`), so
+the loop no longer stalls for that 10s window. WASM
+`validate_state`/`update_state`/store still run serially on the loop,
+so this invariant still holds for the WASM work; only the related-fetch
+WAIT no longer contributes to the stall.
 
 ```
 RIGHT (issue #4155 fix):
@@ -223,6 +243,59 @@ CORRECT:
   send_peer_list(connected_peers.filter(|p| is_live_connection(p)))
 ```
 
+### WHEN publishing a terminal operation reply
+
+```
+Sync-failure paths (where the driver knows the operation is done and
+must publish a Result to the originator) MUST deliver via the SAME
+mechanism the success path uses — NOT via direct send_client_result.
+
+WRONG:
+  if put_contract(...).is_err() {
+      op_manager.send_client_result(tx, Err(host_err));  // M1
+      op_manager.completed(tx);                          // M2
+  }
+
+  M1 and M2 are independent try_send calls on different channels
+  (result_router_tx vs event-loop notification channel). When the
+  event loop processes M2 first, it removes pending_op_results[tx]
+  BEFORE send_and_await consumes M1; the retry-loop sees the closed
+  channel as NotificationError, advances, burns the retry budget on
+  the same deterministic failure, and the user gets the synthesised
+  "failed notifying, channel closed" instead of the real reason.
+
+CORRECT:
+  let err_msg = NetMessage::from(<Op>Msg::Error { id: tx, cause });
+  ctx.send_local_loopback(err_msg).await?;
+
+  Routing: handle_pure_network_message_v1 forwards <Op>Msg::Error
+  into pending_op_results[tx] like Response; classify_reply returns
+  ReplyClass::TerminalError { cause }; the driver returns
+  Terminal(Err(cause)) → Done(Err); run_client_<op> publishes ONE
+  HostResult::Err and calls op_manager.completed(client_tx)
+  synchronously — no race window.
+
+Multi-hop: when a downstream relay returns <Op>Msg::Error, the
+relay MUST propagate the cause one hop further upstream via a
+matching `relay_<op>_send_error` helper, not fall through to a
+generic OpError::UnexpectedOpState wildcard.
+
+DoS amplification: cap the cause length at the wire boundary.
+PUT uses PUT_TERMINAL_CAUSE_MAX_BYTES = 2048 + a UTF-8-safe
+truncator (see `bound_cause` in operations/put.rs).
+
+Testing: PUT's bypass + multi-hop bubble is covered by unit tests
+in `operations/put/op_ctx_task.rs::tests` (search for
+`relay_put_send_error_with_ctx_*`, `drive_relay_put_error_arm_*`,
+`run_relay_put_bubbles_local_failure_*`, and
+`dispatch_loopback_shutdown_fallback_*`) plus the
+`tests/error_notification.rs::test_put_error_notification*` E2E
+pair. The wrapper-contract E2E that asserts on a stable,
+contract-side cause string is tracked as follow-up #4147 — the
+existing E2E tests assert only the absence of the synthesised
+`"failed notifying, channel closed"` marker.
+```
+
 ## Error Handling
 
 ### WHEN a reply arrives with no waiter
@@ -251,8 +324,48 @@ at the dispatch site. Do NOT treat as an error.
 □ Test race conditions (fast responses)
 ```
 
+### WHEN awaiting a reply on `pending_op_results[tx]` (#4313)
+
+When a connection is pruned, `handle_orphaned_transactions` wakes each
+parked driver. The cause travels **through the waiter channel itself**:
+the `TransactionOrphaned { tx, peer }` event-loop handler does
+`sender.try_send(WaiterReply::PeerDisconnected { peer })` and *then*
+drops the sender. tokio mpsc delivers a buffered item before the
+channel reads `None`, so the driver deterministically observes
+`PeerDisconnected` (mapped to `OpError::PeerDisconnected`) — never the
+`"failed notifying, channel closed"` FORBIDDEN_MARKER that
+`tests/error_notification.rs` asserts against. There is no side
+registry and no record-before-release ordering to get wrong.
+
+```
+The waiter channel item is `WaiterReply` (Reply | PeerDisconnected),
+  NOT a bare NetMessage. Every recv site MUST handle PeerDisconnected
+  — the type system enforces this. Funnel through
+  OpCtx::recv_waiter_reply (used by send_and_await, send_to_and_await,
+  and the PUT/CONNECT relays) rather than matching the enum by hand.
+
+The TransactionOrphaned handler MUST send PeerDisconnected on the
+  sender it removes from pending_op_results BEFORE that sender drops
+  (send-before-drop). Dropping without sending re-opens the #4313
+  race (driver wakes on close with no cause → FORBIDDEN_MARKER).
+
+PeerDisconnected routes to the generic advance arm in
+  drive_retry_loop (the peer is gone — advance to the next route),
+  NOT the NotificationError same-peer infra-retry arm. MUST preserve
+  `{err}` interpolation in the Exhausted format so the cause Display
+  reaches the user.
+```
+
+Pins (source-scrape, fail the build on regression):
+- `transaction_orphaned_handler_sends_cause_before_dropping_sender` (p2p_protoc.rs)
+- `handle_orphaned_transactions_wakes_parked_drivers` (p2p_protoc.rs)
+- behavioural: `parked_driver_always_observes_peer_disconnected_under_churn`,
+  `recv_waiter_reply_*` (op_ctx.rs) and
+  `orphaned_transaction_wakes_parked_waiter_with_peer_disconnected` (op_state_manager.rs)
+
 ## Documentation
 
 - Architecture: `docs/architecture/operations/README.md`
 - OpManager: `crates/core/src/node/op_state_manager.rs`
 - Round-trip primitive: `crates/core/src/operations/op_ctx.rs`
+- Orphan-wake signal: `crate::node::WaiterReply::PeerDisconnected` + `NodeEvent::TransactionOrphaned` (#4313)

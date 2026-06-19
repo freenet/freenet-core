@@ -1,0 +1,98 @@
+name: Notify Freenet dev room
+description: >
+  Post a message to the private freenet-dev River room via riverctl. Best
+  effort: never fails the calling job. No-ops with a warning when the dev-room
+  secrets are not configured (e.g. on forks).
+
+inputs:
+  message:
+    description: The message body to post.
+    required: true
+  bot-config:
+    description: >
+      base64-encoded riverctl rooms.json carrying the CI bot's signing key and
+      the room's invitation secrets (the RIVER_DEV_BOT_CONFIG secret). Posting
+      into a PRIVATE room needs both the member signing key AND the room's
+      symmetric secret; this config supplies both.
+    required: true
+  room-id:
+    description: base58 room owner verifying key (RIVER_DEV_ROOM_ID secret).
+    required: true
+  gateway-url:
+    description: Freenet gateway WebSocket URL (RIVER_GATEWAY_URL secret).
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # The two setup steps are continue-on-error so a transient toolchain /
+    # crates.io hiccup never red-fails the calling job: the action is
+    # best-effort notification plumbing. If install fails, the post step below
+    # still runs and degrades to a `::warning::` (riverctl simply isn't found).
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      continue-on-error: true
+      with:
+        toolchain: 1.93.0
+
+    - name: Install riverctl
+      shell: bash
+      continue-on-error: true
+      # Private-room message sending landed in riverctl 0.1.70 (freenet/river#350);
+      # earlier versions can only post to PUBLIC rooms and would fail here. The
+      # `^0.1.70` range (>=0.1.70, <0.2.0) is deliberately NOT pinned to an exact
+      # version: the room contract key is derived from the bundled room-contract
+      # WASM, so if that WASM changes and riverctl is republished, an exact pin
+      # would keep computing the OLD contract key and silently send nowhere.
+      # Tracking the latest 0.1.x keeps CI in sync with the deployed contract.
+      run: cargo install riverctl --version '^0.1.70'
+
+    - name: Post to the dev room (with exponential backoff)
+      shell: bash
+      env:
+        BOT_CONFIG: ${{ inputs.bot-config }}
+        ROOM_ID: ${{ inputs.room-id }}
+        NODE_URL: ${{ inputs.gateway-url }}
+        MESSAGE: ${{ inputs.message }}
+      run: |
+        set -u
+        if [ -z "${BOT_CONFIG}" ] || [ -z "${ROOM_ID}" ] || [ -z "${NODE_URL}" ]; then
+          echo "::warning::Freenet dev-room secrets not configured; skipping notification"
+          exit 0
+        fi
+
+        # Materialise the bot's riverctl config from the secret. `message send`
+        # fetches fresh room state from the network, so the config only needs
+        # the signing key + invitation secrets — the stored state is ignored.
+        CFG="$(mktemp -d)"
+        trap 'rm -rf "$CFG"' EXIT
+        if ! printf '%s' "$BOT_CONFIG" | base64 -d > "$CFG/rooms.json" 2>/dev/null; then
+          echo "::warning::RIVER_DEV_BOT_CONFIG is not valid base64; skipping notification"
+          exit 0
+        fi
+
+        max_attempts=7
+        delay=10
+        for attempt in $(seq 1 "$max_attempts"); do
+          echo "Attempt $attempt/$max_attempts..."
+          # Output is sent to /dev/null on purpose: freenet-core's Actions logs
+          # are public, and RIVER_DEV_BOT_CONFIG carries the room's symmetric
+          # secret. GitHub auto-redacts the registered secret value but NOT the
+          # base64-decoded config, so any riverctl diagnostic that echoed config
+          # bytes would leak. The exit code is the only signal we consume.
+          if riverctl --config-dir "$CFG" --node-url "$NODE_URL" \
+               message send "$ROOM_ID" "$MESSAGE" >/dev/null 2>&1; then
+            echo "Dev-room notification sent on attempt $attempt"
+            exit 0
+          fi
+          if [ "$attempt" -lt "$max_attempts" ]; then
+            # Exponential backoff with +/-20% jitter so a burst of notifier
+            # instances (a merge-queue flush, back-to-back merges) don't retry
+            # in lockstep and synchronously hammer the gateway. (freenet-core
+            # retry/backoff rule: jitter required.)
+            sleep $(( delay - delay / 5 + RANDOM % (2 * delay / 5 + 1) ))
+            delay=$((delay * 2))
+          fi
+        done
+        echo "::warning::Failed to send Freenet dev-room notification after $max_attempts attempts (gateway may be restarting)"
+        exit 0

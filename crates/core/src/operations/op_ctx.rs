@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use tokio::sync::mpsc;
 
 use crate::message::{MessageStats, NetMessage, Transaction};
-use crate::node::OpExecutionPayload;
+use crate::node::{OpExecutionPayload, WaiterReply};
 use crate::operations::OpError;
 
 /// Per-transaction execution context for the driver model.
@@ -160,7 +160,7 @@ impl OpCtx {
             "OpCtx::send_fire_and_forget: msg.id must match ctx.tx"
         );
 
-        let (response_sender, _response_receiver) = mpsc::channel::<NetMessage>(1);
+        let (response_sender, _response_receiver) = mpsc::channel::<WaiterReply>(1);
         // _response_receiver is dropped here. The sender stored in
         // pending_op_results becomes is_closed() == true, reclaimable by
         // the 60s sweep or an explicit release_pending_op_slot call.
@@ -189,7 +189,7 @@ impl OpCtx {
             "OpCtx::send_local_loopback: msg.id must match ctx.tx"
         );
 
-        let (response_sender, _response_receiver) = mpsc::channel::<NetMessage>(1);
+        let (response_sender, _response_receiver) = mpsc::channel::<WaiterReply>(1);
 
         self.op_execution_sender
             .send((response_sender, msg, None))
@@ -231,14 +231,14 @@ impl OpCtx {
         &mut self,
         target_addr: SocketAddr,
         msg: NetMessage,
-    ) -> Result<mpsc::Receiver<NetMessage>, OpError> {
+    ) -> Result<mpsc::Receiver<WaiterReply>, OpError> {
         debug_assert_eq!(
             msg.id(),
             &self.tx,
             "OpCtx::send_to_and_register_waiter: msg.id must match ctx.tx"
         );
 
-        let (response_sender, response_receiver) = mpsc::channel::<NetMessage>(1);
+        let (response_sender, response_receiver) = mpsc::channel::<WaiterReply>(1);
 
         self.op_execution_sender
             .send((response_sender, msg, Some(target_addr)))
@@ -286,7 +286,7 @@ impl OpCtx {
         &mut self,
         msg: NetMessage,
         capacity: usize,
-    ) -> Result<mpsc::Receiver<NetMessage>, OpError> {
+    ) -> Result<mpsc::Receiver<WaiterReply>, OpError> {
         debug_assert_eq!(
             msg.id(),
             &self.tx,
@@ -297,7 +297,7 @@ impl OpCtx {
             "OpCtx::send_and_collect_replies: capacity must be >= 1"
         );
 
-        let (response_sender, response_receiver) = mpsc::channel::<NetMessage>(capacity);
+        let (response_sender, response_receiver) = mpsc::channel::<WaiterReply>(capacity);
 
         self.op_execution_sender
             .send((response_sender, msg, None))
@@ -319,7 +319,7 @@ impl OpCtx {
         target_addr: SocketAddr,
         msg: NetMessage,
         capacity: usize,
-    ) -> Result<mpsc::Receiver<NetMessage>, OpError> {
+    ) -> Result<mpsc::Receiver<WaiterReply>, OpError> {
         debug_assert_eq!(
             msg.id(),
             &self.tx,
@@ -330,7 +330,7 @@ impl OpCtx {
             "OpCtx::send_to_and_collect_replies: capacity must be >= 1"
         );
 
-        let (response_sender, response_receiver) = mpsc::channel::<NetMessage>(capacity);
+        let (response_sender, response_receiver) = mpsc::channel::<WaiterReply>(capacity);
 
         self.op_execution_sender
             .send((response_sender, msg, Some(target_addr)))
@@ -351,29 +351,42 @@ impl OpCtx {
             "OpCtx::send_and_await: msg.id must match ctx.tx"
         );
 
-        let (response_sender, mut response_receiver) = mpsc::channel::<NetMessage>(1);
+        let (response_sender, mut response_receiver) = mpsc::channel::<WaiterReply>(1);
 
         self.op_execution_sender
             .send((response_sender, msg, target_addr))
             .await
             .map_err(|_| OpError::NotificationError)?;
 
-        match response_receiver.recv().await {
-            Some(reply) => {
-                // Debug-only defense-in-depth. In a release build a
-                // mismatched reply tx would silently return to the
-                // caller (the reply is for a *different* transaction).
-                // That would be a correctness bug in whatever mislabeled
-                // the message in `p2p_protoc::pending_op_results`, not a
-                // failure mode of `send_and_await` itself — the assert
-                // exists to catch such bugs at development time.
+        self.recv_waiter_reply(&mut response_receiver).await
+    }
+
+    /// Await the next reply on a `pending_op_results[tx]` waiter channel.
+    ///
+    /// Single chokepoint: the `WaiterReply` enum forces every caller to
+    /// handle the terminal `PeerDisconnected` signal the prune path
+    /// delivers through the channel (#4313). On a `PeerDisconnected`
+    /// item the awaited peer was pruned mid-flight, so the driver should
+    /// advance to another route; a bare channel close with no terminal
+    /// item is a genuine teardown and falls back to `NotificationError`.
+    pub(crate) async fn recv_waiter_reply(
+        &self,
+        receiver: &mut mpsc::Receiver<WaiterReply>,
+    ) -> Result<NetMessage, OpError> {
+        match receiver.recv().await {
+            Some(WaiterReply::Reply(reply)) => {
+                // A mismatched reply tx would be a bug in the bypass
+                // layer; catch it in debug builds.
                 debug_assert_eq!(
                     reply.id(),
                     &self.tx,
-                    "OpCtx::send_and_await: reply tx must match ctx.tx"
+                    "recv_waiter_reply: reply tx must match ctx.tx"
                 );
                 Ok(reply)
             }
+            Some(WaiterReply::PeerDisconnected { peer }) => Err(OpError::PeerDisconnected { peer }),
+            // Genuine teardown with no terminal signal (executor torn
+            // down, callback dropped): pre-#4313 fallback.
             None => Err(OpError::NotificationError),
         }
     }
@@ -455,6 +468,28 @@ pub(crate) trait RetryDriver {
     }
 }
 
+/// Maximum cheap, fast retries of a `NotificationError` (local callback
+/// dropped without a reply) on the same peer before falling through to
+/// peer advancement.
+///
+/// `NotificationError` from `send_and_await` has two sources. First,
+/// `op_execution_sender.send()` fails — receiver dropped (genuine
+/// shutdown, will keep failing). Second, `response_receiver.recv()`
+/// returns `None` — the event loop received the request but dropped
+/// the callback without a reply, which is a transient startup-window
+/// race (a freshly-booted gateway whose downstream handler isn't
+/// ready yet for the first streaming PUT). The second case recovers
+/// within milliseconds; the first will exhaust the budget and
+/// surface promptly. Both are decoupled from "is the chosen peer
+/// slow/dead", so they MUST NOT count against the per-driver
+/// peer-advancement cap (which exists to bound wall-clock budget
+/// against slow transport-stall timeouts — freenet-git#53).
+///
+/// 3 retries with cumulative jittered delay under 300 ms adds
+/// negligible wall-clock vs a single `STREAMING_ATTEMPT_TIMEOUT_CAP`
+/// (600 s) and stays well under any WS-client per-attempt patience.
+const MAX_INFRA_RETRIES: usize = 3;
+
 /// Drive a retry loop against the network.
 ///
 /// The first attempt reuses `client_tx` so telemetry correlates with the
@@ -465,6 +500,9 @@ pub(crate) trait RetryDriver {
 /// - `tokio::time::timeout(driver.attempt_timeout(), ...)` wrapping
 /// - `release_pending_op_slot` cleanup on every exit path
 /// - Structured `outcome=wire_error|timeout` logging
+/// - Cheap fast retries of `NotificationError` (callback drop) on
+///   the same peer, decoupled from the peer-advancement cap — see
+///   [`MAX_INFRA_RETRIES`]
 pub(crate) async fn drive_retry_loop<D: RetryDriver>(
     op_manager: &OpManager,
     client_tx: Transaction,
@@ -473,6 +511,7 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
 ) -> RetryLoopOutcome<D::Terminal> {
     let mut is_first_attempt = true;
     let mut attempt_count: usize = 0;
+    let mut infra_retries: usize = 0;
 
     loop {
         let attempt_tx = if is_first_attempt {
@@ -496,6 +535,39 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
 
         let reply = match round_trip {
             Ok(Ok(reply)) => reply,
+            // Fast infra-retry path: a `NotificationError` is a local
+            // callback drop (event loop received the request but
+            // didn't deliver a reply), NOT a slow peer-stall. Retry
+            // the SAME peer with a fresh attempt_tx — decoupled from
+            // the peer-advancement cap. See `MAX_INFRA_RETRIES` doc
+            // for the budget analysis. Capped to avoid burning CPU in
+            // a true shutdown (where the receiver is genuinely
+            // dropped and will keep failing).
+            Ok(Err(OpError::NotificationError)) if infra_retries < MAX_INFRA_RETRIES => {
+                infra_retries += 1;
+                tracing::debug!(
+                    tx = %client_tx,
+                    attempt_tx = %attempt_tx,
+                    attempt = attempt_count,
+                    infra_retry = infra_retries,
+                    "{op_label}: infrastructure error (callback dropped); \
+                     retrying same peer with fresh attempt_tx"
+                );
+                // Brief jittered delay so the receiver side can
+                // recover from whatever transient state caused the
+                // drop (e.g., a downstream handler still initializing
+                // on a freshly-booted gateway). Base `50 ms ×
+                // infra_retries` with ±20% jitter via `GlobalRng`
+                // (deterministic under simulation, ±20% per the
+                // `code-style.md` retry/backoff rule). Worst-case
+                // cumulative is 50+100+150 ms × 1.2 = 360 ms —
+                // negligible against the per-attempt timeout cap.
+                let base_ms = 50 * infra_retries as u64;
+                let jitter_factor = crate::config::GlobalRng::random_range::<f64, _>(0.8..1.2);
+                let sleep_ms = (base_ms as f64 * jitter_factor) as u64;
+                tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
+                continue;
+            }
             Ok(Err(err)) => {
                 tracing::warn!(
                     tx = %client_tx,
@@ -508,8 +580,10 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                 match driver.advance() {
                     AdvanceOutcome::Next => continue,
                     AdvanceOutcome::Exhausted => {
+                        let peer_attempts = attempt_count.saturating_sub(infra_retries);
                         return RetryLoopOutcome::Exhausted(format!(
-                            "{op_label} failed after {attempt_count} attempts (last error: {err})"
+                            "{op_label} failed after {peer_attempts} peer attempt(s) \
+                             ({infra_retries} infra-retries on same peer; last error: {err})"
                         ));
                     }
                 }
@@ -526,8 +600,10 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                 match driver.advance() {
                     AdvanceOutcome::Next => continue,
                     AdvanceOutcome::Exhausted => {
+                        let peer_attempts = attempt_count.saturating_sub(infra_retries);
                         return RetryLoopOutcome::Exhausted(format!(
-                            "{op_label} timed out after {attempt_count} attempts"
+                            "{op_label} timed out after {peer_attempts} peer attempt(s) \
+                             ({infra_retries} infra-retries on same peer)"
                         ));
                     }
                 }
@@ -582,6 +658,87 @@ mod tests {
     use crate::operations::connect::ConnectMsg;
     use tokio::time::{Duration, timeout};
 
+    /// Behavioural pin on `drive_retry_loop`'s `AttemptOutcome::Terminal`
+    /// arm: it MUST return `RetryLoopOutcome::Done(value)` synchronously,
+    /// WITHOUT calling `driver.advance()`.
+    ///
+    /// Why this is a source-pin: a fully behavioural test requires
+    /// instantiating an `OpManager` (the function takes `&OpManager` to
+    /// build the per-attempt `OpCtx` and to send `TransactionCompleted`),
+    /// which costs too much for a unit test. The structural pin
+    /// scopes the assertion to the Terminal arm itself — the production
+    /// code under test is exactly five lines — and a regression that
+    /// routes Terminal through `advance()` would unambiguously contain
+    /// the substring `.advance()` inside this arm.
+    ///
+    /// Pairs with `classify_reply_error_maps_to_terminal_error_with_cause`
+    /// in `crate::operations::put::op_ctx_task::tests` to cover the full
+    /// PUT-error chain (PutMsg::Error → TerminalError → Terminal →
+    /// Done(Err) without advance).
+    #[test]
+    fn drive_retry_loop_terminal_arm_does_not_call_advance() {
+        const SOURCE: &str = include_str!("op_ctx.rs");
+
+        let fn_anchor = "pub(crate) async fn drive_retry_loop<D: RetryDriver>(";
+        let fn_start = SOURCE.find(fn_anchor).expect(
+            "drive_retry_loop not found — signature has been renamed, \
+             update this guard",
+        );
+
+        // The `match driver.classify(reply) {` block contains the
+        // Terminal arm we care about. Locate it.
+        let classify_match = SOURCE[fn_start..]
+            .find("match driver.classify(reply) {")
+            .map(|p| fn_start + p)
+            .expect("`match driver.classify(reply)` not found in drive_retry_loop");
+
+        let terminal_arm_anchor = "AttemptOutcome::Terminal(value) =>";
+        let arm_start = SOURCE[classify_match..]
+            .find(terminal_arm_anchor)
+            .map(|p| classify_match + p)
+            .expect(
+                "Terminal arm `AttemptOutcome::Terminal(value) =>` not \
+                 found — the production arm shape has changed; update \
+                 this guard with the new shape",
+            );
+
+        // The Terminal arm is delimited by the next `AttemptOutcome::`
+        // sibling arm. Anchor on that.
+        let arm_end = SOURCE[arm_start + terminal_arm_anchor.len()..]
+            .find("AttemptOutcome::")
+            .map(|p| arm_start + terminal_arm_anchor.len() + p)
+            .expect("end-of-Terminal-arm marker (next AttemptOutcome::) not found");
+
+        let arm_body = &SOURCE[arm_start..arm_end];
+
+        assert!(
+            arm_body.contains("return RetryLoopOutcome::Done(value);"),
+            "Terminal arm MUST `return RetryLoopOutcome::Done(value);` \
+             synchronously — re-routing terminal replies into the retry \
+             loop would burn the budget on a deterministic failure and \
+             re-introduce the M1/M2 race the PR fixes.\n\
+             Arm body:\n{arm_body}"
+        );
+        assert!(
+            !arm_body.contains(".advance()"),
+            "Terminal arm MUST NOT call driver.advance() — terminal \
+             classifications are by definition non-retriable. A \
+             regression that calls advance() here would burn the \
+             retry budget against the same deterministic failure and \
+             surface the synthesised 'failed notifying, channel \
+             closed' marker instead of the real cause (issue #4111).\n\
+             Arm body:\n{arm_body}"
+        );
+        assert!(
+            !arm_body.contains("continue"),
+            "Terminal arm MUST NOT `continue` — that would skip the \
+             return and fall back to the next loop iteration, which \
+             would re-`send_and_await` against the SAME closed \
+             attempt-tx channel and surface NotificationError.\n\
+             Arm body:\n{arm_body}"
+        );
+    }
+
     /// Build a synthetic terminal reply keyed by `tx`. Mirrors
     /// `node::tests::callback_forward_tests::dummy_reply` but lets the
     /// caller supply the transaction so both sides of the round-trip agree.
@@ -589,6 +746,15 @@ mod tests {
     /// `Aborted` variant is sufficient payload.
     fn dummy_reply_with_tx(tx: Transaction) -> NetMessage {
         NetMessage::V1(NetMessageV1::Aborted(tx))
+    }
+
+    /// Unwrap a `WaiterReply::Reply` in collect-replies tests; panic on the
+    /// terminal `PeerDisconnected` variant (not expected on the happy path).
+    fn expect_reply(item: WaiterReply) -> NetMessage {
+        match item {
+            WaiterReply::Reply(msg) => msg,
+            other => panic!("expected WaiterReply::Reply, got: {other:?}"),
+        }
     }
 
     /// Happy path: `send_and_await` fires an outbound message, the fake
@@ -628,7 +794,7 @@ mod tests {
                 "send_and_await should not specify a target"
             );
             reply_sender
-                .try_send(dummy_reply_with_tx(tx))
+                .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
                 .expect("capacity-1 reply channel should accept the first send");
         });
 
@@ -689,7 +855,7 @@ mod tests {
                  through the op execution channel (regression for #3838)"
             );
             reply_sender
-                .try_send(dummy_reply_with_tx(tx))
+                .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
                 .expect("capacity-1 reply channel should accept the first send");
         });
 
@@ -869,6 +1035,102 @@ mod tests {
             .expect("executor task should complete without panicking");
     }
 
+    /// Issue #4111: the originator-loopback PUT failure path emits a
+    /// `PutMsg::Error { id, cause }` via `send_local_loopback`. This
+    /// pins the contract from the *sender* side: an Error envelope
+    /// flows through the same primitive as a successful Response, with
+    /// `target=None` and the same `is_closed()` response-receiver
+    /// signal so `handle_op_execution` skips the `pending_op_results`
+    /// insert and the originator's pre-installed callback survives.
+    ///
+    /// (The reception side — that the bypass actually forwards Error
+    /// to the originator's waiter — is pinned by
+    /// `put_branch_bypass_forwards_error` in `node.rs`.)
+    #[tokio::test]
+    async fn send_local_loopback_carries_put_error_to_event_loop() {
+        use crate::message::NetMessageV1;
+        use crate::operations::put::PutMsg;
+
+        let (receiver, sender) = event_loop_notification_channel();
+        let EventLoopNotificationsReceiver {
+            mut op_execution_receiver,
+            ..
+        } = receiver;
+
+        // Allocate the tx as a PutMsg tx so `Transaction::is_for::<PutMsg>()`
+        // is consistent across the round-trip.
+        let tx = Transaction::new::<PutMsg>();
+        let mut ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+        let cause = "contract rejected: invalid update".to_string();
+
+        let executor_cause = cause.clone();
+        let executor = tokio::spawn(async move {
+            let (reply_sender, outbound, target_addr) = op_execution_receiver
+                .recv()
+                .await
+                .expect("PutMsg::Error envelope should be delivered");
+
+            assert_eq!(
+                outbound.id(),
+                &tx,
+                "Error envelope tx must match the ctx tx — debug_assert in \
+                 send_local_loopback should already enforce this"
+            );
+            assert_eq!(
+                target_addr, None,
+                "send_local_loopback MUST pass target_addr=None for the \
+                 PutMsg::Error envelope so handle_op_execution dispatches \
+                 it as InboundMessage (same path as a Response loopback)"
+            );
+
+            // Verify the wire payload is the Error variant with the
+            // intended cause — not a placeholder or truncated string.
+            // The catch-all arm covers the long tail of NetMessage
+            // variants (Get/Subscribe/Update/Aborted/Connect/...) which
+            // are irrelevant here; listing each one in the assertion
+            // would obscure the actual contract.
+            #[allow(clippy::wildcard_enum_match_arm)]
+            match outbound {
+                NetMessage::V1(NetMessageV1::Put(PutMsg::Error {
+                    id,
+                    cause: decoded_cause,
+                })) => {
+                    assert_eq!(id, tx, "Error.id must equal the originator tx");
+                    assert_eq!(
+                        decoded_cause, executor_cause,
+                        "Error.cause must be the verbatim cause string"
+                    );
+                }
+                other => panic!(
+                    "expected NetMessage::V1(Put(Error {{ .. }})), got {:?}",
+                    std::any::type_name_of_val(&other)
+                ),
+            }
+
+            assert!(
+                reply_sender.is_closed(),
+                "send_local_loopback drops its response receiver, so \
+                 handle_op_execution must observe is_closed() on the \
+                 reply sender and skip the pending_op_results insert — \
+                 otherwise it would clobber the originator's pre-installed \
+                 callback (the one waiting for this Error)"
+            );
+        });
+
+        let outbound = NetMessage::V1(NetMessageV1::Put(PutMsg::Error {
+            id: tx,
+            cause: cause.clone(),
+        }));
+        timeout(Duration::from_secs(1), ctx.send_local_loopback(outbound))
+            .await
+            .expect("send_local_loopback should complete quickly")
+            .expect("send_local_loopback should return Ok");
+
+        executor
+            .await
+            .expect("executor task should complete without panicking");
+    }
+
     /// `send_local_loopback` errors with `NotificationError` when the
     /// executor channel is already closed (same contract as
     /// `send_fire_and_forget` / `send_and_await`).
@@ -955,7 +1217,7 @@ mod tests {
                 .await
                 .expect("first outbound delivered");
             reply_sender_1
-                .try_send(dummy_reply_with_tx(tx))
+                .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
                 .expect("first reply accepted");
 
             // Second outbound: hold `reply_sender_2` alive — do NOT
@@ -1026,6 +1288,69 @@ mod tests {
     /// `RetryDriver::attempt_timeout`'s default value is the unscaled
     /// [`OPERATION_TTL`] that non-streaming and pre-#4001 op drivers
     /// (GET / SUBSCRIBE) rely on. Drivers that need a different
+    /// Source-grep pin for the fast infra-retry path in
+    /// `drive_retry_loop`. A `NotificationError` (local callback
+    /// dropped without a reply) is a transient infra hiccup, NOT a
+    /// slow peer-stall — it MUST be retried on the SAME peer without
+    /// calling `driver.advance()`, so it doesn't burn the per-driver
+    /// peer-advancement cap. Reverting to a shape that lumps it in
+    /// with `Ok(Err(err))` re-opens the freenet-git mirror's
+    /// `test_large_state_put_get` failure (transient startup-window
+    /// callback drop → exhausts the streaming cap of 0 advancements →
+    /// surfaces as `put failed after 1 attempts`).
+    ///
+    /// The path also MUST NOT loop forever in a true shutdown
+    /// (receiver genuinely dropped) — `MAX_INFRA_RETRIES` caps the
+    /// retry count and falls through to the regular `advance()` arm
+    /// after exhaustion.
+    #[test]
+    fn drive_retry_loop_has_fast_infra_retry_path() {
+        let src = include_str!("op_ctx.rs");
+        let loop_pos = src
+            .find("pub(crate) async fn drive_retry_loop")
+            .expect("drive_retry_loop must exist");
+        let body = &src[loop_pos..];
+        assert!(
+            body.contains("MAX_INFRA_RETRIES"),
+            "drive_retry_loop must reference the MAX_INFRA_RETRIES cap"
+        );
+        assert!(
+            body.contains("Ok(Err(OpError::NotificationError))"),
+            "drive_retry_loop must pattern-match `Ok(Err(OpError::NotificationError))` \
+             to route the infra-retry path — bare `Ok(Err(err))` would lump it with \
+             real wire errors and call advance()"
+        );
+        assert!(
+            body.contains("if infra_retries < MAX_INFRA_RETRIES"),
+            "the NotificationError arm must be guarded by \
+             `if infra_retries < MAX_INFRA_RETRIES` so a true shutdown \
+             doesn't loop forever burning CPU"
+        );
+        // The infra-retry arm must `continue` (re-attempt same peer)
+        // without calling `driver.advance()` in its body. Carve out a
+        // window between the NotificationError pattern and the next
+        // `match` (the regular wire_error arm) and assert it doesn't
+        // contain `driver.advance()`.
+        let infra_arm_start = body
+            .find("Ok(Err(OpError::NotificationError))")
+            .expect("matched above");
+        let next_arm_start = body[infra_arm_start..]
+            .find("Ok(Err(err)) => {")
+            .expect("regular wire_error arm follows infra-retry arm");
+        let infra_arm = &body[infra_arm_start..infra_arm_start + next_arm_start];
+        assert!(
+            !infra_arm.contains("driver.advance()"),
+            "infra-retry arm MUST NOT call driver.advance() — the whole \
+             point is to decouple cheap callback-drop retries from the \
+             slow peer-stall budget. Arm body:\n{infra_arm}"
+        );
+        assert!(
+            infra_arm.contains("continue;"),
+            "infra-retry arm must `continue;` to re-attempt the same peer \
+             with a fresh attempt_tx"
+        );
+    }
+
     /// per-attempt timeout — currently only PUT, for streaming-payload
     /// scaling per #4001 — must override explicitly. Pin the default so
     /// a refactor that changes the trait can't silently shift behaviour
@@ -1083,7 +1408,7 @@ mod tests {
             );
             for _ in 0..3 {
                 reply_sender
-                    .try_send(dummy_reply_with_tx(tx))
+                    .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
                     .expect("capacity-N reply channel should accept all sends within capacity");
             }
             // Hold reply_sender to keep the channel open while the caller drains.
@@ -1107,7 +1432,7 @@ mod tests {
             let reply = timeout(Duration::from_secs(1), rx.recv())
                 .await
                 .unwrap_or_else(|_| panic!("recv #{i} should yield buffered reply"));
-            let reply = reply.unwrap_or_else(|| panic!("recv #{i} returned None"));
+            let reply = expect_reply(reply.unwrap_or_else(|| panic!("recv #{i} returned None")));
             assert_eq!(reply.id(), &tx, "reply #{i} tx must match ctx tx");
         }
     }
@@ -1143,7 +1468,7 @@ mod tests {
                 "send_to_and_collect_replies must propagate target_addr"
             );
             reply_sender
-                .try_send(dummy_reply_with_tx(tx))
+                .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
                 .expect("capacity-N channel accepts first send");
             reply_sender
         });
@@ -1161,10 +1486,12 @@ mod tests {
             .await
             .expect("executor task should complete without panicking");
 
-        let reply = timeout(Duration::from_secs(1), rx.recv())
-            .await
-            .expect("recv should yield buffered reply")
-            .expect("recv returned None");
+        let reply = expect_reply(
+            timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .expect("recv should yield buffered reply")
+                .expect("recv returned None"),
+        );
         assert_eq!(reply.id(), &tx);
     }
 
@@ -1190,7 +1517,7 @@ mod tests {
                 .await
                 .expect("outbound msg should be delivered");
             reply_sender
-                .try_send(dummy_reply_with_tx(tx))
+                .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
                 .expect("capacity-1 channel accepts first send");
             reply_sender
         });
@@ -1203,7 +1530,112 @@ mod tests {
 
         let _reply_sender = executor.await.expect("executor task should complete");
 
-        let reply = rx.recv().await.expect("first recv should yield reply");
+        let reply = expect_reply(rx.recv().await.expect("first recv should yield reply"));
         assert_eq!(reply.id(), &tx);
+    }
+
+    /// A `WaiterReply::Reply` item resolves to the carried `NetMessage`.
+    #[tokio::test]
+    async fn recv_waiter_reply_returns_reply_on_reply_item() {
+        let (_receiver, sender) = event_loop_notification_channel();
+        let tx = Transaction::new::<ConnectMsg>();
+        let ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+
+        let (waiter_sender, mut rx) = mpsc::channel::<WaiterReply>(1);
+        waiter_sender
+            .try_send(WaiterReply::Reply(dummy_reply_with_tx(tx)))
+            .expect("capacity-1 channel accepts first send");
+
+        let reply = ctx
+            .recv_waiter_reply(&mut rx)
+            .await
+            .expect("Reply item must resolve to Ok");
+        assert_eq!(reply.id(), &tx);
+    }
+
+    /// A `WaiterReply::PeerDisconnected` item (the prune signal) surfaces as
+    /// `OpError::PeerDisconnected` carrying the peer — NOT the FORBIDDEN_MARKER
+    /// (#4313). Delivering it before the sender drops is what makes this
+    /// deterministic; see the concurrency regression below.
+    #[tokio::test]
+    async fn recv_waiter_reply_returns_peer_disconnected_signal() {
+        let (_receiver, sender) = event_loop_notification_channel();
+        let tx = Transaction::new::<ConnectMsg>();
+        let ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+        let peer: SocketAddr = "1.2.3.4:5678"
+            .parse()
+            .expect("test peer addr must be valid");
+
+        // Deliver the cause, then drop the sender — mirrors the
+        // `TransactionOrphaned` handler's send-before-drop.
+        let (waiter_sender, mut rx) = mpsc::channel::<WaiterReply>(1);
+        waiter_sender
+            .try_send(WaiterReply::PeerDisconnected { peer })
+            .expect("capacity-1 channel accepts first send");
+        drop(waiter_sender);
+
+        let err = ctx
+            .recv_waiter_reply(&mut rx)
+            .await
+            .expect_err("PeerDisconnected item must surface as Err");
+        assert!(
+            matches!(err, OpError::PeerDisconnected { peer: p } if p == peer),
+            "expected PeerDisconnected({peer}), got: {err:?}"
+        );
+    }
+
+    /// A bare channel close with no terminal item is a genuine teardown
+    /// and falls back to `NotificationError` (pre-#4313 semantics).
+    #[tokio::test]
+    async fn recv_waiter_reply_falls_back_to_notification_error_on_bare_close() {
+        let (_receiver, sender) = event_loop_notification_channel();
+        let tx = Transaction::new::<ConnectMsg>();
+        let ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+
+        let (waiter_sender, mut rx) = mpsc::channel::<WaiterReply>(1);
+        drop(waiter_sender);
+
+        let err = ctx
+            .recv_waiter_reply(&mut rx)
+            .await
+            .expect_err("closed channel must surface as Err");
+        assert!(
+            matches!(err, OpError::NotificationError),
+            "expected NotificationError fallback, got: {err:?}"
+        );
+    }
+
+    /// #4313 regression: the prune path delivers `PeerDisconnected` through
+    /// the channel BEFORE dropping the sender, so a parked driver reads it
+    /// deterministically even under multi-thread scheduling. The deleted
+    /// orphan-cause registry approach raced a `drop_entry` against this
+    /// `recv` and lost ~99.99% of the time, surfacing the FORBIDDEN_MARKER.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parked_driver_always_observes_peer_disconnected_under_churn() {
+        let (_receiver, sender) = event_loop_notification_channel();
+        let peer: SocketAddr = "9.9.9.9:9999".parse().expect("valid addr");
+
+        for _ in 0..2_000 {
+            let tx = Transaction::new::<ConnectMsg>();
+            let ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+            let (waiter_sender, mut rx) = mpsc::channel::<WaiterReply>(1);
+
+            let driver = tokio::spawn(async move { ctx.recv_waiter_reply(&mut rx).await });
+
+            // Let the driver actually park on recv() before the wake.
+            tokio::task::yield_now().await;
+
+            // Production handler order: send the cause, THEN drop the sender.
+            #[allow(clippy::let_underscore_must_use)]
+            let _ = waiter_sender.try_send(WaiterReply::PeerDisconnected { peer });
+            drop(waiter_sender);
+
+            match driver.await.expect("driver task panicked") {
+                Err(OpError::PeerDisconnected { peer: observed }) => {
+                    assert_eq!(observed, peer);
+                }
+                other => panic!("expected PeerDisconnected, got: {other:?}"),
+            }
+        }
     }
 }

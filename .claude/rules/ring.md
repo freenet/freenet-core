@@ -93,7 +93,17 @@ CORRECT:
 WHY: Backing off a target for a local problem prevents connecting to it
 later when local conditions improve (e.g., more connections acquired).
 
-See: ring.rs connection_maintenance, issue #3414
+COROLLARY (under-min backoff escape, #4348):
+  A node still BELOW min_connections must IGNORE per-target-location
+  backoff entirely and keep probing. Its under-connection is by definition
+  a local capacity problem, so a `Rejected`-stamped 30s→600s location
+  backoff would trap a poorly-positioned node permanently below min.
+  connection_maintenance gates this via should_respect_location_backoff()
+  (honor backoff only at/above min). Storm safety is preserved by the
+  adaptive fast-tick backoff + max_concurrent cap, not by location backoff.
+
+See: ring.rs connection_maintenance + should_respect_location_backoff,
+issues #3414, #4348
 ```
 
 ### Routing Decisions
@@ -127,6 +137,18 @@ WHEN removing a connection (any failure path):
 WHEN exchanging peer lists in sync protocols (e.g., interest sync):
   → MUST filter out peers not currently in the live connection set
   → Stale peer entries cause operations to be sent to dead nodes
+
+WHEN summarizing contracts in the InterestSync heartbeat handlers
+(handle_interest_sync_message: Interests / Summaries / ChangeInterests):
+  → ONLY call get_contract_summary for contracts we host OR actively serve
+    (is_hosting_contract || contract_in_use) — go through
+    summary_if_hosted_or_in_use, never a bare get_contract_summary.
+  → A node carries phantom peer-interest in contracts it neither hosts nor
+    serves (placement-migration after-effect, #4404). Summarizing those issues a
+    GetSummaryQuery round-trip on the serial contract_handling loop that returns
+    "state not found" every heartbeat — the #4473/#4145 summarize storm
+    (~40/sec vs <10 real updates/hr) that wedged gateways. The ResyncRequest arm
+    is exempt: it is state-gated and not heartbeat-driven.
 ```
 
 ### Cleanup Exemptions Must Be Time-Bounded

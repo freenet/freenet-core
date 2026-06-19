@@ -83,7 +83,51 @@ BEFORE changing LEDBAT++ parameters:
   4. Document reasoning in commit message
 ```
 
-### Shadow per-peer RTT registry (issue #4074, Phase 1)
+### Flight-size release invariant (issue #4345)
+
+```
+Flight size has THREE release paths. ACK is the normal one; the other two
+exist so a stream whose ACKs never arrive (lossy path / starved reverse-ACK
+channel) cannot pin flight size at cwnd and stall every subsequent stream
+(the #4345 "cwnd wait timeout" / "no fragments received" failure):
+
+  1. ACK — report_received_receipts returns the packet size; the recv loop
+     calls on_ack* which decrements flight size.
+  2. ABANDON — after MAX_PACKET_RETRANSMITS with no ACK, SentPacketTracker
+     returns ResendAction::Abandon and the recv loop calls
+     CongestionControl::release_flightsize(len). Bounds the worst case for a
+     black-holed individual packet.
+  3. STREAM ABORT (drop_stream) — when an outbound stream aborts (cwnd-wait
+     timeout, upstream stall/error, or mid-send failure in
+     outbound_stream.rs), release_aborted_stream_flightsize() calls
+     SentPacketTracker::drop_stream(stream_id), which removes ALL of that
+     stream's still-tracked packets and returns their byte total; the abort
+     then release_flightsize(total). This frees the stranded bytes in one
+     shot instead of waiting ~6s for each fragment to abandon individually.
+
+Each in-flight packet is released EXACTLY ONCE across these paths, because
+drop_stream / Abandon / ACK each REMOVE the packet from pending_receipts; a
+packet absent from pending_receipts yields no ack-info and cannot abandon.
+
+  - on_timeout() applies the cwnd loss response only; it MUST NOT change
+    flight size (the timed-out packet is immediately re-sent and stays in
+    flight). Do NOT reintroduce a decrement-on-RTO + re-add-on-resend pair —
+    the recv loop always re-sends on RTO, so that is net-zero and does not
+    drain a never-ACKed packet.
+  - get_resend KEEPS a resent packet in pending_receipts (clones the payload,
+    refreshes send-time in place). This is what lets a concurrent drop_stream
+    (spawned abort task) still see and release an in-flight-being-resent
+    packet. Pure tracker bookkeeping — it does NOT touch flight size.
+  - The recv loop's resend re-registration MUST use refresh_sent_packet
+    (update-only, no-op if the packet was already removed), NOT
+    report_sent_packet (insert-capable). Using the insert path would
+    RESURRECT a packet that a concurrent drop_stream just removed+released,
+    and a later ACK/abandon of that zombie would release its bytes a SECOND
+    time (flight-size under-count). See #4345 stage-2 review.
+  - Retransmissions MUST stay bounded. Do not make retransmit infinite again.
+```
+
+### Shadow per-peer RTT registry (issue #4074, Phases 1 + 1.5)
 
 `transport/rolling_rtt_stats.rs` maintains a process-wide
 `SHADOW_RTT_REGISTRY` (`DashMap<SocketAddr, Arc<dyn RttSnapshotProvider>>`)
@@ -93,18 +137,102 @@ populated by `RollingRttStatsHandle` in every `RemoteConnection`. A
 `shadow_rtt_aggregate` event both as `tracing::debug!` (file-log
 mirror; visible via `RUST_LOG=…=debug` in debug builds, compiled
 out entirely in release builds via the `release_max_level_info`
-feature in `crates/core/Cargo.toml`) and via `send_standalone_event`
-so it reaches the OTLP collector regardless of log level — the
-dashboard's 1 Hz feed is independent of the local tracing subscriber.
+feature in `crates/core/Cargo.toml`) and via
+`send_standalone_shadow_event_with_peer_id` so it reaches the OTLP
+collector regardless of log level, tagged with the local node id
+so the collector can disaggregate samples per reporting node. All
+five shadow emitters use the `_shadow_` variant so the telemetry
+rate limiter admits them under a low-priority sub-budget and they
+cannot starve operational telemetry (#4380).
+
+`transport/reference_ping.rs` runs an analogous 1Hz loop
+(`reference_ping` background task) that probes a fixed external
+target (default `1.1.1.1:53`) over UDP with a synthetic DNS query
+and feeds the RTT into a parallel `RollingRttStats`. It emits
+`shadow_reference_ping` events with the same shape and the same
+local-peer-id tag. The point is to separate "overlay multi-hop
+queueing baseline" (visible only in the per-peer signal) from
+"local uplink contention" (visible in both signals simultaneously),
+which the Phase 1 analysis posted on #4074 showed Phase 1 alone
+cannot answer.
+
+The reference-ping spawn is **opt-in**: gated by
+`telemetry.reference-ping-enabled` (default `false`). Production
+gateway configs set it to `true`; developer machines and
+integration tests leave it off so they don't fire DNS traffic
+from CI runners (which would perturb timing-sensitive multi-node
+tests — see PR #4292 root-cause). The shadow aggregator is
+always-on; only reference-ping is gated.
+
+### Shadow demand / queue / OS-counter / class telemetry (Phase 1.6)
+
+`transport/shadow_demand.rs` adds the *demand* side of the floor
+analysis. Three process-wide observation hooks are written from the
+hot send path with a single relaxed atomic add each, and read only
+by the 1Hz aggregator tasks:
+
+- **Outbound class counters** (`record_outbound`): cumulative bytes
+  split into must-flow / short / bulk. `classify()` keys off the
+  `SymmetricMessagePayload` variant — `StreamFragment` is `Bulk`
+  (the only class the token bucket meters, i.e. the only slowable
+  traffic), `ShortMessage` is `Short` (opaque serialized `NetMessage`
+  — small contract op or control plane, unsplittable at the transport
+  layer), and `Ping`/`Pong`/`NoOp`/`AckConnection` are `MustFlow`.
+  Tagged at `packet_sending` (covers `ShortMessage` / `NoOp` /
+  `StreamFragment`) plus the two bypass sites `send_pong` and the
+  keep-alive `Ping`. The split is a classified *subset* of the node
+  total: it excludes retransmits, handshake/intro `AckConnection`, and
+  standalone connection ACKs, which are still counted in
+  `cumulative_bytes_sent` (the `shadow_rate_demand` total) but not the
+  per-class breakdown.
+- **Broadcast-queue depth gauge** (`record_broadcast_queue_depth`):
+  updated by `node/network_bridge/broadcast_queue.rs` under its own
+  queue lock, so the shadow reader never contends on the queue mutex.
+- **Global-bandwidth handle** (`register_global_bandwidth`): a `Weak`
+  to the node's `GlobalBandwidthManager`, registered at construction
+  in `p2p_protoc.rs`, so the demand aggregator can read the effective
+  aggregate rate `R` — present only in global-pool mode
+  (`total_bandwidth_limit` set); null under the default per-connection
+  FixedRate mode.
+
+Two always-on 1Hz tasks (spawned from `p2p_impl.rs`, registered with
+`BackgroundTaskMonitor` as `shadow_demand_aggregator` /
+`shadow_outbound_class_aggregator`) emit `shadow_rate_demand`
+(achieved throughput vs `R`, active-connection count, broadcast-queue
+depth) and `shadow_outbound_class` (the must-flow / short / bulk byte
+split). Same OTLP shape and peer-id tagging as `shadow_rtt_aggregate`.
+
+`transport/shadow_iface_tx.rs` adds the OS-interface counter: a 1Hz
+read of Linux `/proc/net/dev` summing non-loopback `tx_bytes`, emitting
+`shadow_iface_tx` with the derived `op = total_tx − freenet_own_tx`
+(`freenet_own_tx` = `TRANSPORT_METRICS.cumulative_bytes_sent`). It is
+**opt-in and best-effort**: gated by `telemetry.iface-tx-enabled`
+(default `false`, same gating as reference-ping); if `/proc/net/dev`
+is unavailable the tick is silently omitted, never blocking.
+
+The class tagging is the only Phase 1.6 hook that touches the hot send
+path; it is a single relaxed atomic add per packet (no allocation, no
+lock, no blocking). Everything else is read from the separate
+aggregator tasks.
 
 ```
-NEVER read SHADOW_RTT_REGISTRY or cross_connection_median_inflation
-from the production data path (rate limiter, retry, congestion
-control). It exists only for the staged rollout in #4074:
-  Phase 1 → observation only (current)
-  Phase 2 → shadow controller, still no behaviour change
-  Phase 3 → opt-in flag
-  Phase 4 → default switch only after Phase 3 shows improvement
+NEVER read SHADOW_RTT_REGISTRY, cross_connection_median_inflation,
+the reference_ping stats, OR the Phase 1.6 shadow_demand counters /
+broadcast-depth gauge / registered bandwidth handle from the
+production data path (rate limiter, retry, congestion control). The
+hot path only WRITES the cheap class counters; all reads happen in
+the aggregator tasks. They exist only for the staged rollout in
+#4074:
+  Phase 1   → observation only — per-peer overlay RTT (current)
+  Phase 1.5 → observation only — adds reference-path RTT + peer_id
+              tagging so signals can be disaggregated per node and
+              the overlay-vs-uplink confound can be tested
+  Phase 1.6 → observation only — adds outbound demand vs R, broadcast
+              queue depth, OS interface tx (op = total − own), and the
+              must-flow-vs-bulk outbound split
+  Phase 2   → shadow controller, still no behaviour change
+  Phase 3   → opt-in flag
+  Phase 4   → default switch only after Phase 3 shows improvement
 ```
 
 ## Connection Lifecycle Rules
@@ -226,6 +354,32 @@ ALWAYS use: Socket trait (crates/core/src/transport.rs)
 
 Why: Enables SimulationSocket for deterministic testing
 ```
+
+#### Exception: `DefaultSocket` for non-peer-to-peer external probes
+
+There is one documented exception, used by `transport/reference_ping.rs`:
+the `DefaultSocket` type alias in `transport.rs` resolves to
+`tokio::net::UdpSocket`, but referring to it by the alias keeps the
+rule-lint check on the literal `tokio::net::UdpSocket` path satisfied
+without re-introducing the raw path. The reference-ping probe uses
+`DefaultSocket` deliberately to call the **inherent** `UdpSocket`
+methods (NOT the `Socket` trait impl), because the trait's `send_to`
+calls `TRANSPORT_METRICS.record_packet_sent` — which would pollute the
+per-peer dashboard LRU with the reference target IP (`1.1.1.1:53` by
+default), occupying one of the `MAX_TRACKED_PEERS = 256` slots
+permanently.
+
+`DefaultSocket` is acceptable ONLY for:
+- Out-of-band probes whose target is not a Freenet peer (so the
+  `SimulationSocket` substitution is meaningless).
+- Code that explicitly needs to skip the trait's metering /
+  buffer-tuning / dual-stack setup.
+
+For ALL peer-to-peer transport code paths, continue using the
+`Socket` trait so the simulation harness can substitute
+`SimulationSocket`. If you are tempted to add another `DefaultSocket`
+use site, justify it in a load-bearing comment at the call site and
+update this section.
 
 ### WHEN testing transport code
 

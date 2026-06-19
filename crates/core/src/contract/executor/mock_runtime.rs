@@ -259,6 +259,8 @@ where
             if let Err(err) = op_manager.try_notify_node_event(NodeEvent::BroadcastStateChange {
                 key,
                 new_state: state.clone(),
+                is_retry: false,
+                is_reemit: false,
             }) {
                 // Best-effort by design (mirrors the production
                 // executor; see runtime.rs for the #4145 / #4238

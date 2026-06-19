@@ -530,6 +530,11 @@ impl DelegateRuntimeInterface for Runtime {
         // bytes for prompts whose `UserResponse` never arrives (user
         // dismisses, app crashes, network partition).
         native_api::prune_expired_contexts(&self.delegate_contexts);
+        // Keep the inherited-origins map tidy. Mark this delegate as just-used
+        // so the cleanup keeps its entry, then drop entries for delegates that
+        // have gone unused long enough. See `InheritedOriginsEntry`.
+        native_api::touch_inherited_origin(delegate_key);
+        native_api::prune_expired_inherited_origins();
         let mut context: Vec<u8> = self
             .delegate_contexts
             .get(delegate_key)
@@ -758,7 +763,7 @@ impl DelegateRuntimeInterface for Runtime {
 
     #[inline]
     fn unregister_delegate(&mut self, key: &DelegateKey) -> RuntimeResult<()> {
-        self.delegate_modules.lock().unwrap().pop(key);
+        self.delegate_modules.lock().unwrap().remove(key);
         // Drop persisted ctx.write() bytes so an unregistered delegate can't
         // hold onto stale state if it's later re-registered.
         self.delegate_contexts.remove(key);
@@ -1557,6 +1562,167 @@ mod test {
         Ok(())
     }
 
+    /// FIX 4 (issue #4441 review): running a delegate populates the delegate
+    /// module cache with a real compiled-byte size, and `unregister_delegate`
+    /// MUST decrement `total_bytes` back to zero (it removes the cache entry via
+    /// `ModuleCache::remove`, not `LruCache::pop`, so the byte accounting stays
+    /// exact). A leak here would let the delegate cache's tracked total drift
+    /// above its real footprint and evict prematurely.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_unregister_delegate_decrements_cache_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use delegate2_messages::InboundAppMessage;
+
+        let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+
+        // Run the delegate once so its module is compiled and cached.
+        let payload = bincode::serialize(&InboundAppMessage::IncrementCounter)?;
+        let msg = ApplicationMessage::new(payload);
+        let _outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(msg)],
+        )?;
+
+        {
+            let cache = runtime.delegate_modules.lock().unwrap();
+            assert_eq!(
+                cache.len(),
+                1,
+                "delegate module should be cached after a call"
+            );
+            assert!(
+                cache.total_bytes() > 0,
+                "delegate cache must track a non-zero compiled size"
+            );
+        }
+
+        // Unregister must drop the module entry AND its bytes.
+        runtime.unregister_delegate(delegate.key())?;
+        {
+            let cache = runtime.delegate_modules.lock().unwrap();
+            assert_eq!(cache.len(), 0, "unregister must remove the cached module");
+            assert_eq!(
+                cache.total_bytes(),
+                0,
+                "unregister must decrement total_bytes to zero (no byte leak)"
+            );
+        }
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
+    /// FIX 4 (issue #4441 review): the DELEGATE module cache evicts by BYTES
+    /// under a tight budget, exactly like the contract cache. Load several
+    /// distinct-param delegates over the same code under a budget that only
+    /// holds ~1-2 modules and assert the cache stays within budget and evicts
+    /// the rest (resident count far below the loaded count).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_delegate_cache_evicts_by_bytes() -> Result<(), Box<dyn std::error::Error>> {
+        use super::super::{ContractStore, SecretsStore, delegate_store::DelegateStore};
+        use crate::contract::storages::Storage;
+
+        let temp_dir = get_temp_dir();
+        let db = Storage::new(temp_dir.path()).await?;
+        let contract_store = ContractStore::new(temp_dir.path().join("c"), 10_000, db.clone())?;
+        let delegate_store = DelegateStore::new(temp_dir.path().join("d"), 10_000, db.clone())?;
+        let secret_store = SecretsStore::new(temp_dir.path().join("s"), Default::default(), db)?;
+
+        // Probe one delegate's compiled size with a generous budget.
+        let code = super::super::tests::get_test_module(TEST_DELEGATE_2)?;
+        let mk_delegate = |params: Vec<u8>| {
+            DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+                &code.clone().into(),
+                &params.into(),
+            ))))
+        };
+
+        let mut runtime = Runtime::build_with_config(
+            contract_store,
+            delegate_store,
+            secret_store,
+            false,
+            super::super::runtime::RuntimeConfig {
+                module_cache_budget_bytes: 512 * 1024 * 1024,
+                ..Default::default()
+            },
+        )?;
+
+        // Register + run 6 distinct-param delegates so each is a distinct key.
+        let payload = bincode::serialize(&delegate2_messages::InboundAppMessage::IncrementCounter)?;
+        let run = |runtime: &mut Runtime, d: &DelegateContainer| -> RuntimeResult<()> {
+            let msg = ApplicationMessage::new(payload.clone());
+            runtime.inbound_app_message(
+                d.key(),
+                &vec![].into(),
+                None,
+                vec![InboundDelegateMsg::ApplicationMessage(msg)],
+            )?;
+            Ok(())
+        };
+
+        let delegates: Vec<DelegateContainer> = (0..6)
+            .map(|i| mk_delegate(format!("param-{i}").into_bytes()))
+            .collect();
+        for d in &delegates {
+            runtime.delegate_store.store_delegate(d.clone()).unwrap();
+            let key = XChaCha20Poly1305::generate_key(&mut OsRng);
+            let cipher = XChaCha20Poly1305::new(&key);
+            let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+            runtime
+                .secret_store
+                .register_delegate(d.key().clone(), cipher, nonce)
+                .unwrap();
+        }
+
+        // Load the first to measure per-module size.
+        run(&mut runtime, &delegates[0])?;
+        let per_module = {
+            let cache = runtime.delegate_modules.lock().unwrap();
+            assert_eq!(cache.len(), 1);
+            cache.total_bytes()
+        };
+        assert!(per_module > 0, "delegate module size must be measurable");
+
+        // Re-budget the delegate cache to hold ~1-2 modules.
+        let budget = per_module + per_module / 2; // between 1x and 2x
+        {
+            let mut cache = runtime.delegate_modules.lock().unwrap();
+            *cache = super::super::ModuleCache::with_label(budget, "delegate");
+        }
+
+        // Load all 6 distinct delegates; the cache must stay within budget.
+        for d in &delegates {
+            run(&mut runtime, d)?;
+            let cache = runtime.delegate_modules.lock().unwrap();
+            assert!(
+                cache.total_bytes() <= cache.budget_bytes(),
+                "delegate cache total_bytes {} exceeded budget {}",
+                cache.total_bytes(),
+                cache.budget_bytes()
+            );
+        }
+
+        let cache = runtime.delegate_modules.lock().unwrap();
+        assert!(
+            cache.len() < delegates.len(),
+            "byte-budget eviction must drop some of the {} loaded delegates, got {} resident",
+            delegates.len(),
+            cache.len()
+        );
+        assert!(
+            cache.total_bytes() <= cache.budget_bytes(),
+            "final delegate cache total_bytes {} must be within budget {}",
+            cache.total_bytes(),
+            cache.budget_bytes()
+        );
+
+        std::mem::drop(temp_dir);
+        Ok(())
+    }
+
     /// Pin the oversize-context drop path: a delegate that writes a context
     /// larger than `DelegateContext::MAX_SIZE` must NOT crash the runtime on
     /// the subsequent call. The runtime drops the persisted bytes (with a
@@ -1697,6 +1863,31 @@ mod test {
 
         std::mem::drop(temp_dir);
         Ok(())
+    }
+
+    /// Checks that `inbound_app_message` calls `touch_inherited_origin` before
+    /// `prune_expired_inherited_origins`. The other tests verify the eviction
+    /// logic on its own, so without this one nobody would notice if those two
+    /// calls were removed or swapped — and the #3492 leak would come back. Reads
+    /// the source and asserts both calls are present and in that order.
+    #[test]
+    fn inbound_app_message_wires_inherited_origins_ttl_in_order() {
+        let src = include_str!("delegate.rs");
+        // The impl is the LAST occurrence; the first is the trait method signature.
+        let body = src
+            .rsplit("fn inbound_app_message(")
+            .next()
+            .expect("inbound_app_message impl must exist");
+        let touch = body
+            .find("touch_inherited_origin(delegate_key)")
+            .expect("inbound_app_message must refresh inherited-origin liveness (touch)");
+        let prune = body
+            .find("prune_expired_inherited_origins()")
+            .expect("inbound_app_message must run the inherited-origins TTL sweep (prune)");
+        assert!(
+            touch < prune,
+            "touch_inherited_origin must run BEFORE prune so a just-delivered message is not evicted"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

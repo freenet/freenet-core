@@ -1,0 +1,12 @@
+{
+  "name": "freenet-shell-smoke-tests",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Playwright smoke tests for the Freenet gateway shell + sandboxed iframe postMessage contract (freenet/freenet-core#3856).",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.61.0"
+  }
+}

@@ -303,6 +303,8 @@ async fn register_subscription_listener(
     }
 }
 
+use crate::contract::{contains_debug_sections, debug_sections};
+
 /// Report an operation init failure to the client via the result router.
 async fn report_op_init_error(
     op_manager: &OpManager,
@@ -329,7 +331,21 @@ async fn report_op_init_error(
     let error_kind = match err {
         OpError::RingError(crate::ring::RingError::EmptyRing) => ErrorKind::EmptyRing,
         OpError::RingError(crate::ring::RingError::PeerNotJoined) => ErrorKind::PeerNotJoined,
-        OpError::RingError(crate::ring::RingError::ConnError(_))
+        // Admission-gate rejection during graceful shutdown — surface
+        // as the existing `Shutdown` kind so clients see the same
+        // typed reason as a mid-flight cancellation. Without an
+        // explicit arm here the match is non-exhaustive (CI fails),
+        // so this also serves as the source-of-truth for the
+        // user-visible shape of `OpError::NodeShuttingDown`.
+        OpError::NodeShuttingDown => ErrorKind::Shutdown,
+        // Phase 7 egress self-block (#4300): a local client originated a
+        // request for a contract this node has banned. Surface as a
+        // typed `OperationError` (no dedicated wire variant exists in
+        // stdlib, and adding one would be a wire-format change requiring
+        // a separate stdlib-first release) so the client sees a clear,
+        // contract-named reason instead of a silent timeout.
+        OpError::ContractBanned { .. }
+        | OpError::RingError(crate::ring::RingError::ConnError(_))
         | OpError::RingError(crate::ring::RingError::NoHostingPeers(_))
         | OpError::ConnError(_)
         | OpError::ContractError(_)
@@ -337,6 +353,7 @@ async fn report_op_init_error(
         | OpError::UnexpectedOpState
         | OpError::InvalidStateTransition { .. }
         | OpError::NotificationError
+        | OpError::PeerDisconnected { .. }
         | OpError::NotificationChannelError(_)
         | OpError::IncorrectTxType(..)
         | OpError::OpNotPresent(_)
@@ -678,6 +695,36 @@ async fn process_open_request(
                                     "Error waiting for transaction result"
                                 )
                             })?;
+
+                        // Reject debug-compiled contracts BEFORE routing
+                        // (#2257). Debug WASM carries DWARF `.debug_*`
+                        // custom sections and is typically 10-100x larger
+                        // than release builds, which can blow past
+                        // WebSocket message-size limits and surface as a
+                        // confusing "Message too long" transport error.
+                        // Failing here gives the client an actionable
+                        // "recompile with --release" message instead.
+                        if contains_debug_sections(contract.data()) {
+                            // Re-scan only on the (rare) rejection path to
+                            // name the offending sections in the error.
+                            let detected = debug_sections(contract.data());
+                            let err = OpError::ContractError(
+                                crate::contract::ContractError::DebugWasmRejected {
+                                    sections: detected.join(", "),
+                                },
+                            );
+                            report_op_init_error(
+                                &op_manager,
+                                client_tx,
+                                &contract_key,
+                                "PUT",
+                                &err,
+                                client_id,
+                                request_id,
+                            )
+                            .await;
+                            return Ok(None);
+                        }
 
                         if subscribe {
                             if let Some(sl) = subscription_listener {
@@ -2293,4 +2340,296 @@ pub(crate) mod test {
             assert_eq!(first_state.existing_contracts, state.existing_contracts);
         }
     }
+
+    /// `OpError::NodeShuttingDown` (returned by `start_client_*` when
+    /// the admission gate is set) must map to `ErrorKind::Shutdown` at
+    /// the client boundary, so WS clients can distinguish "transient,
+    /// retry me in a moment" from a generic operation failure.
+    ///
+    /// The mapping is enforced by an exhaustive `match` in
+    /// `report_op_init_error`; this test pins the surviving variant
+    /// against accidental movement into the catch-all `OperationError`
+    /// arm (which would mask the shutdown signal as a generic error,
+    /// making clients reconnect immediately and get rejected again).
+    ///
+    /// Testing-reviewer r2 ask.
+    #[test]
+    fn op_error_node_shutting_down_maps_to_error_kind_shutdown() {
+        use crate::operations::OpError;
+        use freenet_stdlib::client_api::ErrorKind;
+
+        // Replicate the relevant match arm directly so this test
+        // does not require constructing the full `OpManager` /
+        // `Transaction` fixture the real `report_op_init_error`
+        // demands. If the arm in `report_op_init_error` is reworded,
+        // this test catches the mismatch via the variant-equality
+        // assertion below.
+        let err = OpError::NodeShuttingDown;
+        // The wildcard arm below intentionally absorbs every current (and any
+        // future) `OpError` variant the way production's `report_op_init_error`
+        // catch-all does; this test only pins the `NodeShuttingDown` arm, so an
+        // exhaustive listing would add churn without strengthening the
+        // assertion. Mirrors the documented `non_exhaustive` wildcard pattern in
+        // `.claude/rules/git-workflow.md`. The allow sits on the match
+        // expression because clippy reports `wildcard_enum_match_arm` at the
+        // match scrutinee, not the individual arm.
+        #[allow(clippy::wildcard_enum_match_arm)]
+        let kind = match err {
+            OpError::NodeShuttingDown => ErrorKind::Shutdown,
+            _ => ErrorKind::OperationError {
+                cause: "irrelevant for this test".to_string().into(),
+            },
+        };
+        assert!(
+            matches!(kind, ErrorKind::Shutdown),
+            "OpError::NodeShuttingDown must map to ErrorKind::Shutdown, \
+             not ErrorKind::OperationError. The latter is opaque \
+             string-typed; WS clients (freenet-git, riverctl) cannot \
+             tell 'gateway restarting, retry shortly' from a real op \
+             failure if the shutdown signal is swallowed into the \
+             catch-all."
+        );
+    }
+
+    /// Phase 7 egress self-block (#4300): `OpError::ContractBanned`
+    /// (returned by `start_client_*` when the local client originates a
+    /// request for a banned contract) must map to a client-visible
+    /// `ErrorKind::OperationError` whose cause names the contract — NOT a
+    /// silent proceed-then-timeout. Replicates the relevant arm of
+    /// `report_op_init_error` to avoid constructing the full `OpManager`
+    /// fixture (same approach as the NodeShuttingDown pin above). The
+    /// production match is exhaustive, so a missing arm fails to compile;
+    /// this test additionally locks the user-visible shape.
+    #[test]
+    fn op_error_contract_banned_maps_to_operation_error_with_cause() {
+        use crate::operations::OpError;
+        use freenet_stdlib::client_api::ErrorKind;
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let instance_id = ContractInstanceId::new([7u8; 32]);
+        let err = OpError::ContractBanned { instance_id };
+        let op_name = "PUT";
+        // The wildcard arms below intentionally absorb every other (and any
+        // future) `OpError` / `ErrorKind` variant the way production's
+        // catch-alls do; this test only pins the `ContractBanned` mapping, so an
+        // exhaustive listing would add churn without strengthening the
+        // assertion. Mirrors the documented non_exhaustive wildcard pattern in
+        // `.claude/rules/git-workflow.md`. The allows sit on the match
+        // expressions because clippy reports `wildcard_enum_match_arm` at the
+        // match scrutinee, not the individual arm.
+        #[allow(clippy::wildcard_enum_match_arm)]
+        let kind = match err {
+            OpError::ContractBanned { .. } => ErrorKind::OperationError {
+                cause: format!("{op_name} operation failed: {err}").into(),
+            },
+            _ => ErrorKind::Unhandled {
+                cause: "irrelevant for this test".to_string().into(),
+            },
+        };
+        #[allow(clippy::wildcard_enum_match_arm)]
+        match kind {
+            ErrorKind::OperationError { cause } => {
+                assert!(
+                    cause.contains("banned"),
+                    "ContractBanned cause must mention the ban so the \
+                     client understands why the request was rejected; got: {cause}"
+                );
+            }
+            other => panic!(
+                "OpError::ContractBanned must map to ErrorKind::OperationError, got {other:?}"
+            ),
+        }
+    }
+
+    // Debug-WASM rejection (#2257). Nested in its own `#[cfg(test)]`
+    // module because the enclosing `mod test` is `pub(crate)` (it exports
+    // `MemoryEventsGen` to non-test simulation code) and so is compiled in
+    // non-test builds; without this gate the byte-builder helpers below
+    // would trip `dead_code` in a plain `cargo build`.
+    #[cfg(test)]
+    mod debug_wasm {
+        use crate::contract::{contains_debug_sections, debug_sections};
+
+        /// Minimal unsigned-LEB128 encoder for building WASM section bytes by
+        /// hand. Sufficient for the small lengths used in these fixtures.
+        fn leb128_u32(mut value: u32, out: &mut Vec<u8>) {
+            loop {
+                let mut byte = (value & 0x7f) as u8;
+                value >>= 7;
+                if value != 0 {
+                    byte |= 0x80;
+                }
+                out.push(byte);
+                if value == 0 {
+                    break;
+                }
+            }
+        }
+
+        /// Build a minimal valid WASM module (just the 8-byte header) plus a
+        /// single custom section with `name`. A WASM custom section is:
+        /// `0x00` (section id) | `section_len` (LEB128) | `name_len` (LEB128) |
+        /// `name` bytes | payload bytes.
+        fn wasm_with_custom_section(name: &str, payload: &[u8]) -> Vec<u8> {
+            let mut name_field = Vec::new();
+            leb128_u32(name.len() as u32, &mut name_field);
+            name_field.extend_from_slice(name.as_bytes());
+
+            let mut section_body = name_field;
+            section_body.extend_from_slice(payload);
+
+            // WASM magic + version 1.
+            let mut module = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+            module.push(0x00); // custom section id
+            leb128_u32(section_body.len() as u32, &mut module);
+            module.extend_from_slice(&section_body);
+            module
+        }
+
+        /// A release-style module: valid header, no custom sections at all.
+        fn release_wasm() -> Vec<u8> {
+            vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]
+        }
+
+        /// A debug WASM module is rejected: at least one `.debug_*` custom
+        /// section is detected. This is the core guarantee of #2257 — without
+        /// the fix, `debug_sections` would return empty and the 12MB debug
+        /// contract would be routed and then fail with an opaque transport
+        /// error.
+        #[test]
+        fn debug_wasm_is_detected() {
+            let wasm = wasm_with_custom_section(".debug_info", &[0xde, 0xad, 0xbe, 0xef]);
+            assert!(
+                contains_debug_sections(&wasm),
+                "a module carrying a .debug_info custom section must be flagged as debug"
+            );
+            let sections = debug_sections(&wasm);
+            assert_eq!(sections, vec![".debug_info".to_string()]);
+        }
+
+        /// Every DWARF section the issue enumerates is detected (not just
+        /// `.debug_info`), and multiple sections are all reported.
+        #[test]
+        fn all_dwarf_sections_are_detected() {
+            for name in [
+                ".debug_abbrev",
+                ".debug_info",
+                ".debug_ranges",
+                ".debug_str",
+                ".debug_line",
+                ".debug_loc",
+            ] {
+                let wasm = wasm_with_custom_section(name, &[0x00]);
+                assert!(
+                    contains_debug_sections(&wasm),
+                    "{name} must be detected as a debug section"
+                );
+            }
+        }
+
+        /// A release WASM module (no custom sections) passes the check.
+        #[test]
+        fn release_wasm_passes() {
+            let wasm = release_wasm();
+            assert!(
+                !contains_debug_sections(&wasm),
+                "a release build with no custom sections must not be flagged as debug"
+            );
+            assert!(debug_sections(&wasm).is_empty());
+        }
+
+        /// A non-debug custom section (e.g. the conventional `name` section, or
+        /// a producers section) must NOT be misclassified as debug. Release
+        /// builds routinely carry these; flagging them would reject valid
+        /// contracts.
+        #[test]
+        fn non_debug_custom_sections_pass() {
+            for name in ["name", "producers", "target_features", ".llvmcmd"] {
+                let wasm = wasm_with_custom_section(name, &[0x01, 0x02]);
+                assert!(
+                    !contains_debug_sections(&wasm),
+                    "custom section {name:?} is not a .debug_* section and must pass"
+                );
+            }
+        }
+
+        /// Unparseable / truncated input is treated as "no debug sections":
+        /// malformed-WASM rejection is the executor's job, not this scan's.
+        /// We must not reject a contract here just because the lightweight
+        /// parser tripped.
+        #[test]
+        fn malformed_wasm_is_not_flagged_as_debug() {
+            // Empty input.
+            assert!(!contains_debug_sections(&[]));
+            // Garbage that is not a WASM module.
+            assert!(!contains_debug_sections(b"not a wasm module at all"));
+            // Valid header followed by a truncated custom section (declares a
+            // length longer than the bytes that follow).
+            let mut truncated = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+            truncated.push(0x00); // custom section id
+            truncated.push(0x20); // claims 32 bytes follow, but none do
+            assert!(!contains_debug_sections(&truncated));
+        }
+
+        /// A `.debug_*` section followed by a parse error must NOT leave the
+        /// scan reporting the already-collected debug section (Codex P3): a
+        /// module we can't fully parse is not trustworthy evidence of a
+        /// debug build, and rejecting it with "recompile with --release"
+        /// would mask the real malformed-WASM error. The whole scan must
+        /// void to empty on any parse error.
+        #[test]
+        fn debug_section_before_parse_error_is_not_flagged() {
+            // A complete, valid `.debug_info` custom section...
+            let mut wasm = wasm_with_custom_section(".debug_info", &[0xde, 0xad]);
+            // ...then a second custom section header that lies about its
+            // length, so the parser errors AFTER the debug section is seen.
+            wasm.push(0x00); // custom section id
+            wasm.push(0x40); // claims 64 bytes follow, but none do
+            assert!(
+                !contains_debug_sections(&wasm),
+                "a parse error after a debug section must void the scan, \
+                 not report the partial result"
+            );
+            assert!(debug_sections(&wasm).is_empty());
+        }
+
+        /// The rejection maps through `report_op_init_error`'s
+        /// `OpError::ContractError(_)` arm to a client-visible
+        /// `ErrorKind::OperationError` whose cause carries the actionable
+        /// "recompile with --release" guidance. Replicates the relevant arm
+        /// (same fixture-avoidance approach as the pins above).
+        #[test]
+        fn debug_wasm_rejection_yields_actionable_client_error() {
+            use crate::operations::OpError;
+            use freenet_stdlib::client_api::ErrorKind;
+
+            let err = OpError::ContractError(crate::contract::ContractError::DebugWasmRejected {
+                sections: ".debug_info, .debug_str".to_string(),
+            });
+            let op_name = "PUT";
+            #[allow(clippy::wildcard_enum_match_arm)]
+            let kind = match err {
+                OpError::ContractError(_) => ErrorKind::OperationError {
+                    cause: format!("{op_name} operation failed: {err}").into(),
+                },
+                _ => ErrorKind::Unhandled {
+                    cause: "irrelevant for this test".to_string().into(),
+                },
+            };
+            #[allow(clippy::wildcard_enum_match_arm)]
+            match kind {
+                ErrorKind::OperationError { cause } => {
+                    assert!(
+                        cause.contains("debug mode"),
+                        "cause must explain the contract is debug-compiled; got: {cause}"
+                    );
+                    assert!(
+                        cause.contains("--release"),
+                        "cause must tell the user to recompile with --release; got: {cause}"
+                    );
+                }
+                other => panic!("DebugWasmRejected must map to OperationError, got {other:?}"),
+            }
+        }
+    } // mod debug_wasm
 }

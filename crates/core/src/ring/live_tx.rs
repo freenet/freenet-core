@@ -1,5 +1,5 @@
-use crate::message::{Transaction, TransactionType};
-use dashmap::DashMap;
+use crate::message::Transaction;
+use dashmap::{DashMap, DashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -16,6 +16,28 @@ pub struct LiveTransactionTracker {
     /// Reverse index: Transaction -> SocketAddr for O(1) lookup during removal.
     /// Without this, remove_finished_transaction would need to iterate all peers.
     peer_for_tx: Arc<DashMap<Transaction, SocketAddr>>,
+    /// CONNECT transactions this node *initiated itself* via `Ring::acquire_new`
+    /// (i.e. genuine connection-acquisition attempts), as opposed to CONNECTs it
+    /// is merely relaying for other peers.
+    ///
+    /// `connection_maintenance` throttles concurrent acquisition attempts on
+    /// this count. It must NOT include relayed CONNECTs: a relay holds a
+    /// `tx_per_peer` entry for each CONNECT it forwards (registered in
+    /// `p2p_protoc`) until the op completes or hits the 60s TTL, so counting
+    /// those would let a relay-heavy node's own acquisition budget be consumed
+    /// by other peers' traffic — once at/above `min_connections` the budget is
+    /// only `BASE = 3`, so a few relayed CONNECTs would stall the node's own
+    /// growth flat just above `min_connections` (#4348). An entry is cleared
+    /// only by `remove_finished_transaction` (NOT by `prune_transactions_from_peer`):
+    /// an acquisition stays "in flight" across peer churn until its driver
+    /// actually finishes. The acquisition driver always reaches
+    /// `remove_finished_transaction` — on completion, on an orphan wake
+    /// (`handle_orphaned_transactions` after a peer disconnect), or via the
+    /// driver's 60s `OPERATION_TTL` exit (`should_exit_for_ttl` →
+    /// `release_pending_op_slot` → `TransactionCompleted`) — so the set cannot
+    /// leak, and tying cleanup to completion alone keeps the gauge race-free
+    /// under concurrent rebinds.
+    acquisition_txs: Arc<DashSet<Transaction>>,
 }
 
 impl LiveTransactionTracker {
@@ -40,6 +62,10 @@ impl LiveTransactionTracker {
     }
 
     pub fn remove_finished_transaction(&self, tx: Transaction) {
+        // Clear the acquisition gauge in lockstep with the live-tx removal so a
+        // completed acquisition frees its maintenance-throttle slot. No-op for
+        // relayed CONNECTs (never registered as acquisitions).
+        self.acquisition_txs.remove(&tx);
         // O(1) lookup using reverse index instead of O(n) full-map iteration
         if let Some((_, peer_addr)) = self.peer_for_tx.remove(&tx) {
             self.tx_per_peer.remove_if_mut(&peer_addr, |_, v| {
@@ -49,10 +75,18 @@ impl LiveTransactionTracker {
         }
     }
 
+    /// Mark `tx` as a self-initiated connection-acquisition attempt so it counts
+    /// toward the `connection_maintenance` concurrency throttle. Call this only
+    /// from `Ring::acquire_new`; relayed CONNECTs must NOT be registered here.
+    pub(crate) fn register_acquisition(&self, tx: Transaction) {
+        self.acquisition_txs.insert(tx);
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             tx_per_peer: Arc::new(DashMap::default()),
             peer_for_tx: Arc::new(DashMap::default()),
+            acquisition_txs: Arc::new(DashSet::default()),
         }
     }
 
@@ -61,7 +95,19 @@ impl LiveTransactionTracker {
     /// Returns the list of transactions that were associated with this peer,
     /// allowing callers to handle them appropriately (e.g., retry via alternate routes).
     pub(crate) fn prune_transactions_from_peer(&self, peer_addr: SocketAddr) -> Vec<Transaction> {
-        // Remove all transactions for this peer from the reverse index
+        // Remove all transactions for this peer from the reverse index.
+        //
+        // NOTE: this deliberately does NOT touch `acquisition_txs`. A pruned
+        // peer means a disconnect, not acquisition completion — the orphaned
+        // acquisition's driver is woken (`handle_orphaned_transactions`) and
+        // retries or fails, and either way reaches `remove_finished_transaction`
+        // (or the 60s TTL backstop), which clears the gauge. Removing here would
+        // (a) undercount a tx that was rebound to a still-live peer, and
+        // (b) race a concurrent `add_transaction` rebind between the owner check
+        // and the remove. Leaving acquisition cleanup solely to
+        // `remove_finished_transaction` is race-free and, during the brief
+        // orphan window, errs toward over-counting — the safe direction for a
+        // concurrency throttle (#4348 review).
         if let Some((_, txs)) = self.tx_per_peer.remove(&peer_addr) {
             for tx in &txs {
                 self.peer_for_tx.remove(tx);
@@ -89,19 +135,16 @@ impl LiveTransactionTracker {
             .sum()
     }
 
-    /// Returns the number of active Connect transactions across all peers.
-    /// Used to limit concurrent connection acquisition attempts.
-    pub(crate) fn active_connect_transaction_count(&self) -> usize {
-        self.tx_per_peer
-            .iter()
-            .map(|entry| {
-                entry
-                    .value()
-                    .iter()
-                    .filter(|tx| tx.transaction_type() == TransactionType::Connect)
-                    .count()
-            })
-            .sum()
+    /// Returns the number of in-flight connection-acquisition attempts this node
+    /// initiated itself (via `Ring::acquire_new`). `connection_maintenance` uses
+    /// this to throttle concurrent acquisitions.
+    ///
+    /// This deliberately excludes CONNECTs the node is relaying for other peers
+    /// (those are tracked in `tx_per_peer` for cancellation/`has_live_connection`
+    /// but never registered as acquisitions), so relay load cannot consume the
+    /// node's own acquisition budget — see the `acquisition_txs` field (#4348).
+    pub(crate) fn active_acquisition_transaction_count(&self) -> usize {
+        self.acquisition_txs.len()
     }
 }
 
@@ -163,39 +206,116 @@ mod tests {
     }
 
     #[test]
-    fn active_connect_transaction_count_filters_by_type() {
+    fn acquisition_count_empty() {
         let tracker = LiveTransactionTracker::new();
-        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-
-        // Add mixed transaction types
-        tracker.add_transaction(addr, Transaction::new::<ConnectMsg>());
-        tracker.add_transaction(addr, Transaction::new::<GetMsg>());
-        tracker.add_transaction(addr, Transaction::new::<PutMsg>());
-        tracker.add_transaction(addr, Transaction::new::<ConnectMsg>());
-
-        // Total count should be 4
-        assert_eq!(tracker.active_transaction_count(), 4);
-        // Connect count should only be 2
-        assert_eq!(tracker.active_connect_transaction_count(), 2);
+        assert_eq!(tracker.active_acquisition_transaction_count(), 0);
     }
 
+    /// Regression test for the residual half of #4348: the
+    /// `connection_maintenance` acquisition throttle must count ONLY CONNECTs
+    /// this node initiated itself, not CONNECTs it is relaying for other peers.
+    /// Relayed CONNECTs land in `tx_per_peer` (via `add_transaction`) and are
+    /// held until the op completes or hits the 60s TTL; counting them let a
+    /// relay-heavy node's own acquisition budget (only `BASE = 3` once at/above
+    /// `min_connections`) be consumed by other peers' traffic, stalling its
+    /// growth flat just above `min_connections`.
     #[test]
-    fn active_connect_transaction_count_empty() {
+    fn acquisition_count_excludes_relayed_connects() {
         let tracker = LiveTransactionTracker::new();
-        assert_eq!(tracker.active_connect_transaction_count(), 0);
+        let peer1: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let peer2: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+
+        // Three CONNECTs this node is merely relaying for others.
+        tracker.add_transaction(peer1, Transaction::new::<ConnectMsg>());
+        tracker.add_transaction(peer1, Transaction::new::<ConnectMsg>());
+        tracker.add_transaction(peer2, Transaction::new::<ConnectMsg>());
+
+        // None of them are this node's own acquisition attempts.
+        assert_eq!(
+            tracker.active_acquisition_transaction_count(),
+            0,
+            "relayed CONNECTs must not consume the acquisition throttle budget"
+        );
+
+        // One CONNECT this node initiated itself via acquire_new.
+        let own = Transaction::new::<ConnectMsg>();
+        tracker.add_transaction(peer1, own);
+        tracker.register_acquisition(own);
+        assert_eq!(tracker.active_acquisition_transaction_count(), 1);
     }
 
+    /// A self-initiated CONNECT rebound across hops (acquire_new registers once,
+    /// then the tx is forwarded to successive peers via `add_transaction`) is
+    /// still a single in-flight acquisition.
     #[test]
-    fn active_connect_transaction_count_no_connects() {
+    fn acquisition_count_unaffected_by_cross_peer_rebind() {
         let tracker = LiveTransactionTracker::new();
-        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let addr1: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let addr2: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        let tx = Transaction::new::<ConnectMsg>();
 
-        // Add only non-connect transactions
-        tracker.add_transaction(addr, Transaction::new::<GetMsg>());
-        tracker.add_transaction(addr, Transaction::new::<PutMsg>());
+        tracker.register_acquisition(tx);
+        tracker.add_transaction(addr1, tx);
+        tracker.add_transaction(addr2, tx); // rebind to a second hop
 
-        assert_eq!(tracker.active_transaction_count(), 2);
-        assert_eq!(tracker.active_connect_transaction_count(), 0);
+        assert_eq!(tracker.active_acquisition_transaction_count(), 1);
+    }
+
+    /// The acquisition gauge drains on transaction completion (and only then),
+    /// so a completed acquisition frees its throttle slot and the set cannot
+    /// leak and pin acquisition at the cap.
+    #[test]
+    fn acquisition_count_drains_on_completion() {
+        let tracker = LiveTransactionTracker::new();
+        let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+
+        let first = Transaction::new::<ConnectMsg>();
+        tracker.add_transaction(addr, first);
+        tracker.register_acquisition(first);
+        let second = Transaction::new::<ConnectMsg>();
+        tracker.add_transaction(addr, second);
+        tracker.register_acquisition(second);
+        assert_eq!(tracker.active_acquisition_transaction_count(), 2);
+
+        tracker.remove_finished_transaction(first);
+        assert_eq!(tracker.active_acquisition_transaction_count(), 1);
+
+        tracker.remove_finished_transaction(second);
+        assert_eq!(tracker.active_acquisition_transaction_count(), 0);
+    }
+
+    /// Pruning a peer (a disconnect, NOT completion) must NOT drain the
+    /// acquisition gauge: the orphaned acquisition is still in flight (its
+    /// driver retries or fails and reaches `remove_finished_transaction`). This
+    /// holds even for a tx cross-peer-rebound to a still-live peer, where a
+    /// remove-on-prune would undercount and let the maintenance throttle exceed
+    /// max_concurrent during churn (#4348 review). The gauge clears only on
+    /// completion.
+    #[test]
+    fn acquisition_count_unaffected_by_prune() {
+        let tracker = LiveTransactionTracker::new();
+        let old_peer: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let new_peer: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        let tx = Transaction::new::<ConnectMsg>();
+
+        tracker.register_acquisition(tx);
+        tracker.add_transaction(old_peer, tx);
+        tracker.add_transaction(new_peer, tx); // rebind; old_peer entry now stale
+        assert_eq!(tracker.active_acquisition_transaction_count(), 1);
+
+        // old_peer disconnects — its stale entry is pruned, but the tx is still
+        // in flight (live on new_peer), so the acquisition gauge must stay at 1.
+        tracker.prune_transactions_from_peer(old_peer);
+        assert_eq!(
+            tracker.active_acquisition_transaction_count(),
+            1,
+            "prune must not drain an in-flight acquisition"
+        );
+        assert!(tracker.has_live_connection(new_peer));
+
+        // Completion finally drains it.
+        tracker.remove_finished_transaction(tx);
+        assert_eq!(tracker.active_acquisition_transaction_count(), 0);
     }
 
     #[test]
@@ -262,8 +382,9 @@ mod tests {
         assert!(pruned.is_empty());
     }
 
-    /// Pins the load-bearing invariant for `Ring::connection_maintenance`
-    /// (`crates/core/src/ring.rs:2360-2365`): once a `tx` has been
+    /// Pins the load-bearing invariant for `Ring::connection_maintenance`'s
+    /// `has_live_connection` neighbor filter (`crates/core/src/ring.rs:3110`):
+    /// once a `tx` has been
     /// registered against a peer, `has_live_connection(that_peer)` must
     /// remain `true` until the tx is explicitly cleared, even after the
     /// same `tx` is re-registered against another peer.

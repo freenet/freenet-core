@@ -142,15 +142,30 @@ async fn test_put_error_notification(ctx: &mut TestContext) -> TestResult {
     // Wait for response - should receive error response
     let put_result = timeout(Duration::from_secs(30), client.recv()).await;
 
+    // Synthesised marker emitted by the retry loop when the bypass
+    // closes early. Reject it explicitly: a response containing this
+    // string means the client got an infrastructure leak rather than
+    // the contract's real rejection reason.
+    const FORBIDDEN_MARKER: &str = "failed notifying, channel closed";
+
     match put_result {
         Ok(Ok(response)) => {
-            // Any response is good - means we're not hanging
-            info!("✓ Received response (not timing out): {:?}", response);
-            info!("✓ Client properly notified instead of hanging");
+            let rendered = format!("{response:?}");
+            assert!(
+                !rendered.contains(FORBIDDEN_MARKER),
+                "PUT failure response contained the forbidden marker \
+                 ({FORBIDDEN_MARKER:?}). Response was: {rendered}"
+            );
+            info!("✓ Received response without forbidden marker: {response:?}");
         }
         Ok(Err(e)) => {
-            // WebSocket error could indicate error was delivered
-            info!("✓ Received error notification: {}", e);
+            let rendered = e.to_string();
+            assert!(
+                !rendered.contains(FORBIDDEN_MARKER),
+                "PUT WS error contained the forbidden marker \
+                 ({FORBIDDEN_MARKER:?}). Error was: {rendered}"
+            );
+            info!("✓ Received error notification without forbidden marker: {rendered}");
         }
         Err(_) => {
             panic!(
@@ -162,8 +177,145 @@ async fn test_put_error_notification(ctx: &mut TestContext) -> TestResult {
     }
 
     info!("PUT error notification test passed - client did not hang on operation failure");
+    // Follow-up: tracked by #4147 — adds a wrapper contract that
+    // emits a deterministic cause string so the assertion can
+    // verify the real contract-side reason, not just the absence
+    // of the FORBIDDEN_MARKER.
 
     // Properly close the client
+    client
+        .send(ClientRequest::Disconnect { cause: None })
+        .await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    Ok(())
+}
+
+/// PR #4126 review item M1 part 2: integration coverage of the
+/// multi-hop PUT-error bubble path.
+///
+/// Setup: 2-node ring (gateway + peer-a). The client connects to
+/// `peer-a` (NOT the gateway), so the PUT enters at a non-originator
+/// node and the wire path is:
+///
+///   peer-a (client) → peer-a (originator-loopback relay) → gateway
+///
+/// `run_relay_put` runs at peer-a in originator-loopback mode (because
+/// the WS client is local). The PUT forward to the gateway exercises
+/// `drive_relay_put`'s downstream-reply handling for `PutMsg::Error`
+/// when the gateway rejects the invalid state, and the upstream-bubble
+/// helper `relay_put_send_error` when the gateway's response surfaces
+/// at peer-a.
+///
+/// What this pins behaviourally (delta vs the single-node
+/// `test_put_error_notification` above):
+///
+///   - The client connected to a non-gateway node still receives a
+///     terminal response (no `OPERATION_TTL` hang) when the PUT fails.
+///   - The response does NOT carry the `FORBIDDEN_MARKER` synthesised
+///     by the pre-#4111 race shape. If the multi-hop bubble regresses
+///     (e.g. `node.rs::handle_pure_network_message_v1` PUT bypass stops
+///     accepting `PutMsg::Error`, or `drive_relay_put`'s `PutMsg::Error`
+///     reply arm falls back through to `UnexpectedOpState`), the
+///     originator's `send_to_and_await` will time out and either
+///     surface the marker or hang past the test deadline — both
+///     trip this assertion.
+///
+/// Known limitation: with the available `test-contract-integration`
+/// contract, invalid state is rejected at every hop (no stateful
+/// version check), so the failure can land on either peer-a's local
+/// validation OR the gateway's relay validation depending on routing
+/// timing. The B1 fix and the multi-hop bubble arm are both
+/// candidate paths exercised. A stricter test that DEFINITIVELY
+/// pins "failure happens on the non-originator node only" — using
+/// a wrapper contract with stateful version validation and a
+/// deterministic, asserted-on cause string — is tracked as
+/// follow-up #4147.
+#[freenet_test(
+    health_check_readiness = true,
+    nodes = ["gateway", "peer-a"],
+    timeout_secs = 120,
+    startup_wait_secs = 30,
+    tokio_flavor = "multi_thread",
+    tokio_worker_threads = 4
+)]
+async fn test_put_error_notification_multi_hop(ctx: &mut TestContext) -> TestResult {
+    let peer = ctx.node("peer-a")?;
+    let (ws_stream, _) = connect_async(&peer.ws_url()).await?;
+    let mut client = WebApi::start(ws_stream);
+
+    info!("Testing multi-hop PUT error: client → peer-a → gateway (ws on peer-a, NOT gateway)");
+
+    const TEST_CONTRACT: &str = "test-contract-integration";
+    let contract = load_contract(TEST_CONTRACT, vec![].into())?;
+    // 1 MB of 0xFF — same shape as `test_put_error_notification`,
+    // proven to deterministically fail the contract's validator.
+    let invalid_state = WrappedState::new(vec![0xFF; 1024 * 1024]);
+
+    let put_request = ClientRequest::ContractOp(ContractRequest::Put {
+        contract: contract.clone(),
+        state: invalid_state,
+        related_contracts: Default::default(),
+        subscribe: false,
+        blocking_subscribe: false,
+    });
+    client.send(put_request).await?;
+
+    // 30 s budget — must be > the cross-hop processing window but
+    // well under `OPERATION_TTL` so a regression that drops the
+    // bubble en route surfaces as a panic here, not as a passing
+    // (slow) test.
+    let put_result = timeout(Duration::from_secs(30), client.recv()).await;
+
+    // Same FORBIDDEN_MARKER as the single-hop variant: the synthesised
+    // "failed notifying, channel closed" string is the canonical
+    // tell-tale that the M1/M2 race fired and the bypass→bubble chain
+    // failed to deliver the real cause.
+    const FORBIDDEN_MARKER: &str = "failed notifying, channel closed";
+
+    match put_result {
+        Ok(Ok(response)) => {
+            let rendered = format!("{response:?}");
+            assert!(
+                !rendered.contains(FORBIDDEN_MARKER),
+                "Multi-hop PUT failure response contained the forbidden \
+                 marker ({FORBIDDEN_MARKER:?}) — the bypass→bubble chain \
+                 regressed to the synthesised-error shape from issue #4111. \
+                 Either the bypass at node.rs PUT branch stopped accepting \
+                 PutMsg::Error, or drive_relay_put's PutMsg::Error reply arm \
+                 fell back to UnexpectedOpState. Response was: {rendered}"
+            );
+            info!("✓ Multi-hop response received without forbidden marker: {response:?}");
+        }
+        Ok(Err(e)) => {
+            let rendered = e.to_string();
+            assert!(
+                !rendered.contains(FORBIDDEN_MARKER),
+                "Multi-hop PUT WS error contained the forbidden marker \
+                 ({FORBIDDEN_MARKER:?}). Got: {rendered}"
+            );
+            info!("✓ Multi-hop error notification received without forbidden marker: {rendered}");
+        }
+        Err(_) => {
+            panic!(
+                "Multi-hop PUT timed out after 30 s — clients connected to a \
+                 non-gateway node are not receiving error notifications when \
+                 the failure path crosses the relay boundary. This indicates \
+                 the multi-hop bubble path (PR #4126, B1 fix) regressed: \
+                 either run_relay_put's non-loopback Err branch stopped \
+                 emitting PutMsg::Error to upstream_addr, or the upstream \
+                 relay's bypass stopped forwarding it. The single-node \
+                 test_put_error_notification would still pass in this state — \
+                 that's why this 2-node companion is load-bearing."
+            );
+        }
+    }
+
+    info!(
+        "Multi-hop PUT error notification test passed — client at non-gateway \
+         node received a real response without the forbidden marker"
+    );
+
     client
         .send(ClientRequest::Disconnect { cause: None })
         .await?;
@@ -593,8 +745,11 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
 
         client.send(put_request).await?;
 
-        // Give the PUT a moment to start processing
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Drop the peer almost immediately so the PUT is still in flight at
+        // prune time — that is what exercises the orphan-wake path (#4313).
+        // A long pre-drop sleep lets the PUT complete first, leaving the
+        // orphan path untested.
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Now forcibly drop the peer connection
         info!("Dropping peer connection to simulate network failure...");
@@ -604,16 +759,33 @@ async fn test_connection_drop_error_notification() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         // The PUT may or may not succeed depending on timing, but we should get SOME response
-        // The key is that we don't hang indefinitely
+        // The key is that we don't hang indefinitely.
         info!("Waiting for response after connection drop...");
         let response_result = timeout(Duration::from_secs(30), client.recv()).await;
 
+        // Whatever response (or error) the client gets, it MUST NOT carry the
+        // FORBIDDEN_MARKER: an orphan-wake closing the waiter channel must
+        // surface `PeerDisconnected`, never the bare "channel closed" string
+        // (#4313). Pre-fix, a prune racing the terminal reply leaked this.
+        const FORBIDDEN_MARKER: &str = "failed notifying, channel closed";
         match response_result {
             Ok(Ok(response)) => {
+                let rendered = format!("{response:?}");
+                assert!(
+                    !rendered.contains(FORBIDDEN_MARKER),
+                    "connection-drop response leaked the orphan-wake marker \
+                     ({FORBIDDEN_MARKER:?}). Response was: {rendered}"
+                );
                 info!("✓ Received response after connection drop: {:?}", response);
                 info!("✓ Client properly handled connection drop scenario");
             }
             Ok(Err(e)) => {
+                let rendered = e.to_string();
+                assert!(
+                    !rendered.contains(FORBIDDEN_MARKER),
+                    "connection-drop error leaked the orphan-wake marker \
+                     ({FORBIDDEN_MARKER:?}). Error was: {rendered}"
+                );
                 info!("✓ Received error notification after connection drop: {}", e);
                 info!("✓ Client properly notified of connection issues");
             }

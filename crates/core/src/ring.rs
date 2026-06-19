@@ -211,6 +211,39 @@ impl Drop for SubscriptionRecoveryGuard {
     }
 }
 
+/// State of the `Ring -> OpManager` weak back-reference, as observed by
+/// the `connection_maintenance` loop.
+///
+/// The startup-vs-shutdown distinction is the whole point: a `None` slot
+/// (not attached yet) must keep waiting, while a `Some(weak)` that no longer
+/// upgrades (attached then dropped) must terminate the loop. Conflating the
+/// two leaves the maintenance task spinning forever on a dead `Weak` —
+/// the #3308 zombie.
+enum OpManagerState<T> {
+    /// `attach_op_manager` has not run yet — normal startup window. The
+    /// maintenance loop should keep waiting for attachment.
+    NotAttached,
+    /// The `OpManager` is alive and was successfully upgraded.
+    Live(Arc<T>),
+    /// The back-reference was attached once but the owning `Arc` has since
+    /// been dropped. Nothing re-attaches it, so the loop owner is dead and
+    /// the maintenance task must terminate instead of spinning on a `Weak`
+    /// that can never upgrade again (#3308).
+    Detached,
+}
+
+/// Classify a `RwLock<Option<Weak<T>>>` back-reference into the three states
+/// the maintenance loop cares about. Generic over `T` so it can be
+/// unit-tested with a stand-in `Arc` instead of a full `OpManager` (#3308).
+fn classify_op_manager_ref<T>(slot: &RwLock<Option<Weak<T>>>) -> OpManagerState<T> {
+    let upgraded = slot.read().as_ref().map(|weak| weak.clone().upgrade());
+    match upgraded {
+        None => OpManagerState::NotAttached,
+        Some(Some(strong)) => OpManagerState::Live(strong),
+        Some(None) => OpManagerState::Detached,
+    }
+}
+
 /// Result of pruning a connection.
 #[derive(Debug, Default)]
 pub struct PruneConnectionResult {
@@ -290,7 +323,7 @@ impl Ring {
             router,
             connection_manager,
             hosting_manager: hosting::HostingManager::new(config.config.max_hosting_storage),
-            broken_invariants: BrokenInvariantsTracker::new(),
+            broken_invariants: BrokenInvariantsTracker::new(time_source.clone()),
             governance,
             update_rate_limiter: Arc::new(update_rate_limit::UpdateRateLimiter::new(
                 time_source.clone(),
@@ -436,6 +469,22 @@ impl Ring {
             .and_then(|weak| weak.clone().upgrade())
     }
 
+    /// Classify the current state of the `OpManager` back-reference.
+    ///
+    /// The maintenance loop must distinguish "not attached yet" (normal
+    /// startup window, before [`Ring::attach_op_manager`] runs) from
+    /// "attached then dropped" (the node has been torn down and the
+    /// `Arc<OpManager>` is gone). The first case must keep waiting; the
+    /// second must terminate the loop so it doesn't become a zombie
+    /// spinning forever on a `Weak` that can never upgrade again (#3308).
+    ///
+    /// This is the sole production instantiation of the generic
+    /// [`classify_op_manager_ref`] (with `T = OpManager`); the unit tests
+    /// instantiate it with a stand-in `Arc` to exercise the same logic.
+    fn op_manager_state(&self) -> OpManagerState<OpManager> {
+        classify_op_manager_ref(&self.op_manager)
+    }
+
     pub fn is_gateway(&self) -> bool {
         self.is_gateway
     }
@@ -520,13 +569,14 @@ impl Ring {
     /// Record a contract-directed CONNECT attempt. Doubles the backoff (up to cap).
     fn record_contract_connect_attempt(&self, contract_key: &ContractKey) {
         let mut backoff = self.contract_connect_backoff.lock();
+        let now = self.time_source.now();
         let state = backoff
             .entry(*contract_key)
             .or_insert_with(|| ContractConnectState {
                 current_backoff: Self::INITIAL_CONTRACT_CONNECT_BACKOFF,
-                last_attempt: Instant::now(),
+                last_attempt: now,
             });
-        state.last_attempt = Instant::now();
+        state.last_attempt = now;
         state.current_backoff = (state.current_backoff * 2).min(Self::MAX_CONTRACT_CONNECT_BACKOFF);
     }
 
@@ -737,6 +787,11 @@ impl Ring {
             // entry slipped through the reaper (e.g. mode flipped off
             // mid-window), cleanup catches it on the next tick.
             ring.contract_ban_list.cleanup();
+
+            // Sweep expired broken-invariant flags on the same cadence so a
+            // suppressed contract (especially a false-positive) recovers
+            // after BROKEN_INVARIANT_TTL instead of being bricked forever.
+            ring.broken_invariants.cleanup();
 
             // Network-norms summary at DEBUG — useful when debugging
             // calibration but too noisy for INFO on a healthy node.
@@ -956,11 +1011,21 @@ impl Ring {
             let history = match register.get_router_events(Self::ROUTER_HISTORY_LIMIT).await {
                 Ok(h) => h,
                 Err(error) => {
-                    // Previously this was an `expect()` that would silently panic
-                    // the task. Now that the task is monitored, returning will
-                    // trigger the BackgroundTaskMonitor and propagate the failure.
-                    tracing::error!(error = %error, "Shutting down refresh router task");
-                    return;
+                    // get_router_events errors are transient and recoverable —
+                    // e.g. file-descriptor exhaustion ("os error 24") when the
+                    // AOF segment file can't be opened during a connection-churn
+                    // spike. Router refresh is a best-effort optimization, so we
+                    // keep the existing in-memory router in place and retry on
+                    // the next interval rather than killing the node. (A genuine
+                    // panic inside this task is still caught by the
+                    // BackgroundTaskMonitor — only this expected, transient read
+                    // failure is swallowed here.)
+                    tracing::error!(
+                        error = %error,
+                        "Failed to refresh routing history from event log; \
+                         keeping existing router and retrying on next interval"
+                    );
+                    continue;
                 }
             };
             if !history.is_empty() {
@@ -996,11 +1061,36 @@ impl Ring {
                 snapshot.connect_forward_peer_adjustments = Some(adjustments);
             }
 
+            // Node-health gauges (#4440): make fd-exhaustion headroom observable
+            // on the existing snapshot cadence. Best-effort — `None` where the
+            // platform can't report it (see `read_fd_usage`).
+            let (open_fds, fd_soft_limit) = read_fd_usage();
+            snapshot.open_fds = open_fds;
+            snapshot.fd_soft_limit = fd_soft_limit;
+
+            // Compiled-WASM module-cache occupancy + eviction gauges (#4440),
+            // read from the process-global the caches publish into (they live
+            // behind the contract-handler channel, unreachable from here).
+            let mc = crate::wasm_runtime::MODULE_CACHE_METRICS.snapshot();
+            snapshot.contract_module_cache_entries = Some(mc.contract_entries);
+            snapshot.contract_module_cache_total_bytes = Some(mc.contract_total_bytes);
+            snapshot.contract_module_cache_budget_bytes = Some(mc.contract_budget_bytes);
+            snapshot.contract_module_cache_evictions_total = Some(mc.contract_evictions_total);
+            snapshot.delegate_module_cache_entries = Some(mc.delegate_entries);
+            snapshot.delegate_module_cache_total_bytes = Some(mc.delegate_total_bytes);
+            snapshot.delegate_module_cache_budget_bytes = Some(mc.delegate_budget_bytes);
+            snapshot.delegate_module_cache_evictions_total = Some(mc.delegate_evictions_total);
+
             tracing::info!(
                 failure_events = snapshot.failure_events,
                 success_events = snapshot.success_events,
                 prediction_active = snapshot.prediction_active,
                 consider_n_closest_peers = snapshot.consider_n_closest_peers,
+                open_fds = ?snapshot.open_fds,
+                fd_soft_limit = ?snapshot.fd_soft_limit,
+                contract_module_cache_entries = mc.contract_entries,
+                contract_module_cache_total_bytes = mc.contract_total_bytes,
+                contract_module_cache_evictions_total = mc.contract_evictions_total,
                 "router_snapshot"
             );
 
@@ -1265,6 +1355,27 @@ impl Ring {
                         "Notification channel >75% full during renewal spawning, stopping early"
                     );
                     break;
+                }
+
+                // Phase 7 egress gate (#4373). Don't renew a subscription
+                // for a contract we have banned: a renewal re-registers
+                // interest via the same outbound-SUBSCRIBE machinery as a
+                // client-initiated request, but unlike the four
+                // `start_client_*` originator entry points this scheduler
+                // doesn't pass through `reject_if_contract_banned`. Without
+                // this check the node keeps emitting outbound SUBSCRIBE
+                // renewals for a banned-but-still-subscribed contract on
+                // every maintenance cycle until the ban TTL lifts. Checked
+                // before `can_request_subscription` so a banned contract is
+                // skipped regardless of its spam-backoff state.
+                if ring.contract_ban_list.is_banned(contract.id()) {
+                    tracing::debug!(
+                        %contract,
+                        phase = "subscription_renewal_banned_skip",
+                        "skipping subscription renewal for banned contract"
+                    );
+                    skipped += 1;
+                    continue;
                 }
 
                 // Check spam prevention (respects exponential backoff and pending checks)
@@ -1583,6 +1694,16 @@ impl Ring {
         self.hosting_manager.set_storage(storage);
     }
 
+    /// Drop the ring's clones of the redb `Storage` handle (hosting metadata +
+    /// broken-invariants persistence). Called on node shutdown so the redb
+    /// `Database` Arc count can fall to zero and release the on-disk file lock
+    /// — otherwise an in-process restart against the same data dir deadlocks on
+    /// the still-held lock. See issue #4401.
+    pub(crate) fn clear_redb_storage(&self) {
+        self.hosting_manager.clear_storage();
+        self.broken_invariants.clear_storage();
+    }
+
     /// Load hosting cache from persisted storage.
     ///
     /// Call this during startup after storage is available to restore
@@ -1809,6 +1930,18 @@ impl Ring {
                         skipped_not_ready += 1;
                         continue;
                     }
+                } else {
+                    // Addressless candidates bypass every filter above (skip
+                    // list, dedup, transient, readiness) because all of them
+                    // key on the socket addr. If the router then selects one,
+                    // the GET advance helpers can't use it as a wire target
+                    // and the hop dies. Keep the inclusion (the candidate may
+                    // gain an addr by send time) but make it visible (#4361).
+                    tracing::debug!(
+                        peer = ?conn.location,
+                        target_location = %target_location.as_f64(),
+                        "k_closest: including addressless candidate (bypasses addr-keyed filters)"
+                    );
                 }
                 candidates.push(conn.location.clone());
             }
@@ -2287,6 +2420,55 @@ impl Ring {
         }
     }
 
+    /// Snapshot of the contract ban list for the local-peer dashboard
+    /// (#4302). Reads directly from the canonical `contract_ban_list` —
+    /// no mirror, no cache. The count, capacity-rejection counter, and
+    /// per-entry list (key + reason + time remaining) all come from the
+    /// list's own accessors, so the panel can't drift the way a mirrored
+    /// counter would.
+    pub fn dashboard_ban_list_snapshot(&self) -> crate::node::network_status::BanListSnapshot {
+        use crate::node::network_status as ns;
+        use crate::ring::contract_ban_list::BanReason;
+
+        let map_reason = |r: BanReason| match r {
+            BanReason::AutoMad => ns::BanReasonSnapshot::AutoMad,
+            BanReason::Operator => ns::BanReasonSnapshot::Operator,
+        };
+
+        let mut entries: Vec<ns::BanListEntry> = self
+            .contract_ban_list
+            .snapshot()
+            .into_iter()
+            .map(|e| ns::BanListEntry {
+                instance_id: e.contract.to_string(),
+                reason: map_reason(e.reason),
+                expires_in_secs: e.remaining.as_secs(),
+            })
+            .collect();
+        // Stable display order: soonest-to-lift first, then by id so the
+        // dashboard doesn't reshuffle rows between refreshes (DashMap
+        // iteration order is unspecified).
+        entries.sort_by(|a, b| {
+            a.expires_in_secs
+                .cmp(&b.expires_in_secs)
+                .then_with(|| a.instance_id.cmp(&b.instance_id))
+        });
+
+        // Count LIVE entries — derive from the filtered snapshot, not
+        // `ContractBanList::len()`. `len()` includes entries that have
+        // expired but not yet been swept by `cleanup()`/`unban()`;
+        // `snapshot()` filters those out with the same `now < expires_at`
+        // predicate as `is_banned`. Using `len()` here would let the
+        // count tile read "1 contract banned" while the entry list (and
+        // the wire boundary) show zero — an inconsistency in the
+        // expiry-before-sweep window. (Codex review on #4464.)
+        ns::BanListSnapshot {
+            count: entries.len(),
+            capacity_rejected_total: self.contract_ban_list.capacity_rejected_total(),
+            entries,
+        }
+    }
+
     /// Record that a state update was observed for `contract`.
     /// No-op if the contract is not currently subscribed.
     pub fn record_contract_update(&self, contract: &ContractKey) {
@@ -2452,6 +2634,131 @@ fn resource_weight(resource: crate::topology::meter::ResourceType) -> f64 {
     }
 }
 
+/// Bridge the transport layer's per-peer wire-byte counters into the
+/// topology meter so `TopologyManager::adjust_topology` can make load-aware
+/// connection decisions in production (#3453).
+///
+/// `TRANSPORT_METRICS.per_peer_snapshot()` exposes *cumulative* sent/received
+/// byte counts per peer socket address. The topology meter, by contrast,
+/// accumulates each reported sample into a sliding-window sum and divides by
+/// the elapsed wall-time (`now − oldest_sample`) to produce a rate. We diff
+/// the current snapshot against the previous tick's counts (`prev`) to recover
+/// the bytes transferred *during the interval*, and feed that delta as one
+/// sample per direction:
+///   - received bytes → `InboundBandwidthBytes`
+///   - sent bytes     → `OutboundBandwidthBytes`
+///
+/// `interval_start` MUST be the time of the *previous* maintenance tick, not
+/// the current one. The meter divides the windowed byte sum by
+/// `query_time − oldest_sample_time` with a 1-second floor
+/// (`RunningAverage::get_rate_at_time`). `adjust_topology` queries the meter at
+/// the current tick time immediately after this call, so timestamping the
+/// interval's whole byte delta at the interval START makes the very first
+/// sample divide by the real interval length (e.g. ~60s) instead of flooring
+/// to 1s. Timestamping at the interval END would treat a full interval's bytes
+/// as if they were transferred in a single second, overstating the rate by up
+/// to the tick interval (~60×) and triggering spurious connection removals
+/// under ordinary traffic (#3453 review).
+///
+/// Only deltas with a resolvable `PeerKeyLocation` are reported: an address
+/// that doesn't (yet) map to a ring peer — e.g. a transient handshake
+/// connection — is skipped rather than attributed to a phantom source, so we
+/// don't pollute the meter with samples that can't be matched against the
+/// node's actual neighbors.
+///
+/// Three things are bounded as peers churn (#3453 review):
+///   - `prev` is pruned of peers absent from `snapshot`, so it stays bounded
+///     by the transport metrics table size (`MAX_TRACKED_PEERS`).
+///   - The topology meter's per-source bandwidth meters AND
+///     `source_creation_times` are pruned to the set of peers resolved this
+///     tick via `retain_peer_sources`, so neither grows without bound (and
+///     `adjust_topology`, which iterates `source_creation_times` every tick,
+///     stays O(live peers)).
+///
+/// This takes the topology manager's write lock once per reported delta plus
+/// once for the retain. It performs no channel sends and no `.await`, so it is
+/// safe to call inline on the `connection_maintenance` tick
+/// (cf. `.claude/rules/channel-safety.md`).
+fn feed_peer_bandwidth_to_meter(
+    connection_manager: &ConnectionManager,
+    snapshot: &[(SocketAddr, u64, u64)],
+    prev: &mut HashMap<SocketAddr, (u64, u64)>,
+    interval_start: Instant,
+) {
+    use crate::topology::meter::{AttributionSource, ResourceType};
+
+    // Peers resolved to a ring `PeerKeyLocation` this tick. Used to bound the
+    // meter / source_creation_times to the live connection set below.
+    let mut live_peers: std::collections::HashSet<PeerKeyLocation> =
+        std::collections::HashSet::new();
+
+    for &(addr, cum_sent, cum_recv) in snapshot {
+        // Cumulative counters only ever increase, but use saturating
+        // subtraction so a counter reset (e.g. the per-peer slot was evicted
+        // and re-created since the last tick) can never underflow into a
+        // huge bogus delta.
+        let (prev_sent, prev_recv) = prev.get(&addr).copied().unwrap_or((0, 0));
+        let sent_delta = cum_sent.saturating_sub(prev_sent);
+        let recv_delta = cum_recv.saturating_sub(prev_recv);
+
+        // Always record the latest cumulative counts so the next tick diffs
+        // against them, even when this tick produced no usable delta.
+        prev.insert(addr, (cum_sent, cum_recv));
+
+        let Some(peer) = connection_manager.get_peer_by_addr(addr) else {
+            // No ring peer for this address (transient/handshake connection,
+            // or just-torn-down). Skip rather than attribute to a phantom.
+            continue;
+        };
+        // Track every resolvable peer (even with a zero delta this tick) as
+        // live so retain below doesn't evict a currently-connected, currently
+        // idle peer's accumulated samples.
+        live_peers.insert(peer.clone());
+
+        if sent_delta == 0 && recv_delta == 0 {
+            continue;
+        }
+
+        let source = AttributionSource::Peer(peer);
+        let mut topo = connection_manager.topology_manager.write();
+        if recv_delta > 0 {
+            topo.report_resource_usage(
+                &source,
+                ResourceType::InboundBandwidthBytes,
+                recv_delta as f64,
+                interval_start,
+            );
+        }
+        if sent_delta > 0 {
+            topo.report_resource_usage(
+                &source,
+                ResourceType::OutboundBandwidthBytes,
+                sent_delta as f64,
+                interval_start,
+            );
+        }
+    }
+
+    // Bound the meter / source_creation_times to the live peer set so they
+    // don't accumulate departed peers forever (#3453 review). Non-Peer
+    // (Contract/Delegate) sources are retained by `retain_peer_sources`.
+    connection_manager
+        .topology_manager
+        .write()
+        .retain_peer_sources(&live_peers);
+
+    // Drop prior-tick entries for peers that vanished from the snapshot so
+    // `prev` stays bounded as peers churn (#3453). After the loop above,
+    // every snapshot address is present in `prev`, so `prev.len() >
+    // snapshot.len()` holds exactly when some prior peer is no longer in the
+    // snapshot — the only case where a prune is needed.
+    if prev.len() > snapshot.len() {
+        let live: std::collections::HashSet<SocketAddr> =
+            snapshot.iter().map(|&(addr, _, _)| addr).collect();
+        prev.retain(|addr, _| live.contains(addr));
+    }
+}
+
 impl Ring {
     // ==================== Subscription Retry Spam Prevention ====================
 
@@ -2614,8 +2921,8 @@ impl Ring {
         tokio::time::sleep(Duration::from_secs(2)).await;
 
         let mut pending_conn_adds = BTreeSet::new();
-        let mut last_backoff_cleanup = Instant::now();
-        let mut last_health_check = Instant::now();
+        let mut last_backoff_cleanup = self.time_source.now();
+        let mut last_health_check = self.time_source.now();
         let mut last_peer_cache_save = self.time_source.now();
         const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(300);
         // How often to snapshot the peer cache to disk.
@@ -2645,11 +2952,39 @@ impl Ring {
         // for faster recovery from cold-start failures (#3737).
         let mut ever_had_connections = false;
 
+        // Prior-tick cumulative per-peer wire-byte counts, keyed by the
+        // transport socket address. Each maintenance tick we diff the current
+        // `TRANSPORT_METRICS.per_peer_snapshot()` against this to derive the
+        // bytes transferred *during the tick*, then feed that delta into the
+        // topology meter so `adjust_topology` can make load-aware decisions
+        // (#3453). Bounded: entries for peers absent from the latest snapshot
+        // are pruned each tick, so this never outgrows the transport metrics
+        // table (capped at `MAX_TRACKED_PEERS`).
+        //
+        // Seed with the current cumulative counts so the first maintenance
+        // tick attributes only the bytes transferred *during* that first
+        // interval, not the entire history accumulated before the loop
+        // started (which would over-count any pre-maintenance bootstrap
+        // traffic into a single inflated first sample).
+        let mut prev_peer_bandwidth: HashMap<SocketAddr, (u64, u64)> =
+            crate::transport::metrics::TRANSPORT_METRICS
+                .per_peer_snapshot()
+                .into_iter()
+                .map(|(addr, sent, recv)| (addr, (sent, recv)))
+                .collect();
+        // Time of the previous bandwidth feed (the start of the interval whose
+        // byte delta the next feed reports). Seeded with "now" so the first
+        // feed's delta is divided by the real first-interval length rather than
+        // flooring to the meter's 1s minimum (#3453 review — see
+        // `feed_peer_bandwidth_to_meter`).
+        let mut prev_bandwidth_tick = self.time_source.now();
+
         // Gateway version probe: random initial delay to prevent thundering herd.
         // The loop guard (`!is_gateway`) ensures gateways never probe themselves.
         let initial_probe_delay_secs =
             GlobalRng::random_u64() % GATEWAY_VERSION_PROBE_INTERVAL.as_secs();
-        let mut next_gateway_probe = Instant::now() + Duration::from_secs(initial_probe_delay_secs);
+        let mut next_gateway_probe =
+            self.time_source.now() + Duration::from_secs(initial_probe_delay_secs);
 
         // Adaptive fast-tick backoff: increase the fast-tick interval when
         // connection count stops growing, to avoid hammering the network
@@ -2694,7 +3029,7 @@ impl Ring {
         const SUSPEND_DETECTION_THRESHOLD: Duration = CHECK_TICK_DURATION.saturating_mul(2);
 
         let mut this_peer = None;
-        loop {
+        'maintenance: loop {
             // Update clock tracking at the top of every iteration (including
             // early-continue paths) so elapsed time doesn't accumulate during
             // startup. The four clock operations below MUST stay back-to-back
@@ -2726,11 +3061,30 @@ impl Ring {
                 );
             }
 
-            let op_manager = match self.upgrade_op_manager() {
-                Some(op_manager) => op_manager,
-                None => {
+            let op_manager = match self.op_manager_state() {
+                OpManagerState::Live(op_manager) => op_manager,
+                OpManagerState::NotAttached => {
+                    // Still in the startup window before attach_op_manager;
+                    // wait for the owner to wire itself up.
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
+                }
+                OpManagerState::Detached => {
+                    // The OpManager was attached and then dropped (node
+                    // shutdown). Stop the maintenance work instead of spinning
+                    // forever on a Weak that can never upgrade again (#3308).
+                    // We do NOT `return Ok(())` here: this task is registered
+                    // with `BackgroundTaskMonitor`, whose `wait_for_any_exit`
+                    // treats any clean return as a fatal "task exited
+                    // unexpectedly". Per the #4292 convention, a monitored
+                    // long-lived task whose work has ended must hand a
+                    // non-completing future to the monitor — so we break out
+                    // of the loop and park below.
+                    tracing::info!(
+                        is_gateway,
+                        "OpManager dropped; connection maintenance loop ending (parking)"
+                    );
+                    break 'maintenance;
                 }
             };
             let Some(this_addr) = &this_peer else {
@@ -2800,7 +3154,7 @@ impl Ring {
             // Periodic cleanup of expired backoff entries
             if last_backoff_cleanup.elapsed() > BACKOFF_CLEANUP_INTERVAL {
                 self.cleanup_connection_backoff();
-                last_backoff_cleanup = Instant::now();
+                last_backoff_cleanup = self.time_source.now();
             }
 
             // Clean up stale pending reservations to prevent permanent isolation
@@ -2837,7 +3191,7 @@ impl Ring {
 
             // Periodic peer health check: evict peers with sustained routing failures.
             if last_health_check.elapsed() > HEALTH_CHECK_INTERVAL {
-                last_health_check = Instant::now();
+                last_health_check = self.time_source.now();
                 let current_ring = self.connection_manager.connection_count();
                 let unhealthy = self
                     .connection_manager
@@ -2902,10 +3256,10 @@ impl Ring {
                             "Node isolated with zero ring connections — resetting all backoff state"
                         );
                         reset_all_backoff();
-                        zero_connections_since = Some(Instant::now());
+                        zero_connections_since = Some(self.time_source.now());
                     }
                 } else {
-                    zero_connections_since = Some(Instant::now());
+                    zero_connections_since = Some(self.time_source.now());
                     tracing::warn!(
                         is_gateway,
                         "Zero ring connections detected — starting isolation timer"
@@ -2929,7 +3283,7 @@ impl Ring {
             if should_probe_gateway(
                 is_gateway,
                 !op_manager.configured_gateways.is_empty(),
-                Instant::now(),
+                self.time_source.now(),
                 next_gateway_probe,
             ) {
                 let gw_index =
@@ -2951,7 +3305,7 @@ impl Ring {
                 let uniform_01 = (GlobalRng::random_u64() as f64) / (u64::MAX as f64);
                 let jittered_secs = base_secs + jitter_range * (2.0 * uniform_01 - 1.0);
                 next_gateway_probe =
-                    Instant::now() + Duration::from_secs_f64(jittered_secs.max(1.0));
+                    self.time_source.now() + Duration::from_secs_f64(jittered_secs.max(1.0));
             }
 
             // Gateway bootstrap fallback: at zero connections, acquire_new always
@@ -3010,10 +3364,18 @@ impl Ring {
             );
 
             // Drain pending connections, initiating multiple attempts per tick
-            // (up to max_concurrent) for faster mesh formation.
-            let mut active_count = live_tx_tracker.active_connect_transaction_count();
+            // (up to max_concurrent) for faster mesh formation. Counts only this
+            // node's own in-flight acquisitions, NOT CONNECTs it is relaying for
+            // others (#4348).
+            let mut active_count = live_tx_tracker.active_acquisition_transaction_count();
+            // Under-min nodes bypass per-target backoff to escape the straggler
+            // trap (#4348); see `should_respect_location_backoff`.
+            let respect_backoff = should_respect_location_backoff(
+                current_conn_count,
+                self.connection_manager.min_connections,
+            );
             while let Some(ideal_location) = pending_conn_adds.pop_first() {
-                if self.is_in_connection_backoff(ideal_location) {
+                if respect_backoff && self.is_in_connection_backoff(ideal_location) {
                     tracing::debug!(
                         target_location = %ideal_location,
                         "Skipping connection attempt - target in backoff"
@@ -3126,6 +3488,24 @@ impl Ring {
                 "Evaluating topology maintenance"
             );
 
+            // Feed the per-peer bandwidth measured since the previous tick into
+            // the topology meter BEFORE adjust_topology reads it. Without this
+            // the meter sees no peer-attributed bandwidth samples in production,
+            // so `calculate_usage_proportion` always reports ~0% usage and
+            // `adjust_topology` perpetually takes the "add connections" branch —
+            // the load-aware add/hold/remove logic never engages (#3453).
+            let bandwidth_tick_now = self.time_source.now();
+            feed_peer_bandwidth_to_meter(
+                &self.connection_manager,
+                &crate::transport::metrics::TRANSPORT_METRICS.per_peer_snapshot(),
+                &mut prev_peer_bandwidth,
+                // Timestamp this interval's byte delta at the PREVIOUS tick
+                // (interval start) so the meter divides by the real interval
+                // length, not the 1s floor. See feed_peer_bandwidth_to_meter.
+                prev_bandwidth_tick,
+            );
+            prev_bandwidth_tick = bandwidth_tick_now;
+
             let adjustment = self
                 .connection_manager
                 .topology_manager
@@ -3133,7 +3513,7 @@ impl Ring {
                 .adjust_topology(
                     &neighbor_locations,
                     &self.connection_manager.own_location().location(),
-                    Instant::now(),
+                    self.time_source.now(),
                     current_connections,
                 );
 
@@ -3331,6 +3711,16 @@ impl Ring {
                 }
             }
         }
+
+        // Intentional teardown parking (#4292): the loop only breaks once the
+        // OpManager has been dropped (node shutdown), so there is no more work
+        // to do. This task is registered with `BackgroundTaskMonitor`; parking
+        // on a never-resolving future — rather than returning `Ok(())` — keeps
+        // `wait_for_any_exit` from misreading orderly teardown as a fatal
+        // background-task exit. The unreachable `Ok(())` after it keeps the
+        // `anyhow::Result<()>` signature.
+        std::future::pending::<()>().await;
+        Ok(())
     }
 
     #[tracing::instrument(level = "debug", skip(self, notifier, live_tx_tracker, op_manager), fields(peer = %self.connection_manager.pub_key))]
@@ -3433,9 +3823,9 @@ impl Ring {
 
         // Register tx with the live transaction tracker BEFORE spawning the
         // driver. Otherwise the driver's first Response could land on the
-        // bypass before the registration completes, breaking the
-        // active_connect_transaction_count gauge that connection_maintenance
-        // uses to throttle concurrent acquisitions.
+        // bypass before the registration completes. (The acquisition-throttle
+        // registration is done inside `start_client_connect`, shared by every
+        // self-initiated CONNECT — ring acquisition, gateway join, and probe.)
         live_tx_tracker.add_transaction(gateway_addr, tx);
 
         let op_manager_spawn = op_manager.clone();
@@ -3529,6 +3919,28 @@ fn calculate_max_concurrent_connections(
     // Cap at half of min_connections, floored at BASE.
     let bootstrap_cap = (min_connections / 2).max(BASE);
     (BASE + deficit / CONNECTIONS_PER_EXTRA_SLOT).min(bootstrap_cap)
+}
+
+/// Whether `connection_maintenance` should honor per-target-location connection
+/// backoff for a node with `current_connections` open connections.
+///
+/// Backoff is honored only once the node has reached `min_connections`. A node
+/// still below min MUST keep probing even recently-rejected ring regions: its
+/// under-connection is a local capacity problem, not the target's fault (cf. the
+/// ring.md "Backoff Target Must Match Failure Cause" rule), and the 30s→600s
+/// location backoff stamped on a `Rejected` would otherwise trap a poorly
+/// positioned node permanently below min — the straggler tail in #4348. This
+/// mirrors the zero-connection re-bootstrap escape, extended to the whole
+/// under-min regime; at/above min, steady-state backoff is unchanged.
+///
+/// Storm safety: bypassing location backoff below min does NOT let a stuck node
+/// hammer indefinitely. The maintenance loop's adaptive fast-tick backoff still
+/// stretches the retry cadence toward the steady ~60s `CHECK_TICK` after
+/// consecutive no-progress ticks (connection count not changing), per-tick
+/// attempts remain bounded by [`calculate_max_concurrent_connections`], and the
+/// separate gateway re-bootstrap backoff (`gateway_backoff`) is untouched.
+fn should_respect_location_backoff(current_connections: usize, min_connections: usize) -> bool {
+    current_connections >= min_connections
 }
 
 fn calculate_allowed_connection_additions(
@@ -3635,6 +4047,494 @@ fn classify_suspend_jump(boot_elapsed: Duration, mono_elapsed: Duration) -> Dura
     boot_elapsed.saturating_sub(mono_elapsed)
 }
 
+/// Best-effort snapshot of this process's open file-descriptor count and the
+/// `RLIMIT_NOFILE` soft limit, for the node-health telemetry gauges (#4440).
+///
+/// fd exhaustion (open fds reaching the soft limit → `EMFILE`) drove the
+/// v0.2.73 gateway crash-loop and was invisible to central telemetry at the
+/// time. Emitting these on the existing `router_snapshot` cadence makes the
+/// headroom observable to operators.
+///
+/// Returns `(open_fds, fd_soft_limit)`. Either element is `None` on a platform
+/// where it can't be read cheaply: the open-fd count is Linux-only (via
+/// `/proc/self/fd`); the soft limit is any-unix (via `getrlimit`).
+fn read_fd_usage() -> (Option<u64>, Option<u64>) {
+    (read_open_fd_count(), read_fd_soft_limit())
+}
+
+/// Count this process's open file descriptors by enumerating `/proc/self/fd`.
+///
+/// Returns `None` if the process is already at its fd limit — `read_dir` itself
+/// needs a descriptor and fails with `EMFILE` at the cliff. The companion
+/// [`read_fd_soft_limit`] still reports in that case, and the 5-minute cadence
+/// captures the *approach* to the limit, which is the actionable signal.
+#[cfg(target_os = "linux")]
+fn read_open_fd_count() -> Option<u64> {
+    // `read_dir` itself holds one descriptor open for the duration of the
+    // iteration, so it is included in the entry count; subtract it to report
+    // the steady-state number of descriptors the process actually holds.
+    let count = std::fs::read_dir("/proc/self/fd").ok()?.count() as u64;
+    Some(count.saturating_sub(1))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_open_fd_count() -> Option<u64> {
+    None
+}
+
+/// Read the current `RLIMIT_NOFILE` soft limit (the ceiling that triggers
+/// `EMFILE`). Mirrors the `getrlimit` read in `bin/freenet.rs::raise_fd_limit`.
+#[cfg(unix)]
+fn read_fd_soft_limit() -> Option<u64> {
+    let mut limits = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `getrlimit` with a valid resource id and an exclusively-borrowed,
+    // initialized out-param is sound; the return code is checked before the
+    // struct is read.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limits) } != 0 {
+        return None;
+    }
+    // `rlim_t` is `u64` on linux-gnu (CI target) but varies across unix targets;
+    // normalize to `u64`. The cast is redundant on linux-gnu, hence the scoped
+    // allow rather than a bare `as u64` that trips clippy.
+    #[allow(clippy::unnecessary_cast)]
+    Some(limits.rlim_cur as u64)
+}
+
+#[cfg(not(unix))]
+fn read_fd_soft_limit() -> Option<u64> {
+    None
+}
+
+#[cfg(test)]
+mod fd_usage_tests {
+    //! Validates the node-health fd gauges (#4440): the open-fd count and the
+    //! `RLIMIT_NOFILE` soft limit must report sane values on Linux so the
+    //! fd-exhaustion headroom signal that was missing during the v0.2.73
+    //! incident is trustworthy.
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_fd_usage_reports_sane_values_on_linux() {
+        let (open, soft) = super::read_fd_usage();
+        let open = open.expect("linux reports an open-fd count via /proc/self/fd");
+        let soft = soft.expect("unix reports the RLIMIT_NOFILE soft limit");
+        // A running process always holds at least stdin/stdout/stderr.
+        assert!(open > 0, "expected a positive open-fd count, got {open}");
+        // The kernel enforces open-fds <= soft limit, so this is invariant, not
+        // a heuristic — it pins that we read the two values the right way round.
+        assert!(
+            soft >= open,
+            "open fds ({open}) must not exceed the soft limit ({soft})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resource_meter_bridge_tests {
+    //! Regression tests for #3453: the topology resource meter was never fed
+    //! per-peer bandwidth data in production, so `adjust_topology` always saw
+    //! ~0% usage and perpetually took the "add connections" branch. These
+    //! tests drive `feed_peer_bandwidth_to_meter` — the production bridge from
+    //! `TRANSPORT_METRICS.per_peer_snapshot()` into the meter — and assert the
+    //! meter actually receives the samples, exercising the load-aware
+    //! remove/hold/add decision logic that was previously dead in production.
+
+    // `super::*` brings in ConnectionManager, TopologyAdjustment, Location,
+    // SocketAddr, HashMap, BTreeMap, Duration, and tokio's Instant.
+    use super::*;
+    use crate::topology::meter::{AttributionSource, ResourceType};
+    use crate::transport::TransportKeypair;
+
+    /// Mirror of `topology::constants::SOURCE_RAMP_UP_DURATION` (5 min). That
+    /// constant is `pub(super)` to the topology module, so we restate it here.
+    /// Samples reported older than this window use their measured attributed
+    /// rate rather than the P50 ramp-up extrapolation.
+    const SOURCE_RAMP_UP_DURATION: Duration = Duration::from_secs(5 * 60);
+
+    /// Add `n` ring connections to `cm`, returning their socket addresses in
+    /// the order added. Each gets a distinct loopback address and location.
+    fn add_connections(cm: &ConnectionManager, n: usize) -> Vec<SocketAddr> {
+        let mut addrs = Vec::with_capacity(n);
+        for i in 0..n {
+            let addr: SocketAddr = format!("127.0.0.1:{}", 9000 + i).parse().unwrap();
+            // Spread locations across the ring so each peer is a distinct
+            // neighbor location (adjust_topology keys neighbors by location).
+            let loc = Location::new((i as f64 + 0.5) / n as f64);
+            let keypair = TransportKeypair::new();
+            assert!(cm.add_connection(loc, addr, keypair.public().clone(), false));
+            addrs.push(addr);
+        }
+        addrs
+    }
+
+    /// Drive the bridge once per simulated second, placing the first sample at
+    /// `first_sample` and one sample per second thereafter for `ticks` seconds.
+    /// `per_sec_recv[i]` is the bytes-received delta attributed to `addrs[i]`
+    /// each second; cumulative counters are simulated by accumulating the
+    /// per-second deltas (mirrors production, where each maintenance tick feeds
+    /// one delta per peer). Returns the final `prev` map for inspection.
+    ///
+    /// Callers that want the meter to report a *measured* rate (rather than the
+    /// ramp-up P50 estimate) must arrange two things, both governed by the
+    /// sample timestamps relative to the eventual `adjust_topology` query time
+    /// `q`:
+    ///   1. The first sample (the source's creation time) must be older than
+    ///      `SOURCE_RAMP_UP_DURATION` before `q`, or `extrapolated_usage`
+    ///      treats the source as ramping up and substitutes the network P50.
+    ///   2. The samples must extend up to just before `q`, because the meter's
+    ///      rate is `sum(retained samples) / (q − oldest_retained_sample)`.
+    ///      A window that ends far in the past inflates the denominator and
+    ///      dilutes the rate toward zero. The meter retains only the most
+    ///      recent `RUNNING_AVERAGE_WINDOW` (100) samples.
+    fn drive_bridge(
+        cm: &ConnectionManager,
+        addrs: &[SocketAddr],
+        per_sec_recv: &[u64],
+        first_sample: Instant,
+        ticks: u64,
+    ) -> HashMap<SocketAddr, (u64, u64)> {
+        let mut prev: HashMap<SocketAddr, (u64, u64)> = HashMap::new();
+        let mut cumulative: Vec<u64> = vec![0; addrs.len()];
+        for t in 0..ticks {
+            for (i, c) in cumulative.iter_mut().enumerate() {
+                *c += per_sec_recv[i];
+            }
+            let snapshot: Vec<(SocketAddr, u64, u64)> = addrs
+                .iter()
+                .zip(cumulative.iter())
+                .map(|(&addr, &recv)| (addr, 0u64, recv))
+                .collect();
+            let at = first_sample + Duration::from_secs(t);
+            feed_peer_bandwidth_to_meter(cm, &snapshot, &mut prev, at);
+        }
+        prev
+    }
+
+    /// The core regression: with the bridge feeding high per-peer bandwidth,
+    /// `adjust_topology` reaches the resource-overload "remove" branch. Before
+    /// the fix nothing fed the meter, so this path was unreachable in
+    /// production and the node would instead always try to ADD connections.
+    #[test_log::test]
+    fn bridge_feeds_meter_so_overloaded_node_removes() {
+        // test_default: min_connections=4, max_connections=10,
+        // max_upstream/downstream = 1_000_000 bytes/sec.
+        let cm = ConnectionManager::test_default();
+        let addrs = add_connections(&cm, 6);
+
+        // `extrapolated_usage` SUMS the per-source rates across all peers, so
+        // 200_000 B/s inbound per peer × 6 peers = 1_200_000 B/s = 1.2× the
+        // 1_000_000 downstream limit → usage proportion 1.2 > 0.9 → remove.
+        let per_sec_recv = vec![200_000u64; 6];
+
+        // Choose the query time `now`, then lay samples from
+        // (now − RAMP_UP − 30s) up to (now − 1s): the first sample is older
+        // than the ramp-up window (so the source reports its measured rate),
+        // and the retained 100-sample tail ends ~1s before `now` (so the rate
+        // isn't diluted by a stale denominator). See `drive_bridge` docs.
+        let now = Instant::now();
+        let first_sample = now - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
+        let ticks = SOURCE_RAMP_UP_DURATION.as_secs() + 29; // last sample ≈ now − 1s
+        drive_bridge(&cm, &addrs, &per_sec_recv, first_sample, ticks);
+
+        let mut neighbor_locations = BTreeMap::new();
+        let conns = cm.get_connections_by_location();
+        for (loc, c) in &conns {
+            neighbor_locations.insert(*loc, c.clone());
+        }
+
+        let adjustment =
+            cm.topology_manager
+                .write()
+                .adjust_topology(&neighbor_locations, &None, now, 6);
+
+        assert!(
+            matches!(adjustment, TopologyAdjustment::RemoveConnections(_)),
+            "overloaded node fed via the bridge must remove a connection, got {adjustment:?}"
+        );
+    }
+
+    /// Demonstrates the bug: with NO bridge call (the production state before
+    /// this fix), the meter is empty and `adjust_topology` on a node above
+    /// min_connections takes the low-usage "add" branch. This is the symptom
+    /// #3453 describes; the test above proves the bridge cures it.
+    #[test_log::test]
+    fn empty_meter_never_removes() {
+        let cm = ConnectionManager::test_default();
+        let _addrs = add_connections(&cm, 6);
+
+        let mut neighbor_locations = BTreeMap::new();
+        let conns = cm.get_connections_by_location();
+        for (loc, c) in &conns {
+            neighbor_locations.insert(*loc, c.clone());
+        }
+
+        let adjustment = cm.topology_manager.write().adjust_topology(
+            &neighbor_locations,
+            &None,
+            Instant::now(),
+            6,
+        );
+
+        assert!(
+            !matches!(adjustment, TopologyAdjustment::RemoveConnections(_)),
+            "with an unfed meter the remove branch must be unreachable (the #3453 bug), got {adjustment:?}"
+        );
+    }
+
+    /// The bridge must attribute samples to the right `ResourceType` and only
+    /// for peers that resolve to a ring `PeerKeyLocation`.
+    #[test_log::test]
+    fn bridge_records_inbound_and_outbound_for_known_peer() {
+        let cm = ConnectionManager::test_default();
+        let addrs = add_connections(&cm, 1);
+        let peer = cm
+            .get_peer_by_addr(addrs[0])
+            .expect("peer is a ring connection");
+
+        let at = Instant::now();
+        let mut prev = HashMap::new();
+        // First snapshot establishes the baseline; cumulative counts start here.
+        feed_peer_bandwidth_to_meter(&cm, &[(addrs[0], 1_000, 2_000)], &mut prev, at);
+
+        let source = AttributionSource::Peer(peer);
+        // `attributed_usage_rate` takes `&mut self` (it can refresh the
+        // meter's cached estimate), so a write guard is required.
+        let mut topo = cm.topology_manager.write();
+        // First tick: delta == cumulative (prev was 0), so both directions get
+        // a sample equal to the cumulative count.
+        let outbound = topo.attributed_usage_rate(
+            &source,
+            &ResourceType::OutboundBandwidthBytes,
+            at + Duration::from_secs(1),
+        );
+        let inbound = topo.attributed_usage_rate(
+            &source,
+            &ResourceType::InboundBandwidthBytes,
+            at + Duration::from_secs(1),
+        );
+        drop(topo);
+
+        assert_eq!(outbound.expect("outbound recorded").per_second(), 1_000.0);
+        assert_eq!(inbound.expect("inbound recorded").per_second(), 2_000.0);
+    }
+
+    /// An address with no ring connection (e.g. a transient handshake) must be
+    /// skipped, not attributed to a phantom source. `prev` is still updated so
+    /// the next tick diffs correctly if the peer later resolves.
+    #[test_log::test]
+    fn bridge_skips_unresolvable_address() {
+        let cm = ConnectionManager::test_default();
+        // Six real peers above min_connections so the only thing that could
+        // push usage into the remove branch is bandwidth attribution.
+        let _addrs = add_connections(&cm, 6);
+        // An address that is NOT a ring connection.
+        let unknown: SocketAddr = "127.0.0.1:55555".parse().unwrap();
+
+        // Feed enormous traffic for the unknown address across a full window.
+        let now = Instant::now();
+        let window_end = now - SOURCE_RAMP_UP_DURATION - Duration::from_secs(30);
+        let mut prev = HashMap::new();
+        let mut cum = 0u64;
+        for t in 0..120u64 {
+            cum += 10_000_000; // far above any limit, IF it were attributed
+            feed_peer_bandwidth_to_meter(
+                &cm,
+                &[(unknown, 0, cum)],
+                &mut prev,
+                window_end - Duration::from_secs(120 - t),
+            );
+        }
+
+        let mut neighbor_locations = BTreeMap::new();
+        for (loc, c) in &cm.get_connections_by_location() {
+            neighbor_locations.insert(*loc, c.clone());
+        }
+        let adjustment =
+            cm.topology_manager
+                .write()
+                .adjust_topology(&neighbor_locations, &None, now, 6);
+
+        // The unknown address contributed no meter sample, so usage stays ~0
+        // and the node must NOT remove — proving the skip.
+        assert!(
+            !matches!(adjustment, TopologyAdjustment::RemoveConnections(_)),
+            "traffic for an unresolvable address must not be attributed, got {adjustment:?}"
+        );
+        // But prev is still updated so a future tick computes the delta from here.
+        assert_eq!(prev.get(&unknown).copied(), Some((0, cum)));
+    }
+
+    /// A counter that goes backwards (per-peer slot evicted then re-created,
+    /// resetting cumulative counts) must not underflow into a giant bogus
+    /// delta. saturating_sub clamps it to zero.
+    #[test_log::test]
+    fn bridge_handles_counter_reset_without_underflow() {
+        let cm = ConnectionManager::test_default();
+        let addrs = add_connections(&cm, 1);
+        let peer = cm.get_peer_by_addr(addrs[0]).unwrap();
+        let source = AttributionSource::Peer(peer);
+
+        let t0 = Instant::now();
+        let mut prev = HashMap::new();
+        // Establish a high cumulative count.
+        feed_peer_bandwidth_to_meter(&cm, &[(addrs[0], 0, 1_000_000)], &mut prev, t0);
+        // Counter reset: cumulative drops to a small value. Delta must be 0,
+        // not u64::MAX - something.
+        let t1 = t0 + Duration::from_secs(1);
+        feed_peer_bandwidth_to_meter(&cm, &[(addrs[0], 0, 10)], &mut prev, t1);
+
+        let rate = cm
+            .topology_manager
+            .write()
+            .attributed_usage_rate(
+                &source,
+                &ResourceType::InboundBandwidthBytes,
+                t1 + Duration::from_secs(1),
+            )
+            .unwrap()
+            .per_second();
+        // Only the first tick's 1_000_000 sample is present; the reset tick
+        // contributed a 0 delta (no sample). Sum=1_000_000 over a ~2s window.
+        assert!(
+            rate > 0.0 && rate.is_finite(),
+            "counter reset must clamp to a finite, non-underflowed rate, got {rate}"
+        );
+    }
+
+    /// `prev` must stay bounded as peers churn: entries for peers absent from
+    /// the latest snapshot are pruned so it never outgrows the transport
+    /// metrics table.
+    #[test_log::test]
+    fn bridge_prunes_departed_peers_from_prev() {
+        let cm = ConnectionManager::test_default();
+        let addrs = add_connections(&cm, 3);
+
+        let at = Instant::now();
+        let mut prev = HashMap::new();
+        let full: Vec<_> = addrs.iter().map(|&a| (a, 1u64, 1u64)).collect();
+        feed_peer_bandwidth_to_meter(&cm, &full, &mut prev, at);
+        assert_eq!(prev.len(), 3);
+
+        // Next tick: only one peer remains in the snapshot. The other two must
+        // be pruned from prev.
+        feed_peer_bandwidth_to_meter(
+            &cm,
+            &[(addrs[0], 2, 2)],
+            &mut prev,
+            at + Duration::from_secs(1),
+        );
+        assert_eq!(prev.len(), 1, "departed peers must be pruned from prev");
+        assert!(prev.contains_key(&addrs[0]));
+    }
+
+    /// #3453 review (P1): the per-interval byte delta must be timestamped at
+    /// the interval START so the meter divides it by the real interval length,
+    /// not the 1-second floor in `RunningAverage::get_rate_at_time`. A single
+    /// tick reporting one interval's worth of bytes must yield
+    /// `bytes / interval`, NOT `bytes / 1s` (which would overstate the rate by
+    /// the interval length and trigger spurious removals).
+    #[test_log::test]
+    fn bridge_timestamps_delta_at_interval_start_no_inflation() {
+        let cm = ConnectionManager::test_default();
+        let addrs = add_connections(&cm, 1);
+        let peer = cm.get_peer_by_addr(addrs[0]).unwrap();
+        let source = AttributionSource::Peer(peer);
+
+        // 60_000 bytes transferred over a 60s interval = 1000 B/s. Production
+        // passes the PREVIOUS tick time as `interval_start`.
+        let interval = Duration::from_secs(60);
+        let interval_start = Instant::now();
+        let query_time = interval_start + interval;
+
+        let mut prev = HashMap::new();
+        feed_peer_bandwidth_to_meter(&cm, &[(addrs[0], 0, 60_000)], &mut prev, interval_start);
+
+        let rate = cm
+            .topology_manager
+            .write()
+            .attributed_usage_rate(&source, &ResourceType::InboundBandwidthBytes, query_time)
+            .expect("inbound recorded")
+            .per_second();
+
+        // Correct: 60_000 / 60s = 1000 B/s. The interval-END bug would give
+        // 60_000 / 1s = 60_000 B/s (60× inflation).
+        assert!(
+            (rate - 1000.0).abs() < 1.0,
+            "interval delta must be divided by the real interval, got {rate} B/s (expected ~1000)"
+        );
+        assert!(
+            rate < 2000.0,
+            "rate must not be inflated toward the 1s-floor (delta/1s = 60000), got {rate}"
+        );
+    }
+
+    /// #3453 review (P2): peers that leave the live set must be pruned from the
+    /// topology meter (and `source_creation_times`), not accumulate forever.
+    /// After a peer departs, a subsequent bridge tick that no longer resolves
+    /// it must drop its meter samples.
+    #[test_log::test]
+    fn bridge_prunes_departed_peer_from_meter() {
+        let cm = ConnectionManager::test_default();
+        let addrs = add_connections(&cm, 2);
+        let peer0 = cm.get_peer_by_addr(addrs[0]).unwrap();
+        let peer1 = cm.get_peer_by_addr(addrs[1]).unwrap();
+        let src0 = AttributionSource::Peer(peer0);
+        let src1 = AttributionSource::Peer(peer1);
+
+        let t0 = Instant::now();
+        let mut prev = HashMap::new();
+        // Tick 1: both peers transfer bytes — both get meter entries.
+        feed_peer_bandwidth_to_meter(
+            &cm,
+            &[(addrs[0], 0, 10_000), (addrs[1], 0, 10_000)],
+            &mut prev,
+            t0,
+        );
+        let q = t0 + Duration::from_secs(60);
+        {
+            let mut topo = cm.topology_manager.write();
+            assert!(
+                topo.attributed_usage_rate(&src0, &ResourceType::InboundBandwidthBytes, q)
+                    .is_some(),
+                "peer0 should have a meter entry after tick 1"
+            );
+            assert!(
+                topo.attributed_usage_rate(&src1, &ResourceType::InboundBandwidthBytes, q)
+                    .is_some(),
+                "peer1 should have a meter entry after tick 1"
+            );
+        }
+
+        // peer1 disconnects from the ring; only peer0 remains a resolvable
+        // connection. The transport snapshot drops the departed peer too.
+        cm.prune_alive_connection(addrs[1]);
+        assert!(
+            cm.get_peer_by_addr(addrs[1]).is_none(),
+            "peer1 must no longer resolve after prune"
+        );
+
+        // Tick 2: only peer0 present in the snapshot. peer1 is no longer in the
+        // live set, so its meter samples must be pruned.
+        feed_peer_bandwidth_to_meter(&cm, &[(addrs[0], 0, 20_000)], &mut prev, t0);
+        {
+            let mut topo = cm.topology_manager.write();
+            assert!(
+                topo.attributed_usage_rate(&src0, &ResourceType::InboundBandwidthBytes, q)
+                    .is_some(),
+                "live peer0 must keep its meter entry"
+            );
+            assert!(
+                topo.attributed_usage_rate(&src1, &ResourceType::InboundBandwidthBytes, q)
+                    .is_none(),
+                "departed peer1 must be pruned from the meter"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod k_closest_source_tests {
     //! Source-scrape pin tests for `Ring::k_closest_potentially_hosting`.
@@ -3722,6 +4622,177 @@ mod k_closest_source_tests {
             body.contains("not_ready_fallback"),
             "k_closest_potentially_hosting must keep the not-yet-ready peer \
              fallback so cold-start nodes don't fail every GET with EmptyRing."
+        );
+    }
+}
+
+#[cfg(test)]
+mod renewal_ban_gate_source_tests {
+    //! Source-scrape pin test for the subscription-renewal ban gate (#4373).
+    //!
+    //! `recover_orphaned_subscriptions` spawns a `run_renewal_subscribe`
+    //! driver for every contract in `contracts_needing_renewal()`. That
+    //! driver emits an outbound SUBSCRIBE using the same machinery as a
+    //! client-initiated request, but — unlike the four `start_client_*`
+    //! originator entry points — the renewal scheduler does NOT route
+    //! through `operations::reject_if_contract_banned`. So before #4373 a
+    //! contract that was banned while the node still held an active
+    //! subscription kept emitting outbound SUBSCRIBE renewals on every
+    //! maintenance cycle until the ban TTL lifted.
+    //!
+    //! The fix adds an `is_banned` gate in the renewal loop. As the
+    //! `k_closest_source_tests` module above documents, building a real
+    //! `Ring` for a behavioral test requires scaffolding that does not yet
+    //! exist in this suite, so — mirroring the `*_dispatch_gates_banned_contracts`
+    //! pins in `contract_ban_list.rs` — this test scrapes the production
+    //! source to ensure the gate stays wired in and keeps running BEFORE
+    //! the renewal is spawned. A refactor that drops or reorders the gate
+    //! would fail CI rather than silently re-open the egress leak.
+
+    fn production_source() -> &'static str {
+        const FULL: &str = include_str!("ring.rs");
+        let cutoff = FULL
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("ring.rs must have a top-level #[cfg(test)] mod section");
+        &FULL[..cutoff]
+    }
+
+    fn extract_fn_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
+        let start = source
+            .find(signature_prefix)
+            .unwrap_or_else(|| panic!("could not find {signature_prefix}"));
+        let brace = source[start..].find('{').expect("fn sig must have body");
+        let body_start = start + brace + 1;
+        let bytes = source.as_bytes();
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[body_start..i];
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("unbalanced braces while extracting {signature_prefix}");
+    }
+
+    #[test]
+    fn renewal_loop_gates_banned_contracts_before_spawning() {
+        let src = production_source();
+        let body = extract_fn_body(
+            src,
+            "async fn recover_orphaned_subscriptions(ring: Arc<Self>",
+        );
+
+        let gate_pos = body.find("contract_ban_list.is_banned").expect(
+            "the subscription-renewal loop must gate on \
+             `contract_ban_list.is_banned` so a banned-but-still-subscribed \
+             contract stops emitting outbound SUBSCRIBE renewals (#4373). If \
+             this gate was removed, the egress leak is back.",
+        );
+
+        // The gate must precede the spam-prevention check: a banned contract
+        // is skipped regardless of its `can_request_subscription` backoff
+        // state, so order matters.
+        let can_request_pos = body
+            .find("can_request_subscription(&contract)")
+            .expect("renewal loop must still consult can_request_subscription");
+        assert!(
+            gate_pos < can_request_pos,
+            "ban gate (offset {gate_pos}) must run BEFORE the \
+             can_request_subscription spam check (offset {can_request_pos}) so \
+             a banned contract is always skipped"
+        );
+
+        // The gate must precede the renewal spawn. Both `mark_subscription_pending`
+        // (which flips per-contract pending state) and `run_renewal_subscribe`
+        // (the outbound-egress driver) must only be reached for non-banned
+        // contracts.
+        let mark_pending_pos = body
+            .find("mark_subscription_pending(contract)")
+            .expect("renewal loop must still call mark_subscription_pending");
+        assert!(
+            gate_pos < mark_pending_pos,
+            "ban gate (offset {gate_pos}) must run BEFORE \
+             mark_subscription_pending (offset {mark_pending_pos})"
+        );
+        let spawn_pos = body
+            .find("run_renewal_subscribe(")
+            .expect("renewal loop must still spawn run_renewal_subscribe");
+        assert!(
+            gate_pos < spawn_pos,
+            "ban gate (offset {gate_pos}) must run BEFORE the \
+             run_renewal_subscribe outbound-egress spawn (offset {spawn_pos})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod renewal_ban_gate_behavior_tests {
+    //! Behavioral coverage for the predicate the renewal-loop ban gate
+    //! relies on (#4373): a contract on the `ContractBanList` reports
+    //! `is_banned == true` (so the loop's `continue` fires), and an
+    //! un-banned contract reports `false` (so renewal proceeds). This
+    //! exercises the exact `contract_ban_list.is_banned(contract.id())`
+    //! call the loop makes, including the `ContractKey::id()` projection,
+    //! against the real ban-list type and a controllable time source.
+
+    use super::contract_ban_list::{BanReason, ContractBanList};
+    // `TimeSource` is needed in scope for the `ts.now()` trait method.
+    use crate::util::time_source::{SharedMockTimeSource, TimeSource};
+    use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn mk_key(byte: u8) -> ContractKey {
+        // A full `ContractKey` (not a bare instance id) so the test
+        // exercises the same `contract.id()` projection the renewal loop's
+        // `is_banned(contract.id())` gate performs.
+        ContractKey::from_id_and_code(
+            ContractInstanceId::new([byte; 32]),
+            CodeHash::new([byte; 32]),
+        )
+    }
+
+    #[test]
+    fn banned_contract_is_skipped_for_renewal_while_unbanned_proceeds() {
+        let ts = SharedMockTimeSource::new();
+        let ban_list = ContractBanList::new(Arc::new(ts.clone()));
+
+        let banned = mk_key(1);
+        let healthy = mk_key(2);
+
+        // Ban one contract; leave the other alone.
+        ban_list.ban(
+            *banned.id(),
+            ts.now() + Duration::from_secs(60),
+            BanReason::AutoMad,
+        );
+
+        // The renewal loop's gate is `if is_banned(contract.id()) { continue }`.
+        // Banned -> skipped; un-banned -> proceeds to renewal.
+        assert!(
+            ban_list.is_banned(banned.id()),
+            "a banned contract must be skipped for subscription renewal (#4373)"
+        );
+        assert!(
+            !ban_list.is_banned(healthy.id()),
+            "a non-banned contract must still be eligible for renewal"
+        );
+
+        // Once the ban TTL lifts, the formerly-banned contract becomes
+        // eligible for renewal again — the gate is time-bounded, matching
+        // the issue's "self-resolves when the ban TTL expires" note.
+        ts.advance_time(Duration::from_secs(61));
+        assert!(
+            !ban_list.is_banned(banned.id()),
+            "after the ban TTL expires the contract is eligible for renewal again"
         );
     }
 }
@@ -3920,6 +4991,29 @@ mod max_concurrent_connections_tests {
 }
 
 #[cfg(test)]
+mod respect_location_backoff_tests {
+    use super::should_respect_location_backoff;
+
+    /// Regression guard for the under-min backoff escape (#4348): a node below
+    /// min_connections must bypass per-target location backoff so it cannot be
+    /// trapped below min by a stamped `Rejected` backoff; at/above min, backoff
+    /// is respected as before. Pins the inequality direction and boundary.
+    #[test]
+    fn below_min_bypasses_backoff() {
+        assert!(!should_respect_location_backoff(0, 10));
+        assert!(!should_respect_location_backoff(7, 10));
+        assert!(!should_respect_location_backoff(9, 10));
+    }
+
+    #[test]
+    fn at_or_above_min_respects_backoff() {
+        assert!(should_respect_location_backoff(10, 10)); // exactly min
+        assert!(should_respect_location_backoff(11, 10));
+        assert!(should_respect_location_backoff(20, 10));
+    }
+}
+
+#[cfg(test)]
 mod pending_additions_tests {
     use super::calculate_allowed_connection_additions;
 
@@ -3949,8 +5043,135 @@ mod pending_additions_tests {
 }
 
 #[cfg(test)]
+mod op_manager_state_tests {
+    use super::{OpManagerState, classify_op_manager_ref};
+    use parking_lot::RwLock;
+    use std::sync::{Arc, Weak};
+
+    // Stand-in for `OpManager`: `classify_op_manager_ref` is generic over the
+    // pointee, so we exercise the exact production logic without building a
+    // full node. The three slot states map 1:1 onto the maintenance loop's
+    // startup / running / shutdown decisions (#3308).
+
+    #[test]
+    fn empty_slot_is_not_attached() {
+        // Mirrors the startup window before `attach_op_manager` runs.
+        let slot: RwLock<Option<Weak<u32>>> = RwLock::new(None);
+        assert!(matches!(
+            classify_op_manager_ref(&slot),
+            OpManagerState::NotAttached
+        ));
+    }
+
+    #[test]
+    fn live_weak_upgrades_to_live() {
+        let owner = Arc::new(7u32);
+        let slot: RwLock<Option<Weak<u32>>> = RwLock::new(Some(Arc::downgrade(&owner)));
+        match classify_op_manager_ref(&slot) {
+            OpManagerState::Live(got) => assert_eq!(*got, 7),
+            OpManagerState::NotAttached | OpManagerState::Detached => {
+                panic!("expected Live while the owner Arc is alive")
+            }
+        }
+    }
+
+    #[test]
+    fn dropped_owner_is_detached_not_not_attached() {
+        // The #3308 regression: the slot was attached (`Some(weak)`) but the
+        // owning Arc has been dropped. This MUST classify as `Detached`
+        // (terminate the loop), NOT `NotAttached` (which spins forever).
+        let owner = Arc::new(7u32);
+        let weak = Arc::downgrade(&owner);
+        let slot: RwLock<Option<Weak<u32>>> = RwLock::new(Some(weak));
+        drop(owner);
+        assert!(
+            matches!(classify_op_manager_ref(&slot), OpManagerState::Detached),
+            "a dropped owner must be Detached so connection_maintenance exits \
+             instead of zombie-spinning (#3308)"
+        );
+    }
+
+    /// End-to-end wiring guard for the maintenance loop's `Detached` arm.
+    ///
+    /// The pure classifier tests above only pin the `slot -> state` mapping.
+    /// They would all stay green if a refactor swapped the loop's `Detached`
+    /// arm back to `continue` (the original #3308 bug) or to a bare
+    /// `return Ok(())` (the #4292 monitor-convention violation). This test
+    /// pins the *action*: a maintenance-shaped task that polls
+    /// `classify_op_manager_ref`, breaks on `Detached`, and then parks must,
+    /// once its owner `Arc` is dropped, hand a *non-completing* future to a
+    /// real `BackgroundTaskMonitor` — `wait_for_any_exit` must NOT fire.
+    ///
+    /// Mirrors `reference_ping::spawn_with_unbindable_target_does_not_exit`.
+    #[tokio::test(start_paused = true)]
+    async fn detached_maintenance_task_parks_without_tripping_monitor() {
+        use crate::node::background_task_monitor::BackgroundTaskMonitor;
+        use std::time::Duration;
+
+        // Shared back-reference slot, exactly like `Ring::op_manager`.
+        let owner = Arc::new(0u32);
+        let slot: Arc<RwLock<Option<Weak<u32>>>> =
+            Arc::new(RwLock::new(Some(Arc::downgrade(&owner))));
+
+        let task_slot = Arc::clone(&slot);
+        let handle = tokio::spawn(async move {
+            // Reproduces the maintenance loop's arm-to-action wiring without
+            // standing up a full Ring: poll the back-reference, act per state.
+            loop {
+                match classify_op_manager_ref(&task_slot) {
+                    // Owner still alive: keep running (the Live work is a
+                    // no-op here; the point is that it does NOT exit).
+                    OpManagerState::Live(_) => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    // Startup window: keep waiting.
+                    OpManagerState::NotAttached => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    // Owner dropped: stop the loop, then park (#3308 / #4292).
+                    OpManagerState::Detached => break,
+                }
+            }
+            // Teardown parking: must NOT return cleanly, or the monitor fires.
+            std::future::pending::<()>().await;
+        });
+
+        let monitor = BackgroundTaskMonitor::new();
+        monitor.register("connection_maintenance_sim", handle);
+
+        // Let the task observe `Live` at least once and start polling.
+        tokio::time::advance(Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+
+        // Drop the owner: the weak now fails to upgrade -> `Detached`.
+        drop(owner);
+
+        // Give the task time to observe `Detached`, break, and park.
+        tokio::time::advance(Duration::from_millis(200)).await;
+        tokio::task::yield_now().await;
+
+        // The monitor must NOT fire: orderly teardown parks instead of
+        // returning. A `continue` (zombie spin) or a `return Ok(())`
+        // (monitor-convention violation) would both fail this assertion —
+        // the latter by resolving `wait_for_any_exit`.
+        let exit = monitor.wait_for_any_exit();
+        tokio::pin!(exit);
+        let still_parked = tokio::time::timeout(Duration::from_millis(100), &mut exit)
+            .await
+            .is_err();
+        assert!(
+            still_parked,
+            "Detached maintenance task must park, not exit: a clean return \
+             would trip BackgroundTaskMonitor::wait_for_any_exit and crash \
+             the node (#3308 / #4292)"
+        );
+    }
+}
+
+#[cfg(test)]
 mod refresh_router_tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use either::Either;
@@ -4061,6 +5282,111 @@ mod refresh_router_tests {
         assert_eq!(snapshot.failure_events, 0);
         assert_eq!(snapshot.success_events, 0);
     }
+
+    /// Mock register whose `get_router_events` fails the first `fail_first`
+    /// times it is called, then returns the configured events on every
+    /// subsequent call. Records the total call count so tests can confirm the
+    /// refresh loop keeps polling past a transient error rather than dying.
+    #[derive(Clone)]
+    struct FlakyRegister {
+        events: Vec<RouteEvent>,
+        fail_first: usize,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl NetEventRegister for FlakyRegister {
+        fn register_events<'a>(
+            &'a self,
+            _events: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
+        ) -> futures::future::BoxFuture<'a, ()> {
+            async {}.boxed()
+        }
+
+        fn notify_of_time_out(
+            &mut self,
+            _tx: crate::message::Transaction,
+            _op_type: &str,
+            _target_peer: Option<String>,
+        ) -> futures::future::BoxFuture<'_, ()> {
+            async {}.boxed()
+        }
+
+        fn trait_clone(&self) -> Box<dyn NetEventRegister> {
+            Box::new(self.clone())
+        }
+
+        fn get_router_events(
+            &self,
+            number: usize,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<Vec<RouteEvent>>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let fail = call < self.fail_first;
+            let events: Vec<RouteEvent> = self.events.iter().take(number).cloned().collect();
+            async move {
+                if fail {
+                    // Mimics the production failure: an AOF segment read failing
+                    // under fd exhaustion ("No file descriptors available").
+                    Err(anyhow::anyhow!(
+                        "No file descriptors available (os error 24)"
+                    ))
+                } else {
+                    Ok(events)
+                }
+            }
+            .boxed()
+        }
+    }
+
+    /// Regression test: a transient `get_router_events` error inside the
+    /// periodic refresh loop must NOT terminate the task (which, as a monitored
+    /// background task, would be node-fatal and crash-loop the gateway).
+    ///
+    /// The mock fails the startup load plus the first few periodic ticks, then
+    /// succeeds. We assert the loop kept polling past the errors (call count >
+    /// the number of injected failures) AND eventually recovered by loading the
+    /// history — both impossible if the error arm had `return`ed.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_router_survives_transient_get_router_events_error() {
+        let events = make_route_events(100);
+        let calls = Arc::new(AtomicUsize::new(0));
+        // Fail the startup load (call 0) and the first 3 periodic ticks
+        // (calls 1..=3), then succeed from call 4 onward.
+        let register = FlakyRegister {
+            events: events.clone(),
+            fail_first: 4,
+            calls: calls.clone(),
+        };
+        let router = Arc::new(RwLock::new(Router::new(&[])));
+
+        // The periodic loop ticks every 5 minutes; under start_paused the
+        // timeout auto-advances virtual time, so ~40 min covers >5 ticks and
+        // lets the loop poll well past the injected failures and recover.
+        tokio::time::timeout(
+            Duration::from_secs(60 * 40),
+            super::Ring::refresh_router(router.clone(), register),
+        )
+        .await
+        .ok(); // timeout is expected — the loop runs forever when healthy
+
+        // The loop must have kept polling past every injected failure rather
+        // than returning on the first Err.
+        let total_calls = calls.load(Ordering::SeqCst);
+        assert!(
+            total_calls > 4,
+            "refresh loop should keep polling past transient errors, but only \
+             called get_router_events {total_calls} times (<= the 4 injected failures), \
+             implying it returned/died instead of retrying"
+        );
+
+        // And it must have recovered: once get_router_events started succeeding,
+        // the router got populated from the historical events.
+        let snapshot = router.read().snapshot();
+        assert_eq!(
+            snapshot.success_events, 100,
+            "router should have recovered and loaded history after the transient \
+             errors cleared"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -4145,6 +5471,87 @@ mod deferred_swap_drop_tests {
     #[test]
     fn below_min_connections_no_drop() {
         assert_eq!(deferred_swap_drops_to_execute(5, 10, 2), 0);
+    }
+}
+
+/// Source-grep pin test: lock down the set of bare `Instant::now()` call
+/// sites in this file so a future change can't silently reintroduce a
+/// wall-clock time read on the connection-maintenance path.
+///
+/// All production time reads in `ring.rs` go through `self.time_source.now()`
+/// (the injectable `TimeSource`) so simulation/governance tests can drive the
+/// connection-maintenance loop under `tokio::time::start_paused(true)` (or a
+/// `SharedMockTimeSource`) deterministically. See #4277 and the #4260 fix that
+/// migrated the first such call site (`report_contract_resource_usage`).
+///
+/// Two categories are deliberately exempt and are NOT bare `Instant::now()`:
+///   * `boot_time::Instant::now()` / `WallClockInstant::now()` — the OS
+///     suspend/resume detector in `connection_maintenance`, which by design
+///     needs real wall-clock time (see `.claude/rules/code-style.md`).
+///     These carry a type prefix, so they don't match a *bare* `Instant::now()`.
+///
+/// The only remaining bare `Instant::now()` call sites live in two
+/// `#[cfg(test)]` modules:
+///   * `gateway_version_probe_predicate_tests` (6 sites) — constructs inputs
+///     for the pure `should_probe_gateway` predicate (no production time read).
+///   * `resource_meter_bridge_tests` (8 sites) — drives the #3453 bandwidth
+///     bridge directly with synthetic timestamps; `feed_peer_bandwidth_to_meter`
+///     itself takes the time as a parameter, and the production caller in
+///     `connection_maintenance` supplies `self.time_source.now()`.
+///
+/// If you add a new production time read, route it through
+/// `self.time_source.now()` rather than bumping this count.
+#[cfg(test)]
+mod instant_now_pin_test {
+    /// Number of bare `Instant::now()` call sites expected in this file, all
+    /// in test code. Production code must use `self.time_source.now()`.
+    /// 6 in `gateway_version_probe_predicate_tests` + 8 in
+    /// `resource_meter_bridge_tests` (#3453).
+    const EXPECTED_BARE_INSTANT_NOW: usize = 14;
+
+    #[test]
+    fn no_unexpected_bare_instant_now_call_sites() {
+        let src = include_str!("ring.rs");
+        // Build the needle from fragments so this test's own source line does
+        // not itself contain a verbatim bare call-site token that it would count.
+        let needle = format!("Instant{}now()", "::");
+        let mut count = 0usize;
+        for line in src.lines() {
+            // Strip a `//` line comment so doc/comment mentions (including this
+            // test's own docs) don't count.
+            let code = match line.split_once("//") {
+                Some((before, _)) => before,
+                None => line,
+            };
+            // Count bare occurrences — i.e. not preceded by an identifier or
+            // path separator (excludes `boot_time::Instant::now()` and
+            // `WallClockInstant::now()`).
+            let bytes = code.as_bytes();
+            let mut idx = 0;
+            while let Some(pos) = code[idx..].find(&needle) {
+                let abs = idx + pos;
+                let prev_is_pathy = abs
+                    .checked_sub(1)
+                    .map(|p| {
+                        let c = bytes[p];
+                        c == b':' || c == b'_' || c.is_ascii_alphanumeric()
+                    })
+                    .unwrap_or(false);
+                if !prev_is_pathy {
+                    count += 1;
+                }
+                idx = abs + needle.len();
+            }
+        }
+        assert_eq!(
+            count, EXPECTED_BARE_INSTANT_NOW,
+            "Unexpected number of bare wall-clock time-read call sites in ring.rs. \
+             Production code must read time via `self.time_source.now()` so the \
+             connection-maintenance loop stays deterministic under start_paused \
+             (#4277). If you intentionally added or removed a TEST-only call site, \
+             update EXPECTED_BARE_INSTANT_NOW; if this fired on PRODUCTION code, \
+             migrate it to `self.time_source.now()` instead of bumping the count."
+        );
     }
 }
 

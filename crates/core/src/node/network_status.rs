@@ -39,6 +39,14 @@ pub type GovernanceProvider = Arc<dyn Fn() -> GovernanceSnapshot + Send + Sync +
 /// Same provider pattern as `SubscriptionProvider`/`GovernanceProvider`.
 pub type RingStatsProvider = Arc<dyn Fn() -> RingStatsSnapshot + Send + Sync + 'static>;
 
+/// Provider for the contract ban-list snapshot (#4302). Same pattern as
+/// `GovernanceProvider`: registered at node startup, replaceable for
+/// multi-node test harnesses, read by `get_snapshot` on every dashboard
+/// request. In production the closure captures `Arc<Ring>` and calls
+/// `Ring::dashboard_ban_list_snapshot()`, which reads the canonical
+/// `Ring::contract_ban_list` directly — no mirrored counter to rot.
+pub type BanListProvider = Arc<dyn Fn() -> BanListSnapshot + Send + Sync + 'static>;
+
 /// Snapshot of ring-level statistics exposed to the dashboard.
 #[derive(Debug, Clone, Default)]
 pub struct RingStatsSnapshot {
@@ -50,6 +58,17 @@ pub struct RingStatsSnapshot {
     pub peer_id: String,
     /// Base58-encoded full 32-byte X25519 public key.
     pub own_pub_key: String,
+    /// Total relayed UPDATEs accepted by the per-(sender, contract) rate
+    /// limiter since startup (see `ring::update_rate_limit`).
+    pub updates_accepted: u64,
+    /// Total relayed UPDATEs dropped because the per-(sender, contract)
+    /// rate exceeded the limit. A rising value means legitimate traffic
+    /// may be getting dropped — operators should watch this.
+    pub updates_rate_limited: u64,
+    /// Total relayed UPDATEs dropped because the limiter's tracking map
+    /// was at capacity (`MAX_TRACKED_PAIRS`). A non-zero value suggests
+    /// identity churn / admission pressure, distinct from per-pair rate.
+    pub updates_capacity_dropped: u64,
 }
 
 static GOVERNANCE_PROVIDER: parking_lot::RwLock<Option<GovernanceProvider>> =
@@ -80,6 +99,16 @@ pub(crate) fn clear_ring_stats_provider() {
 #[allow(dead_code)] // consumed by Phase 4.5 dashboard tests
 pub(crate) fn clear_governance_provider() {
     *GOVERNANCE_PROVIDER.write() = None;
+}
+
+static BAN_LIST_PROVIDER: parking_lot::RwLock<Option<BanListProvider>> =
+    parking_lot::RwLock::new(None);
+
+/// Register the dashboard's contract-ban-list data source (#4302).
+/// Replaces any previously-registered provider so multi-node in-process
+/// harnesses can re-wire to the current node.
+pub fn set_ban_list_provider(provider: BanListProvider) {
+    *BAN_LIST_PROVIDER.write() = Some(provider);
 }
 
 /// Replaceable storage for the subscription provider. Wrapped in a
@@ -243,6 +272,28 @@ pub enum FailureReason {
 }
 
 /// Initialize the global network status tracker.
+///
+/// In production `init()` runs exactly once, at node startup, on one of the
+/// two mutually-exclusive bring-up paths (`run_local_node` or `run_node`),
+/// so the first call installs the tracker. If it is called again — which in
+/// practice only happens in this module's own unit tests, each of which
+/// re-initializes the global with its own port/version — the new status is
+/// written **in place** into the existing `RwLock` rather than dropped.
+///
+/// The previous implementation relied on `OnceLock::set`, which is
+/// first-write-wins: a second `init()` silently became a no-op. Because the
+/// `OnceLock` outlives any single test (it is process-global and cannot be
+/// reset by the `TEST_GLOBAL_STATE_LOCK` the tests serialize on), every test
+/// running after the first `init()` inherited the first test's
+/// `NetworkStatus` — wrong version, leaked gateway failures, leaked op stats.
+/// That made the test outcomes order-dependent: they passed in isolation but
+/// failed intermittently under parallel execution. Overwriting in place makes
+/// `init()` deterministically reset the tracker on every call.
+///
+/// This refreshes only the `NetworkStatus` value. The separately-registered
+/// providers (`SUBSCRIPTION_PROVIDER`, `GOVERNANCE_PROVIDER`,
+/// `RING_STATS_PROVIDER`, `ROUTER`) live in their own statics with their own
+/// replace-on-set semantics and are intentionally left untouched here.
 pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: String) {
     let status = NetworkStatus {
         gateway_failures: Vec::new(),
@@ -257,9 +308,28 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         op_stats: OperationStats::default(),
         nat_stats: NatStats::default(),
     };
-    // OnceLock::set returns Err if already initialized; this is expected on repeated calls
-    #[allow(clippy::let_underscore_must_use)]
-    let _ = NETWORK_STATUS.set(Arc::new(RwLock::new(status)));
+    match NETWORK_STATUS.get() {
+        // Already initialized: overwrite the existing tracker in place so
+        // repeated `init()` calls are idempotent-overwrite rather than no-ops.
+        Some(existing) => {
+            if let Ok(mut guard) = existing.write() {
+                *guard = status;
+            }
+        }
+        // First call: install the tracker. A concurrent first-init race (two
+        // threads both observing `None`) cannot occur in production — `init()`
+        // is called exactly once, on a single linear startup path — and is
+        // serialized by `TEST_GLOBAL_STATE_LOCK` in tests. If it ever did
+        // occur, `set` picks exactly one winner and the loser's status (freshly
+        // built, with no accumulated failures/peers/stats) is dropped. That is
+        // the one window where the "every call overwrites" contract would not
+        // hold, but it is unreachable by construction, so we don't pay to
+        // recover the loser's value here.
+        None => {
+            #[allow(clippy::let_underscore_must_use)]
+            let _ = NETWORK_STATUS.set(Arc::new(RwLock::new(status)));
+        }
+    }
 }
 
 /// Check if an address is a known gateway.
@@ -490,6 +560,55 @@ pub struct NetworkStatusSnapshot {
     /// we silence it here too with the same justification.
     #[allow(dead_code)] // consumed by the dashboard renderer (Phase 4.5)
     pub governance: GovernanceSnapshot,
+    /// Contract ban list (Phase 7, #4302). Drives the "N contracts on
+    /// ban list" tile and the per-entry list in the dashboard's ban-list
+    /// card. Read from the canonical `Ring::contract_ban_list` via the
+    /// provider closure — no mirrored counter to rot. Empty when nothing
+    /// is banned (the common case).
+    pub ban_list: BanListSnapshot,
+}
+
+/// Snapshot of the contract ban list for the dashboard (#4302).
+///
+/// Carries only data the canonical `Ring::contract_ban_list` already
+/// exposes: the live count, the per-entry list (key + reason + time
+/// remaining), and the cumulative capacity-rejection counter. There is
+/// no mirrored state — `get_snapshot` rebuilds this on every dashboard
+/// request from the provider closure.
+#[derive(Debug, Clone, Default)]
+pub struct BanListSnapshot {
+    /// Number of currently-banned contracts (`ContractBanList::len`).
+    /// Drives the count tile.
+    pub count: usize,
+    /// Total bans rejected because the list was at `MAX_BANNED_CONTRACTS`
+    /// capacity. A non-zero value tells operators the cap is being hit.
+    pub capacity_rejected_total: u64,
+    /// One entry per currently-banned contract.
+    pub entries: Vec<BanListEntry>,
+}
+
+/// One row of [`BanListSnapshot`]: a banned contract, why it was banned,
+/// and how long until the ban lifts.
+#[derive(Debug, Clone)]
+pub struct BanListEntry {
+    /// `ContractInstanceId.to_string()` — the same string the dashboard's
+    /// other contract panels render.
+    pub instance_id: String,
+    /// Why the contract is banned: governance-automatic vs operator-driven.
+    pub reason: BanReasonSnapshot,
+    /// Seconds until the ban automatically lifts (`expires_at - now`,
+    /// clamped at zero). Rendered as a human-readable "Ns" / "Nm" string.
+    pub expires_in_secs: u64,
+}
+
+/// Public mirror of the `pub(crate)` `ring::contract_ban_list::BanReason`,
+/// so the snapshot stays decoupled from the ring-internal enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BanReasonSnapshot {
+    /// Auto-flipped by the governance reaper after `BanTriggered`.
+    AutoMad,
+    /// Operator-driven via the CLI / config flag (#4274).
+    Operator,
 }
 
 /// Snapshot of the governance system's state, mirrored from
@@ -867,6 +986,11 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
         ring_stats,
         transport_snapshot,
         governance: GOVERNANCE_PROVIDER
+            .read()
+            .as_ref()
+            .map(|provider| provider())
+            .unwrap_or_default(),
+        ban_list: BAN_LIST_PROVIDER
             .read()
             .as_ref()
             .map(|provider| provider())
@@ -1359,6 +1483,52 @@ mod tests {
         assert_eq!(s.open_connections, 0);
     }
 
+    /// Regression: a second `init()` must overwrite the global tracker in
+    /// place rather than no-op.
+    ///
+    /// The original implementation used `OnceLock::set` (first-write-wins),
+    /// so once any test initialized the process-global `NETWORK_STATUS`,
+    /// every later `init()` was silently dropped. The version/port/failures
+    /// from the first call leaked into every subsequent test, making the
+    /// whole module order-dependent and intermittently failing under
+    /// parallel execution. This test pins the fix deterministically: it
+    /// initializes twice, with a recorded failure between the calls, and
+    /// asserts the second call's values fully replace the first's.
+    #[test]
+    fn init_overwrites_existing_global() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+
+        // First initialization, then dirty the state so we can prove the
+        // second init() resets it (not just changes scalar fields).
+        init(40001, HashSet::new(), "first-version".to_string());
+        record_gateway_failure(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 31337),
+            FailureReason::Timeout,
+        );
+        let first = get_snapshot().unwrap();
+        assert_eq!(first.version, "first-version");
+        assert_eq!(first.listening_port, 40001);
+        assert_eq!(
+            first.failures.len(),
+            1,
+            "failure recorded against the first tracker"
+        );
+
+        // Second initialization with different values must take effect
+        // immediately and reset the accumulated state.
+        init(40002, HashSet::new(), "second-version".to_string());
+        let second = get_snapshot().unwrap();
+        assert_eq!(
+            second.version, "second-version",
+            "second init() version must win (first-write-wins would keep `first-version`)"
+        );
+        assert_eq!(second.listening_port, 40002);
+        assert!(
+            second.failures.is_empty(),
+            "second init() must reset accumulated gateway failures"
+        );
+    }
+
     /// Registered RingStatsProvider must surface in `snap.ring_stats`,
     /// replacing the provider must take effect immediately, and the
     /// no-provider default is all-zeros.
@@ -1379,11 +1549,17 @@ mod tests {
             hosted_contracts: 7,
             peer_id: "abc".to_string(),
             own_pub_key: "test-key".to_string(),
+            updates_accepted: 1000,
+            updates_rate_limited: 13,
+            updates_capacity_dropped: 2,
         }));
         let snap = get_snapshot().unwrap();
         assert_eq!(snap.ring_stats.connection_count, 42);
         assert_eq!(snap.ring_stats.peer_id, "abc");
         assert_eq!(snap.ring_stats.own_pub_key, "test-key");
+        assert_eq!(snap.ring_stats.updates_accepted, 1000);
+        assert_eq!(snap.ring_stats.updates_rate_limited, 13);
+        assert_eq!(snap.ring_stats.updates_capacity_dropped, 2);
 
         // 3. Replace provider — must take effect immediately.
         set_ring_stats_provider(Arc::new(|| RingStatsSnapshot {
@@ -1391,6 +1567,7 @@ mod tests {
             hosted_contracts: 1,
             peer_id: "xyz".to_string(),
             own_pub_key: "new-key".to_string(),
+            ..Default::default()
         }));
         let snap = get_snapshot().unwrap();
         assert_eq!(snap.ring_stats.connection_count, 99);

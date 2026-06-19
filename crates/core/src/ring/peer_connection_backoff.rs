@@ -38,8 +38,9 @@ impl PeerConnectionBackoff {
 
     /// Default maximum backoff interval (90 seconds).
     ///
-    /// With 30s base and exponential growth (30s → 60s → 90s), persistent failures
-    /// cap quickly at 90s.  The previous 600s cap was appropriate for random ring
+    /// With 30s base and exponential growth (30s → 60s → 120s clamped to the
+    /// 90s cap), persistent failures cap quickly at 90s by the third failure.
+    /// The previous 600s cap was appropriate for random ring
     /// peers but far too aggressive for configured gateways: a single gateway in a
     /// 10-minute backoff means the node cannot bootstrap at all.  NAT traversal
     /// failures are transient (network change, temporary congestion) so a 90s cap
@@ -169,6 +170,61 @@ mod tests {
             remaining <= Duration::from_secs(108),
             "Gateway backoff exceeded 90s cap + jitter: {remaining:?} — issue #3304"
         );
+    }
+
+    /// Regression guard for issue #3329 / #3304: the gateway backoff
+    /// progression must escalate at most to the 90s cap and NEVER reach the
+    /// old 600s (10-minute) blackout, no matter how many consecutive failures
+    /// accrue.
+    ///
+    /// The production incident was a single configured gateway whose repeated
+    /// NAT-traversal failures pushed the per-address backoff to 600s, isolating
+    /// the node for ten minutes.  Here we drive the *deterministic* delay
+    /// calculator (`delay_for_failures`, which applies no jitter) straight off
+    /// the production defaults so the assertion pins the exact cap rather than
+    /// a jittered upper bound.
+    ///
+    /// The config is built env-independently via `with_config` from the
+    /// production `DEFAULT_*` constants — NOT `new()`, which reads
+    /// `FREENET_BACKOFF_BASE_SECS` and would yield a CI-overridden base (CI
+    /// sets it to 5s on the workspace test step). The asserted progression and
+    /// cap are derived from those same constants so the test tracks the
+    /// source-of-truth rather than drifting literals.
+    #[test]
+    fn test_gateway_backoff_progression_caps_at_90s_never_600s() {
+        let backoff = PeerConnectionBackoff::with_config(
+            PeerConnectionBackoff::DEFAULT_BASE_INTERVAL,
+            PeerConnectionBackoff::DEFAULT_MAX_BACKOFF,
+            PeerConnectionBackoff::DEFAULT_MAX_ENTRIES,
+        );
+        let config = backoff.inner.config();
+        let base = PeerConnectionBackoff::DEFAULT_BASE_INTERVAL;
+        let cap = PeerConnectionBackoff::DEFAULT_MAX_BACKOFF;
+
+        // Production defaults give 30s base, 90s cap, so the deterministic
+        // progression is base → base*2 → base*2^2 clamped to the cap:
+        // 30s → 60s → 120s-clamped-to-90s.
+        assert_eq!(config.max(), cap);
+        assert_eq!(config.delay_for_failures(1), base);
+        assert_eq!(config.delay_for_failures(2), base * 2);
+        assert_eq!(config.delay_for_failures(3), cap);
+
+        // From the 3rd failure onward the delay is pinned at the cap and never
+        // escalates — even a pathological 50-failure streak stays at the cap
+        // and never approaches the old 600s blackout. The explicit
+        // `< 600s` guard is the named #3329/#3304 tripwire: 600 is the
+        // intentional historical literal the cap regression must never reach.
+        for failures in 3..=50 {
+            let delay = config.delay_for_failures(failures);
+            assert_eq!(
+                delay, cap,
+                "backoff escalated past the {cap:?} cap at {failures} failures — issue #3329"
+            );
+            assert!(
+                delay < Duration::from_secs(600),
+                "backoff reached the old 600s blackout at {failures} failures — issue #3329"
+            );
+        }
     }
 
     #[test]

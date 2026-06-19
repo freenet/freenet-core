@@ -49,7 +49,7 @@ use freenet_stdlib::client_api::DelegateRequest;
 use serde::{Deserialize, Serialize};
 
 pub(crate) use network_bridge::{
-    ConnectionError, EventLoopNotificationsSender, NetworkBridge, OpExecutionPayload,
+    ConnectionError, EventLoopNotificationsSender, NetworkBridge, OpExecutionPayload, WaiterReply,
 };
 #[cfg(test)]
 pub(crate) use network_bridge::{EventLoopNotificationsReceiver, event_loop_notification_channel};
@@ -80,16 +80,65 @@ pub use request_router::{DeduplicatedRequest, RequestRouter};
 #[derive(Clone)]
 pub struct ShutdownHandle {
     tx: tokio::sync::mpsc::Sender<NodeEvent>,
+    /// Counter of currently-running client-originated driver tasks
+    /// (`run_client_put` / `_get` / `_update` / `_subscribe`). Read by
+    /// `shutdown` to wait for those tasks to finish before triggering
+    /// the Disconnect.
+    inflight_client_ops: Arc<std::sync::atomic::AtomicUsize>,
+    /// Admission gate flipped by `shutdown` *before* the drain begins,
+    /// so `start_client_*` can fail fast with `OpError::NodeShuttingDown`
+    /// instead of slipping a new op into the post-drain race window.
+    /// Same `Arc` is held by `OpManager::shutting_down` so the gate is
+    /// visible to the spawn sites without a separate channel.
+    shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    /// Maximum time to wait for `inflight_client_ops` to reach zero
+    /// before forcing the disconnect anyway. `Duration::ZERO` disables
+    /// the drain (legacy immediate-disconnect behaviour).
+    drain_timeout: std::time::Duration,
 }
 
 impl ShutdownHandle {
     /// Trigger a graceful shutdown of the node.
     ///
-    /// This will:
-    /// 1. Close all peer connections gracefully
-    /// 2. Stop accepting new connections
-    /// 3. Exit the event loop
+    /// Three-phase shutdown — order matters:
+    ///
+    /// 1. **Close admission**: flip `OpManager::shutting_down` so
+    ///    `start_client_{put,get,update,subscribe}` immediately
+    ///    refuse new work with `OpError::NodeShuttingDown`. Without
+    ///    this, a new client op could spawn between the drain
+    ///    observing `counter == 0` and Disconnect being sent — that
+    ///    op would bump the counter (now unobserved) and then get
+    ///    cut off by the Disconnect. (Codex reviewer call-out
+    ///    2026-05.)
+    /// 2. **Drain**: wait up to `drain_timeout` for the in-flight
+    ///    client-op counter to reach zero. Without this wait, a
+    ///    SIGTERM arriving mid-PUT (e.g. release-driven auto-update
+    ///    on the nova gateway) drops the client's WebSocket
+    ///    mid-operation. See the rationale on
+    ///    `Config::shutdown_drain_secs`.
+    /// 3. **Disconnect**: send `NodeEvent::Disconnect`, which closes
+    ///    peer connections and exits the event loop.
+    ///
+    /// Scope limitation: the drain covers **client-originated**
+    /// drivers only. In-flight *relay* operations (peer-to-peer
+    /// PUT/GET this node is forwarding) are NOT drained — those are
+    /// short-lived per-message work and the peer can re-attempt. The
+    /// targeted failure mode is user-facing WS client requests (the
+    /// `freenet-git` mirror), not relay traffic.
     pub async fn shutdown(&self) {
+        use std::sync::atomic::Ordering;
+
+        // Phase 1: close admission BEFORE the drain. Subsequent
+        // start_client_* calls fail fast. SeqCst is required for the
+        // Dekker-style handshake with `admit_client_op` — see
+        // `OpManager::admit_client_op` rustdoc for the full memory-
+        // ordering analysis (Codex r3 + skeptical r3).
+        self.shutting_down.store(true, Ordering::SeqCst);
+
+        // Phase 2: drain.
+        self.wait_for_drain().await;
+
+        // Phase 3: trigger event-loop teardown.
         if let Err(err) = self
             .tx
             .send(NodeEvent::Disconnect {
@@ -101,6 +150,69 @@ impl ShutdownHandle {
                 error = %err,
                 "failed to send graceful shutdown signal; shutdown channel may already be closed"
             );
+        }
+    }
+
+    /// Poll-loop the in-flight client-op counter until it hits zero or
+    /// `drain_timeout` expires. Cap each individual sleep at 200ms so
+    /// the drain can react promptly when the counter clears.
+    ///
+    /// Counter loads use `SeqCst` so they synchronize with
+    /// `ClientOpGuard::new`'s `fetch_add(SeqCst)` — without this, the
+    /// Dekker-style handshake described in
+    /// `OpManager::admit_client_op` would let a racing client bump
+    /// go unobserved (Codex r3 + skeptical r3 finding).
+    async fn wait_for_drain(&self) {
+        use std::sync::atomic::Ordering;
+
+        if self.drain_timeout.is_zero() {
+            return;
+        }
+        let initial = self.inflight_client_ops.load(Ordering::SeqCst);
+        if initial == 0 {
+            return;
+        }
+        tracing::info!(
+            initial,
+            drain_timeout_secs = self.drain_timeout.as_secs(),
+            "Shutdown drain: waiting for in-flight client ops to finish"
+        );
+
+        // `tokio::time` is appropriate here even under the
+        // `TimeSource`-or-bust rule for crates/core: shutdown drain is
+        // a process-exit code path that wall-clock blocks on real
+        // tokio sleeps, has no analogue in simulation tests, and is
+        // explicitly bounded by `drain_timeout`.
+        let drained = tokio::time::timeout(self.drain_timeout, async {
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(200));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // First `tick` fires immediately; advance past it so the
+            // loop body actually sleeps between checks.
+            tick.tick().await;
+            loop {
+                // SeqCst: participates in the admission handshake
+                // (see admit_client_op rustdoc). Relaxed here could
+                // let the poll see a stale 0 even after a racing
+                // bump, missing a late-arrived op.
+                if self.inflight_client_ops.load(Ordering::SeqCst) == 0 {
+                    return;
+                }
+                tick.tick().await;
+            }
+        })
+        .await;
+
+        // Final log-only read after the drain decision — Relaxed is
+        // fine, this doesn't gate any further action.
+        let remaining = self.inflight_client_ops.load(Ordering::Relaxed);
+        match drained {
+            Ok(()) => tracing::info!(initial, "Shutdown drain complete (all client ops finished)"),
+            Err(_) => tracing::warn!(
+                initial,
+                remaining,
+                drain_timeout_secs = self.drain_timeout.as_secs(),
+                "Shutdown drain timed out; proceeding with disconnect"
+            ),
         }
     }
 }
@@ -187,9 +299,35 @@ pub struct NodeConfig {
     /// `Option` is simply always `None` outside tests.
     #[serde(skip)]
     pub(crate) governance_config_override: Option<crate::contract::governance::GovernanceConfig>,
+    /// Test-only override for the placement-migration version floor
+    /// (`SUBSCRIBE_HINT_MIN_VERSION`). Simulation peers all report the current
+    /// build version, which is below the production floor until release, so the
+    /// `SubscribeHint` gate would never fire in a sim. A test that exercises the
+    /// migration cascade sets this to `Some((0,0,0))` for its own nodes, leaving
+    /// every other sim (and production) at the real floor — so the cascade is
+    /// opt-in and cannot perturb unrelated simulations.
+    ///
+    /// `None` in production. Not cfg-gated for the same reason as
+    /// `governance_config_override`: `node::testing_impl` sets it and is compiled
+    /// unconditionally. `#[serde(skip)]`; never serialized.
+    #[serde(skip)]
+    pub(crate) subscribe_hint_floor_override: Option<(u8, u8, u16)>,
 }
 
 impl NodeConfig {
+    /// This node's own peer id as a telemetry attribution string
+    /// (public key + best-effort address). The address portion falls
+    /// back to the listener address for non-gateway nodes until
+    /// external-address discovery — a refresh path is tracked in
+    /// #4294. Shared by the telemetry reporter and the shadow-RTT /
+    /// reference-ping emitters so the two constructions can't drift.
+    pub(crate) fn local_peer_id_string(&self) -> String {
+        let addr = self.own_addr.unwrap_or_else(|| {
+            std::net::SocketAddr::new(self.network_listener_ip, self.network_listener_port)
+        });
+        PeerId::new(self.key_pair.public().clone(), addr).to_string()
+    }
+
     pub async fn new(config: Config) -> anyhow::Result<NodeConfig> {
         tracing::info!("Loading node configuration for mode {}", config.mode);
 
@@ -310,17 +448,31 @@ impl NodeConfig {
                 Some(3) // Production: require 3 relay-ready upstream peers
             },
             governance_config_override: None,
+            subscribe_hint_floor_override: None,
         })
     }
 
     pub(crate) async fn parse_socket_addr(address: &Address) -> anyhow::Result<SocketAddr> {
         let (hostname, port) = match address {
+            // New form: host and port already separated. `port` is always
+            // populated (defaulted to DEFAULT_GATEWAY_PORT at deserialize time).
+            crate::config::Address::Host { host, port } => {
+                let host_with_port = format!("{host}:{port}");
+                if let Ok(mut addrs) = host_with_port.to_socket_addrs() {
+                    if let Some(addr) = addrs.next() {
+                        return Ok(addr);
+                    }
+                }
+                (Cow::Borrowed(host.as_str()), Some(*port))
+            }
             crate::config::Address::Hostname(hostname) => {
                 match hostname.rsplit_once(':') {
                     None => {
-                        // no port found, use default
+                        // No port found. Default to the gateway port (31337), NOT
+                        // a random local port — we are addressing a gateway we need
+                        // to reach (issue #1388).
                         let hostname_with_port =
-                            format!("{}:{}", hostname, crate::config::default_network_api_port());
+                            format!("{}:{}", hostname, crate::config::DEFAULT_GATEWAY_PORT);
 
                         if let Ok(mut addrs) = hostname_with_port.to_socket_addrs() {
                             if let Some(addr) = addrs.next() {
@@ -360,7 +512,9 @@ impl NodeConfig {
         match ips.iter().next() {
             Some(ip) => Ok(SocketAddr::new(
                 ip,
-                port.unwrap_or_else(crate::config::default_network_api_port),
+                // No explicit port → default to the gateway port (31337), not a
+                // random local port (issue #1388).
+                port.unwrap_or(crate::config::DEFAULT_GATEWAY_PORT),
             )),
             None => Err(anyhow::anyhow!("Fail to resolve IP address of {hostname}")),
         }
@@ -454,14 +608,23 @@ impl NodeConfig {
                 registers.push(Box::new(OTEventRegister::new()));
             }
 
-            // Add telemetry reporter if enabled in config
-            if let Some(telemetry) = TelemetryReporter::new(&self.config.telemetry) {
+            // Add telemetry reporter if enabled in config. The local
+            // peer id (public key + best-effort address, same
+            // construction as the shadow-RTT events in `p2p_impl.rs`)
+            // attributes transport-level events — transfer_failed,
+            // transport_snapshot, timeout — which otherwise carry an
+            // empty peer_id and cannot be correlated to a sender in
+            // the collector (#4345 observability gap).
+            if let Some(telemetry) =
+                TelemetryReporter::new(&self.config.telemetry, self.local_peer_id_string())
+            {
                 registers.push(Box::new(telemetry));
             }
 
             (DynamicRegister::new(registers), flush_handle)
         };
         let cfg = self.config.clone();
+        let drain_timeout = std::time::Duration::from_secs(cfg.shutdown_drain_secs);
         let (node_inner, shutdown_tx) = NodeP2P::build::<NetworkContractHandler, CLIENTS, _>(
             self,
             clients,
@@ -469,7 +632,12 @@ impl NodeConfig {
             cfg,
         )
         .await?;
-        let shutdown_handle = ShutdownHandle { tx: shutdown_tx };
+        let shutdown_handle = ShutdownHandle {
+            tx: shutdown_tx,
+            inflight_client_ops: node_inner.op_manager.inflight_client_ops_handle(),
+            shutting_down: node_inner.op_manager.shutting_down_handle(),
+            drain_timeout,
+        };
         Ok((
             Node {
                 inner: node_inner,
@@ -614,7 +782,7 @@ pub(crate) async fn process_message_decoupled<CB>(
     op_manager: Arc<OpManager>,
     conn_manager: CB,
     mut event_listener: Box<dyn NetEventRegister>,
-    pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
+    pending_op_result: Option<tokio::sync::mpsc::Sender<crate::node::WaiterReply>>,
 ) where
     CB: NetworkBridge + Clone + 'static,
 {
@@ -643,7 +811,7 @@ async fn handle_pure_network_message<CB>(
     op_manager: Arc<OpManager>,
     conn_manager: CB,
     event_listener: &mut dyn NetEventRegister,
-    pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
+    pending_op_result: Option<tokio::sync::mpsc::Sender<crate::node::WaiterReply>>,
 ) -> Result<(), crate::node::OpError>
 where
     CB: NetworkBridge + Clone + 'static,
@@ -685,12 +853,40 @@ where
 ///
 /// # Channel safety
 ///
-/// Uses `try_send` on the bounded capacity-1 channel created by
-/// `OpCtx::send_and_await`. On a closed receiver (caller cancelled or
-/// timed out) the send fails and is logged; the handler still makes
-/// progress. See `.claude/rules/channel-safety.md`.
+/// Uses `try_send` on the bounded reply channel created by the
+/// `OpCtx::send_*` family. A `try_send` failure means the reply could not
+/// be handed to the OpCtx driver and is dropped — which is benign and
+/// expected, not an error. The two failure modes (surfaced in the logged
+/// `err` field) are:
+///
+/// - `TrySendError::Closed`: the driver's receiver is gone because the
+///   caller already finished, timed out, or was cancelled. The dominant
+///   source is SUBSCRIBE renewals, whose ~25s outer cancel deadline fires
+///   before the ~60s per-attempt peer wait (see issue #4350), so a peer's
+///   reply routinely lands after the renewal task was dropped.
+///   `send_fire_and_forget` / `send_local_loopback` (UPDATE,
+///   originator-loopback PUT) also drop the receiver by design, so they
+///   produce `Closed` here as normal operation.
+/// - `TrySendError::Full`: the reply channel is at capacity. For a
+///   capacity-1 caller (GET/PUT/SUBSCRIBE via `send_and_await`) that means a
+///   duplicate reply arrived before the driver drained the first; for the
+///   capacity-N CONNECT fan-in (`send_to_and_collect_replies`) it means a
+///   burst of distinct replies exceeded the buffer — an expected overflow,
+///   see `compute_reply_capacity` in `connect/op_ctx_task.rs`.
+///
+/// In every case the channel is intentionally lossy
+/// (`.claude/rules/channel-safety.md`: drop when full rather than block) and
+/// the operation makes progress without this reply, so the drop is logged at
+/// `debug`, matching `.claude/rules/operations.md` ("WHEN a reply arrives
+/// with no waiter → Benign → debug log"). Logging it at `error` produced a
+/// steady stream of false-alarm errors on busy gateways (~30/hr on nova
+/// after the v0.2.69 rollout, when ~745 hosted contracts re-subscribe at
+/// once after a restart); `warn` is likewise wrong because the CONNECT
+/// fan-in legitimately hits the full-channel case under load.
+///
+/// Either way the handler still makes progress and returns `true`.
 fn try_forward_driver_reply(
-    pending_op_result: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
+    pending_op_result: Option<&tokio::sync::mpsc::Sender<crate::node::WaiterReply>>,
     reply: NetMessage,
     op_label: &'static str,
 ) -> bool {
@@ -698,12 +894,16 @@ fn try_forward_driver_reply(
         return false;
     };
     let tx_id = *reply.id();
-    if let Err(err) = callback.try_send(reply) {
-        tracing::error!(
+    if let Err(err) = callback.try_send(crate::node::WaiterReply::Reply(reply)) {
+        // Benign, expected, and intentionally lossy (see `# Channel safety`):
+        // the reply could not be delivered (receiver closed, or the channel
+        // full for a CONNECT-style capacity-N fan-in) and the operation
+        // proceeds without it. `err` distinguishes Closed vs Full.
+        tracing::debug!(
             %err,
             %tx_id,
             op = op_label,
-            "Failed to forward driver reply to OpCtx task"
+            "Driver reply dropped (OpCtx receiver closed or reply channel full); operation proceeds without it"
         );
     }
     true
@@ -755,7 +955,7 @@ async fn handle_pure_network_message_v1<CB>(
     op_manager: Arc<OpManager>,
     conn_manager: CB,
     event_listener: &mut dyn NetEventRegister,
-    pending_op_result: Option<tokio::sync::mpsc::Sender<NetMessage>>,
+    pending_op_result: Option<tokio::sync::mpsc::Sender<crate::node::WaiterReply>>,
 ) -> Result<(), crate::node::OpError>
 where
     CB: NetworkBridge + Clone + 'static,
@@ -854,15 +1054,25 @@ where
             return Ok(());
         }
         NetMessageV1::Put(ref op) => {
-            // Forward only **terminal** Response/ResponseStreaming
+            // Forward only **terminal** Response/ResponseStreaming/Error
             // messages to the originator's awaiting task via the
             // bypass. Non-terminal messages (Request,
             // RequestStreaming, ForwardingAck) must NOT be
             // forwarded: they would fill the capacity-1 reply
             // channel and cause `classify_reply` to fail.
+            //
+            // `Error` is terminal-by-construction (issue #4111): the
+            // originator-loopback failure path emits it via
+            // `send_local_loopback` so the originator's
+            // `start_client_put` retry loop classifies the local
+            // contract-side rejection as `Terminal(Err(cause))` once,
+            // rather than burning the retry budget against a closed
+            // per-attempt reply channel.
             if matches!(
                 op,
-                put::PutMsg::Response { .. } | put::PutMsg::ResponseStreaming { .. }
+                put::PutMsg::Response { .. }
+                    | put::PutMsg::ResponseStreaming { .. }
+                    | put::PutMsg::Error { .. }
             ) && try_forward_driver_reply(
                 pending_op_result.as_ref(),
                 NetMessage::V1(NetMessageV1::Put((*op).clone())),
@@ -975,8 +1185,8 @@ where
                             tx = %op.id(),
                             ?op,
                             "PUT: non-dispatch variant ignored \
-                             (Response/ResponseStreaming already handled \
-                             by bypass; ForwardingAck is no-op)"
+                             (Response/ResponseStreaming/Error already \
+                             handled by bypass; ForwardingAck is no-op)"
                         );
                     }
                 }
@@ -1040,6 +1250,7 @@ where
                     } => {
                         if let Err(err) = get::op_ctx_task::start_relay_get(
                             op_manager.clone(),
+                            conn_manager.clone(),
                             *id,
                             *instance_id,
                             *htl,
@@ -1410,9 +1621,58 @@ where
                     );
                     continue;
                 }
+                // Skip the per-contract state fetch — a `GetQuery` that opens
+                // the `fetch_contract` span on the single-threaded
+                // contract-handling loop — for contracts we neither actively
+                // serve nor owe a deferred broadcast. A node carrying phantom
+                // interest (e.g. the #4404 placement migration left hundreds
+                // of not-held contracts) otherwise fetched state for EVERY
+                // overlapping contract on EVERY inbound NeighborHosting
+                // announce, only to discard it at the
+                // `is_receiving_updates() || has_downstream_subscribers()`
+                // gate below. That fetch-then-discard was the residual #4473
+                // `fetch_contract` churn on technic (the fetch-path sibling of
+                // the #4475 / #4482 summarize gates).
+                //
+                // The gate reuses the existing discard predicate
+                // (`is_receiving_updates || has_downstream_subscribers`), so it
+                // changes nothing for served contracts, and adds a
+                // `pending_broadcasts` clause so the #4359 fresh-PUT flush at
+                // the matching arm still runs for any contract that owes one.
+                // Skipping is safe for the flush because a deferred broadcast
+                // is only ever stashed for a contract THIS node originated
+                // (broadcast give-up), so the flush is a guaranteed no-op for
+                // every contract this gate skips. The predicates take a
+                // synthetic key with a zero code hash: `ContractKey` equality
+                // and hashing are instance-only (freenet-stdlib `key.rs`), so
+                // the hosting / subscription maps resolve correctly from the
+                // instance id alone — `get_contract_state_by_id` is the only
+                // path that recovers the full key here, and that is exactly the
+                // round-trip we are avoiding.
+                let probe_key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+                    instance_id,
+                    freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
+                );
+                if !op_manager.ring.is_receiving_updates(&probe_key)
+                    && !op_manager.ring.has_downstream_subscribers(&probe_key)
+                    && !op_manager.pending_broadcasts.contains(&instance_id)
+                {
+                    continue;
+                }
                 if let Some((key, state)) =
                     get_contract_state_by_id(&op_manager, &instance_id).await
                 {
+                    // #4359 (MUST-FIX 1, Source 1 / proximity): this neighbor
+                    // just announced it hosts a contract we also host, so it is
+                    // now a `neighbors_with_contract` broadcast target. If a
+                    // fresh-contract PUT gave up with no targets and is stashed,
+                    // flush it here — this is the proximity first-viable-target
+                    // signal, distinct from the interest-manager (Source 2)
+                    // signals. Must run BEFORE the receiving-updates/downstream
+                    // gate below, which `continue`s for exactly the
+                    // locally-hosted-only fresh-PUT case this fix targets.
+                    op_manager.flush_pending_broadcast_on_interest(&key).await;
+
                     if !op_manager.ring.is_receiving_updates(&key)
                         && !op_manager.ring.has_downstream_subscribers(&key)
                     {
@@ -1490,6 +1750,92 @@ where
             );
             return Ok(());
         }
+        NetMessageV1::SubscribeHint(hint) => {
+            // Placement-migration deactivation gate (v0.2.74 hotfix). The
+            // placement migration was disabled after the v0.2.73 UPDATE-broadcast
+            // degradation by parking the SubscribeHint version floor at
+            // `(0, 3, 0)`, above every shipped 0.2.x release. The SEND side
+            // (`p2p_protoc::peer_supports_subscribe_hint`) already respects this
+            // floor, but the floor bump alone only stops US from emitting hints —
+            // a 0.2.74 node receiving a hint from a not-yet-upgraded 0.2.73 peer
+            // would still ACT on it and keep the migration load alive throughout
+            // the multi-hour staggered rollout.
+            //
+            // So gate the RECEIVE path too. The symmetric (sender-version) gate is
+            // not cleanly reachable here — the per-connection remote version lives
+            // in `P2pConnManager.connections` and is not exposed through the
+            // `NetworkBridge` trait — so use this node's OWN version against the
+            // SAME floor the send side uses. With the floor parked at `(0, 3, 0)`
+            // and our own version on the 0.2.x line this evaluates to "migration
+            // off → ignore"; lowering the floor re-activates both sides together.
+            //
+            // Read the floor via `subscribe_hint_floor_override().unwrap_or(...)`,
+            // identical to the send side, so a simulation that opts into the
+            // cascade (`SimNetwork::enable_placement_migration`, which lowers the
+            // per-node floor to `(0,0,0)`) still has its receivers act on hints.
+            let floor = op_manager
+                .ring
+                .connection_manager
+                .subscribe_hint_floor_override()
+                .unwrap_or(crate::node::network_bridge::p2p_protoc::SUBSCRIBE_HINT_MIN_VERSION);
+            let own_version = crate::node::network_bridge::p2p_protoc::own_crate_version();
+            if !crate::node::network_bridge::p2p_protoc::version_supports_subscribe_hint(
+                Some(own_version),
+                floor,
+            ) {
+                tracing::debug!(
+                    key = %hint.key,
+                    ?own_version,
+                    ?floor,
+                    ?source_addr,
+                    "Ignoring inbound SubscribeHint — placement migration deactivated \
+                     (own version below the SubscribeHint floor)"
+                );
+                return Ok(());
+            }
+            // Directed-subscribe placement (#4404): a holder is nudging us to
+            // host `hint.key` because we are closer to it in the ring. If we
+            // already host it there is nothing to do. Otherwise start a
+            // fire-and-forget directed subscribe routed THROUGH the holder
+            // (`hint.holder`), which fetches and thereby hosts the contract.
+            if op_manager.ring.is_hosting_contract(&hint.key) {
+                tracing::debug!(
+                    key = %hint.key,
+                    ?source_addr,
+                    "Received SubscribeHint for an already-hosted contract — ignoring"
+                );
+                return Ok(());
+            }
+            // `hint.holder` is network-sourced. A legitimate sender always sets
+            // `holder = its own location`, so the holder's address must equal the
+            // address this hint actually arrived from. Requiring that:
+            //   - drops an address-less holder (the directed-subscribe driver
+            //     routes through the holder's socket address and would otherwise
+            //     panic), and
+            //   - prevents a peer from redirecting us to directed-subscribe
+            //     through an arbitrary THIRD party (a cheap 1-packet → 1-spawned-
+            //     -op amplification / SSRF-style vector). A peer can still nudge
+            //     us toward ITSELF, which is exactly a legitimate hint.
+            // Fail-safe: a dropped legitimate hint is re-sent on the next
+            // migration trigger, so being strict here costs nothing.
+            if hint.holder.socket_addr() != source_addr {
+                tracing::debug!(
+                    key = %hint.key,
+                    holder = ?hint.holder.socket_addr(),
+                    ?source_addr,
+                    "Received SubscribeHint whose holder is not the sender — ignoring"
+                );
+                return Ok(());
+            }
+            tracing::debug!(
+                key = %hint.key,
+                holder = %hint.holder,
+                ?source_addr,
+                "Received SubscribeHint — starting directed subscribe to holder"
+            );
+            subscribe::start_directed_subscribe(op_manager.clone(), hint.key, hint.holder);
+            return Ok(());
+        }
         NetMessageV1::Aborted(tx) => {
             // Drivers own their own cancellation; `Aborted` senders are
             // drivers themselves and the bypass handles in-driver delivery.
@@ -1501,6 +1847,112 @@ where
             Ok(())
         }
     }
+}
+
+/// Maximum number of stale-contract `SyncStateToPeer` events emitted per
+/// `Summaries` message handled (#3798 Gap 1, anti-amplification hardening).
+///
+/// A single peer whose summary diverges on N contracts would otherwise trigger
+/// N `SyncStateToPeer` emissions in one `handle_interest_sync_message` call —
+/// still targeted at one peer (O(1) peer, unlike `BroadcastStateChange`), but
+/// an unbounded burst per message. Capping the per-message burst keeps the
+/// notification channel responsive under a divergent (or crafted) summary.
+///
+/// Eventual consistency is preserved without a backlog queue: staleness is
+/// re-derived every heartbeat cycle from the durable summary comparison in the
+/// `Summaries` arm below (driven by the 5-minute interest heartbeat in
+/// `ring::Ring::interest_heartbeat`, expiry-swept every 60 s by
+/// `InterestManager::sweep_expired_interests`). Any contract over the cap this
+/// cycle is re-detected and synced on a later cycle.
+///
+/// Starvation avoidance: when the stale set exceeds the cap, the emission loop
+/// starts at a random offset and wraps (see the `rotate_left` in the `Summaries`
+/// arm), so the cap window slides across the whole stale set over successive
+/// cycles instead of always re-processing the same prefix. Without this, a
+/// contract stuck in the leading `cap` positions — e.g. one whose
+/// `SyncStateToPeer` is dropped on a full channel, lost in transit, or not
+/// applied by the peer — would re-consume the budget every cycle and
+/// permanently starve every contract past the cap. Random rotation makes each
+/// over-cap contract eligible with independent probability each cycle, so its
+/// expected wait is bounded regardless of whether the rest of the set
+/// converges.
+///
+/// Value chosen to match the per-message burst-control family of existing
+/// caps (`MAX_BROADCAST_RETRIES = 3`, `MAX_BROADCAST_STREAK_ENTRIES = 256`,
+/// `MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT = 512`): 32 bounds the burst well
+/// below those while staying comfortably above the typical handful of stale
+/// contracts a healthy peer reports in one summary exchange.
+const MAX_STALE_SYNCS_PER_SUMMARIES: usize = 32;
+
+/// The per-message budget of stale-contract `SyncStateToPeer` emissions
+/// (#3798 Gap 1): `min(stale_contracts_len, MAX_STALE_SYNCS_PER_SUMMARIES)`.
+///
+/// Returns the maximum number of events the `Summaries` handler may emit this
+/// call. The caller increments an `emitted` counter only for contracts it
+/// actually emits for (banned / no-local-state contracts are skipped without
+/// consuming the budget) and stops once `emitted` reaches this value, so the
+/// number of `SyncStateToPeer` events is hard-bounded by
+/// [`MAX_STALE_SYNCS_PER_SUMMARIES`] regardless of `stale_contracts_len`.
+fn stale_sync_emit_budget(stale_contracts_len: usize) -> usize {
+    stale_contracts_len.min(MAX_STALE_SYNCS_PER_SUMMARIES)
+}
+
+/// Per-contract disposition in the stale-sync emission loop, used to model the
+/// loop's cap accounting in a unit test without constructing an `OpManager`.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StaleSyncDisposition {
+    /// Contract is not banned and has local state — emits a `SyncStateToPeer`
+    /// (and so consumes one unit of the emit budget).
+    Emit,
+    /// Contract is banned — skipped without emitting or consuming the budget.
+    Banned,
+    /// No local state available — skipped without emitting or consuming the
+    /// budget.
+    NoState,
+}
+
+/// Pure model of the stale-sync emission loop's cap accounting (#3798 Gap 1).
+///
+/// Mirrors the `for contract in stale_contracts` loop in the `Summaries` arm of
+/// [`handle_interest_sync_message`]: break once `emitted` reaches the budget;
+/// `Banned` / `NoState` contracts are skipped without consuming the budget;
+/// every `Emit` before the budget is exhausted counts. Returns the number of
+/// `SyncStateToPeer` events the real loop would emit for the given sequence.
+///
+/// Kept in lockstep with the production loop by the
+/// `stale_sync_loop_uses_emit_budget_pin` source-scrape test, which asserts the
+/// loop still applies this budget-and-break structure.
+#[cfg(test)]
+fn count_stale_syncs_emitted(dispositions: &[StaleSyncDisposition]) -> usize {
+    let budget = stale_sync_emit_budget(dispositions.len());
+    let mut emitted = 0usize;
+    for d in dispositions {
+        if emitted >= budget {
+            break;
+        }
+        if *d == StaleSyncDisposition::Emit {
+            emitted += 1;
+        }
+    }
+    emitted
+}
+
+/// Pure model of which original stale-contract indices the capped loop emits
+/// for, given the random rotation start used in the `Summaries` arm (#3798
+/// Gap 1 starvation avoidance).
+///
+/// Mirrors `stale_contracts.rotate_left(start)` followed by the capped
+/// emit loop where every contract is emittable (the all-`Emit` case, which is
+/// the worst case for starvation): after rotation, loop position `p` holds
+/// original index `(start + p) % total`, and the loop emits the first `budget`
+/// positions. Returns the set of original indices that would be emitted this
+/// cycle. Used to prove that, across rotation starts, the cap window covers the
+/// whole stale set (no index is permanently unreachable).
+#[cfg(test)]
+fn emitted_indices_for_rotation(total: usize, start: usize) -> Vec<usize> {
+    let budget = stale_sync_emit_budget(total);
+    (0..budget).map(|p| (start + p) % total).collect()
 }
 
 /// Handle incoming InterestSync messages for delta-based state synchronization.
@@ -1566,7 +2018,12 @@ async fn handle_interest_sync_message(
             let mut entries = Vec::with_capacity(matching.len());
             for contract in matching {
                 let hash = contract_hash(&contract);
-                let summary = get_contract_summary(op_manager, &contract).await;
+                // Only summarize contracts we host or actively serve; phantom
+                // peer-interest contracts (no state, no live subscriber) have
+                // nothing to advertise and their pointless GetSummaryQuery
+                // round-trips were the dominant #4473 storm. See
+                // `summary_if_hosted_or_in_use`.
+                let summary = summary_if_hosted_or_in_use(op_manager, &contract).await;
                 entries.push(SummaryEntry::from_summary(hash, summary.as_ref()));
 
                 if let Some(ref pk) = peer_key {
@@ -1583,12 +2040,21 @@ async fn handle_interest_sync_message(
                             .interest_manager
                             .refresh_peer_interest(&contract, pk);
                     } else {
-                        op_manager.interest_manager.register_peer_interest(
+                        let is_new = op_manager.interest_manager.register_peer_interest(
                             &contract,
                             pk.clone(),
                             None, // New entry; summary arrives in their Summaries response
                             false,
                         );
+                        if is_new {
+                            // #4359 (MUST-FIX 1): an Interests-sync registration
+                            // makes this peer a viable broadcast target. Flush
+                            // any deferred fresh-contract broadcast so a cold-id
+                            // PUT that gave up with no targets reaches it.
+                            op_manager
+                                .flush_pending_broadcast_on_interest(&contract)
+                                .await;
+                        }
                     }
                 }
             }
@@ -1640,7 +2106,13 @@ async fn handle_interest_sync_message(
                         }
 
                         let their_summary = entry.to_summary();
-                        let our_summary = get_contract_summary(op_manager, &contract).await;
+                        // Only summarize contracts we host or actively serve (see
+                        // `summary_if_hosted_or_in_use`, #4473). A contract skipped
+                        // here is neither hosted nor has a live subscriber, so it
+                        // has nothing to advertise and no subscriber whose stale
+                        // copy we'd heal: `our_summary` is None → not stale → no
+                        // SyncStateToPeer, while the loop round-trip is avoided.
+                        let our_summary = summary_if_hosted_or_in_use(op_manager, &contract).await;
 
                         if emit_confirmed {
                             if let Some(ref summary) = our_summary {
@@ -1670,7 +2142,48 @@ async fn handle_interest_sync_message(
             // summary. Previously this emitted BroadcastStateChange which fanned
             // out to ALL subscribers (~28 peers), causing O(peers^2) traffic when
             // many peers reported mismatches within the same heartbeat cycle.
+            //
+            // #3798 Gap 1: cap the number of SyncStateToPeer events emitted per
+            // Summaries message so a peer diverging on many contracts cannot
+            // trigger an unbounded burst in one handler call. `emit_budget`
+            // bounds *emitted* events (not loop iterations) — banned and
+            // no-local-state contracts are skipped without consuming the
+            // budget. Overflow is not dropped permanently: each later
+            // heartbeat re-derives the still-stale set from the durable summary
+            // comparison above and syncs the next batch (see
+            // MAX_STALE_SYNCS_PER_SUMMARIES rustdoc for the eventual-consistency
+            // argument).
+            let total_stale = stale_contracts.len();
+            let emit_budget = stale_sync_emit_budget(total_stale);
+            // Starvation avoidance: when the stale set exceeds the cap, rotate
+            // the start of the iteration by a random offset so the cap window
+            // slides across the whole set over successive cycles. Without this,
+            // a contract stuck in the leading `cap` positions (dropped emit,
+            // lost packet, peer fails to apply) would re-consume the budget
+            // every cycle and permanently starve everything past the cap. No
+            // rotation when total_stale <= cap — every contract is emitted
+            // anyway, so the order does not matter. GlobalRng keeps this
+            // deterministic under simulation/test.
+            if total_stale > emit_budget {
+                let start = crate::config::GlobalRng::random_range(0..total_stale);
+                stale_contracts.rotate_left(start);
+            }
+            let mut emitted = 0usize;
             for contract in stale_contracts {
+                if emitted >= emit_budget {
+                    // Cap reached; the still-stale remainder (any that are not
+                    // banned / have local state) is re-detected and synced on a
+                    // subsequent interest-sync cycle rather than emitted now.
+                    tracing::warn!(
+                        stale_peer = %source,
+                        total_stale,
+                        emitted,
+                        cap = MAX_STALE_SYNCS_PER_SUMMARIES,
+                        "Stale-contract sync cap hit for Summaries message; \
+                         deferring the remainder to a later interest-sync cycle"
+                    );
+                    break;
+                }
                 // Phase 7 egress gate. Don't repair a stale peer's
                 // summary mismatch by pushing state for a contract
                 // we have banned — same rationale as the inbound
@@ -1692,6 +2205,12 @@ async fn handle_interest_sync_message(
                     );
                     continue;
                 };
+                // Count this contract against the emit budget: it has local
+                // state and is not banned, so we are about to emit a
+                // SyncStateToPeer event for it. Increment before the emit so a
+                // channel-full drop still consumes the budget — the dropped
+                // event is retried next cycle exactly like an over-cap one.
+                emitted += 1;
                 // Fires per stale-peer detection during interest sync, which
                 // is dominant on hot contracts. Diagnostic-grade rather than
                 // user-actionable; keep accessible via RUST_LOG=…=debug.
@@ -1772,15 +2291,26 @@ async fn handle_interest_sync_message(
                         }
 
                         // Register their interest
-                        op_manager.interest_manager.register_peer_interest(
+                        let is_new = op_manager.interest_manager.register_peer_interest(
                             &contract,
                             pk.clone(),
                             None,
                             false,
                         );
+                        if is_new {
+                            // #4359 (MUST-FIX 1): a ChangeInterests addition
+                            // makes this peer a viable broadcast target. Flush
+                            // any deferred fresh-contract broadcast so a cold-id
+                            // PUT that gave up with no targets reaches it.
+                            op_manager
+                                .flush_pending_broadcast_on_interest(&contract)
+                                .await;
+                        }
 
-                        // Get our summary to send back
-                        let summary = get_contract_summary(op_manager, &contract).await;
+                        // Get our summary to send back — only for contracts we
+                        // host or actively serve (see `summary_if_hosted_or_in_use`,
+                        // #4473).
+                        let summary = summary_if_hosted_or_in_use(op_manager, &contract).await;
                         entries.push(SummaryEntry::from_summary(hash, summary.as_ref()));
                     }
                 }
@@ -2057,6 +2587,45 @@ async fn get_contract_summary(
     }
 }
 
+/// Compute our summary for `key` for interest-sync, but ONLY if we host it or
+/// are actively serving it (a live local-client or downstream subscriber);
+/// otherwise return `None` without touching the contract-handling loop.
+///
+/// A node can carry *interest* in a contract it neither hosts nor serves —
+/// phantom interest advertised by peers in the InterestSync heartbeat, e.g. the
+/// after-effect of the placement migration (#4404). It has no local state to
+/// advertise for such a contract, yet the old code issued a `GetSummaryQuery`
+/// for it on every heartbeat from every connected peer. Each query is a
+/// round-trip on the single-threaded `contract_handling` loop that returns
+/// "state not found" (uncached) every time. Measured on `technic`: ~40
+/// summarize/sec across ~69 such phantom contracts while taking <10 real
+/// UPDATEs/hour — a ~4,000× amplification that saturated the loop (starving
+/// real GET/PUT/UPDATE on relays; feeding the #4145 notification-channel
+/// saturation on gateways). #4473.
+///
+/// Gating on `is_hosting_contract || contract_in_use` is correct, not just a
+/// heuristic:
+/// - Phantom contracts (the storm) are neither hosted nor in use, so they are
+///   skipped — empirically ~95% of the storm on technic.
+/// - A contract we hold state for but evicted from the hosting cache is only
+///   reachable while NOT in use (`evict_over_budget` retains `contract_in_use`
+///   entries), and `reclaim_evicted_contract` deletes its state once not in use.
+///   So a skipped contract has no live subscriber depending on its interest-sync
+///   heal, and (outside a brief pending-reclamation window) no state to advertise.
+/// - The moment a contract gains a live subscriber it is `contract_in_use`, so
+///   we resume summarizing and healing it — no loss of proactive repair for any
+///   contract a peer is actually subscribed to.
+async fn summary_if_hosted_or_in_use(
+    op_manager: &Arc<OpManager>,
+    key: &freenet_stdlib::prelude::ContractKey,
+) -> Option<freenet_stdlib::prelude::StateSummary<'static>> {
+    if op_manager.ring.is_hosting_contract(key) || op_manager.ring.contract_in_use(key) {
+        get_contract_summary(op_manager, key).await
+    } else {
+        None
+    }
+}
+
 /// Get the PeerKey for a socket address.
 fn get_peer_key_from_addr(
     op_manager: &Arc<OpManager>,
@@ -2311,33 +2880,78 @@ mod tests {
     use rstest::rstest;
 
     /// Source-level pins for the three log sites in this file that were
-    /// demoted / format-fixed in PR #4252 for issue #4251. Each pin
-    /// asserts the macro family of the call site by scanning a 400-byte
-    /// window before the anchor message. Same shape as the
-    /// `bug-prevention-patterns.md` FreeConsole pins in `service.rs`.
-    /// Window widened from 240 to 400 in re-review #3 to absorb future
-    /// added structured fields without false-breaking the pin.
-    fn assert_log_site_pin(needle: &str, must_contain: &[&str], must_not_contain: &[&str]) {
+    /// demoted / format-fixed in PR #4252 for issue #4251.
+    ///
+    /// Anchors on the closest preceding `tracing::` macro (via `rfind`)
+    /// and parses the macro name out of the source, rather than scanning
+    /// a fixed byte window. Adopted from the #4272 pin tests (see
+    /// `operations/update.rs::no_targets_propagation_logs_at_debug_pin_test`):
+    /// the old byte-window scan false-broke when added structured fields
+    /// shifted bytes, and could false-pass off a neighboring macro. A
+    /// line-prefix guard rejects a `tracing::` match that lands inside a
+    /// string literal or comment instead of a real macro invocation.
+    ///
+    /// `expected_macro` pins the macro family (e.g. "debug"); the equality
+    /// check rejects every other level implicitly. The optional
+    /// `must_contain` / `must_not_contain` substrings are matched within
+    /// the macro invocation body (between the macro and the anchor
+    /// message) and guard format-specifier regressions such as Display
+    /// (`%field`) vs Debug (`?field`) expansion of a structured field.
+    fn assert_log_site_pin(
+        needle: &str,
+        expected_macro: &str,
+        must_contain: &[&str],
+        must_not_contain: &[&str],
+    ) {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/node.rs");
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("must read own source at {}: {e}", path.display()));
         let idx = source
             .find(needle)
             .unwrap_or_else(|| panic!("log message `{needle}` must still exist in source"));
-        let start = idx.saturating_sub(400);
-        let window = &source[start..idx];
-        for needle in must_contain {
+        let preceding = &source[..idx];
+        let macro_idx = preceding
+            .rfind("tracing::")
+            .unwrap_or_else(|| panic!("a tracing macro must precede the `{needle}` log site"));
+        let line_start = preceding[..macro_idx].rfind('\n').map_or(0, |n| n + 1);
+        let line_prefix = &preceding[line_start..macro_idx];
+        assert!(
+            line_prefix.chars().all(char::is_whitespace),
+            "rfind matched `tracing::` inside a string literal or comment, \
+             not a macro invocation. Prefix on its line: {line_prefix:?}"
+        );
+        let after_macro = &preceding[macro_idx + "tracing::".len()..];
+        let macro_name = after_macro.split('!').next().unwrap_or("");
+        // Char-boundary-safe last-200-bytes window: a raw byte slice could
+        // start mid-UTF-8-char and panic while building the failure message.
+        let tail_start = preceding
+            .char_indices()
+            .map(|(i, _)| i)
+            .find(|&i| preceding.len() - i <= 200)
+            .unwrap_or(0);
+        let context = &preceding[tail_start..];
+        assert_eq!(
+            macro_name, expected_macro,
+            "log site for `{needle}` must be at `tracing::{expected_macro}!` \
+             (closest preceding macro is `tracing::{macro_name}!`). \
+             A level change here restores an issue #4251 regression.\n\
+             Preceding source (last 200 bytes):\n{context}"
+        );
+        // Scan only the macro invocation body (macro start -> anchor
+        // message) so the format-specifier checks can't match a
+        // neighboring macro or an explanatory comment above the call.
+        let macro_body = &source[macro_idx..idx];
+        for substr in must_contain {
             assert!(
-                window.contains(needle),
-                "site `{needle}` must appear in the 240-byte window before message:\n{window}",
-                needle = needle
+                macro_body.contains(substr),
+                "log site for `{needle}` must contain `{substr}` in its macro invocation:\n{macro_body}"
             );
         }
         for forbidden in must_not_contain {
             assert!(
-                !window.contains(forbidden),
-                "site must NOT contain `{forbidden}` (would restore an issue #4251 regression):\n{window}",
-                forbidden = forbidden
+                !macro_body.contains(forbidden),
+                "log site for `{needle}` must NOT contain `{forbidden}` \
+                 (would restore an issue #4251 regression):\n{macro_body}"
             );
         }
     }
@@ -2348,8 +2962,9 @@ mod tests {
         // hot contracts. Per #4251 review (testing reviewer #1).
         assert_log_site_pin(
             "Summary mismatch in interest sync \u{2014} syncing state to stale peer",
-            &["tracing::debug!"],
-            &["tracing::info!", "tracing::warn!"],
+            "debug",
+            &[],
+            &[],
         );
     }
 
@@ -2361,8 +2976,9 @@ mod tests {
         // hand-written impl). Per #4251 review (code-first + Codex).
         assert_log_site_pin(
             "Unexpected response to resync update",
-            &["tracing::debug!", "response = %other"],
-            &["response = ?other", "tracing::warn!", "tracing::info!"],
+            "debug",
+            &["response = %other"],
+            &["response = ?other"],
         );
     }
 
@@ -2372,23 +2988,145 @@ mod tests {
         // the executor queue is saturated for a hot contract (#4251).
         // The actionable signal is the queue saturation itself, not
         // the per-summary failure. Caught by rule-review on PR #4252.
-        assert_log_site_pin(
-            "Failed to get contract summary",
-            &["tracing::debug!"],
-            &["tracing::warn!", "tracing::info!"],
+        assert_log_site_pin("Failed to get contract summary", "debug", &[], &[]);
+    }
+
+    /// Regression pin for the #4473 / #4145 interest-sync summarize storm.
+    ///
+    /// The three PERIODIC interest-sync arms (`Interests`, `Summaries`,
+    /// `ChangeInterests`) each handle a message from every connected peer on its
+    /// 5-min heartbeat and summarize every shared-interest contract. Before #4473
+    /// they called `get_contract_summary` directly even for contracts we neither
+    /// host nor serve, flooding the serial `contract_handling` loop with pointless
+    /// "state not found" round-trips (~40/sec measured on a relay; decoupled from
+    /// the <10/hour real update rate). They MUST route through
+    /// `summary_if_hosted_or_in_use`, which skips the round-trip for contracts we
+    /// neither host nor actively serve.
+    ///
+    /// Fails (finding a bare `get_contract_summary`) on the pre-fix code. The one
+    /// legitimate bare call left in `handle_interest_sync_message` is the
+    /// `ResyncRequest` arm, which is already state-gated (returns early when
+    /// `get_contract_state` is `None`) and is not heartbeat-driven, so it is
+    /// excluded by slicing up to that arm.
+    #[test]
+    fn interest_sync_periodic_arms_summarize_only_hosted_or_in_use_pin() {
+        let src = include_str!("node.rs");
+
+        // The helper must gate the expensive call on BOTH the hosting check and
+        // the in-use check: gating on hosting alone wrongly drops the proactive
+        // heal for an evicted-but-in-use stateful contract (Codex P1 on #4475).
+        let helper_start = src
+            .find("async fn summary_if_hosted_or_in_use(")
+            .expect("summary_if_hosted_or_in_use helper not found");
+        // Bound the slice to the helper body (its closing `}` at column 0) so the
+        // gate-condition assertions below can't false-pass on a neighboring fn.
+        let helper_end = helper_start
+            + src[helper_start..]
+                .find("\n}\n")
+                .expect("summary_if_hosted_or_in_use body end not found");
+        let helper_src = &src[helper_start..helper_end];
+        assert!(
+            helper_src.contains("is_hosting_contract"),
+            "summary_if_hosted_or_in_use must gate on is_hosting_contract"
+        );
+        assert!(
+            helper_src.contains("contract_in_use"),
+            "summary_if_hosted_or_in_use must ALSO gate on contract_in_use so an \
+             evicted-but-in-use stateful contract keeps its interest-sync heal"
+        );
+
+        // Slice the periodic arms = handler start .. the ResyncRequest arm.
+        let handler_start = src
+            .find("async fn handle_interest_sync_message(")
+            .expect("handle_interest_sync_message not found");
+        let resync_off = src[handler_start..]
+            .find("InterestMessage::ResyncRequest")
+            .expect("ResyncRequest arm not found");
+        let periodic_arms = &src[handler_start..handler_start + resync_off];
+
+        assert!(
+            !periodic_arms.contains("get_contract_summary("),
+            "the periodic interest-sync arms (Interests/Summaries/ChangeInterests) \
+             must call summary_if_hosted_or_in_use, not get_contract_summary \
+             directly (#4473) — a bare call here reintroduces the summarize storm"
+        );
+        let gated_calls = periodic_arms
+            .matches("summary_if_hosted_or_in_use(")
+            .count();
+        assert!(
+            gated_calls >= 3,
+            "expected the 3 periodic interest-sync arms to call \
+             summary_if_hosted_or_in_use, found {gated_calls}"
+        );
+    }
+
+    /// Regression pin for the #4473 residual `fetch_contract` churn (the
+    /// fetch-path sibling of the summarize gate pinned above).
+    ///
+    /// The NeighborHosting overlap-sync loop fetched `get_contract_state_by_id`
+    /// for EVERY overlapping contract on EVERY inbound announce, only to discard
+    /// the result at the `is_receiving_updates || has_downstream_subscribers`
+    /// gate for contracts we don't actively serve — a `fetch_contract` span
+    /// burst on the serial `contract_handling` loop driven by phantom interest.
+    /// The activity gate (plus a `pending_broadcasts` clause that preserves the
+    /// #4359 fresh-PUT flush) MUST precede the `get_contract_state_by_id` fetch
+    /// so the span is never opened for a skipped contract. If a refactor moves
+    /// the gate after the fetch, the churn regresses silently, so pin the
+    /// ordering at the source level.
+    #[test]
+    fn neighbor_hosting_overlap_sync_gates_before_state_fetch_pin() {
+        let src = include_str!("node.rs");
+
+        // Bound the slice to the NeighborHosting overlap-sync loop so the
+        // ordering check can't false-pass on a neighbouring handler. The loop
+        // is the only site that iterates `result.overlapping_contracts`.
+        let loop_start = src
+            .find("for instance_id in result.overlapping_contracts {")
+            .expect("NeighborHosting overlap-sync loop not found");
+        let loop_src = &src[loop_start..];
+
+        let gate_pos = loop_src
+            .find("op_manager.pending_broadcasts.contains(&instance_id)")
+            .expect(
+                "overlap-sync loop MUST gate on the activity predicate + \
+                 pending_broadcasts.contains before fetching state (#4473)",
+            );
+        let recv_pos = loop_src
+            .find("is_receiving_updates(&probe_key)")
+            .expect("overlap-sync gate MUST check is_receiving_updates on the probe key");
+        let downstream_pos = loop_src
+            .find("has_downstream_subscribers(&probe_key)")
+            .expect("overlap-sync gate MUST check has_downstream_subscribers on the probe key");
+        let fetch_pos = loop_src
+            .find("get_contract_state_by_id(&op_manager, &instance_id)")
+            .expect("overlap-sync loop must still fetch state on the served path");
+
+        assert!(
+            recv_pos < fetch_pos && downstream_pos < fetch_pos && gate_pos < fetch_pos,
+            "the activity gate (is_receiving_updates || has_downstream_subscribers \
+             || pending_broadcasts.contains) MUST precede get_contract_state_by_id, \
+             or the #4473 fetch_contract churn regresses for phantom contracts"
         );
     }
 
     // Hostname resolution tests
     #[tokio::test]
     async fn test_hostname_resolution_localhost() {
+        // A port-less host must resolve to the fixed gateway port (31337), NOT a
+        // random local port. Regression for issue #1388: the old code fell back
+        // to `default_network_api_port()` (a random free port), which made the
+        // gateway unreachable.
         let addr = Address::Hostname("localhost".to_string());
         let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
         assert!(
             socket_addr.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST)
                 || socket_addr.ip() == IpAddr::V6(Ipv6Addr::LOCALHOST)
         );
-        assert!(socket_addr.port() > 1024);
+        assert_eq!(
+            socket_addr.port(),
+            crate::config::DEFAULT_GATEWAY_PORT,
+            "port-less gateway host must default to 31337, not a random port"
+        );
     }
 
     #[tokio::test]
@@ -2396,6 +3134,32 @@ mod tests {
         let addr = Address::Hostname("google.com:8080".to_string());
         let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
         assert_eq!(socket_addr.port(), 8080);
+    }
+
+    #[tokio::test]
+    async fn test_host_variant_defaults_to_gateway_port() {
+        // New `{ host, port }` form with the default port resolves to 31337.
+        let addr = Address::Host {
+            host: "localhost".to_string(),
+            port: crate::config::DEFAULT_GATEWAY_PORT,
+        };
+        let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
+        assert!(
+            socket_addr.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST)
+                || socket_addr.ip() == IpAddr::V6(Ipv6Addr::LOCALHOST)
+        );
+        assert_eq!(socket_addr.port(), crate::config::DEFAULT_GATEWAY_PORT);
+    }
+
+    #[tokio::test]
+    async fn test_host_variant_explicit_port() {
+        // New `{ host, port }` form honors an explicit non-default port.
+        let addr = Address::Host {
+            host: "localhost".to_string(),
+            port: 12345,
+        };
+        let socket_addr = NodeConfig::parse_socket_addr(&addr).await.unwrap();
+        assert_eq!(socket_addr.port(), 12345);
     }
 
     #[tokio::test]
@@ -2559,6 +3323,94 @@ mod tests {
         assert_eq!(init_peer.location, location);
     }
 
+    // Tests for the INBOUND `SubscribeHint` receive gate (v0.2.74 hotfix).
+    //
+    // FIX 1: the floor bump to `(0, 3, 0)` only gates the SEND side; the
+    // receive handler must ALSO ignore inbound hints while the placement
+    // migration is deactivated, so a 0.2.74 node does not act on hints sent
+    // by a not-yet-upgraded 0.2.73 peer during the staggered rollout.
+    mod inbound_subscribe_hint_gate {
+        use crate::node::network_bridge::p2p_protoc::{
+            SUBSCRIBE_HINT_MIN_VERSION, own_crate_version, version_supports_subscribe_hint,
+        };
+
+        /// The gate predicate ignores an inbound hint while the migration is
+        /// deactivated: for THIS node's own (0.2.x) version against the parked
+        /// production floor, `version_supports_subscribe_hint` returns `false`,
+        /// which is the "ignore the hint" branch in the receive handler.
+        #[test]
+        fn receive_gate_ignores_hint_while_deactivated() {
+            let own = own_crate_version();
+            // Sanity: this hotfix ships on the 0.2.x line, strictly below the
+            // parked floor. If the crate ever crosses the floor this guard
+            // (and the deactivation it pins) must be revisited.
+            assert!(
+                own < SUBSCRIBE_HINT_MIN_VERSION,
+                "own version {own:?} must be below the parked floor \
+                 {SUBSCRIBE_HINT_MIN_VERSION:?} for the migration to stay off"
+            );
+            assert!(
+                !version_supports_subscribe_hint(Some(own), SUBSCRIBE_HINT_MIN_VERSION),
+                "while deactivated, the receive gate must IGNORE inbound hints \
+                 (own version below the floor)"
+            );
+            // A concrete 0.2.73 sender's own-version analogue is likewise ignored.
+            assert!(!version_supports_subscribe_hint(
+                Some((0, 2, 73)),
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+        }
+
+        /// Lowering the floor (as `SimNetwork::enable_placement_migration` does
+        /// to `(0, 0, 0)`) re-activates the receive side: the gate now ACTS on
+        /// the hint. This is the symmetry the cascade simulation test relies on.
+        #[test]
+        fn receive_gate_acts_on_hint_when_floor_lowered() {
+            let own = own_crate_version();
+            assert!(
+                version_supports_subscribe_hint(Some(own), (0, 0, 0)),
+                "with the floor lowered to (0,0,0) the receive side must act on hints"
+            );
+        }
+
+        /// Source-pin: the `SubscribeHint` receive arm must compute the floor
+        /// the SAME way as the send side (`subscribe_hint_floor_override()`
+        /// `unwrap_or` the production constant) and bail via the gate predicate
+        /// BEFORE invoking `start_directed_subscribe`. Without this pin a future
+        /// refactor could delete the gate and the predicate unit tests above
+        /// would still pass.
+        #[test]
+        fn receive_gate_is_wired_before_directed_subscribe() {
+            const SOURCE: &str = include_str!("node.rs");
+            let arm_anchor: String = ["NetMessageV1::", "SubscribeHint(hint)", " => {"].concat();
+            let arm_start = SOURCE
+                .find(&arm_anchor)
+                .expect("SubscribeHint receive arm not found — update this guard");
+            // Bound at the start of the next match arm.
+            let next_anchor: String = ["NetMessageV1::", "Aborted(tx)", " => {"].concat();
+            let arm_end = SOURCE[arm_start..]
+                .find(&next_anchor)
+                .map(|i| arm_start + i)
+                .expect("end of SubscribeHint arm not found — update guard");
+            let arm = &SOURCE[arm_start..arm_end];
+
+            let gate_idx = arm
+                .find("version_supports_subscribe_hint(")
+                .expect("receive arm must call version_supports_subscribe_hint as a gate");
+            let directed_idx = arm
+                .find("start_directed_subscribe(")
+                .expect("receive arm must still call start_directed_subscribe");
+            assert!(
+                gate_idx < directed_idx,
+                "the deactivation gate must run BEFORE start_directed_subscribe"
+            );
+            assert!(
+                arm.contains("subscribe_hint_floor_override()"),
+                "receive gate must read the same per-node floor override as the send side"
+            );
+        }
+    }
+
     // Tests for `try_forward_driver_reply`.
     //
     // The bypass routes a reply directly to an awaiting
@@ -2585,7 +3437,7 @@ mod tests {
 
         #[tokio::test]
         async fn bypass_forwards_when_callback_registered() {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             let reply = dummy_reply();
             let expected_id = *reply.id();
 
@@ -2595,7 +3447,10 @@ mod tests {
             let received = rx
                 .try_recv()
                 .expect("helper should forward the reply to the callback");
-            assert_eq!(*received.id(), expected_id);
+            match received {
+                crate::node::WaiterReply::Reply(msg) => assert_eq!(*msg.id(), expected_id),
+                other => panic!("expected WaiterReply::Reply, got: {other:?}"),
+            }
         }
 
         #[tokio::test]
@@ -2621,13 +3476,85 @@ mod tests {
             // `OpNotPresent`, which is meaningless for a tx owned by a
             // (now-dead) task and pointlessly wastes a pipeline
             // iteration.
-            let (tx, rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             drop(rx);
 
             let taken = try_forward_driver_reply(Some(&tx), dummy_reply(), "subscribe");
             assert!(
                 taken,
                 "callback present but receiver dropped → bypass still taken"
+            );
+        }
+
+        // Note: the behavioral contract of the dropped-reply path (drop the
+        // reply, never block, still return `true`) is already pinned for both
+        // the closed-receiver and full-channel cases by
+        // `bypass_returns_true_even_when_receiver_dropped` and
+        // `bypass_does_not_block_when_channel_already_full`. The pin test
+        // below guards that the drop is logged at `debug`, never at the alarm
+        // levels (`error` / `warn`).
+
+        /// Pin the log level of the dropped-reply path in
+        /// `try_forward_driver_reply`. A `try_send` failure here is always a
+        /// benign, intentionally-lossy drop — either a closed receiver (caller
+        /// finished / cancelled / timed out, dominated by SUBSCRIBE renewals,
+        /// see issue #4350) or a full reply channel (CONNECT's capacity-N
+        /// fan-in overflow, or a capacity-1 duplicate). Per
+        /// `.claude/rules/operations.md` ("WHEN a reply arrives with no waiter
+        /// → Benign → debug log") and `channel-safety.md` (drop-when-full is
+        /// intended), it MUST be logged at `debug` — never `error` (which
+        /// produced ~30/hr false-alarm errors on nova after the v0.2.69
+        /// rollout) and never `warn` (CONNECT legitimately reaches the
+        /// full-channel case under load, so warning on it is also a false
+        /// alarm).
+        ///
+        /// Reads `node.rs` at compile time and asserts this function's body
+        /// logs at `debug` and contains no `error!` / `warn!`. A refactor that
+        /// re-escalates the benign drop fails here at the unit-test level.
+        /// Needles are assembled at runtime so this test cannot match its own
+        /// source; the window is bounded to the function body.
+        #[test]
+        fn forward_driver_reply_logs_benign_drop_at_debug_only() {
+            const SOURCE: &str = include_str!("node.rs");
+
+            let fn_anchor: String = ["fn try_forward_driver_reply", "("].concat();
+            let start = SOURCE.find(&fn_anchor).expect(
+                "try_forward_driver_reply definition not found — \
+                 it was renamed or moved; update this guard",
+            );
+            // Bound the window at this function's own closing brace (a `}` in
+            // column 0), so only its body is inspected — not any neighbouring
+            // function's doc comment or body.
+            let fn_end: String = ["\n", "}", "\n"].concat();
+            let after = start + fn_anchor.len();
+            let window_end = SOURCE[after..]
+                .find(&fn_end)
+                .map(|i| after + i + fn_end.len())
+                .expect("closing brace of try_forward_driver_reply not found");
+            let body = &SOURCE[start..window_end];
+
+            let debug_macro: String = ["tracing", "::debug!"].concat();
+            let warn_macro: String = ["tracing", "::warn!"].concat();
+            let error_macro: String = ["tracing", "::error!"].concat();
+
+            assert!(
+                body.contains(&debug_macro),
+                "the benign dropped-reply path must be logged at debug"
+            );
+            assert!(
+                !body.contains(&error_macro),
+                "try_forward_driver_reply must NOT log at error: the dropped \
+                 reply (closed receiver from a cancelled SUBSCRIBE renewal, or \
+                 a full CONNECT fan-in channel) is benign and intentionally \
+                 lossy. Re-escalating to error! reintroduces the false-alarm \
+                 spam this guard prevents (see issue #4350)."
+            );
+            assert!(
+                !body.contains(&warn_macro),
+                "try_forward_driver_reply must NOT log at warn: CONNECT's \
+                 capacity-N fan-in legitimately reaches the full-channel case \
+                 under load, so warning on the benign drop is also a false \
+                 alarm."
             );
         }
 
@@ -2709,15 +3636,90 @@ mod tests {
             );
         }
 
+        /// Issue #4111 regression guard. The PUT branch of
+        /// `handle_pure_network_message_v1` must forward `PutMsg::Error`
+        /// through `try_forward_driver_reply` exactly like
+        /// `PutMsg::Response` / `PutMsg::ResponseStreaming`. Without
+        /// this, the originator-loopback failure path's
+        /// `send_local_loopback(PutMsg::Error)` would arrive at the
+        /// dispatch site, find no bypass match for `Error`, and the
+        /// catch-all wildcard would drop it as
+        /// "non-dispatch variant ignored" — re-introducing the bug
+        /// the fix addresses (retry-storm + `"failed notifying,
+        /// channel closed"` synthesised for a deterministic local
+        /// failure).
+        ///
+        /// Same pattern as
+        /// `bypass_is_wired_into_subscribe_branch_regression_guard`:
+        /// a structural source-scrape so a future refactor that
+        /// breaks the wiring fails at the unit-test level instead of
+        /// as an end-to-end hang.
+        #[test]
+        fn put_branch_bypass_includes_error_variant_regression_guard() {
+            const SOURCE: &str = include_str!("node.rs");
+
+            let put_branch_anchor: String = ["NetMessageV1::", "Put(ref op)", " => {"].concat();
+            let branch_start = SOURCE.find(&put_branch_anchor).expect(
+                "PUT branch of handle_pure_network_message_v1 not found; \
+                 the match arm has been renamed or moved — update this guard",
+            );
+
+            // The PUT branch ends at the GET branch start.
+            let next_anchor: String = ["NetMessageV1::", "Get(ref op)", " => {"].concat();
+            let window_end = SOURCE[branch_start..]
+                .find(&next_anchor)
+                .expect("end of PUT branch not found — update guard")
+                + branch_start;
+            let window = &SOURCE[branch_start..window_end];
+
+            assert!(
+                window.contains("try_forward_driver_reply("),
+                "PUT branch no longer calls try_forward_driver_reply \
+                 — either restore the bypass or update this guard."
+            );
+
+            // The terminal-reply gate MUST list `Error` alongside
+            // `Response` and `ResponseStreaming`. We check on the
+            // substring rather than the full `matches!` pattern so a
+            // line-wrap or arm-reorder doesn't trip the guard
+            // spuriously — the load-bearing claim is "Error appears
+            // inside the matches! that gates the bypass forward".
+            let gate_start = window
+                .find("matches!(\n                op,")
+                .or_else(|| window.find("matches!(op,"))
+                .expect("terminal-gate matches! not found in PUT branch");
+            let gate_end = window[gate_start..]
+                .find(") && try_forward_driver_reply(")
+                .expect("end of terminal-gate matches! not found")
+                + gate_start;
+            let gate = &window[gate_start..gate_end];
+
+            for expected in [
+                "put::PutMsg::Response { .. }",
+                "put::PutMsg::ResponseStreaming { .. }",
+                "put::PutMsg::Error { .. }",
+            ] {
+                assert!(
+                    gate.contains(expected),
+                    "PUT bypass terminal-gate missing `{expected}` — \
+                     issue #4111: without Error in the gate, the \
+                     originator-loopback failure path's \
+                     send_local_loopback(PutMsg::Error) lands in the \
+                     dispatch wildcard and the originator's retry-loop \
+                     re-runs the same deterministic local failure."
+                );
+            }
+        }
+
         #[tokio::test]
         async fn bypass_does_not_block_when_channel_already_full() {
             // Pin the non-blocking contract: `try_send` on a full
             // channel must fail without blocking the handler. Future
             // refactors must not switch to `.send().await` (see
             // `.claude/rules/channel-safety.md`).
-            let (tx, _rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, _rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             // Pre-fill the capacity-1 channel.
-            tx.try_send(dummy_reply())
+            tx.try_send(crate::node::WaiterReply::Reply(dummy_reply()))
                 .expect("capacity-1 channel should accept first message");
 
             let taken = try_forward_driver_reply(Some(&tx), dummy_reply(), "subscribe");
@@ -2769,7 +3771,7 @@ mod tests {
         /// driver channel (and the branch would return early).
         fn subscribe_branch_would_forward(
             op: &SubscribeMsg,
-            callback: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
+            callback: Option<&tokio::sync::mpsc::Sender<crate::node::WaiterReply>>,
         ) -> bool {
             matches!(op, SubscribeMsg::Response { .. })
                 && try_forward_driver_reply(
@@ -2781,7 +3783,7 @@ mod tests {
 
         #[tokio::test]
         async fn subscribe_response_is_forwarded_to_task() {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             let sub_tx = Transaction::new::<SubscribeMsg>();
             let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([1u8; 32]);
             let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
@@ -2798,8 +3800,10 @@ mod tests {
             let taken = subscribe_branch_would_forward(&op, Some(&tx));
             assert!(taken, "Response with callback → must be forwarded");
 
-            let received = rx.try_recv().expect("Response should be in channel");
-            assert_eq!(*received.id(), sub_tx);
+            match rx.try_recv().expect("Response should be in channel") {
+                crate::node::WaiterReply::Reply(msg) => assert_eq!(*msg.id(), sub_tx),
+                other => panic!("expected WaiterReply::Reply, got: {other:?}"),
+            }
         }
 
         #[tokio::test]
@@ -2807,7 +3811,7 @@ mod tests {
             // ForwardingAck is non-terminal: relay peers send it to
             // signal "I'm working on it". Forwarding it would fill
             // the capacity-1 channel and block the real Response.
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             let sub_tx = Transaction::new::<SubscribeMsg>();
             let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([3u8; 32]);
             let op = SubscribeMsg::ForwardingAck {
@@ -2828,7 +3832,7 @@ mod tests {
 
         #[tokio::test]
         async fn unsubscribe_is_not_forwarded_to_task() {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             let sub_tx = Transaction::new::<SubscribeMsg>();
             let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([4u8; 32]);
             let op = SubscribeMsg::Unsubscribe {
@@ -2843,7 +3847,7 @@ mod tests {
 
         #[tokio::test]
         async fn request_is_not_forwarded_to_task() {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             let sub_tx = Transaction::new::<SubscribeMsg>();
             let instance_id = freenet_stdlib::prelude::ContractInstanceId::new([5u8; 32]);
             let op = SubscribeMsg::Request {
@@ -2952,7 +3956,7 @@ mod tests {
 
         fn put_branch_would_forward(
             op: &PutMsg,
-            callback: Option<&tokio::sync::mpsc::Sender<NetMessage>>,
+            callback: Option<&tokio::sync::mpsc::Sender<crate::node::WaiterReply>>,
         ) -> bool {
             matches!(
                 op,
@@ -2966,7 +3970,7 @@ mod tests {
 
         #[tokio::test]
         async fn put_response_is_forwarded_to_task() {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             let put_tx = Transaction::new::<PutMsg>();
             let key = dummy_put_key(10, 11);
             let op = PutMsg::Response {
@@ -2978,13 +3982,15 @@ mod tests {
             let taken = put_branch_would_forward(&op, Some(&tx));
             assert!(taken, "Response with callback → must be forwarded");
 
-            let received = rx.try_recv().expect("Response should be in channel");
-            assert_eq!(*received.id(), put_tx);
+            match rx.try_recv().expect("Response should be in channel") {
+                crate::node::WaiterReply::Reply(msg) => assert_eq!(*msg.id(), put_tx),
+                other => panic!("expected WaiterReply::Reply, got: {other:?}"),
+            }
         }
 
         #[tokio::test]
         async fn put_response_streaming_is_forwarded_to_task() {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             let put_tx = Transaction::new::<PutMsg>();
             let key = dummy_put_key(12, 13);
             let op = PutMsg::ResponseStreaming {
@@ -2997,15 +4003,18 @@ mod tests {
             let taken = put_branch_would_forward(&op, Some(&tx));
             assert!(taken, "ResponseStreaming with callback → must be forwarded");
 
-            let received = rx
+            match rx
                 .try_recv()
-                .expect("ResponseStreaming should be in channel");
-            assert_eq!(*received.id(), put_tx);
+                .expect("ResponseStreaming should be in channel")
+            {
+                crate::node::WaiterReply::Reply(msg) => assert_eq!(*msg.id(), put_tx),
+                other => panic!("expected WaiterReply::Reply, got: {other:?}"),
+            }
         }
 
         #[tokio::test]
         async fn put_forwarding_ack_is_not_forwarded_to_task() {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             let put_tx = Transaction::new::<PutMsg>();
             let key = dummy_put_key(14, 15);
             let op = PutMsg::ForwardingAck {
@@ -3026,7 +4035,7 @@ mod tests {
 
         #[tokio::test]
         async fn put_request_is_not_forwarded_to_task() {
-            let (tx, mut rx) = tokio::sync::mpsc::channel::<NetMessage>(1);
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<crate::node::WaiterReply>(1);
             let put_tx = Transaction::new::<PutMsg>();
             let op = PutMsg::Request {
                 id: put_tx,
@@ -3682,6 +4691,471 @@ mod tests {
                  active_relay_connect_txs.contains(id). Without it, a \
                  duplicate Request retransmission could spawn a second \
                  driver before the first inserts into the dedup set."
+            );
+        }
+    }
+
+    /// Source-level pin for the #4145 non-streaming caching safety net.
+    ///
+    /// The summary-cache fix (#4145) caches a peer's summary on any
+    /// *delivered* broadcast. That is only safe because the
+    /// `ResyncRequest` handler clears the SENDER's cached summary for the
+    /// peer when a downstream delta fails to apply — otherwise a wrongly
+    /// cached summary would trap the pair sending unappliable deltas.
+    /// If a refactor drops the `update_peer_summary(.., None)` clear from
+    /// this handler, the #4145 caching loses its corrective backstop and
+    /// the behavioural sim test would still pass. Pin it at the source
+    /// level so the omission fails CI.
+    mod resync_request_clears_sender_summary {
+        const SOURCE: &str = include_str!("node.rs");
+
+        /// The body of the `InterestMessage::ResyncRequest` match arm,
+        /// bounded by the start of the following `ResyncResponse` arm.
+        fn resync_request_arm() -> &'static str {
+            let arm_anchor = "InterestMessage::ResyncRequest { key } => {";
+            let arm_start = SOURCE.find(arm_anchor).expect(
+                "ResyncRequest arm of handle_interest_sync_message not found — \
+                 the match arm has been renamed or moved; update this guard",
+            );
+            let next_anchor = "InterestMessage::ResyncResponse {";
+            let arm_end = SOURCE[arm_start..]
+                .find(next_anchor)
+                .map(|i| arm_start + i)
+                .expect("end of ResyncRequest arm not found — update guard");
+            &SOURCE[arm_start..arm_end]
+        }
+
+        #[test]
+        fn resync_request_handler_clears_cached_peer_summary() {
+            let arm = resync_request_arm();
+            assert!(
+                arm.contains("update_peer_summary"),
+                "ResyncRequest handler no longer calls update_peer_summary. \
+                 #4145 caching relies on this handler clearing the sender's \
+                 cached summary so a delta-apply failure forces a fresh \
+                 full-state resend instead of looping on unappliable deltas."
+            );
+            // The clear MUST pass `None` (clear), not a `Some(summary)` cache.
+            // Strip whitespace so the multi-line call (`op_manager\n
+            // .interest_manager\n .update_peer_summary(&key, pk, None);`)
+            // matches regardless of formatting.
+            let collapsed: String = arm.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                collapsed.contains("update_peer_summary(&key,pk,None)"),
+                "ResyncRequest handler must clear the cached summary with \
+                 `update_peer_summary(&key, pk, None)` (the `None` clears it). \
+                 Caching a summary here instead would defeat the #4145 backstop."
+            );
+        }
+    }
+
+    /// Tests for `ShutdownHandle::shutdown`'s drain behaviour. The
+    /// drain stops in-flight client PUT/GET/UPDATE/SUBSCRIBE drivers
+    /// from being torn down mid-operation when the gateway is stopped
+    /// for an auto-update (motivating incident: `freenet-git` mirror
+    /// failures on the nova gateway).
+    mod shutdown_drain {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        /// Construct a ShutdownHandle wired to a fresh channel,
+        /// counter, and admission gate, mirroring the production
+        /// wire-up in `NodeBuilder::build`. The receiver is returned
+        /// so tests can assert what (if anything) was sent; the gate
+        /// is returned so tests can observe Phase 1 flipping it.
+        fn make_handle(
+            initial_count: usize,
+            drain_timeout: Duration,
+        ) -> (
+            ShutdownHandle,
+            Arc<AtomicUsize>,
+            Arc<std::sync::atomic::AtomicBool>,
+            tokio::sync::mpsc::Receiver<NodeEvent>,
+        ) {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            let counter = Arc::new(AtomicUsize::new(initial_count));
+            let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let handle = ShutdownHandle {
+                tx,
+                inflight_client_ops: counter.clone(),
+                shutting_down: gate.clone(),
+                drain_timeout,
+            };
+            (handle, counter, gate, rx)
+        }
+
+        #[tokio::test]
+        async fn shutdown_with_zero_ops_returns_immediately() {
+            let (handle, _counter, _gate, mut rx) = make_handle(0, Duration::from_secs(60));
+            let start = std::time::Instant::now();
+            handle.shutdown().await;
+            assert!(
+                start.elapsed() < Duration::from_millis(100),
+                "shutdown with zero in-flight ops should not sleep"
+            );
+            // Disconnect must still be sent.
+            assert!(matches!(
+                rx.recv().await.expect("Disconnect must be sent"),
+                NodeEvent::Disconnect { .. }
+            ));
+        }
+
+        #[tokio::test]
+        async fn shutdown_waits_then_proceeds_on_timeout() {
+            // 1 op in flight that never decrements; drain capped at 200ms.
+            let (handle, _counter, _gate, mut rx) = make_handle(1, Duration::from_millis(200));
+            let start = std::time::Instant::now();
+            handle.shutdown().await;
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed >= Duration::from_millis(180),
+                "shutdown should wait the full drain timeout when ops \
+                 never finish (elapsed: {elapsed:?})"
+            );
+            // Disconnect must still be sent so the node can exit.
+            assert!(matches!(
+                rx.recv()
+                    .await
+                    .expect("Disconnect must be sent even on drain timeout"),
+                NodeEvent::Disconnect { .. }
+            ));
+        }
+
+        #[tokio::test]
+        async fn shutdown_proceeds_as_soon_as_counter_clears() {
+            // 1 op in flight; another task decrements after 100ms.
+            let (handle, counter, _gate, mut rx) = make_handle(1, Duration::from_secs(5));
+            let counter_clone = counter.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                counter_clone.fetch_sub(1, Ordering::Relaxed);
+            });
+            let start = std::time::Instant::now();
+            handle.shutdown().await;
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed >= Duration::from_millis(80) && elapsed < Duration::from_secs(2),
+                "shutdown should return shortly after the counter clears, \
+                 not wait the full drain timeout (elapsed: {elapsed:?})"
+            );
+            assert!(matches!(
+                rx.recv().await.expect("Disconnect must be sent"),
+                NodeEvent::Disconnect { .. }
+            ));
+        }
+
+        #[tokio::test]
+        async fn drain_disabled_skips_wait_even_with_ops_in_flight() {
+            // Tests opt out of the drain via Duration::ZERO so a
+            // SimNetwork teardown doesn't block on the 30s production
+            // default. Verify the zero-timeout path bypasses the wait
+            // entirely even when ops are "in flight".
+            let (handle, _counter, _gate, mut rx) = make_handle(5, Duration::ZERO);
+            let start = std::time::Instant::now();
+            handle.shutdown().await;
+            assert!(
+                start.elapsed() < Duration::from_millis(50),
+                "drain_timeout=0 must skip the wait"
+            );
+            assert!(matches!(
+                rx.recv().await.expect("Disconnect must be sent"),
+                NodeEvent::Disconnect { .. }
+            ));
+        }
+
+        /// Phase 1 of the three-phase shutdown: admission gate MUST be
+        /// flipped before the drain begins, so `start_client_*` calls
+        /// arriving during the drain wait fail fast and don't slip
+        /// through the post-drain race window. Codex reviewer call-out
+        /// 2026-05 — re-opening this race re-opens the
+        /// gateway-restart-kills-mirror-PUT failure for any op spawned
+        /// in the window between drain-complete and Disconnect-send.
+        #[tokio::test]
+        async fn shutdown_closes_admission_gate_before_drain() {
+            // 1 op in flight; drain caps at 500ms so we have time to
+            // observe the gate during the wait.
+            let (handle, counter, gate, mut rx) = make_handle(1, Duration::from_millis(500));
+            assert!(
+                !gate.load(Ordering::Relaxed),
+                "admission gate must start closed"
+            );
+
+            let counter_clone = counter.clone();
+            let gate_clone = gate.clone();
+            let observed_during_drain = tokio::spawn(async move {
+                // Wait briefly so shutdown's Phase 1 fires first.
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let g = gate_clone.load(Ordering::Relaxed);
+                // Release the op so drain can complete.
+                counter_clone.fetch_sub(1, Ordering::Relaxed);
+                g
+            });
+
+            handle.shutdown().await;
+
+            let gate_was_set_during_drain = observed_during_drain
+                .await
+                .expect("observer task must not panic");
+            assert!(
+                gate_was_set_during_drain,
+                "shutdown() must flip the admission gate BEFORE the \
+                 drain wait, not after. Otherwise a new client op \
+                 spawned during the drain bypasses the gate, bumps \
+                 the counter (now unobserved), and gets cut off."
+            );
+            assert!(matches!(
+                rx.recv().await.expect("Disconnect must be sent"),
+                NodeEvent::Disconnect { .. }
+            ));
+        }
+    }
+
+    // ───────────────────────────────────────────────────────────
+    // #3798 Gap 1: cap stale-contract SyncStateToPeer emission per
+    // Summaries message. Anti-amplification hardening — a peer whose
+    // summary diverges on many contracts must not trigger an unbounded
+    // burst of SyncStateToPeer events in one handler invocation.
+    // ───────────────────────────────────────────────────────────
+    mod stale_sync_cap {
+        use super::super::{
+            MAX_STALE_SYNCS_PER_SUMMARIES, StaleSyncDisposition, count_stale_syncs_emitted,
+            emitted_indices_for_rotation, stale_sync_emit_budget,
+        };
+        use std::collections::HashSet;
+
+        const EMIT: StaleSyncDisposition = StaleSyncDisposition::Emit;
+        const BANNED: StaleSyncDisposition = StaleSyncDisposition::Banned;
+        const NO_STATE: StaleSyncDisposition = StaleSyncDisposition::NoState;
+
+        #[test]
+        fn emit_budget_caps_at_max() {
+            // Below cap: budget is the full count.
+            assert_eq!(stale_sync_emit_budget(0), 0);
+            assert_eq!(stale_sync_emit_budget(1), 1);
+            assert_eq!(
+                stale_sync_emit_budget(MAX_STALE_SYNCS_PER_SUMMARIES - 1),
+                MAX_STALE_SYNCS_PER_SUMMARIES - 1
+            );
+            // At and above cap: budget saturates at the cap.
+            assert_eq!(
+                stale_sync_emit_budget(MAX_STALE_SYNCS_PER_SUMMARIES),
+                MAX_STALE_SYNCS_PER_SUMMARIES
+            );
+            assert_eq!(
+                stale_sync_emit_budget(MAX_STALE_SYNCS_PER_SUMMARIES + 1),
+                MAX_STALE_SYNCS_PER_SUMMARIES
+            );
+            assert_eq!(
+                stale_sync_emit_budget(MAX_STALE_SYNCS_PER_SUMMARIES * 100),
+                MAX_STALE_SYNCS_PER_SUMMARIES
+            );
+        }
+
+        /// The core regression: with far more stale contracts than the cap, the
+        /// loop emits at most MAX_STALE_SYNCS_PER_SUMMARIES events. Without the
+        /// cap this would emit one per contract (here, 200).
+        #[test]
+        fn many_stale_contracts_emit_at_most_cap() {
+            let n = MAX_STALE_SYNCS_PER_SUMMARIES * 100; // 3200 divergent contracts
+            let dispositions = vec![EMIT; n];
+            let emitted = count_stale_syncs_emitted(&dispositions);
+            assert_eq!(
+                emitted, MAX_STALE_SYNCS_PER_SUMMARIES,
+                "a peer diverging on {n} contracts must emit at most the cap \
+                 ({MAX_STALE_SYNCS_PER_SUMMARIES}) SyncStateToPeer events per \
+                 Summaries message, not one per contract"
+            );
+        }
+
+        /// Boundary: exactly cap-many emittable contracts emit all of them.
+        #[test]
+        fn exactly_cap_emits_all() {
+            let dispositions = vec![EMIT; MAX_STALE_SYNCS_PER_SUMMARIES];
+            assert_eq!(
+                count_stale_syncs_emitted(&dispositions),
+                MAX_STALE_SYNCS_PER_SUMMARIES
+            );
+        }
+
+        /// Below cap: emits exactly the emittable count, no spurious cap.
+        #[test]
+        fn below_cap_emits_all_emittable() {
+            let dispositions = vec![EMIT; 5];
+            assert_eq!(count_stale_syncs_emitted(&dispositions), 5);
+            assert_eq!(count_stale_syncs_emitted(&[]), 0);
+        }
+
+        /// Banned / no-state contracts are skipped WITHOUT consuming the budget,
+        /// so the emit count is the number of emittable contracts (capped), and
+        /// a leading run of skips does not starve later emittable contracts when
+        /// the total emittable count is under the cap.
+        #[test]
+        fn skips_do_not_consume_budget() {
+            // 10 banned/no-state skips followed by 3 emittable contracts.
+            // budget = min(13, cap) = 13 (cap is 32), so all 3 emit despite the
+            // skips appearing first.
+            let mut dispositions = vec![BANNED, NO_STATE, BANNED, NO_STATE, BANNED];
+            dispositions.extend([NO_STATE, BANNED, NO_STATE, BANNED, NO_STATE]);
+            dispositions.extend([EMIT, EMIT, EMIT]);
+            assert_eq!(
+                count_stale_syncs_emitted(&dispositions),
+                3,
+                "banned/no-state contracts must be skipped without consuming \
+                 the emit budget"
+            );
+        }
+
+        /// Even with skips interleaved, the number of EMIT events never exceeds
+        /// the cap when there are more than `cap` emittable contracts. Here the
+        /// budget = min(len, cap) where len > cap, so the loop stops at the cap
+        /// (the trailing emittable contracts beyond the cap are deferred).
+        #[test]
+        fn interleaved_skips_still_capped() {
+            // cap*3 emittable contracts, each preceded by one skip → len = cap*6,
+            // budget = cap. The loop counts only EMITs toward the budget and
+            // breaks at the cap.
+            let mut dispositions = Vec::new();
+            for _ in 0..(MAX_STALE_SYNCS_PER_SUMMARIES * 3) {
+                dispositions.push(BANNED);
+                dispositions.push(EMIT);
+            }
+            let emitted = count_stale_syncs_emitted(&dispositions);
+            assert_eq!(
+                emitted, MAX_STALE_SYNCS_PER_SUMMARIES,
+                "emitted SyncStateToPeer events must be capped at \
+                 {MAX_STALE_SYNCS_PER_SUMMARIES} even with skips interleaved"
+            );
+        }
+
+        /// Starvation regression (codex P2 on PR #4468): with more stale
+        /// contracts than the cap, the random rotation must make EVERY contract
+        /// eligible for some rotation start. Otherwise a contract stuck in the
+        /// fixed leading `cap` positions would re-consume the budget every cycle
+        /// and permanently starve the tail. Asserts the union of emitted indices
+        /// over all rotation starts covers the whole stale set.
+        #[test]
+        fn rotation_covers_every_contract_over_cap() {
+            let total = MAX_STALE_SYNCS_PER_SUMMARIES * 3; // 96 > cap
+            let mut covered = HashSet::new();
+            for start in 0..total {
+                for idx in emitted_indices_for_rotation(total, start) {
+                    covered.insert(idx);
+                }
+            }
+            assert_eq!(
+                covered.len(),
+                total,
+                "every one of the {total} stale contracts must be reachable for \
+                 some rotation start — otherwise contracts past the cap are \
+                 permanently starved when the leading prefix stays stale"
+            );
+            // And each cycle still emits exactly the cap (no over/under-emit).
+            for start in 0..total {
+                assert_eq!(
+                    emitted_indices_for_rotation(total, start).len(),
+                    MAX_STALE_SYNCS_PER_SUMMARIES
+                );
+            }
+        }
+
+        /// A contract stuck at original index 0 (its emit keeps failing) must
+        /// NOT prevent an over-cap contract from being attempted. With
+        /// `total = cap + 1`, each rotation window of `cap` consecutive indices
+        /// (mod total) covers all but exactly one index, so there is a rotation
+        /// start whose window includes the tail index while excluding the
+        /// assumed-stuck head index 0 — proving the anti-starvation property the
+        /// deterministic prefix-only loop lacked.
+        #[test]
+        fn stuck_prefix_does_not_block_tail_under_rotation() {
+            let total = MAX_STALE_SYNCS_PER_SUMMARIES + 1; // cap + 1
+            let last = total - 1;
+            let mut found = false;
+            for start in 0..total {
+                let window: HashSet<usize> = emitted_indices_for_rotation(total, start)
+                    .into_iter()
+                    .collect();
+                if window.contains(&last) && !window.contains(&0) {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(
+                found,
+                "there must be a rotation start that attempts the tail contract \
+                 ({last}) without attempting the (assumed-stuck) head contract \
+                 (0); otherwise a stuck head starves the tail"
+            );
+        }
+
+        /// Source-scrape pin: the `Summaries` arm of
+        /// `handle_interest_sync_message` must still wire the emit budget into
+        /// its `for contract in stale_contracts` loop (compute the budget,
+        /// rotate by a random offset when over the cap to avoid starvation,
+        /// break when `emitted >= emit_budget`, and increment `emitted` per
+        /// emission). Guards against a future refactor silently dropping the
+        /// cap or the rotation and re-opening the #3798 Gap 1 amplification
+        /// burst / starvation — the behavioral tests above run against the
+        /// model helpers, not the live loop, so this pin keeps the two in
+        /// lockstep.
+        #[test]
+        fn stale_sync_loop_uses_emit_budget_pin() {
+            const SOURCE: &str = include_str!("node.rs");
+
+            // Bound the search window to the stale-contract emission loop.
+            let loop_anchor = "for contract in stale_contracts {";
+            let start = SOURCE.find(loop_anchor).expect(
+                "stale-contract emission loop not found; the `for contract in \
+                 stale_contracts` loop has been renamed or moved — update this \
+                 pin and re-verify the #3798 Gap 1 cap is still applied",
+            );
+            // End the window at the next sibling loop in the Summaries arm.
+            let window_end = SOURCE[start..]
+                .find("for (key, state_hash) in confirmed_states {")
+                .map(|off| start + off)
+                .unwrap_or(SOURCE.len());
+            // Include the budget computation that immediately precedes the loop.
+            let budget_decl = "let emit_budget = stale_sync_emit_budget(";
+            let budget_pos = SOURCE[..start]
+                .rfind(budget_decl)
+                .expect("emit budget is not computed before the stale-sync loop");
+            let window = &SOURCE[budget_pos..window_end];
+
+            assert!(
+                window.contains("stale_sync_emit_budget("),
+                "stale-sync loop no longer computes the emit budget — the \
+                 #3798 Gap 1 cap has been dropped"
+            );
+            assert!(
+                window.contains("if emitted >= emit_budget {"),
+                "stale-sync loop no longer breaks when the emit budget is \
+                 reached — the #3798 Gap 1 cap is not enforced"
+            );
+            assert!(
+                window.contains("emitted += 1;"),
+                "stale-sync loop no longer counts emissions against the budget \
+                 — the #3798 Gap 1 cap cannot be enforced without it"
+            );
+            assert!(
+                window.contains("MAX_STALE_SYNCS_PER_SUMMARIES"),
+                "stale-sync cap warning no longer references the cap constant"
+            );
+            // Starvation avoidance (codex P2 on #4468): the over-cap branch must
+            // rotate the stale set by a random offset before the loop, else a
+            // stuck leading prefix re-consumes the cap every cycle and starves
+            // the tail.
+            assert!(
+                window.contains("if total_stale > emit_budget {")
+                    && window.contains("rotate_left("),
+                "stale-sync loop no longer rotates the stale set when over the \
+                 cap — over-cap contracts can be permanently starved by a stuck \
+                 prefix (#3798 Gap 1 / #4468 codex P2)"
+            );
+            assert!(
+                window.contains("GlobalRng::random_range("),
+                "stale-sync rotation offset is no longer drawn from GlobalRng — \
+                 a fixed/non-random rotation does not avoid starvation and \
+                 breaks simulation determinism"
             );
         }
     }

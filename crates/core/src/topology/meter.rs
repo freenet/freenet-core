@@ -169,6 +169,28 @@ impl Meter {
         sorted_rates.get(estimated_index).cloned()
     }
 
+    /// Drop the per-source meters for every `AttributionSource::Peer` whose
+    /// inner `PeerKeyLocation` is NOT in `live`. Non-`Peer` sources (Contract,
+    /// Delegate) are always retained — only the peer-attributed bandwidth
+    /// samples are bounded by the live connection set.
+    ///
+    /// Without this, a peer that ever exchanged bytes leaves a permanent entry
+    /// in `attribution_meters`, so under connection churn the map (and the
+    /// per-tick work that iterates it) grows without bound. See #3453 review.
+    pub(crate) fn retain_peer_sources(
+        &mut self,
+        live: &std::collections::HashSet<PeerKeyLocation>,
+    ) {
+        let mut meters = self.attribution_meters.write().unwrap();
+        meters.retain(|source, _| match source {
+            AttributionSource::Peer(peer) => live.contains(peer),
+            // Non-peer sources are not bounded by the live connection set;
+            // enumerated explicitly (not `_`) so a future AttributionSource
+            // variant must consciously decide its retention policy here.
+            AttributionSource::Delegate(_) | AttributionSource::Contract(_) => true,
+        });
+    }
+
     /// Report the use of a resource. This should be done in the lowest-level
     /// functions that consume the resource, taking an AttributionMeter
     /// as a parameter.

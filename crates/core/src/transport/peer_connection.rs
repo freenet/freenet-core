@@ -44,7 +44,7 @@ use super::{
     packet_data::{self, PacketData},
     received_packet_tracker::ReceivedPacketTracker,
     received_packet_tracker::ReportResult,
-    sent_packet_tracker::{ResendAction, SentPacketTracker},
+    sent_packet_tracker::{PacketStream, ResendAction, SentPacketTracker},
     symmetric_message::{self, SymmetricMessage, SymmetricMessagePayload},
     token_bucket::TokenBucket,
 };
@@ -105,6 +105,10 @@ pub(crate) struct RemoteConnection<S = super::UdpSocket, T: TimeSource = RealTim
     pub(super) inbound_symmetric_key_bytes: [u8; 16],
     #[allow(dead_code)]
     pub(super) my_address: Option<SocketAddr>,
+    /// Remote peer's negotiated protocol version, captured during the handshake.
+    /// `None` on the joiner->gateway path (the gateway's AckConnection payload
+    /// carries no version) — see connection_handler.rs traverse_nat AckConnection arm.
+    pub(super) remote_protoc_version: Option<(u8, u8, u16)>,
     pub(super) transport_secret_key: TransportSecretKey,
     /// Congestion controller (BBR by default) - adapts to network conditions
     pub(super) congestion_controller: Arc<CongestionController<T>>,
@@ -579,6 +583,13 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
                 match socket.send_to(&ping_packet, remote_addr).await {
                     Ok(_) => {
+                        // Phase 1.6 (#4074): keep-alive Ping bypasses
+                        // `packet_sending`; count it as must-flow here.
+                        // Observation only.
+                        crate::transport::shadow_demand::record_outbound(
+                            crate::transport::shadow_demand::OutboundClass::MustFlow,
+                            ping_packet.len(),
+                        );
                         tracing::debug!(
                             target: "freenet_core::transport::keepalive_lifecycle",
                             remote = ?remote_addr,
@@ -972,16 +983,42 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                 pong_sequence = sequence,
                                 "Received Pong, confirming bidirectional liveness"
                             );
-                            // Remove the corresponding ping from pending set
-                            let mut pending = self.pending_pings.write();
-                            if pending.remove(sequence).is_some() {
-                                tracing::trace!(
-                                    target: "freenet_core::transport::keepalive_received",
-                                    remote = ?self.remote_conn.remote_addr,
-                                    pong_sequence = sequence,
-                                    remaining_pending = pending.len(),
-                                    "Removed acknowledged ping from pending set"
-                                );
+                            // Remove the corresponding ping from pending set and,
+                            // if found, sample the round-trip time. The keep-alive
+                            // cycle runs on every connection regardless of stream
+                            // traffic, so this keeps RTT statistics populated for
+                            // quiet, long-lived connections that rarely (or never)
+                            // complete a stream transfer (#4000). Without it,
+                            // RTT was only sampled at stream completion and quiet
+                            // connections contributed zero samples.
+                            let removed_send_nanos = {
+                                let mut pending = self.pending_pings.write();
+                                let removed = pending.remove(sequence);
+                                if removed.is_some() {
+                                    tracing::trace!(
+                                        target: "freenet_core::transport::keepalive_received",
+                                        remote = ?self.remote_conn.remote_addr,
+                                        pong_sequence = sequence,
+                                        remaining_pending = pending.len(),
+                                        "Removed acknowledged ping from pending set"
+                                    );
+                                }
+                                removed
+                            };
+                            if let Some(send_nanos) = removed_send_nanos {
+                                // The ping timestamp was recorded with this same
+                                // `time_source` (the keep-alive task clones it), so
+                                // the subtraction is over one monotonic clock.
+                                // `saturating_sub` is defensive against any skew
+                                // yielding a 0 sample rather than underflowing.
+                                let rtt_nanos = self
+                                    .time_source
+                                    .now_nanos()
+                                    .saturating_sub(send_nanos);
+                                let rtt_us = rtt_nanos / 1_000;
+                                if rtt_us > 0 {
+                                    super::TRANSPORT_METRICS.record_rtt_sample(rtt_us);
+                                }
                             }
                         }
                         SymmetricMessagePayload::AckConnection { .. } | SymmetricMessagePayload::ShortMessage { .. } | SymmetricMessagePayload::StreamFragment { .. } => {}
@@ -1259,13 +1296,41 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             .get_resend();
                         // Extract (idx, packet) from the resend action, applying
                         // action-specific side effects (congestion notification, logging).
+                        // Abandon releases flight size and is handled inline (it neither
+                        // re-sends nor re-registers). See #4345.
                         let (idx, packet) = match maybe_resend {
                             ResendAction::WaitUntil(deadline_nanos) => {
                                 resend_check_sleep = Some(self.time_source.sleep_until(deadline_nanos));
                                 break;
                             }
+                            ResendAction::Abandon { packet_id, payload_len } => {
+                                // The packet was retransmitted MAX_PACKET_RETRANSMITS times
+                                // with no ACK and is now permanently lost. Release its bytes
+                                // from flight size — this is the give-up that drains a flight
+                                // size pinned by a never-ACKed packet (issue #4345). The
+                                // tracker already dropped it, so we neither re-send nor
+                                // re-register; continue draining the resend queue.
+                                self.remote_conn
+                                    .congestion_controller
+                                    .release_flightsize(payload_len);
+                                tracing::debug!(
+                                    peer_addr = %self.remote_conn.remote_addr,
+                                    packet_id,
+                                    payload_len,
+                                    "Resend abandoned packet — released flight size (#4345)"
+                                );
+                                resend_count += 1;
+                                if resend_count >= MAX_RESENDS_PER_ITERATION {
+                                    resend_check_sleep = Some(self.time_source.sleep(resend_yield));
+                                    break;
+                                }
+                                continue;
+                            }
                             ResendAction::Resend(idx, packet) => {
-                                // Notify congestion controller of packet loss (timeout-based retransmission)
+                                // Notify congestion controller of packet loss (timeout-based
+                                // retransmission). The packet stays in flight — it is
+                                // immediately re-sent and re-registered below — so flight size
+                                // is unchanged; on_timeout only applies the cwnd loss response.
                                 self.remote_conn.congestion_controller.on_timeout();
                                 (idx, packet)
                             }
@@ -1290,9 +1355,35 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                             .await
                         {
                             Ok(_) => {
-                                // Re-register packet for ACK/RTO tracking. on_send() is NOT called
-                                // because bytes were already counted in flightsize during the initial send.
-                                self.remote_conn.sent_tracker.lock().report_sent_packet(idx, packet);
+                                // Refresh the packet's send timestamp to the actual
+                                // post-send instant. Since #4345 get_resend KEEPS the
+                                // packet in the tracker across a resend, so this is an
+                                // in-place refresh — BUT only if the packet is still
+                                // tracked. A concurrent drop_stream (spawned abort task)
+                                // may have removed and released it while we were awaiting
+                                // send_to; refresh_sent_packet then no-ops instead of
+                                // resurrecting it as a Control zombie (which a later
+                                // ACK/abandon would double-release). When the packet IS
+                                // still tracked, flight size is unchanged: it never left
+                                // flight (on_timeout did not decrement), so no on_send /
+                                // re-add runs. See refresh_sent_packet's rustdoc.
+                                //
+                                // `false` (the deliberate no-op-on-drop) is the
+                                // resurrection-safe path, not an error — surface it at
+                                // trace level rather than silently discarding the bool.
+                                let still_tracked = self
+                                    .remote_conn
+                                    .sent_tracker
+                                    .lock()
+                                    .refresh_sent_packet(idx, packet, None);
+                                if !still_tracked {
+                                    tracing::trace!(
+                                        peer_addr = %self.remote_conn.remote_addr,
+                                        packet_id = idx,
+                                        "Resent packet was dropped (stream aborted) before \
+                                         re-registration — refresh no-op (#4345)"
+                                    );
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -1301,13 +1392,18 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                                     error = %e,
                                     "Resend send failed, will retry on next RTO"
                                 );
-                                // Re-insert packet so RTO will retry it. Without this,
-                                // the packet would be permanently lost from tracking since
-                                // resend_check() already removed it.
-                                self.remote_conn
+                                // Refresh only if still tracked — RTO then retries it.
+                                // If a concurrent drop_stream already removed it, this
+                                // no-ops (the stream is being torn down anyway), avoiding
+                                // a resurrected zombie. See refresh_sent_packet's rustdoc.
+                                // The bool is intentionally discarded: on this error path
+                                // we're breaking out regardless of whether the packet was
+                                // still tracked.
+                                let _ = self
+                                    .remote_conn
                                     .sent_tracker
                                     .lock()
-                                    .report_sent_packet(idx, packet);
+                                    .refresh_sent_packet(idx, packet, None);
                                 break;
                             }
                         }
@@ -1422,6 +1518,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
 
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote_conn.remote_addr
+    }
+
+    /// Remote peer's negotiated protocol version, if known (None on joiner->gateway connections).
+    pub fn remote_version(&self) -> Option<(u8, u8, u16)> {
+        self.remote_conn.remote_protoc_version
     }
 
     /// Returns a handle for accessing an inbound stream incrementally.
@@ -1760,6 +1861,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             (),
             &self.remote_conn.sent_tracker,
             token,
+            PacketStream::Control,
         )
         .await
     }
@@ -1787,6 +1889,12 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             .await
         {
             Ok(_) => {
+                // Phase 1.6 (#4074): Pong bypasses `packet_sending`, so
+                // classify it as must-flow here. Observation only.
+                super::shadow_demand::record_outbound(
+                    super::shadow_demand::OutboundClass::MustFlow,
+                    pong_packet.len(),
+                );
                 tracing::trace!(
                     peer_addr = %self.remote_conn.remote_addr,
                     packet_id,
@@ -1830,6 +1938,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             symmetric_message::ShortMessage(data.into()),
             &self.remote_conn.sent_tracker,
             token,
+            PacketStream::Control,
         )
         .await?;
         Ok(())
@@ -1846,14 +1955,15 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     /// in the metadata message and must match the data stream.
     ///
     /// If `completion_tx` is provided, it will be signaled when the stream
-    /// transfer completes (success or failure). Used by the broadcast queue
+    /// transfer completes, carrying a [`BroadcastDeliveryOutcome`] that
+    /// distinguishes delivery from a drop (#4235). Used by the broadcast queue
     /// to hold a semaphore permit until the actual transfer finishes.
     async fn outbound_stream_with_id(
         &mut self,
         stream_id: StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
-        completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        completion_tx: Option<tokio::sync::oneshot::Sender<super::BroadcastDeliveryOutcome>>,
     ) {
         let task = GlobalExecutor::spawn(
             outbound_stream::send_stream(
@@ -2008,6 +2118,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             },
             &self.remote_conn.sent_tracker,
             token,
+            PacketStream::Stream(fragment.stream_id),
         )
         .await?;
 
@@ -2022,6 +2133,30 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     }
 }
 
+/// Register a freshly-sent packet with the tracker, tagging it with its owning
+/// stream for flight-size accounting (issue #4345).
+///
+/// `Stream(id)` first sends route to `report_sent_stream_packet` (which records
+/// the tag); `Control` sends route to `report_sent_packet_with_token` (which
+/// preserves any existing tag, so resend re-registration of a stream fragment
+/// keeps its stream, and genuinely-new control packets stay `Control`).
+fn report_sent_tagged<T: crate::simulation::TimeSource>(
+    tracker: &mut SentPacketTracker<T>,
+    packet_id: u32,
+    payload: Box<[u8]>,
+    delivery_token: Option<DeliveryRateToken>,
+    stream: PacketStream,
+) {
+    match stream {
+        PacketStream::Stream(stream_id) => {
+            tracker.report_sent_stream_packet(packet_id, payload, delivery_token, stream_id);
+        }
+        PacketStream::Control => {
+            tracker.report_sent_packet_with_token(packet_id, payload, delivery_token);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
     remote_addr: SocketAddr,
@@ -2032,6 +2167,11 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
     payload: impl Into<SymmetricMessagePayload>,
     sent_tracker: &parking_lot::Mutex<SentPacketTracker<T>>,
     delivery_token: Option<DeliveryRateToken>,
+    // Owning stream for flight-size accounting (issue #4345). `Stream(id)` for
+    // `StreamFragment` sends so an aborted stream's bytes can be released
+    // atomically via `SentPacketTracker::drop_stream`; `Control` for everything
+    // else (handshake, NoOp, short message).
+    stream: PacketStream,
 ) -> Result<()> {
     let start_time = tokio::time::Instant::now();
     tracing::trace!(
@@ -2039,6 +2179,16 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
         packet_id,
         "Attempting to send packet"
     );
+
+    // Phase 1.6 shadow telemetry (#4074): classify this outbound payload
+    // (must-flow / short / bulk) before it is consumed by serialization,
+    // so the must-flow-vs-bulk split can be measured. Converting to the
+    // concrete payload here is a no-op for callers that already pass one
+    // and a cheap `Into` for the rest; `try_serialize_msg_to_packet_data`
+    // still accepts it via `Into<Self>`. Observation only — see
+    // `transport/shadow_demand.rs` and `.claude/rules/transport.md`.
+    let payload: SymmetricMessagePayload = payload.into();
+    let outbound_class = super::shadow_demand::classify(&payload);
 
     match SymmetricMessage::try_serialize_msg_to_packet_data(
         packet_id,
@@ -2064,10 +2214,15 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                         elapsed_ms = elapsed.as_millis(),
                         "Successfully sent packet"
                     );
-                    sent_tracker.lock().report_sent_packet_with_token(
+                    // Record the classified on-wire bytes once the packet
+                    // is actually sent (not on the error path).
+                    super::shadow_demand::record_outbound(outbound_class, packet_data.len());
+                    report_sent_tagged(
+                        &mut sent_tracker.lock(),
                         packet_id,
                         packet_data,
                         delivery_token,
+                        stream,
                     );
                     Ok(())
                 }
@@ -2088,6 +2243,18 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                 packet_id,
                 "Sending multi-packet message"
             );
+            // Accumulate on-wire bytes across all packets of this multi-part
+            // message so the Phase 1.6 class counters see the full cost,
+            // attributed to the primary payload's class. Two accepted
+            // accounting nits (observation-only, see shadow_demand.rs): the
+            // trailing NoOp confirm-receipt packets are counted under the
+            // primary class rather than as must-flow, and on a mid-burst
+            // `send_to` failure the `?` below returns before the
+            // `record_outbound` call, so the class split can undercount the
+            // already-sent bytes relative to `cumulative_bytes_sent` (which
+            // is incremented per packet at the socket layer). Both are tiny
+            // and only affect the rarely-hit multi-packet path.
+            let mut sent_on_wire = 0usize;
             macro_rules! send {
                 ($packets:ident) => {{
                     for packet in $packets {
@@ -2096,10 +2263,13 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                             .send_to(&packet_data, remote_addr)
                             .await
                             .map_err(|e| TransportError::SendFailed(remote_addr, e.kind()))?;
-                        sent_tracker.lock().report_sent_packet_with_token(
+                        sent_on_wire += packet_data.len();
+                        report_sent_tagged(
+                            &mut sent_tracker.lock(),
                             packet_id,
                             packet_data,
                             delivery_token,
+                            stream,
                         );
                     }
                 }};
@@ -2125,6 +2295,7 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
                 ];
 
                 send!(packets);
+                super::shadow_demand::record_outbound(outbound_class, sent_on_wire);
                 return Ok(());
             }
 
@@ -2154,6 +2325,7 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
             }
 
             send!(packets);
+            super::shadow_demand::record_outbound(outbound_class, sent_on_wire);
             Ok(())
         }
     }
@@ -2166,6 +2338,10 @@ async fn packet_sending<S: super::Socket, T: crate::simulation::TimeSource>(
 impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
     fn remote_addr(&self) -> std::net::SocketAddr {
         self.remote_conn.remote_addr
+    }
+
+    fn remote_version(&self) -> Option<(u8, u8, u16)> {
+        PeerConnection::remote_version(self)
     }
 
     fn send_message(
@@ -2194,7 +2370,7 @@ impl<S: super::Socket> super::PeerConnectionApi for PeerConnection<S> {
         stream_id: StreamId,
         data: bytes::Bytes,
         metadata: Option<bytes::Bytes>,
-        completion_tx: Option<tokio::sync::oneshot::Sender<()>>,
+        completion_tx: Option<tokio::sync::oneshot::Sender<super::BroadcastDeliveryOutcome>>,
     ) -> std::pin::Pin<
         Box<dyn futures::Future<Output = Result<(), super::TransportError>> + Send + '_>,
     > {
@@ -2356,6 +2532,7 @@ mod tests {
                 (),
                 &sent_tracker,
                 None,
+                PacketStream::Control,
             )
             .await;
 
@@ -2367,6 +2544,253 @@ mod tests {
             assert!(
                 !matches!(err, TransportError::ConnectionClosed(_)),
                 "should NOT be ConnectionClosed"
+            );
+        });
+    }
+
+    /// Regression guard for issue #3318/#3321 at the `packet_sending` layer:
+    /// a transient send failure must map to a recoverable, transient error and
+    /// must not leave the send path in a poisoned state.
+    ///
+    /// The production incident saw a brief ENETUNREACH blip tear down all 11
+    /// ring connections in under two seconds because every failed
+    /// `socket.send_to()` surfaced as `ConnectionClosed`.  This drives the
+    /// exact same `packet_sending` path through a transient failure and then
+    /// asserts that, once the blip clears, the *same* socket and key send
+    /// successfully again.
+    ///
+    /// Scope note: `packet_sending` is a stateless free function, so this locks
+    /// only its error-mapping (blip → transient, not `ConnectionClosed`) and
+    /// its statelessness/recoverability — a failed datagram leaves nothing
+    /// behind that blocks the next send on the same socket+key. It does NOT
+    /// exercise connection teardown: the decision to keep or drop the
+    /// connection lives in the callers that consume this error
+    /// (`is_transient_send_failure` dispatch sites), which this free function
+    /// does not drive. That residual caller-level gap is the #3321 follow-up.
+    #[test]
+    fn transient_send_failure_then_recovery_succeeds() {
+        let fail_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (tx, mut rx) = mpsc::channel(16);
+        let socket = Arc::new(FailableTestSocket::new(tx, fail_flag.clone()));
+        let remote_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let outbound_key = {
+                use aes_gcm::KeyInit;
+                Aes128Gcm::new(&[0u8; 16].into())
+            };
+            let sent_tracker = Arc::new(parking_lot::Mutex::new(
+                crate::transport::sent_packet_tracker::tests::mock_sent_packet_tracker(),
+            ));
+
+            // ---- blip: send fails transiently ----
+            let err = packet_sending(
+                remote_addr,
+                &socket,
+                1,
+                &outbound_key,
+                vec![],
+                (),
+                &sent_tracker,
+                None,
+                PacketStream::Control,
+            )
+            .await
+            .expect_err("send during blip should fail");
+            assert!(
+                err.is_transient_send_failure(),
+                "blip must surface as a transient failure callers can swallow, got: {err:?}"
+            );
+            assert!(
+                !matches!(err, TransportError::ConnectionClosed(_)),
+                "a single failed datagram must NOT report the connection closed — issue #3321"
+            );
+
+            // ---- blip clears: the same socket + key recover ----
+            fail_flag.store(false, std::sync::atomic::Ordering::Relaxed);
+            packet_sending(
+                remote_addr,
+                &socket,
+                2,
+                &outbound_key,
+                vec![],
+                (),
+                &sent_tracker,
+                None,
+                PacketStream::Control,
+            )
+            .await
+            .expect("send after the blip clears must succeed on the same connection");
+
+            let (target, _) = rx.recv().await.expect("recovered packet must be sent");
+            assert_eq!(
+                target, remote_addr,
+                "recovered packet must go to the same peer"
+            );
+        });
+    }
+
+    /// All transient send error kinds observed in production (the ENETUNREACH
+    /// family and friends) must classify as transient so the p2p error
+    /// handlers swallow them instead of closing the connection.  This locks
+    /// the `is_transient_send_failure` contract the #3321 fix relies on.
+    ///
+    /// Classification is deliberately kind-agnostic: `is_transient_send_failure`
+    /// matches `SendFailed(..)` on the *variant*, not the inner `ErrorKind`, so
+    /// every send error is connection-local regardless of errno. The loop below
+    /// therefore pins "every `SendFailed` is transient"; the explicit negative
+    /// assertion on a non-`SendFailed` variant pins the *boundary* — a genuine
+    /// `ConnectionClosed` must NOT be swallowed as transient — so the test
+    /// nails down both sides of the predicate rather than only the true case.
+    #[test]
+    fn send_failed_kinds_classify_as_transient() {
+        use std::io::ErrorKind;
+        let remote_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        for kind in [
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::HostUnreachable,
+            ErrorKind::ConnectionReset,
+            ErrorKind::WouldBlock,
+            ErrorKind::TimedOut,
+        ] {
+            let err = TransportError::SendFailed(remote_addr, kind);
+            assert!(
+                err.is_transient_send_failure(),
+                "SendFailed({kind:?}) must be transient so the connection survives — issue #3321"
+            );
+        }
+
+        // Boundary: a real connection-teardown error must NOT be classified as
+        // a transient send blip, otherwise the swallow path would mask genuine
+        // closures. `ConnectionClosed` and `ChannelClosed` are the canonical
+        // non-transient variants.
+        assert!(
+            !TransportError::ConnectionClosed(remote_addr).is_transient_send_failure(),
+            "ConnectionClosed must NOT be swallowed as a transient send failure — issue #3321"
+        );
+        assert!(
+            !TransportError::ChannelClosed.is_transient_send_failure(),
+            "ChannelClosed must NOT be swallowed as a transient send failure — issue #3321"
+        );
+    }
+
+    /// Phase 1.6 (#4074): the hot-path instrumentation must feed the
+    /// classified byte counters, and only on a successful send. A
+    /// `ShortMessage` advances `short`, a `StreamFragment` advances `bulk`,
+    /// and a failing send records nothing. The class counters are
+    /// process-global and monotonic, so the success assertions are framed
+    /// as lower bounds (delta ≥ payload) and the failure assertion as an
+    /// upper bound well below the payload size — both robust under
+    /// shared-process (`cargo test`) execution where another test might
+    /// also touch the same statics.
+    #[test]
+    fn packet_sending_feeds_classified_counters_on_success_only() {
+        use crate::transport::shadow_demand::outbound_counters_snapshot;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let outbound_key = {
+                use aes_gcm::KeyInit;
+                Aes128Gcm::new(&[0u8; 16].into())
+            };
+            let sent_tracker = Arc::new(parking_lot::Mutex::new(
+                crate::transport::sent_packet_tracker::tests::mock_sent_packet_tracker(),
+            ));
+            let remote_addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+
+            // ---- success: ShortMessage advances `short` ----
+            let ok_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (tx, _rx) = mpsc::channel(16);
+            let socket = Arc::new(FailableTestSocket::new(tx, ok_flag));
+
+            let (_, short_before, bulk_before) = outbound_counters_snapshot();
+            packet_sending(
+                remote_addr,
+                &socket,
+                1,
+                &outbound_key,
+                vec![],
+                SymmetricMessagePayload::ShortMessage {
+                    payload: bytes::Bytes::from(vec![7u8; 200]),
+                },
+                &sent_tracker,
+                None,
+                PacketStream::Control,
+            )
+            .await
+            .expect("short send should succeed");
+            let (_, short_after, _) = outbound_counters_snapshot();
+            assert!(
+                short_after - short_before >= 200,
+                "ShortMessage send must add >= its 200-byte payload to `short` (delta {})",
+                short_after - short_before
+            );
+
+            // ---- success: StreamFragment advances `bulk` ----
+            let frag_stream_id = StreamId::next();
+            packet_sending(
+                remote_addr,
+                &socket,
+                2,
+                &outbound_key,
+                vec![],
+                SymmetricMessagePayload::StreamFragment {
+                    stream_id: frag_stream_id,
+                    total_length_bytes: 300,
+                    fragment_number: 0,
+                    payload: bytes::Bytes::from(vec![9u8; 300]),
+                    metadata_bytes: None,
+                },
+                &sent_tracker,
+                None,
+                PacketStream::Stream(frag_stream_id),
+            )
+            .await
+            .expect("stream fragment send should succeed");
+            let (_, _, bulk_after) = outbound_counters_snapshot();
+            assert!(
+                bulk_after - bulk_before >= 300,
+                "StreamFragment send must add >= its 300-byte payload to `bulk` (delta {})",
+                bulk_after - bulk_before
+            );
+
+            // ---- failure: a failing send records nothing ----
+            let fail_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let (tx2, _rx2) = mpsc::channel(16);
+            let failing = Arc::new(FailableTestSocket::new(tx2, fail_flag));
+            let (_, short_pre_fail, _) = outbound_counters_snapshot();
+            let res = packet_sending(
+                remote_addr,
+                &failing,
+                3,
+                &outbound_key,
+                vec![],
+                SymmetricMessagePayload::ShortMessage {
+                    payload: bytes::Bytes::from(vec![3u8; 600]),
+                },
+                &sent_tracker,
+                None,
+                PacketStream::Control,
+            )
+            .await;
+            assert!(res.is_err(), "failing socket must return Err");
+            let (_, short_post_fail, _) = outbound_counters_snapshot();
+            // A wrongly-recorded error path would jump `short` by >= 600;
+            // concurrent unit tests only add tiny amounts, so a delta well
+            // under 600 proves nothing was recorded on the failure path.
+            assert!(
+                short_post_fail - short_pre_fail < 600,
+                "failing send must not record its 600-byte payload (delta {})",
+                short_post_fail - short_pre_fail
             );
         });
     }
@@ -2693,6 +3117,126 @@ mod tests {
         );
     }
 
+    /// Regression test for issue #4345: flight size must drain when a packet is
+    /// retransmitted forever with no ACK — the real production recv-loop path.
+    ///
+    /// This drives the EXACT production sequence (not a synthetic give-up): for
+    /// each fired RTO the recv loop calls `on_timeout()` (cwnd loss response
+    /// only — flight size unchanged), successfully re-sends, and re-registers
+    /// the packet, because with no ACK arriving the tracker keeps re-queueing
+    /// it. Crucially, since `on_timeout()` never touches flight size, it would
+    /// stay pinned forever WITHOUT a give-up mechanism. The fix is the
+    /// tracker's bounded-retransmit abandonment: after `MAX_PACKET_RETRANSMITS`
+    /// it returns `ResendAction::Abandon`, the recv loop calls
+    /// `release_flightsize(len)`, and the packet is dropped — so flight size
+    /// finally drains.
+    ///
+    /// This is the integration-level companion to the pure-controller unit
+    /// tests (`bbr`/`fixed_rate`
+    /// `test_issue_4345_release_flightsize_drains_abandoned_bytes`): it confirms
+    /// the END-TO-END path through `SentPacketTracker` actually reaches the
+    /// give-up branch in production, which the earlier draft missed (the recv
+    /// loop always re-sends on RTO, so only abandonment drains the leak).
+    ///
+    /// Before this fix, no abandonment existed: a never-ACKed packet was
+    /// retransmitted forever, its initial `on_send` bytes pinned flight size at
+    /// `cwnd`, and every subsequent stream on the connection aborted with
+    /// "cwnd wait timeout".
+    #[test]
+    fn test_issue_4345_flightsize_drains_via_bounded_retransmit() {
+        use crate::simulation::VirtualTime;
+        use crate::transport::bbr::{BbrConfig, BbrController};
+        use crate::transport::sent_packet_tracker::{ResendAction, SentPacketTracker};
+        use std::sync::Arc;
+
+        let time = VirtualTime::new();
+        let congestion = Arc::new(BbrController::new_with_time_source(
+            BbrConfig {
+                initial_cwnd: 60_000,
+                min_cwnd: 2_000,
+                max_cwnd: 10_000_000,
+                ..Default::default()
+            },
+            time.clone(),
+        ));
+        let mut tracker = SentPacketTracker::new_with_time_source(time.clone());
+
+        // Send a burst that will never be ACKed (dead reverse-ACK path).
+        let packet_size = 1424usize;
+        let num_packets = 30u32;
+        for packet_id in 0..num_packets {
+            let payload: Box<[u8]> = vec![0u8; packet_size].into_boxed_slice();
+            tracker.report_sent_packet(packet_id, payload);
+            congestion.on_send(packet_size);
+        }
+        assert_eq!(
+            congestion.flightsize(),
+            num_packets as usize * packet_size,
+            "flightsize should account for the whole in-flight burst"
+        );
+
+        // Drive the REAL production recv-loop sequence: each RTO calls
+        // on_timeout() (cwnd loss response only — the packet is immediately
+        // re-sent and stays in flight, so flight size is UNCHANGED) and
+        // re-registers, repeating (no ACK ever arrives). Because every re-send
+        // leaves flight size untouched, it would stay pinned forever WITHOUT a
+        // give-up. The fix: after MAX_PACKET_RETRANSMITS the tracker returns
+        // Abandon, the recv loop calls release_flightsize(len), and flight size
+        // finally drains.
+        let mut abandoned = 0u32;
+        let mut resends = 0u32;
+        for _ in 0..20_000 {
+            match tracker.get_resend() {
+                ResendAction::Resend(id, packet) => {
+                    // Production recv-loop Resend arm: cwnd loss response, re-send
+                    // (succeeds here), re-register. Flight size unchanged.
+                    congestion.on_timeout();
+                    tracker.report_sent_packet(id, packet);
+                    resends += 1;
+                }
+                ResendAction::Abandon { payload_len, .. } => {
+                    // The give-up that actually drains the leak.
+                    congestion.release_flightsize(payload_len);
+                    abandoned += 1;
+                }
+                ResendAction::TlpProbe(_id, _packet) => {
+                    // Speculative probe — no flight-size effect.
+                }
+                ResendAction::WaitUntil(_) => {
+                    if abandoned >= num_packets {
+                        break; // every packet abandoned
+                    }
+                    // Jump past the (backed-off) next deadline and retry.
+                    time.advance(std::time::Duration::from_secs(120));
+                }
+            }
+        }
+
+        // Sanity: flight size stayed pinned across the net-zero re-send rounds,
+        // i.e. on_timeout alone never released it — only abandonment does.
+        assert!(
+            resends >= num_packets,
+            "issue #4345: expected the production re-send path to run before \
+             abandonment (resends={resends}); the test did not exercise the \
+             real recv-loop re-send sequence"
+        );
+        assert_eq!(
+            abandoned, num_packets,
+            "issue #4345: every never-ACKed packet must eventually be abandoned \
+             (abandoned={abandoned}/{num_packets})"
+        );
+        assert!(
+            congestion.flightsize() <= packet_size,
+            "issue #4345: flight size did not drain after bounded-retransmit \
+             abandonment — got {} bytes ({} packets still in flight). Re-sends \
+             alone never release a never-ACKed packet (on_timeout leaves flight \
+             size unchanged); the tracker MUST abandon it (ResendAction::Abandon) \
+             so the recv loop calls release_flightsize().",
+            congestion.flightsize(),
+            congestion.flightsize() / packet_size,
+        );
+    }
+
     /// Keepalive interval backs off exponentially past the unanswered-ping threshold (#3252).
     #[test]
     fn keepalive_interval_backs_off_for_unanswered_pings() {
@@ -2866,6 +3410,7 @@ mod tests {
             inbound_symmetric_key: cipher,
             inbound_symmetric_key_bytes: key,
             my_address: None,
+            remote_protoc_version: None,
             transport_secret_key: keypair.secret,
             congestion_controller,
             token_bucket,
@@ -2958,6 +3503,7 @@ mod tests {
             inbound_symmetric_key: cipher.clone(),
             inbound_symmetric_key_bytes: key,
             my_address: None,
+            remote_protoc_version: None,
             transport_secret_key: keypair.secret,
             congestion_controller,
             token_bucket,
@@ -3029,6 +3575,137 @@ mod tests {
         );
 
         // Cleanup so the singleton doesn't leak our address into other tests.
+        crate::transport::TRANSPORT_METRICS.remove_peer(remote_addr);
+    }
+
+    /// Regression test for #4000: a Pong received for a pending keep-alive
+    /// Ping must record an RTT sample, so quiet connections that never
+    /// complete a stream transfer still contribute to the RTT statistics.
+    ///
+    /// Before the fix, the Pong handler removed the matching ping timestamp
+    /// from `pending_pings` and discarded it — `record_rtt_sample` was only
+    /// reachable from `record_transfer_completed` (stream completion), so a
+    /// connection exchanging only keep-alive traffic recorded zero RTT
+    /// samples. This test seeds a pending ping, advances the (mock) clock,
+    /// feeds an encrypted Pong, and asserts the global RTT sample counter
+    /// moved by at least one.
+    #[tokio::test]
+    async fn pong_records_rtt_sample_from_keepalive_cycle() {
+        use crate::transport::crypto::TransportKeypair;
+        use crate::transport::packet_data::PacketData;
+        use crate::transport::symmetric_message::SymmetricMessagePayload;
+        use crate::util::time_source::SharedMockTimeSource;
+        use bytes::Bytes;
+
+        let time_source = SharedMockTimeSource::new();
+        let (inbound_tx, inbound_rx) = mpsc::channel(16);
+        let remote_addr = SocketAddr::new(Ipv4Addr::new(10, 99, 99, 2).into(), 50002);
+
+        let mut key = [0u8; 16];
+        crate::config::GlobalRng::fill_bytes(&mut key);
+        let cipher = Aes128Gcm::new(&key.into());
+        let keypair = TransportKeypair::new();
+
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(
+            SentPacketTracker::new_with_time_source(time_source.clone()),
+        ));
+        let congestion_controller =
+            crate::transport::congestion_control::CongestionControlConfig::default()
+                .build_arc_with_time_source(time_source.clone());
+        let token_bucket = Arc::new(TokenBucket::new_with_time_source(
+            10_000,
+            10_000_000,
+            time_source.clone(),
+        ));
+        let socket = Arc::new(TestSocket::new(
+            mpsc::channel::<(SocketAddr, Arc<[u8]>)>(16).0,
+        ));
+
+        let rolling_rtt_stats = crate::transport::rolling_rtt_stats::RollingRttStatsHandle::new(
+            remote_addr,
+            time_source.clone(),
+        );
+        let remote_conn = RemoteConnection {
+            outbound_symmetric_key: cipher.clone(),
+            remote_addr,
+            sent_tracker,
+            last_packet_id: Arc::new(AtomicU32::new(0)),
+            inbound_packet_recv: inbound_rx,
+            inbound_symmetric_key: cipher.clone(),
+            inbound_symmetric_key_bytes: key,
+            my_address: None,
+            remote_protoc_version: None,
+            transport_secret_key: keypair.secret,
+            congestion_controller,
+            token_bucket,
+            socket,
+            global_bandwidth: None,
+            rolling_rtt_stats,
+            time_source: time_source.clone(),
+        };
+
+        // Build the encrypted Pong (sequence 7) and a trailing ShortMessage.
+        // The Pong handler does not make `recv()` return (it produces no
+        // message), so the ShortMessage gives the loop a value to yield once
+        // the Pong has been processed.
+        let pong_seq = 7u64;
+        let pong = SymmetricMessage::serialize_msg_to_packet_data(
+            1,
+            SymmetricMessagePayload::Pong { sequence: pong_seq },
+            &cipher,
+            vec![],
+        )
+        .expect("encrypt pong");
+        let pong_packet =
+            PacketData::<crate::transport::packet_data::UnknownEncryption>::from_buf(pong.data());
+
+        let short = SymmetricMessage::serialize_msg_to_packet_data(
+            2,
+            SymmetricMessagePayload::ShortMessage {
+                payload: Bytes::from_static(b"done"),
+            },
+            &cipher,
+            vec![],
+        )
+        .expect("encrypt short");
+        let short_packet =
+            PacketData::<crate::transport::packet_data::UnknownEncryption>::from_buf(short.data());
+
+        let mut conn = PeerConnection::new(remote_conn);
+
+        // Advance past zero before seeding so the ping's send timestamp is
+        // strictly positive. The recv loop's stale-ping cleanup retains only
+        // pings with `sent_at_nanos > now_nanos - idle_timeout`; at small mock
+        // times that threshold saturates to 0, so a ping stamped at exactly 0
+        // would be pruned before the Pong arrives. Stamp at 10 ms, then
+        // advance another 50 ms so the round-trip is a deterministic 50 ms.
+        time_source.advance_time(Duration::from_millis(10));
+        let send_nanos = time_source.now_nanos();
+        conn.pending_pings.write().insert(pong_seq, send_nanos);
+        time_source.advance_time(Duration::from_millis(50));
+
+        let samples_before = crate::transport::TRANSPORT_METRICS.rtt_sample_count();
+
+        inbound_tx.send(pong_packet).await.expect("send pong");
+        inbound_tx.send(short_packet).await.expect("send short");
+
+        let _msg = conn.recv().await.expect("recv");
+
+        let samples_after = crate::transport::TRANSPORT_METRICS.rtt_sample_count();
+        assert!(
+            samples_after > samples_before,
+            "Pong for a pending ping must record at least one RTT sample \
+             (before={samples_before}, after={samples_after}). \
+             The keep-alive RTT path (#4000) is not wired up."
+        );
+
+        // The matching ping must have been consumed so it isn't sampled twice
+        // or treated as still-unanswered by the keep-alive backoff.
+        assert!(
+            !conn.pending_pings.read().contains_key(&pong_seq),
+            "Pong must remove the matching pending ping"
+        );
+
         crate::transport::TRANSPORT_METRICS.remove_peer(remote_addr);
     }
 

@@ -33,6 +33,7 @@ fn homepage_html() -> String {
     let status_card = build_status_card(&snap);
     let peers_card = build_peers_card(&snap);
     let governance_card = build_governance_card(&snap);
+    let ban_list_card = build_ban_list_card(&snap);
     let contracts_card = build_contracts_card(&snap);
     let ops_card = build_ops_card(&snap);
     let transfer_card = build_transfer_card(&snap);
@@ -102,17 +103,24 @@ fn homepage_html() -> String {
         </div>
     </header>
 
+    <div class="version-banner" id="version-mismatch-banner" data-asset-version="{asset_version}" role="alert" hidden></div>
+
     <main>
         {status_card}
         {peers_card}
         {transfer_card}
         {governance_card}
+        {ban_list_card}
         {contracts_card}
         {ops_card}
 
         <div class="card">
             <h2>Freenet Links</h2>
             <ul class="app-list">
+                <li>
+                    <a href="/v1/contract/web/771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH9/">Atlas</a>
+                    <p class="note">Decentralized search and recommendation engine for Freenet.</p>
+                </li>
                 <li>
                     <a href="/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv/">River Chat</a>
                     <p class="note">You'll need an <a href="https://freenet.org/quickstart#invite-form" target="_blank" rel="noopener noreferrer">invite</a> to join the "Freenet Official" room.</p>
@@ -142,6 +150,10 @@ fn homepage_html() -> String {
         JS = JS,
         favicon = favicon,
         version = html_escape(version),
+        // Asset version = the build that compiled THIS served page. Baked in at
+        // compile time so the JS can compare it against the live runtime version
+        // fetched from /v1/version and warn when a cached page is stale (#4289).
+        asset_version = html_escape(crate::config::PCK_VERSION),
         uptime = uptime,
         peer_id = html_escape(peer_id),
         peer_copy_btn = peer_copy_btn,
@@ -341,6 +353,37 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
         attempts = snap.connection_attempts,
     );
 
+    // UPDATE rate-limiter stats: only shown once the limiter has seen
+    // traffic, so idle nodes stay uncluttered. A non-zero "Rate-limited"
+    // or "Capacity-dropped" count is the operator's signal that the
+    // per-(sender, contract) UPDATE limiter is dropping relayed traffic.
+    let rate_limit_html = if snap.ring_stats.updates_accepted > 0
+        || snap.ring_stats.updates_rate_limited > 0
+        || snap.ring_stats.updates_capacity_dropped > 0
+    {
+        format!(
+            r#"<div class="metrics-row">
+            <div class="metric-tile">
+                <span class="metric-value">{accepted}</span>
+                <span class="metric-label">UPDATEs relayed</span>
+            </div>
+            <div class="metric-tile">
+                <span class="metric-value">{rate_limited}</span>
+                <span class="metric-label">Rate-limited</span>
+            </div>
+            <div class="metric-tile">
+                <span class="metric-value">{capacity_dropped}</span>
+                <span class="metric-label">Capacity-dropped</span>
+            </div>
+        </div>"#,
+            accepted = snap.ring_stats.updates_accepted,
+            rate_limited = snap.ring_stats.updates_rate_limited,
+            capacity_dropped = snap.ring_stats.updates_capacity_dropped,
+        )
+    } else {
+        String::new()
+    };
+
     let spinner = if snap.open_connections == 0 {
         r#"<div class="spinner"></div>"#
     } else {
@@ -456,6 +499,7 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
             <h2>Connection Status</h2>
             {health_banner}
             {ring_stats_html}
+            {rate_limit_html}
             {external_addr_html}
             {spinner}
             {gateway_warning}
@@ -464,6 +508,7 @@ fn build_status_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> St
         </div>"#,
         health_banner = health_banner,
         ring_stats_html = ring_stats_html,
+        rate_limit_html = rate_limit_html,
         external_addr_html = external_addr_html,
         spinner = spinner,
         gateway_warning = gateway_warning,
@@ -968,6 +1013,14 @@ fn build_ring_svg(
     svg
 }
 
+/// Format the governance card's "last evaluated" footer from the number
+/// of seconds since the reaper last ticked. `format_ago` already appends
+/// " ago" (or returns "just now"), so the template must NOT add a second
+/// "ago" — doing so rendered "Last evaluated 18s ago ago".
+fn format_last_evaluated(secs: u64) -> String {
+    format!("Last evaluated {}", format_ago(secs))
+}
+
 /// Build the governance card. Reads `snap.governance` (sourced from
 /// `Ring::dashboard_governance_snapshot` → `GovernanceManager`). Every
 /// field rendered here came from the back-end's computation —
@@ -997,7 +1050,7 @@ fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
             // moments ago so we can approximate "now" inline.
             let now = tokio::time::Instant::now();
             let secs = now.saturating_duration_since(at).as_secs();
-            format!("Last evaluated {} ago", format_ago(secs))
+            format_last_evaluated(secs)
         }
         None => "Reaper has not yet ticked".to_string(),
     };
@@ -1011,10 +1064,17 @@ fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
     if g.contracts.is_empty() {
         let observed = g.observed_count;
         let needed = g.min_samples;
+        // When governance is Off (the default — see `GovernanceConfig`),
+        // no contract is ever scored, so the ramp-up / "scoring activates"
+        // copy below would be misleading on every default node. Render a
+        // disabled message instead.
+        let is_off = matches!(g.mode, network_status::GovernanceModeSnapshot::Off);
         // Tiny pluralization helper so the user-facing messages
         // don't read "1 contracts" — Codex review nit.
         let plural = |n: usize| if n == 1 { "contract" } else { "contracts" };
-        let progress_msg = if needed == 0 {
+        let progress_msg = if is_off {
+            "Governance is off: contracts are not scored, and nothing is evicted.".to_string()
+        } else if needed == 0 {
             "Governance manager is not yet wired.".to_string()
         } else if observed == 0 {
             format!(
@@ -1044,7 +1104,12 @@ fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
                 n_word = plural(observed),
             )
         };
-        let verdict_main = if observed >= needed {
+        let verdict_main = if is_off {
+            r#"<div class="verdict-num">—</div>
+                   <div class="verdict-headline">Governance off</div>
+                   <div class="verdict-detail">Contracts are not scored or evicted.</div>"#
+                .to_string()
+        } else if observed >= needed {
             format!(
                 r#"<div class="verdict-num">✓</div>
                    <div class="verdict-headline">{observed} contracts within normal range</div>
@@ -1300,6 +1365,99 @@ fn build_governance_card(snap: &Option<network_status::NetworkStatusSnapshot>) -
         mad = mad_txt,
         threshold = threshold_txt,
         rows = rows,
+    )
+}
+
+/// Contract ban-list card (#4302). Surfaces the canonical
+/// `Ring::contract_ban_list` so operators can see whether the Phase 7
+/// hardening mechanism is catching abusers or sitting idle.
+///
+/// Two concrete asks from the issue: a count tile ("N contracts on ban
+/// list") and a per-entry list (key, reason, time remaining). The
+/// governance-state-machine drill-down is deferred (the ban list stores
+/// only the current entry, not the transition history that led to it).
+///
+/// The card is rendered whenever a snapshot exists — including when the
+/// list is empty — so an idle-but-active mechanism is distinguishable
+/// from one that isn't wired. Every value here comes from the ban list's
+/// own accessors via the provider closure; nothing is invented at render
+/// time.
+fn build_ban_list_card(snap: &Option<network_status::NetworkStatusSnapshot>) -> String {
+    let Some(snap) = snap else {
+        return String::new();
+    };
+    let b = &snap.ban_list;
+
+    let plural = |n: usize| if n == 1 { "contract" } else { "contracts" };
+
+    // Capacity-rejection note: only shown when non-zero, so the common
+    // case stays uncluttered. A non-zero value is the operator's signal
+    // that the bounded list (MAX_BANNED_CONTRACTS) is overflowing.
+    let capacity_note = if b.capacity_rejected_total > 0 {
+        format!(
+            r#"<p class="empty" style="margin: 0 0.9rem 0.6rem; font-size: 0.82rem; color: var(--danger, #c0392b);">{n} ban{s} rejected — list at capacity.</p>"#,
+            n = b.capacity_rejected_total,
+            s = if b.capacity_rejected_total == 1 {
+                ""
+            } else {
+                "s"
+            },
+        )
+    } else {
+        String::new()
+    };
+
+    let body = if b.entries.is_empty() {
+        r#"<p class="empty" style="margin: 0.6rem 0.9rem;">No contracts banned. The mechanism is active and currently idle.</p>"#
+            .to_string()
+    } else {
+        let mut rows = String::new();
+        for e in &b.entries {
+            let reason_txt = match e.reason {
+                network_status::BanReasonSnapshot::AutoMad => "auto (governance)",
+                network_status::BanReasonSnapshot::Operator => "operator",
+            };
+            let remaining = if e.expires_in_secs == 0 {
+                "lifting".to_string()
+            } else {
+                format!("{} left", format_duration(e.expires_in_secs))
+            };
+            // html_escape the contract id even though instance ids are
+            // base58 (no HTML metacharacters today): defense-in-depth so
+            // the row stays safe if the id format ever changes.
+            write!(
+                rows,
+                r#"<tr><td class="mono">{id}</td><td>{reason}</td><td>{remaining}</td></tr>"#,
+                id = html_escape(&e.instance_id),
+                reason = reason_txt,
+                remaining = html_escape(&remaining),
+            )
+            .ok();
+        }
+        format!(
+            r#"<table class="data-table">
+                <thead><tr><th>Contract</th><th>Reason</th><th>Expires</th></tr></thead>
+                <tbody>{rows}</tbody>
+            </table>"#
+        )
+    };
+
+    format!(
+        r##"<div class="card">
+            <div class="card-header"><h2>Contract Ban List</h2></div>
+            <div class="g-verdict-row">
+                <div class="g-norms">
+                    <div class="g-norm"><div class="g-norm-label">On ban list</div><div class="g-norm-value">{count}</div></div>
+                </div>
+                <p class="empty" style="margin: 0; padding: 0.4rem 0.9rem; font-size: 0.9rem;">{count} {n_word} currently banned at this node.</p>
+            </div>
+            {capacity_note}
+            {body}
+        </div>"##,
+        count = b.count,
+        n_word = plural(b.count),
+        capacity_note = capacity_note,
+        body = body,
     )
 }
 
@@ -1769,6 +1927,22 @@ main {
     margin-bottom: 0.35rem;
     font-size: 0.85rem;
 }
+/* Stale-assets warning bar (#4289): shown by the JS only when the served
+   page's compile-time version differs from the live runtime version. */
+.version-banner {
+    background: rgba(248, 113, 113, 0.15);
+    border-bottom: 2px solid rgba(248, 113, 113, 0.5);
+    color: #f87171;
+    padding: 0.6rem 1.5rem;
+    font-size: 0.9rem;
+    font-weight: 500;
+    text-align: center;
+}
+[data-theme="light"] .version-banner {
+    color: #b91c1c;
+    background: rgba(220, 38, 38, 0.1);
+    border-bottom-color: rgba(220, 38, 38, 0.4);
+}
 .attempts {
     color: var(--text-muted);
     font-size: 0.8rem;
@@ -1971,6 +2145,8 @@ code {
 }
 .note a { color: var(--accent-light); }
 [data-theme="light"] .note a { color: var(--accent-primary); }
+.ext-link { color: var(--accent-light); }
+[data-theme="light"] .ext-link { color: var(--accent-primary); }
 p { margin-bottom: 0.5rem; }
 p:last-child { margin-bottom: 0; }
 .ring-wrap {
@@ -2543,6 +2719,44 @@ function checkForUpdate() {
     });
 }
 
+/* A version string is "known" when it is non-empty and not the '?'
+   placeholder the homepage uses before a node snapshot exists.
+   Mirrors version_is_known() in home_page.rs — keep both in sync. */
+function versionIsKnown(v) {
+    return !!v && v !== '?';
+}
+
+/* Show the stale-assets banner iff both the asset version (baked into this
+   served page at compile time) and the live runtime version are known and
+   differ. Mirrors should_show_version_banner() in home_page.rs. The point
+   of comparing against a LIVE fetch (not the rendered data-version) is to
+   catch the #4289 case: the browser is holding a cached page emitted by an
+   old binary while a newer binary is now answering requests. */
+function checkVersionMismatch() {
+    var banner = document.getElementById('version-mismatch-banner');
+    if (!banner) return;
+    var assetVersion = banner.getAttribute('data-asset-version') || '';
+    if (!versionIsKnown(assetVersion)) return;
+    fetch('/v1/version', { headers: { 'Accept': 'application/json' } }).then(function(r) {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+    }).then(function(data) {
+        var runtimeVersion = data && data.version;
+        if (!versionIsKnown(runtimeVersion)) return;
+        if (runtimeVersion !== assetVersion) {
+            banner.textContent = 'Asset version ' + assetVersion + ' ≠ node version '
+                + runtimeVersion + ' — this page is stale, refresh to load the current version.';
+            banner.hidden = false;
+        } else {
+            /* Versions agree (e.g. after a refresh fixed the staleness). */
+            banner.hidden = true;
+        }
+    }).catch(function(e) {
+        /* Endpoint unreachable / node mid-startup — don't show a spurious banner. */
+        console.debug('Version check failed:', e);
+    });
+}
+
 /* Tab switching for per-operation-type charts */
 function switchTab(el) {
     var tabId = el.getAttribute('data-tab');
@@ -2578,6 +2792,7 @@ document.addEventListener('DOMContentLoaded', function() {
     restoreTab();
     restoreSort();
     checkForUpdate();
+    checkVersionMismatch();
 
     /* Delegated click handler \u2014 survives <main> innerHTML swaps from auto-refresh,
        so we don't need to re-bind after each refresh. */
@@ -2627,6 +2842,12 @@ document.addEventListener('DOMContentLoaded', function() {
                 /* Restore tab selection and table sort after content swap */
                 restoreTab();
                 restoreSort();
+                /* Re-check the live runtime version so the stale-assets banner
+                   appears (or clears) if the serving process changes while the
+                   page stays open. The banner's data-asset-version stays anchored
+                   to the originally-loaded page, which is the version we're
+                   comparing against. */
+                checkVersionMismatch();
             }).catch(function(e) { console.warn('Dashboard refresh failed:', e); })
               .finally(scheduleRefresh);
         }, 5000);
@@ -2742,6 +2963,7 @@ fn peer_detail_html(address_str: &str) -> String {
                     <div class="info-label">This peer: transfer rate</div><div class="info-value">{pt} events</div>
                 </div>
                 <h3 style="margin-top: 1em;">Renegade ML Predictor</h3>
+                <p class="empty" style="font-size: 0.8em; margin-top: 0.25em;"><a href="https://github.com/sanity/renegade" target="_blank" rel="noopener noreferrer" class="ext-link">Renegade</a> is a zero-configuration k-nearest-neighbours model (it auto-selects K and learns which features matter). It predicts per-peer, per-contract outcomes from four features (peer, contract location, distance, time); the router blends its prediction with the distance-based estimate (a weighted average, Renegade's share growing with data up to half) to catch patterns distance alone misses, such as a peer that drops requests for specific contracts.</p>
                 <div class="info-grid">
                     <div class="info-label">Failure observations</div><div class="info-value">{rf}</div>
                     <div class="info-label">Response time observations</div><div class="info-value">{rr}</div>
@@ -2797,39 +3019,70 @@ fn peer_detail_html(address_str: &str) -> String {
         for (i, &tab_name) in tab_names.iter().enumerate() {
             let tab_id = tab_name.to_lowercase().replace(' ', "-");
 
-            // Get curves for this tab
-            let (f_curve, f_range, rt_curve, rt_range, xfer_curve, xfer_range, event_count) =
-                if tab_name == "All" {
-                    (
-                        rs.failure_curve.as_slice(),
-                        rs.failure_data_range,
-                        rs.response_time_curve.as_slice(),
-                        rs.response_time_data_range,
-                        rs.transfer_rate_curve.as_slice(),
-                        rs.transfer_rate_data_range,
-                        rs.failure_events,
-                    )
-                } else if let Some(c) = rs.per_op_curves.get(tab_name) {
-                    (
-                        c.failure_curve.as_slice(),
-                        c.failure_data_range,
-                        c.response_time_curve.as_slice(),
-                        c.response_time_data_range,
-                        c.transfer_rate_curve.as_slice(),
-                        c.transfer_rate_data_range,
-                        c.failure_events,
-                    )
-                } else {
-                    (
-                        &[][..],
-                        (0.0, 0.0),
-                        &[][..],
-                        (0.0, 0.0),
-                        &[][..],
-                        (0.0, 0.0),
-                        0,
-                    )
-                };
+            // Get curves + raw scatter points for this tab
+            #[allow(clippy::type_complexity)]
+            let (
+                f_curve,
+                f_range,
+                f_points,
+                rt_curve,
+                rt_range,
+                rt_points,
+                xfer_curve,
+                xfer_range,
+                xfer_points,
+                event_count,
+            ): (
+                &[(f64, f64)],
+                (f64, f64),
+                &[(f64, f64)],
+                &[(f64, f64)],
+                (f64, f64),
+                &[(f64, f64)],
+                &[(f64, f64)],
+                (f64, f64),
+                &[(f64, f64)],
+                usize,
+            ) = if tab_name == "All" {
+                (
+                    rs.failure_curve.as_slice(),
+                    rs.failure_data_range,
+                    rs.failure_points.as_slice(),
+                    rs.response_time_curve.as_slice(),
+                    rs.response_time_data_range,
+                    rs.response_time_points.as_slice(),
+                    rs.transfer_rate_curve.as_slice(),
+                    rs.transfer_rate_data_range,
+                    rs.transfer_rate_points.as_slice(),
+                    rs.failure_events,
+                )
+            } else if let Some(c) = rs.per_op_curves.get(tab_name) {
+                (
+                    c.failure_curve.as_slice(),
+                    c.failure_data_range,
+                    c.failure_points.as_slice(),
+                    c.response_time_curve.as_slice(),
+                    c.response_time_data_range,
+                    c.response_time_points.as_slice(),
+                    c.transfer_rate_curve.as_slice(),
+                    c.transfer_rate_data_range,
+                    c.transfer_rate_points.as_slice(),
+                    c.failure_events,
+                )
+            } else {
+                (
+                    &[][..],
+                    (0.0, 0.0),
+                    &[][..],
+                    &[][..],
+                    (0.0, 0.0),
+                    &[][..],
+                    &[][..],
+                    (0.0, 0.0),
+                    &[][..],
+                    0,
+                )
+            };
 
             // Tab label with event count badge
             let count_badge = if event_count > 0 {
@@ -2867,19 +3120,28 @@ fn peer_detail_html(address_str: &str) -> String {
                 // migration stopped feeding the response-time
                 // and transfer-rate estimators (the `Failure Probability`-only
                 // dashboard regression that surfaced this code path).
+                // Failure probabilities are tiny, so a fixed 0.0–1.0 axis
+                // squashes the curve flat against the bottom. Zoom the top of
+                // the axis to 2x the curve's value at the right edge of the
+                // plot so the line is legible. See failure_chart_y_max.
+                let fail_y_max =
+                    failure_chart_y_max(f_curve, if tab_name == "All" { fail_adj } else { None })
+                        .to_string();
                 panel_content.push_str(&build_estimator_chart_or_placeholder(
                     "Failure Probability",
                     f_curve,
+                    f_points,
                     f_range,
                     if tab_name == "All" { fail_adj } else { None },
                     ploc,
                     "0.0",
-                    "1.0",
+                    &fail_y_max,
                     "No success/failure observations have routed through this peer yet.",
                 ));
                 panel_content.push_str(&build_estimator_chart_or_placeholder(
                     "Response Time (s)",
                     rt_curve,
+                    rt_points,
                     rt_range,
                     if tab_name == "All" { rt_adj } else { None },
                     ploc,
@@ -2890,11 +3152,15 @@ fn peer_detail_html(address_str: &str) -> String {
                 panel_content.push_str(&build_estimator_chart_or_placeholder(
                     "Transfer Rate (B/s)",
                     xfer_curve,
+                    xfer_points,
                     xfer_range,
                     if tab_name == "All" { xfer_adj } else { None },
                     ploc,
-                    "auto",
+                    // Transfer rate is a positive B/s value: floor at 0, auto-scale
+                    // the top. (Was "auto"/"0", which clamped the max to 0 and gave a
+                    // degenerate inverted range that also hid the scatter overlay.)
                     "0",
+                    "auto",
                     "No payload transfers have been observed from this peer yet.",
                 ));
             }
@@ -2912,9 +3178,19 @@ fn peer_detail_html(address_str: &str) -> String {
 
         format!(
             r#"<div class="card">
-                <h2>Routing Predictions</h2>
+                <h2>Outcomes vs Distance</h2>
+                <p style="font-size:0.8em;color:var(--text-muted);">
+                    Actual observed outcomes (dots) against ring distance to the contract, with the
+                    isotonic fit overlaid (the All tab is the aggregate the router uses; per-op tabs
+                    just break it down and are not consulted separately). "Peer-adjusted" adds this
+                    peer's running EWMA correction to that fit. How tightly the dots hug a monotonic
+                    curve shows how well distance alone predicts the outcome. A separate Renegade
+                    model is blended into the final estimate; its accuracy is in the Prediction
+                    Accuracy panel below.
+                </p>
                 <p class="chart-legend">
-                    <span class="chart-key"><span class="chart-dot chart-dot-global"></span> Global model</span>
+                    <span class="chart-key"><span class="chart-dot chart-dot-actual"></span> Actual outcomes</span>
+                    <span class="chart-key"><span class="chart-dot chart-dot-global"></span> Isotonic fit</span>
                     <span class="chart-key"><span class="chart-dot chart-dot-peer"></span> Peer-adjusted</span>
                     <span class="chart-key"><span class="chart-dot chart-dot-loc"></span> Peer location</span>
                     <span class="chart-key"><span class="chart-dot chart-dot-ext"></span> Extrapolated</span>
@@ -2931,13 +3207,14 @@ fn peer_detail_html(address_str: &str) -> String {
         String::new()
     };
 
-    // Build renegade accuracy chart
+    // Build the renegade prediction-accuracy panel (failure + timing models)
     let renegade_chart = if let Some(ref rs) = router_snapshot {
-        if rs.renegade_accuracy_pairs.is_empty() {
-            String::new()
-        } else {
-            build_renegade_accuracy_chart(&rs.renegade_accuracy_pairs)
-        }
+        build_renegade_accuracy_panel(
+            &rs.renegade_accuracy_pairs,
+            rs.renegade_brier_score,
+            &rs.renegade_response_time_pairs,
+            &rs.renegade_transfer_speed_pairs,
+        )
     } else {
         String::new()
     };
@@ -3018,6 +3295,35 @@ fn peer_detail_html(address_str: &str) -> String {
     )
 }
 
+/// Choose the top of the failure-probability chart's y-axis.
+///
+/// Failure probabilities for a healthy peer are tiny (often well under 0.1),
+/// so a fixed 0.0–1.0 axis squashes the fitted curve flat against the bottom
+/// and its shape is unreadable. Instead, scale the top of the axis to twice the
+/// curve's value at the right edge of the plot (the largest distance shown,
+/// 0.5), so the line occupies roughly the lower half of the chart. The PAV
+/// failure estimator is monotonically increasing in distance, so the right edge
+/// is the curve's maximum and 2x leaves headroom above the whole line.
+///
+/// Returns 1.0 (the original full-range axis) when there is no failure signal at
+/// the right edge, avoiding a degenerate zero-height axis. The result is capped
+/// at 1.0 since a probability can never exceed 1.0.
+fn failure_chart_y_max(curve_points: &[(f64, f64)], peer_adjustment: Option<f64>) -> f64 {
+    // y-value at the largest sampled distance (the right edge of the chart).
+    let right_edge = curve_points
+        .iter()
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|&(_, y)| y)
+        .unwrap_or(0.0);
+    // Keep the peer-adjusted line on-screen too: only an upward (positive)
+    // adjustment can push its right edge above the global curve's.
+    let right_edge = right_edge + peer_adjustment.unwrap_or(0.0).max(0.0);
+    if right_edge <= 1e-9 {
+        return 1.0;
+    }
+    (2.0 * right_edge).min(1.0)
+}
+
 /// Render the named estimator chart, or — when no data has been observed
 /// yet — a titled placeholder. The placeholder keeps the slot visible so
 /// users can always see every component of a routing prediction even when
@@ -3029,6 +3335,7 @@ fn peer_detail_html(address_str: &str) -> String {
 fn build_estimator_chart_or_placeholder(
     title: &str,
     curve_points: &[(f64, f64)],
+    scatter_points: &[(f64, f64)],
     data_range: (f64, f64),
     peer_adjustment: Option<f64>,
     peer_location: Option<f64>,
@@ -3046,6 +3353,7 @@ fn build_estimator_chart_or_placeholder(
     build_estimator_chart(
         title,
         curve_points,
+        scatter_points,
         data_range,
         peer_adjustment,
         peer_location,
@@ -3058,9 +3366,11 @@ fn build_estimator_chart_or_placeholder(
 ///
 /// `data_range` is `(data_x_min, data_x_max)` -- the x-range of actual regression data.
 /// Points outside this range are extrapolated by the PAV crate and drawn as dashed lines.
+#[allow(clippy::too_many_arguments)]
 fn build_estimator_chart(
     title: &str,
     curve_points: &[(f64, f64)],
+    scatter_points: &[(f64, f64)],
     data_range: (f64, f64),
     peer_adjustment: Option<f64>,
     peer_location: Option<f64>,
@@ -3075,11 +3385,13 @@ fn build_estimator_chart(
     }
 
     let w: f64 = 560.0;
-    let h: f64 = 200.0;
+    // Bottom padding leaves room for both the distance tick numbers and the
+    // "Distance" axis title below them; plot height stays 160px.
+    let h: f64 = 210.0;
     let pad_l: f64 = 50.0;
     let pad_r: f64 = 10.0;
     let pad_t: f64 = 10.0;
-    let pad_b: f64 = 30.0;
+    let pad_b: f64 = 40.0;
     let plot_w = w - pad_l - pad_r;
     let plot_h = h - pad_t - pad_b;
 
@@ -3097,6 +3409,14 @@ fn build_estimator_chart(
         let y_vals: Vec<f64> = curve_points.iter().map(|(_, y)| *y).collect();
         y_min = y_vals.iter().cloned().fold(f64::INFINITY, f64::min);
         y_max = y_vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+
+        // Include the raw scatter so observed outliers aren't clipped.
+        for (_, y) in scatter_points {
+            if y.is_finite() {
+                y_min = y_min.min(*y);
+                y_max = y_max.max(*y);
+            }
+        }
 
         // Include peer-adjusted values in range if present
         if let Some(adj) = peer_adjustment {
@@ -3178,24 +3498,70 @@ fn build_estimator_chart(
         .ok();
     }
 
-    // Y-axis labels (3 ticks)
+    // X-axis title: the x-axis is always ring distance (peer ↔ contract).
+    write!(
+        svg,
+        r#"<text x="{x:.0}" y="{y:.0}" text-anchor="middle" class="axis-label">Distance</text>"#,
+        x = pad_l + plot_w / 2.0,
+        y = h - 6.0,
+    )
+    .ok();
+
+    // Y-axis labels (3 ticks).
+    //
+    // Pick decimal places from the tick step so adjacent ticks stay
+    // distinguishable. The failure chart now zooms to a very small range
+    // (probabilities are tiny), where a fixed 2-decimal format would collapse
+    // every tick to "0.00".
+    let step = y_range / 2.0;
+    let decimals: usize = if step <= 0.0 {
+        3
+    } else if step >= 10.0 {
+        0
+    } else if step >= 1.0 {
+        1
+    } else {
+        // step in (0, 1): enough places for ~2 significant figures of the step.
+        ((-step.log10()).ceil() as usize).saturating_add(1).min(9)
+    };
     for i in 0..=2 {
         let frac = i as f64 / 2.0;
         let y_val = y_min + frac * y_range;
         let sy = to_svg_y(y_val);
-        let label = if y_val.abs() < 1e-3 && y_range < 10.0 {
-            format!("{:.3}", y_val)
-        } else if y_range <= 1.0 {
-            format!("{:.2}", y_val)
-        } else {
-            format!("{:.0}", y_val)
-        };
+        let label = format!("{y_val:.decimals$}");
         write!(
             svg,
             r#"<text x="{x}" y="{sy:.0}" text-anchor="end" class="axis-label">{label}</text>"#,
             x = pad_l - 4.0,
             sy = sy,
             label = label,
+        )
+        .ok();
+    }
+
+    // Raw observed outcomes (drawn first, under the isotonic fit). Each dot is one
+    // actual event at its (distance, outcome); the spread shows how isotonic the
+    // relationship really is.
+    //
+    // The failure chart zooms its y-axis to the tiny fitted probabilities (see
+    // failure_chart_y_max), which would push the binary failure outcomes (y = 1.0)
+    // off the top of the plot. Rather than dropping off-scale points — which would
+    // hide every failure precisely on the healthy, low-probability peers the zoom
+    // is meant to illuminate — clamp them to the nearest edge so they remain
+    // visible as a row of dots at the boundary. (Auto-scaled charts always size
+    // their range to include the scatter, so the clamp is a no-op there.)
+    for &(x, y) in scatter_points {
+        if !(x.is_finite() && y.is_finite()) {
+            continue;
+        }
+        if !(x_min..=x_max).contains(&x) {
+            continue;
+        }
+        write!(
+            svg,
+            r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="1.8" fill="var(--text-muted)" opacity="0.35"/>"#,
+            cx = to_svg_x(x),
+            cy = to_svg_y(y.clamp(y_min, y_max)),
         )
         .ok();
     }
@@ -3301,12 +3667,13 @@ fn build_estimator_chart(
         }
     };
 
-    // Global curve (blue)
+    // Global curve (teal, the brand accent)
     draw_curve(&mut svg, curve_points, 0.0, "var(--accent-primary)");
 
-    // Peer-adjusted curve (green)
+    // Peer-adjusted curve (violet — deliberately off the teal/green family so it
+    // is not confused with the teal global curve)
     if let Some(adj) = peer_adjustment {
-        draw_curve(&mut svg, curve_points, adj, "#34d399");
+        draw_curve(&mut svg, curve_points, adj, "#8b5cf6");
     }
 
     // Peer location marker (vertical dashed line)
@@ -3357,73 +3724,118 @@ fn fmt_prediction_prob(v: f64) -> String {
     }
 }
 
-/// Build an SVG strip chart showing predicted failure probability vs actual outcome.
-/// X-axis: predicted probability [0, 1].
-/// Y-axis: actual outcome (0 = success at bottom, 1 = failure at top).
-/// Good calibration: successes cluster left, failures cluster right.
-fn build_renegade_accuracy_chart(pairs: &[(f64, f64)]) -> String {
+/// Which kind of regression model a scatter chart is rendering, controlling the
+/// axis unit formatting (durations vs throughput).
+#[derive(Clone, Copy)]
+enum RegKind {
+    Time,
+    Speed,
+}
+
+/// Build the renegade prediction-accuracy panel: one reliability diagram for the
+/// binary failure model plus predicted-vs-actual scatters for the two regression
+/// models (response time, transfer speed). Returns an empty string when no model
+/// has scored any predictions yet, so a fresh node shows nothing rather than an
+/// empty card.
+fn build_renegade_accuracy_panel(
+    failure_pairs: &[(f64, f64)],
+    brier: Option<f64>,
+    response_time_pairs: &[(f64, f64)],
+    transfer_speed_pairs: &[(f64, f64)],
+) -> String {
+    if failure_pairs.is_empty() && response_time_pairs.is_empty() && transfer_speed_pairs.is_empty()
+    {
+        return String::new();
+    }
+
+    let failure = build_reliability_chart(failure_pairs, brier);
+    let response = build_regression_chart("Response time", RegKind::Time, response_time_pairs);
+    let transfer = build_regression_chart("Transfer speed", RegKind::Speed, transfer_speed_pairs);
+
+    format!(
+        r#"<div class="card">
+        <h2>Prediction Accuracy</h2>
+        <p style="font-size:0.8em;color:var(--text-muted);">
+            How well the Renegade predictor's recent predictions matched reality (this scores
+            the Renegade k-NN layer, not the distance-only fit in Outcomes vs Distance above).
+            On the dashed diagonal predictions are perfect: for failure, predicted probability
+            equals the observed failure rate (calibration); for the timing models, predicted
+            equals actual.
+        </p>
+        <div style="display:flex;flex-wrap:wrap;gap:1rem;justify-content:flex-start;">
+            {failure}
+            {response}
+            {transfer}
+        </div>
+    </div>"#,
+        failure = failure,
+        response = response,
+        transfer = transfer,
+    )
+}
+
+/// Reliability (calibration) diagram for the binary failure model.
+/// X = predicted failure probability, Y = observed failure rate within each
+/// predicted-probability bin. Dots on the diagonal mean the model is calibrated;
+/// above the line it under-predicts failure, below it over-predicts.
+fn build_reliability_chart(pairs: &[(f64, f64)], brier: Option<f64>) -> String {
     use std::fmt::Write;
 
-    // Filter out NaN/non-finite values before processing
-    let valid_pairs: Vec<(f64, f64)> = pairs
+    let valid: Vec<(f64, f64)> = pairs
         .iter()
         .copied()
         .filter(|(p, a)| p.is_finite() && a.is_finite())
-        .collect();
-    let total_count = valid_pairs.len();
-
-    let successes: Vec<f64> = valid_pairs
-        .iter()
-        .filter(|(_, a)| *a < 0.5)
-        .map(|(p, _)| p.clamp(0.0, 1.0))
-        .collect();
-    let failures: Vec<f64> = valid_pairs
-        .iter()
-        .filter(|(_, a)| *a >= 0.5)
-        .map(|(p, _)| p.clamp(0.0, 1.0))
+        .map(|(p, a)| (p.clamp(0.0, 1.0), a))
         .collect();
 
-    let w = 400.0_f64;
-    let h = 200.0_f64;
-    let pad_l = 50.0;
-    let pad_r = 20.0;
-    let pad_t = 30.0;
-    let pad_b = 30.0;
+    if valid.is_empty() {
+        return mini_chart_placeholder("Failure (calibration)", "predicted prob vs observed rate");
+    }
+
+    let n = valid.len();
+    let n_bins = 10usize;
+    let mut bin_pred_sum = vec![0.0f64; n_bins];
+    let mut bin_fail = vec![0usize; n_bins];
+    let mut bin_total = vec![0usize; n_bins];
+    for (p, a) in &valid {
+        let bin = ((p * n_bins as f64) as usize).min(n_bins - 1);
+        bin_pred_sum[bin] += p;
+        bin_total[bin] += 1;
+        if *a >= 0.5 {
+            bin_fail[bin] += 1;
+        }
+    }
+
+    let (w, h) = (260.0f64, 220.0f64);
+    let (pad_l, pad_r, pad_t, pad_b) = (38.0f64, 12.0f64, 30.0f64, 30.0f64);
     let plot_w = w - pad_l - pad_r;
     let plot_h = h - pad_t - pad_b;
-    let mid_y = pad_t + plot_h / 2.0; // dividing line between failure (top) and success (bottom)
-    let half_h = plot_h / 2.0;
-
-    // Use dots for very small datasets, bars for larger ones
-    let use_dots = total_count < 15;
-
-    // Adaptive bin count: fewer bins when less data
-    let n_bins = if total_count < 30 {
-        5
-    } else if total_count < 100 {
-        8
-    } else {
-        10
-    };
-    let bin_width = 1.0 / n_bins as f64;
-
-    let to_x = |v: f64| -> f64 { pad_l + v.clamp(0.0, 1.0) * plot_w };
+    let to_x = |v: f64| pad_l + v.clamp(0.0, 1.0) * plot_w;
+    let to_y = |v: f64| pad_t + (1.0 - v.clamp(0.0, 1.0)) * plot_h;
 
     let mut svg = format!(
-        r#"<div class="card">
-        <h2>Renegade Prediction Accuracy</h2>
-        <p style="font-size:0.8em;color:var(--text-muted);">
-            Distribution of predicted failure probability, split by outcome.
-            <span style="color:var(--accent-danger, #f85149);">Failures</span> above,
-            <span style="color:var(--accent-success, #3fb950);">successes</span> below.
-            Well-calibrated: failures skew right, successes skew left.
-        </p>
-        <svg viewBox="0 0 {w} {h}" width="{w}" height="{h}" class="chart-svg">"#,
+        r#"<svg viewBox="0 0 {w} {h}" width="{w}" height="{h}" class="accuracy-chart">"#,
         w = w as u32,
         h = h as u32,
     );
 
-    // Background
+    write!(
+        svg,
+        r#"<text x="{x}" y="14" font-size="10" font-weight="600" fill="var(--text-secondary)">Failure (calibration)</text>"#,
+        x = pad_l,
+    )
+    .ok();
+    let headline = match brier {
+        Some(b) if b.is_finite() => format!("Brier {b:.3} · n={n}"),
+        _ => format!("n={n}"),
+    };
+    write!(
+        svg,
+        r#"<text x="{x}" y="26" font-size="9" fill="var(--text-muted)">{headline}</text>"#,
+        x = pad_l,
+    )
+    .ok();
+
     write!(
         svg,
         r#"<rect x="{lx}" y="{ty}" width="{pw}" height="{ph}" fill="var(--bg-secondary)" rx="2"/>"#,
@@ -3434,233 +3846,283 @@ fn build_renegade_accuracy_chart(pairs: &[(f64, f64)]) -> String {
     )
     .ok();
 
-    // Center dividing line
+    // perfect-calibration diagonal
     write!(
         svg,
-        r#"<line x1="{lx}" y1="{my}" x2="{rx}" y2="{my}" stroke="var(--text-muted)" stroke-width="1"/>"#,
-        lx = pad_l,
-        my = mid_y,
-        rx = pad_l + plot_w,
+        r#"<line x1="{x1:.1}" y1="{y1:.1}" x2="{x2:.1}" y2="{y2:.1}" stroke="var(--text-muted)" stroke-width="1" stroke-dasharray="4"/>"#,
+        x1 = to_x(0.0),
+        y1 = to_y(0.0),
+        x2 = to_x(1.0),
+        y2 = to_y(1.0),
     )
     .ok();
 
-    // X-axis labels and grid
-    for &v in &[0.0, 0.25, 0.5, 0.75, 1.0] {
-        let x = to_x(v);
+    // axis ticks at 0 / 0.5 / 1 on both axes
+    for &v in &[0.0_f64, 0.5, 1.0] {
         write!(
             svg,
-            r#"<text x="{x}" y="{y}" text-anchor="middle" font-size="9" fill="var(--text-muted)">{v}</text>"#,
-            x = x,
-            y = pad_t + plot_h + 15.0,
-            v = v,
+            r#"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">{v}</text>"#,
+            x = to_x(v),
+            y = pad_t + plot_h + 12.0,
         )
         .ok();
         write!(
             svg,
-            r#"<line x1="{x}" y1="{ty}" x2="{x}" y2="{by}" stroke="var(--text-muted)" stroke-width="0.3" stroke-dasharray="3"/>"#,
-            x = x,
+            r#"<text x="{x:.1}" y="{y:.1}" text-anchor="end" font-size="8" fill="var(--text-muted)">{v}</text>"#,
+            x = pad_l - 4.0,
+            y = to_y(v) + 3.0,
+        )
+        .ok();
+    }
+
+    // calibration curve through non-empty bins (in predicted-probability order)
+    let mut pts: Vec<(f64, f64, usize)> = Vec::new();
+    for b in 0..n_bins {
+        if bin_total[b] == 0 {
+            continue;
+        }
+        let mean_pred = bin_pred_sum[b] / bin_total[b] as f64;
+        let obs_rate = bin_fail[b] as f64 / bin_total[b] as f64;
+        pts.push((mean_pred, obs_rate, bin_total[b]));
+    }
+    if pts.len() >= 2 {
+        let path = pts
+            .iter()
+            .map(|(px, py, _)| format!("{:.1},{:.1}", to_x(*px), to_y(*py)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        write!(
+            svg,
+            r#"<polyline points="{path}" fill="none" stroke="var(--accent-primary, #58a6ff)" stroke-width="1.5" opacity="0.8"/>"#,
+        )
+        .ok();
+    }
+    let max_bin = bin_total.iter().copied().max().unwrap_or(1).max(1);
+    for (px, py, count) in &pts {
+        let r = 2.5 + 3.5 * (*count as f64 / max_bin as f64).sqrt();
+        write!(
+            svg,
+            r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{r:.1}" fill="var(--accent-primary, #58a6ff)" opacity="0.85"/>"#,
+            cx = to_x(*px),
+            cy = to_y(*py),
+        )
+        .ok();
+    }
+
+    write!(
+        svg,
+        r#"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">predicted fail prob</text>"#,
+        x = pad_l + plot_w / 2.0,
+        y = h - 1.0,
+    )
+    .ok();
+
+    svg.push_str("</svg>");
+    svg
+}
+
+/// Predicted-vs-actual scatter for a regression model (response time, transfer
+/// speed) on log-log axes, since both targets span orders of magnitude. Points
+/// on the dashed diagonal mean predicted == actual; the headline is the median
+/// absolute percentage error over the retained window.
+fn build_regression_chart(label: &str, kind: RegKind, pairs: &[(f64, f64)]) -> String {
+    use std::fmt::Write;
+
+    // Log axes require strictly-positive, finite values.
+    let valid: Vec<(f64, f64)> = pairs
+        .iter()
+        .copied()
+        .filter(|(p, a)| p.is_finite() && a.is_finite() && *p > 0.0 && *a > 0.0)
+        .collect();
+
+    if valid.len() < 2 {
+        return mini_chart_placeholder(label, "predicted vs actual");
+    }
+
+    let n = valid.len();
+
+    // Median absolute percentage error (robust to the heavy tails of latency /
+    // throughput) as the single headline number.
+    let mut apes: Vec<f64> = valid.iter().map(|(p, a)| ((p - a) / a).abs()).collect();
+    apes.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = apes.len() / 2;
+    let mdape = if apes.len() % 2 == 0 {
+        (apes[mid - 1] + apes[mid]) / 2.0
+    } else {
+        apes[mid]
+    };
+
+    // Shared log range across predicted and actual so the diagonal is 45°.
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    for (p, a) in &valid {
+        lo = lo.min(p.min(*a));
+        hi = hi.max(p.max(*a));
+    }
+    let mut log_lo = lo.log10();
+    let mut log_hi = hi.log10();
+    if (log_hi - log_lo) < 0.5 {
+        // Pad a near-flat range so points don't all sit on one edge.
+        let center = (log_hi + log_lo) / 2.0;
+        log_lo = center - 0.5;
+        log_hi = center + 0.5;
+    } else {
+        let pad = (log_hi - log_lo) * 0.08;
+        log_lo -= pad;
+        log_hi += pad;
+    }
+    let span = (log_hi - log_lo).max(1e-9);
+
+    let (w, h) = (260.0f64, 220.0f64);
+    let (pad_l, pad_r, pad_t, pad_b) = (38.0f64, 12.0f64, 30.0f64, 30.0f64);
+    let plot_w = w - pad_l - pad_r;
+    let plot_h = h - pad_t - pad_b;
+    let to_x = |v: f64| pad_l + ((v.log10() - log_lo) / span) * plot_w;
+    let to_y = |v: f64| pad_t + (1.0 - (v.log10() - log_lo) / span) * plot_h;
+
+    let mut svg = format!(
+        r#"<svg viewBox="0 0 {w} {h}" width="{w}" height="{h}" class="accuracy-chart">"#,
+        w = w as u32,
+        h = h as u32,
+    );
+    write!(
+        svg,
+        r#"<text x="{x}" y="14" font-size="10" font-weight="600" fill="var(--text-secondary)">{label}</text>"#,
+        x = pad_l,
+    )
+    .ok();
+    write!(
+        svg,
+        r#"<text x="{x}" y="26" font-size="9" fill="var(--text-muted)">median err {pct:.0}% · n={n}</text>"#,
+        x = pad_l,
+        pct = mdape * 100.0,
+    )
+    .ok();
+
+    write!(
+        svg,
+        r#"<rect x="{lx}" y="{ty}" width="{pw}" height="{ph}" fill="var(--bg-secondary)" rx="2"/>"#,
+        lx = pad_l,
+        ty = pad_t,
+        pw = plot_w,
+        ph = plot_h,
+    )
+    .ok();
+
+    // Power-of-ten gridlines + axis labels. When all points fall within a single
+    // decade (the common steady-state case) there is no power-of-ten boundary in
+    // range, so fall back to labelling the axis endpoints rather than rendering an
+    // unlabelled axis.
+    let first_decade = log_lo.ceil() as i32;
+    let last_decade = log_hi.floor() as i32;
+    let tick_vals: Vec<f64> = if first_decade <= last_decade {
+        (first_decade..=last_decade)
+            .map(|d| 10f64.powi(d))
+            .collect()
+    } else {
+        vec![10f64.powf(log_lo), 10f64.powf(log_hi)]
+    };
+    for val in tick_vals {
+        let gx = to_x(val);
+        let gy = to_y(val);
+        write!(
+            svg,
+            r#"<line x1="{gx:.1}" y1="{ty:.1}" x2="{gx:.1}" y2="{by:.1}" stroke="var(--text-muted)" stroke-width="0.3" stroke-dasharray="3"/>"#,
             ty = pad_t,
             by = pad_t + plot_h,
         )
         .ok();
+        write!(
+            svg,
+            r#"<text x="{gx:.1}" y="{y:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">{lbl}</text>"#,
+            y = pad_t + plot_h + 12.0,
+            lbl = fmt_reg_axis(kind, val),
+        )
+        .ok();
+        write!(
+            svg,
+            r#"<text x="{x:.1}" y="{gy:.1}" text-anchor="end" font-size="8" fill="var(--text-muted)">{lbl}</text>"#,
+            x = pad_l - 4.0,
+            lbl = fmt_reg_axis(kind, val),
+        )
+        .ok();
     }
 
-    // Y-axis labels
+    // Perfect diagonal (predicted == actual).
     write!(
         svg,
-        r#"<text x="{x}" y="{y}" text-anchor="end" font-size="9" fill="var(--accent-danger, #f85149)">Fail</text>"#,
-        x = pad_l - 4.0,
-        y = pad_t + 14.0,
-    )
-    .ok();
-    write!(
-        svg,
-        r#"<text x="{x}" y="{y}" text-anchor="end" font-size="9" fill="var(--accent-success, #3fb950)">OK</text>"#,
-        x = pad_l - 4.0,
-        y = pad_t + plot_h - 6.0,
+        r#"<line x1="{x1:.1}" y1="{y1:.1}" x2="{x2:.1}" y2="{y2:.1}" stroke="var(--text-muted)" stroke-width="1" stroke-dasharray="4"/>"#,
+        x1 = to_x(10f64.powf(log_lo)),
+        y1 = to_y(10f64.powf(log_lo)),
+        x2 = to_x(10f64.powf(log_hi)),
+        y2 = to_y(10f64.powf(log_hi)),
     )
     .ok();
 
-    // X-axis title
+    for (p, a) in &valid {
+        write!(
+            svg,
+            r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="2.2" fill="var(--accent-primary, #58a6ff)" opacity="0.45"/>"#,
+            cx = to_x(*p),
+            cy = to_y(*a),
+        )
+        .ok();
+    }
+
     write!(
         svg,
-        r#"<text x="{x}" y="{y}" text-anchor="middle" font-size="9" fill="var(--text-muted)">Predicted failure probability</text>"#,
+        r#"<text x="{x:.1}" y="{y:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">predicted (x) vs actual (y)</text>"#,
         x = pad_l + plot_w / 2.0,
-        y = h - 2.0,
+        y = h - 1.0,
     )
     .ok();
 
-    if use_dots {
-        // Dot strip mode: stack dots vertically from the center line outward
-        let dot_r = 3.5;
-        let dot_spacing = dot_r * 2.2;
+    svg.push_str("</svg>");
+    svg
+}
 
-        // Bin dots to stack them
-        let mut fail_bins: Vec<Vec<f64>> = vec![Vec::new(); n_bins];
-        let mut ok_bins: Vec<Vec<f64>> = vec![Vec::new(); n_bins];
-
-        for &p in &failures {
-            let bin = ((p / bin_width) as usize).min(n_bins - 1);
-            fail_bins[bin].push(p);
-        }
-        for &p in &successes {
-            let bin = ((p / bin_width) as usize).min(n_bins - 1);
-            ok_bins[bin].push(p);
-        }
-
-        // Draw failure dots (grow upward from center), with overflow indicator
-        for (bin_idx, dots) in fail_bins.iter().enumerate() {
-            let cx = pad_l + (bin_idx as f64 + 0.5) * bin_width * plot_w;
-            let mut drawn = 0;
-            for (i, _) in dots.iter().enumerate() {
-                let cy = mid_y - dot_spacing * (i as f64 + 0.5);
-                if cy < pad_t + dot_r {
-                    break;
-                }
-                drawn += 1;
-                write!(
-                    svg,
-                    r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{r}" fill="var(--accent-danger, #f85149)" opacity="0.7"/>"#,
-                    cx = cx,
-                    cy = cy,
-                    r = dot_r,
-                )
-                .ok();
-            }
-            if drawn < dots.len() {
-                write!(
-                    svg,
-                    r#"<text x="{cx:.1}" y="{y:.1}" text-anchor="middle" font-size="8" fill="var(--accent-danger, #f85149)">+{n}</text>"#,
-                    cx = cx,
-                    y = pad_t - 1.0,
-                    n = dots.len() - drawn,
-                )
-                .ok();
+/// Compact axis label for a regression value: durations as s/ms/µs, throughput
+/// as B/KB/MB/GB per second.
+fn fmt_reg_axis(kind: RegKind, v: f64) -> String {
+    match kind {
+        RegKind::Time => {
+            if v >= 1.0 {
+                format!("{v:.0}s")
+            } else if v >= 0.001 {
+                format!("{:.0}ms", v * 1000.0)
+            } else {
+                format!("{:.0}µs", v * 1_000_000.0)
             }
         }
-
-        // Draw success dots (grow downward from center), with overflow indicator
-        for (bin_idx, dots) in ok_bins.iter().enumerate() {
-            let cx = pad_l + (bin_idx as f64 + 0.5) * bin_width * plot_w;
-            let mut drawn = 0;
-            for (i, _) in dots.iter().enumerate() {
-                let cy = mid_y + dot_spacing * (i as f64 + 0.5);
-                if cy > pad_t + plot_h - dot_r {
-                    break;
-                }
-                drawn += 1;
-                write!(
-                    svg,
-                    r#"<circle cx="{cx:.1}" cy="{cy:.1}" r="{r}" fill="var(--accent-success, #3fb950)" opacity="0.7"/>"#,
-                    cx = cx,
-                    cy = cy,
-                    r = dot_r,
-                )
-                .ok();
-            }
-            if drawn < dots.len() {
-                write!(
-                    svg,
-                    r#"<text x="{cx:.1}" y="{y:.1}" text-anchor="middle" font-size="8" fill="var(--accent-success, #3fb950)">+{n}</text>"#,
-                    cx = cx,
-                    y = pad_t + plot_h + 10.0,
-                    n = dots.len() - drawn,
-                )
-                .ok();
-            }
-        }
-    } else {
-        // Histogram bar mode
-        let mut fail_counts = vec![0usize; n_bins];
-        let mut ok_counts = vec![0usize; n_bins];
-
-        for &p in &failures {
-            let bin = ((p / bin_width) as usize).min(n_bins - 1);
-            fail_counts[bin] += 1;
-        }
-        for &p in &successes {
-            let bin = ((p / bin_width) as usize).min(n_bins - 1);
-            ok_counts[bin] += 1;
-        }
-
-        let max_count = fail_counts
-            .iter()
-            .chain(ok_counts.iter())
-            .copied()
-            .max()
-            .unwrap_or(1)
-            .max(1);
-
-        let bar_w = plot_w / n_bins as f64;
-        let bar_pad = bar_w * 0.1;
-
-        for i in 0..n_bins {
-            let x = pad_l + i as f64 * bar_w + bar_pad;
-            let bw = bar_w - 2.0 * bar_pad;
-
-            // Failure bars grow upward from center
-            if fail_counts[i] > 0 {
-                let bar_h = (fail_counts[i] as f64 / max_count as f64) * (half_h - 4.0);
-                let y = mid_y - bar_h;
-                write!(
-                    svg,
-                    r#"<rect x="{x:.1}" y="{y:.1}" width="{bw:.1}" height="{bh:.1}" fill="var(--accent-danger, #f85149)" opacity="0.7" rx="1"/>"#,
-                    x = x,
-                    y = y,
-                    bw = bw,
-                    bh = bar_h,
-                )
-                .ok();
-                // Count label on bar
-                write!(
-                    svg,
-                    r#"<text x="{tx:.1}" y="{ty:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">{n}</text>"#,
-                    tx = x + bw / 2.0,
-                    ty = y - 2.0,
-                    n = fail_counts[i],
-                )
-                .ok();
-            }
-
-            // Success bars grow downward from center
-            if ok_counts[i] > 0 {
-                let bar_h = (ok_counts[i] as f64 / max_count as f64) * (half_h - 4.0);
-                write!(
-                    svg,
-                    r#"<rect x="{x:.1}" y="{my:.1}" width="{bw:.1}" height="{bh:.1}" fill="var(--accent-success, #3fb950)" opacity="0.7" rx="1"/>"#,
-                    x = x,
-                    my = mid_y,
-                    bw = bw,
-                    bh = bar_h,
-                )
-                .ok();
-                // Count label on bar
-                write!(
-                    svg,
-                    r#"<text x="{tx:.1}" y="{ty:.1}" text-anchor="middle" font-size="8" fill="var(--text-muted)">{n}</text>"#,
-                    tx = x + bw / 2.0,
-                    ty = mid_y + bar_h + 10.0,
-                    n = ok_counts[i],
-                )
-                .ok();
+        RegKind::Speed => {
+            if v >= 1e9 {
+                format!("{:.0}GB/s", v / 1e9)
+            } else if v >= 1e6 {
+                format!("{:.0}MB/s", v / 1e6)
+            } else if v >= 1e3 {
+                format!("{:.0}KB/s", v / 1e3)
+            } else {
+                format!("{v:.0}B/s")
             }
         }
     }
+}
 
-    // Stats summary
-    write!(
-        svg,
-        r#"<text x="{x}" y="{y}" text-anchor="start" font-size="9" fill="var(--text-muted)">{n} events ({s} ok, {f} fail)</text>"#,
-        x = pad_l + 2.0,
-        y = pad_t - 5.0,
-        n = total_count,
-        s = successes.len(),
-        f = failures.len(),
+/// A small placeholder chart shown while a model has too little data to plot.
+fn mini_chart_placeholder(label: &str, sub: &str) -> String {
+    let (w, h) = (260.0f64, 220.0f64);
+    format!(
+        r#"<svg viewBox="0 0 {w} {h}" width="{w}" height="{h}" class="accuracy-chart">
+        <text x="38" y="14" font-size="10" font-weight="600" fill="var(--text-secondary)">{label}</text>
+        <text x="{cx}" y="{cy}" text-anchor="middle" font-size="10" fill="var(--text-muted)">collecting data…</text>
+        <text x="{cx}" y="{cy2}" text-anchor="middle" font-size="8" fill="var(--text-muted)">{sub}</text>
+    </svg>"#,
+        w = w as u32,
+        h = h as u32,
+        cx = w / 2.0,
+        cy = h / 2.0,
+        cy2 = h / 2.0 + 14.0,
     )
-    .ok();
-
-    svg.push_str("</svg></div>");
-    svg
 }
 
 const PEER_CSS: &str = r##"
@@ -3718,6 +4180,15 @@ a.header-title {
     width: 100%;
     max-width: 600px;
 }
+/* Small-multiple accuracy charts: fixed width so the three sit side by side
+   in the flex row and wrap on narrow viewports (overridden global width:100%). */
+.accuracy-chart {
+    display: block;
+    width: 260px;
+    max-width: 100%;
+    height: auto;
+    flex: 0 0 auto;
+}
 .chart-svg .axis-label {
     font-family: var(--font-mono);
     font-size: 10px;
@@ -3741,8 +4212,9 @@ a.header-title {
     border-radius: 50%;
     display: inline-block;
 }
+.chart-dot-actual { background: var(--text-muted); opacity: 0.55; }
 .chart-dot-global { background: var(--accent-primary); }
-.chart-dot-peer { background: #34d399; }
+.chart-dot-peer { background: #8b5cf6; }
 .chart-dot-loc { background: #fbbf24; }
 .chart-dot-ext {
     background: transparent;
@@ -3842,7 +4314,152 @@ mod tests {
             ring_stats: RingStatsSnapshot::default(),
             transport_snapshot: TransportSnapshot::default(),
             governance: Default::default(),
+            ban_list: Default::default(),
         }
+    }
+
+    // ── Asset/runtime version mismatch banner (#4289) ──────────────────────
+
+    /// Reference specification of the "stale assets" banner rule, used to test
+    /// the logic the homepage JS implements client-side.
+    ///
+    /// The actual mismatch detection runs in the browser (see
+    /// `checkVersionMismatch` in [`JS`]): the served page bakes in its
+    /// `asset_version` (the build that generated the HTML/JS the browser is
+    /// running) and fetches the live `runtime_version` from `/v1/version` at page
+    /// load. This Rust function is the canonical, unit-testable statement of when
+    /// the banner should appear; the JS mirrors it exactly. Keeping it here (and
+    /// tested) makes the rule's edge cases explicit and guards against the JS
+    /// drifting from the intended behaviour. It lives in the test module (not as
+    /// production code) because the production decision is made in JS, not in the
+    /// server-side render — and keeping it inside the single `#[cfg(test)]`
+    /// boundary preserves the source-scrape pin invariant relied on by
+    /// `peer_detail_panel_calls_estimator_helper_for_all_three_components` (the
+    /// first `#[cfg(test)]` marker must be the production/test boundary).
+    ///
+    /// The mismatch is meaningful in the #3967 / #4289 scenario: a browser is
+    /// still holding a cached homepage emitted by an old binary while a newer
+    /// binary is now the process actually answering requests. In that case the
+    /// asset version (frozen in the cached page) differs from the live runtime
+    /// version, and the page is genuinely stale — the user should refresh.
+    ///
+    /// The banner is shown **only** when both versions are known and they
+    /// differ. A missing/unknown version on either side (`""` or `"?"`, e.g. the
+    /// node is mid-startup and `network_status` has no snapshot yet) is treated
+    /// as "can't tell" and never triggers the banner, so the warning cannot fire
+    /// spuriously during startup. The comparison is an exact string match: any
+    /// difference in the published version string (including pre-release suffixes
+    /// like `0.2.68-rc1`) is a real asset/runtime divergence worth surfacing.
+    fn should_show_version_banner(asset_version: &str, runtime_version: &str) -> bool {
+        if !version_is_known(asset_version) || !version_is_known(runtime_version) {
+            return false;
+        }
+        asset_version != runtime_version
+    }
+
+    /// A version string is "known" when it is non-empty and not the `"?"`
+    /// placeholder used by the homepage when no `network_status` snapshot exists.
+    /// Reference for the JS `versionIsKnown`; see [`should_show_version_banner`].
+    fn version_is_known(version: &str) -> bool {
+        !version.is_empty() && version != "?"
+    }
+
+    #[test]
+    fn version_banner_hidden_when_versions_match() {
+        assert!(
+            !should_show_version_banner("0.2.49", "0.2.49"),
+            "identical asset and runtime versions must not show the banner"
+        );
+    }
+
+    #[test]
+    fn version_banner_shown_when_versions_differ() {
+        assert!(
+            should_show_version_banner("0.2.37", "0.2.49"),
+            "a stale cached asset version vs a newer runtime must show the banner"
+        );
+        // Direction is irrelevant: any divergence is worth surfacing.
+        assert!(
+            should_show_version_banner("0.2.49", "0.2.37"),
+            "asset newer than runtime is still a mismatch worth surfacing"
+        );
+    }
+
+    #[test]
+    fn version_banner_treats_prerelease_suffixes_as_distinct() {
+        // Pre-release / build-metadata suffixes are part of the published
+        // version string; an exact mismatch there is a real divergence.
+        assert!(
+            should_show_version_banner("0.2.68-rc1", "0.2.68"),
+            "0.2.68-rc1 and 0.2.68 are different builds and must mismatch"
+        );
+        assert!(
+            !should_show_version_banner("0.2.68-rc1", "0.2.68-rc1"),
+            "identical pre-release strings must not show the banner"
+        );
+    }
+
+    #[test]
+    fn version_banner_hidden_when_either_version_unknown() {
+        // Startup race: node has no snapshot yet, so the runtime version is
+        // the "?" placeholder or empty. The banner must not fire spuriously.
+        assert!(
+            !should_show_version_banner("0.2.49", "?"),
+            "unknown runtime version (?) must not trigger the banner"
+        );
+        assert!(
+            !should_show_version_banner("0.2.49", ""),
+            "empty runtime version must not trigger the banner"
+        );
+        assert!(
+            !should_show_version_banner("?", "0.2.49"),
+            "unknown asset version (?) must not trigger the banner"
+        );
+        assert!(
+            !should_show_version_banner("", "0.2.49"),
+            "empty asset version must not trigger the banner"
+        );
+        assert!(
+            !should_show_version_banner("?", "?"),
+            "both unknown must not trigger the banner"
+        );
+    }
+
+    #[test]
+    fn homepage_renders_version_mismatch_banner_slot() {
+        let html = homepage_html();
+        assert!(
+            html.contains("id=\"version-mismatch-banner\""),
+            "homepage must render a hidden banner slot the JS can reveal on mismatch"
+        );
+        assert!(
+            html.contains("data-asset-version="),
+            "banner slot must carry the compile-time asset version for the JS comparison"
+        );
+        // The slot must ship hidden so it never flashes before the live check.
+        let slot = extract_element_line(&html, "id=\"version-mismatch-banner\"");
+        assert!(
+            slot.contains("hidden"),
+            "version mismatch banner must be hidden by default, got: {slot}"
+        );
+    }
+
+    #[test]
+    fn js_contains_version_mismatch_check() {
+        assert!(
+            JS.contains("checkVersionMismatch"),
+            "JS must include the asset/runtime version mismatch check"
+        );
+        assert!(
+            JS.contains("/v1/version"),
+            "JS must query the runtime version endpoint"
+        );
+        // The JS must mirror should_show_version_banner: skip unknown ('?'/'')
+        // versions so the banner can't fire during startup.
+        assert!(
+            JS.contains("data-asset-version"),
+            "JS must read the baked-in asset version from the banner slot"
+        );
     }
 
     #[test]
@@ -3885,6 +4502,17 @@ mod tests {
         let snap = base_snapshot();
         let uri = build_favicon_data_uri(&Some(snap));
         assert!(uri.contains("%23fbbf24"), "expected amber color");
+    }
+
+    #[test]
+    fn last_evaluated_footer_has_single_ago() {
+        // Regression: format_ago already appends " ago", so the footer
+        // template must not add a second one. Previously rendered
+        // "Last evaluated 18s ago ago".
+        assert_eq!(format_last_evaluated(18), "Last evaluated 18s ago");
+        assert!(!format_last_evaluated(18).contains("ago ago"));
+        // Under 5s, format_ago returns "just now" (no "ago" suffix at all).
+        assert_eq!(format_last_evaluated(2), "Last evaluated just now");
     }
 
     #[test]
@@ -3997,6 +4625,84 @@ mod tests {
             html.contains("(normal)"),
             "should indicate failures are normal"
         );
+    }
+
+    #[test]
+    fn rate_limit_stats_hidden_when_no_traffic() {
+        // A fresh node (no relayed UPDATEs yet) must not render the
+        // UPDATE rate-limiter row — keeps the idle dashboard uncluttered.
+        let snap = base_snapshot();
+        assert_eq!(snap.ring_stats.updates_accepted, 0);
+        let html = build_status_card(&Some(snap));
+        assert!(
+            !html.contains("Rate-limited"),
+            "rate-limit row should be hidden when the limiter has seen no traffic"
+        );
+    }
+
+    #[test]
+    fn rate_limit_stats_rendered_when_active() {
+        // Once the limiter has dropped traffic, the operator must see the
+        // accepted / rate-limited / capacity-dropped counts on the card.
+        let mut snap = base_snapshot();
+        snap.ring_stats.updates_accepted = 1234;
+        snap.ring_stats.updates_rate_limited = 56;
+        snap.ring_stats.updates_capacity_dropped = 7;
+        let html = build_status_card(&Some(snap));
+        assert!(html.contains("UPDATEs relayed"), "accepted label missing");
+        assert!(html.contains("1234</span>"), "accepted count missing");
+        assert!(html.contains("Rate-limited"), "rate-limited label missing");
+        assert!(html.contains("56</span>"), "rate-limited count missing");
+        assert!(
+            html.contains("Capacity-dropped"),
+            "capacity-dropped label missing"
+        );
+        assert!(html.contains("7</span>"), "capacity-dropped count missing");
+    }
+
+    #[test]
+    fn rate_limit_stats_shown_when_only_accepted() {
+        // Boundary: accepted>0 but zero drops should still render the row
+        // (operators want to see the limiter is active and healthy).
+        let mut snap = base_snapshot();
+        snap.ring_stats.updates_accepted = 10;
+        let html = build_status_card(&Some(snap));
+        assert!(
+            html.contains("UPDATEs relayed"),
+            "row should render once any UPDATE has been accepted"
+        );
+    }
+
+    #[test]
+    fn rate_limit_stats_shown_when_only_rate_limited() {
+        // Boundary: the row's most operator-critical trigger. Independently
+        // exercises the SECOND term of the OR guard so a `||`->`&&` change,
+        // a dropped term, or a field-name swap is caught. A node that has
+        // ONLY ever rate-limited (accepted/capacity both zero) must still
+        // surface the signal.
+        let mut snap = base_snapshot();
+        snap.ring_stats.updates_rate_limited = 1;
+        let html = build_status_card(&Some(snap));
+        assert!(
+            html.contains("Rate-limited"),
+            "row must render when the limiter has rate-limited traffic"
+        );
+        assert!(html.contains("1</span>"), "rate-limited count missing");
+    }
+
+    #[test]
+    fn rate_limit_stats_shown_when_only_capacity_dropped() {
+        // Boundary: independently exercises the THIRD term of the OR guard
+        // (capacity drops signal identity churn / admission pressure). A
+        // node that has ONLY ever capacity-dropped must still surface it.
+        let mut snap = base_snapshot();
+        snap.ring_stats.updates_capacity_dropped = 1;
+        let html = build_status_card(&Some(snap));
+        assert!(
+            html.contains("Capacity-dropped"),
+            "row must render when the limiter has capacity-dropped traffic"
+        );
+        assert!(html.contains("1</span>"), "capacity-dropped count missing");
     }
 
     #[test]
@@ -4203,63 +4909,154 @@ mod tests {
     }
 
     #[test]
-    fn renegade_chart_empty_input() {
-        let svg = build_renegade_accuracy_chart(&[]);
-        assert!(svg.contains("0 events (0 ok, 0 fail)"));
+    fn reliability_chart_empty_is_placeholder() {
+        let svg = build_reliability_chart(&[], None);
+        assert!(svg.contains("collecting data"));
         assert!(svg.contains("<svg"));
     }
 
     #[test]
-    fn renegade_chart_dot_mode_sparse_data() {
-        // < 15 points should use dot mode (circles, not rects for bars)
-        let pairs: Vec<(f64, f64)> = vec![
-            (0.1, 0.0), // success, low predicted
-            (0.9, 1.0), // failure, high predicted
-            (0.5, 0.0), // success, mid predicted
-        ];
-        let svg = build_renegade_accuracy_chart(&pairs);
-        assert!(svg.contains("<circle"), "dot mode should render circles");
-        assert!(svg.contains("3 events (2 ok, 1 fail)"));
-    }
-
-    #[test]
-    fn renegade_chart_bar_mode_dense_data() {
-        // >= 15 points should use histogram bars
+    fn reliability_chart_renders_points_and_brier() {
+        // Well-separated: low predicted -> success, high predicted -> failure.
         let pairs: Vec<(f64, f64)> = (0..20)
             .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
             .collect();
-        let svg = build_renegade_accuracy_chart(&pairs);
-        assert!(svg.contains("<rect"), "bar mode should render rects");
-        assert!(svg.contains("20 events"));
+        let svg = build_reliability_chart(&pairs, Some(0.042));
+        assert!(svg.contains("Failure (calibration)"));
+        assert!(svg.contains("Brier 0.042"));
+        assert!(svg.contains("n=20"));
+        assert!(svg.contains("<circle"), "bins should render as points");
     }
 
     #[test]
-    fn renegade_chart_filters_nan_values() {
+    fn reliability_chart_filters_nonfinite() {
         let pairs = vec![
-            (0.5, 0.0),           // valid success
-            (f64::NAN, 1.0),      // NaN predicted -- filtered
-            (0.3, f64::NAN),      // NaN actual -- filtered
-            (f64::INFINITY, 0.0), // infinite predicted -- filtered
-            (0.7, 1.0),           // valid failure
+            (0.5, 0.0),
+            (f64::NAN, 1.0),
+            (0.3, f64::NAN),
+            (f64::INFINITY, 0.0),
+            (0.7, 1.0),
         ];
-        let svg = build_renegade_accuracy_chart(&pairs);
-        // Only the 2 valid pairs should be counted
-        assert!(svg.contains("2 events (1 ok, 1 fail)"));
+        // Only 2 valid pairs survive the finite filter.
+        let svg = build_reliability_chart(&pairs, None);
+        assert!(svg.contains("n=2"));
     }
 
     #[test]
-    fn renegade_chart_all_successes() {
-        let pairs: Vec<(f64, f64)> = vec![(0.1, 0.0), (0.2, 0.0), (0.3, 0.0)];
-        let svg = build_renegade_accuracy_chart(&pairs);
-        assert!(svg.contains("3 events (3 ok, 0 fail)"));
+    fn reliability_chart_boundary_values_no_panic() {
+        // p == 1.0 and p == 0.0 must clamp into a bin without panicking.
+        let svg = build_reliability_chart(&[(1.0, 0.0), (0.0, 1.0)], Some(0.5));
+        assert!(svg.contains("<svg"));
+        assert!(svg.contains("n=2"));
     }
 
     #[test]
-    fn renegade_chart_boundary_predicted_value() {
-        // p=1.0 should not panic (bin clamping)
-        let pairs = vec![(1.0, 0.0), (0.0, 1.0)];
-        let svg = build_renegade_accuracy_chart(&pairs);
-        assert!(svg.contains("2 events"));
+    fn regression_chart_sparse_is_placeholder() {
+        // Fewer than 2 valid (positive, finite) points -> placeholder.
+        let svg = build_regression_chart("Response time", RegKind::Time, &[(0.5, 0.4)]);
+        assert!(svg.contains("collecting data"));
+        assert!(svg.contains("Response time"));
+    }
+
+    #[test]
+    fn regression_chart_time_renders_scatter_and_metric() {
+        // predicted ~= actual, sub-second range -> ms axis labels, low error.
+        let pairs: Vec<(f64, f64)> = (1..=20)
+            .map(|i| {
+                let actual = i as f64 * 0.01; // 10ms..200ms
+                (actual * 1.1, actual) // 10% over-prediction
+            })
+            .collect();
+        let svg = build_regression_chart("Response time", RegKind::Time, &pairs);
+        assert!(svg.contains("Response time"));
+        assert!(svg.contains("median err"));
+        assert!(svg.contains("<circle"));
+        assert!(
+            svg.contains("ms"),
+            "sub-second axis should be labelled in ms"
+        );
+    }
+
+    #[test]
+    fn regression_chart_speed_uses_byte_units() {
+        let pairs: Vec<(f64, f64)> = (1..=20)
+            .map(|i| {
+                let actual = i as f64 * 100_000.0; // up to ~2 MB/s
+                (actual, actual)
+            })
+            .collect();
+        let svg = build_regression_chart("Transfer speed", RegKind::Speed, &pairs);
+        assert!(svg.contains("Transfer speed"));
+        assert!(
+            svg.contains("KB/s") || svg.contains("MB/s"),
+            "throughput axis should use byte-rate units"
+        );
+    }
+
+    #[test]
+    fn regression_chart_filters_nonpositive() {
+        // Zero/negative/non-finite values can't be plotted on a log axis and are
+        // dropped, leaving too few points -> placeholder.
+        let pairs = vec![(0.0, 1.0), (-1.0, 2.0), (f64::NAN, 3.0), (5.0, 0.0)];
+        let svg = build_regression_chart("Response time", RegKind::Time, &pairs);
+        assert!(svg.contains("collecting data"));
+    }
+
+    #[test]
+    fn regression_chart_all_equal_points_render_finite() {
+        // Every point identical -> degenerate log range. Must pad the range and
+        // produce finite coordinates (no NaN) rather than dividing by a zero span.
+        let pairs = vec![(1000.0, 1000.0), (1000.0, 1000.0), (1000.0, 1000.0)];
+        let svg = build_regression_chart("Transfer speed", RegKind::Speed, &pairs);
+        assert!(svg.contains("<svg"));
+        assert!(
+            svg.contains("<circle"),
+            "should plot the overlapping points"
+        );
+        assert!(!svg.contains("NaN"), "no NaN coordinates, got: {svg}");
+        // Single-decade fallback must still produce axis labels.
+        assert!(svg.contains("B/s"), "endpoint axis labels should render");
+    }
+
+    #[test]
+    fn regression_chart_single_decade_labels_endpoints() {
+        // All points within one decade (no power-of-ten boundary lands in the
+        // padded range): the chart must fall back to labelling the axis endpoints
+        // rather than rendering an unlabelled axis.
+        let pairs: Vec<(f64, f64)> = (0..12)
+            .map(|i| {
+                let a = 0.16 + (i as f64) * 0.04; // 0.16..0.60 s, within one decade
+                (a, a)
+            })
+            .collect();
+        let svg = build_regression_chart("Response time", RegKind::Time, &pairs);
+        assert!(svg.contains("<svg"));
+        assert!(!svg.contains("NaN"), "no NaN coords, got: {svg}");
+        assert!(
+            svg.contains("ms"),
+            "endpoint axis labels should render in the single-decade case, got: {svg}"
+        );
+    }
+
+    #[test]
+    fn accuracy_panel_empty_when_no_data() {
+        assert_eq!(
+            build_renegade_accuracy_panel(&[], None, &[], &[]),
+            String::new()
+        );
+    }
+
+    #[test]
+    fn accuracy_panel_renders_all_three_models() {
+        let failure: Vec<(f64, f64)> = (0..20)
+            .map(|i| (i as f64 / 20.0, if i > 10 { 1.0 } else { 0.0 }))
+            .collect();
+        let svg = build_renegade_accuracy_panel(&failure, Some(0.05), &[], &[]);
+        assert!(svg.contains("Prediction Accuracy"));
+        assert!(svg.contains("Failure (calibration)"));
+        // Timing models have no data yet -> their placeholders still appear.
+        assert!(svg.contains("Response time"));
+        assert!(svg.contains("Transfer speed"));
     }
 
     #[test]
@@ -4295,6 +5092,7 @@ mod tests {
         let html = build_estimator_chart_or_placeholder(
             "Response Time (s)",
             &[],
+            &[],
             (0.0, 0.0),
             None,
             None,
@@ -4316,7 +5114,31 @@ mod tests {
         );
     }
 
-    /// Regression: the per-tab "Routing Predictions" panel must call
+    #[test]
+    fn estimator_chart_overlays_raw_scatter() {
+        // A fit curve plus raw observations: the chart must draw the scatter dots
+        // (circles) behind the isotonic curve so the spread is visible.
+        let curve = vec![(0.0, 0.1), (0.25, 0.5), (0.5, 0.9)];
+        let scatter = vec![(0.05, 0.0), (0.1, 1.0), (0.3, 0.0), (0.4, 1.0)];
+        let html = build_estimator_chart_or_placeholder(
+            "Failure Probability",
+            &curve,
+            &scatter,
+            (0.0, 0.5),
+            None,
+            None,
+            "0.0",
+            "1.0",
+            "no data",
+        );
+        assert!(html.contains("<svg"), "should render an SVG, got: {html}");
+        assert!(
+            html.contains("<circle"),
+            "raw observations should render as scatter circles, got: {html}"
+        );
+    }
+
+    /// Regression: the per-tab "Outcomes vs Distance" panel must call
     /// `build_estimator_chart_or_placeholder` for all three
     /// prediction-component slots (Failure Probability, Response Time,
     /// Transfer Rate). Hiding empty slots previously masked the
@@ -4372,6 +5194,7 @@ mod tests {
         let html = build_estimator_chart_or_placeholder(
             "Failure Probability",
             &curve,
+            &[],
             (0.0, 0.5),
             None,
             None,
@@ -4383,6 +5206,130 @@ mod tests {
         assert!(
             !html.contains("should not see this"),
             "non-empty curve must not show the empty-message text"
+        );
+    }
+
+    #[test]
+    fn failure_chart_y_max_zooms_to_twice_right_edge() {
+        // Monotonic, tiny failure curve: right edge is 0.04 → axis top 0.08, so
+        // the line sits around mid-height instead of hugging y=0.
+        let curve = vec![(0.0, 0.001), (0.25, 0.02), (0.5, 0.04)];
+        let y_max = failure_chart_y_max(&curve, None);
+        assert!((y_max - 0.08).abs() < 1e-9, "expected 0.08, got {y_max}");
+    }
+
+    #[test]
+    fn failure_chart_y_max_falls_back_to_full_range_without_signal() {
+        // No failures observed (all-zero curve) → keep the original 0..1 axis
+        // rather than collapsing to a degenerate zero-height range.
+        let curve = vec![(0.0, 0.0), (0.5, 0.0)];
+        assert_eq!(failure_chart_y_max(&curve, None), 1.0);
+        // An empty curve also falls back to the full range.
+        assert_eq!(failure_chart_y_max(&[], None), 1.0);
+    }
+
+    #[test]
+    fn failure_chart_y_max_capped_at_one() {
+        // A large right edge would give 2x > 1; a probability axis can't exceed 1.
+        let curve = vec![(0.0, 0.2), (0.5, 0.7)];
+        assert_eq!(failure_chart_y_max(&curve, None), 1.0);
+    }
+
+    #[test]
+    fn failure_chart_y_max_accounts_for_peer_adjustment() {
+        let curve = vec![(0.0, 0.001), (0.5, 0.02)];
+        // Upward adjustment lifts the peer-adjusted line, so the axis must grow
+        // to keep it on-screen: (0.02 + 0.03) * 2 = 0.10.
+        let up = failure_chart_y_max(&curve, Some(0.03));
+        assert!((up - 0.10).abs() < 1e-9, "expected 0.10, got {up}");
+        // A downward adjustment must not shrink the axis below the global edge.
+        let down = failure_chart_y_max(&curve, Some(-0.01));
+        assert!((down - 0.04).abs() < 1e-9, "expected 0.04, got {down}");
+    }
+
+    #[test]
+    fn estimator_chart_labels_x_axis_as_distance() {
+        // The x-axis is always ring distance; it must carry a "Distance" title.
+        let curve = vec![(0.0, 0.1), (0.25, 0.5), (0.5, 0.9)];
+        let html = build_estimator_chart(
+            "Failure Probability",
+            &curve,
+            &[],
+            (0.0, 0.5),
+            None,
+            None,
+            "0.0",
+            "1.0",
+        );
+        assert!(
+            html.contains(">Distance<"),
+            "estimator chart must label its x-axis 'Distance', got: {html}"
+        );
+    }
+
+    #[test]
+    fn estimator_chart_small_range_y_labels_stay_distinct() {
+        // Zoomed failure axis (0.0 .. 0.01): a fixed 2-decimal format collapsed
+        // the middle and top ticks to "0.00"/"0.01". Adaptive decimals must keep
+        // all three ticks readable and distinct.
+        let curve = vec![(0.0, 0.0), (0.25, 0.003), (0.5, 0.005)];
+        let html = build_estimator_chart(
+            "Failure Probability",
+            &curve,
+            &[],
+            (0.0, 0.5),
+            None,
+            None,
+            "0.0",
+            "0.01",
+        );
+        assert!(
+            html.contains(">0.0050<"),
+            "middle y-tick must remain readable at a small range, got: {html}"
+        );
+        assert!(
+            html.contains(">0.0100<"),
+            "top y-tick must remain readable at a small range, got: {html}"
+        );
+    }
+
+    #[test]
+    fn estimator_chart_keeps_offscale_failure_dots_when_zoomed() {
+        // With a zoomed failure axis (0.0 .. 0.08), raw failure outcomes at
+        // y=1.0 are off-scale-high. They must still render (clamped to the top
+        // edge) instead of vanishing, so failures stay visible on the
+        // low-probability peers the zoom targets. The fitted curve renders as a
+        // <path>, so every <circle> here is a scatter dot.
+        let curve = vec![(0.0, 0.001), (0.25, 0.02), (0.5, 0.04)];
+        let scatter = vec![(0.1, 0.0), (0.2, 1.0), (0.3, 1.0)];
+        let html = build_estimator_chart(
+            "Failure Probability",
+            &curve,
+            &scatter,
+            (0.0, 0.5),
+            None,
+            None,
+            "0.0",
+            "0.08",
+        );
+        let circles = html.matches("<circle").count();
+        assert!(
+            circles >= 3,
+            "all 3 scatter dots (incl. the 2 off-scale failures) must render, got {circles}: {html}"
+        );
+    }
+
+    #[test]
+    fn peer_detail_links_renegade_to_repo() {
+        // The "Renegade" label on the Routing Model card links to the project repo.
+        let src = include_str!("home_page.rs");
+        let cutoff = src
+            .find("#[cfg(test)]")
+            .expect("home_page.rs must have a #[cfg(test)] section");
+        let prod = &src[..cutoff];
+        assert!(
+            prod.contains(r#"href="https://github.com/sanity/renegade""#),
+            "the Renegade label must link to https://github.com/sanity/renegade"
         );
     }
 
@@ -5013,6 +5960,37 @@ mod tests {
     }
 
     #[test]
+    fn governance_card_empty_state_off_mode_is_disabled() {
+        // Regression (#4338 review): with the default mode now Off, the
+        // empty state must NOT claim "scoring activates after N contracts"
+        // — scoring never activates while Off, so that copy is misleading
+        // on every default node. It must say governance is off instead.
+        let mut snap = base_snapshot();
+        snap.governance = GovernanceSnapshot {
+            mode: GovernanceModeSnapshot::Off,
+            contracts: Vec::new(),
+            norms: NetworkNorms::default(),
+            observed_count: 0,
+            min_samples: 30,
+            last_tick_at: None,
+            state_by_id: std::collections::HashMap::new(),
+        };
+        let html = build_governance_card(&Some(snap));
+        assert!(
+            html.contains("Governance is off"),
+            "Off empty state must say governance is off — got:\n{html}"
+        );
+        assert!(
+            !html.contains("Scoring activates"),
+            "Off empty state must NOT claim scoring will activate — got:\n{html}"
+        );
+        assert!(
+            html.contains(r#"g-mode g-mode-off">off<"#),
+            "Off empty state must show the off mode pill — got:\n{html}"
+        );
+    }
+
+    #[test]
     fn governance_card_empty_state_healthy_when_enough_samples() {
         // Pin: once observed_count >= min_samples but nothing is
         // flagged, the empty state should read "all N within normal
@@ -5121,6 +6099,160 @@ mod tests {
     #[test]
     fn governance_card_omits_when_snap_is_none() {
         let html = build_governance_card(&None);
+        assert!(html.is_empty());
+    }
+
+    // ─── Contract ban-list card (#4302) ────────────────────────────
+
+    use crate::node::network_status::{BanListEntry, BanListSnapshot, BanReasonSnapshot};
+
+    fn mk_ban_entry(id: &str, reason: BanReasonSnapshot, expires_in_secs: u64) -> BanListEntry {
+        BanListEntry {
+            instance_id: id.to_string(),
+            reason,
+            expires_in_secs,
+        }
+    }
+
+    #[test]
+    fn ban_list_card_empty_state_renders_count_zero_and_idle_message() {
+        // Empty list still renders the card so operators can tell the
+        // mechanism is active-but-idle (the issue's core motivation),
+        // not unwired. Count tile shows 0.
+        let snap = base_snapshot();
+        let html = build_ban_list_card(&Some(snap));
+        assert!(
+            html.contains("Contract Ban List"),
+            "card must render its heading even when empty — got:\n{html}"
+        );
+        assert!(
+            html.contains(
+                r#"<div class="g-norm-label">On ban list</div><div class="g-norm-value">0</div>"#
+            ),
+            "empty state must show a 0 count tile — got:\n{html}"
+        );
+        assert!(
+            html.contains("0 contracts currently banned"),
+            "empty state must say 0 contracts banned — got:\n{html}"
+        );
+        assert!(
+            html.contains("active and currently idle"),
+            "empty state must distinguish idle-but-active from unwired — got:\n{html}"
+        );
+        assert!(
+            !html.contains("<table"),
+            "empty state must not render an entry table — got:\n{html}"
+        );
+    }
+
+    #[test]
+    fn ban_list_card_lists_entries_with_key_reason_and_expiry() {
+        // The two concrete asks: count tile + entry list (key, reason,
+        // expiry remaining). Pin all three columns for both reasons.
+        let mut snap = base_snapshot();
+        snap.ban_list = BanListSnapshot {
+            count: 2,
+            capacity_rejected_total: 0,
+            entries: vec![
+                mk_ban_entry("AutoBannedContract11111", BanReasonSnapshot::AutoMad, 1800),
+                mk_ban_entry("OperatorBannedContract22", BanReasonSnapshot::Operator, 90),
+            ],
+        };
+        let html = build_ban_list_card(&Some(snap));
+        // Count tile.
+        assert!(
+            html.contains(r#"<div class="g-norm-value">2</div>"#),
+            "count tile must show 2 — got:\n{html}"
+        );
+        // Keys appear.
+        assert!(
+            html.contains("AutoBannedContract11111"),
+            "auto-banned contract id must appear — got:\n{html}"
+        );
+        assert!(
+            html.contains("OperatorBannedContract22"),
+            "operator-banned contract id must appear — got:\n{html}"
+        );
+        // Reasons distinguish AutoMad vs Operator.
+        assert!(
+            html.contains("auto (governance)"),
+            "AutoMad ban must render an 'auto (governance)' reason — got:\n{html}"
+        );
+        assert!(
+            html.contains(">operator<"),
+            "Operator ban must render an 'operator' reason — got:\n{html}"
+        );
+        // Expiry remaining: 90s formatted, and 1800s as 30m.
+        assert!(
+            html.contains("30m left") || html.contains("30m 0s left"),
+            "expiry remaining must render the 1800s ban as ~30m — got:\n{html}"
+        );
+        assert!(
+            html.contains("1m 30s left") || html.contains("90s left"),
+            "expiry remaining must render the 90s ban — got:\n{html}"
+        );
+    }
+
+    #[test]
+    fn ban_list_card_singular_count_pluralization() {
+        // Boundary: count == 1 must read "1 contract", not "1 contracts".
+        let mut snap = base_snapshot();
+        snap.ban_list = BanListSnapshot {
+            count: 1,
+            capacity_rejected_total: 0,
+            entries: vec![mk_ban_entry("OnlyBanned1", BanReasonSnapshot::AutoMad, 600)],
+        };
+        let html = build_ban_list_card(&Some(snap));
+        assert!(
+            html.contains("1 contract currently banned"),
+            "count==1 must use singular 'contract' — got:\n{html}"
+        );
+        assert!(
+            !html.contains("1 contracts currently banned"),
+            "count==1 must not say '1 contracts' — got:\n{html}"
+        );
+    }
+
+    #[test]
+    fn ban_list_card_shows_capacity_rejection_note_when_nonzero() {
+        // The capacity-rejection counter is the operator's signal that
+        // the bounded list is overflowing — surface it only when > 0.
+        let mut snap = base_snapshot();
+        snap.ban_list = BanListSnapshot {
+            count: 1,
+            capacity_rejected_total: 5,
+            entries: vec![mk_ban_entry("AtCapacity1", BanReasonSnapshot::AutoMad, 300)],
+        };
+        let html = build_ban_list_card(&Some(snap));
+        assert!(
+            html.contains("5 bans rejected"),
+            "non-zero capacity rejection must surface a note — got:\n{html}"
+        );
+        assert!(
+            html.contains("list at capacity"),
+            "capacity note must explain the cause — got:\n{html}"
+        );
+    }
+
+    #[test]
+    fn ban_list_card_hides_capacity_note_when_zero() {
+        // Common case: no capacity pressure → no clutter.
+        let mut snap = base_snapshot();
+        snap.ban_list = BanListSnapshot {
+            count: 1,
+            capacity_rejected_total: 0,
+            entries: vec![mk_ban_entry("Normal1", BanReasonSnapshot::Operator, 300)],
+        };
+        let html = build_ban_list_card(&Some(snap));
+        assert!(
+            !html.contains("rejected"),
+            "zero capacity rejections must not render the note — got:\n{html}"
+        );
+    }
+
+    #[test]
+    fn ban_list_card_omits_when_snap_is_none() {
+        let html = build_ban_list_card(&None);
         assert!(html.is_empty());
     }
 }

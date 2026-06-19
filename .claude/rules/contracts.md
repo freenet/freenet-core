@@ -148,11 +148,24 @@ State merging rules:
   - For `UpdateData::State` inputs, merge MUST be idempotent:
       update_state(update_state(S, State(X)), State(X)) == update_state(S, State(X))
     Enforced at runtime via the in-peer probe in
-    `Executor::maybe_probe_idempotency`. Violators get flagged in
-    `Ring::broken_invariants` and their outbound `BroadcastStateChange`
-    is suppressed locally; the flag is permanent for that contract
-    instance id and survives restart. See `ring::broken_invariants` and
-    issue #4251 / PR #4279.
+    `Executor::maybe_probe_idempotency`. The probe re-applies the update and
+    flags a violation when the re-applied state's byte MULTISET differs from
+    the original — i.e. the CONTENT changed (a counter/timestamp/signature
+    churned, an entry was added/removed), including the fixed-size byte-churn
+    shape of the #4251 incident. It does NOT flag a mere REORDERING of the
+    same bytes, because a correct contract with non-canonical serialization
+    (HashMap/HashSet iteration order) re-serializes the same logical state in
+    a different byte order (the #4295 false-positive case). Violators get
+    flagged in `Ring::broken_invariants` and their outbound
+    `BroadcastStateChange` is suppressed locally. The flag is TTL-bounded
+    (`BROKEN_INVARIANT_TTL`, swept by the Ring reaper) so a false positive
+    self-heals instead of bricking the contract forever; a genuine violation
+    is re-detected by the next sampled probe after expiry (probabilistic, so
+    a bounded periodic leak — see `ring::broken_invariants`). Residual
+    false-negative: a content change that coincidentally preserves the exact
+    byte multiset evades detection (far narrower than a size-only check). See
+    `ring::broken_invariants`, issue #4251 / PR #4279, and the #4295
+    soundness/TTL fix.
     Note: this invariant is NOT enforced for `UpdateData::Delta` inputs
     (CmRDT-style "increment by X" deltas legitimately violate it) or
     `UpdateData::RelatedState` (a cross-contract hint, not a CRDT op).
@@ -244,6 +257,34 @@ MUST:
   and the local-only path forced wasted ResyncRequest round trips
   on every send. The escalation is bounded by RELATED_FETCH_TIMEOUT.
   See PR #4006 / freenet/mail#80.
+
+- Off-loop deferral (#4391): there are now TWO entry points into the
+  bridged upsert.
+  * The NON-deferrable path (`upsert_contract_state`, used by
+    delegate-driven PUTs and direct callers) keeps the INLINE
+    `start_sub_op_get` escalation described above — it awaits the
+    network GET in place, bounded by RELATED_FETCH_TIMEOUT.
+  * The DEFERRABLE path (`upsert_contract_state_deferrable`, used by the
+    serial `contract_handling` loop) resolves related contracts
+    LOCAL-ONLY first. On a local miss it does NOT await the network GET
+    inline — it returns `UpsertOutcome::DeferRelated(missing)`, and the
+    loop off-loads the fetch to a background task and re-enqueues a
+    continuation (`contract.rs::maybe_defer_upsert` /
+    `handle_deferred_resume`). This keeps the single-threaded loop from
+    stalling on the 10s fetch while other contracts' events (including
+    cached GETs) drain. WASM validate/store still runs serially on the
+    loop; only the network WAIT moves off-loop. The off-loop waiter
+    delivers EXACTLY ONE resume via an RAII `ResumeGuard` (Drop delivers a
+    MissingRelated resume if the task is dropped before sending), so every
+    deferral terminates with exactly one client answer.
+    There is NO per-contract ordering/blocking: a GET/UPDATE for a contract
+    whose PUT is mid-deferral runs immediately in normal fair-queue order and
+    may observe the pre-deferral state — this reordering is intended (the
+    per-contract-FIFO machinery was removed in #4391 round 5). The deferring
+    op's own response is still delivered only on commit (its responder is
+    parked by `deferral_id`), and the resume re-reads CURRENT state, so
+    concurrent same-key deferrals reconcile via the contract's CRDT merge
+    exactly as two concurrent same-key UPDATEs would — no lost update.
 ```
 
 ### WHEN a contract's validate_state returns RequestRelated

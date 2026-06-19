@@ -363,6 +363,12 @@ impl HostingManager {
         *self.storage.write() = Some(storage);
     }
 
+    /// Drop the storage reference so its redb `Database` clone is released.
+    /// Called on node shutdown to help free the on-disk file lock (issue #4401).
+    pub(crate) fn clear_storage(&self) {
+        *self.storage.write() = None;
+    }
+
     // =========================================================================
     // Pending Reclamation Retry Queue
     // =========================================================================
@@ -3102,6 +3108,84 @@ mod tests {
         assert!(!manager.contract_in_use(&contract));
     }
 
+    /// Behavioural regression for the #4473 UPDATE auto-fetch gate.
+    ///
+    /// On the `AutoFetchReason::InboundRelay` path,
+    /// `OpManager::try_auto_fetch_contract` self-heal-fetches a contract only
+    /// when `self.ring.contract_in_use(key)` — i.e. a local client or a
+    /// downstream peer subscriber depends on it. (The `Originator` path is
+    /// demand-driven and bypasses this gate; see `AutoFetchReason`.) Before the
+    /// gate, an inbound UPDATE/broadcast for a phantom-interest contract (the
+    /// #4404 placement-migration after-effect: stale interest with no
+    /// subscriber) spawned a `fetch_contract` sub-op every time the 5-minute
+    /// cooldown lapsed — the residual #4473 churn. This drives the predicate
+    /// the gate keys on through real subscription registration/teardown and
+    /// asserts the decision the gate makes at each step:
+    ///   phantom (no subscriber)            → gate skips  (would NOT auto-fetch)
+    ///   live local client                  → gate passes (WOULD auto-fetch)
+    ///   live downstream subscriber         → gate passes (WOULD auto-fetch)
+    ///   upstream network subscription only → gate skips  (would NOT auto-fetch)
+    /// and that teardown returns the decision to "skip", so the gate re-arms
+    /// only while a real subscriber exists.
+    #[test]
+    fn auto_fetch_gate_skips_phantom_contracts_and_passes_served_ones() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+
+        // Phantom: interest carried with no subscriber of any kind. The gate
+        // (`!contract_in_use`) skips it — no auto-fetch sub-op spawned, which is
+        // the whole point of the #4473 fix.
+        let phantom = make_contract_key(40);
+        assert!(
+            !manager.contract_in_use(&phantom),
+            "phantom contract (no subscriber) MUST be gated out of auto-fetch (#4473)"
+        );
+
+        // A live local client makes the contract genuinely needed → gate passes.
+        let client_served = make_contract_key(41);
+        let client = crate::client_events::ClientId::next();
+        manager.add_client_subscription(client_served.id(), client);
+        assert!(
+            manager.contract_in_use(&client_served),
+            "a contract with a live local-client subscription MUST pass the \
+             auto-fetch gate so genuinely-needed state still self-heals"
+        );
+        // Teardown re-arms the skip: once the client leaves, the contract is
+        // phantom again and must NOT keep auto-fetching.
+        manager.remove_client_subscription(client_served.id(), client);
+        assert!(
+            !manager.contract_in_use(&client_served),
+            "auto-fetch gate must re-close once the last client unsubscribes"
+        );
+
+        // A downstream peer subscriber likewise makes the fetch legitimate.
+        let downstream_served = make_contract_key(42);
+        let peer = make_peer_key(9);
+        manager.add_downstream_subscriber(&downstream_served, peer.clone());
+        assert!(
+            manager.contract_in_use(&downstream_served),
+            "a contract with a downstream subscriber MUST pass the auto-fetch gate"
+        );
+        manager.remove_downstream_subscriber(&downstream_served, &peer);
+        assert!(
+            !manager.contract_in_use(&downstream_served),
+            "auto-fetch gate must re-close once the last downstream subscriber leaves"
+        );
+
+        // An upstream network subscription ALONE is deliberately excluded: it
+        // renews its lease unboundedly (see `contract_in_use` rustdoc) and is
+        // meant to be torn down, not kept alive by self-heal fetches. So a
+        // contract we are merely network-subscribed to stays gated out.
+        let upstream_only = make_contract_key(43);
+        manager.subscribe(upstream_only);
+        assert!(manager.is_subscribed(&upstream_only));
+        assert!(
+            !manager.contract_in_use(&upstream_only),
+            "an upstream-network-subscription-only contract MUST stay gated out \
+             of auto-fetch (#4473): keeping it would re-introduce the phantom churn"
+        );
+        manager.unsubscribe(&upstream_only);
+    }
+
     /// Generation flow through `HostingManager`: bumping the state
     /// generation BEFORE `record_contract_access` makes the captured
     /// generation match; subsequently bumping the generation simulates
@@ -4042,5 +4126,220 @@ mod tests {
              again — leaving it would let the sweep emit `EvictContract` \
              events that all bail at the `is_hosting_contract` check"
         );
+    }
+
+    // =========================================================================
+    // Subscription-maintenance decision functions (#3367 Gap 2)
+    //
+    // Direct unit coverage for the three decision functions that drive
+    // subscription maintenance. The named incidents in each test are the
+    // failures these assertions would have caught: #3347 (hosting collapse),
+    // #3360 (GET 94% fail / stale cache), and the #3363/#3763 subscription
+    // storms. The existing tests above cover the happy paths; these lock the
+    // boundary case that each incident actually hit — an *expired* lease that
+    // still physically sits in `active_subscriptions` (the cache outlives the
+    // lease), plus the hosted-without-clients framing of the storm.
+    // =========================================================================
+
+    /// `should_unsubscribe_upstream()` must return `false` for a contract we
+    /// are hosting that still has a downstream subscriber, even though no
+    /// *local* client is attached. The #3347 hosting collapse came from
+    /// dropping the upstream lease for exactly this shape — a relay hosting a
+    /// contract on behalf of downstream peers, with no local WebSocket client
+    /// of its own. Tearing that down severs the only path keeping the relay's
+    /// hosted state fresh for those downstream peers.
+    #[test]
+    fn test_should_unsubscribe_upstream_false_when_hosted_without_local_clients() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(0xC0);
+        let downstream = make_peer_key(7);
+
+        // We host the contract (in the LRU cache) and serve a downstream
+        // subscriber, but no local client is subscribed.
+        //
+        // NOTE: the record_contract_access()/subscribe() calls model a
+        // realistic hosting relay but are INCIDENTAL to this decision —
+        // should_unsubscribe_upstream() reads only has_client_subscriptions()
+        // + has_downstream_subscribers(), never the hosting cache or the lease
+        // map. The decision keys solely off the downstream-subscriber map here.
+        manager.record_contract_access(contract, 1000, AccessType::Get);
+        manager.subscribe(contract);
+        assert!(
+            manager
+                .add_downstream_subscriber(&contract, downstream.clone())
+                .was_accepted()
+        );
+
+        // Precondition: hosted, with a downstream subscriber, no local client.
+        assert!(manager.is_hosting_contract(&contract));
+        assert!(manager.has_downstream_subscribers(&contract));
+        assert!(
+            !manager.has_client_subscriptions(contract.id()),
+            "test precondition: no local client subscription"
+        );
+
+        // The downstream subscriber alone must hold the upstream lease open.
+        assert!(
+            !manager.should_unsubscribe_upstream(&contract),
+            "hosted contract serving downstream peers must NOT unsubscribe \
+             upstream just because no local client is attached (#3347 \
+             hosting collapse)"
+        );
+
+        // Lock the other early-return branch: a local client subscription also
+        // yields false, independent of the downstream map.
+        let bare = make_contract_key(0xC1);
+        let client_id = crate::client_events::ClientId::next();
+        manager.add_client_subscription(bare.id(), client_id);
+        assert!(
+            !manager.has_downstream_subscribers(&bare),
+            "test precondition: no downstream subscriber for the bare contract"
+        );
+        assert!(
+            !manager.should_unsubscribe_upstream(&bare),
+            "a local client subscription alone must hold the upstream lease \
+             open (has_client_subscriptions early-return branch)"
+        );
+    }
+
+    /// `is_receiving_updates()` must distinguish an *active* network
+    /// subscription from a *stale* hosting-cache entry whose lease has already
+    /// expired. An expired lease can still physically sit in
+    /// `active_subscriptions` until `expire_stale_subscriptions()` sweeps it,
+    /// and the contract typically remains in the hosting cache the whole time.
+    /// If `is_receiving_updates()` keyed off mere map membership it would
+    /// report a contract as fresh while no UPDATE stream is actually arriving
+    /// — the #3360 "serving 94%-stale state" failure mode.
+    #[test]
+    fn test_is_receiving_updates_false_for_expired_lease_stale_cache() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(0x33);
+
+        // Contract is in the hosting cache (durable fallback) ...
+        manager.record_contract_access(contract, 1000, AccessType::Get);
+        assert!(manager.is_hosting_contract(&contract));
+
+        // ... and an active, non-expired subscription reads as receiving.
+        manager.subscribe(contract);
+        assert!(
+            manager.is_receiving_updates(&contract),
+            "an active lease must count as receiving updates"
+        );
+
+        // Force the lease into the past (same idiom as
+        // test_expire_downstream_triggers_unsubscribe_decision: directly
+        // backdate the private map to model time passing without a real
+        // sleep). The entry is still present in `active_subscriptions`.
+        if let Some(mut lease) = manager.active_subscriptions.get_mut(&contract) {
+            lease.expires_at = Instant::now() - Duration::from_secs(1);
+        }
+
+        // Even though the cache entry survives and the lease row is still in
+        // the map, an expired lease must NOT count as receiving updates.
+        assert!(
+            !manager.is_receiving_updates(&contract),
+            "expired lease + warm cache must read as NOT receiving updates \
+             (stale-cache distinction, #3360)"
+        );
+        // And the warm cache alone must never resurrect the signal.
+        assert!(
+            manager.is_hosting_contract(&contract),
+            "test precondition: contract still hosted in the LRU cache"
+        );
+    }
+
+    /// `contracts_needing_renewal()` must stay bounded by *active interest*,
+    /// not by the size of the hosting cache. Purely-cached contracts — those
+    /// with no live subscription, no client, and no recent local-client
+    /// access — must NOT be counted, including the boundary case of a contract
+    /// whose lease has already expired but still occupies `active_subscriptions`.
+    ///
+    /// This is the bound that the #3363/#3763 368-contract storm violated:
+    /// renewing every cached contract makes the renewal set grow with the
+    /// cache (unbounded) instead of with the handful of genuinely-subscribed
+    /// contracts. It ties to the AGENTS.md GC rule — the only cache-derived
+    /// entries that may be renewed are time-bounded by recent local-client
+    /// access (`SUBSCRIPTION_LEASE_DURATION`); an expired lease grants no such
+    /// exemption.
+    #[test]
+    fn test_contracts_needing_renewal_bounded_by_active_interest() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+
+        // 50 purely-cached contracts (e.g. relay-cached from GETs) — no
+        // subscription, no client, no local-client access.
+        for i in 0..50u8 {
+            manager.record_contract_access(make_contract_key(i), 1000, AccessType::Get);
+        }
+        assert_eq!(manager.hosting_contracts_count(), 50);
+        assert!(
+            manager.contracts_needing_renewal().is_empty(),
+            "purely-cached contracts must NOT need renewal — the set must be \
+             bounded by active interest, not cache size (#3763 storm)"
+        );
+
+        // Positive/negative control pair that pins the `expires_at > now`
+        // lower-bound guard in Branch 1 (line ~1368). Both contracts carry a
+        // backdated/forward-dated lease in `active_subscriptions`; the ONLY
+        // thing distinguishing them is which side of `now` the lease sits on.
+        //
+        // - `within_window`: lease expires inside the renewal window but still
+        //   in the future (now < expires_at <= now + SUBSCRIPTION_RENEWAL_INTERVAL).
+        //   Branch 1 returns the lease key directly, so this contract MUST be
+        //   counted. Without it the expired-lease assertion alone is inert: a
+        //   fresh `subscribe()` lease is now + 8min (excluded by the window's
+        //   upper bound) and 0xE0 isn't in the 0..50 cache for Branch 2, so the
+        //   expired-lease guard could be deleted with the test still passing.
+        // - `expired`: lease is in the past. It must NOT be counted, otherwise
+        //   the renewal set would refill itself from stale leases (the AGENTS.md
+        //   time-bounded GC rule — an expired lease grants no renewal exemption).
+        let within_window = make_contract_key(0xA0);
+        manager.subscribe(within_window);
+        if let Some(mut lease) = manager.active_subscriptions.get_mut(&within_window) {
+            lease.expires_at = Instant::now() + Duration::from_secs(30);
+        }
+        let expired = make_contract_key(0xE0);
+        manager.record_contract_access(expired, 1000, AccessType::Get);
+        manager.subscribe(expired);
+        if let Some(mut lease) = manager.active_subscriptions.get_mut(&expired) {
+            lease.expires_at = Instant::now() - Duration::from_secs(1);
+        }
+        let within_window_renewal = manager.contracts_needing_renewal();
+        assert!(
+            within_window_renewal.contains(&within_window),
+            "a lease expiring inside the renewal window but still in the future \
+             MUST be counted (Branch 1 `expires_at > now` lower-bound guard)"
+        );
+        assert!(
+            !within_window_renewal.contains(&expired),
+            "a contract with an expired lease must NOT be counted as needing \
+             renewal (expired leases grant no renewal exemption — AGENTS.md \
+             time-bounded GC rule)"
+        );
+
+        // Now add genuine interest: two client subscriptions. The renewal set
+        // grows by exactly two and no more — it tracks interest, not cache.
+        // want_a(3)/want_b(9) are intentionally chosen from the cached 0..50
+        // set so Branch 2 can resolve their instance_id back to a ContractKey
+        // via the hosting_cache lookup (line ~1390).
+        let client_id = crate::client_events::ClientId::next();
+        let want_a = make_contract_key(3);
+        let want_b = make_contract_key(9);
+        manager.add_client_subscription(want_a.id(), client_id);
+        manager.add_client_subscription(want_b.id(), client_id);
+
+        let needs_renewal = manager.contracts_needing_renewal();
+        // Exactly three: the two client-subscribed contracts plus the
+        // within-window lease — never the 51 cached-only / expired ones.
+        assert_eq!(
+            needs_renewal.len(),
+            3,
+            "renewal set must contain exactly the two client-subscribed \
+             contracts and the within-window lease, not the 51 cached ones; \
+             found {}",
+            needs_renewal.len()
+        );
+        assert!(needs_renewal.contains(&want_a));
+        assert!(needs_renewal.contains(&want_b));
+        assert!(needs_renewal.contains(&within_window));
     }
 }

@@ -1,5 +1,5 @@
 ---
-description: Prevent bounded channel deadlocks — cascading backpressure from .send().await in event loops has caused 4+ production incidents
+description: Prevent bounded channel deadlocks — cascading backpressure from .send().await in event loops has caused 6+ production incidents
 paths:
   - "crates/core/src/node/**"
   - "crates/core/src/transport/**"
@@ -13,7 +13,7 @@ paths:
 
 `.send().await` on a bounded channel inside an event loop or recv loop.
 When the receiver is slow or blocked on another channel, the sender blocks,
-stalling the entire event loop. This has caused 5+ production deadlocks:
+stalling the entire event loop. This has caused 6+ production deadlocks:
 
 - **StreamRegistry** (Mar 2026): `mpsc::channel(64)` whose receiver was never
   consumed. After 64 streams, `.send().await` blocked forever, deadlocking
@@ -60,6 +60,40 @@ stalling the entire event loop. This has caused 5+ production deadlocks:
   (`announce_contract_hosted`) intentionally kept the blocking variant
   because it carries a one-shot transition — see its inline
   `DELIBERATELY blocking` comment for the rationale.
+
+  The same #4145/#4231 investigation surfaced a SECOND, separate
+  degradation under the same fan-out — not a deadlock but a full-state
+  broadcast STORM (#4442). A peer's summary was cached only after a
+  *delta* send (PR #2763's `if sent_delta`), but a delta needs the
+  peer's cached summary to compute against — a chicken-and-egg that
+  trapped every summary-less subscriber (any new subscriber, or one
+  whose summary was cleared) on full state forever. Under sustained
+  fan-out that meant every update re-sent full state to every
+  subscriber, swamping the event loop. Fixed (#4442) by caching the
+  summary on any *delivered* broadcast (delta OR full state): #4235's
+  real-delivery signal (`BroadcastDeliveryOutcome::Delivered`) makes
+  caching on a full-state delivery safe, so the next broadcast to that
+  peer collapses to a small delta. A wrongly-cached summary (e.g. a
+  lost stream tail — `Delivered` is sender-side completion, not a
+  receiver ack) is corrected by the periodic InterestSync summary
+  exchange and by the delta-apply-failure → ResyncRequest path that
+  clears the sender's cached summary.
+
+- **Event-log channel send** (#4466, Jun 2026): `EventRegister::register_events`
+  and `notify_of_time_out` (`tracing.rs`) did an untimed `.send().await` on the
+  bounded event-log `mpsc::channel(1000)`, awaited from the network event loop's
+  hot outbound path (`p2p_protoc.rs` `OutboundMessageWithTarget` and disconnect
+  handlers). The sole consumer `record_logs` blocks on its metrics-server
+  WebSocket send (`ws://127.0.0.1:55010`, present on peers running the fdev
+  metrics server) and its AOF write; when that sink stalled, the channel filled
+  and the event loop blocked forever, parking every runtime thread on a futex at
+  0% CPU — a silent freeze (process alive, API port open, logging frozen
+  mid-activity, no crash so systemd never restarts). This is the sibling send
+  the #4145/#4231 fix missed, three lines above the peer-send it *did* wrap.
+  Fixed (#4467) by switching both sends to `try_send` with drop-on-full
+  (best-effort telemetry) plus a `DROPPED_EVENT_LOGS` counter; the `trace-ot`
+  `OTEventRegister` siblings were converted too. Observed on a 0.2.75 peer and
+  corroborated by a real-user diagnostic report on 0.2.74.
 
 ## Exception: same-runtime internal consumers
 

@@ -70,6 +70,41 @@ requests, Metadata) and `workflow` scopes. See AGENTS.md → "Release Workflow
 workflow-triggering events as an anti-recursion safeguard, so PAT is
 required for the cascade to fire automatically).
 
+### Wire-gated feature floors (one-time, per feature)
+
+Some features that add a new `NetMessageV1` wire variant are version-gated:
+a node only sends the new variant to peers whose negotiated protocol version
+is at or above a hardcoded floor, so older peers never receive a variant they
+can't deserialize (they'd drop the connection). When you cut the release that
+**first** ships such a feature, set its floor to **exactly that release
+version**, then leave it frozen — do NOT bump it on later releases (raising it
+above the first-shipping version would silently stop sending to fully-capable
+peers).
+
+Current wire-gated floors:
+
+- `SUBSCRIBE_HINT_MIN_VERSION` in `crates/core/src/node/network_bridge/p2p_protoc.rs`
+  (SubscribeHint placement migration, #4404).
+
+  **DO NOT lower this to the release version.** It is intentionally **parked at
+  `(0, 3, 0)`** — above every shipped 0.2.x release — to keep the placement
+  migration **DEACTIVATED**. The migration's directed-subscribe / hint-broadcast
+  load drove a network-wide UPDATE-broadcast degradation after the v0.2.73
+  release, and v0.2.74 disabled it by raising this floor above all live peers
+  (the SEND side **and** the inbound-hint RECEIVE gate in `node.rs` both read
+  this floor, so the migration is dormant in both directions). This is the one
+  wire-gated floor that does **NOT** follow the "set to the first-shipping
+  release version" rule above.
+
+  Lowering it to the release version would **silently re-enable** the migration
+  and reproduce the degradation. Leave it at `(0, 3, 0)` until the
+  broadcast-backpressure load issue (#4145) is fixed; only then drop it to the
+  release that first ships a load-safe SubscribeHint and freeze it there per the
+  general rule.
+
+When a NEW wire-gated feature first ships (not this one), set its floor to
+**exactly that release version** and freeze it, as described above.
+
 ## What fires when
 
 ```
@@ -178,15 +213,38 @@ gh workflow run release-announce.yml --field version=X.Y.Z
 
 ### One gateway didn't converge
 
-The `Gateway Update` workflow polls `/version` for 120 s after the POST. If
-that times out the workflow reports failure for that gateway and the
-remaining gateway doesn't try (fail-fast). Recovery:
+The `Gateway Update` workflow polls `/version` for 120 s after the POST. It
+now requires BOTH that the on-disk binary reports the new version AND that the
+gateway service is actually `active` on it (the `service_active` field). So a
+converge timeout now has two possible meanings:
+
+- the binary never updated (download/swap failed), OR
+- the binary swapped but the **service failed to restart** — this is the
+  vega v0.2.71 case, where `/version` reported the new version while the
+  gateway was down. Check `ssh <host> 'sudo systemctl status freenet-gateway'`
+  (or `freenet-gateway-hector` on vega's secondary instance); a `failed`/
+  `inactive` unit with the new binary on disk is this failure mode.
+
+(Note: against a gateway running an OLD release-agent that predates the
+`service_active` field, the workflow can no longer confirm the service is
+running. As of #4492 it **fails closed** by default — the rollout step errors
+at the deadline telling you to update that gateway's release-agent. The old
+binary-only behaviour is available only via the explicit
+`allow_binary_only_fallback=true` `workflow_dispatch` input, for a deliberate
+rollout to a gateway you know runs an old agent. So on the normal
+release-triggered path, a gateway with an outdated agent will fail the rollout
+until its agent is upgraded.)
+
+Recovery:
 
 1. Check the agent's status: `ssh ian@<host> 'sudo systemctl status
    freenet-release-agent && sudo journalctl -u freenet-release-agent
    --since "10 min ago"'`
-2. If the agent is fine but the script failed, the manual fix is
-   `ssh ian@<host> 'sudo /usr/local/bin/gateway-auto-update.sh --force'`.
+2. If the agent is fine but the service is down, restart it directly:
+   `ssh ian@<host> 'sudo systemctl restart freenet-gateway'` (then confirm
+   `systemctl is-active freenet-gateway`). If the script itself failed, the
+   manual fix is `ssh ian@<host> 'sudo /usr/local/bin/gateway-auto-update.sh
+   --force'`.
 3. Re-run the gateway-update workflow against just the failed gateway:
    `gh workflow run gateway-update.yml --field version=X.Y.Z --field
    gateways=vega`.
