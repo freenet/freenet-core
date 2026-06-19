@@ -294,30 +294,69 @@ async fn run_driver<S: crate::transport::Socket>(
                             (None, None, false)
                         };
 
-                        // Non-blocking (#4145): events_tx (cap 128) is drained by
-                        // the network event-loop task. A blocking `.send().await`
-                        // here would stall the handshake driver — and therefore stop
-                        // it draining commands_rx — whenever the event loop is
-                        // momentarily behind under fan-out load. On a FULL channel we
-                        // drop THIS inbound connection and keep accepting: the peer's
-                        // connect op retries, so a transiently-full channel must not
-                        // tear down the acceptor. Only a CLOSED channel (event loop
-                        // gone) is terminal — then we break to shut the driver down.
-                        match events_tx.try_send(Event::InboundConnection {
-                            transaction,
-                            peer,
-                            connection: Box::new(conn),
-                            transient,
-                        }) {
+                        // Bounded send (#4145), NOT an unconditional drop.
+                        //
+                        // events_tx (cap 128) is drained by the network event-loop
+                        // task. The original blocking `.send().await` here could
+                        // stall this handshake driver indefinitely — and therefore
+                        // stop it draining commands_rx — whenever the event loop
+                        // fell behind under fan-out load.
+                        //
+                        // Why send_timeout rather than try_send-drop: dropping an
+                        // InboundConnection is not always free. An inbound
+                        // connection that satisfies a locally-initiated connect
+                        // clears the event loop's `awaiting_connection` entry and
+                        // its callbacks; while a dropped one is ultimately recovered
+                        // (the dialing side's `spawn_outbound` resolves to
+                        // OutboundEstablished/OutboundFailed within 10s, and
+                        // OutboundFailed clears `awaiting_connection`), and a
+                        // duplicate inbound is harmless, a bounded wait lets us
+                        // PRESERVE the connection across a transient backlog instead
+                        // of forcing a slower reconnect. Crucially, run_driver is
+                        // NOT the event-loop task, so a bounded block here cannot
+                        // reintroduce the #4145 event-loop self-stall — it only
+                        // briefly pauses this accept loop.
+                        //
+                        // The block is on the `inbound_conn` select arm, so while it
+                        // waits (up to 5s) the sibling `commands_rx.recv()` arm is
+                        // also paused — the driver stops draining handshake commands
+                        // for that window. That is safe: every command sender is the
+                        // event loop's non-blocking `try_send` (the converted sites
+                        // 2-7), which drops + logs on a full channel rather than
+                        // blocking, so a paused `commands_rx` cannot wedge the event
+                        // loop back. The only cost is a brief delay in applying
+                        // Connect/ExpectInbound/DropConnection under heavy backlog,
+                        // which is recoverable (the senders' drop paths already
+                        // tolerate loss).
+                        //
+                        // Elapsed (event loop wedged longer than the bound): warn +
+                        // drop as a last resort, keep accepting. Closed (event loop
+                        // gone): break to shut the driver down.
+                        const INBOUND_FORWARD_TIMEOUT: Duration = Duration::from_secs(5);
+                        match events_tx
+                            .send_timeout(
+                                Event::InboundConnection {
+                                    transaction,
+                                    peer,
+                                    connection: Box::new(conn),
+                                    transient,
+                                },
+                                INBOUND_FORWARD_TIMEOUT,
+                            )
+                            .await
+                        {
                             Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {
+                            Err(mpsc::error::SendTimeoutError::Timeout(_)) => {
                                 tracing::warn!(
                                     remote = %remote_addr,
-                                    "Event channel full; dropping inbound connection \
-                                     (peer's connect op will retry). Acceptor continues."
+                                    timeout_secs = INBOUND_FORWARD_TIMEOUT.as_secs(),
+                                    "Event channel full for the full forward timeout; \
+                                     dropping inbound connection as a last resort \
+                                     (dialer's connect op recovers via Outbound* / TTL). \
+                                     Acceptor continues."
                                 );
                             }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                            Err(mpsc::error::SendTimeoutError::Closed(_)) => {
                                 tracing::debug!(
                                     remote = %remote_addr,
                                     "Event channel closed; shutting down handshake driver"
@@ -497,17 +536,15 @@ mod tests {
         assert!(!sender.try_send(Command::DropConnection { peer }));
     }
 
-    /// SITE 8 source-scrape pin (#4145): the run_driver inbound-accept arm
-    /// must forward via the non-blocking `events_tx.try_send(` and must NOT
-    /// tear the acceptor down on a transiently-full channel. A blocking
-    /// `events_tx.send(...).await` here would stall the handshake driver
-    /// (and thus stop it draining commands_rx) whenever the event loop is
-    /// momentarily behind under fan-out load. The per-connection spawned
-    /// task in `spawn_outbound` keeps its blocking `events_tx.send(...).await`
-    /// (it cannot stall the loop), so we assert specifically that the accept
-    /// arm uses try_send and that Full continues while Closed breaks.
+    /// SITE 8 source-scrape pin (#4145): the run_driver inbound-accept arm must
+    /// forward via the BOUNDED `events_tx.send_timeout(` (NOT an unconditional
+    /// drop and NOT a blocking `.send().await`), and must distinguish Timeout
+    /// (drop as last resort + keep accepting) from Closed (break). run_driver is
+    /// not the event-loop task, so a bounded block here cannot reintroduce the
+    /// #4145 self-stall; the bound preserves the inbound connection across a
+    /// transient backlog instead of dropping it.
     #[test]
-    fn run_driver_inbound_accept_is_non_blocking() {
+    fn run_driver_inbound_accept_is_bounded_send() {
         let full = include_str!("handshake.rs");
         // Scan production only (everything before the `mod tests {` block), so
         // this pin does not match the marker strings in its own assertions.
@@ -516,61 +553,89 @@ mod tests {
             .expect("handshake.rs must have a `mod tests {` block");
         let src = &full[..cut];
 
-        // The accept arm builds an Event::InboundConnection and forwards it.
-        let marker = "events_tx.try_send(Event::InboundConnection {";
-        let from = src.find(marker).expect(
-            "#4145 SITE 8: run_driver's inbound-accept arm must use \
-             events_tx.try_send(Event::InboundConnection ...), not a blocking send.",
-        );
-        // Window large enough to cover the full match (the Closed arm is the
-        // last of four arms, ~25 lines down).
-        let end = (from + 1200).min(src.len());
-        let arm = &src[from..end];
+        // Anchor indentation-independently on the bounded send_timeout call in
+        // run_driver (there is exactly one in production). Its presence is itself
+        // the primary assertion: the forward must NOT be a blocking .send().await
+        // (the spawn_outbound blocking send is `events_tx.send(event)`, a
+        // different receiver expression) and must NOT be an unconditional
+        // try_send-drop.
+        let send_at = src.find(".send_timeout(").unwrap_or_else(|| {
+            panic!(
+                "#4145 SITE 8: run_driver's inbound-accept arm must forward via \
+                 events_tx.send_timeout(Event::InboundConnection ...), not a blocking \
+                 send or an unconditional try_send-drop."
+            )
+        });
+        // Window from the send_timeout call through its Timeout/Closed match
+        // arms (the Closed arm is ~22 lines / ~1.3k chars after the call).
+        let end = (send_at + 1600).min(src.len());
+        let arm = &src[send_at..end];
         assert!(
-            arm.contains("TrySendError::Full") && arm.contains("TrySendError::Closed"),
-            "#4145 SITE 8: the accept arm must explicitly distinguish Full \
+            arm.contains("SendTimeoutError::Timeout") && arm.contains("SendTimeoutError::Closed"),
+            "#4145 SITE 8: the accept arm must explicitly distinguish Timeout \
              (drop + continue) from Closed (break). Slice:\n{arm}"
         );
-        // And the blocking form must be gone from the accept arm.
+        // The unconditional-drop form (try_send) must NOT be how the inbound
+        // connection is forwarded anywhere in production — that would needlessly
+        // drop a recoverable inbound connection.
         assert!(
-            !arm.contains("events_tx.send(Event::InboundConnection"),
-            "#4145 SITE 8: a blocking events_tx.send(Event::InboundConnection ...).await \
-             remains in the accept arm — must be try_send."
+            !src.contains("try_send(Event::InboundConnection"),
+            "#4145 SITE 8: inbound forward must use the bounded send_timeout, not an \
+             unconditional try_send-drop (see review item 3)."
         );
     }
 
-    /// SITE 8 behavioral pin: a FULL events channel must drop the inbound
-    /// connection and let the acceptor keep going (try_send returns Full,
-    /// not a block); a CLOSED channel is the only case that shuts the driver
-    /// down. This mirrors the match in run_driver without standing up a real
-    /// transport.
-    #[tokio::test]
-    async fn full_events_channel_does_not_break_acceptor() {
+    /// SITE 8 behavioral pin for the bounded send_timeout semantics:
+    /// - a channel that drains WITHIN the bound must SUCCEED (connection preserved,
+    ///   not dropped);
+    /// - a channel that stays full PAST the bound returns Timeout (drop + continue);
+    /// - a closed channel returns Closed (break).
+    #[tokio::test(start_paused = true)]
+    async fn bounded_inbound_send_preserves_then_times_out_then_closes() {
+        use std::time::Duration;
+
+        // (1) Drains within the bound -> Ok (preserved, NOT dropped).
+        // Channel cap 1, pre-filled. A drainer frees the slot at t=1s, well
+        // inside the 5s bound, so the bounded send must succeed.
         let (tx, mut rx) = mpsc::channel::<u32>(1);
         tx.try_send(1).expect("fill the single slot");
-
-        // Full -> non-blocking error, acceptor would `continue`.
-        let mut should_break = false;
-        match tx.try_send(2) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => { /* drop + continue */ }
-            Err(mpsc::error::TrySendError::Closed(_)) => should_break = true,
-        }
+        let drainer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(
+                rx.recv().await,
+                Some(1),
+                "drainer frees the pre-filled slot"
+            );
+            rx // keep rx alive (and now holding `2` after the send below lands)
+        });
+        let res = tx.send_timeout(2, Duration::from_secs(5)).await;
         assert!(
-            !should_break,
-            "a transiently-full events channel must NOT break the acceptor"
+            res.is_ok(),
+            "a channel that drains within the bound must preserve the connection (Ok), got {res:?}"
+        );
+        let mut rx = drainer.await.unwrap();
+        // After (1) the channel holds `2` (the send that just succeeded). Drain
+        // it so we start (2) from a known-empty channel.
+        assert_eq!(rx.recv().await, Some(2), "drain the value sent in step (1)");
+
+        // (2) Full past the bound -> Timeout (drop + continue).
+        // Fill the slot and never drain; the paused clock auto-advances when the
+        // runtime is otherwise idle, so the 5s timeout elapses deterministically.
+        tx.try_send(3).expect("re-fill the single slot");
+        let res = tx.send_timeout(4, Duration::from_secs(5)).await;
+        assert!(
+            matches!(res, Err(mpsc::error::SendTimeoutError::Timeout(_))),
+            "a channel full past the bound must time out (drop as last resort), got {res:?}"
         );
 
-        // Drain + close -> Closed -> break.
-        let _ = rx.recv().await;
+        // (3) Closed -> Closed (break). Drain the `3` from step (2), then drop the
+        // receiver so the cause is unambiguously Closed (not Timeout).
+        assert_eq!(rx.recv().await, Some(3), "drain the value from step (2)");
         drop(rx);
-        match tx.try_send(3) {
-            Err(mpsc::error::TrySendError::Closed(_)) => should_break = true,
-            other => panic!("expected Closed after receiver dropped, got {other:?}"),
-        }
+        let res = tx.send_timeout(5, Duration::from_secs(5)).await;
         assert!(
-            should_break,
-            "a closed events channel (event loop gone) must break the acceptor"
+            matches!(res, Err(mpsc::error::SendTimeoutError::Closed(_))),
+            "a closed channel (event loop gone) must report Closed (break), got {res:?}"
         );
     }
 }
