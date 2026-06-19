@@ -140,3 +140,37 @@ grep -rn "\.send(.*).await" crates/core/src/ | grep -v "try_send\|#\[test\]\|#\[
 ```
 
 Each hit must be justified: is the caller a critical loop? Can the receiver block?
+
+## CI Enforcement (#4145 follow-up)
+
+The `rule_lint` job in `.github/workflows/ci.yml` (rule #6) fails the
+build when a PR *adds* a blocking `.send(...).await` on an
+event-loop-reachable sender. The check is **diff-scoped to added lines
+only**, so the grandfathered sites it does not yet cover do not fail
+CI; it only guards against *new* offenders.
+
+Watched senders (the identifier allowlist): `ev_listener_tx`,
+`bridge_sender`, `handshake_cmd_sender`, `handshake_commands`,
+`events_tx`, `result_router_tx`. These are the senders that are
+drained by — or feed — the network event loop / handshake driver, so a
+blocking send on one of them can self-stall the loop under fan-out
+back-pressure (the #4145 / #4231 / #4466 incident class).
+
+Escape hatch: when a blocking send on one of these is provably safe
+(e.g. a per-connection spawned task that cannot stall the loop, like
+`spawn_outbound` in `handshake.rs`), annotate the call-site line with:
+
+```rust
+// channel-safety: ok — <reason>
+```
+
+and the lint will skip it. Use this only with a real justification that
+satisfies the "Exception: same-runtime internal consumers" criteria
+above; a bare annotation with no reason is a review red flag.
+
+The non-blocking conversions of the eight original #4145 sites
+(ConnectPeer enqueue, six `HandshakeCommand` sends, and the
+`run_driver` inbound-accept send) are the canonical `try_send` +
+drop/log precedents — mirror them. The in-tree `try_send` template is
+`drop_zombie_connection` in `p2p_protoc.rs`
+(`if !handshake_cmd_sender.try_send(DropConnection{..}) { debug!(...) }`).
