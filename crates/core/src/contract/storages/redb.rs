@@ -47,6 +47,16 @@ pub(crate) const BROKEN_INVARIANTS_TABLE: TableDefinition<&[u8], &[u8]> =
 pub(crate) const SECRETS_INDEX_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("secrets_index");
 
+/// Index table for the per-user secret dimension (P1 of #4381). SEPARATE
+/// from [`SECRETS_INDEX_TABLE`] so the existing single-user index keeps its
+/// exact schema and a pre-#4381 database opens unchanged (this table is
+/// simply absent → created empty on first open).
+///
+/// Key: DelegateKey (64 bytes) || UserId (32 bytes) = 96 bytes
+/// Value: Concatenated secret key hashes (N * 32 bytes)
+pub(crate) const USER_SECRETS_INDEX_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("user_secrets_index");
+
 /// Metadata about a hosted contract, persisted to survive restarts.
 #[derive(Debug, Clone, Copy)]
 pub struct HostingMetadata {
@@ -222,6 +232,20 @@ impl ReDb {
                     table = "SECRETS_INDEX_TABLE",
                     phase = "table_init_failed",
                     "Failed to open SECRETS_INDEX_TABLE"
+                );
+                e
+            })?;
+
+            // Per-user secrets index (P1 of #4381). Created on first open of
+            // upgraded databases too — redb creates missing tables inside the
+            // same write txn that opens them, so old DBs gain an empty table
+            // without disturbing the single-user SECRETS_INDEX_TABLE above.
+            txn.open_table(USER_SECRETS_INDEX_TABLE).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    table = "USER_SECRETS_INDEX_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open USER_SECRETS_INDEX_TABLE"
                 );
                 e
             })?;
@@ -723,6 +747,132 @@ impl ReDb {
             let delegate_key =
                 DelegateKey::new(delegate_key_bytes, CodeHash::from(&code_hash_bytes));
             result.push((delegate_key, secret_keys));
+        }
+        Ok(result)
+    }
+
+    // ============== Per-User Secrets Index Methods (P1 of #4381) ==============
+    // SEPARATE table from the single-user index above; the DelegateKey is
+    // suffixed with the 32-byte UserId so each user's set is independent. The
+    // single-user SECRETS_INDEX_TABLE is never touched by these methods.
+
+    /// Build the 96-byte composite key `DelegateKey(64) || UserId(32)`.
+    fn user_index_key(delegate_key: &DelegateKey, user_id: &[u8; 32]) -> [u8; 96] {
+        let mut key_bytes = [0u8; 96];
+        key_bytes[..32].copy_from_slice(delegate_key.as_ref());
+        key_bytes[32..64].copy_from_slice(delegate_key.code_hash().as_ref());
+        key_bytes[64..].copy_from_slice(user_id);
+        key_bytes
+    }
+
+    /// Store a per-user secrets index entry:
+    /// `(DelegateKey, UserId) → concatenated secret key hashes`.
+    pub fn store_user_secrets_index(
+        &self,
+        delegate_key: &DelegateKey,
+        user_id: &[u8; 32],
+        secret_keys: &[[u8; 32]],
+    ) -> Result<(), redb::Error> {
+        let key_bytes = Self::user_index_key(delegate_key, user_id);
+
+        let mut value_bytes = Vec::with_capacity(secret_keys.len() * 32);
+        for sk in secret_keys {
+            value_bytes.extend_from_slice(sk);
+        }
+
+        let txn = self.0.begin_write()?;
+        {
+            let mut tbl = txn.open_table(USER_SECRETS_INDEX_TABLE)?;
+            tbl.insert(key_bytes.as_slice(), value_bytes.as_slice())?;
+        }
+        txn.commit().map_err(Into::into)
+    }
+
+    /// Get the secret key hashes for a `(DelegateKey, UserId)` pair.
+    /// Test-only today; the runtime hydrates the whole table at startup via
+    /// [`Self::load_all_user_secrets_index`] and keeps an in-memory mirror,
+    /// so it never point-queries. Kept for parity with the single-user
+    /// `get_secrets_index` and for tests asserting on the durable row.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn get_user_secrets_index(
+        &self,
+        delegate_key: &DelegateKey,
+        user_id: &[u8; 32],
+    ) -> Result<Option<Vec<[u8; 32]>>, redb::Error> {
+        let key_bytes = Self::user_index_key(delegate_key, user_id);
+
+        let txn = self.0.begin_read()?;
+        let tbl = txn.open_table(USER_SECRETS_INDEX_TABLE)?;
+        match tbl.get(key_bytes.as_slice())? {
+            Some(v) => {
+                let value = v.value();
+                if value.len() % 32 != 0 {
+                    return Err(redb::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid user secrets index value length",
+                    )));
+                }
+                let mut result = Vec::with_capacity(value.len() / 32);
+                for chunk in value.chunks(32) {
+                    let arr: [u8; 32] = chunk.try_into().unwrap();
+                    result.push(arr);
+                }
+                Ok(Some(result))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Remove a per-user secrets index entry.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn remove_user_secrets_index(
+        &self,
+        delegate_key: &DelegateKey,
+        user_id: &[u8; 32],
+    ) -> Result<(), redb::Error> {
+        let key_bytes = Self::user_index_key(delegate_key, user_id);
+
+        let txn = self.0.begin_write()?;
+        {
+            let mut tbl = txn.open_table(USER_SECRETS_INDEX_TABLE)?;
+            tbl.remove(key_bytes.as_slice())?;
+        }
+        txn.commit().map_err(Into::into)
+    }
+
+    /// Load all per-user secrets index entries as
+    /// `((DelegateKey, UserId bytes), secret key hashes)`.
+    #[allow(clippy::type_complexity)]
+    pub fn load_all_user_secrets_index(
+        &self,
+    ) -> Result<Vec<((DelegateKey, [u8; 32]), Vec<[u8; 32]>)>, redb::Error> {
+        let txn = self.0.begin_read()?;
+        let tbl = txn.open_table(USER_SECRETS_INDEX_TABLE)?;
+
+        let mut result = Vec::new();
+        for entry in tbl.iter()? {
+            let (key, value) = entry?;
+            let key_bytes = key.value();
+            if key_bytes.len() != 96 {
+                continue; // Skip malformed entries
+            }
+            let delegate_key_bytes: [u8; 32] = key_bytes[..32].try_into().unwrap();
+            let code_hash_bytes: [u8; 32] = key_bytes[32..64].try_into().unwrap();
+            let user_id_bytes: [u8; 32] = key_bytes[64..].try_into().unwrap();
+
+            let value_bytes = value.value();
+            if value_bytes.len() % 32 != 0 {
+                continue; // Skip malformed entries
+            }
+            let mut secret_keys = Vec::with_capacity(value_bytes.len() / 32);
+            for chunk in value_bytes.chunks(32) {
+                let arr: [u8; 32] = chunk.try_into().unwrap();
+                secret_keys.push(arr);
+            }
+
+            let delegate_key =
+                DelegateKey::new(delegate_key_bytes, CodeHash::from(&code_hash_bytes));
+            result.push(((delegate_key, user_id_bytes), secret_keys));
         }
         Ok(result)
     }
