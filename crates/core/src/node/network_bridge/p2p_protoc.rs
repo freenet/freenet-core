@@ -1672,15 +1672,53 @@ impl P2pConnManager {
                                     let is_gw = gateways
                                         .iter()
                                         .any(|gw| gw.socket_addr() == Some(target_addr));
-                                    ctx.bridge
-                                        .ev_listener_tx
-                                        .send(P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer {
+
+                                    // Non-blocking enqueue to avoid self-deadlocking the
+                                    // event loop (#4145). ev_listener_tx is drained by THIS
+                                    // task's own select loop, so a `.send().await` here that
+                                    // back-pressures would stall the very loop that drains it
+                                    // — a true self-deadlock cycle. Under the SubscribeHint
+                                    // placement migration's load this is the ConnectPeer arm
+                                    // the nudge drives, so a full channel is the load signal
+                                    // we must shed cleanly rather than wedge on.
+                                    //
+                                    // On Full/Closed we drop THIS outbound attempt: the
+                                    // message is not sent, the op driver's retry loop / op
+                                    // TTL re-routes it (same recovery as the congested-peer
+                                    // 500ms-timeout drop above). We must NOT spawn the
+                                    // resend-waiter in that case — its `callback` would never
+                                    // be registered with any connect op, so dropping the
+                                    // callback here closes `result` and the waiter would
+                                    // observe `Ok(None)` immediately rather than hang the
+                                    // full 20s timeout on a connection that was never
+                                    // requested.
+                                    if let Err(err) = ctx.bridge.ev_listener_tx.try_send(
+                                        P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer {
                                             peer: target_peer.clone(),
                                             tx,
                                             callback,
                                             is_gw,
-                                        }))
-                                        .await?;
+                                        }),
+                                    ) {
+                                        // `err` owns the ConnectPeer event (and thus the
+                                        // callback Sender); dropping it here is what
+                                        // short-circuits the would-be waiter.
+                                        let reason = match err {
+                                            mpsc::error::TrySendError::Full(_) => "full",
+                                            mpsc::error::TrySendError::Closed(_) => "closed",
+                                        };
+                                        tracing::warn!(
+                                            tx = %tx,
+                                            peer_addr = %target_addr,
+                                            reason,
+                                            phase = "backpressure",
+                                            "Event-loop bridge channel {reason} while dispatching \
+                                             ConnectPeer; dropping outbound message (op will retry). \
+                                             Sustained occurrences indicate fan-out / migration load \
+                                             overwhelming the event loop."
+                                        );
+                                        continue;
+                                    }
 
                                     tracing::debug!(
                                         tx = %tx,
