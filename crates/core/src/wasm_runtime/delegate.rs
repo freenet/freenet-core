@@ -4999,5 +4999,91 @@ mod test {
                 "user_id should appear in Debug"
             );
         }
+
+        /// The per-user namespace does NOT propagate across a delegate-to-delegate
+        /// hop. When delegate A (running under user X's connection) sends a
+        /// `SendDelegateMessage` to delegate B, the executor delivers it to B with
+        /// `user_context = None` and `origin = Some(MessageOrigin::Delegate(A))`
+        /// (see `contract.rs::handle_delegate_with_contract_requests`, the
+        /// `execute_delegate_request(target_req, None, Some(delegate_key), None)`
+        /// call). So B's secret op MUST land in B's `Local` namespace, never under
+        /// user X — the user namespace is bound to the originating connection, not
+        /// transitively inherited through the inter-delegate hop.
+        ///
+        /// This test drives B exactly the way the executor drives it for that hop:
+        /// `origin = Delegate(A)`, `user_context = None`. It is parameterised over
+        /// the user X whose namespace must stay untouched.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn user_namespace_does_not_propagate_across_inter_delegate_hop()
+        -> Result<(), Box<dyn std::error::Error>> {
+            // Register two distinct delegates (A the sender, B the target). Only B
+            // performs the secret op; A's key is used solely to attest the
+            // inter-delegate origin the executor would inject.
+            let (delegate_b, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+            let key_b = delegate_b.key().clone();
+            // Synthetic sender delegate A (key only — its WASM is irrelevant here;
+            // we are testing what B's secrets bind to, given the hop's arguments).
+            let key_a = DelegateKey::new([0xA1u8; 32], CodeHash::new([0xA2u8; 32]));
+
+            // User X's connection: a secret B stores DIRECTLY under X's context.
+            let ctx_x = UserSecretContext::from_token(b"user-X");
+            let sk = vec![0xEE, 0xEE];
+            let x_value = vec![0x58; 8]; // 'X'
+            store(
+                &mut runtime,
+                &key_b,
+                Some(&ctx_x),
+                sk.clone(),
+                x_value.clone(),
+            );
+
+            // Now deliver to B the way the executor delivers an inter-delegate hop
+            // that originated from A (which was itself invoked under user X):
+            //   origin = Some(MessageOrigin::Delegate(A)),  user_context = None.
+            // B stores under the SAME secret key but a different value.
+            let hop_value = vec![0x42; 8]; // 'B' — the inter-delegate write
+            let origin = MessageOrigin::Delegate(key_a.clone());
+            let payload = bincode::serialize(&InboundAppMessage::StoreSecret {
+                key: sk.clone(),
+                value: hop_value.clone(),
+            })
+            .expect("serialize");
+            let app_msg = ApplicationMessage::new(payload);
+            let outbound = runtime
+                .inbound_app_message(
+                    &key_b,
+                    &vec![].into(),
+                    Some(&origin), // attested inter-delegate origin (A)
+                    None,          // user_context = None: the hop does NOT carry X
+                    vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+                )
+                .expect("inbound_app_message");
+            let OutboundDelegateMsg::ApplicationMessage(m) = &outbound[0] else {
+                panic!("Expected ApplicationMessage reply, got {:?}", &outbound[0]);
+            };
+            let resp: OutboundAppMessage = bincode::deserialize(&m.payload).expect("decode");
+            assert!(
+                matches!(resp, OutboundAppMessage::SecretStored),
+                "inter-delegate-hop store should succeed, got {resp:?}"
+            );
+
+            // The hop's write landed in B's Local namespace...
+            assert_eq!(
+                get(&mut runtime, &key_b, None, sk.clone()),
+                Some(hop_value),
+                "inter-delegate-hop secret must be in B's Local namespace"
+            );
+            // ...and user X's namespace is UNTOUCHED — it still holds X's value,
+            // NOT the value written during the A->B hop. This is the property:
+            // the hop did not write into (or read from) X's namespace.
+            assert_eq!(
+                get(&mut runtime, &key_b, Some(&ctx_x), sk),
+                Some(x_value),
+                "user X's secret must be unchanged by the inter-delegate hop"
+            );
+
+            std::mem::drop(temp_dir);
+            Ok(())
+        }
     }
 }
