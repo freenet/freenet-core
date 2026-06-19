@@ -2033,18 +2033,24 @@ impl P2pConnManager {
                                             ctx.addr_by_pub_key.remove(&pub_key);
                                         }
 
-                                        // Notify handshake handler to clean up
-                                        if let Err(error) = handshake_cmd_sender
-                                            .send(HandshakeCommand::DropConnection {
-                                                peer: peer.clone(),
-                                            })
-                                            .await
-                                        {
+                                        // Notify handshake handler to clean up.
+                                        // Non-blocking (#4145): runs on the event-loop task,
+                                        // so a `.send().await` that back-pressures on the
+                                        // handshake command channel (cap 128) would stall the
+                                        // loop. Drop on full — the DropConnection is redundant
+                                        // cleanup: the connection has already been removed from
+                                        // ctx.connections / addr_by_pub_key and pruned from the
+                                        // ring above, so the handshake driver's expected-inbound
+                                        // entry (if any) is the only residue, reclaimed when the
+                                        // peer's expectation later times out.
+                                        if !handshake_cmd_sender.try_send(
+                                            HandshakeCommand::DropConnection { peer: peer.clone() },
+                                        ) {
                                             tracing::warn!(
                                                 peer = %peer,
-                                                error = ?error,
                                                 phase = "cleanup",
-                                                "Failed to send drop connection command during cleanup"
+                                                "Handshake command channel full/closed during \
+                                                 cleanup; skipping redundant drop notification"
                                             );
                                         }
                                     }
@@ -2166,19 +2172,30 @@ impl P2pConnManager {
                                         .clone(),
                                     addr,
                                 );
-                                if let Err(error) = handshake_cmd_sender
-                                    .send(HandshakeCommand::ExpectInbound {
-                                        peer: peer_placeholder,
-                                        transaction: None,
-                                        transient: false,
-                                    })
-                                    .await
-                                {
+                                // Non-blocking (#4145): this ExpectPeerConnection
+                                // handler runs on the event-loop task, so a
+                                // `.send().await` that back-pressures on the
+                                // handshake command channel (cap 128) would stall the
+                                // loop. Dropping the ExpectInbound registration is
+                                // recoverable: when the inbound connection actually
+                                // arrives without a matching expectation it is still
+                                // accepted provisionally (see handle_handshake_action,
+                                // "accepting provisionally"), and the originating
+                                // connect op retries if its handshake does not
+                                // complete. We `warn!` because a dropped expectation
+                                // makes admission less reliable under load.
+                                if !handshake_cmd_sender.try_send(HandshakeCommand::ExpectInbound {
+                                    peer: peer_placeholder,
+                                    transaction: None,
+                                    transient: false,
+                                }) {
                                     tracing::warn!(
                                         peer_addr = %addr,
-                                        error = ?error,
                                         phase = "connect",
-                                        "Failed to enqueue expect inbound command - connection may be rejected"
+                                        "Handshake command channel full/closed; dropped \
+                                         ExpectInbound registration. Inbound connection will \
+                                         be accepted provisionally; connect op retries if the \
+                                         handshake does not complete."
                                     );
                                 }
                             }
@@ -2764,15 +2781,17 @@ impl P2pConnManager {
             "Removing connection from tracking map"
         );
 
-        if let Err(error) = handshake_cmd_sender
-            .send(HandshakeCommand::DropConnection { peer: peer.clone() })
-            .await
-        {
+        // Non-blocking (#4145): drop_connection_by_addr runs on the event-loop
+        // task, so a `.send().await` that back-pressures on the handshake
+        // command channel (cap 128) would stall the loop. The DropConnection is
+        // redundant teardown — we remove the connection from ctx.connections /
+        // addr_by_pub_key and prune the ring below regardless; the handshake
+        // driver's expected-inbound entry self-reclaims on its own timeout.
+        if !handshake_cmd_sender.try_send(HandshakeCommand::DropConnection { peer: peer.clone() }) {
             tracing::warn!(
                 peer = %peer,
-                error = ?error,
                 phase = "disconnect",
-                "Failed to enqueue drop connection command"
+                "Handshake command channel full/closed; skipping redundant drop notification"
             );
         }
 
@@ -3430,20 +3449,27 @@ impl P2pConnManager {
             }
         }
 
-        if let Err(error) = handshake_commands
-            .send(HandshakeCommand::Connect {
-                peer: peer.clone(),
-                transaction: tx,
-                transient,
-            })
-            .await
-        {
+        // Non-blocking (#4145): connect_peer runs on the event-loop task (it is
+        // driven by the ConnectPeer event handler), so a `.send().await` that
+        // back-pressures on the handshake command channel (cap 128) would stall
+        // the loop. On Full/Closed we run the SAME cleanup the blocking error
+        // path used: prune the in-transit connection slot and fail every
+        // awaiting callback with Err(()), so callers (including the SubscribeHint
+        // resend-waiter registered above) are notified immediately instead of
+        // parking. The connect op can retry on a later attempt; this failure is
+        // LOCAL channel contention, not a remote connection failure, so we do
+        // NOT record peer backoff.
+        if !handshake_commands.try_send(HandshakeCommand::Connect {
+            peer: peer.clone(),
+            transaction: tx,
+            transient,
+        }) {
             tracing::warn!(
                 tx = %tx,
                 remote = %peer_addr,
                 transient,
-                ?error,
-                "Failed to enqueue connect command"
+                "Handshake command channel full/closed; failed to enqueue connect \
+                 command. Failing awaiting callbacks (op will retry)."
             );
             self.bridge
                 .op_manager
@@ -3867,16 +3893,21 @@ impl P2pConnManager {
                 self.bridge
                     .op_manager
                     .on_ring_connection_lost(old_peer.pub_key());
-                if let Err(error) = handshake_commands
-                    .send(HandshakeCommand::DropConnection {
-                        peer: old_peer.clone(),
-                    })
-                    .await
-                {
+                // Non-blocking (#4145): this runs on the event-loop task while
+                // handling an inbound handshake event, so a `.send().await` that
+                // back-pressures on the handshake command channel (cap 128) would
+                // stall the loop. The DropConnection for the REPLACED (stale)
+                // connection is redundant cleanup — we've already pruned the old
+                // peer from the ring above and are about to install the new
+                // connection entry; the stale expected-inbound entry self-reclaims
+                // on its own timeout.
+                if !handshake_commands.try_send(HandshakeCommand::DropConnection {
+                    peer: old_peer.clone(),
+                }) {
                     tracing::warn!(
                         remote = %peer_addr,
-                        ?error,
-                        "Failed to notify handshake driver about replaced connection"
+                        "Handshake command channel full/closed; skipping redundant \
+                         drop notification for replaced connection"
                     );
                 }
             }
@@ -4333,14 +4364,20 @@ impl P2pConnManager {
                         tracing::debug!(remote = %remote_addr, "Recorded peer backoff after transport closure");
                     }
 
-                    if let Err(error) = handshake_commands
-                        .send(HandshakeCommand::DropConnection { peer: peer.clone() })
-                        .await
+                    // Non-blocking (#4145): handle_transport_event runs on the
+                    // event-loop task, so a `.send().await` that back-pressures on
+                    // the handshake command channel (cap 128) would stall the loop.
+                    // The DropConnection is redundant teardown — the connection is
+                    // already removed from ctx.connections and pruned from the ring
+                    // above; the handshake driver's expected-inbound entry (if any)
+                    // self-reclaims on its own timeout.
+                    if !handshake_commands
+                        .try_send(HandshakeCommand::DropConnection { peer: peer.clone() })
                     {
                         tracing::warn!(
                             remote = %remote_addr,
-                            ?error,
-                            "Failed to notify handshake driver about dropped connection"
+                            "Handshake command channel full/closed; skipping redundant \
+                             drop notification for closed connection"
                         );
                     }
                 }

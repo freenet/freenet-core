@@ -121,15 +121,17 @@ pub(crate) enum Command {
 pub(crate) struct CommandSender(mpsc::Sender<Command>);
 
 impl CommandSender {
-    pub async fn send(&self, cmd: Command) -> Result<(), mpsc::error::SendError<Command>> {
-        tracing::info!(?cmd, "handshake: sending command");
-        self.0.send(cmd).await
-    }
-
     /// Non-blocking send that returns false if the channel is full or closed.
-    /// Use this in code paths that run inside the event loop's critical section
-    /// (e.g., zombie cleanup) to avoid deadlocking with the handshake driver.
+    ///
+    /// This is the ONLY way to enqueue a handshake command. Every caller runs
+    /// on the network event-loop task, which also drives the handshake driver
+    /// that drains this channel; a blocking `.send().await` here would risk
+    /// self-stalling the loop under back-pressure (#4145). The blocking `send`
+    /// method was removed for that reason — callers must drop/log on a full
+    /// channel (each handshake command has a recoverable fallback: redundant
+    /// teardown, provisional inbound accept, or op-level retry).
     pub fn try_send(&self, cmd: Command) -> bool {
+        tracing::debug!(?cmd, "handshake: try_send command");
         match self.0.try_send(cmd) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => false,
