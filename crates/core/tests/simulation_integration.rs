@@ -3389,6 +3389,306 @@ fn test_sustained_update_fanout_no_full_state_storm() {
 }
 
 // =============================================================================
+// #4233: Event-loop liveness under wide-star sustained UPDATE fan-out
+// =============================================================================
+
+/// Shared driver for the #4233 wide-star broadcast fan-out liveness scenario.
+///
+/// ## What this guards (the safety gate for re-enabling placement migration)
+///
+/// On 2026-05-24 both production gateways wedged simultaneously (#4145) under
+/// sustained UPDATE fan-out from a popular River-style contract with dozens of
+/// downstream subscribers: the event-loop `event_loop_notification` channel
+/// filled faster than the loop could drain it, the drainers were themselves
+/// blocked downstream (a self-feeding back-pressure cycle), and subscribers
+/// went silent. #4231 broke the cycle (`try_notify_node_event` + a 500 ms
+/// `reserve()` timeout on per-peer dispatch); #4442 fixed a second, separate
+/// full-state broadcast STORM under the same load (cache the summary on ANY
+/// delivered broadcast, not just deltas). `.claude/rules/channel-safety.md`
+/// lists this bug class with 6+ production incidents.
+///
+/// The existing `test_sustained_update_fanout_no_full_state_storm` pins the
+/// #4442 storm discriminator but only at `SUBSCRIBERS = 2`. This driver scales
+/// the SAME star to the production-incident width (40-80 direct subscribers) so
+/// the fan-out actually exercises the event-loop saturation surface, and asserts
+/// **liveness** (no subscriber goes silent, backlog stays bounded, no broadcast
+/// is lost or left unapplied, all peers converge) rather than the delta/full
+/// crossover. This is the simulation-level guard #4233 asks for, and the gate
+/// that must be green before the placement-migration / `SubscribeHint` feature
+/// (which adds new `notify_node_event` fan-out sites) is re-enabled.
+///
+/// ## CRITICAL topology knob: `max_connections >= subscribers`
+///
+/// To get a TRUE wide star (one host with direct connections to all N
+/// subscribers — the production pattern from the incident) the gateway must be
+/// allowed to hold N direct connections. If `max_connections < N` a multi-hop
+/// relay tree forms instead: relay nodes cache a downstream peer's full state as
+/// its "summary" and `compute_delta` then rejects the diff as inefficient,
+/// emitting full state regardless of the #4442 gate. That changes the fan-out
+/// shape and swamps the delta/full metric — a different scenario. We size
+/// `max_connections` to `subscribers + slack` so the host fans out directly.
+///
+/// ## Signals available vs. what #4233 ideally wants
+///
+/// #4233 ideally asserts on `Event loop stats iterations` advancing and
+/// `notification_channel_pending` staying bounded. Those are emitted as raw
+/// `tracing::info!("Event loop stats")` lines in
+/// `p2p_protoc.rs` — they are NOT part of the structured `NetLogMessage` event
+/// log that `StateVerifier` / `check_convergence_from_logs` consume, and the
+/// integration test harness here captures the structured log, not raw tracing
+/// fields. So we assert on the strongest proxies the harness DOES expose:
+///   - `StalePeer` anomalies — a subscriber that stopped receiving broadcasts
+///     while others kept getting them. This is the incident's defining symptom
+///     (subscribers go silent) and is exactly what a wedged event loop produces.
+///   - `pending_op_high_water_mark` — high-water mark of in-flight transactions
+///     awaiting a reply (`pending_op_results` map size). A wedged loop lets
+///     replies pile up unboundedly; a healthy loop keeps this bounded. This is
+///     the closest available analogue to `notification_channel_pending`.
+///   - `MissingBroadcast` / `BroadcastNotApplied` — broadcast-assembly / delivery
+///     failures (a broadcast that never reached a subscriber, or reached it but
+///     was never applied).
+///   - convergence — every subscriber ends on the host's latest state.
+///
+/// To assert directly on event-loop iteration progress and
+/// `notification_channel_pending` per the letter of #4233, the harness would
+/// need to either surface those two fields as `GlobalTestMetrics` counters
+/// (mirroring `pending_op_high_water_mark`) or expose a raw-tracing capture to
+/// integration tests. That is noted as a harness follow-up; the proxies above
+/// cover the same failure mode (silent subscribers + unbounded backlog).
+#[cfg(feature = "simulation_tests")]
+fn run_fanout_liveness_scenario(network_name: &str, seed: u64, subscribers: usize) {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+
+    // UPDATEs driven into the hot contract AFTER all subscribers have
+    // bootstrapped. A sustained burst (not a single update) is what saturated
+    // the notification channel in the incident.
+    const SUSTAINED_UPDATES: usize = 40;
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+
+    // Wide star: the gateway must hold a direct connection to every subscriber,
+    // so max_connections must exceed the fan-out width. Slack covers the
+    // gateway's own bootstrap/gateway-mesh connections. If this were < N a
+    // relay tree would form and the topology would no longer be the production
+    // wide-star (see the rustdoc above).
+    let max_connections = subscribers + 16;
+
+    let (sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new(
+            network_name,
+            1,           // 1 gateway (the broadcast source / contract host)
+            subscribers, // subscriber nodes (the fan-out targets)
+            7,           // max_htl
+            3,           // rnd_if_htl_above
+            max_connections,
+            2, // min_connections
+            seed,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // CRDT contract so post-bootstrap broadcasts compute real version-aware
+    // deltas (a plain hash contract's "delta" is full state).
+    let contract = SimOperation::create_test_contract(0x42);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let initial_state = SimOperation::create_crdt_state(1, 0x10);
+
+    let mut operations = Vec::new();
+
+    // Bootstrap: gateway PUTs + subscribes (becomes the host/source), then every
+    // node subscribes directly to the gateway.
+    operations.push(ScheduledOperation::new(
+        NodeLabel::gateway(network_name, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: initial_state,
+            subscribe: true,
+        },
+    ));
+    for node_idx in 1..=subscribers {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(network_name, node_idx),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+
+    // Sustained UPDATE fan-out: a burst of UPDATEs from the gateway, each fanned
+    // out to all N subscribers. This is the load pattern that wedged production.
+    for v in 0..SUSTAINED_UPDATES {
+        let version = (v as u64) + 2; // versions 2.. (v1 was the PUT)
+        operations.push(ScheduledOperation::new(
+            NodeLabel::gateway(network_name, 0),
+            SimOperation::Update {
+                key: contract_key,
+                data: SimOperation::create_crdt_state(version, 0x20 + v as u8),
+            },
+        ));
+    }
+
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(300), // simulation duration (virtual)
+        Duration::from_secs(120), // post-op propagation wait (virtual)
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "#4233 fan-out (N={subscribers}): simulation should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let convergence =
+        rt.block_on(async { freenet::dev_tool::check_convergence_from_logs(&logs_handle).await });
+    let delta_sends = GlobalTestMetrics::delta_sends();
+    let full_state_sends = GlobalTestMetrics::full_state_sends();
+    let resync_count = GlobalTestMetrics::resync_requests();
+    // Event-loop backlog proxy (closest available analogue to
+    // notification_channel_pending): high-water mark of in-flight transactions
+    // awaiting a reply. A wedged loop lets replies pile up; a healthy loop keeps
+    // this bounded.
+    let pending_op_hwm = GlobalTestMetrics::pending_op_high_water_mark();
+
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    });
+    let stale = report.stale_peers();
+    let missing = report.missing_broadcasts();
+    let unapplied = report.unapplied_broadcasts();
+
+    tracing::info!(
+        "#4233 fanout N={}: delta_sends={}, full_state_sends={}, resyncs={}, \
+         pending_op_hwm={}, converged={}/{}, stale_peers={}, missing_broadcasts={}, \
+         unapplied_broadcasts={}",
+        subscribers,
+        delta_sends,
+        full_state_sends,
+        resync_count,
+        pending_op_hwm,
+        convergence.converged.len(),
+        convergence.total_contracts(),
+        stale.len(),
+        missing.len(),
+        unapplied.len(),
+    );
+
+    // Sanity: the scenario must actually have broadcast something, otherwise the
+    // liveness assertions below would pass vacuously.
+    assert!(
+        delta_sends + full_state_sends > 0,
+        "#4233 fan-out (N={subscribers}): no broadcasts were recorded — the \
+         fan-out scenario did not run"
+    );
+
+    // (a) LIVENESS — the incident's defining symptom. No subscriber goes silent
+    // under the fan-out. A wedged event loop strands a subscriber, surfacing as
+    // a StalePeer anomaly.
+    assert!(
+        stale.is_empty(),
+        "#4233 liveness (N={subscribers}): {} subscriber(s) went stale under \
+         sustained UPDATE fan-out — the event loop wedged and subscribers went \
+         silent (the v0.2.73 / #4145 production symptom): {:?}",
+        stale.len(),
+        stale,
+    );
+
+    // (b) EVENT-LOOP BACKLOG STAYS BOUNDED. If the loop is pinned by the
+    // broadcast fan-out, op-result replies accumulate and the high-water mark
+    // climbs without bound. The bound scales with the fan-out width (each
+    // UPDATE legitimately fans out to N subscribers, so a window of concurrent
+    // in-flight broadcast/op work is expected to grow with N) plus generous
+    // headroom, but stays far below a level that would indicate the loop is
+    // wedged and replies are piling up unboundedly. A wedged loop produces a
+    // mark that scales with updates*subscribers, dwarfing this bound.
+    let pending_op_bound = (subscribers as u64) * 8 + 256;
+    assert!(
+        pending_op_hwm < pending_op_bound,
+        "#4233 liveness (N={subscribers}): event-loop backlog high-water mark \
+         {pending_op_hwm} reached the bound {pending_op_bound} of in-flight \
+         op-results under sustained UPDATE fan-out — the event loop is falling \
+         behind (replies piling up), a sign the broadcast path is pinning the \
+         loop (the #4145 wedge condition)."
+    );
+
+    // (c) BROADCAST DELIVERY HEALTH: no broadcast lost in assembly/delivery, and
+    // none delivered-but-never-applied. Both are direct broadcast-path failures
+    // the wedge produced.
+    assert!(
+        missing.is_empty(),
+        "#4233 (N={subscribers}): {} broadcast(s) never reached a subscriber \
+         (assembly/delivery failure): {:?}",
+        missing.len(),
+        missing,
+    );
+    assert!(
+        unapplied.is_empty(),
+        "#4233 (N={subscribers}): {} broadcast(s) reached a subscriber but were \
+         never applied: {:?}",
+        unapplied.len(),
+        unapplied,
+    );
+
+    // (d) CONVERGENCE: every subscriber ends on the host's latest state. A
+    // subscriber stranded by the wedge would diverge.
+    assert!(
+        convergence.is_converged(),
+        "#4233 (N={subscribers}): broadcast delivery degraded — peers failed to \
+         converge under sustained fan-out. {} converged, {} diverged",
+        convergence.converged.len(),
+        convergence.diverged.len(),
+    );
+
+    tracing::info!(
+        "#4233 fan-out liveness (N={}) PASSED: no stale peers, \
+         pending_op_hwm={} < {}, no missing/unapplied broadcasts, converged \
+         ({} delta / {} full sends)",
+        subscribers,
+        pending_op_hwm,
+        pending_op_bound,
+        delta_sends,
+        full_state_sends,
+    );
+}
+
+/// #4233 wide-star fan-out liveness at N=40 direct subscribers.
+///
+/// See [`run_fanout_liveness_scenario`] for the full rationale. This is the
+/// lower end of the production-incident fan-out width (40-80 downstream
+/// subscribers per popular River contract).
+#[test_log::test]
+#[cfg(feature = "simulation_tests")]
+fn test_fanout_liveness_40_subscribers() {
+    run_fanout_liveness_scenario("i4233-fanout-40", 0x4233_4001_0001, 40);
+}
+
+/// #4233 wide-star fan-out liveness at N=60 direct subscribers (midpoint).
+///
+/// See [`run_fanout_liveness_scenario`].
+#[test_log::test]
+#[cfg(feature = "simulation_tests")]
+fn test_fanout_liveness_60_subscribers() {
+    run_fanout_liveness_scenario("i4233-fanout-60", 0x4233_6001_0001, 60);
+}
+
+/// #4233 wide-star fan-out liveness at N=80 direct subscribers.
+///
+/// See [`run_fanout_liveness_scenario`]. This is the upper end of the
+/// production-incident fan-out width and the widest star this test exercises.
+#[test_log::test]
+#[cfg(feature = "simulation_tests")]
+fn test_fanout_liveness_80_subscribers() {
+    run_fanout_liveness_scenario("i4233-fanout-80", 0x4233_8001_0001, 80);
+}
+
+// =============================================================================
 // Extended Edge Case Tests for Ring Protocol
 // =============================================================================
 
