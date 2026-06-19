@@ -211,12 +211,12 @@ fn retry_loading_page() -> String {
     <meta http-equiv="refresh" content="{refresh}">
     <title>Loading contract…</title>
     <style>
-        body {{{{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
                display: flex; justify-content: center; align-items: center; min-height: 100vh;
-               margin: 0; background: #0c0d0f; color: #edeeef; }}}}
-        .container {{{{ text-align: center; padding: 2rem; }}}}
-        h1 {{{{ font-size: 1.2rem; font-weight: 500; margin-bottom: 0.5rem; }}}}
-        p {{{{ color: #94969a; font-size: 0.85rem; margin-bottom: 0.3rem; }}}}
+               margin: 0; background: #0c0d0f; color: #edeeef; }}
+        .container {{ text-align: center; padding: 2rem; }}
+        h1 {{ font-size: 1.2rem; font-weight: 500; margin-bottom: 0.5rem; }}
+        p {{ color: #94969a; font-size: 0.85rem; margin-bottom: 0.3rem; }}
     </style>
 </head>
 <body>
@@ -280,6 +280,13 @@ mod tests {
         assert!(
             text.contains(r#"<meta http-equiv="refresh" content="60"#),
             "retry page must contain meta-refresh tag"
+        );
+        // The CSS must use single braces — a `format!` brace-escaping bug
+        // ({{{{ instead of {{) would emit `body {{ … }}`, invalid CSS that
+        // strips the page's styling.
+        assert!(
+            text.contains("body {") && !text.contains("body {{"),
+            "retry page CSS must emit single braces, got: {text}"
         );
     }
 
