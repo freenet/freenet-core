@@ -724,7 +724,6 @@ async fn connection_info(
     }): Query<ConnectionInfo>,
     Extension(allowed_hosts): Extension<crate::server::AllowedHosts>,
     Extension(allowed_source_cidrs): Extension<crate::server::AllowedSourceCidrs>,
-    Extension(hosted_mode): Extension<crate::server::HostedMode>,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
@@ -831,6 +830,18 @@ async fn connection_info(
     // which, if present, takes precedence (mirrors how a Bearer `auth_token`
     // header overrides its query form). The token is sensitive: we derive the
     // context and then drop the raw bytes — they are never stored or logged.
+    // Read the hosted-mode flag tolerantly: an absent `HostedMode` extension
+    // defaults to OFF. The production local path
+    // (node::run_local_node -> serve_client_api_in) always injects it, but a
+    // required `Extension<HostedMode>` extractor would make any embedded /
+    // library / secondary server that mounts this middleware without the layer
+    // 500 on every WS upgrade. Defaulting to false = hosted-off = inert/secure,
+    // which is the correct posture for any non-hosted server.
+    let hosted_mode = req
+        .extensions()
+        .get::<crate::server::HostedMode>()
+        .copied()
+        .unwrap_or_default();
     let user_token = req
         .headers()
         .get("x-freenet-user-token")
@@ -839,15 +850,19 @@ async fn connection_info(
         .or(user_token_q);
     let user_context = derive_user_context(hosted_mode.0, user_token.as_deref());
 
+    // Do NOT log credentials. The auth token, the user token, and the full
+    // request URI are all sensitive: the URI query string carries
+    // `?auth_token=<raw>` and `?userToken=<raw>` verbatim, and the user token
+    // is an especially high-value credential (durable, node-independent, names
+    // a per-user secret namespace). Log only the URI PATH and non-secret
+    // presence/derived flags. `?user_context` is safe — its `Debug` redacts the
+    // dek_secret and prints only the non-secret user_id (or `None`).
     tracing::debug!(
-        ?auth_token_q,
-        ?auth_token,
+        auth_token_present = auth_token.is_some(),
         hosted_mode = hosted_mode.0,
-        // `UserSecretContext`'s Debug redacts the dek_secret; only the
-        // non-secret user_id (or `None`) is logged. The raw token never is.
         ?user_context,
-        request_uri = ?req.uri(),
-        "connection_info middleware extracting auth token and encoding protocol",
+        request_path = req.uri().path(),
+        "connection_info middleware: resolved auth token, hosted-mode context, and encoding protocol",
     );
     req.extensions_mut().insert(encoding_protoc);
     req.extensions_mut().insert(auth_token);
