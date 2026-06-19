@@ -7751,19 +7751,68 @@ mod tests {
     #[test]
     fn connect_peer_enqueue_is_non_blocking() {
         let src = production_src();
-        assert!(
-            src.contains("ev_listener_tx.try_send("),
+        // Anchor on the SITE-1 ConnectPeer enqueue specifically. The broader
+        // "no blocking send on a watched channel" guarantee is enforced by the
+        // CI linter (.github/scripts/check_blocking_sends.py); here we pin the
+        // SITE-1 shape and the resend-waiter ordering it depends on.
+        let try_send_at = src.find("ev_listener_tx.try_send(").expect(
             "#4145 SITE 1: the ConnectPeer enqueue must use ev_listener_tx.try_send(), \
-             not a blocking .send().await (self-deadlock on the channel the loop drains)."
+             not a blocking .send().await (self-deadlock on the channel the loop drains).",
         );
-        // No single-line blocking send on the bridge channel from the event
-        // loop. (The P2pBridge::send-family methods send INTO the loop from
-        // other tasks via `self.ev_listener_tx\n.send(...)` — multi-line, not
-        // matched here — and the spawned resend-waiter's bridge_sender.send is
-        // a detached task; both are legitimately blocking.)
+
+        // Spawn-ordering invariant (review item 10): the resend-waiter must be
+        // spawned STRICTLY AFTER the try_send. The waiter does
+        // `timeout(20s, result.recv())`; it is sound only because on a Full
+        // enqueue we `continue` BEFORE spawning, so a dropped callback closes
+        // `result` and the waiter would short-circuit. If a future refactor
+        // spawned the waiter before (or unconditionally regardless of) the
+        // try_send, a dropped ConnectPeer would leave the waiter parked the full
+        // 20s on a connection that was never requested. We anchor on the waiter's
+        // 20s timeout, which is unique to this site.
+        let waiter_at = src[try_send_at..]
+            .find("Duration::from_secs(20)")
+            .map(|rel| try_send_at + rel)
+            .expect(
+                "#4145 SITE 1: the resend-waiter (timeout 20s) must appear AFTER the \
+                 ev_listener_tx.try_send — found it before, which risks a 20s hang on a \
+                 dropped ConnectPeer.",
+            );
+        // And the `continue` that short-circuits the Full path must sit between
+        // the try_send and the waiter spawn.
+        let between = &src[try_send_at..waiter_at];
         assert!(
-            !src.contains("ev_listener_tx.send("),
-            "#4145 SITE 1: found a blocking ev_listener_tx.send(...).await — must be try_send."
+            between.contains("continue"),
+            "#4145 SITE 1: the Full-path `continue` must short-circuit BEFORE the \
+             resend-waiter spawn, so a dropped ConnectPeer never spawns a waiter."
+        );
+    }
+
+    /// Source-scrape pin (review item 2): the four inline-on-event-loop
+    /// `P2pBridge::send` callers — both connection-establishment interest/cache
+    /// fan-out loops, plus the two unicast NodeEvent handlers — must use the
+    /// non-blocking `bridge.try_send(`, never `bridge.send(...).await`. A
+    /// blocking send there awaits the cap-512 ev_listener_tx the event loop
+    /// itself drains (#4145). The off-loop callers (`broadcast_to_peers`'
+    /// spawned task, the sim-only `broadcast_state_to_peers`) and the
+    /// op-driver/contract-task callers stay blocking and are NOT matched here.
+    #[test]
+    fn inline_bridge_sends_are_non_blocking() {
+        let src = production_src();
+        // The four converted call sites all read `self.bridge.try_send(`.
+        let converted = src.matches("self.bridge.try_send(").count();
+        assert!(
+            converted >= 4,
+            "#4145 item 2: expected at least four inline-on-loop self.bridge.try_send(...) \
+             call sites (2 fan-out loops + 2 unicast handlers), found {converted}."
+        );
+        // The blocking `self.bridge.send(...).await` form must be GONE from
+        // production (the remaining blocking bridge.send callers use the bare
+        // `bridge.send(` receiver — broadcast_to_peers' spawned task and the
+        // sim-only broadcast_state_to_peers — not `self.bridge.send(`).
+        assert!(
+            !src.contains("self.bridge.send("),
+            "#4145 item 2: a blocking self.bridge.send(...).await remains on an \
+             inline-on-event-loop path — must be self.bridge.try_send()."
         );
     }
 
@@ -7798,6 +7847,108 @@ mod tests {
         assert!(
             multi_line >= 1,
             "#4145: expected at least one multi-line try_send( call site."
+        );
+    }
+
+    /// Behavioral test (review item 8) for the SITE 6 connect-command-drop
+    /// cleanup. When the handshake command channel is full/closed and the
+    /// `HandshakeCommand::Connect` enqueue is dropped, `connect_peer` must:
+    ///   (a) prune the in-transit connection slot — covered by the source pin
+    ///       `connect_peer_full_handshake_channel_prunes_in_transit` below,
+    ///       since the prune touches the live ring;
+    ///   (b) resolve EVERY awaiting callback with Err(()) — never park it;
+    ///   (c) drain BOTH awaiting_connection and awaiting_connection_txs;
+    ///   (d) NOT record peer backoff (local channel contention, not a remote
+    ///       failure).
+    /// This drives the extracted `fail_awaiting_connection` helper directly,
+    /// which owns (b)-(d).
+    #[tokio::test]
+    async fn connect_command_drop_fails_callbacks_without_backoff() {
+        use crate::dev_tool::Transaction;
+        use crate::transport::ExpectedInboundTracker;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 45678);
+        let tx = Transaction::new::<crate::operations::connect::ConnectMsg>();
+
+        // Two callers queued on this peer (mirrors the Occupied-entry append).
+        let (cb1, mut rx1) = mpsc::channel::<Result<(SocketAddr, Option<usize>), ()>>(1);
+        let (cb2, mut rx2) = mpsc::channel::<Result<(SocketAddr, Option<usize>), ()>>(1);
+        state.awaiting_connection.insert(
+            peer_addr,
+            vec![
+                Box::new(cb1) as Box<dyn super::ConnectResultSender>,
+                Box::new(cb2) as Box<dyn super::ConnectResultSender>,
+            ],
+        );
+        state.awaiting_connection_txs.insert(peer_addr, vec![tx]);
+
+        // Precondition: peer is NOT in backoff.
+        assert!(
+            !state.peer_backoff.is_in_backoff(peer_addr),
+            "precondition: peer must not be in backoff before the drop"
+        );
+
+        super::fail_awaiting_connection(&mut state, peer_addr, tx, false).await;
+
+        // (b) every callback resolved with Err(()), immediately (not parked).
+        let r1 = timeout(Duration::from_secs(1), rx1.recv())
+            .await
+            .expect("callback 1 must resolve immediately, not park");
+        let r2 = timeout(Duration::from_secs(1), rx2.recv())
+            .await
+            .expect("callback 2 must resolve immediately, not park");
+        assert_eq!(r1, Some(Err(())), "callback 1 must receive Err(())");
+        assert_eq!(r2, Some(Err(())), "callback 2 must receive Err(())");
+
+        // (c) both maps drained for this peer.
+        assert!(
+            !state.awaiting_connection.contains_key(&peer_addr),
+            "awaiting_connection must be drained for the peer"
+        );
+        assert!(
+            !state.awaiting_connection_txs.contains_key(&peer_addr),
+            "awaiting_connection_txs must be drained for the peer (lock-step with callbacks)"
+        );
+
+        // (d) no peer backoff recorded.
+        assert!(
+            !state.peer_backoff.is_in_backoff(peer_addr),
+            "#4145 SITE 6: a LOCAL handshake-channel-full drop must NOT record peer \
+             backoff — that would wrongly delay a legitimate retry."
+        );
+    }
+
+    /// Source pin (review item 8, invariant a): the connect-command-drop branch
+    /// in `connect_peer` must prune the in-transit connection slot, and must NOT
+    /// record peer backoff on this path. (The prune touches the live ring, so it
+    /// is verified by source-scrape rather than the behavioral test above.)
+    #[test]
+    fn connect_peer_full_handshake_channel_prunes_in_transit() {
+        let src = production_src();
+        // Locate the Connect-command try_send and bound a window over its
+        // failure branch (the `fail_awaiting_connection` call is the tail).
+        let from = src
+            .find("try_send(HandshakeCommand::Connect {")
+            .expect("connect_peer must enqueue HandshakeCommand::Connect via try_send");
+        let end = (from + 1200).min(src.len());
+        let branch = &src[from..end];
+        assert!(
+            branch.contains("prune_in_transit_connection(peer_addr)"),
+            "#4145 SITE 6: the connect-command-drop branch must prune the in-transit \
+             connection slot so the dropped attempt does not leak a reservation."
+        );
+        assert!(
+            branch.contains("fail_awaiting_connection("),
+            "#4145 SITE 6: the connect-command-drop branch must fail awaiting callbacks \
+             via fail_awaiting_connection()."
+        );
+        // Must NOT record backoff on this local-contention path.
+        assert!(
+            !branch.contains("record_failure"),
+            "#4145 SITE 6: the connect-command-drop branch must NOT record peer backoff \
+             (local channel contention is not a remote connection failure)."
         );
     }
 }
