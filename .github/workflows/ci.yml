@@ -53,7 +53,7 @@ jobs:
     if: github.event_name == 'pull_request'
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -88,7 +88,7 @@ jobs:
     # Run in parallel with conventional_commits (both are fast GitHub-hosted checks)
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -216,7 +216,7 @@ jobs:
     if: github.event_name == 'pull_request'
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -338,7 +338,7 @@ jobs:
       RUST_MIN_STACK: 268435456
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install mold linker
         run: |
@@ -371,7 +371,7 @@ jobs:
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -409,7 +409,7 @@ jobs:
       RUST_MIN_STACK: 268435456
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install mold linker
         run: |
@@ -530,7 +530,7 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         if: steps.skip_check.outputs.skip != 'true'
 
       - name: Install mold linker
@@ -774,7 +774,7 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         if: steps.skip_check.outputs.skip != 'true'
 
       - name: Install dependencies
@@ -850,7 +850,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 10
           ref: ${{ github.event.pull_request.head.ref }}
@@ -925,7 +925,7 @@ jobs:
     # job to an already-red run (parity with the nightly notify job).
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/river-dev-notify
         with:
           message: "🚨 main CI failed — ${{ github.repository }}@${{ github.sha }} — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

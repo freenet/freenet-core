@@ -61,7 +61,7 @@ jobs:
       FREENET_BACKOFF_BASE_SECS: "5"
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install mold linker
         run: |

@@ -140,7 +140,7 @@ jobs:
       # Needed for the verify step, which sources
       # scripts/release-agent/verify-version-decision.sh so the workflow and
       # its regression test share one copy of the decision logic.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Resolve secret
         id: secret
