@@ -145,32 +145,69 @@ Each hit must be justified: is the caller a critical loop? Can the receiver bloc
 
 The `rule_lint` job in `.github/workflows/ci.yml` (rule #6) fails the
 build when a PR *adds* a blocking `.send(...).await` on an
-event-loop-reachable sender. The check is **diff-scoped to added lines
-only**, so the grandfathered sites it does not yet cover do not fail
-CI; it only guards against *new* offenders.
+event-loop-reachable sender. The matcher lives in
+`.github/scripts/check_blocking_sends.py` (with a `--self-test` run as
+its own CI step). The check is **diff-scoped to added lines only**, so
+the grandfathered sites it does not yet cover do not fail CI; it only
+guards against *new* offenders.
 
 Watched senders (the identifier allowlist): `ev_listener_tx`,
 `bridge_sender`, `handshake_cmd_sender`, `handshake_commands`,
-`events_tx`, `result_router_tx`. These are the senders that are
-drained by — or feed — the network event loop / handshake driver, so a
-blocking send on one of them can self-stall the loop under fan-out
-back-pressure (the #4145 / #4231 / #4466 incident class).
+`events_tx`, `result_router_tx`. It also matches the **wrapper form**
+`bridge.send(...).await` (`P2pBridge::send`, which enqueues onto the
+bounded `ev_listener_tx` — the most common way an on-loop caller hits
+the channel). These are the senders that are drained by — or feed — the
+network event loop / handshake driver, so a blocking send on one of
+them can self-stall the loop under fan-out back-pressure (the #4145 /
+#4231 / #4466 incident class).
+
+What the matcher handles (beyond a naive line grep):
+
+- **Multi-line statements** — `sender\n    .send(x)\n    .await` is
+  joined into one logical statement before matching.
+- **Split statements (added + unchanged lines)** — on CI it
+  reconstructs each statement from the full file content (read at HEAD),
+  then reports only statements that touch a diff-added line, so a
+  blocking send split across an added `.send(` and an unchanged
+  receiver / `.await` is caught.
+- **String literals and comments** — their *contents* are blanked
+  before matching, so prose or an assertion message that merely
+  mentions `foo.send(...).await` does not trip the lint.
+- **Wrapper stream methods** — besides `bridge.send(`, it also matches
+  `bridge.send_stream(`, `bridge.pipe_stream(`, and
+  `bridge.send_stream_with_completion(` (each blocks on `ev_listener_tx`
+  internally; forward-looking — no on-loop caller today).
+- **Non-blocking / bounded variants** — a statement that uses
+  `try_send`, `send_timeout`, or `reserve` on the send itself is not a
+  violation (it does not blanket-exempt a line just for containing the
+  token `try_send` elsewhere).
+
+The matcher's own "Known limits" (split-statement diff-only fallback,
+the soft `// channel-safety: ok` gate, raw-strings/macros, wrapper
+binding names) are documented in the script's module docstring.
 
 Escape hatch: when a blocking send on one of these is provably safe
 (e.g. a per-connection spawned task that cannot stall the loop, like
-`spawn_outbound` in `handshake.rs`), annotate the call-site line with:
+`spawn_outbound` in `handshake.rs`, or a bounded `send_timeout` on a
+task that is NOT the event loop), annotate it with:
 
 ```rust
 // channel-safety: ok — <reason>
 ```
 
-and the lint will skip it. Use this only with a real justification that
-satisfies the "Exception: same-runtime internal consumers" criteria
-above; a bare annotation with no reason is a review red flag.
+on the **call-site line OR the line immediately above it** (the linter
+checks both). Use this only with a real justification that satisfies
+the "Exception: same-runtime internal consumers" criteria above; a bare
+annotation with no reason is a review red flag.
 
-The non-blocking conversions of the eight original #4145 sites
-(ConnectPeer enqueue, six `HandshakeCommand` sends, and the
-`run_driver` inbound-accept send) are the canonical `try_send` +
-drop/log precedents — mirror them. The in-tree `try_send` template is
-`drop_zombie_connection` in `p2p_protoc.rs`
+The non-blocking conversions of the original #4145 sites (ConnectPeer
+enqueue, six `HandshakeCommand` sends, the four inline-on-loop
+`P2pBridge::send` fan-out / unicast callers, and the `run_driver`
+inbound-accept send) are the canonical precedents. The in-tree
+`try_send` template is `drop_zombie_connection` in `p2p_protoc.rs`
 (`if !handshake_cmd_sender.try_send(DropConnection{..}) { debug!(...) }`).
+Site 8 (`run_driver` accept loop) uses a bounded `events_tx.send_timeout`
+instead of an unconditional drop because it runs on the handshake driver
+task (NOT the event loop), so a bounded block there cannot reintroduce
+the event-loop wedge — and a bounded wait preserves the inbound
+connection across a transient backlog.

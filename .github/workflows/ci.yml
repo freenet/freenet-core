@@ -230,6 +230,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Self-test the rule #6 blocking-send linter (good/bad fixtures) so a
+      # regression in the matcher fails CI before it can let a real offender
+      # through or wrongly flag clean code.
+      - name: Rule #6 linter self-test
+        run: python3 .github/scripts/check_blocking_sends.py --self-test
+
       - name: Check for banned patterns in new code
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
@@ -269,46 +275,17 @@ jobs:
           fi
 
           # 6. Blocking .send(...).await on an event-loop-reachable bounded
-          # channel sender. A .send().await on these senders can stall the
-          # network event loop (or the handshake driver) under fan-out
-          # back-pressure — the #4145/#4231/#4466 incident class. New code
-          # MUST use try_send() (drop+log on Full) or
-          # tokio::time::timeout(). See .claude/rules/channel-safety.md.
-          #
-          # Diff-scoped to ADDED lines only, so the grandfathered sites this
-          # rule does not (yet) cover don't fail CI. The identifier allowlist
-          # is the set of senders that are drained by — or feed — the event
-          # loop / handshake driver. To send blockingly on one of these from
-          # a context where it is provably safe (e.g. a per-connection
-          # spawned task that cannot stall the loop), annotate the line with
-          #   // channel-safety: ok — <reason>
-          # and the lint will skip it.
-          #
-          # SENDER_RE matches the receiver-expression of a `.send(...).await`
-          # whose head identifier is one of the watched senders.
-          SENDER_RE='(ev_listener_tx|bridge_sender|handshake_cmd_sender|handshake_commands|events_tx|result_router_tx)([.a-zA-Z0-9_]*)?\.send\(.*\)\.await'
-          # Matching order matters:
-          #   1. Drop escape-hatched lines FIRST (the annotation is a comment, so
-          #      we must check it before stripping comments).
-          #   2. Strip the `//` comment portion from each remaining line, so the
-          #      pattern only matches real CODE — prose in a doc/line comment that
-          #      merely mentions `foo.send(...).await` does NOT trip the lint
-          #      (including this rule's own comments and the channel-safety docs).
-          #      The diff `+` prefix is preserved (sed only removes `//...`).
-          #   3. Match SENDER_RE on the comment-stripped code with grep -E.
-          BLOCKING_SENDS=$(echo "$ADDED" \
-            | grep -v 'try_send' \
-            | grep -v 'channel-safety: ok' \
-            | sed 's|//.*||' \
-            | grep -E "$SENDER_RE" \
-            || true)
-          if [ -n "$BLOCKING_SENDS" ]; then
+          # channel sender (the #4145/#4231/#4466 incident class). Implemented
+          # as a Python linter so it can span multi-line statements, skip
+          # string-literal / comment contents, catch the P2pBridge::send wrapper
+          # form, and honour a `// channel-safety: ok` annotation on the call
+          # line OR the line above. The linter has its own --self-test (run as
+          # the "Rule #6 linter self-test" step above). Diff-scoped to ADDED
+          # lines only. See .claude/rules/channel-safety.md and
+          # .github/scripts/check_blocking_sends.py.
+          if ! BLOCKING_OUT=$(python3 .github/scripts/check_blocking_sends.py "$BASE" "$HEAD"); then
             ERRORS="$ERRORS
-          ERROR: blocking .send(...).await on an event-loop-reachable channel in crates/core/ —
-          use try_send() (drop+log on Full) or tokio::time::timeout(), or annotate
-          the line '// channel-safety: ok — <reason>' if it is provably safe.
-          See .claude/rules/channel-safety.md (#4145/#4231/#4466 incident class).
-          $BLOCKING_SENDS"
+          $BLOCKING_OUT"
           fi
 
           # 4. Deleted test functions (removed #[test], #[tokio::test],
