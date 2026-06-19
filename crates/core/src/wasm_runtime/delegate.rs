@@ -4750,41 +4750,68 @@ mod test {
                     vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
                 )
                 .expect("inbound_app_message");
-            match &outbound[0] {
-                OutboundDelegateMsg::ApplicationMessage(m) => {
-                    bincode::deserialize(&m.payload).expect("decode outbound")
-                }
-                other => panic!("Expected ApplicationMessage reply, got {other:?}"),
-            }
+            let OutboundDelegateMsg::ApplicationMessage(m) = &outbound[0] else {
+                panic!("Expected ApplicationMessage reply, got {:?}", &outbound[0]);
+            };
+            bincode::deserialize(&m.payload).expect("decode outbound")
         }
 
-        fn store(runtime: &mut Runtime, key: &DelegateKey, ctx: Option<&UserSecretContext>, sk: Vec<u8>, sv: Vec<u8>) {
-            let resp = run(runtime, key, ctx, InboundAppMessage::StoreSecret { key: sk, value: sv });
+        fn store(
+            runtime: &mut Runtime,
+            key: &DelegateKey,
+            ctx: Option<&UserSecretContext>,
+            sk: Vec<u8>,
+            sv: Vec<u8>,
+        ) {
+            let resp = run(
+                runtime,
+                key,
+                ctx,
+                InboundAppMessage::StoreSecret { key: sk, value: sv },
+            );
             assert!(
                 matches!(resp, OutboundAppMessage::SecretStored),
                 "store should succeed, got {resp:?}"
             );
         }
 
-        fn get(runtime: &mut Runtime, key: &DelegateKey, ctx: Option<&UserSecretContext>, sk: Vec<u8>) -> Option<Vec<u8>> {
-            match run(runtime, key, ctx, InboundAppMessage::GetNonExistentSecret(sk)) {
-                OutboundAppMessage::SecretResult(v) => v,
-                other => panic!("Expected SecretResult, got {other:?}"),
-            }
+        fn get(
+            runtime: &mut Runtime,
+            key: &DelegateKey,
+            ctx: Option<&UserSecretContext>,
+            sk: Vec<u8>,
+        ) -> Option<Vec<u8>> {
+            let resp = run(
+                runtime,
+                key,
+                ctx,
+                InboundAppMessage::GetNonExistentSecret(sk),
+            );
+            let OutboundAppMessage::SecretResult(v) = resp else {
+                panic!("Expected SecretResult, got {resp:?}");
+            };
+            v
         }
 
-        fn has(runtime: &mut Runtime, key: &DelegateKey, ctx: Option<&UserSecretContext>, sk: Vec<u8>) -> bool {
-            match run(runtime, key, ctx, InboundAppMessage::HasSecret(sk)) {
-                OutboundAppMessage::SecretExists(b) => b,
-                other => panic!("Expected SecretExists, got {other:?}"),
-            }
+        fn has(
+            runtime: &mut Runtime,
+            key: &DelegateKey,
+            ctx: Option<&UserSecretContext>,
+            sk: Vec<u8>,
+        ) -> bool {
+            let resp = run(runtime, key, ctx, InboundAppMessage::HasSecret(sk));
+            let OutboundAppMessage::SecretExists(b) = resp else {
+                panic!("Expected SecretExists, got {resp:?}");
+            };
+            b
         }
 
         /// Two different user tokens get disjoint secret namespaces under the
         /// SAME delegate: A's secret is invisible to B, B's to A, and each can
         /// read only its own — even though the secret KEY is identical.
         #[tokio::test(flavor = "multi_thread")]
-        async fn two_users_have_disjoint_secret_namespaces() -> Result<(), Box<dyn std::error::Error>> {
+        async fn two_users_have_disjoint_secret_namespaces()
+        -> Result<(), Box<dyn std::error::Error>> {
             let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
             let key = delegate.key().clone();
 
@@ -4800,8 +4827,14 @@ mod test {
             store(&mut runtime, &key, Some(&ctx_b), sk.clone(), val_b.clone());
 
             // Each user reads back ONLY its own value.
-            assert_eq!(get(&mut runtime, &key, Some(&ctx_a), sk.clone()), Some(val_a));
-            assert_eq!(get(&mut runtime, &key, Some(&ctx_b), sk.clone()), Some(val_b));
+            assert_eq!(
+                get(&mut runtime, &key, Some(&ctx_a), sk.clone()),
+                Some(val_a)
+            );
+            assert_eq!(
+                get(&mut runtime, &key, Some(&ctx_b), sk.clone()),
+                Some(val_b)
+            );
 
             // A cannot read B's namespace and vice-versa is implied by the
             // distinct values above; assert existence is per-namespace too.
@@ -4809,10 +4842,21 @@ mod test {
             assert!(has(&mut runtime, &key, Some(&ctx_b), sk.clone()));
 
             // Removing A's secret leaves B's intact (independent namespaces).
-            let resp = run(&mut runtime, &key, Some(&ctx_a), InboundAppMessage::RemoveSecret(sk.clone()));
+            let resp = run(
+                &mut runtime,
+                &key,
+                Some(&ctx_a),
+                InboundAppMessage::RemoveSecret(sk.clone()),
+            );
             assert!(matches!(resp, OutboundAppMessage::SecretRemoved));
-            assert!(!has(&mut runtime, &key, Some(&ctx_a), sk.clone()), "A's secret should be gone");
-            assert!(has(&mut runtime, &key, Some(&ctx_b), sk.clone()), "B's secret must survive A's removal");
+            assert!(
+                !has(&mut runtime, &key, Some(&ctx_a), sk.clone()),
+                "A's secret should be gone"
+            );
+            assert!(
+                has(&mut runtime, &key, Some(&ctx_b), sk.clone()),
+                "B's secret must survive A's removal"
+            );
 
             std::mem::drop(temp_dir);
             Ok(())
@@ -4825,7 +4869,8 @@ mod test {
         /// expose — or collide with — the node's pre-existing single-user
         /// secrets, so the flag-off behavior is preserved byte-for-byte.
         #[tokio::test(flavor = "multi_thread")]
-        async fn local_and_user_namespaces_are_disjoint() -> Result<(), Box<dyn std::error::Error>> {
+        async fn local_and_user_namespaces_are_disjoint() -> Result<(), Box<dyn std::error::Error>>
+        {
             let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
             let key = delegate.key().clone();
             let ctx_a = UserSecretContext::from_token(b"token-A");
@@ -4837,21 +4882,36 @@ mod test {
             // Write under Local (no token).
             store(&mut runtime, &key, None, sk.clone(), local_val.clone());
             // Same key under user A.
-            store(&mut runtime, &key, Some(&ctx_a), sk.clone(), user_val.clone());
+            store(
+                &mut runtime,
+                &key,
+                Some(&ctx_a),
+                sk.clone(),
+                user_val.clone(),
+            );
 
             // Each side sees only its own.
             assert_eq!(get(&mut runtime, &key, None, sk.clone()), Some(local_val));
-            assert_eq!(get(&mut runtime, &key, Some(&ctx_a), sk.clone()), Some(user_val));
+            assert_eq!(
+                get(&mut runtime, &key, Some(&ctx_a), sk.clone()),
+                Some(user_val)
+            );
 
             // A key written only under Local is invisible to a user, and a
             // key written only under a user is invisible to Local.
             let local_only = vec![1u8];
             store(&mut runtime, &key, None, local_only.clone(), vec![1]);
-            assert!(!has(&mut runtime, &key, Some(&ctx_a), local_only.clone()), "Local-only secret must be invisible to a user");
+            assert!(
+                !has(&mut runtime, &key, Some(&ctx_a), local_only.clone()),
+                "Local-only secret must be invisible to a user"
+            );
 
             let user_only = vec![2u8];
             store(&mut runtime, &key, Some(&ctx_a), user_only.clone(), vec![2]);
-            assert!(!has(&mut runtime, &key, None, user_only), "User-only secret must be invisible to Local");
+            assert!(
+                !has(&mut runtime, &key, None, user_only),
+                "User-only secret must be invisible to Local"
+            );
 
             std::mem::drop(temp_dir);
             Ok(())
@@ -4866,7 +4926,8 @@ mod test {
         /// namespace it operates on, because that choice is carried entirely by
         /// the out-of-band `user_context` argument.
         #[tokio::test(flavor = "multi_thread")]
-        async fn namespace_is_determined_solely_by_user_context() -> Result<(), Box<dyn std::error::Error>> {
+        async fn namespace_is_determined_solely_by_user_context()
+        -> Result<(), Box<dyn std::error::Error>> {
             let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
             let key = delegate.key().clone();
 
@@ -4885,12 +4946,18 @@ mod test {
                 "A different user_context must NOT see user A's secret, even with an identical request body"
             );
             // And re-reading under A's context still finds it.
-            assert_eq!(get(&mut runtime, &key, Some(&ctx_a), sk.clone()), Some(vec![0xA1]));
+            assert_eq!(
+                get(&mut runtime, &key, Some(&ctx_a), sk.clone()),
+                Some(vec![0xA1])
+            );
 
             // Re-deriving the context from the same token reproduces the same
             // namespace (the derivation is deterministic in the token alone).
             let ctx_a_again = UserSecretContext::from_token(b"alice");
-            assert_eq!(get(&mut runtime, &key, Some(&ctx_a_again), sk), Some(vec![0xA1]));
+            assert_eq!(
+                get(&mut runtime, &key, Some(&ctx_a_again), sk),
+                Some(vec![0xA1])
+            );
 
             std::mem::drop(temp_dir);
             Ok(())
@@ -4907,7 +4974,11 @@ mod test {
             let a2 = UserSecretContext::from_token(b"token-A");
             let b = UserSecretContext::from_token(b"token-B");
             assert_eq!(a1.user_id(), a2.user_id(), "same token => same UserId");
-            assert_ne!(a1.user_id(), b.user_id(), "different tokens => different UserId");
+            assert_ne!(
+                a1.user_id(),
+                b.user_id(),
+                "different tokens => different UserId"
+            );
         }
 
         /// The `Debug` impl must never leak the `dek_secret`. A struct that
@@ -4918,9 +4989,15 @@ mod test {
         fn debug_redacts_the_dek_secret() {
             let ctx = UserSecretContext::from_token(b"super-secret-token");
             let rendered = format!("{ctx:?}");
-            assert!(rendered.contains("redacted"), "dek_secret must be redacted in Debug, got: {rendered}");
+            assert!(
+                rendered.contains("redacted"),
+                "dek_secret must be redacted in Debug, got: {rendered}"
+            );
             // The non-secret user_id is fine to show.
-            assert!(rendered.contains(&ctx.user_id().encode()), "user_id should appear in Debug");
+            assert!(
+                rendered.contains(&ctx.user_id().encode()),
+                "user_id should appear in Debug"
+            );
         }
     }
 }

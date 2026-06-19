@@ -690,6 +690,31 @@ struct ConnectionInfo {
     user_token: Option<String>,
 }
 
+/// Decide a connection's per-user secret namespace from the hosted-mode flag
+/// and the presented user token (P2 of #4381).
+///
+/// This is the security-critical gate, factored out of the `connection_info`
+/// middleware so it can be unit-tested in isolation:
+///
+/// - hosted mode OFF => always `None` (token ignored entirely; single-user).
+/// - hosted mode ON, non-empty token => `Some` context derived solely from the
+///   token bytes.
+/// - hosted mode ON, no token or empty token => `None` (this connection is
+///   single-user, just like a non-hosted node).
+///
+/// `None` everywhere means [`crate::wasm_runtime::SecretScope::Local`]
+/// downstream — byte-for-byte the pre-#4381 behavior — so the flag-off path is
+/// provably inert.
+fn derive_user_context(hosted_mode: bool, user_token: Option<&str>) -> Option<UserSecretContext> {
+    match (hosted_mode, user_token) {
+        (true, Some(token)) if !token.is_empty() => {
+            Some(UserSecretContext::from_token(token.as_bytes()))
+        }
+        // hosted on but no/empty token, or hosted off (token ignored): Local.
+        (true, _) | (false, _) => None,
+    }
+}
+
 async fn connection_info(
     Query(ConnectionInfo {
         auth_token: auth_token_q,
@@ -812,19 +837,7 @@ async fn connection_info(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_owned())
         .or(user_token_q);
-    // Only honor the token in hosted mode. With the flag off the token is
-    // ignored entirely: `None` flows through and every connection is
-    // single-user (byte-for-byte the pre-#4381 behavior).
-    let user_context: Option<UserSecretContext> = match (hosted_mode.0, user_token) {
-        (true, Some(token)) if !token.is_empty() => {
-            // Derived solely from the token bytes via domain-separated hashes.
-            Some(UserSecretContext::from_token(token.as_bytes()))
-        }
-        // hosted mode on but no/empty token => single-user for this connection.
-        (true, _) => None,
-        // hosted mode off => token ignored regardless of presence.
-        (false, _) => None,
-    };
+    let user_context = derive_user_context(hosted_mode.0, user_token.as_deref());
 
     tracing::debug!(
         ?auth_token_q,
@@ -1885,6 +1898,49 @@ mod tests {
     use freenet_stdlib::client_api::streaming::{
         CHUNK_SIZE, CHUNK_THRESHOLD, ReassemblyBuffer, chunk_request,
     };
+
+    /// The hosted-mode flag is the gate: with it OFF, a presented user token is
+    /// ignored entirely and no per-user context is derived (single-user).
+    #[test]
+    fn hosted_mode_off_ignores_user_token() {
+        assert!(
+            derive_user_context(false, Some("some-user-token")).is_none(),
+            "flag off must ignore the token entirely"
+        );
+        assert!(derive_user_context(false, None).is_none());
+        assert!(derive_user_context(false, Some("")).is_none());
+    }
+
+    /// With hosted mode ON, a non-empty token yields a context; absent/empty
+    /// token still means single-user (no context).
+    #[test]
+    fn hosted_mode_on_honors_only_a_nonempty_token() {
+        assert!(
+            derive_user_context(true, Some("alice")).is_some(),
+            "flag on + token must derive a context"
+        );
+        assert!(
+            derive_user_context(true, None).is_none(),
+            "flag on + no token => single-user"
+        );
+        assert!(
+            derive_user_context(true, Some("")).is_none(),
+            "flag on + empty token => single-user (not an empty-token namespace)"
+        );
+    }
+
+    /// The derived namespace depends only on the token bytes: same token =>
+    /// same UserId; different tokens => different UserId. This pins that the
+    /// flag-gated boundary feeds the token straight into the (deterministic)
+    /// derivation with no other inputs.
+    #[test]
+    fn derived_context_namespace_tracks_only_the_token() {
+        let a = derive_user_context(true, Some("alice")).unwrap();
+        let a_again = derive_user_context(true, Some("alice")).unwrap();
+        let b = derive_user_context(true, Some("bob")).unwrap();
+        assert_eq!(a.user_id(), a_again.user_id());
+        assert_ne!(a.user_id(), b.user_id());
+    }
 
     fn test_conn_state(encoding: EncodingProtocol) -> ConnectionState {
         ConnectionState {

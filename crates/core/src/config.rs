@@ -3143,6 +3143,60 @@ mod tests {
         );
     }
 
+    /// Hosted mode (P2 of #4381) is OFF unless explicitly enabled. This is the
+    /// inert-by-default guarantee: a node built with no hosted-mode flag never
+    /// honors a user token and stays single-user.
+    #[tokio::test]
+    async fn hosted_mode_defaults_to_off() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            ..Default::default()
+        };
+        let cfg = args.build().await.unwrap();
+        assert!(
+            !cfg.ws_api.hosted_mode,
+            "hosted_mode must default to false (inert unless explicitly enabled)"
+        );
+    }
+
+    /// When explicitly enabled, hosted mode resolves to `true` and survives a
+    /// TOML round-trip (so it works from a config file, not just the CLI flag).
+    #[tokio::test]
+    async fn hosted_mode_explicit_true_round_trips() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            ws_api: WebsocketApiArgs {
+                hosted_mode: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cfg = args.build().await.unwrap();
+        assert!(
+            cfg.ws_api.hosted_mode,
+            "explicit --hosted-mode should resolve to true"
+        );
+
+        let serialized = toml::to_string(&cfg).unwrap();
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert!(
+            reparsed.ws_api.hosted_mode,
+            "hosted_mode=true must survive a TOML serialize/deserialize round-trip"
+        );
+    }
+
     #[tokio::test]
     async fn max_hosting_storage_explicit_value_round_trips() {
         let temp_dir = tempfile::tempdir().unwrap();
