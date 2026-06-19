@@ -496,4 +496,81 @@ mod tests {
 
         assert!(!sender.try_send(Command::DropConnection { peer }));
     }
+
+    /// SITE 8 source-scrape pin (#4145): the run_driver inbound-accept arm
+    /// must forward via the non-blocking `events_tx.try_send(` and must NOT
+    /// tear the acceptor down on a transiently-full channel. A blocking
+    /// `events_tx.send(...).await` here would stall the handshake driver
+    /// (and thus stop it draining commands_rx) whenever the event loop is
+    /// momentarily behind under fan-out load. The per-connection spawned
+    /// task in `spawn_outbound` keeps its blocking `events_tx.send(...).await`
+    /// (it cannot stall the loop), so we assert specifically that the accept
+    /// arm uses try_send and that Full continues while Closed breaks.
+    #[test]
+    fn run_driver_inbound_accept_is_non_blocking() {
+        let full = include_str!("handshake.rs");
+        // Scan production only (everything before the `mod tests {` block), so
+        // this pin does not match the marker strings in its own assertions.
+        let cut = full
+            .find("\nmod tests {")
+            .expect("handshake.rs must have a `mod tests {` block");
+        let src = &full[..cut];
+
+        // The accept arm builds an Event::InboundConnection and forwards it.
+        let marker = "events_tx.try_send(Event::InboundConnection {";
+        let from = src.find(marker).expect(
+            "#4145 SITE 8: run_driver's inbound-accept arm must use \
+             events_tx.try_send(Event::InboundConnection ...), not a blocking send.",
+        );
+        // Window large enough to cover the full match (the Closed arm is the
+        // last of four arms, ~25 lines down).
+        let end = (from + 1200).min(src.len());
+        let arm = &src[from..end];
+        assert!(
+            arm.contains("TrySendError::Full") && arm.contains("TrySendError::Closed"),
+            "#4145 SITE 8: the accept arm must explicitly distinguish Full \
+             (drop + continue) from Closed (break). Slice:\n{arm}"
+        );
+        // And the blocking form must be gone from the accept arm.
+        assert!(
+            !arm.contains("events_tx.send(Event::InboundConnection"),
+            "#4145 SITE 8: a blocking events_tx.send(Event::InboundConnection ...).await \
+             remains in the accept arm — must be try_send."
+        );
+    }
+
+    /// SITE 8 behavioral pin: a FULL events channel must drop the inbound
+    /// connection and let the acceptor keep going (try_send returns Full,
+    /// not a block); a CLOSED channel is the only case that shuts the driver
+    /// down. This mirrors the match in run_driver without standing up a real
+    /// transport.
+    #[tokio::test]
+    async fn full_events_channel_does_not_break_acceptor() {
+        let (tx, mut rx) = mpsc::channel::<u32>(1);
+        tx.try_send(1).expect("fill the single slot");
+
+        // Full -> non-blocking error, acceptor would `continue`.
+        let mut should_break = false;
+        match tx.try_send(2) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => { /* drop + continue */ }
+            Err(mpsc::error::TrySendError::Closed(_)) => should_break = true,
+        }
+        assert!(
+            !should_break,
+            "a transiently-full events channel must NOT break the acceptor"
+        );
+
+        // Drain + close -> Closed -> break.
+        let _ = rx.recv().await;
+        drop(rx);
+        match tx.try_send(3) {
+            Err(mpsc::error::TrySendError::Closed(_)) => should_break = true,
+            other => panic!("expected Closed after receiver dropped, got {other:?}"),
+        }
+        assert!(
+            should_break,
+            "a closed events channel (event loop gone) must break the acceptor"
+        );
+    }
 }

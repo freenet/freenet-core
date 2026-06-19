@@ -7558,4 +7558,137 @@ mod tests {
              first target arrives via proximity announcement never drains."
         );
     }
+
+    // ----------------------------------------------------------------------
+    // #4145: blocking .send().await on event-loop-reachable channels.
+    //
+    // The behavioral tests below pin the two properties the SITE 1 fix
+    // depends on. The source-scrape pins guard against a future revert of
+    // any of the eight converted sites.
+    // ----------------------------------------------------------------------
+
+    /// SITE 1 liveness: when the event-loop bridge channel is full, the
+    /// ConnectPeer enqueue must NOT block the event loop. `try_send` on a
+    /// full bounded channel returns `Full` immediately rather than parking,
+    /// which is what lets the loop `continue` and drop the outbound attempt.
+    #[tokio::test]
+    async fn full_bridge_channel_try_send_does_not_block() {
+        // Cap 1, then fill it so the next send would block a `.send().await`.
+        let (tx, _rx) = mpsc::channel::<u32>(1);
+        tx.try_send(1).expect("first send fills the single slot");
+
+        // A blocking send would hang here forever (receiver is parked, never
+        // draining). try_send must return immediately with Full.
+        let res = timeout(Duration::from_millis(500), async { tx.try_send(2) })
+            .await
+            .expect("try_send must return immediately, never block the event loop");
+
+        match res {
+            Err(mpsc::error::TrySendError::Full(v)) => assert_eq!(v, 2),
+            other => panic!("expected TrySendError::Full, got {other:?}"),
+        }
+    }
+
+    /// SITE 1 resend-waiter safety: the waiter does `timeout(20s,
+    /// result.recv())`. If the ConnectPeer enqueue is dropped on a full
+    /// channel, the `callback` Sender (carried inside the dropped event) is
+    /// dropped too, so the waiter's `result.recv()` must observe `None`
+    /// IMMEDIATELY — never hang the full 20s on a connection that was never
+    /// requested. This reproduces the drop path: build the callback/result
+    /// pair exactly as the production code does, then drop the callback (as
+    /// dropping the TrySendError::Full(event) does) without registering it.
+    #[tokio::test]
+    async fn dropped_connect_peer_does_not_hang_resend_waiter() {
+        // Mirror the production pair: `let (callback, mut result) = mpsc::channel(10);`
+        let (callback, mut result) = mpsc::channel::<u32>(10);
+
+        // Simulate the Full path: the event (and thus `callback`) is dropped
+        // without ever being delivered to a connect op.
+        drop(callback);
+
+        // The real waiter awaits up to 20s. Bound the test well under that:
+        // if the callback drop did NOT close `result`, this recv would hang
+        // and the timeout would fire. A correct drop closes the channel so
+        // recv() resolves to None immediately.
+        let recv = timeout(Duration::from_secs(1), result.recv())
+            .await
+            .expect("result.recv() must resolve immediately when callback dropped, not hang");
+        assert!(
+            recv.is_none(),
+            "dropping the callback must close the result channel (recv -> None), \
+             so the resend-waiter short-circuits instead of waiting 20s"
+        );
+    }
+
+    /// Production source ONLY (everything before the `mod tests` block).
+    /// We deliberately do not use `strip_cfg_test_regions` here: these pins
+    /// reference the very `.send(...)` substrings they forbid, inside their
+    /// own assertion strings, so scanning the test module (whose brace-based
+    /// strip can be thrown off by `{`/`}` in earlier test string literals)
+    /// would self-trip. Slicing at the single top-level `mod tests {` is
+    /// robust and unambiguous.
+    fn production_src() -> &'static str {
+        let full = include_str!("p2p_protoc.rs");
+        let cut = full
+            .find("\nmod tests {")
+            .expect("p2p_protoc.rs must have a `mod tests {` block");
+        &full[..cut]
+    }
+
+    /// Source-scrape pin: SITE 1. The ConnectPeer enqueue in the
+    /// OutboundMessageWithTarget no-connection branch must use the
+    /// non-blocking `ev_listener_tx.try_send(` — never a blocking
+    /// `.send(...).await` — or the event loop can self-deadlock (#4145).
+    #[test]
+    fn connect_peer_enqueue_is_non_blocking() {
+        let src = production_src();
+        assert!(
+            src.contains("ev_listener_tx.try_send("),
+            "#4145 SITE 1: the ConnectPeer enqueue must use ev_listener_tx.try_send(), \
+             not a blocking .send().await (self-deadlock on the channel the loop drains)."
+        );
+        // No single-line blocking send on the bridge channel from the event
+        // loop. (The P2pBridge::send-family methods send INTO the loop from
+        // other tasks via `self.ev_listener_tx\n.send(...)` — multi-line, not
+        // matched here — and the spawned resend-waiter's bridge_sender.send is
+        // a detached task; both are legitimately blocking.)
+        assert!(
+            !src.contains("ev_listener_tx.send("),
+            "#4145 SITE 1: found a blocking ev_listener_tx.send(...).await — must be try_send."
+        );
+    }
+
+    /// Source-scrape pin: SITES 2-7. Every HandshakeCommand send from the
+    /// event-loop task must go through `try_send` (the bare blocking
+    /// `.send(HandshakeCommand::` shape stalls the loop, #4145). The blocking
+    /// `CommandSender::send` method was removed so it cannot be reintroduced.
+    #[test]
+    fn handshake_commands_are_non_blocking() {
+        let src = production_src();
+        assert!(
+            !src.contains(".send(HandshakeCommand::"),
+            "#4145 SITES 2-7: a blocking .send(HandshakeCommand::...).await remains — \
+             every handshake command from the event loop must use try_send()."
+        );
+        // Sanity: every place that constructs a HandshakeCommand for sending
+        // goes through try_send. The conversions plus the original zombie
+        // precedent give seven handshake try_send sites; some use the
+        // same-line `try_send(HandshakeCommand::` form and one uses the
+        // multi-line `try_send(\n    HandshakeCommand::` form, so we count
+        // both rather than pin a brittle single-form number.
+        let same_line = src.matches("try_send(HandshakeCommand::").count();
+        let multi_line = src.matches("try_send(").count().saturating_sub(same_line);
+        assert!(
+            same_line >= 6,
+            "#4145 SITES 2-7: expected at least six same-line \
+             try_send(HandshakeCommand::...) call sites, found {same_line}."
+        );
+        // The multi-line try_send( count includes the ev_listener_tx site too,
+        // so we only assert it is non-zero as a smoke check that the
+        // multi-line conversion (SITE 2 cleanup) survives.
+        assert!(
+            multi_line >= 1,
+            "#4145: expected at least one multi-line try_send( call site."
+        );
+    }
 }
