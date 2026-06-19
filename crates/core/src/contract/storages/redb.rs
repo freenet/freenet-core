@@ -854,7 +854,17 @@ impl ReDb {
             let (key, value) = entry?;
             let key_bytes = key.value();
             if key_bytes.len() != 96 {
-                continue; // Skip malformed entries
+                // Skip malformed entries. The write path always emits a
+                // 96-byte composite key (DelegateKey(64) || UserId(32)); a
+                // wrong length means an externally-corrupted or
+                // future-format row. Drop it rather than panic on the
+                // fixed-size `try_into`s below, and warn so the corruption
+                // is visible in monitoring.
+                tracing::warn!(
+                    len = key_bytes.len(),
+                    "Skipping malformed user-secrets-index row (key length != 96)"
+                );
+                continue;
             }
             let delegate_key_bytes: [u8; 32] = key_bytes[..32].try_into().unwrap();
             let code_hash_bytes: [u8; 32] = key_bytes[32..64].try_into().unwrap();
@@ -862,7 +872,15 @@ impl ReDb {
 
             let value_bytes = value.value();
             if value_bytes.len() % 32 != 0 {
-                continue; // Skip malformed entries
+                // Skip malformed entries. The value is a concatenation of
+                // 32-byte secret-key hashes, so a length not divisible by
+                // 32 is corruption. Warn and drop rather than splitting a
+                // partial hash.
+                tracing::warn!(
+                    len = value_bytes.len(),
+                    "Skipping malformed user-secrets-index row (value length not a multiple of 32)"
+                );
+                continue;
             }
             let mut secret_keys = Vec::with_capacity(value_bytes.len() / 32);
             for chunk in value_bytes.chunks(32) {
@@ -1345,6 +1363,134 @@ mod tests {
             rows.is_empty(),
             "malformed row must be silently skipped; got: {:?}",
             rows
+        );
+    }
+
+    // ==================== Per-User Secrets Index (P1 of #4381) ====================
+
+    /// Build a deterministic `DelegateKey` from two seed bytes (one for the
+    /// instance key, one for the code hash) for the per-user index tests.
+    fn fake_delegate_key(key_seed: u8, code_seed: u8) -> DelegateKey {
+        DelegateKey::new([key_seed; 32], CodeHash::from(&[code_seed; 32]))
+    }
+
+    /// Full store → get → remove → load round trip for the per-user secrets
+    /// index, exercising `store_user_secrets_index`, `get_user_secrets_index`,
+    /// `remove_user_secrets_index` (otherwise uncalled in non-test builds),
+    /// and `load_all_user_secrets_index`. Pins that the composite
+    /// `(DelegateKey, UserId)` key round-trips and that two users under the
+    /// same delegate are independent.
+    #[tokio::test]
+    async fn user_secrets_index_store_get_remove_load_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+
+        let delegate = fake_delegate_key(0x11, 0x22);
+        let alice: [u8; 32] = [0xAA; 32];
+        let bob: [u8; 32] = [0xBB; 32];
+        let alice_secrets = vec![[1u8; 32], [2u8; 32]];
+        let bob_secrets = vec![[3u8; 32]];
+
+        // Store under two distinct users of the same delegate.
+        db.store_user_secrets_index(&delegate, &alice, &alice_secrets)
+            .unwrap();
+        db.store_user_secrets_index(&delegate, &bob, &bob_secrets)
+            .unwrap();
+
+        // Point-query each user back.
+        assert_eq!(
+            db.get_user_secrets_index(&delegate, &alice).unwrap(),
+            Some(alice_secrets.clone()),
+            "alice's secret set must round-trip"
+        );
+        assert_eq!(
+            db.get_user_secrets_index(&delegate, &bob).unwrap(),
+            Some(bob_secrets.clone()),
+            "bob's secret set must round-trip independently"
+        );
+
+        // load_all returns both rows.
+        let mut loaded = db.load_all_user_secrets_index().unwrap();
+        loaded.sort_by_key(|((_, user), _)| *user);
+        let mut expected = vec![
+            ((delegate.clone(), alice), alice_secrets.clone()),
+            ((delegate.clone(), bob), bob_secrets.clone()),
+        ];
+        expected.sort_by_key(|((_, user), _)| *user);
+        assert_eq!(loaded, expected, "load_all must return both users' rows");
+
+        // Remove alice; bob is untouched, alice point-query is now None.
+        db.remove_user_secrets_index(&delegate, &alice).unwrap();
+        assert_eq!(
+            db.get_user_secrets_index(&delegate, &alice).unwrap(),
+            None,
+            "removed user must read back as None"
+        );
+        assert_eq!(
+            db.get_user_secrets_index(&delegate, &bob).unwrap(),
+            Some(bob_secrets.clone()),
+            "removing alice must not touch bob"
+        );
+        let remaining = db.load_all_user_secrets_index().unwrap();
+        assert_eq!(
+            remaining,
+            vec![((delegate, bob), bob_secrets)],
+            "only bob's row must remain after removing alice"
+        );
+    }
+
+    /// Malformed rows in `USER_SECRETS_INDEX_TABLE` must be skipped (not
+    /// panic, not abort the whole load), mirroring
+    /// `broken_invariants_load_skips_malformed_value`. We inject (a) a 95-byte
+    /// key (composite key must be 96 bytes) and (b) a value whose length is
+    /// not a multiple of 32, then assert a well-formed row still loads and the
+    /// malformed ones are dropped.
+    #[tokio::test]
+    async fn user_secrets_index_load_skips_malformed_rows() {
+        use redb::Database;
+        let temp_dir = TempDir::new().unwrap();
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+
+        // Seed one well-formed row through the public API so we can confirm
+        // the good row survives alongside the malformed injections.
+        let good_delegate = fake_delegate_key(0x01, 0x02);
+        let good_user: [u8; 32] = [0x03; 32];
+        let good_secrets = vec![[0x44u8; 32]];
+        db.store_user_secrets_index(&good_delegate, &good_user, &good_secrets)
+            .unwrap();
+
+        let db_path = temp_dir.path().join("db");
+        // Drop the wrapper so the raw redb file lock is released before we
+        // open it directly to inject the malformed rows.
+        drop(db);
+        let raw = Database::open(&db_path).unwrap();
+        {
+            let txn = raw.begin_write().unwrap();
+            {
+                let mut tbl = txn.open_table(USER_SECRETS_INDEX_TABLE).unwrap();
+                // (a) 95-byte key (one short of the required 96) with an
+                // otherwise valid value.
+                let short_key = [0xEE_u8; 95];
+                let valid_value = [0x55_u8; 32];
+                tbl.insert(short_key.as_slice(), valid_value.as_slice())
+                    .unwrap();
+                // (b) valid 96-byte key but a value whose length is not a
+                // multiple of 32 (33 bytes).
+                let valid_key = [0xCD_u8; 96];
+                let bogus_value = [0x66_u8; 33];
+                tbl.insert(valid_key.as_slice(), bogus_value.as_slice())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        drop(raw);
+
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+        let loaded = db.load_all_user_secrets_index().unwrap();
+        assert_eq!(
+            loaded,
+            vec![((good_delegate, good_user), good_secrets)],
+            "malformed key/value rows must be skipped, leaving only the good row"
         );
     }
 }

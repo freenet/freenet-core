@@ -962,17 +962,23 @@ impl SecretsStore {
     }
 
     /// Enumerate the snapshot history for a given `(delegate, secret_id)`
-    /// pair, oldest-first. Returns an empty vector if the secret was never
-    /// overwritten (no snapshot directory exists). Does not decrypt;
+    /// pair under `scope`, oldest-first. Returns an empty vector if the secret
+    /// was never overwritten (no snapshot directory exists). Does not decrypt;
     /// callers that want the plaintext can `restore_snapshot` and then
     /// `get_secret`.
+    ///
+    /// The snapshot history lives under the scope's `.snapshots/` directory,
+    /// so a `Local` secret and a `User` secret sharing the same `SecretsId`
+    /// have independent histories. For `Local`, `scope_dir` returns the exact
+    /// pre-#4381 path, so Local listing is byte-for-byte unchanged.
     pub fn list_snapshots(
         &self,
         delegate: &DelegateKey,
         key: &SecretsId,
+        scope: SecretScope<'_>,
     ) -> Result<Vec<SnapshotMetadata>, SecretStoreError> {
-        let delegate_path = self.base_path.join(delegate.encode());
-        let snap_dir = snapshot_dir_for(&delegate_path, key);
+        let scope_path = self.scope_dir(delegate, &scope);
+        let snap_dir = snapshot_dir_for(&scope_path, key);
         Ok(list_snapshots(&snap_dir)?)
     }
 
@@ -1005,6 +1011,12 @@ impl SecretsStore {
     /// is byte-level copy, not re-encryption. The restored ciphertext
     /// remains decryptable by whatever cipher wrote it.
     ///
+    /// The restore operates within `scope`: the snapshot history, active
+    /// path, and index repair all target the scope's tree/table. For
+    /// `Local`, `scope_dir` returns the exact pre-#4381 path and the index
+    /// repair goes through the single-user index, so Local restore is
+    /// byte-for-byte unchanged.
+    ///
     /// # Errors
     /// - `SnapshotNotFound` if no snapshot matches `timestamp_ms`
     /// - `IO` for filesystem errors during the copy / rename / fsync
@@ -1012,9 +1024,10 @@ impl SecretsStore {
         &mut self,
         delegate: &DelegateKey,
         key: &SecretsId,
+        scope: SecretScope<'_>,
         timestamp_ms: u64,
     ) -> Result<(), SecretStoreError> {
-        let delegate_path = self.base_path.join(delegate.encode());
+        let scope_path = self.scope_dir(delegate, &scope);
 
         // Byte-level restore: find the snapshot, reversibly snapshot the
         // current active value, atomic tmp+fsync+rename onto the active
@@ -1027,7 +1040,7 @@ impl SecretsStore {
         // is deliberately NOT part of the core — we thin below, after the
         // index repair, to preserve the pre-extraction order.
         match restore_snapshot_file(
-            &delegate_path,
+            &scope_path,
             &key.encode(),
             timestamp_ms,
             // The runtime API selects by timestamp only (unsuffixed-wins);
@@ -1048,34 +1061,61 @@ impl SecretsStore {
         // Index repair: only needed if the entry was previously removed
         // (e.g. user called `remove_secret` then realized they wanted a
         // value back). In the common case the secret is already in the
-        // index and the block below is a no-op. This is the only part of
-        // restore that needs the in-memory map + ReDb, so it stays here
-        // rather than in the shared filesystem core.
+        // index and the block below is a no-op (no ReDb write). This is
+        // the only part of restore that needs the in-memory map + ReDb,
+        // so it stays here rather than in the shared filesystem core.
+        // Local and User repair disjoint tables/maps; the Local branch is
+        // byte-for-byte the pre-#4381 code (it skips the ReDb write when
+        // the key is already present, rather than rewriting unconditionally).
         let secret_key = *key.hash();
-        let mut current_secrets: Vec<[u8; 32]> = self
-            .key_to_secret_part
-            .get(delegate)
-            .map(|entry| entry.value().iter().copied().collect())
-            .unwrap_or_default();
-        if !current_secrets.contains(&secret_key) {
-            current_secrets.push(secret_key);
-            self.db
-                .store_secrets_index(delegate, &current_secrets)
-                .map_err(|e| {
-                    std::io::Error::other(format!("Failed to update secrets index: {e}"))
-                })?;
-            let secret_set: HashSet<SecretKey> = current_secrets.into_iter().collect();
-            self.key_to_secret_part.insert(delegate.clone(), secret_set);
+        match &scope {
+            SecretScope::Local => {
+                let mut current_secrets: Vec<[u8; 32]> = self
+                    .key_to_secret_part
+                    .get(delegate)
+                    .map(|entry| entry.value().iter().copied().collect())
+                    .unwrap_or_default();
+                if !current_secrets.contains(&secret_key) {
+                    current_secrets.push(secret_key);
+                    self.db
+                        .store_secrets_index(delegate, &current_secrets)
+                        .map_err(|e| {
+                            std::io::Error::other(format!("Failed to update secrets index: {e}"))
+                        })?;
+                    let secret_set: HashSet<SecretKey> = current_secrets.into_iter().collect();
+                    self.key_to_secret_part.insert(delegate.clone(), secret_set);
+                }
+            }
+            SecretScope::User { id, .. } => {
+                let map_key = (delegate.clone(), **id);
+                let mut current_secrets: Vec<[u8; 32]> = self
+                    .user_key_to_secret_part
+                    .get(&map_key)
+                    .map(|entry| entry.value().iter().copied().collect())
+                    .unwrap_or_default();
+                if !current_secrets.contains(&secret_key) {
+                    current_secrets.push(secret_key);
+                    self.db
+                        .store_user_secrets_index(delegate, id.as_bytes(), &current_secrets)
+                        .map_err(|e| {
+                            std::io::Error::other(format!(
+                                "Failed to update user secrets index: {e}"
+                            ))
+                        })?;
+                    let secret_set: HashSet<SecretKey> = current_secrets.into_iter().collect();
+                    self.user_key_to_secret_part.insert(map_key, secret_set);
+                }
+            }
         }
 
         // Best-effort thin LAST — only after the index repair above has
-        // committed. Mirrors the pre-extraction order: a failed
-        // `store_secrets_index` early-returns above, so the snapshot
-        // history is left intact for a clean retry instead of having
-        // already pruned source snapshots. Thinning touches only
-        // `.snapshots/`; a failure here self-corrects on the next write.
+        // committed. Mirrors the pre-extraction order: a failed index
+        // store early-returns above, so the snapshot history is left
+        // intact for a clean retry instead of having already pruned source
+        // snapshots. Thinning touches only `.snapshots/`; a failure here
+        // self-corrects on the next write.
         if self.snapshots_enabled {
-            let snap_dir = snapshot_dir_for(&delegate_path, key);
+            let snap_dir = snapshot_dir_for(&scope_path, key);
             if snap_dir.exists() {
                 thin_snapshots(&snap_dir, &self.retention, SystemTime::now());
             }
@@ -1673,7 +1713,7 @@ mod test {
         let delegate = Delegate::from((&vec![20].into(), &vec![].into()));
         let secret_id = SecretsId::new(vec![21]);
 
-        let snaps = store.list_snapshots(delegate.key(), &secret_id)?;
+        let snaps = store.list_snapshots(delegate.key(), &secret_id, SecretScope::Local)?;
         assert!(snaps.is_empty(), "no writes → no snapshots");
         Ok(())
     }
@@ -1716,7 +1756,7 @@ mod test {
             Zeroizing::new(b"v3".to_vec()),
         )?;
 
-        let snaps = store.list_snapshots(delegate.key(), &secret_id)?;
+        let snaps = store.list_snapshots(delegate.key(), &secret_id, SecretScope::Local)?;
         assert_eq!(snaps.len(), 2, "expected two snapshots after 3 writes");
         assert!(
             snaps[0].timestamp_ms <= snaps[1].timestamp_ms,
@@ -1764,11 +1804,11 @@ mod test {
         );
 
         // Pick the (only) snapshot — it holds the v1 ciphertext.
-        let snaps = store.list_snapshots(delegate.key(), &secret_id)?;
+        let snaps = store.list_snapshots(delegate.key(), &secret_id, SecretScope::Local)?;
         assert_eq!(snaps.len(), 1);
         let v1_ts = snaps[0].timestamp_ms;
 
-        store.restore_snapshot(delegate.key(), &secret_id, v1_ts)?;
+        store.restore_snapshot(delegate.key(), &secret_id, SecretScope::Local, v1_ts)?;
 
         assert_eq!(
             store
@@ -1780,7 +1820,7 @@ mod test {
 
         // After restore there must be a snapshot of v2 (the value that was
         // replaced) so the operation is reversible.
-        let snaps_after = store.list_snapshots(delegate.key(), &secret_id)?;
+        let snaps_after = store.list_snapshots(delegate.key(), &secret_id, SecretScope::Local)?;
         assert!(
             !snaps_after.is_empty(),
             "restore must snapshot the prior active value; got {} snapshots",
@@ -1819,7 +1859,7 @@ mod test {
         )?;
 
         let err = store
-            .restore_snapshot(delegate.key(), &secret_id, 0)
+            .restore_snapshot(delegate.key(), &secret_id, SecretScope::Local, 0)
             .expect_err("timestamp 0 should not exist");
         match err {
             SecretStoreError::SnapshotNotFound { timestamp_ms, .. } => {
@@ -1868,7 +1908,7 @@ mod test {
 
         // Grab the snapshot stamp BEFORE removing the secret. `remove_secret`
         // also deletes the snapshot directory, so we need the timestamp now.
-        let snaps = store.list_snapshots(delegate.key(), &secret_id)?;
+        let snaps = store.list_snapshots(delegate.key(), &secret_id, SecretScope::Local)?;
         assert_eq!(snaps.len(), 1);
         let prior_ts = snaps[0].timestamp_ms;
 
@@ -1899,7 +1939,7 @@ mod test {
             .unwrap_or(false);
         assert!(!in_mem_before, "index should be empty after remove_secret");
 
-        store.restore_snapshot(delegate.key(), &secret_id, prior_ts)?;
+        store.restore_snapshot(delegate.key(), &secret_id, SecretScope::Local, prior_ts)?;
 
         // Post-condition: index contains the secret again AND get_secret
         // returns the restored value.
@@ -2005,7 +2045,7 @@ mod test {
         std::fs::write(snap_dir.join(format!("{base}.0")), mk(b"suffix-0"))?;
         std::fs::write(snap_dir.join(format!("{base}.1")), mk(b"suffix-1"))?;
 
-        store.restore_snapshot(delegate.key(), &secret_id, stamp)?;
+        store.restore_snapshot(delegate.key(), &secret_id, SecretScope::Local, stamp)?;
         assert_eq!(
             store
                 .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
@@ -2017,7 +2057,7 @@ mod test {
         // Now remove the unsuffixed entry and restore again: lowest
         // surviving suffix wins.
         std::fs::remove_file(snap_dir.join(&base))?;
-        store.restore_snapshot(delegate.key(), &secret_id, stamp)?;
+        store.restore_snapshot(delegate.key(), &secret_id, SecretScope::Local, stamp)?;
         assert_eq!(
             store
                 .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
@@ -2410,7 +2450,7 @@ mod test {
         });
 
         // Restore byte-copies legacy AEAD back to the active path.
-        store.restore_snapshot(delegate.key(), &secret_id, stamp)?;
+        store.restore_snapshot(delegate.key(), &secret_id, SecretScope::Local, stamp)?;
         // Active path now holds a legacy blob. `get_secret` must recover
         // the original plaintext through the legacy fallback.
         let recovered = store
@@ -3709,5 +3749,212 @@ mod test {
             "user secret file must be 0o600, got {file_mode:o}"
         );
         Ok(())
+    }
+
+    /// Snapshot history is per-scope: a second `User` write snapshots the
+    /// prior version, which `list_snapshots(.., User)` enumerates and
+    /// `restore_snapshot(.., User)` rolls back to — all without touching a
+    /// same-`SecretsId` `Local` secret's history or active value.
+    #[tokio::test]
+    async fn user_scope_second_write_creates_listable_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![180].into(), &vec![].into()));
+        let secret_id = SecretsId::new(vec![181]);
+        let alice = UserId::new([0xA5; 32]);
+        let alice_dek = user_dek(0xA5);
+        let user_scope = || SecretScope::User {
+            id: &alice,
+            dek_secret: &alice_dek,
+        };
+
+        // A Local secret with the SAME SecretsId — must be unaffected by all
+        // the User-scope writes/restore below.
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"local-untouched".to_vec()),
+        )?;
+
+        // First User write: no prior value, so no snapshot yet.
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            user_scope(),
+            Zeroizing::new(b"user-v1".to_vec()),
+        )?;
+        assert!(
+            store
+                .list_snapshots(delegate.key(), &secret_id, user_scope())?
+                .is_empty(),
+            "first User write must not create a snapshot"
+        );
+
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Second User write (distinct value): snapshots the prior version.
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            user_scope(),
+            Zeroizing::new(b"user-v2".to_vec()),
+        )?;
+        let snaps = store.list_snapshots(delegate.key(), &secret_id, user_scope())?;
+        assert_eq!(
+            snaps.len(),
+            1,
+            "second User write must snapshot the prior version"
+        );
+
+        // Active is v2; restoring the snapshot rolls back to v1.
+        assert_eq!(
+            store
+                .get_secret(delegate.key(), &secret_id, user_scope())?
+                .to_vec(),
+            b"user-v2".to_vec()
+        );
+        store.restore_snapshot(
+            delegate.key(),
+            &secret_id,
+            user_scope(),
+            snaps[0].timestamp_ms,
+        )?;
+        assert_eq!(
+            store
+                .get_secret(delegate.key(), &secret_id, user_scope())?
+                .to_vec(),
+            b"user-v1".to_vec(),
+            "restore must put the User v1 plaintext back"
+        );
+
+        // The same-SecretsId Local secret is byte-for-byte untouched: its
+        // value is unchanged and it has no snapshot history (it was written
+        // exactly once).
+        assert_eq!(
+            store
+                .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+                .to_vec(),
+            b"local-untouched".to_vec(),
+            "User-scope writes/restore must not perturb the Local secret"
+        );
+        assert!(
+            store
+                .list_snapshots(delegate.key(), &secret_id, SecretScope::Local)?
+                .is_empty(),
+            "Local secret written once must have no snapshot history"
+        );
+        Ok(())
+    }
+
+    /// Two DISTINCT users sharing the SAME `dek_secret` still get fully
+    /// independent secrets. The per-user DEK is `f(delegate, dek_secret)` and
+    /// is INTENTIONALLY independent of the `UserId` (see `derive_user_dek`):
+    /// isolation between these two users therefore rests entirely on the
+    /// `users/<id>/` PATH separation, NOT on the crypto. A future reader who
+    /// assumes the id is folded into the DEK would be wrong — this test pins
+    /// that the path is what keeps them apart.
+    #[tokio::test]
+    async fn same_dek_secret_distinct_users_isolated_only_by_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![190].into(), &vec![].into()));
+        let secret_id = SecretsId::new(vec![191]);
+
+        // Two distinct ids, ONE shared dek_secret.
+        let alice = UserId::new([0x01; 32]);
+        let bob = UserId::new([0x02; 32]);
+        let shared_dek = user_dek(0xDE);
+
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::User {
+                id: &alice,
+                dek_secret: &shared_dek,
+            },
+            Zeroizing::new(b"alice-value".to_vec()),
+        )?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::User {
+                id: &bob,
+                dek_secret: &shared_dek,
+            },
+            Zeroizing::new(b"bob-value".to_vec()),
+        )?;
+
+        // Distinct on-disk paths (the only thing separating them).
+        let alice_file = secrets_dir
+            .join(delegate.key().encode())
+            .join("users")
+            .join(alice.encode())
+            .join(secret_id.encode());
+        let bob_file = secrets_dir
+            .join(delegate.key().encode())
+            .join("users")
+            .join(bob.encode())
+            .join(secret_id.encode());
+        assert_ne!(
+            alice_file, bob_file,
+            "distinct users must occupy distinct on-disk paths"
+        );
+        assert!(alice_file.exists() && bob_file.exists());
+
+        // Independent values read back per user despite the shared dek_secret.
+        assert_eq!(
+            store
+                .get_secret(
+                    delegate.key(),
+                    &secret_id,
+                    SecretScope::User {
+                        id: &alice,
+                        dek_secret: &shared_dek
+                    }
+                )?
+                .to_vec(),
+            b"alice-value".to_vec()
+        );
+        assert_eq!(
+            store
+                .get_secret(
+                    delegate.key(),
+                    &secret_id,
+                    SecretScope::User {
+                        id: &bob,
+                        dek_secret: &shared_dek
+                    }
+                )?
+                .to_vec(),
+            b"bob-value".to_vec()
+        );
+        Ok(())
+    }
+
+    /// Pin the path-non-collision claim documented on `scope_dir`: the
+    /// `users/` segment that namespaces per-user secrets can never collide
+    /// with a real `SecretsId` on-disk name, because a bs58-encoded 32-byte
+    /// hash is never the ASCII string "users".
+    #[test]
+    fn secrets_id_encode_never_collides_with_users_segment() {
+        for seed in [0u8, 1, 42, 0xAA, 0xFF] {
+            let id = SecretsId::new(vec![seed; 4]);
+            assert_ne!(
+                id.encode(),
+                "users",
+                "a SecretsId must never encode to the reserved `users/` path segment"
+            );
+        }
     }
 }
