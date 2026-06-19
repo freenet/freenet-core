@@ -339,6 +339,18 @@ mod tests {
     }
 
     #[test]
+    fn request_error_timeout_returns_retry_page() {
+        // A RequestError(Timeout) is the same class of transient GET-fetch
+        // failure as OperationError("…timed out…") and must serve the 503
+        // auto-refresh page rather than a dead error (#3472).
+        let err = WebSocketApiError::AxumError {
+            error: ErrorKind::RequestError(RequestError::Timeout),
+        };
+        let response = err.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
     fn other_axum_error_returns_internal_server_error() {
         let err = WebSocketApiError::AxumError {
             error: ErrorKind::Unhandled {
