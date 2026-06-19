@@ -988,8 +988,15 @@ impl Ring {
         // Load routing history immediately on startup so the router doesn't
         // start cold — without this, peers route suboptimally for ~5 minutes
         // until the first periodic refresh.
+        //
+        // Health gauge (#4440): the startup read is recorded too, with the same
+        // semantics as the periodic loop (any Ok read = success, empty or not).
+        // Without this, a node whose startup read succeeds but whose every later
+        // periodic refresh fails would report `last_success_age_secs == null`
+        // forever — masking that it did succeed once.
         match register.get_router_events(Self::ROUTER_HISTORY_LIMIT).await {
             Ok(history) if !history.is_empty() => {
+                BACKGROUND_TASK_HEALTH.record_refresh_router_success();
                 tracing::info!(
                     events = history.len(),
                     "Restored routing history from event log"
@@ -997,9 +1004,11 @@ impl Ring {
                 *router.write() = Router::new(&history);
             }
             Ok(_) => {
+                BACKGROUND_TASK_HEALTH.record_refresh_router_success();
                 tracing::debug!("No routing history to restore on startup");
             }
             Err(error) => {
+                BACKGROUND_TASK_HEALTH.record_refresh_router_failure();
                 tracing::warn!(%error, "Failed to load routing history on startup, starting cold");
             }
         }
@@ -4390,6 +4399,50 @@ mod background_task_health_tests {
             s.last_success_age_secs,
             Some(100),
             "age unaffected by failures; still measured from last success"
+        );
+    }
+
+    /// Source-scrape pin: the startup read in `refresh_router` (the `match`
+    /// before the periodic loop) must record into the health gauge on every
+    /// arm, with the SAME semantics as the loop — both `Ok` arms record a
+    /// success, the `Err` arm records a failure. Without this, a node whose
+    /// startup read succeeds but whose later periodic refreshes all fail would
+    /// report `last_success_age_secs == null` forever, masking that it did
+    /// succeed once.
+    ///
+    /// Asserting against the process-global `BACKGROUND_TASK_HEALTH` after
+    /// running `refresh_router` would be racy (concurrent tests share the
+    /// global), so this pins the call sites in source instead — three startup
+    /// records plus two in the loop = five total.
+    #[test]
+    fn refresh_router_records_health_on_startup_and_in_loop() {
+        let src = include_str!("ring.rs");
+        // Restrict to the `refresh_router` fn body so unrelated mentions (this
+        // test, the rustdoc on the metrics struct) don't count. The body runs
+        // from its signature to the start of the next method.
+        let start = src
+            .find("async fn refresh_router")
+            .expect("refresh_router fn present");
+        let after = &src[start..];
+        let end = after
+            .find("async fn emit_router_snapshot_telemetry")
+            .expect("next method present");
+        let body = &after[..end];
+
+        let successes = body.matches(".record_refresh_router_success()").count();
+        let failures = body.matches(".record_refresh_router_failure()").count();
+        // Startup: 2 Ok arms (success) + 1 Err arm (failure). Loop: 1 Ok
+        // (success) + 1 Err (failure). Total 3 success + 2 failure.
+        assert_eq!(
+            successes, 3,
+            "refresh_router must record a success on both startup Ok arms and \
+             the loop Ok arm (got {successes}); a dropped startup record would \
+             mask a startup-only success in the health gauge"
+        );
+        assert_eq!(
+            failures, 2,
+            "refresh_router must record a failure on both the startup Err arm \
+             and the loop Err arm (got {failures})"
         );
     }
 }
