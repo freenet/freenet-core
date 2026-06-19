@@ -32,13 +32,18 @@ const STREAM_COMPLETION_TIMEOUT: Duration = Duration::from_secs(120);
 /// Process-global UPDATE-broadcast stream-assembly telemetry (#4440).
 ///
 /// The streaming broadcast path (`broadcast_to_single_peer`'s `use_streaming`
-/// branch) sends a multi-fragment state transfer to one subscriber peer and
-/// awaits a `BroadcastDeliveryOutcome` completion signal. A non-`Delivered`
-/// outcome (explicit `Dropped`, a dropped completion oneshot, or a
-/// `STREAM_COMPLETION_TIMEOUT`) is a stream-assembly / transfer failure — the
-/// exact signal that flagged the v0.2.73 incident, where nova/vega saw
-/// ~1500-2300 broadcast stream-assembly failures/hr against a ~0 baseline and
-/// central telemetry had no gauge for it.
+/// branch) sends a multi-fragment state transfer to one subscriber peer. Each
+/// invocation records exactly one attempt, and a failure on any of its three
+/// exits is counted: the initial metadata send returning `Err` (the stream
+/// never landed), `send_stream_with_completion` returning `Err` (dispatch
+/// failed before any fragment), or a post-dispatch non-`Delivered`
+/// `BroadcastDeliveryOutcome` (explicit `Dropped`, a dropped completion oneshot,
+/// or a `STREAM_COMPLETION_TIMEOUT`). All three are stream-assembly / transfer
+/// failures — the exact signal that flagged the v0.2.73 incident, where
+/// nova/vega saw ~1500-2300 broadcast stream-assembly failures/hr against a ~0
+/// baseline and central telemetry had no gauge for it. (The two early-send
+/// exits are the congestion failure mode that would otherwise bias the gauge
+/// LOW precisely when it matters most.)
 ///
 /// These broadcast tasks are spawned per (contract, peer) from the global
 /// `BroadcastQueue` worker, unreachable from the `Ring` telemetry-snapshot task
@@ -50,6 +55,11 @@ const STREAM_COMPLETION_TIMEOUT: Duration = Duration::from_secs(120);
 /// Both counters are monotonic; the snapshot task differences them across the
 /// cadence to derive a per-window failure rate (see
 /// `Ring::emit_router_snapshot_telemetry`).
+///
+/// Per-node meaning holds only in single-node-per-process production. In a
+/// multi-node simulation every node shares this process-global, so the snapshot
+/// reads the aggregate across all in-process nodes (same caveat as
+/// [`MODULE_CACHE_METRICS`]).
 ///
 /// [`MODULE_CACHE_METRICS`]: crate::wasm_runtime::MODULE_CACHE_METRICS
 /// [`TRANSPORT_METRICS`]: crate::transport::metrics::TRANSPORT_METRICS
@@ -700,7 +710,13 @@ pub(super) async fn broadcast_to_single_peer(
         };
 
         let send_res = bridge.send(peer_addr, net_msg).await;
-        if send_res.is_ok() {
+        if send_res.is_err() {
+            // Telemetry gauge (#4440): the initial metadata send failed, so the
+            // streaming broadcast never landed. This is a real streaming-
+            // broadcast failure — and exactly the congestion failure mode that
+            // would otherwise bias the gauge LOW when it matters most.
+            BROADCAST_STREAM_METRICS.record_attempt(false);
+        } else {
             // Create completion channel for the broadcast queue to track
             // when the actual stream transfer finishes.
             let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
@@ -715,6 +731,10 @@ pub(super) async fn broadcast_to_single_peer(
                 )
                 .await
             {
+                // Telemetry gauge (#4440): stream dispatch failed before any
+                // fragment was handed to the transport — also a streaming-
+                // broadcast failure.
+                BROADCAST_STREAM_METRICS.record_attempt(false);
                 tracing::warn!(
                     tx = %update_tx,
                     peer = %peer_addr,
@@ -743,13 +763,16 @@ pub(super) async fn broadcast_to_single_peer(
                     new_state.size(),
                     payload_size,
                 );
-                // Telemetry gauge (#4440): count every completed streaming
-                // broadcast attempt, and (when !delivered) the stream-assembly /
-                // transfer failure. This is the single classification point that
-                // sees all failure modes uniformly (Dropped, dropped oneshot,
-                // timeout). Process-global counter, read on the router_snapshot
-                // cadence — NOT a per-failure event. This is the exact signal
-                // that flagged the v0.2.73 incident.
+                // Telemetry gauge (#4440): post-dispatch outcome — a drop,
+                // dropped completion oneshot, or completion timeout is the
+                // stream-assembly / transfer failure (`!delivered`). Together
+                // with the two earlier exits above, exactly one
+                // `record_attempt` fires per streaming broadcast invocation,
+                // covering initial-send failure, stream-dispatch failure, and
+                // post-dispatch drop/timeout/dropped-oneshot. Process-global
+                // counter, read on the router_snapshot cadence — NOT a
+                // per-failure event. This is the exact signal that flagged the
+                // v0.2.73 incident.
                 BROADCAST_STREAM_METRICS.record_attempt(delivered);
                 if delivered {
                     tracing::debug!(

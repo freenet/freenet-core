@@ -1109,10 +1109,10 @@ impl Ring {
             // (for collector-side differencing) plus the per-window failure delta
             // sampled here.
             let bs = crate::node::BROADCAST_STREAM_METRICS.snapshot();
-            let broadcast_stream_failures_delta = bs
-                .streaming_failures_total
-                .saturating_sub(prev_broadcast_stream_failures_total);
-            prev_broadcast_stream_failures_total = bs.streaming_failures_total;
+            let broadcast_stream_failures_delta = window_delta(
+                bs.streaming_failures_total,
+                &mut prev_broadcast_stream_failures_total,
+            );
             snapshot.broadcast_stream_attempts_total = Some(bs.streaming_attempts_total);
             snapshot.broadcast_stream_failures_total = Some(bs.streaming_failures_total);
             snapshot.broadcast_stream_failures_last_snapshot =
@@ -4095,6 +4095,22 @@ fn classify_suspend_jump(boot_elapsed: Duration, mono_elapsed: Duration) -> Dura
     boot_elapsed.saturating_sub(mono_elapsed)
 }
 
+/// Compute the per-snapshot window delta of a monotonic counter and advance the
+/// running previous-total in one step (#4440).
+///
+/// `current_total` is this snapshot's lifetime count; `prev_total` is the count
+/// at the previous snapshot. Returns `current_total - prev_total` (saturating,
+/// so a counter reset can never underflow to a huge bogus rate) and stores
+/// `current_total` into `*prev_total` for the next call. Extracted from the
+/// snapshot loop and unit-tested because a future reorder of the
+/// compute-then-advance steps would silently zero the broadcast-failure incident
+/// signal with no test failure otherwise.
+fn window_delta(current_total: u64, prev_total: &mut u64) -> u64 {
+    let delta = current_total.saturating_sub(*prev_total);
+    *prev_total = current_total;
+    delta
+}
+
 /// Process-global health gauges for monitored background tasks (#4440).
 ///
 /// A task that the [`BackgroundTaskMonitor`](crate::node::background_task_monitor)
@@ -4112,6 +4128,12 @@ fn classify_suspend_jump(boot_elapsed: Duration, mono_elapsed: Duration) -> Dura
 /// `BROADCAST_STREAM_METRICS`. Currently scoped to `refresh_router`, the one
 /// monitored task with a non-fatal per-run failure mode; add fields here if
 /// another monitored task grows the same pattern.
+///
+/// Per-node meaning holds only in single-node-per-process production. In a
+/// multi-node simulation every node's `refresh_router` shares this
+/// process-global, so the snapshot reads the aggregate (last-write-wins
+/// last-success across nodes; the consecutive-failure run is shared) — same
+/// caveat as `MODULE_CACHE_METRICS` / `BROADCAST_STREAM_METRICS`.
 static BACKGROUND_TASK_HEALTH: std::sync::LazyLock<BackgroundTaskHealth> =
     std::sync::LazyLock::new(BackgroundTaskHealth::new);
 
@@ -4369,6 +4391,37 @@ mod background_task_health_tests {
             Some(100),
             "age unaffected by failures; still measured from last success"
         );
+    }
+}
+
+#[cfg(test)]
+mod window_delta_tests {
+    //! Pins the per-snapshot window-delta of the monotonic broadcast-failure
+    //! counter (#4440): it must return `current - prev` AND advance `prev` to
+    //! `current`, so a reorder of those two steps (which would silently zero
+    //! the incident signal) fails CI.
+
+    use super::window_delta;
+
+    #[test]
+    fn broadcast_failure_window_delta_computes_and_advances_prev() {
+        let mut prev: u64 = 10;
+        // First window: 13 - 10 = 3, and prev advances to 13.
+        assert_eq!(window_delta(13, &mut prev), 3, "delta over the window");
+        assert_eq!(prev, 13, "prev advanced to current");
+        // No new failures: 13 - 13 = 0, prev stays 13.
+        assert_eq!(window_delta(13, &mut prev), 0, "no failures => zero delta");
+        assert_eq!(prev, 13);
+        // Next window: 20 - 13 = 7, prev advances to 20.
+        assert_eq!(window_delta(20, &mut prev), 7, "delta resumes from prev");
+        assert_eq!(prev, 20, "prev advanced to current again");
+        // Counter reset / restart must saturate to 0, never underflow.
+        assert_eq!(
+            window_delta(5, &mut prev),
+            0,
+            "reset saturates, no underflow"
+        );
+        assert_eq!(prev, 5, "prev tracks the reset value");
     }
 }
 
