@@ -13,6 +13,7 @@ use super::native_api::{
     self, CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV, DelegateCallEnv, DelegateContextEntry,
     InstanceId,
 };
+use super::secrets_store::UserSecretContext;
 use super::{Runtime, RuntimeResult};
 use crate::wasm_runtime::delegate_api::DelegateApiVersion;
 
@@ -59,6 +60,7 @@ pub(crate) trait DelegateRuntimeInterface {
         key: &DelegateKey,
         params: &Parameters,
         origin: Option<&MessageOrigin>,
+        user_context: Option<&UserSecretContext>,
         inbound: Vec<InboundDelegateMsg>,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>>;
 
@@ -83,6 +85,7 @@ impl Runtime {
         delegate_key: &DelegateKey,
         params: &Parameters<'_>,
         origin: Option<&MessageOrigin>,
+        user_context: Option<&UserSecretContext>,
         msg: &InboundDelegateMsg,
         context: Vec<u8>,
         handle: &InstanceHandle,
@@ -134,6 +137,12 @@ impl Runtime {
                 &mut self.delegate_store,
                 0, // creation_depth: always 0 for top-level calls
                 origin_contracts,
+                // Clone the connection's user context into the env so the
+                // owned `dek_secret` outlives every secret call during this
+                // `process()` invocation. The context is read-only here; the
+                // delegate cannot mutate or forge it. `None` outside hosted
+                // mode keeps secret ops on `SecretScope::Local`.
+                user_context.cloned(),
             )
         };
 
@@ -500,6 +509,7 @@ impl DelegateRuntimeInterface for Runtime {
         delegate_key: &DelegateKey,
         params: &Parameters,
         origin: Option<&MessageOrigin>,
+        user_context: Option<&UserSecretContext>,
         inbound: Vec<InboundDelegateMsg>,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>> {
         let mut results = Vec::with_capacity(inbound.len());
@@ -570,6 +580,7 @@ impl DelegateRuntimeInterface for Runtime {
                             delegate_key,
                             params,
                             origin,
+                            user_context,
                             &app_msg,
                             std::mem::take(&mut context),
                             &running.handle,
@@ -595,6 +606,7 @@ impl DelegateRuntimeInterface for Runtime {
                             delegate_key,
                             params,
                             origin,
+                            user_context,
                             &InboundDelegateMsg::UserResponse(response),
                             std::mem::take(&mut context),
                             &running.handle,
@@ -620,6 +632,7 @@ impl DelegateRuntimeInterface for Runtime {
                             delegate_key,
                             params,
                             origin,
+                            user_context,
                             &InboundDelegateMsg::GetContractResponse(response),
                             std::mem::take(&mut context),
                             &running.handle,
@@ -649,6 +662,7 @@ impl DelegateRuntimeInterface for Runtime {
                             delegate_key,
                             params,
                             origin,
+                            user_context,
                             &msg,
                             std::mem::take(&mut context),
                             &running.handle,
@@ -679,6 +693,7 @@ impl DelegateRuntimeInterface for Runtime {
                             delegate_key,
                             params,
                             origin,
+                            user_context,
                             &other,
                             std::mem::take(&mut context),
                             &running.handle,

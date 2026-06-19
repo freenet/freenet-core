@@ -2761,6 +2761,7 @@ pub async fn run_local_node(
             notification_channel,
             token,
             origin_contract,
+            user_context,
             ..
         } = req;
         tracing::debug!(client_id = %id, ?token, "Received OpenRequest -> {request}");
@@ -2786,7 +2787,14 @@ pub async fn run_local_node(
                     ?origin_contract,
                     "Handling ClientRequest::DelegateOp"
                 );
-                executor.delegate_request(op, origin_contract.as_ref(), None)
+                // `user_context` is `Some` only in hosted mode with a user token;
+                // `None` keeps secrets on the single-user `SecretScope::Local`.
+                executor.delegate_request(
+                    op,
+                    origin_contract.as_ref(),
+                    None,
+                    user_context.as_ref(),
+                )
             }
             ClientRequest::Disconnect { cause } => {
                 if let Some(cause) = cause {

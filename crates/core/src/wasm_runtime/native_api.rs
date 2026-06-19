@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use super::contract_store::ContractStore;
 use super::delegate_store::DelegateStore;
 use super::runtime::InstanceInfo;
-use super::secrets_store::{SecretScope, SecretsStore};
+use super::secrets_store::{SecretScope, SecretsStore, UserSecretContext};
 use crate::contract::storages::Storage;
 
 /// This is a map of starting addresses of the instance memory space.
@@ -367,6 +367,19 @@ pub(super) struct DelegateCallEnv {
     secret_store: std::cell::UnsafeCell<*mut SecretsStore>,
     /// The delegate key, needed to scope secret access.
     pub delegate_key: DelegateKey,
+    /// Optional per-user secret namespace for this call, derived ONCE at the
+    /// WS connection boundary from the connection's user token (hosted mode,
+    /// P2 of #4381). When `Some`, the secret host functions
+    /// (`get_secret`/`set_secret`/`remove_secret`/`get_secret_len`) operate on
+    /// [`SecretScope::User`] keyed by this context; when `None` they use
+    /// [`SecretScope::Local`] — byte-for-byte the single-user behavior.
+    ///
+    /// This is OWNED (not a borrow) so the `dek_secret` it holds outlives every
+    /// secret call made during this `process()` invocation. It is supplied by
+    /// the runtime from the connection context and is NEVER settable from
+    /// inside the WASM sandbox, a delegate message, or any request body — that
+    /// is the unforgeability invariant of the per-user namespace.
+    user_context: Option<UserSecretContext>,
     /// Read-only pointer to the ContractStore for index lookups
     /// (ContractInstanceId → CodeHash). Valid only during synchronous process().
     contract_store: *const ContractStore,
@@ -455,11 +468,13 @@ impl DelegateCallEnv {
         delegate_store: &mut DelegateStore,
         creation_depth: u32,
         origin_contracts: Vec<ContractInstanceId>,
+        user_context: Option<UserSecretContext>,
     ) -> Self {
         Self {
             context,
             secret_store: std::cell::UnsafeCell::new(secret_store as *mut SecretsStore),
             delegate_key,
+            user_context,
             contract_store: contract_store as *const ContractStore,
             state_store_db,
             state_write_callback,
@@ -467,6 +482,19 @@ impl DelegateCallEnv {
             creation_depth,
             creations_this_call: std::cell::Cell::new(0),
             origin_contracts,
+        }
+    }
+
+    /// The [`SecretScope`] for this call's secret operations.
+    ///
+    /// Returns [`SecretScope::User`] (borrowing the connection's
+    /// [`UserSecretContext`]) when this call runs under a hosted-mode user
+    /// token, else [`SecretScope::Local`]. The borrow is tied to `&self`, so
+    /// the `dek_secret` is never copied out of the owned context.
+    fn secret_scope(&self) -> SecretScope<'_> {
+        match &self.user_context {
+            Some(ctx) => ctx.scope(),
+            None => SecretScope::Local,
         }
     }
 
@@ -1105,11 +1133,13 @@ pub(super) mod delegate_secrets {
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
-        // Look up the secret. P1 of #4381 added an optional per-user scope;
-        // the delegate host ABI is still single-user, so always Local here.
+        // Look up the secret. The scope is `Local` for single-user nodes and
+        // `User` when this call runs under a hosted-mode user token (P2 of
+        // #4381). The scope comes solely from the connection-derived
+        // `user_context`, never from anything the delegate can influence.
         match env
             .secret_store()
-            .get_secret(&env.delegate_key, &secret_id, SecretScope::Local)
+            .get_secret(&env.delegate_key, &secret_id, env.secret_scope())
         {
             Ok(plaintext) => {
                 let len = plaintext.len();
@@ -1177,10 +1207,11 @@ pub(super) mod delegate_secrets {
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
-        // Look up the secret (single-user Local scope; see get_secret_len).
+        // Look up the secret (scope per the connection's user_context; see
+        // get_secret_len).
         match env
             .secret_store()
-            .get_secret(&env.delegate_key, &secret_id, SecretScope::Local)
+            .get_secret(&env.delegate_key, &secret_id, env.secret_scope())
         {
             Ok(plaintext) => {
                 let secret_len = plaintext.len();
@@ -1296,12 +1327,11 @@ pub(super) mod delegate_secrets {
             unsafe { std::slice::from_raw_parts(val_src, val_len as usize) }.to_vec(),
         );
 
-        match env.secret_store_mut().store_secret(
-            &env.delegate_key,
-            &secret_id,
-            SecretScope::Local,
-            value,
-        ) {
+        let scope = env.secret_scope();
+        match env
+            .secret_store_mut()
+            .store_secret(&env.delegate_key, &secret_id, scope, value)
+        {
             Ok(()) => error_codes::SUCCESS,
             Err(e) => {
                 tracing::error!("delegate set_secret failed: {e}");
@@ -1352,7 +1382,7 @@ pub(super) mod delegate_secrets {
 
         match env
             .secret_store()
-            .get_secret(&env.delegate_key, &secret_id, SecretScope::Local)
+            .get_secret(&env.delegate_key, &secret_id, env.secret_scope())
         {
             Ok(_) => 1,
             Err(e) => {
@@ -1408,11 +1438,11 @@ pub(super) mod delegate_secrets {
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
-        match env.secret_store_mut().remove_secret(
-            &env.delegate_key,
-            &secret_id,
-            SecretScope::Local,
-        ) {
+        let scope = env.secret_scope();
+        match env
+            .secret_store_mut()
+            .remove_secret(&env.delegate_key, &secret_id, scope)
+        {
             Ok(()) => error_codes::SUCCESS,
             Err(e) => {
                 tracing::debug!(

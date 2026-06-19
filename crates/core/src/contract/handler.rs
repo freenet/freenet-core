@@ -30,6 +30,7 @@ use crate::client_events::{AuthToken, HostResult, RequestId};
 use crate::config::Config;
 use crate::message::{QueryResult, Transaction};
 use crate::node::OpManager;
+use crate::wasm_runtime::UserSecretContext;
 use std::num::NonZeroUsize;
 
 pub(crate) struct ClientResponsesReceiver(UnboundedReceiver<(ClientId, RequestId, HostResult)>);
@@ -663,6 +664,14 @@ pub(crate) enum ContractHandlerEvent {
     DelegateRequest {
         req: DelegateRequest<'static>,
         origin_contract: Option<ContractInstanceId>,
+        /// Per-connection per-user secret namespace (hosted mode, P2 of #4381),
+        /// derived once at the WS connection boundary from the connection's
+        /// user token. `None` outside hosted mode or when no token was
+        /// presented. Carried here on a separate channel from `req`/`origin_contract`
+        /// so nothing in the request body can forge it. The owned
+        /// `UserSecretContext` holds the `dek_secret` in `Zeroizing`; its
+        /// `Debug` impl redacts the secret, so logging this event is safe.
+        user_context: Option<UserSecretContext>,
     },
     DelegateResponse(Vec<OutboundDelegateMsg>),
     /// Try to push/put a new value into the contract
@@ -767,6 +776,10 @@ impl std::fmt::Display for ContractHandlerEvent {
             ContractHandlerEvent::DelegateRequest {
                 req,
                 origin_contract,
+                // `user_context` deliberately omitted from Display: it names a
+                // per-user namespace and carries a (redacted-in-Debug) secret;
+                // it has no place in a human-facing event description.
+                ..
             } => {
                 write!(
                     f,

@@ -130,6 +130,7 @@ use crate::{
 
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
 use crate::server::client_api::OriginContractMap;
+use crate::wasm_runtime::UserSecretContext;
 
 /// Checks if a WebSocket Origin header value refers to localhost.
 ///
@@ -528,6 +529,7 @@ impl WebSocketProxy {
     /// Returns `None` if the client has already disconnected (response channel
     /// closed or missing). Returning `None` instead of an error prevents
     /// transient disconnects from killing `client_fn` (#3479).
+    #[allow(clippy::too_many_arguments)]
     fn setup_subscription(
         &self,
         client_id: ClientId,
@@ -535,6 +537,7 @@ impl WebSocketProxy {
         req: Box<ClientRequest<'static>>,
         auth_token: Option<AuthToken>,
         origin_contract: Option<ContractInstanceId>,
+        user_context: Option<UserSecretContext>,
     ) -> Option<OpenRequest<'static>> {
         let (tx, rx) =
             tokio::sync::mpsc::channel(crate::contract::SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
@@ -554,7 +557,8 @@ impl WebSocketProxy {
             OpenRequest::new(client_id, req)
                 .with_notification(tx)
                 .with_token(auth_token)
-                .with_origin_contract(origin_contract),
+                .with_origin_contract(origin_contract)
+                .with_user_context(user_context),
         )
     }
 
@@ -584,6 +588,7 @@ impl WebSocketProxy {
                 req,
                 auth_token,
                 origin_contract,
+                user_context,
                 ..
             } => {
                 // Extract the subscription key if this request needs a notification channel.
@@ -610,8 +615,14 @@ impl WebSocketProxy {
 
                 let open_req = if let Some(key) = sub_key {
                     tracing::debug!(%client_id, contract = %key, "setting up subscription channel");
-                    match self.setup_subscription(client_id, key, req, auth_token, origin_contract)
-                    {
+                    match self.setup_subscription(
+                        client_id,
+                        key,
+                        req,
+                        auth_token,
+                        origin_contract,
+                        user_context,
+                    ) {
                         Some(r) => r,
                         None => return Ok(None),
                     }
@@ -619,6 +630,7 @@ impl WebSocketProxy {
                     OpenRequest::new(client_id, req)
                         .with_token(auth_token)
                         .with_origin_contract(origin_contract)
+                        .with_user_context(user_context)
                 };
                 Ok(Some(open_req))
             }
@@ -666,6 +678,16 @@ struct ConnectionInfo {
     /// Accepted for backward compatibility but ignored — streaming is always enabled.
     #[allow(dead_code)]
     streaming: Option<bool>,
+    /// Durable per-user token for hosted mode (P2 of #4381). This is a SEPARATE
+    /// credential from `auth_token` (the per-app session token minted by the
+    /// HTTP attestation flow): `auth_token` identifies which app-contract a
+    /// connection is acting for, whereas `user_token` identifies WHICH USER's
+    /// secret namespace the connection's delegate secret operations bind to.
+    /// The browser shell page supplies it as the `userToken` query parameter on
+    /// the WS upgrade URL (the P2-frontend follow-up mints/stores/presents it).
+    /// It is honored ONLY when the node runs in hosted mode; otherwise it is
+    /// ignored entirely and every connection stays single-user.
+    user_token: Option<String>,
 }
 
 async fn connection_info(
@@ -673,9 +695,11 @@ async fn connection_info(
         auth_token: auth_token_q,
         encoding_protocol,
         streaming: _,
+        user_token: user_token_q,
     }): Query<ConnectionInfo>,
     Extension(allowed_hosts): Extension<crate::server::AllowedHosts>,
     Extension(allowed_source_cidrs): Extension<crate::server::AllowedSourceCidrs>,
+    Extension(hosted_mode): Extension<crate::server::HostedMode>,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
@@ -769,11 +793,52 @@ async fn connection_info(
         }
     }
 
+    // Derive the per-connection user secret context (hosted mode, P2 of #4381).
+    //
+    // SECURITY-CRITICAL boundary: this is the ONE place a `UserSecretContext` is
+    // constructed. It happens here, at connection establishment, from the user
+    // token presented on the upgrade request — never from a `ClientRequest`, a
+    // delegate message, or anything reachable from WASM. Downstream the context
+    // is immutable and travels with the connection.
+    //
+    // Token source: the `userToken` query parameter (canonical, supplied by the
+    // browser shell page on the WS URL), OR an `X-Freenet-User-Token` header
+    // which, if present, takes precedence (mirrors how a Bearer `auth_token`
+    // header overrides its query form). The token is sensitive: we derive the
+    // context and then drop the raw bytes — they are never stored or logged.
+    let user_token = req
+        .headers()
+        .get("x-freenet-user-token")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned())
+        .or(user_token_q);
+    // Only honor the token in hosted mode. With the flag off the token is
+    // ignored entirely: `None` flows through and every connection is
+    // single-user (byte-for-byte the pre-#4381 behavior).
+    let user_context: Option<UserSecretContext> = match (hosted_mode.0, user_token) {
+        (true, Some(token)) if !token.is_empty() => {
+            // Derived solely from the token bytes via domain-separated hashes.
+            Some(UserSecretContext::from_token(token.as_bytes()))
+        }
+        // hosted mode on but no/empty token => single-user for this connection.
+        (true, _) => None,
+        // hosted mode off => token ignored regardless of presence.
+        (false, _) => None,
+    };
+
     tracing::debug!(
-        ?auth_token_q, ?auth_token, request_uri = ?req.uri(), "connection_info middleware extracting auth token and encoding protocol",
+        ?auth_token_q,
+        ?auth_token,
+        hosted_mode = hosted_mode.0,
+        // `UserSecretContext`'s Debug redacts the dek_secret; only the
+        // non-secret user_id (or `None`) is logged. The raw token never is.
+        ?user_context,
+        request_uri = ?req.uri(),
+        "connection_info middleware extracting auth token and encoding protocol",
     );
     req.extensions_mut().insert(encoding_protoc);
     req.extensions_mut().insert(auth_token);
+    req.extensions_mut().insert(user_context);
     // `streaming` query parameter is accepted but ignored — streaming is now
     // always enabled for payloads exceeding CHUNK_THRESHOLD (512 KiB).
 
@@ -787,6 +852,10 @@ async fn websocket_commands(
     Extension(rs): Extension<WebSocketRequest>,
     Extension(origin_contracts): Extension<OriginContractMap>,
     Extension(api_version): Extension<ApiVersion>,
+    // The per-connection user secret context derived in `connection_info`
+    // (hosted mode). `None` outside hosted mode or when no user token was
+    // presented. Owned and moved into the connection task below.
+    Extension(user_context): Extension<Option<UserSecretContext>>,
 ) -> Response {
     let on_upgrade = move |ws: WebSocket| async move {
         // Get the data we need from the DashMap
@@ -844,6 +913,7 @@ async fn websocket_commands(
         if let Err(error) = websocket_interface(
             rs.clone(),
             auth_and_instance,
+            user_context,
             token_is_invalid,
             encoding_protoc,
             api_version,
@@ -883,6 +953,8 @@ async fn notify_disconnect(
             req: Box::new(ClientRequest::Disconnect { cause: None }),
             auth_token: auth_token.as_ref().map(|t| t.0.clone()),
             origin_contract: auth_token.as_ref().map(|t| t.1),
+            // Synthetic disconnect: no secret operations, so no user context.
+            user_context: None,
             api_version,
         })
         .await
@@ -894,6 +966,11 @@ async fn notify_disconnect(
 async fn websocket_interface(
     request_sender: WebSocketRequest,
     mut auth_token: Option<(AuthToken, ContractInstanceId)>,
+    // Per-connection user secret context (hosted mode). Derived once at upgrade
+    // and immutable for the life of this connection; cloned into each
+    // `ClientConnection::Request` so every request from this connection (and
+    // only this connection) binds to the same user namespace.
+    user_context: Option<UserSecretContext>,
     token_is_invalid: bool,
     encoding_protoc: EncodingProtocol,
     api_version: ApiVersion,
@@ -1016,6 +1093,7 @@ async fn websocket_interface(
                     &request_sender,
                     &mut auth_token.as_mut().map(|t| t.0.clone()),
                     auth_token.as_mut().map(|t| t.1),
+                    user_context.as_ref(),
                     api_version,
                     &mut delegate_rate_limiter,
                     &mut conn_state,
@@ -1280,6 +1358,7 @@ async fn process_client_request(
     request_sender: &mpsc::Sender<ClientConnection>,
     auth_token: &mut Option<AuthToken>,
     origin_contract: Option<ContractInstanceId>,
+    user_context: Option<&UserSecretContext>,
     api_version: ApiVersion,
     rate_limiter: &mut DelegateRateLimiter,
     conn_state: &mut ConnectionState,
@@ -1454,6 +1533,10 @@ async fn process_client_request(
             req: Box::new(req),
             auth_token: auth_token.clone(),
             origin_contract,
+            // Clone the connection's user context into this request. Every
+            // request from this connection carries the SAME context, derived
+            // once at upgrade; a client cannot vary it per-request.
+            user_context: user_context.cloned(),
             api_version,
         })
         .await

@@ -179,6 +179,7 @@ impl Default for ConfigArgs {
                 token_cleanup_interval_seconds: None,
                 allowed_host: None,
                 allowed_source_cidrs: None,
+                hosted_mode: None,
             },
             secrets: Default::default(),
             log_level: Some(tracing::log::LevelFilter::Info),
@@ -351,6 +352,7 @@ impl ConfigArgs {
                         .collect(),
                 );
             }
+            self.ws_api.hosted_mode.get_or_insert(cfg.ws_api.hosted_mode);
             self.network_api
                 .address
                 .get_or_insert(cfg.network_api.address);
@@ -796,6 +798,7 @@ impl ConfigArgs {
                     })
                     .transpose()?
                     .unwrap_or_default(),
+                hosted_mode: self.ws_api.hosted_mode.unwrap_or(false),
             },
             secrets,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
@@ -1573,6 +1576,17 @@ pub struct WebsocketApiArgs {
         skip_serializing_if = "Option::is_none"
     )]
     pub allowed_source_cidrs: Option<Vec<String>>,
+
+    /// Opt-in hosted mode (P2 of #4381): honor a per-connection durable user
+    /// token (the `userToken` query parameter on the WebSocket upgrade) and
+    /// give that connection its own per-user delegate-secret namespace.
+    ///
+    /// OFF by default. When off, `userToken` is ignored and every connection is
+    /// single-user, byte-for-byte today's behavior. Enable only on a node you
+    /// intend to operate as a shared public proxy for untrusted users.
+    #[arg(long = "hosted-mode", env = "FREENET_HOSTED_MODE")]
+    #[serde(rename = "hosted-mode", skip_serializing_if = "Option::is_none")]
+    pub hosted_mode: Option<bool>,
 }
 
 /// Default telemetry endpoint (nova.locut.us OTLP collector).
@@ -1758,6 +1772,18 @@ pub struct WebsocketApiConfig {
     /// Empty means only loopback + RFC1918 / IPv6 ULA are accepted.
     #[serde(default, rename = "allowed-source-cidrs")]
     pub allowed_source_cidrs: Vec<ipnet::IpNet>,
+
+    /// Opt-in hosted mode (P2 of #4381). When `true`, a WebSocket connection
+    /// that presents a durable per-user token (the `userToken` query parameter)
+    /// gets a per-user delegate-secret namespace derived from that token; when
+    /// `false` (the default), the `userToken` parameter is ignored entirely and
+    /// every connection is single-user — byte-for-byte the pre-#4381 behavior.
+    ///
+    /// This flag ONLY governs whether the WS boundary derives a per-user
+    /// context; everything downstream is driven by whether a context was
+    /// derived, so with the flag off the entire feature is inert.
+    #[serde(default, rename = "hosted-mode")]
+    pub hosted_mode: bool,
 }
 
 #[inline]
@@ -1779,6 +1805,7 @@ impl From<SocketAddr> for WebsocketApiConfig {
             token_cleanup_interval_seconds: default_token_cleanup_interval_seconds(),
             allowed_hosts: Vec::new(),
             allowed_source_cidrs: Vec::new(),
+            hosted_mode: false,
         }
     }
 }
@@ -1793,6 +1820,7 @@ impl Default for WebsocketApiConfig {
             token_cleanup_interval_seconds: default_token_cleanup_interval_seconds(),
             allowed_hosts: Vec::new(),
             allowed_source_cidrs: Vec::new(),
+            hosted_mode: false,
         }
     }
 }

@@ -1,6 +1,7 @@
 use super::*;
 use crate::wasm_runtime::{
     ContractRuntimeInterface, ContractStoreBridge, InMemoryContractStore, MockStateStorage,
+    UserSecretContext,
 };
 use std::collections::HashMap;
 
@@ -325,6 +326,7 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         _req: DelegateRequest<'_>,
         _origin_contract: Option<&ContractInstanceId>,
         _caller_delegate: Option<&DelegateKey>,
+        _user_context: Option<&UserSecretContext>,
     ) -> Response {
         Err(ExecutorError::other(anyhow::anyhow!(
             "delegates not supported in MockWasmRuntime"

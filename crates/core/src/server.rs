@@ -32,6 +32,7 @@ use tower_http::trace::TraceLayer;
 use crate::{
     client_events::{AuthToken, BoxedClient, ClientId, HostResult, websocket::WebSocketProxy},
     config::{GlobalExecutor, WebsocketApiConfig},
+    wasm_runtime::UserSecretContext,
 };
 
 pub use app_packaging::WebApp;
@@ -80,6 +81,11 @@ pub(crate) enum ClientConnection {
         req: Box<ClientRequest<'static>>,
         auth_token: Option<AuthToken>,
         origin_contract: Option<ContractInstanceId>,
+        /// Per-connection per-user secret namespace (hosted mode, P2 of #4381),
+        /// derived once at WS upgrade from the connection's user token. `None`
+        /// outside hosted mode. Carried on the connection, never from the
+        /// request body, so a client cannot forge another user's namespace.
+        user_context: Option<UserSecretContext>,
         /// Plumbing for future V2-specific dispatch; not yet read.
         #[allow(dead_code)]
         api_version: ApiVersion,
@@ -307,6 +313,7 @@ pub mod local_node {
                 request,
                 notification_channel,
                 token,
+                user_context,
                 ..
             } = req;
             tracing::trace!(cli_id = %id, "got request -> {request}");
@@ -323,7 +330,14 @@ pub mod local_node {
                             .get(&token)
                             .map(|entry| entry.contract_id)
                     });
-                    executor.delegate_request(op, origin_contract.as_ref(), None)
+                    // `user_context` is `Some` only in hosted mode with a user
+                    // token; otherwise `None` keeps secrets `SecretScope::Local`.
+                    executor.delegate_request(
+                        op,
+                        origin_contract.as_ref(),
+                        None,
+                        user_context.as_ref(),
+                    )
                 }
                 ClientRequest::Disconnect { cause } => {
                     if let Some(cause) = cause {
@@ -435,6 +449,13 @@ pub(crate) async fn serve_client_api_in(
 
 /// Hostnames and IPs accepted in the HTTP `Host` header for WebSocket connections.
 pub(crate) type AllowedHosts = Arc<HashSet<String>>;
+
+/// Whether this node runs in hosted mode (P2 of #4381). Injected as an axum
+/// `Extension` so the `connection_info` middleware can decide whether to honor
+/// a connection's `userToken` and derive a per-user secret namespace. Defaults
+/// to `false`; only `--hosted-mode` / `hosted-mode = true` turns it on.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct HostedMode(pub bool);
 
 /// User-supplied source CIDRs that extend the built-in private-IP allowlist.
 ///
@@ -646,6 +667,18 @@ async fn serve_client_api_in_impl(
     // When bound to a non-loopback address, reject connections from non-private
     // source IPs. Users may extend the allowlist with --allowed-source-cidrs
     // (e.g. for a Tailscale tailnet range).
+    let hosted_mode = HostedMode(config.hosted_mode);
+    if hosted_mode.0 {
+        // Posture change the operator should see on every boot: hosted mode
+        // lets untrusted connections claim per-user secret namespaces via the
+        // `userToken` parameter. warn! (not info!) so it stands out in logs.
+        tracing::warn!(
+            "Hosted mode ENABLED: WebSocket connections presenting a `userToken` \
+             get a per-user delegate-secret namespace. Only run this on a node \
+             intended as a shared public proxy."
+        );
+    }
+
     let needs_lan_filter = !config.address.is_loopback();
     let router = if needs_lan_filter {
         // Layer ordering matters: axum executes layers bottom-to-top per
@@ -661,6 +694,7 @@ async fn serve_client_api_in_impl(
         // `connection_info` (inside the WebSocket router) also extracts
         // `Extension<AllowedSourceCidrs>` for the Host-header CIDR check.
         ws_router
+            .layer(Extension(hosted_mode))
             .layer(Extension(allowed_hosts))
             .layer(axum::middleware::from_fn(private_network_filter))
             .layer(Extension(allowed_source_cidrs))
@@ -670,6 +704,7 @@ async fn serve_client_api_in_impl(
         // `connection_info` always finds the extractor; missing it would
         // 500 every WS upgrade.
         ws_router
+            .layer(Extension(hosted_mode))
             .layer(Extension(allowed_hosts))
             .layer(Extension(allowed_source_cidrs))
             .layer(TraceLayer::new_for_http())

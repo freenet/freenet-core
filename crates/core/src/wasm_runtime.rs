@@ -46,7 +46,7 @@ pub(crate) use native_api::{
 pub(crate) use native_api::InheritedOriginsEntry;
 pub use runtime::{ContractExecError, Runtime};
 pub(crate) use runtime::{RuntimeConfig, SharedModuleCache};
-pub use secrets_store::{SecretStoreError, SecretsStore};
+pub use secrets_store::{SecretStoreError, SecretsStore, UserSecretContext};
 // NOTE: InMemoryContractStore and SimulationStores are available but currently unused
 // They provide infrastructure for more sophisticated simulation scenarios
 #[allow(unused_imports)]

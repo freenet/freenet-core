@@ -565,11 +565,13 @@ impl ClientEventsProxy for HttpClientApi {
                         req,
                         auth_token,
                         origin_contract,
+                        user_context,
                         ..
                     } => {
                         return Ok(OpenRequest::new(client_id, req)
                             .with_token(auth_token)
-                            .with_origin_contract(origin_contract));
+                            .with_origin_contract(origin_contract)
+                            .with_user_context(user_context));
                     }
                 }
             }

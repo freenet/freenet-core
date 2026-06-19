@@ -214,6 +214,7 @@ async fn test_token_cleanup_removes_expired_tokens() -> TestResult {
             token_cleanup_interval_seconds: CLEANUP_INTERVAL_SECS,
             allowed_hosts: Vec::new(),
             allowed_source_cidrs: Vec::new(),
+            hosted_mode: false,
         };
 
         // Start the client API server (which spawns the cleanup task)

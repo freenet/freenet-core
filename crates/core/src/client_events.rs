@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use crate::contract::{ClientResponsesReceiver, ContractHandlerEvent};
 use crate::message::{NodeEvent, QueryResult};
 use crate::node::OpManager;
+use crate::wasm_runtime::UserSecretContext;
 use crate::operations::{OpError, get, put, update};
 use crate::ring::KnownPeerKeyLocation;
 use crate::tracing::NetEventLog;
@@ -179,6 +180,12 @@ pub struct OpenRequest<'a> {
     pub notification_channel: Option<mpsc::Sender<HostResult>>,
     pub token: Option<AuthToken>,
     pub origin_contract: Option<ContractInstanceId>,
+    /// Per-connection per-user secret namespace (hosted mode, P2 of #4381),
+    /// derived once at the WS connection boundary from the connection's user
+    /// token. `None` outside hosted mode or when no token was presented. This
+    /// is carried alongside the request — never read from the request body —
+    /// so it cannot be forged by a client.
+    pub user_context: Option<UserSecretContext>,
 }
 
 impl Display for OpenRequest<'_> {
@@ -207,6 +214,7 @@ impl<'a> OpenRequest<'a> {
             notification_channel: None,
             token: None,
             origin_contract: None,
+            user_context: None,
         }
     }
 
@@ -222,6 +230,11 @@ impl<'a> OpenRequest<'a> {
 
     pub fn with_origin_contract(mut self, contract: Option<ContractInstanceId>) -> Self {
         self.origin_contract = contract;
+        self
+    }
+
+    pub fn with_user_context(mut self, user_context: Option<UserSecretContext>) -> Self {
+        self.user_context = user_context;
         self
     }
 }
@@ -1626,11 +1639,17 @@ async fn process_open_request(
                     );
                 }
                 let origin_contract = request.origin_contract;
+                // Per-connection user secret namespace (hosted mode). Taken from
+                // the OpenRequest, which received it from the connection layer —
+                // NOT from anything inside `req`. Moving it into the event keeps
+                // it on a channel the delegate/client cannot reach.
+                let user_context = request.user_context;
 
                 let res = match op_manager
                     .notify_contract_handler(ContractHandlerEvent::DelegateRequest {
                         req,
                         origin_contract,
+                        user_context,
                     })
                     .await
                 {
@@ -1987,6 +2006,7 @@ pub(crate) mod test {
                 notification_channel,
                 token: None,
                 origin_contract: None,
+                user_context: None,
             }
             .into_owned()
         }

@@ -1,7 +1,9 @@
 use super::*;
 use crate::message::NodeEvent;
 use crate::node::OpManager;
-use crate::wasm_runtime::{InMemoryContractStore, MockStateStorage, StateStorage};
+use crate::wasm_runtime::{
+    InMemoryContractStore, MockStateStorage, StateStorage, UserSecretContext,
+};
 use dashmap::DashSet;
 use std::sync::Arc;
 
@@ -706,6 +708,7 @@ where
         _req: DelegateRequest<'_>,
         _origin_contract: Option<&ContractInstanceId>,
         _caller_delegate: Option<&DelegateKey>,
+        _user_context: Option<&UserSecretContext>,
     ) -> Response {
         Err(ExecutorError::other(anyhow::anyhow!(
             "not supported in mock runtime"

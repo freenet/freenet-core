@@ -224,6 +224,8 @@ async fn is_locally_known(
             })),
             auth_token: None,
             origin_contract: None,
+            // Internal node-query request: no delegate secrets, no user context.
+            user_context: None,
             api_version: Default::default(),
         })
         .await
@@ -253,6 +255,8 @@ async fn is_locally_known(
             req: Box::new(ClientRequest::Disconnect { cause: None }),
             auth_token: None,
             origin_contract: None,
+            // Internal node-query request: no delegate secrets, no user context.
+            user_context: None,
             api_version: Default::default(),
         })
         .await
@@ -459,6 +463,8 @@ async fn ensure_contract_cached(
             ),
             auth_token: None,
             origin_contract: None,
+            // Internal node-query request: no delegate secrets, no user context.
+            user_context: None,
             api_version: Default::default(),
         })
         .await
@@ -481,6 +487,8 @@ async fn ensure_contract_cached(
             req: Box::new(ClientRequest::Disconnect { cause: None }),
             auth_token: None,
             origin_contract: None,
+            // Internal node-query request: no delegate secrets, no user context.
+            user_context: None,
             api_version: Default::default(),
         })
         .await
