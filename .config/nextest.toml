@@ -28,6 +28,18 @@ slow-timeout = { period = "300s", terminate-after = 2 }
 filter = "package(freenet-ping-app)"
 slow-timeout = { period = "300s", terminate-after = 3 }
 
+# #4233 wide-star UPDATE fan-out liveness tests (40/60/80 direct subscribers).
+# These drive a 1-gateway / N-subscriber star through 300s of virtual time in
+# the paused-time Turmoil runner, advanced in tiny quanta. Wall-clock cost
+# scales with N (each of the N subscriber event loops is stepped every quantum),
+# so the wide-star variants need far more than the default 240s cap. See
+# test_fanout_liveness_* / run_fanout_liveness_scenario in
+# tests/simulation_integration.rs (issue #4233).
+[[profile.ci.overrides]]
+filter = "test(test_fanout_liveness)"
+slow-timeout = { period = "600s", terminate-after = 2 }
+retries = 0
+
 # test_ping_blocked_peers is the canary for the CONNECT promotion-drop bug
 # class (#3838, fixed in #3893). The profile-wide retries = 2 masked a ~40%
 # per-run failure rate as ~6% effective during the flaky period, making an

@@ -3669,6 +3669,24 @@ fn test_fanout_liveness_40_subscribers() {
     run_fanout_liveness_scenario("i4233-fanout-40", 0x4233_4001_0001, 40);
 }
 
+#[test_log::test]
+#[cfg(feature = "simulation_tests")]
+fn test_fanout_liveness_diag_08_subscribers() {
+    run_fanout_liveness_scenario("i4233-fanout-diag08", 0x4233_0801_0001, 8);
+}
+
+#[test_log::test]
+#[cfg(feature = "simulation_tests")]
+fn test_fanout_liveness_diag_16_subscribers() {
+    run_fanout_liveness_scenario("i4233-fanout-diag16", 0x4233_1601_0001, 16);
+}
+
+#[test_log::test]
+#[cfg(feature = "simulation_tests")]
+fn test_fanout_liveness_diag_24_subscribers() {
+    run_fanout_liveness_scenario("i4233-fanout-diag24", 0x4233_2401_0001, 24);
+}
+
 /// #4233 wide-star fan-out liveness at N=60 direct subscribers (midpoint).
 ///
 /// See [`run_fanout_liveness_scenario`].
