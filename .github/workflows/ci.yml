@@ -230,6 +230,12 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Self-test the rule #6 blocking-send linter (good/bad fixtures) so a
+      # regression in the matcher fails CI before it can let a real offender
+      # through or wrongly flag clean code.
+      - name: Rule #6 linter self-test
+        run: python3 .github/scripts/check_blocking_sends.py --self-test
+
       - name: Check for banned patterns in new code
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
@@ -266,6 +272,20 @@ jobs:
             ERRORS="$ERRORS
           ERROR: tokio::net::UdpSocket used in crates/core/ — use Socket trait instead
           $(echo "$ADDED" | grep -n 'tokio::net::UdpSocket')"
+          fi
+
+          # 6. Blocking .send(...).await on an event-loop-reachable bounded
+          # channel sender (the #4145/#4231/#4466 incident class). Implemented
+          # as a Python linter so it can span multi-line statements, skip
+          # string-literal / comment contents, catch the P2pBridge::send wrapper
+          # form, and honour a `// channel-safety: ok` annotation on the call
+          # line OR the line above. The linter has its own --self-test (run as
+          # the "Rule #6 linter self-test" step above). Diff-scoped to ADDED
+          # lines only. See .claude/rules/channel-safety.md and
+          # .github/scripts/check_blocking_sends.py.
+          if ! BLOCKING_OUT=$(python3 .github/scripts/check_blocking_sends.py "$BASE" "$HEAD"); then
+            ERRORS="$ERRORS
+          $BLOCKING_OUT"
           fi
 
           # 4. Deleted test functions (removed #[test], #[tokio::test],
