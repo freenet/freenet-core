@@ -3490,6 +3490,32 @@ fn test_sustained_update_fanout_no_full_state_storm() {
 /// cover the same failure mode (silent subscribers + unbounded backlog).
 #[cfg(feature = "simulation_tests")]
 fn run_fanout_liveness_scenario(network_name: &str, seed: u64, subscribers: usize) {
+    run_fanout_liveness_scenario_inner(network_name, seed, subscribers, false, false);
+}
+
+/// Configurable driver behind [`run_fanout_liveness_scenario`].
+///
+/// `preseed` selects how the wide direct star is formed:
+///   - `false`: organic ring-routed CONNECT (the original path). Only forms up
+///     to ~N=16 in this harness — see the bootstrap-ceiling note above.
+///   - `true`: inject the direct star via [`SimNetwork::preseed_direct_star`],
+///     bypassing the CONNECT handshake so N=40/60/80 (the production-incident
+///     width) can be reached. This is the #4233 topology-preseed primitive.
+///
+/// `enable_migration` selects the placement-migration (`SubscribeHint`) cascade
+/// floor:
+///   - `false`: migration OFF (sim default) — the baseline fan-out.
+///   - `true`: migration ON via [`SimNetwork::enable_placement_migration`] —
+///     the closest sim reproduction of the v0.2.73 incident, in which the
+///     migration AMPLIFIES broadcast load.
+#[cfg(feature = "simulation_tests")]
+fn run_fanout_liveness_scenario_inner(
+    network_name: &str,
+    seed: u64,
+    subscribers: usize,
+    preseed: bool,
+    enable_migration: bool,
+) {
     use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
 
     // UPDATEs driven into the hot contract AFTER all subscribers have
@@ -3509,7 +3535,7 @@ fn run_fanout_liveness_scenario(network_name: &str, seed: u64, subscribers: usiz
     let max_connections = subscribers + 16;
 
     let (sim, logs_handle) = rt.block_on(async {
-        let sim = SimNetwork::new(
+        let mut sim = SimNetwork::new(
             network_name,
             1,           // 1 gateway (the broadcast source / contract host)
             subscribers, // subscriber nodes (the fan-out targets)
@@ -3520,6 +3546,22 @@ fn run_fanout_liveness_scenario(network_name: &str, seed: u64, subscribers: usiz
             seed,
         )
         .await;
+        if enable_migration {
+            // Closest sim reproduction of the v0.2.73 incident: the migration
+            // cascade amplifies the broadcast/summarize load under fan-out.
+            sim.enable_placement_migration();
+        }
+        if preseed {
+            // #4233 topology preseed: wire the gateway directly to every
+            // subscriber so the production-incident-width star (N=40-80) exists
+            // at t=0, bypassing the organic CONNECT handshake the harness cannot
+            // complete at this width.
+            let host = NodeLabel::gateway(network_name, 0);
+            let subs: Vec<NodeLabel> = (1..=subscribers)
+                .map(|idx| NodeLabel::node(network_name, idx))
+                .collect();
+            sim.preseed_direct_star(&host, &subs);
+        }
         let logs_handle = sim.event_logs_handle();
         (sim, logs_handle)
     });
@@ -3730,6 +3772,92 @@ fn test_fanout_liveness_8_subscribers() {
 #[cfg(feature = "simulation_tests")]
 fn test_fanout_liveness_16_subscribers() {
     run_fanout_liveness_scenario("i4233-fanout-16", 0x4233_1601_0001, 16);
+}
+
+// =============================================================================
+// #4233 INCIDENT-SCALE fan-out liveness diagnostics (N = 40 / 60 / 80)
+//
+// These use the topology-preseed primitive (`SimNetwork::preseed_direct_star`)
+// to build the production-incident-width direct star that the organic CONNECT
+// path cannot bootstrap in this harness (N>=24 never finishes — see the
+// bootstrap-ceiling note on `run_fanout_liveness_scenario`). They are the real
+// incident-scale reproduction #4233 asks for, in BOTH conditions:
+//   - migration OFF (default): baseline sustained UPDATE fan-out.
+//   - migration ON: the closest sim reproduction of the v0.2.73 incident, where
+//     the placement-migration cascade amplifies the broadcast/summarize load.
+//
+// They are `#[ignore]`d by default: each builds 41-81 real event-loop nodes and
+// drives 40 sustained UPDATEs fanned out across the whole star, which is far
+// heavier than the normal per-test CI budget. The N=8/16 organic tests above
+// are the always-on regression gate; these are the on-demand incident-scale
+// diagnostic. Run explicitly with, e.g.:
+//
+//   cargo test -p freenet --features "simulation_tests,testing" \
+//     --test simulation_integration -- --ignored --nocapture \
+//     test_fanout_liveness_incident_scale
+// =============================================================================
+
+/// #4233 incident-scale fan-out liveness, migration OFF.
+///
+/// Preseeded direct star at N=40/60/80, sustained UPDATE fan-out, migration OFF.
+/// Asserts the same liveness gates as the organic tests (no stale peers,
+/// bounded event-loop backlog, convergence) at the production-incident width.
+#[test_log::test]
+#[cfg(feature = "simulation_tests")]
+#[ignore = "#4233 incident-scale diagnostic (preseeded N=40/60/80, 40 UPDATEs each); too heavy for default CI. Run with --ignored. Always-on gate is test_fanout_liveness_8/16_subscribers."]
+fn test_fanout_liveness_incident_scale_migration_off() {
+    for (n, seed) in [
+        (40usize, 0x4233_4001_0001u64),
+        (60, 0x4233_6001_0001),
+        (80, 0x4233_8001_0001),
+    ] {
+        let name = format!("i4233-fanout-preseed-off-{n}");
+        run_fanout_liveness_scenario_inner(
+            &name, seed, n, /*preseed=*/ true, /*migration=*/ false,
+        );
+    }
+}
+
+/// #4233 incident-scale fan-out liveness, migration ON.
+///
+/// Preseeded direct star at N=40/60/80, sustained UPDATE fan-out, with the
+/// placement-migration (`SubscribeHint`) cascade ENABLED. This is the closest
+/// sim reproduction of the actual v0.2.73 incident, where the migration
+/// amplifies broadcast load. The headline question #4233 poses: does the event
+/// loop wedge at incident scale with the migration on?
+#[test_log::test]
+#[cfg(feature = "simulation_tests")]
+#[ignore = "#4233 incident-scale diagnostic (preseeded N=40/60/80, 40 UPDATEs each, migration ON); too heavy for default CI. Run with --ignored. Always-on gate is test_fanout_liveness_8/16_subscribers."]
+fn test_fanout_liveness_incident_scale_migration_on() {
+    for (n, seed) in [
+        (40usize, 0x4233_4001_0002u64),
+        (60, 0x4233_6001_0002),
+        (80, 0x4233_8001_0002),
+    ] {
+        let name = format!("i4233-fanout-preseed-on-{n}");
+        run_fanout_liveness_scenario_inner(
+            &name, seed, n, /*preseed=*/ true, /*migration=*/ true,
+        );
+    }
+}
+
+/// #4233 topology-preseed sanity at modest width (N=24), migration OFF.
+///
+/// N=24 is the smallest width the organic CONNECT path CANNOT bootstrap in this
+/// harness (see the bootstrap-ceiling note on `run_fanout_liveness_scenario`).
+/// This test forms it via the preseed primitive instead, proving the primitive
+/// reaches widths organic formation cannot — and runs fast enough to stay in the
+/// default suite as an always-on guard that the preseed path itself works.
+#[test_log::test]
+#[cfg(feature = "simulation_tests")]
+fn test_fanout_liveness_preseed_24_subscribers() {
+    run_fanout_liveness_scenario_inner(
+        "i4233-fanout-preseed-24",
+        0x4233_2401_0001,
+        24,
+        /*preseed=*/ true,
+        /*migration=*/ false,
+    );
 }
 
 // =============================================================================
