@@ -234,6 +234,85 @@ impl P2pBridge {
             .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
         Ok(())
     }
+
+    /// Resolve the `PeerKeyLocation` to address a message to `target_addr`,
+    /// preferring the connection-manager record, then a configured gateway key,
+    /// then (as a normal transient fallback during handshake) our own key.
+    fn resolve_target(&self, target_addr: SocketAddr) -> PeerKeyLocation {
+        if let Some(target) = self
+            .op_manager
+            .ring
+            .connection_manager
+            .get_peer_by_addr(target_addr)
+        {
+            return target;
+        }
+        if let Some(gw_peer) = self
+            .gateways
+            .iter()
+            .find(|gw| gw.socket_addr() == Some(target_addr))
+            .cloned()
+        {
+            tracing::debug!(
+                peer_addr = %target_addr,
+                phase = "send",
+                "Using gateway public key for reconnection"
+            );
+            return gw_peer;
+        }
+        // Truly unknown peer - use own key as last resort. This is a normal
+        // transient state during connection handshakes when the peer's public
+        // key hasn't been established yet.
+        tracing::debug!(
+            peer_addr = %target_addr,
+            phase = "send",
+            "Sending to unknown peer address with no known public key"
+        );
+        PeerKeyLocation::new(
+            (*self.op_manager.ring.connection_manager.pub_key).clone(),
+            target_addr,
+        )
+    }
+
+    /// Non-blocking variant of [`NetworkBridge::send`] for callers that run
+    /// INLINE on the network event-loop task.
+    ///
+    /// `send` does `ev_listener_tx.send(..).await` on the cap-512 bridge channel
+    /// that the event loop itself drains; awaiting it from an on-loop caller is a
+    /// self-deadlock cycle under fan-out back-pressure (#4145). This variant uses
+    /// `try_send`: on a full or closed channel it drops the message and returns
+    /// `SendNotCompleted` so the caller can log it. The dropped message is
+    /// recovered by the caller's own path (op retry, or the periodic
+    /// InterestSync / subscription-renewal re-sync for interest/cache fan-out) —
+    /// see each call site's rationale. Returns `Ok(())` on a successful enqueue.
+    fn try_send(&self, target_addr: SocketAddr, msg: NetMessage) -> super::ConnResult<()> {
+        let target = self.resolve_target(target_addr);
+        self.op_manager.sending_transaction(&target, &msg);
+        match self
+            .ev_listener_tx
+            .try_send(P2pBridgeEvent::Message(target, Box::new(msg)))
+        {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    peer_addr = %target_addr,
+                    phase = "backpressure",
+                    "Event-loop bridge channel full; dropped outbound message from an \
+                     on-loop caller (will be recovered by op retry / periodic re-sync). \
+                     Sustained occurrences indicate fan-out / migration load."
+                );
+                Err(ConnectionError::SendNotCompleted(target_addr))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!(
+                    peer_addr = %target_addr,
+                    phase = "send",
+                    "Event-loop bridge channel closed; dropping outbound message"
+                );
+                Err(ConnectionError::SendNotCompleted(target_addr))
+            }
+        }
+    }
 }
 
 impl NetworkBridge for P2pBridge {
@@ -283,58 +362,16 @@ impl NetworkBridge for P2pBridge {
         // from P2pBridge::send() flow through handle_bridge_msg → OutboundMessageWithTarget
         // → the shared handler which calls register_events(from_outbound_msg(...)).
         // Tracing here would cause duplicate events.
-
-        // Look up the full PeerKeyLocation from connection manager for transaction tracking
-        let target_loc = self
-            .op_manager
-            .ring
-            .connection_manager
-            .get_peer_by_addr(target_addr);
-        if let Some(ref target) = target_loc {
-            self.op_manager.sending_transaction(target, &msg);
-            self.ev_listener_tx
-                .send(P2pBridgeEvent::Message(target.clone(), Box::new(msg)))
-                .await
-                .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
-        } else {
-            // No known peer at this address - try to find the public key from gateways
-            let gateway_peer = self
-                .gateways
-                .iter()
-                .find(|gw| gw.socket_addr() == Some(target_addr))
-                .cloned();
-
-            if let Some(gw_peer) = gateway_peer {
-                tracing::debug!(
-                    peer_addr = %target_addr,
-                    phase = "send",
-                    "Using gateway public key for reconnection"
-                );
-                self.op_manager.sending_transaction(&gw_peer, &msg);
-                self.ev_listener_tx
-                    .send(P2pBridgeEvent::Message(gw_peer, Box::new(msg)))
-                    .await
-                    .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
-            } else {
-                // Truly unknown peer - use own key as last resort.
-                // This is a normal transient state during connection handshakes
-                // when the peer's public key hasn't been established yet.
-                tracing::debug!(
-                    peer_addr = %target_addr,
-                    phase = "send",
-                    "Sending to unknown peer address with no known public key"
-                );
-                let temp_peer = PeerKeyLocation::new(
-                    (*self.op_manager.ring.connection_manager.pub_key).clone(),
-                    target_addr,
-                );
-                self.op_manager.sending_transaction(&temp_peer, &msg);
-                self.ev_listener_tx
-                    .send(P2pBridgeEvent::Message(temp_peer, Box::new(msg)))
-                    .await
-                    .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
-            }
-        }
+        let target = self.resolve_target(target_addr);
+        self.op_manager.sending_transaction(&target, &msg);
+        // channel-safety: ok — NetworkBridge::send is the OFF-loop producer API
+        // (op-driver / contract / broadcast tasks producing INTO the event loop);
+        // blocking here is the intended back-pressure on those callers. On-loop
+        // callers must use Self::try_send instead (#4145).
+        self.ev_listener_tx
+            .send(P2pBridgeEvent::Message(target, Box::new(msg)))
+            .await
+            .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
         Ok(())
     }
 
@@ -2040,9 +2077,14 @@ impl P2pConnManager {
                                         // loop. Drop on full — the DropConnection is redundant
                                         // cleanup: the connection has already been removed from
                                         // ctx.connections / addr_by_pub_key and pruned from the
-                                        // ring above, so the handshake driver's expected-inbound
-                                        // entry (if any) is the only residue, reclaimed when the
-                                        // peer's expectation later times out.
+                                        // ring above. The only residue is the handshake driver's
+                                        // ExpectedInboundTracker entry (if any). That tracker is
+                                        // a per-SocketAddr HashMap with no TTL sweep, but the
+                                        // entry is benign and bounded: it is overwritten on the
+                                        // next register() for the same addr and consumed when a
+                                        // matching inbound arrives, so a missed DropConnection
+                                        // leaves at most one stale per-addr expectation, not an
+                                        // unbounded leak.
                                         if !handshake_cmd_sender.try_send(
                                             HandshakeCommand::DropConnection { peer: peer.clone() },
                                         ) {
@@ -2785,8 +2827,10 @@ impl P2pConnManager {
         // task, so a `.send().await` that back-pressures on the handshake
         // command channel (cap 128) would stall the loop. The DropConnection is
         // redundant teardown — we remove the connection from ctx.connections /
-        // addr_by_pub_key and prune the ring below regardless; the handshake
-        // driver's expected-inbound entry self-reclaims on its own timeout.
+        // addr_by_pub_key and prune the ring below regardless. A missed
+        // DropConnection leaves at most one stale per-SocketAddr
+        // ExpectedInboundTracker entry (no TTL sweep, but overwritten on the
+        // next register() and consumed on a matching inbound — bounded, benign).
         if !handshake_cmd_sender.try_send(HandshakeCommand::DropConnection { peer: peer.clone() }) {
             tracing::warn!(
                 peer = %peer,
@@ -3264,17 +3308,25 @@ impl P2pConnManager {
                     Some(pkl),
                 );
 
-                // tell the promoted peer about our subscriptions and cache
+                // tell the promoted peer about our subscriptions and cache.
+                // Non-blocking (#4145): handle_connect_peer runs INLINE on the
+                // event-loop task, and bridge.send() awaits the cap-512
+                // ev_listener_tx that this same task drains — a self-stall under
+                // the connection-churn the SubscribeHint nudge drives. Use
+                // bridge.try_send: a dropped interest/cache message is recovered
+                // by the periodic InterestSync exchange + subscription-renewal
+                // background task, which re-advertise our interests to this peer.
                 for (target, msg) in self
                     .bridge
                     .op_manager
                     .on_ring_connection_established(peer_addr, peer.pub_key())
                 {
-                    if let Err(e) = self.bridge.send(target, msg).await {
+                    if let Err(e) = self.bridge.try_send(target, msg) {
                         tracing::warn!(
                             %peer_addr,
                             error = %e,
-                            "Failed to send interest/cache data on transient promotion"
+                            "Failed to send interest/cache data on transient promotion \
+                             (will re-sync via periodic InterestSync/renewal)"
                         );
                     }
                 }
@@ -3471,46 +3523,17 @@ impl P2pConnManager {
                 "Handshake command channel full/closed; failed to enqueue connect \
                  command. Failing awaiting callbacks (op will retry)."
             );
+            // Prune the phantom in-transit reservation (connection-manager side
+            // effect; needs the live ring). We intentionally do NOT record peer
+            // backoff: this is LOCAL channel contention, not a remote connection
+            // failure — backoff would wrongly delay a legitimate retry.
             self.bridge
                 .op_manager
                 .ring
                 .connection_manager
                 .prune_in_transit_connection(peer_addr);
-
-            // Note: We intentionally do NOT record backoff here. This failure is a LOCAL
-            // channel issue (handshake command queue full), not a failure to connect to the
-            // REMOTE peer. Backoff should only apply to actual connection failures
-            // (OutboundFailed), not local resource contention.
-
-            let pending_txs = state.awaiting_connection_txs.remove(&peer_addr);
-            if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
-                tracing::debug!(
-                    tx = %tx,
-                    remote = %peer_addr,
-                    callbacks = callbacks.len(),
-                    transient,
-                    "Cleaning up callbacks after connect command failure"
-                );
-                for mut cb in callbacks {
-                    cb.send_result(Err(()))
-                        .await
-                        .inspect_err(|send_err| {
-                            tracing::debug!(
-                                remote = %peer_addr,
-                                ?send_err,
-                                "Failed to deliver connect command failure to awaiting callback"
-                            );
-                        })
-                        .ok();
-                }
-            }
-            if let Some(pending_txs) = pending_txs {
-                tracing::debug!(
-                    remote = %peer_addr,
-                    pending_txs = ?pending_txs,
-                    "Removed pending transactions after connect command failure"
-                );
-            }
+            // Fail/clear the awaiting-connection state (callbacks + tx maps).
+            fail_awaiting_connection(state, peer_addr, tx, transient).await;
         } else {
             tracing::debug!(
                 tx = %tx,
@@ -3899,8 +3922,10 @@ impl P2pConnManager {
                 // stall the loop. The DropConnection for the REPLACED (stale)
                 // connection is redundant cleanup — we've already pruned the old
                 // peer from the ring above and are about to install the new
-                // connection entry; the stale expected-inbound entry self-reclaims
-                // on its own timeout.
+                // connection entry. A missed DropConnection leaves at most one
+                // stale per-SocketAddr ExpectedInboundTracker entry (no TTL sweep,
+                // but overwritten on the next register() and consumed on a
+                // matching inbound — bounded, benign).
                 if !handshake_commands.try_send(HandshakeCommand::DropConnection {
                     peer: old_peer.clone(),
                 }) {
@@ -4106,17 +4131,25 @@ impl P2pConnManager {
                     crate::node::network_status::record_nat_attempt(true);
                 }
 
-                // tell the new peer about our subscriptions and cache
+                // tell the new peer about our subscriptions and cache.
+                // Non-blocking (#4145): handle_successful_connection runs INLINE
+                // on the event-loop task, and bridge.send() awaits the cap-512
+                // ev_listener_tx that this same task drains — a self-stall on
+                // exactly the connection-establishment fan-out the SubscribeHint
+                // nudge drives. Use bridge.try_send: a dropped interest/cache
+                // message is recovered by the periodic InterestSync exchange +
+                // subscription-renewal background task.
                 for (target, msg) in self
                     .bridge
                     .op_manager
                     .on_ring_connection_established(peer_addr, peer.pub_key())
                 {
-                    if let Err(e) = self.bridge.send(target, msg).await {
+                    if let Err(e) = self.bridge.try_send(target, msg) {
                         tracing::warn!(
                             %peer_addr,
                             error = %e,
-                            "Failed to send interest/cache data to new peer"
+                            "Failed to send interest/cache data to new peer \
+                             (will re-sync via periodic InterestSync/renewal)"
                         );
                     }
                 }
@@ -4369,8 +4402,10 @@ impl P2pConnManager {
                     // the handshake command channel (cap 128) would stall the loop.
                     // The DropConnection is redundant teardown — the connection is
                     // already removed from ctx.connections and pruned from the ring
-                    // above; the handshake driver's expected-inbound entry (if any)
-                    // self-reclaims on its own timeout.
+                    // above. A missed DropConnection leaves at most one stale
+                    // per-SocketAddr ExpectedInboundTracker entry (no TTL sweep, but
+                    // overwritten on the next register() and consumed on a matching
+                    // inbound — bounded, benign).
                     if !handshake_commands
                         .try_send(HandshakeCommand::DropConnection { peer: peer.clone() })
                     {
@@ -4751,11 +4786,16 @@ impl P2pConnManager {
         let msg =
             crate::message::NetMessage::V1(crate::message::NetMessageV1::InterestSync { message });
 
-        if let Err(e) = self.bridge.send(target, msg).await {
+        // Non-blocking (#4145): this handler is dispatched INLINE on the
+        // event-loop task from the NodeEvent::SendInterestMessage arm, so
+        // bridge.send()'s await on the cap-512 ev_listener_tx (drained by this
+        // same task) would self-stall. A dropped InterestSync is recovered by
+        // the next periodic InterestSync exchange / summary reconciliation.
+        if let Err(e) = self.bridge.try_send(target, msg) {
             tracing::warn!(
                 peer_addr = %target,
                 error = %e,
-                "Failed to send interest message to peer"
+                "Failed to send interest message to peer (will re-sync periodically)"
             );
         }
     }
@@ -4778,11 +4818,18 @@ impl P2pConnManager {
             "Sending net message to peer"
         );
 
-        if let Err(e) = self.bridge.send(target, msg).await {
+        // Non-blocking (#4145): dispatched INLINE on the event-loop task from
+        // the NodeEvent::SendNetMessage arm, so bridge.send()'s await on the
+        // cap-512 ev_listener_tx (drained by this same task) would self-stall.
+        // This path carries the CONNECT joiner's upstream ConnectFailed; if the
+        // message is dropped here, the upstream connect operation still fails on
+        // its own OPERATION_TTL rather than hanging — so dropping is safe, and a
+        // wedged event loop (the alternative) would be strictly worse.
+        if let Err(e) = self.bridge.try_send(target, msg) {
             tracing::warn!(
                 peer_addr = %target,
                 error = %e,
-                "Failed to send net message to peer"
+                "Failed to send net message to peer (upstream op falls back to TTL)"
             );
         }
     }
@@ -5539,6 +5586,68 @@ impl ConnectResultSender for mpsc::Sender<Result<(SocketAddr, Option<usize>), ()
     ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>> {
         async move { self.send(result).await.map_err(|_| ()) }.boxed()
     }
+}
+
+/// Fail every callback awaiting a connection to `peer_addr` after a connect
+/// attempt was abandoned (e.g. its `HandshakeCommand::Connect` enqueue was
+/// dropped on a full/closed handshake command channel, #4145).
+///
+/// Extracted as a free function so its callback/state invariants are
+/// unit-testable without standing up a full `P2pConnManager`:
+///
+/// 1. Every awaiting callback for `peer_addr` is resolved with `Err(())` — never
+///    left parked — so callers (including the SubscribeHint resend-waiter) fail
+///    fast and the op can retry.
+/// 2. `awaiting_connection` AND `awaiting_connection_txs` are both drained for
+///    `peer_addr` (kept in lock-step; a stranded tx entry would mislead later
+///    diagnostics).
+/// 3. NO peer backoff is recorded: a full LOCAL channel is resource contention,
+///    not a remote connection failure, so backing the peer off would wrongly
+///    delay a legitimate retry. (This function simply never touches
+///    `state.peer_backoff`; the test asserts it stays clear.)
+///
+/// The caller is responsible for the connection-manager side effect
+/// (`prune_in_transit_connection`), which is the one piece that needs the live
+/// ring — see the call site in `connect_peer`.
+async fn fail_awaiting_connection(
+    state: &mut EventListenerState,
+    peer_addr: SocketAddr,
+    tx: Transaction,
+    transient: bool,
+) {
+    // (2) drain both maps in lock-step.
+    let pending_txs = state.awaiting_connection_txs.remove(&peer_addr);
+
+    // (1) fail every awaiting callback — never leave one parked.
+    if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
+        tracing::debug!(
+            tx = %tx,
+            remote = %peer_addr,
+            callbacks = callbacks.len(),
+            transient,
+            "Cleaning up callbacks after connect command failure"
+        );
+        for mut cb in callbacks {
+            cb.send_result(Err(()))
+                .await
+                .inspect_err(|send_err| {
+                    tracing::debug!(
+                        remote = %peer_addr,
+                        ?send_err,
+                        "Failed to deliver connect command failure to awaiting callback"
+                    );
+                })
+                .ok();
+        }
+    }
+    if let Some(pending_txs) = pending_txs {
+        tracing::debug!(
+            remote = %peer_addr,
+            pending_txs = ?pending_txs,
+            "Removed pending transactions after connect command failure"
+        );
+    }
+    // (3) Deliberately NO state.peer_backoff.record_failure() here.
 }
 
 struct EventListenerState {
