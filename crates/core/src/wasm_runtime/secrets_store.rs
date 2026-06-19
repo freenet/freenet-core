@@ -57,6 +57,127 @@ const HEADER_LEN: usize = 1 + 24;
 
 type SecretKey = [u8; 32];
 
+/// Identifier for a per-user secret namespace.
+///
+/// A `UserId` is a 32-byte opaque tag that partitions a delegate's secret
+/// storage into independent per-user namespaces. It is INERT in this release:
+/// no production caller constructs one yet (the WS/token plumbing that will
+/// feed it lands in P2 of #4381). It exists so the storage layer can carry the
+/// per-user dimension end-to-end and be exercised by tests.
+///
+/// The bytes are not secret on their own (they only name a namespace), so
+/// `UserId` does NOT zeroize — unlike the `dek_secret` that travels alongside
+/// it in [`SecretScope::User`], which is held in `Zeroizing`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UserId([u8; 32]);
+
+impl UserId {
+    /// Construct a `UserId` from its raw 32 bytes.
+    pub const fn new(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Raw 32-byte tag.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// bs58 (BITCOIN alphabet) encoding of the 32-byte tag, used as the
+    /// on-disk path segment under `users/`. Mirrors `DelegateKey::encode`
+    /// and `SecretsId::encode` so all three render consistently in paths
+    /// and logs.
+    pub fn encode(&self) -> String {
+        bs58::encode(self.0)
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into_string()
+    }
+}
+
+impl std::fmt::Debug for UserId {
+    /// Render as the bs58 encoding rather than a raw byte array. The tag is
+    /// not secret, but the encoded form is what appears in paths and logs,
+    /// so matching it keeps `{:?}` output greppable against the filesystem.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "UserId({})", self.encode())
+    }
+}
+
+/// Scope selector for a secret read/write/remove.
+///
+/// `Local` is the historical single-user path: it MUST behave byte-for-byte
+/// identically to pre-#4381 code (same on-disk path, same node-KEK-derived
+/// DEK, same ReDb table). `User` adds an optional per-user dimension whose
+/// DEK is derived purely from a caller-provided `dek_secret` (NOT the node
+/// KEK), making per-user secrets portable by design (P3 export). The `User`
+/// scope is INERT in this release — only tests construct it.
+///
+/// The `dek_secret` is borrowed as `&Zeroizing<[u8; 32]>` so the caller
+/// retains ownership and the value is wiped when the caller drops it; the
+/// store never copies it into a longer-lived buffer.
+pub enum SecretScope<'a> {
+    /// Single-user / node-local path. Byte-for-byte identical to pre-#4381.
+    Local,
+    /// Per-user path keyed by `id`, encrypted under a DEK derived solely
+    /// from `dek_secret` (node-KEK-independent).
+    User {
+        id: &'a UserId,
+        dek_secret: &'a Zeroizing<[u8; 32]>,
+    },
+}
+
+/// Domain-separation prefix for [`user_id`]. Distinct from
+/// [`USER_DEK_SECRET_DOMAIN`] so the same token cannot yield a user id that
+/// collides with a dek-secret (and vice-versa).
+///
+/// `allow(dead_code)` in non-test builds: these are landed INERT for P2 of
+/// #4381 (the token threading that consumes them is a later phase). Tests
+/// exercise them now so the derivation is pinned before any caller depends on
+/// it.
+#[cfg_attr(not(test), allow(dead_code))]
+const USER_ID_DOMAIN: &[u8] = b"freenet-user-id";
+
+/// Domain-separation prefix for [`user_dek_secret`]. See [`USER_ID_DOMAIN`]
+/// for the inert-until-P2 rationale.
+#[cfg_attr(not(test), allow(dead_code))]
+const USER_DEK_SECRET_DOMAIN: &[u8] = b"freenet-user-dek";
+
+/// Derive a [`UserId`] from an opaque bearer token.
+///
+/// `user_id(token) = blake3(USER_ID_DOMAIN || token)`. The domain prefix is
+/// distinct from [`user_dek_secret`]'s so the two derivations are
+/// independent: knowing a user's id reveals nothing about their dek-secret.
+///
+/// INERT in this release: the token threading that will call this lands in
+/// P2 of #4381. Provided now (with tests) so the derivation is pinned before
+/// any caller depends on it.
+///
+/// The token is sensitive; this function never logs it. The returned id is a
+/// non-secret namespace tag, so it is not wrapped in `Zeroizing`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn user_id(token: &[u8]) -> UserId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(USER_ID_DOMAIN);
+    hasher.update(token);
+    UserId(*hasher.finalize().as_bytes())
+}
+
+/// Derive a per-user DEK secret (HKDF IKM) from an opaque bearer token.
+///
+/// `user_dek_secret(token) = blake3(USER_DEK_SECRET_DOMAIN || token)`,
+/// returned in `Zeroizing` so it is wiped on drop. Distinct domain prefix
+/// from [`user_id`] guarantees `user_id(token) != user_dek_secret(token)`
+/// as byte strings for every token.
+///
+/// INERT in this release (see [`user_id`]). The token is sensitive; this
+/// function never logs it or the derived secret.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn user_dek_secret(token: &[u8]) -> Zeroizing<[u8; 32]> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(USER_DEK_SECRET_DOMAIN);
+    hasher.update(token);
+    Zeroizing::new(*hasher.finalize().as_bytes())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SecretStoreError {
     #[error("encryption error: {0}")]
@@ -127,6 +248,12 @@ pub struct SecretsStore {
     /// Populated from ReDb on startup and kept in sync with it; never
     /// updated unless the corresponding ReDb write succeeded.
     key_to_secret_part: Arc<DashMap<DelegateKey, HashSet<SecretKey>>>,
+    /// In-memory index for the per-user ([`SecretScope::User`]) dimension:
+    /// (DelegateKey, UserId) -> Set of secret key hashes. Kept disjoint from
+    /// `key_to_secret_part` so the Local index is byte-for-byte unchanged.
+    /// Mirrors the separate `user_secrets_index` ReDb table; populated on
+    /// startup and updated only after the corresponding ReDb write succeeds.
+    user_key_to_secret_part: Arc<DashMap<(DelegateKey, UserId), HashSet<SecretKey>>>,
     /// ReDb storage for persistent index
     db: Storage,
     default_encryption: Encryption,
@@ -159,6 +286,12 @@ pub struct SecretsStore {
 /// so a future derivation-algorithm change can rotate via this string
 /// without rotating the KEK itself.
 const DEK_HKDF_INFO: &[u8] = b"freenet-delegate-dek-v1";
+
+/// HKDF info string for the per-user DEK derivation (the [`SecretScope::User`]
+/// path). Distinct from [`DEK_HKDF_INFO`] so the two derivations can never
+/// collide even if a `dek_secret` ever equalled the node KEK by accident.
+/// Versioned (`user-v1`) on the same rotation discipline as the local info.
+const USER_DEK_HKDF_INFO: &[u8] = b"freenet-delegate-dek-user-v1";
 
 /// `File::create` opens the file with the process umask, which on most
 /// distros leaves it world-readable. Every secret blob we land at rest
@@ -273,6 +406,28 @@ impl SecretsStore {
             }
         }
 
+        // Load the per-user index from its SEPARATE ReDb table. A pre-#4381
+        // database simply has no rows here (redb creates the table empty on
+        // first open), so old nodes load an empty user index — the Local
+        // index above is untouched.
+        let user_key_to_secret_part = Arc::new(DashMap::new());
+        match db.load_all_user_secrets_index() {
+            Ok(entries) => {
+                for ((delegate_key, user_bytes), secret_keys) in entries {
+                    let secret_set: HashSet<SecretKey> = secret_keys.into_iter().collect();
+                    user_key_to_secret_part
+                        .insert((delegate_key, UserId::new(user_bytes)), secret_set);
+                }
+                tracing::debug!(
+                    "Loaded {} user-scoped secrets index entries from ReDb",
+                    user_key_to_secret_part.len()
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load user-scoped secrets index from ReDb: {e}");
+            }
+        }
+
         // Seed the legacy-migration fallback with the historical
         // (LEGACY_DEFAULT_CIPHER, LEGACY_DEFAULT_NONCE) pair regardless
         // of what the operator's configured `secrets` carries. This is
@@ -292,6 +447,7 @@ impl SecretsStore {
             kek_backend,
             ciphers: std::collections::HashMap::new(),
             key_to_secret_part,
+            user_key_to_secret_part,
             db,
             default_encryption: Encryption {
                 cipher: secrets.cipher(),
@@ -348,6 +504,67 @@ impl SecretsStore {
             // zeros for determinism (so two stores constructed against
             // the same KEK produce byte-identical `Encryption` values).
             legacy_nonce: chacha20poly1305::XNonce::from_slice(&[0u8; 24]).to_owned(),
+        }
+    }
+
+    /// Derive the per-user DEK for a `(delegate, dek_secret)` pair via
+    /// HKDF-SHA256.
+    ///
+    /// HKDF inputs:
+    ///
+    /// - `ikm` = `dek_secret` (32 bytes), supplied by the caller. This is the
+    ///   ONLY key material in the derivation — the node KEK is deliberately
+    ///   NOT involved, so a per-user secret is portable: it can be decrypted
+    ///   anywhere the same `dek_secret` is presented, independent of which
+    ///   node wrote it. (Contrast [`Self::derive_delegate_dek`], whose IKM is
+    ///   the node KEK.)
+    /// - `salt` = `delegate.encode()`, the bs58 instance key, so two
+    ///   delegates presenting the same `dek_secret` still get distinct DEKs.
+    /// - `info` = [`USER_DEK_HKDF_INFO`] (distinct from the local-path info).
+    /// - `okm` = 32 bytes (XChaCha20-Poly1305 key size).
+    ///
+    /// Deterministic in `(delegate, dek_secret)`: the same pair always yields
+    /// the same DEK, which is what lets a per-user secret round-trip across a
+    /// store reopen and stay readable even if the node KEK rotates.
+    ///
+    /// `&self` is unused (the node KEK is intentionally not consulted) but the
+    /// method stays on `SecretsStore` for symmetry with `derive_delegate_dek`
+    /// and so a future implementation could fold in store-level state if the
+    /// design ever needs it.
+    fn derive_user_dek(
+        &self,
+        delegate: &DelegateKey,
+        dek_secret: &Zeroizing<[u8; 32]>,
+    ) -> Encryption {
+        let salt = delegate.encode();
+        let hk = Hkdf::<Sha256>::new(Some(salt.as_bytes()), dek_secret.as_slice());
+        let mut okm = Zeroizing::new([0u8; KEK_SIZE]);
+        hk.expand(USER_DEK_HKDF_INFO, okm.as_mut_slice())
+            .expect("HKDF expand with 32-byte OKM never fails for SHA-256");
+        Encryption {
+            cipher: XChaCha20Poly1305::new(okm.as_slice().into()),
+            // Per-write random nonces are the only nonce source on the User
+            // path (there are no legacy User-scoped on-disk files), so this
+            // field is never consulted. Pin to zeros for determinism, matching
+            // `derive_delegate_dek`.
+            legacy_nonce: chacha20poly1305::XNonce::from_slice(&[0u8; 24]).to_owned(),
+        }
+    }
+
+    /// On-disk directory that holds the active secret files for a scope.
+    ///
+    /// - `Local` => `base_path/<delegate>` — UNCHANGED from pre-#4381, so
+    ///   existing secret files and `.snapshots/` keep their exact paths.
+    /// - `User`  => `base_path/<delegate>/users/<user_id>` — the literal
+    ///   `users/` segment can never collide with an existing secret-id file
+    ///   or the `.snapshots` directory, because those are siblings of
+    ///   `users/`, and a `SecretsId::encode()` (bs58 of a 32-byte hash) is
+    ///   never the ASCII string "users".
+    fn scope_dir(&self, delegate: &DelegateKey, scope: &SecretScope<'_>) -> PathBuf {
+        let delegate_dir = self.base_path.join(delegate.encode());
+        match scope {
+            SecretScope::Local => delegate_dir,
+            SecretScope::User { id, .. } => delegate_dir.join("users").join(id.encode()),
         }
     }
 
@@ -435,19 +652,33 @@ impl SecretsStore {
         self.ciphers.remove(delegate);
     }
 
+    /// Store a secret under the given `scope`.
+    ///
+    /// `SecretScope::Local` is byte-for-byte identical to the pre-#4381
+    /// single-user path (same on-disk path, node-KEK-derived DEK, ReDb
+    /// `secrets_index` table, blob layout). `SecretScope::User` writes under
+    /// `…/users/<user_id>/`, encrypts with a DEK derived solely from the
+    /// caller's `dek_secret`, and tracks the index in a SEPARATE ReDb table.
     pub fn store_secret(
         &mut self,
         delegate: &DelegateKey,
         key: &SecretsId,
+        scope: SecretScope<'_>,
         plaintext: Zeroizing<Vec<u8>>,
     ) -> RuntimeResult<()> {
-        let delegate_path = self.base_path.join(delegate.encode());
-        let secret_file_path = delegate_path.join(key.encode());
+        let scope_path = self.scope_dir(delegate, &scope);
+        let secret_file_path = scope_path.join(key.encode());
         let secret_key = *key.hash();
-        // `cipher_for` derives via HKDF and caches on first call. A
-        // prior `register_delegate(delegate, ..)` keeps its registered
-        // cipher (legacy compatibility path).
-        let encryption = self.cipher_for(delegate);
+        // DEK selection. Local: `cipher_for` derives via HKDF from the node
+        // KEK and caches on first call (a prior `register_delegate` keeps its
+        // registered cipher). User: derive a fresh DEK from `dek_secret`,
+        // node-KEK-independent and uncached. The Local branch MUST go through
+        // `cipher_for` (not `encryption_for_scope`) so the caching behavior is
+        // byte-for-byte unchanged.
+        let encryption = match &scope {
+            SecretScope::Local => self.cipher_for(delegate).clone(),
+            SecretScope::User { dek_secret, .. } => self.derive_user_dek(delegate, dek_secret),
+        };
 
         // Generate a fresh random nonce per write. XChaCha20-Poly1305's
         // 192-bit nonce makes random selection collision-safe for any
@@ -467,9 +698,9 @@ impl SecretsStore {
         ciphertext.extend_from_slice(nonce.as_slice());
         ciphertext.extend_from_slice(&aead);
 
-        fs::create_dir_all(&delegate_path)?;
-        if let Err(e) = ensure_owner_only_dir(&delegate_path) {
-            tracing::warn!(path = %delegate_path.display(), error = %e, "chmod delegate dir failed");
+        fs::create_dir_all(&scope_path)?;
+        if let Err(e) = ensure_owner_only_dir(&scope_path) {
+            tracing::warn!(path = %scope_path.display(), error = %e, "chmod scope dir failed");
         }
 
         // CRITICAL ORDER: hard-link prior value into snapshot history, write
@@ -484,7 +715,7 @@ impl SecretsStore {
         //     and index-update still gives `get_secret` the new value.
         if self.snapshots_enabled
             && secret_file_path.exists()
-            && let Err(e) = self.snapshot_prior_value(&delegate_path, key, &secret_file_path)
+            && let Err(e) = self.snapshot_prior_value(&scope_path, key, &secret_file_path)
         {
             // Snapshotting is best-effort. A failure here must not block the
             // primary write — the user's data still gets through. Log so
@@ -526,34 +757,68 @@ impl SecretsStore {
         }
 
         // Update index in ReDb and in-memory only after the active path has
-        // the new value durably committed.
-        let mut current_secrets: Vec<[u8; 32]> = self
-            .key_to_secret_part
-            .get(delegate)
-            .map(|entry| entry.value().iter().copied().collect())
-            .unwrap_or_default();
-
-        if !current_secrets.contains(&secret_key) {
-            current_secrets.push(secret_key);
-        }
-
-        self.db
-            .store_secrets_index(delegate, &current_secrets)
-            .map_err(|e| anyhow::anyhow!("Failed to store secrets index: {e}"))?;
-
-        let secret_set: HashSet<SecretKey> = current_secrets.into_iter().collect();
-        self.key_to_secret_part.insert(delegate.clone(), secret_set);
+        // the new value durably committed. The Local and User indices live in
+        // separate ReDb tables + separate in-memory maps, so a User write
+        // never perturbs a Local entry and vice-versa.
+        self.add_to_index(delegate, &scope, secret_key)?;
 
         // Best-effort thin of the snapshot history. Failures here only mean
         // we keep more snapshots than the policy targets, which is harmless
         // and self-correcting on the next write.
         if self.snapshots_enabled {
-            let snap_dir = snapshot_dir_for(&delegate_path, key);
+            let snap_dir = snapshot_dir_for(&scope_path, key);
             if snap_dir.exists() {
                 thin_snapshots(&snap_dir, &self.retention, SystemTime::now());
             }
         }
 
+        Ok(())
+    }
+
+    /// Add `secret_key` to the index for `(delegate, scope)`, persisting to
+    /// the scope's ReDb table FIRST and only then updating the in-memory
+    /// mirror (so a transient DB failure can't leave the in-memory map ahead
+    /// of the durable state). Local and User scopes use disjoint tables and
+    /// maps.
+    fn add_to_index(
+        &self,
+        delegate: &DelegateKey,
+        scope: &SecretScope<'_>,
+        secret_key: SecretKey,
+    ) -> RuntimeResult<()> {
+        match scope {
+            SecretScope::Local => {
+                let mut current: Vec<SecretKey> = self
+                    .key_to_secret_part
+                    .get(delegate)
+                    .map(|entry| entry.value().iter().copied().collect())
+                    .unwrap_or_default();
+                if !current.contains(&secret_key) {
+                    current.push(secret_key);
+                }
+                self.db
+                    .store_secrets_index(delegate, &current)
+                    .map_err(|e| anyhow::anyhow!("Failed to store secrets index: {e}"))?;
+                let secret_set: HashSet<SecretKey> = current.into_iter().collect();
+                self.key_to_secret_part.insert(delegate.clone(), secret_set);
+            }
+            SecretScope::User { id, .. } => {
+                let map_key = (delegate.clone(), **id);
+                let mut current: Vec<SecretKey> = self
+                    .user_key_to_secret_part
+                    .get(&map_key)
+                    .map(|entry| entry.value().iter().copied().collect())
+                    .unwrap_or_default();
+                if !current.contains(&secret_key) {
+                    current.push(secret_key);
+                }
+                self.db
+                    .store_user_secrets_index(delegate, id.as_bytes(), &current)
+                    .map_err(|e| anyhow::anyhow!("Failed to store user secrets index: {e}"))?;
+                let secret_set: HashSet<SecretKey> = current.into_iter().collect();
+                self.user_key_to_secret_part.insert(map_key, secret_set);
+            }
+        }
         Ok(())
     }
 
@@ -573,14 +838,18 @@ impl SecretsStore {
         snapshot_active_value(delegate_path, &key.encode(), secret_file_path)
     }
 
+    /// Remove a secret under the given `scope`. Local and User scopes are
+    /// independent: removing a Local secret leaves any same-`SecretsId` User
+    /// secrets intact, and vice-versa.
     pub fn remove_secret(
         &mut self,
         delegate: &DelegateKey,
         key: &SecretsId,
+        scope: SecretScope<'_>,
     ) -> Result<(), SecretStoreError> {
-        let delegate_path = self.base_path.join(delegate.encode());
-        let secret_path = delegate_path.join(key.encode());
-        let snap_dir = snapshot_dir_for(&delegate_path, key);
+        let scope_path = self.scope_dir(delegate, &scope);
+        let secret_path = scope_path.join(key.encode());
+        let snap_dir = snapshot_dir_for(&scope_path, key);
 
         // Best-effort delete of the snapshot history. Removing a secret means
         // the user no longer wants any version of that value retained.
@@ -607,47 +876,89 @@ impl SecretsStore {
         // `store_secret`, we treat persistence failure as fatal here
         // and only mutate the in-memory map after ReDb commits.
         let secret_key = *key.hash();
-        let mut current: Vec<SecretKey> = self
-            .key_to_secret_part
-            .get(delegate)
-            .map(|e| e.value().iter().copied().collect())
-            .unwrap_or_default();
-        current.retain(|k| k != &secret_key);
-
-        self.db
-            .store_secrets_index(delegate, &current)
-            .map_err(|e| std::io::Error::other(format!("Failed to update secrets index: {e}")))?;
-
-        let secret_set: HashSet<SecretKey> = current.into_iter().collect();
-        self.key_to_secret_part.insert(delegate.clone(), secret_set);
+        match &scope {
+            SecretScope::Local => {
+                let mut current: Vec<SecretKey> = self
+                    .key_to_secret_part
+                    .get(delegate)
+                    .map(|e| e.value().iter().copied().collect())
+                    .unwrap_or_default();
+                current.retain(|k| k != &secret_key);
+                self.db
+                    .store_secrets_index(delegate, &current)
+                    .map_err(|e| {
+                        std::io::Error::other(format!("Failed to update secrets index: {e}"))
+                    })?;
+                let secret_set: HashSet<SecretKey> = current.into_iter().collect();
+                self.key_to_secret_part.insert(delegate.clone(), secret_set);
+            }
+            SecretScope::User { id, .. } => {
+                let map_key = (delegate.clone(), **id);
+                let mut current: Vec<SecretKey> = self
+                    .user_key_to_secret_part
+                    .get(&map_key)
+                    .map(|e| e.value().iter().copied().collect())
+                    .unwrap_or_default();
+                current.retain(|k| k != &secret_key);
+                self.db
+                    .store_user_secrets_index(delegate, id.as_bytes(), &current)
+                    .map_err(|e| {
+                        std::io::Error::other(format!("Failed to update user secrets index: {e}"))
+                    })?;
+                let secret_set: HashSet<SecretKey> = current.into_iter().collect();
+                self.user_key_to_secret_part.insert(map_key, secret_set);
+            }
+        }
 
         Ok(())
     }
 
+    /// Read a secret under the given `scope`.
+    ///
+    /// `SecretScope::Local` is byte-for-byte the pre-#4381 read path (same
+    /// on-disk path, node-KEK-derived DEK, legacy-fallback chain).
+    /// `SecretScope::User` reads from `…/users/<user_id>/`, decrypting with
+    /// the DEK derived from the caller's `dek_secret`. The User path has NO
+    /// legacy-fallback chain (no historical user-scoped files exist), so a
+    /// wrong `dek_secret` surfaces as a clean `Encryption` error.
     pub fn get_secret(
         &self,
         delegate: &DelegateKey,
         key: &SecretsId,
+        scope: SecretScope<'_>,
     ) -> Result<Zeroizing<Vec<u8>>, SecretStoreError> {
-        let secret_path = self.base_path.join(delegate.encode()).join(key.encode());
-        // Read path derives DEK on demand without caching (requires
-        // &self). Cold reads pay one HKDF-SHA256 expand call (~µs).
-        let encryption = self.cipher_for_read(delegate);
-
+        let secret_path = self.scope_dir(delegate, &scope).join(key.encode());
         let blob =
             fs::read(secret_path).map_err(|_| SecretStoreError::MissingSecret(key.clone()))?;
-        // The post-#4144 / pre-#4140 auto-persisted `delegate_cipher`
-        // file shows up here as `default_encryption`. Pre-#4143 blobs
-        // written under the world-known constants are caught by the
-        // last-tier `legacy_migration_encryption`.
-        let legacy_chain = [&self.default_encryption];
-        decrypt_secret_blob(
-            &encryption,
-            &legacy_chain,
-            self.legacy_migration_encryption.as_ref(),
-            &blob,
-            key,
-        )
+
+        match &scope {
+            SecretScope::Local => {
+                // Read path derives DEK on demand without caching (requires
+                // &self). Cold reads pay one HKDF-SHA256 expand call (~µs).
+                let encryption = self.cipher_for_read(delegate);
+                // The post-#4144 / pre-#4140 auto-persisted `delegate_cipher`
+                // file shows up here as `default_encryption`. Pre-#4143 blobs
+                // written under the world-known constants are caught by the
+                // last-tier `legacy_migration_encryption`.
+                let legacy_chain = [&self.default_encryption];
+                decrypt_secret_blob(
+                    &encryption,
+                    &legacy_chain,
+                    self.legacy_migration_encryption.as_ref(),
+                    &blob,
+                    key,
+                )
+            }
+            SecretScope::User { dek_secret, .. } => {
+                // User secrets are only ever written by THIS code under the
+                // current format, so there is no legacy chain and no
+                // migration cipher: pass empty fallbacks. A bad `dek_secret`
+                // (wrong user) fails AEAD on the only attempted cipher and
+                // returns `Encryption`.
+                let encryption = self.derive_user_dek(delegate, dek_secret);
+                decrypt_secret_blob(&encryption, &[], None, &blob, key)
+            }
+        }
     }
 
     /// Enumerate the snapshot history for a given `(delegate, secret_id)`
@@ -933,8 +1244,13 @@ mod test {
         let text = vec![0, 1, 2];
 
         store.register_delegate(delegate.key().clone(), cipher, nonce)?;
-        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(text))?;
-        let f = store.get_secret(delegate.key(), &secret_id);
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(text),
+        )?;
+        let f = store.get_secret(delegate.key(), &secret_id, SecretScope::Local);
 
         assert!(f.is_ok());
         // Clean up after test
@@ -959,7 +1275,12 @@ mod test {
         store.register_delegate(delegate.key().clone(), cipher, nonce)?;
         let secret_id = SecretsId::new(vec![42]);
 
-        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"v1".to_vec()))?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"v1".to_vec()),
+        )?;
         // Sleep 2ms to guarantee a distinct epoch-millis stamp on the snapshot.
         // Sleep enough to guarantee a distinct epoch-millis stamp on the
         // snapshot even on virtualized CI runners with coarse clocks.
@@ -967,11 +1288,18 @@ mod test {
         // exercise the collision-suffix branch instead, which has its own
         // test in the secret_snapshots module.
         std::thread::sleep(Duration::from_millis(5));
-        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"v2".to_vec()))?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"v2".to_vec()),
+        )?;
 
         // Active value is the latest write.
         assert_eq!(
-            store.get_secret(delegate.key(), &secret_id)?.to_vec(),
+            store
+                .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+                .to_vec(),
             b"v2".to_vec()
         );
 
@@ -1031,6 +1359,7 @@ mod test {
             store.store_secret(
                 delegate.key(),
                 &secret_id,
+                SecretScope::Local,
                 Zeroizing::new(i.to_le_bytes().to_vec()),
             )?;
             // Force distinct epoch-millis stamps so the snapshot files don't
@@ -1075,14 +1404,24 @@ mod test {
         store.register_delegate(delegate.key().clone(), cipher, nonce)?;
         let secret_id = SecretsId::new(vec![9]);
 
-        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"a".to_vec()))?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"a".to_vec()),
+        )?;
         // Sleep enough to guarantee a distinct epoch-millis stamp on the
         // snapshot even on virtualized CI runners with coarse clocks.
         // A test that lands two writes in the same millisecond would
         // exercise the collision-suffix branch instead, which has its own
         // test in the secret_snapshots module.
         std::thread::sleep(Duration::from_millis(5));
-        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"b".to_vec()))?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"b".to_vec()),
+        )?;
 
         // Pre-conditions: index has the key, snapshot dir is populated.
         let secret_hash = *secret_id.hash();
@@ -1104,7 +1443,7 @@ mod test {
             "snapshot dir should exist before removal"
         );
 
-        store.remove_secret(delegate.key(), &secret_id)?;
+        store.remove_secret(delegate.key(), &secret_id, SecretScope::Local)?;
 
         // Post-conditions: index entry gone in BOTH ReDb and the in-memory
         // map, file gone, snapshot dir gone.
@@ -1129,7 +1468,7 @@ mod test {
             "snapshot dir should be deleted with the secret"
         );
         assert!(matches!(
-            store.get_secret(delegate.key(), &secret_id),
+            store.get_secret(delegate.key(), &secret_id, SecretScope::Local),
             Err(SecretStoreError::MissingSecret(_))
         ));
         Ok(())
@@ -1150,7 +1489,7 @@ mod test {
         store.register_delegate(delegate.key().clone(), cipher, nonce)?;
         let secret_id = SecretsId::new(vec![11]);
 
-        store.remove_secret(delegate.key(), &secret_id)?;
+        store.remove_secret(delegate.key(), &secret_id, SecretScope::Local)?;
 
         let post_index = store
             .db
@@ -1179,9 +1518,19 @@ mod test {
         store.register_delegate(delegate.key().clone(), cipher, nonce)?;
         let secret_id = SecretsId::new(vec![14]);
 
-        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"a".to_vec()))?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"a".to_vec()),
+        )?;
         std::thread::sleep(Duration::from_millis(5));
-        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"b".to_vec()))?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"b".to_vec()),
+        )?;
 
         let snap_dir = secrets_dir
             .join(delegate.key().encode())
@@ -1193,7 +1542,9 @@ mod test {
         );
         // Active path still holds the latest write.
         assert_eq!(
-            store.get_secret(delegate.key(), &secret_id)?.to_vec(),
+            store
+                .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+                .to_vec(),
             b"b".to_vec()
         );
         Ok(())
@@ -1222,11 +1573,21 @@ mod test {
 
         // Two writes per delegate against the same SecretsId.
         for value in [&b"a1"[..], &b"a2"[..]] {
-            store.store_secret(delegate_a.key(), &shared_id, Zeroizing::new(value.to_vec()))?;
+            store.store_secret(
+                delegate_a.key(),
+                &shared_id,
+                SecretScope::Local,
+                Zeroizing::new(value.to_vec()),
+            )?;
             std::thread::sleep(Duration::from_millis(5));
         }
         for value in [&b"b1"[..], &b"b2"[..]] {
-            store.store_secret(delegate_b.key(), &shared_id, Zeroizing::new(value.to_vec()))?;
+            store.store_secret(
+                delegate_b.key(),
+                &shared_id,
+                SecretScope::Local,
+                Zeroizing::new(value.to_vec()),
+            )?;
             std::thread::sleep(Duration::from_millis(5));
         }
 
@@ -1250,11 +1611,15 @@ mod test {
 
         // And get_secret on each delegate returns its own most-recent value.
         assert_eq!(
-            store.get_secret(delegate_a.key(), &shared_id)?.to_vec(),
+            store
+                .get_secret(delegate_a.key(), &shared_id, SecretScope::Local)?
+                .to_vec(),
             b"a2".to_vec()
         );
         assert_eq!(
-            store.get_secret(delegate_b.key(), &shared_id)?.to_vec(),
+            store
+                .get_secret(delegate_b.key(), &shared_id, SecretScope::Local)?
+                .to_vec(),
             b"b2".to_vec()
         );
         Ok(())
@@ -1278,6 +1643,7 @@ mod test {
         store.store_secret(
             delegate.key(),
             &secret_id,
+            SecretScope::Local,
             Zeroizing::new(b"first".to_vec()),
         )?;
 
@@ -1329,11 +1695,26 @@ mod test {
         store.register_delegate(delegate.key().clone(), cipher, nonce)?;
         let secret_id = SecretsId::new(vec![31]);
 
-        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"v1".to_vec()))?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"v1".to_vec()),
+        )?;
         std::thread::sleep(Duration::from_millis(5));
-        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"v2".to_vec()))?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"v2".to_vec()),
+        )?;
         std::thread::sleep(Duration::from_millis(5));
-        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"v3".to_vec()))?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"v3".to_vec()),
+        )?;
 
         let snaps = store.list_snapshots(delegate.key(), &secret_id)?;
         assert_eq!(snaps.len(), 2, "expected two snapshots after 3 writes");
@@ -1360,13 +1741,25 @@ mod test {
         store.register_delegate(delegate.key().clone(), cipher, nonce)?;
         let secret_id = SecretsId::new(vec![41]);
 
-        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"v1".to_vec()))?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"v1".to_vec()),
+        )?;
         std::thread::sleep(Duration::from_millis(5));
-        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"v2".to_vec()))?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"v2".to_vec()),
+        )?;
 
         // Confirm active = v2.
         assert_eq!(
-            store.get_secret(delegate.key(), &secret_id)?.to_vec(),
+            store
+                .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+                .to_vec(),
             b"v2".to_vec()
         );
 
@@ -1378,7 +1771,9 @@ mod test {
         store.restore_snapshot(delegate.key(), &secret_id, v1_ts)?;
 
         assert_eq!(
-            store.get_secret(delegate.key(), &secret_id)?.to_vec(),
+            store
+                .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+                .to_vec(),
             b"v1".to_vec(),
             "restore must put the v1 plaintext back"
         );
@@ -1409,9 +1804,19 @@ mod test {
         store.register_delegate(delegate.key().clone(), cipher, nonce)?;
         let secret_id = SecretsId::new(vec![51]);
 
-        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"a".to_vec()))?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"a".to_vec()),
+        )?;
         std::thread::sleep(Duration::from_millis(5));
-        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"b".to_vec()))?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"b".to_vec()),
+        )?;
 
         let err = store
             .restore_snapshot(delegate.key(), &secret_id, 0)
@@ -1447,11 +1852,17 @@ mod test {
         store.register_delegate(delegate.key().clone(), cipher, nonce)?;
         let secret_id = SecretsId::new(vec![61]);
 
-        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"keep".to_vec()))?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"keep".to_vec()),
+        )?;
         std::thread::sleep(Duration::from_millis(5));
         store.store_secret(
             delegate.key(),
             &secret_id,
+            SecretScope::Local,
             Zeroizing::new(b"overwrite".to_vec()),
         )?;
 
@@ -1468,7 +1879,7 @@ mod test {
         let snap_backup = temp_dir.path().join("backup-snapshot");
         std::fs::copy(&snap_src, &snap_backup)?;
 
-        store.remove_secret(delegate.key(), &secret_id)?;
+        store.remove_secret(delegate.key(), &secret_id, SecretScope::Local)?;
 
         // Re-stage the saved snapshot at the same on-disk location so the
         // restore code can find it.
@@ -1513,7 +1924,9 @@ mod test {
         // The snapshot was taken when "overwrite" was written, but it
         // holds the PRIOR active value at that point: "keep".
         assert_eq!(
-            store.get_secret(delegate.key(), &secret_id)?.to_vec(),
+            store
+                .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+                .to_vec(),
             b"keep".to_vec()
         );
         Ok(())
@@ -1553,6 +1966,7 @@ mod test {
         store.store_secret(
             delegate.key(),
             &secret_id,
+            SecretScope::Local,
             Zeroizing::new(b"active".to_vec()),
         )?;
 
@@ -1593,7 +2007,9 @@ mod test {
 
         store.restore_snapshot(delegate.key(), &secret_id, stamp)?;
         assert_eq!(
-            store.get_secret(delegate.key(), &secret_id)?.to_vec(),
+            store
+                .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+                .to_vec(),
             b"unsuffixed-winner".to_vec(),
             "unsuffixed file must win the collision tiebreak"
         );
@@ -1603,7 +2019,9 @@ mod test {
         std::fs::remove_file(snap_dir.join(&base))?;
         store.restore_snapshot(delegate.key(), &secret_id, stamp)?;
         assert_eq!(
-            store.get_secret(delegate.key(), &secret_id)?.to_vec(),
+            store
+                .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+                .to_vec(),
             b"suffix-0".to_vec(),
             "with the unsuffixed entry gone, lowest-numbered suffix wins"
         );
@@ -1633,6 +2051,7 @@ mod test {
         store.store_secret(
             delegate.key(),
             &secret_id,
+            SecretScope::Local,
             Zeroizing::new(plaintext.clone()),
         )?;
         let active = secrets_dir
@@ -1647,6 +2066,7 @@ mod test {
         store.store_secret(
             delegate.key(),
             &secret_id,
+            SecretScope::Local,
             Zeroizing::new(plaintext.clone()),
         )?;
         let second = std::fs::read(&active)?;
@@ -1666,7 +2086,9 @@ mod test {
         );
         // Both must decrypt back to the same plaintext.
         assert_eq!(
-            store.get_secret(delegate.key(), &secret_id)?.to_vec(),
+            store
+                .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+                .to_vec(),
             plaintext
         );
         Ok(())
@@ -1746,7 +2168,9 @@ mod test {
         std::fs::create_dir_all(&delegate_dir)?;
         std::fs::write(delegate_dir.join(secret_id.encode()), &legacy_blob)?;
 
-        let recovered = store.get_secret(delegate.key(), &secret_id)?.to_vec();
+        let recovered = store
+            .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+            .to_vec();
         assert_eq!(
             recovered,
             vec![winning_byte; 16],
@@ -1781,6 +2205,7 @@ mod test {
         store.store_secret(
             delegate.key(),
             &secret_id,
+            SecretScope::Local,
             Zeroizing::new(b"hello".to_vec()),
         )?;
         let active = secrets_dir
@@ -1809,6 +2234,7 @@ mod test {
         store.store_secret(
             delegate.key(),
             &secret_id_2,
+            SecretScope::Local,
             Zeroizing::new(b"hello".to_vec()),
         )?;
         let blob_2 = std::fs::read(
@@ -1864,7 +2290,9 @@ mod test {
         std::fs::create_dir_all(&delegate_dir)?;
         std::fs::write(delegate_dir.join(secret_id.encode()), &legacy_blob)?;
 
-        let recovered = store.get_secret(delegate.key(), &secret_id)?.to_vec();
+        let recovered = store
+            .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+            .to_vec();
         assert_eq!(
             recovered, plaintext,
             "legacy-format blob must decrypt via tier 1 raw-AEAD fallback"
@@ -1898,7 +2326,7 @@ mod test {
         std::fs::write(delegate_dir.join(secret_id.encode()), &bogus)?;
 
         let err = store
-            .get_secret(delegate.key(), &secret_id)
+            .get_secret(delegate.key(), &secret_id, SecretScope::Local)
             .expect_err("corrupt blob must fail");
         assert!(
             matches!(err, SecretStoreError::Encryption(_)),
@@ -1944,6 +2372,7 @@ mod test {
         store.store_secret(
             delegate.key(),
             &secret_id,
+            SecretScope::Local,
             Zeroizing::new(b"current".to_vec()),
         )?;
 
@@ -1984,7 +2413,9 @@ mod test {
         store.restore_snapshot(delegate.key(), &secret_id, stamp)?;
         // Active path now holds a legacy blob. `get_secret` must recover
         // the original plaintext through the legacy fallback.
-        let recovered = store.get_secret(delegate.key(), &secret_id)?.to_vec();
+        let recovered = store
+            .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+            .to_vec();
         assert_eq!(
             recovered, plaintext,
             "legacy snapshot must remain decryptable after restore + get_secret"
@@ -2037,7 +2468,9 @@ mod test {
         std::fs::write(delegate_dir.join(secret_id.encode()), &legacy_aead)?;
 
         // Must recover plaintext via legacy fallback path.
-        let recovered = store.get_secret(delegate.key(), &secret_id)?.to_vec();
+        let recovered = store
+            .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+            .to_vec();
         assert_eq!(
             recovered, plaintext,
             "default-cipher legacy blob must remain readable after register_delegate \
@@ -2094,7 +2527,9 @@ mod test {
         // No `register_delegate` call — this simulates the first
         // `get_secret` after restart, before any client has issued a
         // new `RegisterDelegate`. Must still recover the plaintext.
-        let recovered = store.get_secret(delegate.key(), &secret_id)?.to_vec();
+        let recovered = store
+            .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+            .to_vec();
         assert_eq!(
             recovered, plaintext,
             "legacy-default blob MUST be decryptable via legacy_migration_encryption \
@@ -2145,6 +2580,7 @@ mod test {
             store.store_secret(
                 delegate.key(),
                 &secret_id,
+                SecretScope::Local,
                 Zeroizing::new(plaintext.clone()),
             )?;
             // Pin the KEK file was provisioned by the file backend
@@ -2171,7 +2607,9 @@ mod test {
         let store = SecretsStore::new(secrets_dir, Default::default(), db)?;
         // No `register_delegate` call. DEK is re-derived from the KEK
         // loaded from the persisted file backend.
-        let recovered = store.get_secret(delegate.key(), &secret_id)?.to_vec();
+        let recovered = store
+            .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+            .to_vec();
         assert_eq!(
             recovered, plaintext,
             "second-start get_secret MUST recover plaintext via HKDF re-derivation"
@@ -2269,7 +2707,9 @@ mod test {
         std::fs::write(delegate_dir.join(secret_id.encode()), &blob)?;
 
         // No register_delegate. Must recover.
-        let recovered = store.get_secret(delegate.key(), &secret_id)?.to_vec();
+        let recovered = store
+            .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+            .to_vec();
         assert_eq!(recovered, plaintext);
         Ok(())
     }
@@ -2316,7 +2756,9 @@ mod test {
         // which does NOT match the blob's cipher. legacy_chain[0] =
         // default_encryption holds the captured old cipher, so the
         // versioned-format attempt at chain index 1 succeeds.
-        let recovered = store.get_secret(delegate.key(), &secret_id)?.to_vec();
+        let recovered = store
+            .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+            .to_vec();
         assert_eq!(recovered, plaintext);
         // Sanity: silence unused-mut warning.
         secrets.cipher_path = None;
@@ -2351,7 +2793,9 @@ mod test {
         std::fs::create_dir_all(&delegate_dir)?;
         std::fs::write(delegate_dir.join(secret_id.encode()), &aead)?;
 
-        let recovered = store.get_secret(delegate.key(), &secret_id)?.to_vec();
+        let recovered = store
+            .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+            .to_vec();
         assert_eq!(recovered, plaintext);
         Ok(())
     }
@@ -2378,9 +2822,12 @@ mod test {
         store.store_secret(
             delegate.key(),
             &secret_id,
+            SecretScope::Local,
             Zeroizing::new(plaintext.clone()),
         )?;
-        let recovered = store.get_secret(delegate.key(), &secret_id)?.to_vec();
+        let recovered = store
+            .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+            .to_vec();
         assert_eq!(recovered, plaintext);
         Ok(())
     }
@@ -2418,9 +2865,19 @@ mod test {
         store.register_delegate(delegate.key().clone(), cipher, nonce)?;
         let secret_id = SecretsId::new(vec![201]);
 
-        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"v1".to_vec()))?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"v1".to_vec()),
+        )?;
         std::thread::sleep(Duration::from_millis(5));
-        store.store_secret(delegate.key(), &secret_id, Zeroizing::new(b"v2".to_vec()))?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"v2".to_vec()),
+        )?;
 
         let delegate_dir = secrets_dir.join(delegate.key().encode());
         let secret_file = delegate_dir.join(secret_id.encode());
@@ -2518,12 +2975,739 @@ mod test {
         store.store_secret(
             delegate.key(),
             &secret_id,
+            SecretScope::Local,
             Zeroizing::new(plaintext.clone()),
         )?;
-        let recovered = store.get_secret(delegate.key(), &secret_id)?;
+        let recovered = store.get_secret(delegate.key(), &secret_id, SecretScope::Local)?;
         // Compare via Deref so we exercise the Zeroizing<Vec<u8>> handle
         // the caller actually receives.
         assert_eq!(recovered.as_slice(), plaintext.as_slice());
+        Ok(())
+    }
+
+    // =========================================================================
+    // PER-USER DIMENSION (P1 of #4381)
+    // =========================================================================
+    //
+    // The `User` scope is INERT in production (no caller constructs one yet).
+    // These tests are the acceptance gate for the storage layer: they prove
+    // (a) the Local path is byte-for-byte unchanged, (b) cross-user isolation
+    // holds, (c) the ReDb back-compat / separation is correct, (d) the user
+    // DEK is node-KEK-independent, and (e) the token helpers are
+    // domain-separated.
+
+    /// Helper: a fresh 32-byte dek_secret for a user. Distinct values yield
+    /// distinct DEKs.
+    fn user_dek(byte: u8) -> Zeroizing<[u8; 32]> {
+        Zeroizing::new([byte; 32])
+    }
+
+    /// NO-REGRESSION: a `Local` write lands at the EXACT pre-#4381 on-disk
+    /// path (`secrets_dir/<delegate>/<secret_id>`, no `users/` segment) and
+    /// the blob is the canonical `[VERSION_V1][24-byte nonce][AEAD]` layout.
+    /// This is the explicit "byte-for-byte identical" assertion the acceptance
+    /// gate requires.
+    #[tokio::test]
+    async fn local_scope_uses_legacy_path_and_blob_layout() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![230].into(), &vec![].into()));
+        let secret_id = SecretsId::new(vec![231]);
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"local-value".to_vec()),
+        )?;
+
+        // EXACT legacy path: secrets_dir/<delegate>/<secret_id>, no `users/`.
+        let legacy_path = secrets_dir
+            .join(delegate.key().encode())
+            .join(secret_id.encode());
+        assert!(
+            legacy_path.exists(),
+            "Local secret must land at the unchanged legacy path {}",
+            legacy_path.display()
+        );
+        // There must be NO `users/` directory created by a Local write.
+        let users_dir = secrets_dir.join(delegate.key().encode()).join("users");
+        assert!(
+            !users_dir.exists(),
+            "a Local write must not create a users/ directory"
+        );
+
+        // Canonical blob layout.
+        let blob = std::fs::read(&legacy_path)?;
+        assert_eq!(
+            blob.first().copied(),
+            Some(VERSION_V1),
+            "Local blob must keep the VERSION_V1 header"
+        );
+        assert!(
+            blob.len() >= HEADER_LEN + 16,
+            "Local blob must be [VER][24-nonce][AEAD>=16]; got {} bytes",
+            blob.len()
+        );
+
+        // Round-trips through the Local read path.
+        assert_eq!(
+            store
+                .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+                .to_vec(),
+            b"local-value".to_vec()
+        );
+        Ok(())
+    }
+
+    /// NO-REGRESSION: a `Local` write touches ONLY the single-user ReDb table
+    /// (`secrets_index`); the per-user table stays empty. Conversely a `User`
+    /// write touches ONLY the per-user table and leaves the single-user table
+    /// empty. Proves the schemas are disjoint.
+    #[tokio::test]
+    async fn local_and_user_writes_touch_disjoint_redb_tables()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![232].into(), &vec![].into()));
+        let secret_id = SecretsId::new(vec![233]);
+        let alice = UserId::new([1u8; 32]);
+        let alice_dek = user_dek(0x11);
+
+        // Local write: single-user table populated, per-user table empty.
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"L".to_vec()),
+        )?;
+        let local_index = store
+            .db
+            .get_secrets_index(delegate.key())?
+            .unwrap_or_default();
+        assert!(
+            local_index.contains(secret_id.hash()),
+            "Local write must populate the single-user index"
+        );
+        let user_index_after_local = store
+            .db
+            .get_user_secrets_index(delegate.key(), alice.as_bytes())?
+            .unwrap_or_default();
+        assert!(
+            user_index_after_local.is_empty(),
+            "Local write must NOT touch the per-user index"
+        );
+
+        // User write: per-user table populated, single-user index unchanged.
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::User {
+                id: &alice,
+                dek_secret: &alice_dek,
+            },
+            Zeroizing::new(b"U".to_vec()),
+        )?;
+        let user_index = store
+            .db
+            .get_user_secrets_index(delegate.key(), alice.as_bytes())?
+            .unwrap_or_default();
+        assert!(
+            user_index.contains(secret_id.hash()),
+            "User write must populate the per-user index"
+        );
+        // Single-user index is exactly what the Local write left — the User
+        // write didn't add or remove anything there.
+        let local_index_after_user = store
+            .db
+            .get_secrets_index(delegate.key())?
+            .unwrap_or_default();
+        assert_eq!(
+            local_index, local_index_after_user,
+            "User write must not perturb the single-user index"
+        );
+        Ok(())
+    }
+
+    /// ADVERSARIAL cross-user isolation. A secret written under user A:
+    ///   - is unreadable under user B (wrong dek_secret → AEAD failure),
+    ///   - is absent from B's namespace (different on-disk path),
+    ///   - is invisible to the Local scope and vice-versa,
+    ///   - holds an independent value from the SAME SecretsId under user B.
+    #[tokio::test]
+    async fn cross_user_isolation() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![240].into(), &vec![].into()));
+        let secret_id = SecretsId::new(vec![241]);
+
+        let alice = UserId::new([0xAA; 32]);
+        let bob = UserId::new([0xBB; 32]);
+        let alice_dek = user_dek(0xA1);
+        let bob_dek = user_dek(0xB1);
+
+        // Same SecretsId, three independent values across Local / A / B.
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"local-secret".to_vec()),
+        )?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::User {
+                id: &alice,
+                dek_secret: &alice_dek,
+            },
+            Zeroizing::new(b"alice-secret".to_vec()),
+        )?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::User {
+                id: &bob,
+                dek_secret: &bob_dek,
+            },
+            Zeroizing::new(b"bob-secret".to_vec()),
+        )?;
+
+        // Each scope reads back its own independent value.
+        assert_eq!(
+            store
+                .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+                .to_vec(),
+            b"local-secret".to_vec()
+        );
+        assert_eq!(
+            store
+                .get_secret(
+                    delegate.key(),
+                    &secret_id,
+                    SecretScope::User {
+                        id: &alice,
+                        dek_secret: &alice_dek
+                    }
+                )?
+                .to_vec(),
+            b"alice-secret".to_vec()
+        );
+        assert_eq!(
+            store
+                .get_secret(
+                    delegate.key(),
+                    &secret_id,
+                    SecretScope::User {
+                        id: &bob,
+                        dek_secret: &bob_dek
+                    }
+                )?
+                .to_vec(),
+            b"bob-secret".to_vec()
+        );
+
+        // Reading A's namespace with B's dek_secret (right id, wrong key)
+        // MUST fail with an AEAD error, not silently return another value.
+        let err = store
+            .get_secret(
+                delegate.key(),
+                &secret_id,
+                SecretScope::User {
+                    id: &alice,
+                    dek_secret: &bob_dek,
+                },
+            )
+            .expect_err("A's secret must not decrypt under B's dek_secret");
+        assert!(
+            matches!(err, SecretStoreError::Encryption(_)),
+            "wrong dek_secret must surface Encryption error, got {err:?}"
+        );
+
+        // A user C who never wrote anything has no file at their path → the
+        // secret is absent (MissingSecret), proving namespace separation by
+        // path as well as by key.
+        let carol = UserId::new([0xCC; 32]);
+        let carol_dek = user_dek(0xC1);
+        let absent = store.get_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::User {
+                id: &carol,
+                dek_secret: &carol_dek,
+            },
+        );
+        assert!(
+            matches!(absent, Err(SecretStoreError::MissingSecret(_))),
+            "an unwritten user namespace must be MissingSecret, got {absent:?}"
+        );
+
+        // On-disk paths are physically distinct, and the `users/<id>` dirs
+        // exist only for users that were written.
+        let local_file = secrets_dir
+            .join(delegate.key().encode())
+            .join(secret_id.encode());
+        let alice_file = secrets_dir
+            .join(delegate.key().encode())
+            .join("users")
+            .join(alice.encode())
+            .join(secret_id.encode());
+        let bob_file = secrets_dir
+            .join(delegate.key().encode())
+            .join("users")
+            .join(bob.encode())
+            .join(secret_id.encode());
+        assert!(local_file.exists() && alice_file.exists() && bob_file.exists());
+        assert!(
+            local_file != alice_file && alice_file != bob_file,
+            "each scope must occupy a distinct on-disk path"
+        );
+        let carol_dir = secrets_dir
+            .join(delegate.key().encode())
+            .join("users")
+            .join(carol.encode());
+        assert!(
+            !carol_dir.exists(),
+            "no directory should exist for a user who never wrote"
+        );
+        Ok(())
+    }
+
+    /// Removing a User secret leaves the same-`SecretsId` Local secret and a
+    /// second user's secret intact (independent delete domains).
+    #[tokio::test]
+    async fn remove_user_secret_is_scoped() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![242].into(), &vec![].into()));
+        let secret_id = SecretsId::new(vec![243]);
+        let alice = UserId::new([0xA0; 32]);
+        let bob = UserId::new([0xB0; 32]);
+        let alice_dek = user_dek(0xA2);
+        let bob_dek = user_dek(0xB2);
+
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"L".to_vec()),
+        )?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::User {
+                id: &alice,
+                dek_secret: &alice_dek,
+            },
+            Zeroizing::new(b"A".to_vec()),
+        )?;
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::User {
+                id: &bob,
+                dek_secret: &bob_dek,
+            },
+            Zeroizing::new(b"B".to_vec()),
+        )?;
+
+        // Remove ONLY Alice's.
+        store.remove_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::User {
+                id: &alice,
+                dek_secret: &alice_dek,
+            },
+        )?;
+
+        // Alice gone (file + index), Local + Bob intact.
+        assert!(matches!(
+            store.get_secret(
+                delegate.key(),
+                &secret_id,
+                SecretScope::User {
+                    id: &alice,
+                    dek_secret: &alice_dek
+                }
+            ),
+            Err(SecretStoreError::MissingSecret(_))
+        ));
+        assert!(
+            store
+                .db
+                .get_user_secrets_index(delegate.key(), alice.as_bytes())?
+                .unwrap_or_default()
+                .is_empty(),
+            "Alice's per-user index entry must be cleared"
+        );
+        assert_eq!(
+            store
+                .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
+                .to_vec(),
+            b"L".to_vec(),
+            "Local secret must survive a User remove"
+        );
+        assert_eq!(
+            store
+                .get_secret(
+                    delegate.key(),
+                    &secret_id,
+                    SecretScope::User {
+                        id: &bob,
+                        dek_secret: &bob_dek
+                    }
+                )?
+                .to_vec(),
+            b"B".to_vec(),
+            "Bob's secret must survive Alice's remove"
+        );
+        Ok(())
+    }
+
+    /// ReDb back-compat: a database that already holds a single-user
+    /// (`secrets_index`) entry written by pre-#4381 code loads correctly,
+    /// adding User entries does not perturb the Local entry, and User secrets
+    /// round-trip across a full store reopen (drop + reconstruct).
+    #[tokio::test]
+    async fn redb_backcompat_and_user_roundtrip_across_reopen()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // SAFETY: nextest per-process isolation — force the deterministic file
+        // KEK backend so the Local DEK survives the reopen.
+        unsafe {
+            std::env::remove_var("CREDENTIALS_DIRECTORY");
+        }
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db_path = temp_dir.path().to_path_buf();
+
+        let delegate = Delegate::from((&vec![250].into(), &vec![].into()));
+        let local_id = SecretsId::new(vec![251]);
+        let user_id_secret = SecretsId::new(vec![252]);
+        let alice = UserId::new([0x5A; 32]);
+        let alice_dek = user_dek(0x5A);
+
+        // --- First start: write a Local secret (the "pre-#4381" data) and a
+        //     User secret, then drop. ---
+        {
+            let db = create_test_db(&db_path).await;
+            let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+            store.store_secret(
+                delegate.key(),
+                &local_id,
+                SecretScope::Local,
+                Zeroizing::new(b"legacy-local".to_vec()),
+            )?;
+
+            // Snapshot the single-user index BEFORE any User write.
+            let local_index_before = store
+                .db
+                .get_secrets_index(delegate.key())?
+                .unwrap_or_default();
+            assert!(local_index_before.contains(local_id.hash()));
+
+            store.store_secret(
+                delegate.key(),
+                &user_id_secret,
+                SecretScope::User {
+                    id: &alice,
+                    dek_secret: &alice_dek,
+                },
+                Zeroizing::new(b"alice-persisted".to_vec()),
+            )?;
+
+            // Adding the User entry didn't change the single-user index.
+            let local_index_after = store
+                .db
+                .get_secrets_index(delegate.key())?
+                .unwrap_or_default();
+            assert_eq!(
+                local_index_before, local_index_after,
+                "User write must not perturb the persisted single-user index"
+            );
+        }
+
+        // --- Second start: reopen the SAME secrets_dir + DB. ---
+        let db = create_test_db(&db_path).await;
+        let store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        // Local secret still readable (HKDF re-derive from persisted KEK).
+        assert_eq!(
+            store
+                .get_secret(delegate.key(), &local_id, SecretScope::Local)?
+                .to_vec(),
+            b"legacy-local".to_vec(),
+            "pre-existing Local secret must remain readable after reopen"
+        );
+        // User secret still readable (DEK re-derived from the same dek_secret).
+        assert_eq!(
+            store
+                .get_secret(
+                    delegate.key(),
+                    &user_id_secret,
+                    SecretScope::User {
+                        id: &alice,
+                        dek_secret: &alice_dek
+                    }
+                )?
+                .to_vec(),
+            b"alice-persisted".to_vec(),
+            "User secret must round-trip across a store reopen"
+        );
+
+        // The in-memory user index was rehydrated from the per-user table.
+        let rehydrated = store
+            .user_key_to_secret_part
+            .get(&(delegate.key().clone(), alice))
+            .map(|e| e.value().contains(user_id_secret.hash()))
+            .unwrap_or(false);
+        assert!(
+            rehydrated,
+            "per-user in-memory index must rehydrate from ReDb on reopen"
+        );
+        Ok(())
+    }
+
+    /// DEK correctness: same `(delegate, dek_secret)` → same key; different
+    /// `dek_secret` → different key/ciphertext; the user DEK is independent of
+    /// the node KEK (a User secret stays decryptable with the same dek_secret
+    /// even after the node KEK changes between store reopens).
+    #[tokio::test]
+    async fn user_dek_deterministic_and_kek_independent() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // SAFETY: nextest per-process isolation — deterministic file KEK.
+        unsafe {
+            std::env::remove_var("CREDENTIALS_DIRECTORY");
+        }
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![160].into(), &vec![].into()));
+        let dek_a = user_dek(0x01);
+        let dek_b = user_dek(0x02);
+
+        // Determinism: same (delegate, dek_secret) yields byte-identical
+        // ciphertext for a fixed (nonce, plaintext).
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let pt = b"user-dek-determinism".as_slice();
+        let enc_a1 = store.derive_user_dek(delegate.key(), &dek_a);
+        let enc_a2 = store.derive_user_dek(delegate.key(), &dek_a);
+        let ct_a1 = enc_a1.cipher.encrypt(&nonce, pt).expect("encrypt");
+        let ct_a2 = enc_a2.cipher.encrypt(&nonce, pt).expect("encrypt");
+        assert_eq!(
+            ct_a1, ct_a2,
+            "same (delegate, dek_secret) must yield the same user DEK"
+        );
+
+        // Different dek_secret → different DEK → different ciphertext.
+        let enc_b = store.derive_user_dek(delegate.key(), &dek_b);
+        let ct_b = enc_b.cipher.encrypt(&nonce, pt).expect("encrypt");
+        assert_ne!(
+            ct_a1, ct_b,
+            "different dek_secret must yield a different user DEK"
+        );
+
+        // The user DEK must NOT depend on the node KEK: a store whose KEK
+        // differs derives the SAME user DEK for the same (delegate,
+        // dek_secret). Construct a second store in a SEPARATE secrets_dir so
+        // it provisions a fresh, different node KEK.
+        let secrets_dir2 = temp_dir.path().join("secrets-store-test-2");
+        std::fs::create_dir_all(&secrets_dir2)?;
+        let db2_dir = temp_dir.path().join("db2");
+        std::fs::create_dir_all(&db2_dir)?;
+        let db2 = create_test_db(&db2_dir).await;
+        let store2 = SecretsStore::new(secrets_dir2, Default::default(), db2)?;
+        // Sanity: the two stores really do have different node KEKs (so the
+        // Local DEKs would differ) — proven by different Local ciphertext.
+        let local1 = store.derive_delegate_dek(delegate.key());
+        let local2 = store2.derive_delegate_dek(delegate.key());
+        let lct1 = local1.cipher.encrypt(&nonce, pt).expect("encrypt");
+        let lct2 = local2.cipher.encrypt(&nonce, pt).expect("encrypt");
+        assert_ne!(
+            lct1, lct2,
+            "test precondition: the two stores must have distinct node KEKs"
+        );
+        // Despite distinct KEKs, the user DEK is identical.
+        let enc_a_store2 = store2.derive_user_dek(delegate.key(), &dek_a);
+        let ct_a_store2 = enc_a_store2.cipher.encrypt(&nonce, pt).expect("encrypt");
+        assert_eq!(
+            ct_a1, ct_a_store2,
+            "user DEK must be independent of the node KEK"
+        );
+        Ok(())
+    }
+
+    /// End-to-end KEK-independence at the secret level: a User secret written
+    /// by one store is decryptable by a DIFFERENT store (different node KEK)
+    /// given only the same dek_secret, when the on-disk file is moved into the
+    /// second store's tree. This models the P3 export/import portability the
+    /// design is built for.
+    #[tokio::test]
+    async fn user_secret_portable_across_nodes() -> Result<(), Box<dyn std::error::Error>> {
+        // SAFETY: nextest per-process isolation. The env mutation is confined
+        // to this test process and not restored because the process exits when
+        // the test ends. Clearing CREDENTIALS_DIRECTORY forces the file KEK
+        // backend so each node provisions a deterministic, distinct node KEK.
+        unsafe {
+            std::env::remove_var("CREDENTIALS_DIRECTORY");
+        }
+        let temp_dir = tempfile::tempdir()?;
+
+        let dir1 = temp_dir.path().join("node1-secrets");
+        let dir2 = temp_dir.path().join("node2-secrets");
+        let db1_dir = temp_dir.path().join("db-node1");
+        let db2_dir = temp_dir.path().join("db-node2");
+        std::fs::create_dir_all(&dir1)?;
+        std::fs::create_dir_all(&dir2)?;
+        std::fs::create_dir_all(&db1_dir)?;
+        std::fs::create_dir_all(&db2_dir)?;
+
+        let delegate = Delegate::from((&vec![161].into(), &vec![].into()));
+        let secret_id = SecretsId::new(vec![163]);
+        let alice = UserId::new([0x77; 32]);
+        let alice_dek = user_dek(0x77);
+
+        // Node 1 writes the user secret.
+        let db1 = create_test_db(&db1_dir).await;
+        let mut store1 = SecretsStore::new(dir1.clone(), Default::default(), db1)?;
+        store1.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::User {
+                id: &alice,
+                dek_secret: &alice_dek,
+            },
+            Zeroizing::new(b"portable-payload".to_vec()),
+        )?;
+
+        // Copy the on-disk blob into node 2's tree at the SAME relative path.
+        let rel = std::path::Path::new(&delegate.key().encode())
+            .join("users")
+            .join(alice.encode())
+            .join(secret_id.encode());
+        let src = dir1.join(&rel);
+        let dst = dir2.join(&rel);
+        std::fs::create_dir_all(dst.parent().unwrap())?;
+        std::fs::copy(&src, &dst)?;
+
+        // Node 2 has a DIFFERENT node KEK but the same dek_secret → decrypts.
+        let db2 = create_test_db(&db2_dir).await;
+        let store2 = SecretsStore::new(dir2.clone(), Default::default(), db2)?;
+        let recovered = store2
+            .get_secret(
+                delegate.key(),
+                &secret_id,
+                SecretScope::User {
+                    id: &alice,
+                    dek_secret: &alice_dek,
+                },
+            )?
+            .to_vec();
+        assert_eq!(
+            recovered,
+            b"portable-payload".to_vec(),
+            "User secret must be portable: decryptable on another node with the same dek_secret"
+        );
+        Ok(())
+    }
+
+    /// Domain separation of the token-derivation helpers:
+    /// `user_id(token) != user_dek_secret(token)` for any token, and both are
+    /// deterministic in the token.
+    #[test]
+    fn token_helpers_are_domain_separated_and_deterministic() {
+        for token in [&b""[..], b"t", b"a-much-longer-bearer-token-value"] {
+            let id = user_id(token);
+            let dek = user_dek_secret(token);
+            // Distinct domains → distinct outputs for the same token.
+            assert_ne!(
+                id.as_bytes(),
+                &*dek,
+                "user_id and user_dek_secret must differ for token {token:?}"
+            );
+            // Deterministic.
+            assert_eq!(
+                id.as_bytes(),
+                user_id(token).as_bytes(),
+                "user_id must be deterministic"
+            );
+            assert_eq!(
+                &*dek,
+                &*user_dek_secret(token),
+                "user_dek_secret must be deterministic"
+            );
+        }
+
+        // Different tokens → different ids (sanity, not a collision proof).
+        assert_ne!(
+            user_id(b"alice").as_bytes(),
+            user_id(b"bob").as_bytes(),
+            "distinct tokens should map to distinct user ids"
+        );
+    }
+
+    /// A User secret, like a Local one, must be 0o600 under a 0o700 tree —
+    /// including the new `users/<user_id>/` directories.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn user_secret_files_are_owner_only_on_unix() -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![170].into(), &vec![].into()));
+        let secret_id = SecretsId::new(vec![172]);
+        let alice = UserId::new([0x90; 32]);
+        let alice_dek = user_dek(0x90);
+
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::User {
+                id: &alice,
+                dek_secret: &alice_dek,
+            },
+            Zeroizing::new(b"v1".to_vec()),
+        )?;
+
+        let user_dir = secrets_dir
+            .join(delegate.key().encode())
+            .join("users")
+            .join(alice.encode());
+        let secret_file = user_dir.join(secret_id.encode());
+
+        let dir_mode = std::fs::metadata(&user_dir)?.permissions().mode() & 0o777;
+        assert_eq!(
+            dir_mode, 0o700,
+            "users/<id> dir must be 0o700, got {dir_mode:o}"
+        );
+        let file_mode = std::fs::metadata(&secret_file)?.permissions().mode() & 0o777;
+        assert_eq!(
+            file_mode, 0o600,
+            "user secret file must be 0o600, got {file_mode:o}"
+        );
         Ok(())
     }
 }

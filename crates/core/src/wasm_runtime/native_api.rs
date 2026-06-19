@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use super::contract_store::ContractStore;
 use super::delegate_store::DelegateStore;
 use super::runtime::InstanceInfo;
-use super::secrets_store::SecretsStore;
+use super::secrets_store::{SecretScope, SecretsStore};
 use crate::contract::storages::Storage;
 
 /// This is a map of starting addresses of the instance memory space.
@@ -1105,8 +1105,12 @@ pub(super) mod delegate_secrets {
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
-        // Look up the secret
-        match env.secret_store().get_secret(&env.delegate_key, &secret_id) {
+        // Look up the secret. P1 of #4381 added an optional per-user scope;
+        // the delegate host ABI is still single-user, so always Local here.
+        match env
+            .secret_store()
+            .get_secret(&env.delegate_key, &secret_id, SecretScope::Local)
+        {
             Ok(plaintext) => {
                 let len = plaintext.len();
                 if len > i32::MAX as usize {
@@ -1173,8 +1177,11 @@ pub(super) mod delegate_secrets {
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
-        // Look up the secret
-        match env.secret_store().get_secret(&env.delegate_key, &secret_id) {
+        // Look up the secret (single-user Local scope; see get_secret_len).
+        match env
+            .secret_store()
+            .get_secret(&env.delegate_key, &secret_id, SecretScope::Local)
+        {
             Ok(plaintext) => {
                 let secret_len = plaintext.len();
                 let out_len_usize = out_len as usize;
@@ -1289,10 +1296,12 @@ pub(super) mod delegate_secrets {
             unsafe { std::slice::from_raw_parts(val_src, val_len as usize) }.to_vec(),
         );
 
-        match env
-            .secret_store_mut()
-            .store_secret(&env.delegate_key, &secret_id, value)
-        {
+        match env.secret_store_mut().store_secret(
+            &env.delegate_key,
+            &secret_id,
+            SecretScope::Local,
+            value,
+        ) {
             Ok(()) => error_codes::SUCCESS,
             Err(e) => {
                 tracing::error!("delegate set_secret failed: {e}");
@@ -1341,7 +1350,10 @@ pub(super) mod delegate_secrets {
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
-        match env.secret_store().get_secret(&env.delegate_key, &secret_id) {
+        match env
+            .secret_store()
+            .get_secret(&env.delegate_key, &secret_id, SecretScope::Local)
+        {
             Ok(_) => 1,
             Err(e) => {
                 tracing::debug!(
@@ -1396,10 +1408,11 @@ pub(super) mod delegate_secrets {
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
-        match env
-            .secret_store_mut()
-            .remove_secret(&env.delegate_key, &secret_id)
-        {
+        match env.secret_store_mut().remove_secret(
+            &env.delegate_key,
+            &secret_id,
+            SecretScope::Local,
+        ) {
             Ok(()) => error_codes::SUCCESS,
             Err(e) => {
                 tracing::debug!(
