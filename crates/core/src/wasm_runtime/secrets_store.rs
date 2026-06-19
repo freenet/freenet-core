@@ -352,6 +352,42 @@ pub(super) fn ensure_owner_only_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Tighten EVERY directory segment from `base` (exclusive) down to `full`
+/// (inclusive) to owner-only.
+///
+/// `create_dir_all(full)` materializes all missing intermediate segments
+/// under the process umask (typically 0o755 = world-readable directory
+/// entries), but the callers historically only chmodded the leaf. For the
+/// per-user [`SecretScope::User`] path that leaf is
+/// `<delegate>/users/<user_id>`, so the freshly-created `<delegate>/users`
+/// and (on a delegate's first write) `<delegate>` would be left
+/// world-traversable — a local user could enumerate `users/` subdir names
+/// (the per-user id tags) and write timing, violating the owner-only-dir
+/// invariant (#4141). This walks the components strictly below `base` and
+/// applies [`ensure_owner_only_dir`] to each.
+///
+/// For [`SecretScope::Local`] `full == base/<delegate>`, so the only
+/// segment below `base` is `<delegate>` and this performs the SAME single
+/// chmod the pre-#4381 code did — Local behavior is byte-for-byte
+/// unchanged. `base` itself is never touched here (it is tightened once in
+/// [`SecretsStore::new`]). Best-effort by contract of its callers: they log
+/// and continue on a chmod error rather than failing the primary write.
+fn ensure_owner_only_tree(base: &Path, full: &Path) -> std::io::Result<()> {
+    // The relative path from base to full names exactly the segments we
+    // must tighten. If `full` is not under `base` (should never happen —
+    // both are derived from `self.base_path`), tighten only the leaf as a
+    // conservative fallback.
+    let Ok(rel) = full.strip_prefix(base) else {
+        return ensure_owner_only_dir(full);
+    };
+    let mut current = base.to_path_buf();
+    for component in rel.components() {
+        current.push(component);
+        ensure_owner_only_dir(&current)?;
+    }
+    Ok(())
+}
+
 impl SecretsStore {
     pub fn new(secrets_dir: PathBuf, secrets: Secrets, db: Storage) -> RuntimeResult<Self> {
         std::fs::create_dir_all(&secrets_dir).map_err(|err| {
@@ -699,8 +735,12 @@ impl SecretsStore {
         ciphertext.extend_from_slice(&aead);
 
         fs::create_dir_all(&scope_path)?;
-        if let Err(e) = ensure_owner_only_dir(&scope_path) {
-            tracing::warn!(path = %scope_path.display(), error = %e, "chmod scope dir failed");
+        // Tighten EVERY segment from base_path down to the leaf, not just the
+        // leaf: `create_dir_all` makes the intermediate `users/<id>` (and
+        // `<delegate>` on a delegate's first write) under the umask. For Local
+        // the leaf IS `<delegate>`, so this is the same single chmod as before.
+        if let Err(e) = ensure_owner_only_tree(&self.base_path, &scope_path) {
+            tracing::warn!(path = %scope_path.display(), error = %e, "chmod scope dir tree failed");
         }
 
         // CRITICAL ORDER: hard-link prior value into snapshot history, write
@@ -1056,6 +1096,17 @@ impl SecretsStore {
                 });
             }
             Err(RestoreError::Io(e)) => return Err(e.into()),
+        }
+
+        // `restore_snapshot_file` (and the reversibility snapshot it takes)
+        // `create_dir_all` the scope tree, chmodding only the leaves they
+        // create. For a User restore that materializes `<delegate>/users`
+        // and `<delegate>` (when restore is a delegate's first write) under
+        // the umask, so tighten the whole tree from base down to the leaf.
+        // For Local the leaf IS `<delegate>` → the same single chmod as the
+        // pre-#4381 path.
+        if let Err(e) = ensure_owner_only_tree(&self.base_path, &scope_path) {
+            tracing::warn!(path = %scope_path.display(), error = %e, "chmod scope dir tree failed");
         }
 
         // Index repair: only needed if the entry was previously removed
@@ -3732,21 +3783,44 @@ mod test {
             Zeroizing::new(b"v1".to_vec()),
         )?;
 
-        let user_dir = secrets_dir
-            .join(delegate.key().encode())
-            .join("users")
-            .join(alice.encode());
+        let delegate_dir = secrets_dir.join(delegate.key().encode());
+        let users_dir = delegate_dir.join("users");
+        let user_dir = users_dir.join(alice.encode());
         let secret_file = user_dir.join(secret_id.encode());
 
-        let dir_mode = std::fs::metadata(&user_dir)?.permissions().mode() & 0o777;
+        let mode = |p: &std::path::Path| -> std::io::Result<u32> {
+            Ok(std::fs::metadata(p)?.permissions().mode() & 0o777)
+        };
+
+        // EVERY directory segment from <delegate> down to the leaf must be
+        // owner-only, not just the leaf. `create_dir_all` materializes the
+        // intermediate `<delegate>` and `<delegate>/users` under the umask
+        // (typically 0o755); the fix tightens the whole tree. Without it,
+        // these two intermediates would be world-traversable and a local
+        // user could enumerate the per-user id tags under `users/`.
         assert_eq!(
-            dir_mode, 0o700,
-            "users/<id> dir must be 0o700, got {dir_mode:o}"
+            mode(&delegate_dir)?,
+            0o700,
+            "<delegate> dir must be 0o700, got {:o}",
+            mode(&delegate_dir)?
         );
-        let file_mode = std::fs::metadata(&secret_file)?.permissions().mode() & 0o777;
         assert_eq!(
-            file_mode, 0o600,
-            "user secret file must be 0o600, got {file_mode:o}"
+            mode(&users_dir)?,
+            0o700,
+            "<delegate>/users dir must be 0o700, got {:o}",
+            mode(&users_dir)?
+        );
+        assert_eq!(
+            mode(&user_dir)?,
+            0o700,
+            "users/<id> dir must be 0o700, got {:o}",
+            mode(&user_dir)?
+        );
+        assert_eq!(
+            mode(&secret_file)?,
+            0o600,
+            "user secret file must be 0o600, got {:o}",
+            mode(&secret_file)?
         );
         Ok(())
     }
