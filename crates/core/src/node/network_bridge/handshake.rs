@@ -294,13 +294,36 @@ async fn run_driver<S: crate::transport::Socket>(
                             (None, None, false)
                         };
 
-                        if events_tx.send(Event::InboundConnection {
+                        // Non-blocking (#4145): events_tx (cap 128) is drained by
+                        // the network event-loop task. A blocking `.send().await`
+                        // here would stall the handshake driver — and therefore stop
+                        // it draining commands_rx — whenever the event loop is
+                        // momentarily behind under fan-out load. On a FULL channel we
+                        // drop THIS inbound connection and keep accepting: the peer's
+                        // connect op retries, so a transiently-full channel must not
+                        // tear down the acceptor. Only a CLOSED channel (event loop
+                        // gone) is terminal — then we break to shut the driver down.
+                        match events_tx.try_send(Event::InboundConnection {
                             transaction,
                             peer,
                             connection: Box::new(conn),
                             transient,
-                        }).await.is_err() {
-                            break;
+                        }) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                tracing::warn!(
+                                    remote = %remote_addr,
+                                    "Event channel full; dropping inbound connection \
+                                     (peer's connect op will retry). Acceptor continues."
+                                );
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                tracing::debug!(
+                                    remote = %remote_addr,
+                                    "Event channel closed; shutting down handshake driver"
+                                );
+                                break;
+                            }
                         }
                     }
                     None => break,
@@ -355,6 +378,11 @@ fn spawn_outbound<S: crate::transport::Socket>(
             },
         };
 
+        // channel-safety: ok — this runs in a detached per-connection task
+        // (GlobalExecutor::spawn), NOT on the event loop or the run_driver
+        // acceptor, so blocking here cannot stall the loop or stop commands
+        // draining. Matches the "spawned task where blocking is acceptable"
+        // exception in .claude/rules/channel-safety.md (#4145).
         if let Err(e) = events_tx.send(event).await {
             tracing::warn!(error = %e, "failed to send handshake event");
         }
