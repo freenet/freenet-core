@@ -724,6 +724,7 @@ async fn connection_info(
     }): Query<ConnectionInfo>,
     Extension(allowed_hosts): Extension<crate::server::AllowedHosts>,
     Extension(allowed_source_cidrs): Extension<crate::server::AllowedSourceCidrs>,
+    Extension(hosted_mode): Extension<crate::server::HostedMode>,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
@@ -830,18 +831,15 @@ async fn connection_info(
     // which, if present, takes precedence (mirrors how a Bearer `auth_token`
     // header overrides its query form). The token is sensitive: we derive the
     // context and then drop the raw bytes — they are never stored or logged.
-    // Read the hosted-mode flag tolerantly: an absent `HostedMode` extension
-    // defaults to OFF. The production local path
-    // (node::run_local_node -> serve_client_api_in) always injects it, but a
-    // required `Extension<HostedMode>` extractor would make any embedded /
-    // library / secondary server that mounts this middleware without the layer
-    // 500 on every WS upgrade. Defaulting to false = hosted-off = inert/secure,
-    // which is the correct posture for any non-hosted server.
-    let hosted_mode = req
-        .extensions()
-        .get::<crate::server::HostedMode>()
-        .copied()
-        .unwrap_or_default();
+    // `hosted_mode` is a REQUIRED `Extension<HostedMode>` extractor (above), not
+    // read tolerantly: it is a security-isolation flag, so a missing injection
+    // must fail loud (500) rather than silently default to hosted-off. The single
+    // bring-up choke point `server::serve_client_api_in_impl` injects it on both
+    // router branches (loopback and LAN), so production always has it; a 500 here
+    // means a misconfiguration to surface, not to paper over. A silent
+    // default-to-false in a real hosted deployment that lost the injection would
+    // disable per-user isolation (all users -> Local shared namespace ->
+    // cross-user clobber) — for a security flag, fail-loud beats fail-silent.
     let user_token = req
         .headers()
         .get("x-freenet-user-token")
