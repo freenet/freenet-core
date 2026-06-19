@@ -352,7 +352,9 @@ impl ConfigArgs {
                         .collect(),
                 );
             }
-            self.ws_api.hosted_mode.get_or_insert(cfg.ws_api.hosted_mode);
+            self.ws_api
+                .hosted_mode
+                .get_or_insert(cfg.ws_api.hosted_mode);
             self.network_api
                 .address
                 .get_or_insert(cfg.network_api.address);

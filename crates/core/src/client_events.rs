@@ -22,10 +22,10 @@ use tokio::sync::mpsc;
 use crate::contract::{ClientResponsesReceiver, ContractHandlerEvent};
 use crate::message::{NodeEvent, QueryResult};
 use crate::node::OpManager;
-use crate::wasm_runtime::UserSecretContext;
 use crate::operations::{OpError, get, put, update};
 use crate::ring::KnownPeerKeyLocation;
 use crate::tracing::NetEventLog;
+use crate::wasm_runtime::UserSecretContext;
 use crate::{
     config::{GlobalExecutor, GlobalRng},
     contract::StoreResponse,

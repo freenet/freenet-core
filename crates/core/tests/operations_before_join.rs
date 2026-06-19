@@ -96,6 +96,7 @@ async fn test_operations_blocked_before_join() -> anyhow::Result<()> {
             token_cleanup_interval_seconds: None,
             allowed_host: None,
             allowed_source_cidrs: None,
+            hosted_mode: None,
         },
         network_api: freenet::config::NetworkArgs {
             public_address: Some(Ipv4Addr::LOCALHOST.into()),
@@ -154,6 +155,7 @@ async fn test_operations_blocked_before_join() -> anyhow::Result<()> {
             token_cleanup_interval_seconds: None,
             allowed_host: None,
             allowed_source_cidrs: None,
+            hosted_mode: None,
         },
         network_api: freenet::config::NetworkArgs {
             public_address: Some(Ipv4Addr::LOCALHOST.into()),

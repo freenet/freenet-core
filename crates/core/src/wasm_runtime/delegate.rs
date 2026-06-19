@@ -964,6 +964,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -990,8 +991,13 @@ mod test {
             context: contract_request.context.clone(),
         });
 
-        let final_outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response])?;
+        let final_outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![response],
+        )?;
 
         assert_eq!(final_outbound.len(), 1);
         let final_msg = match &final_outbound[0] {
@@ -1047,6 +1053,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -1069,8 +1076,13 @@ mod test {
             context: contract_request.context.clone(),
         });
 
-        let final_outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response])?;
+        let final_outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![response],
+        )?;
 
         let final_msg = match &final_outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(msg) => msg,
@@ -1126,6 +1138,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -1150,8 +1163,13 @@ mod test {
             context: req1.context,
         });
 
-        let outbound2 =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response1])?;
+        let outbound2 = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![response1],
+        )?;
 
         assert_eq!(outbound2.len(), 1);
         let req2 = match &outbound2[0] {
@@ -1174,8 +1192,13 @@ mod test {
             context: req2.context,
         });
 
-        let outbound3 =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response2])?;
+        let outbound3 = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![response2],
+        )?;
 
         assert_eq!(outbound3.len(), 1);
         let req3 = match &outbound3[0] {
@@ -1198,8 +1221,13 @@ mod test {
             context: req3.context,
         });
 
-        let final_outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response3])?;
+        let final_outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![response3],
+        )?;
 
         assert_eq!(final_outbound.len(), 1);
         let final_msg = match &final_outbound[0] {
@@ -1263,6 +1291,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -1324,6 +1353,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![contract_response],
         )?;
 
@@ -1379,8 +1409,13 @@ mod test {
         let payload: Vec<u8> = bincode::serialize(&InboundAppMessage::CreateInboxRequest).unwrap();
         let create_msg = ApplicationMessage::new(payload);
         let inbound = InboundDelegateMsg::ApplicationMessage(create_msg);
-        let outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![inbound])?;
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![inbound],
+        )?;
 
         let expected_payload =
             bincode::serialize(&OutboundAppMessage::CreateInboxResponse(vec![1])).unwrap();
@@ -1394,8 +1429,13 @@ mod test {
             bincode::serialize(&InboundAppMessage::PleaseSignMessage(vec![1, 2, 3])).unwrap();
         let sign_msg = ApplicationMessage::new(payload);
         let inbound = InboundDelegateMsg::ApplicationMessage(sign_msg);
-        let outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![inbound])?;
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![inbound],
+        )?;
 
         let expected_payload =
             bincode::serialize(&OutboundAppMessage::MessageSigned(vec![4, 5, 2])).unwrap();
@@ -1432,7 +1472,7 @@ mod test {
         ];
 
         let outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, messages)?;
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, None, messages)?;
 
         assert_eq!(outbound.len(), 2);
 
@@ -1516,6 +1556,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
 
@@ -1541,6 +1582,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -1596,6 +1638,7 @@ mod test {
         let _outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -1672,6 +1715,7 @@ mod test {
             runtime.inbound_app_message(
                 d.key(),
                 &vec![].into(),
+                None,
                 None,
                 vec![InboundDelegateMsg::ApplicationMessage(msg)],
             )?;
@@ -1767,6 +1811,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(
                 ApplicationMessage::new(payload),
             )],
@@ -1789,6 +1834,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(
                 ApplicationMessage::new(payload),
@@ -1864,6 +1910,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(
                 ApplicationMessage::new(payload),
             )],
@@ -1925,6 +1972,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
 
@@ -1951,6 +1999,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
 
@@ -1959,6 +2008,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -1999,6 +2049,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -2044,6 +2095,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
 
@@ -2067,6 +2119,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -2133,6 +2186,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
 
@@ -2176,6 +2230,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -2234,6 +2289,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
 
@@ -2242,6 +2298,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -2265,6 +2322,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -2324,7 +2382,7 @@ mod test {
             .collect();
 
         let outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, messages)?;
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, None, messages)?;
 
         assert_eq!(outbound.len(), 3);
 
@@ -2389,6 +2447,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
 
@@ -2397,6 +2456,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -2420,6 +2480,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
         let response: OutboundAppMessage = match &outbound[0] {
@@ -2441,6 +2502,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -2487,6 +2549,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
         let response: OutboundAppMessage = match &outbound[0] {
@@ -2526,6 +2589,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -2595,7 +2659,7 @@ mod test {
         ];
 
         let outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, messages)?;
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, None, messages)?;
 
         assert_eq!(outbound.len(), 2);
 
@@ -2668,6 +2732,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
         let response: OutboundAppMessage = match &outbound[0] {
@@ -2708,6 +2773,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -2795,6 +2861,7 @@ mod test {
                         delegate1_clone.key(),
                         &vec![].into(),
                         None,
+                        None,
                         vec![InboundDelegateMsg::ApplicationMessage(msg)],
                     )
                     .unwrap();
@@ -2810,6 +2877,7 @@ mod test {
                     .inbound_app_message(
                         delegate1_clone.key(),
                         &vec![].into(),
+                        None,
                         None,
                         vec![InboundDelegateMsg::ApplicationMessage(msg)],
                     )
@@ -2875,6 +2943,7 @@ mod test {
                         delegate2_clone.key(),
                         &vec![].into(),
                         None,
+                        None,
                         vec![InboundDelegateMsg::ApplicationMessage(msg)],
                     )
                     .unwrap();
@@ -2890,6 +2959,7 @@ mod test {
                     .inbound_app_message(
                         delegate2_clone.key(),
                         &vec![].into(),
+                        None,
                         None,
                         vec![InboundDelegateMsg::ApplicationMessage(msg)],
                     )
@@ -3003,8 +3073,13 @@ mod test {
         let payload: Vec<u8> = bincode::serialize(&InboundAppMessage::CreateInboxRequest).unwrap();
         let create_msg = ApplicationMessage::new(payload);
         let inbound = InboundDelegateMsg::ApplicationMessage(create_msg);
-        let outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![inbound])?;
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![inbound],
+        )?;
 
         let expected_payload =
             bincode::serialize(&OutboundAppMessage::CreateInboxResponse(vec![1])).unwrap();
@@ -3141,6 +3216,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -3228,6 +3304,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
@@ -3341,6 +3418,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
@@ -3550,6 +3628,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -3575,8 +3654,13 @@ mod test {
             context: put_request.context.clone(),
         });
 
-        let final_outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response])?;
+        let final_outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![response],
+        )?;
 
         assert_eq!(
             final_outbound.len(),
@@ -3638,6 +3722,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -3663,8 +3748,13 @@ mod test {
             context: update_request.context.clone(),
         });
 
-        let final_outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response])?;
+        let final_outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![response],
+        )?;
 
         assert_eq!(
             final_outbound.len(),
@@ -3728,6 +3818,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -3753,8 +3844,13 @@ mod test {
             context: subscribe_request.context.clone(),
         });
 
-        let final_outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response])?;
+        let final_outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![response],
+        )?;
 
         assert_eq!(
             final_outbound.len(),
@@ -3819,6 +3915,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![notification],
         )?;
@@ -3931,6 +4028,7 @@ mod test {
             &delegate_key,
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -3980,6 +4078,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             &delegate_key,
             &vec![].into(),
+            None,
             None,
             vec![subscribe_response],
         )?;
@@ -4040,8 +4139,13 @@ mod test {
             context: DelegateContext::default(),
         });
 
-        let outbound =
-            runtime.inbound_app_message(&delegate_key, &vec![].into(), None, vec![notification])?;
+        let outbound = runtime.inbound_app_message(
+            &delegate_key,
+            &vec![].into(),
+            None,
+            None,
+            vec![notification],
+        )?;
 
         // --- Step 4: Verify delegate responds correctly ---
         assert_eq!(outbound.len(), 1, "Expected one outbound from notification");
@@ -4258,6 +4362,7 @@ mod test {
             &key_a,
             &vec![1u8].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -4320,6 +4425,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             &key_b,
             &vec![2u8].into(),
+            None,
             None,
             vec![InboundDelegateMsg::DelegateMessage(delegate_msg)],
         )?;
@@ -4391,6 +4497,7 @@ mod test {
             &key_b,
             &vec![2u8].into(),
             Some(&origin),
+            None,
             vec![InboundDelegateMsg::DelegateMessage(delegate_msg)],
         )?;
 
@@ -4452,6 +4559,7 @@ mod test {
             &key_a,
             &vec![1u8].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -4477,6 +4585,7 @@ mod test {
         let outbound_b = runtime_b.inbound_app_message(
             &key_b,
             &vec![2u8].into(),
+            None,
             None,
             vec![InboundDelegateMsg::DelegateMessage(send_msg)],
         )?;
@@ -4562,6 +4671,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             &key_a,
             &vec![1u8].into(),
+            None,
             None,
             vec![
                 InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload1)),

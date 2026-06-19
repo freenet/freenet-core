@@ -64,8 +64,7 @@ fn byte_multiset_eq(a: &[u8], b: &[u8]) -> bool {
 
 use crate::node::OpManager;
 use crate::wasm_runtime::{
-    BackendEngine, MAX_STATE_SIZE, ModuleCache, RuntimeConfig, SharedModuleCache,
-    UserSecretContext,
+    BackendEngine, MAX_STATE_SIZE, ModuleCache, RuntimeConfig, SharedModuleCache, UserSecretContext,
 };
 
 use dashmap::DashMap;
@@ -949,8 +948,7 @@ impl ContractExecutor for RuntimePool {
         user_context: Option<&UserSecretContext>,
     ) -> Response {
         let mut executor = self.pop_executor().await;
-        let result =
-            executor.delegate_request(req, origin_contract, caller_delegate, user_context);
+        let result = executor.delegate_request(req, origin_contract, caller_delegate, user_context);
         self.return_checked(executor, "execute_delegate_request")
             .await;
         result
