@@ -1251,4 +1251,55 @@ mod tests {
              fires for every phantom contract before the gate can skip it"
         );
     }
+
+    /// Source-scrape pin: the streaming branch of `broadcast_to_single_peer`
+    /// must record the broadcast-stream gauge on ALL THREE of its exits (#4440),
+    /// not just the success arm. The two early-failure exits — initial metadata
+    /// `bridge.send(...)` returning Err, and `send_stream_with_completion(...)`
+    /// returning Err — are exactly the congestion failure mode the v0.2.73
+    /// incident exhibited. If a future edit drops one of those
+    /// `record_attempt(false)` calls, the gauge would silently undercount and
+    /// bias the incident signal LOW precisely when it matters most, with no
+    /// test failure otherwise. (The post-dispatch `record_attempt(delivered)` is
+    /// the third site.)
+    ///
+    /// Asserting against the process-global `BROADCAST_STREAM_METRICS` after
+    /// running the broadcast would be racy (concurrent tests share the global),
+    /// so this pins the call sites in source instead — mirroring the
+    /// `refresh_router` health-gauge pin in `ring.rs`.
+    #[test]
+    fn broadcast_to_single_peer_records_attempt_on_every_streaming_exit_pin() {
+        let src = include_str!("broadcast_queue.rs");
+        // Slice the `broadcast_to_single_peer` fn body so the unrelated
+        // `record_attempt` calls in the metrics unit test (and this test's own
+        // docs) don't count: from its signature to the start of the next fn.
+        let fn_start = src
+            .find("pub(super) async fn broadcast_to_single_peer(")
+            .expect("broadcast_to_single_peer not found");
+        let after = &src[fn_start..];
+        // The next item after the fn is the `#[cfg(test)] mod tests`.
+        let fn_end = after
+            .find("\nmod tests {")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .expect("end of broadcast_to_single_peer (start of tests module) not found");
+        let body = &after[..fn_end];
+
+        let record_calls = body.matches(".record_attempt(").count();
+        assert_eq!(
+            record_calls, 3,
+            "broadcast_to_single_peer's streaming branch must call record_attempt \
+             on all three exits (initial-send Err, dispatch Err, post-dispatch \
+             outcome) — got {record_calls}. A dropped early-exit record silently \
+             biases the v0.2.73 incident gauge LOW under congestion."
+        );
+        // Two of the three must be the explicit-failure form, so a refactor that
+        // collapses an early exit into the success path (losing the `false`)
+        // also trips this pin.
+        let failure_calls = body.matches(".record_attempt(false)").count();
+        assert_eq!(
+            failure_calls, 2,
+            "exactly the two early-failure exits must record record_attempt(false) \
+             (got {failure_calls}); the third exit records record_attempt(delivered)"
+        );
+    }
 }
