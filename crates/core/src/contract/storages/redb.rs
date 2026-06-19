@@ -47,6 +47,16 @@ pub(crate) const BROKEN_INVARIANTS_TABLE: TableDefinition<&[u8], &[u8]> =
 pub(crate) const SECRETS_INDEX_TABLE: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("secrets_index");
 
+/// Index table for the per-user secret dimension (P1 of #4381). SEPARATE
+/// from [`SECRETS_INDEX_TABLE`] so the existing single-user index keeps its
+/// exact schema and a pre-#4381 database opens unchanged (this table is
+/// simply absent → created empty on first open).
+///
+/// Key: DelegateKey (64 bytes) || UserId (32 bytes) = 96 bytes
+/// Value: Concatenated secret key hashes (N * 32 bytes)
+pub(crate) const USER_SECRETS_INDEX_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("user_secrets_index");
+
 /// Metadata about a hosted contract, persisted to survive restarts.
 #[derive(Debug, Clone, Copy)]
 pub struct HostingMetadata {
@@ -222,6 +232,20 @@ impl ReDb {
                     table = "SECRETS_INDEX_TABLE",
                     phase = "table_init_failed",
                     "Failed to open SECRETS_INDEX_TABLE"
+                );
+                e
+            })?;
+
+            // Per-user secrets index (P1 of #4381). Created on first open of
+            // upgraded databases too — redb creates missing tables inside the
+            // same write txn that opens them, so old DBs gain an empty table
+            // without disturbing the single-user SECRETS_INDEX_TABLE above.
+            txn.open_table(USER_SECRETS_INDEX_TABLE).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    table = "USER_SECRETS_INDEX_TABLE",
+                    phase = "table_init_failed",
+                    "Failed to open USER_SECRETS_INDEX_TABLE"
                 );
                 e
             })?;
@@ -727,6 +751,150 @@ impl ReDb {
         Ok(result)
     }
 
+    // ============== Per-User Secrets Index Methods (P1 of #4381) ==============
+    // SEPARATE table from the single-user index above; the DelegateKey is
+    // suffixed with the 32-byte UserId so each user's set is independent. The
+    // single-user SECRETS_INDEX_TABLE is never touched by these methods.
+
+    /// Build the 96-byte composite key `DelegateKey(64) || UserId(32)`.
+    fn user_index_key(delegate_key: &DelegateKey, user_id: &[u8; 32]) -> [u8; 96] {
+        let mut key_bytes = [0u8; 96];
+        key_bytes[..32].copy_from_slice(delegate_key.as_ref());
+        key_bytes[32..64].copy_from_slice(delegate_key.code_hash().as_ref());
+        key_bytes[64..].copy_from_slice(user_id);
+        key_bytes
+    }
+
+    /// Store a per-user secrets index entry:
+    /// `(DelegateKey, UserId) → concatenated secret key hashes`.
+    pub fn store_user_secrets_index(
+        &self,
+        delegate_key: &DelegateKey,
+        user_id: &[u8; 32],
+        secret_keys: &[[u8; 32]],
+    ) -> Result<(), redb::Error> {
+        let key_bytes = Self::user_index_key(delegate_key, user_id);
+
+        let mut value_bytes = Vec::with_capacity(secret_keys.len() * 32);
+        for sk in secret_keys {
+            value_bytes.extend_from_slice(sk);
+        }
+
+        let txn = self.0.begin_write()?;
+        {
+            let mut tbl = txn.open_table(USER_SECRETS_INDEX_TABLE)?;
+            tbl.insert(key_bytes.as_slice(), value_bytes.as_slice())?;
+        }
+        txn.commit().map_err(Into::into)
+    }
+
+    /// Get the secret key hashes for a `(DelegateKey, UserId)` pair.
+    /// Test-only today; the runtime hydrates the whole table at startup via
+    /// [`Self::load_all_user_secrets_index`] and keeps an in-memory mirror,
+    /// so it never point-queries. Kept for parity with the single-user
+    /// `get_secrets_index` and for tests asserting on the durable row.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn get_user_secrets_index(
+        &self,
+        delegate_key: &DelegateKey,
+        user_id: &[u8; 32],
+    ) -> Result<Option<Vec<[u8; 32]>>, redb::Error> {
+        let key_bytes = Self::user_index_key(delegate_key, user_id);
+
+        let txn = self.0.begin_read()?;
+        let tbl = txn.open_table(USER_SECRETS_INDEX_TABLE)?;
+        match tbl.get(key_bytes.as_slice())? {
+            Some(v) => {
+                let value = v.value();
+                if value.len() % 32 != 0 {
+                    return Err(redb::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Invalid user secrets index value length",
+                    )));
+                }
+                let mut result = Vec::with_capacity(value.len() / 32);
+                for chunk in value.chunks(32) {
+                    let arr: [u8; 32] = chunk.try_into().unwrap();
+                    result.push(arr);
+                }
+                Ok(Some(result))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Remove a per-user secrets index entry.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn remove_user_secrets_index(
+        &self,
+        delegate_key: &DelegateKey,
+        user_id: &[u8; 32],
+    ) -> Result<(), redb::Error> {
+        let key_bytes = Self::user_index_key(delegate_key, user_id);
+
+        let txn = self.0.begin_write()?;
+        {
+            let mut tbl = txn.open_table(USER_SECRETS_INDEX_TABLE)?;
+            tbl.remove(key_bytes.as_slice())?;
+        }
+        txn.commit().map_err(Into::into)
+    }
+
+    /// Load all per-user secrets index entries as
+    /// `((DelegateKey, UserId bytes), secret key hashes)`.
+    #[allow(clippy::type_complexity)]
+    pub fn load_all_user_secrets_index(
+        &self,
+    ) -> Result<Vec<((DelegateKey, [u8; 32]), Vec<[u8; 32]>)>, redb::Error> {
+        let txn = self.0.begin_read()?;
+        let tbl = txn.open_table(USER_SECRETS_INDEX_TABLE)?;
+
+        let mut result = Vec::new();
+        for entry in tbl.iter()? {
+            let (key, value) = entry?;
+            let key_bytes = key.value();
+            if key_bytes.len() != 96 {
+                // Skip malformed entries. The write path always emits a
+                // 96-byte composite key (DelegateKey(64) || UserId(32)); a
+                // wrong length means an externally-corrupted or
+                // future-format row. Drop it rather than panic on the
+                // fixed-size `try_into`s below, and warn so the corruption
+                // is visible in monitoring.
+                tracing::warn!(
+                    len = key_bytes.len(),
+                    "Skipping malformed user-secrets-index row (key length != 96)"
+                );
+                continue;
+            }
+            let delegate_key_bytes: [u8; 32] = key_bytes[..32].try_into().unwrap();
+            let code_hash_bytes: [u8; 32] = key_bytes[32..64].try_into().unwrap();
+            let user_id_bytes: [u8; 32] = key_bytes[64..].try_into().unwrap();
+
+            let value_bytes = value.value();
+            if value_bytes.len() % 32 != 0 {
+                // Skip malformed entries. The value is a concatenation of
+                // 32-byte secret-key hashes, so a length not divisible by
+                // 32 is corruption. Warn and drop rather than splitting a
+                // partial hash.
+                tracing::warn!(
+                    len = value_bytes.len(),
+                    "Skipping malformed user-secrets-index row (value length not a multiple of 32)"
+                );
+                continue;
+            }
+            let mut secret_keys = Vec::with_capacity(value_bytes.len() / 32);
+            for chunk in value_bytes.chunks(32) {
+                let arr: [u8; 32] = chunk.try_into().unwrap();
+                secret_keys.push(arr);
+            }
+
+            let delegate_key =
+                DelegateKey::new(delegate_key_bytes, CodeHash::from(&code_hash_bytes));
+            result.push(((delegate_key, user_id_bytes), secret_keys));
+        }
+        Ok(result)
+    }
+
     // ==================== Broken Invariants Methods ====================
     // Per-contract record of detected CRDT-invariant violations. See
     // `ring::broken_invariants` for the in-memory tracker.
@@ -1195,6 +1363,134 @@ mod tests {
             rows.is_empty(),
             "malformed row must be silently skipped; got: {:?}",
             rows
+        );
+    }
+
+    // ==================== Per-User Secrets Index (P1 of #4381) ====================
+
+    /// Build a deterministic `DelegateKey` from two seed bytes (one for the
+    /// instance key, one for the code hash) for the per-user index tests.
+    fn fake_delegate_key(key_seed: u8, code_seed: u8) -> DelegateKey {
+        DelegateKey::new([key_seed; 32], CodeHash::from(&[code_seed; 32]))
+    }
+
+    /// Full store → get → remove → load round trip for the per-user secrets
+    /// index, exercising `store_user_secrets_index`, `get_user_secrets_index`,
+    /// `remove_user_secrets_index` (otherwise uncalled in non-test builds),
+    /// and `load_all_user_secrets_index`. Pins that the composite
+    /// `(DelegateKey, UserId)` key round-trips and that two users under the
+    /// same delegate are independent.
+    #[tokio::test]
+    async fn user_secrets_index_store_get_remove_load_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+
+        let delegate = fake_delegate_key(0x11, 0x22);
+        let alice: [u8; 32] = [0xAA; 32];
+        let bob: [u8; 32] = [0xBB; 32];
+        let alice_secrets = vec![[1u8; 32], [2u8; 32]];
+        let bob_secrets = vec![[3u8; 32]];
+
+        // Store under two distinct users of the same delegate.
+        db.store_user_secrets_index(&delegate, &alice, &alice_secrets)
+            .unwrap();
+        db.store_user_secrets_index(&delegate, &bob, &bob_secrets)
+            .unwrap();
+
+        // Point-query each user back.
+        assert_eq!(
+            db.get_user_secrets_index(&delegate, &alice).unwrap(),
+            Some(alice_secrets.clone()),
+            "alice's secret set must round-trip"
+        );
+        assert_eq!(
+            db.get_user_secrets_index(&delegate, &bob).unwrap(),
+            Some(bob_secrets.clone()),
+            "bob's secret set must round-trip independently"
+        );
+
+        // load_all returns both rows.
+        let mut loaded = db.load_all_user_secrets_index().unwrap();
+        loaded.sort_by_key(|((_, user), _)| *user);
+        let mut expected = vec![
+            ((delegate.clone(), alice), alice_secrets.clone()),
+            ((delegate.clone(), bob), bob_secrets.clone()),
+        ];
+        expected.sort_by_key(|((_, user), _)| *user);
+        assert_eq!(loaded, expected, "load_all must return both users' rows");
+
+        // Remove alice; bob is untouched, alice point-query is now None.
+        db.remove_user_secrets_index(&delegate, &alice).unwrap();
+        assert_eq!(
+            db.get_user_secrets_index(&delegate, &alice).unwrap(),
+            None,
+            "removed user must read back as None"
+        );
+        assert_eq!(
+            db.get_user_secrets_index(&delegate, &bob).unwrap(),
+            Some(bob_secrets.clone()),
+            "removing alice must not touch bob"
+        );
+        let remaining = db.load_all_user_secrets_index().unwrap();
+        assert_eq!(
+            remaining,
+            vec![((delegate, bob), bob_secrets)],
+            "only bob's row must remain after removing alice"
+        );
+    }
+
+    /// Malformed rows in `USER_SECRETS_INDEX_TABLE` must be skipped (not
+    /// panic, not abort the whole load), mirroring
+    /// `broken_invariants_load_skips_malformed_value`. We inject (a) a 95-byte
+    /// key (composite key must be 96 bytes) and (b) a value whose length is
+    /// not a multiple of 32, then assert a well-formed row still loads and the
+    /// malformed ones are dropped.
+    #[tokio::test]
+    async fn user_secrets_index_load_skips_malformed_rows() {
+        use redb::Database;
+        let temp_dir = TempDir::new().unwrap();
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+
+        // Seed one well-formed row through the public API so we can confirm
+        // the good row survives alongside the malformed injections.
+        let good_delegate = fake_delegate_key(0x01, 0x02);
+        let good_user: [u8; 32] = [0x03; 32];
+        let good_secrets = vec![[0x44u8; 32]];
+        db.store_user_secrets_index(&good_delegate, &good_user, &good_secrets)
+            .unwrap();
+
+        let db_path = temp_dir.path().join("db");
+        // Drop the wrapper so the raw redb file lock is released before we
+        // open it directly to inject the malformed rows.
+        drop(db);
+        let raw = Database::open(&db_path).unwrap();
+        {
+            let txn = raw.begin_write().unwrap();
+            {
+                let mut tbl = txn.open_table(USER_SECRETS_INDEX_TABLE).unwrap();
+                // (a) 95-byte key (one short of the required 96) with an
+                // otherwise valid value.
+                let short_key = [0xEE_u8; 95];
+                let valid_value = [0x55_u8; 32];
+                tbl.insert(short_key.as_slice(), valid_value.as_slice())
+                    .unwrap();
+                // (b) valid 96-byte key but a value whose length is not a
+                // multiple of 32 (33 bytes).
+                let valid_key = [0xCD_u8; 96];
+                let bogus_value = [0x66_u8; 33];
+                tbl.insert(valid_key.as_slice(), bogus_value.as_slice())
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        drop(raw);
+
+        let db = ReDb::new(temp_dir.path()).await.unwrap();
+        let loaded = db.load_all_user_secrets_index().unwrap();
+        assert_eq!(
+            loaded,
+            vec![((good_delegate, good_user), good_secrets)],
+            "malformed key/value rows must be skipped, leaving only the good row"
         );
     }
 }
