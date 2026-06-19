@@ -988,8 +988,15 @@ impl Ring {
         // Load routing history immediately on startup so the router doesn't
         // start cold — without this, peers route suboptimally for ~5 minutes
         // until the first periodic refresh.
+        //
+        // Health gauge (#4440): the startup read is recorded too, with the same
+        // semantics as the periodic loop (any Ok read = success, empty or not).
+        // Without this, a node whose startup read succeeds but whose every later
+        // periodic refresh fails would report `last_success_age_secs == null`
+        // forever — masking that it did succeed once.
         match register.get_router_events(Self::ROUTER_HISTORY_LIMIT).await {
             Ok(history) if !history.is_empty() => {
+                BACKGROUND_TASK_HEALTH.record_refresh_router_success();
                 tracing::info!(
                     events = history.len(),
                     "Restored routing history from event log"
@@ -997,9 +1004,11 @@ impl Ring {
                 *router.write() = Router::new(&history);
             }
             Ok(_) => {
+                BACKGROUND_TASK_HEALTH.record_refresh_router_success();
                 tracing::debug!("No routing history to restore on startup");
             }
             Err(error) => {
+                BACKGROUND_TASK_HEALTH.record_refresh_router_failure();
                 tracing::warn!(%error, "Failed to load routing history on startup, starting cold");
             }
         }
@@ -1009,7 +1018,16 @@ impl Ring {
         loop {
             interval.tick().await;
             let history = match register.get_router_events(Self::ROUTER_HISTORY_LIMIT).await {
-                Ok(h) => h,
+                Ok(h) => {
+                    // Health gauge (#4440): a successful read clears the
+                    // consecutive-failure run and stamps the last-success time so
+                    // a *persistently* failing refresh (silent since the #4438
+                    // non-fatal hotfix) becomes observable on the snapshot
+                    // cadence. The read succeeded regardless of whether the
+                    // history is empty, so record success here, not below.
+                    BACKGROUND_TASK_HEALTH.record_refresh_router_success();
+                    h
+                }
                 Err(error) => {
                     // get_router_events errors are transient and recoverable —
                     // e.g. file-descriptor exhaustion ("os error 24") when the
@@ -1020,6 +1038,11 @@ impl Ring {
                     // panic inside this task is still caught by the
                     // BackgroundTaskMonitor — only this expected, transient read
                     // failure is swallowed here.)
+                    //
+                    // Health gauge (#4440): bump the consecutive-failure run so
+                    // the escalation #4438 deliberately left non-fatal is at
+                    // least visible in telemetry.
+                    BACKGROUND_TASK_HEALTH.record_refresh_router_failure();
                     tracing::error!(
                         error = %error,
                         "Failed to refresh routing history from event log; \
@@ -1042,6 +1065,14 @@ impl Ring {
         let mut interval = tokio::time::interval(interval_duration);
         // Skip the first immediate tick
         interval.tick().await;
+
+        // Previous lifetime broadcast-stream-failure count, so each snapshot can
+        // emit the per-window delta directly (#4440) without a stateful
+        // collector. Loop-local because this task is the sole reader; the
+        // monotonic totals are still emitted for collector-side differencing.
+        let mut prev_broadcast_stream_failures_total: u64 = crate::node::BROADCAST_STREAM_METRICS
+            .snapshot()
+            .streaming_failures_total;
 
         loop {
             interval.tick().await;
@@ -1081,6 +1112,27 @@ impl Ring {
             snapshot.delegate_module_cache_budget_bytes = Some(mc.delegate_budget_bytes);
             snapshot.delegate_module_cache_evictions_total = Some(mc.delegate_evictions_total);
 
+            // UPDATE-broadcast stream-assembly failure gauge (#4440): the exact
+            // signal that flagged the v0.2.73 incident. The broadcast queue
+            // publishes monotonic totals into the process-global; emit the totals
+            // (for collector-side differencing) plus the per-window failure delta
+            // sampled here.
+            let bs = crate::node::BROADCAST_STREAM_METRICS.snapshot();
+            let broadcast_stream_failures_delta = window_delta(
+                bs.streaming_failures_total,
+                &mut prev_broadcast_stream_failures_total,
+            );
+            snapshot.broadcast_stream_attempts_total = Some(bs.streaming_attempts_total);
+            snapshot.broadcast_stream_failures_total = Some(bs.streaming_failures_total);
+            snapshot.broadcast_stream_failures_last_snapshot =
+                Some(broadcast_stream_failures_delta);
+
+            // Background-task health gauges (#4440): make a persistently-failing
+            // (but non-fatal, post-#4438) `refresh_router` observable.
+            let rr_health = BACKGROUND_TASK_HEALTH.refresh_router_snapshot();
+            snapshot.refresh_router_last_success_age_secs = rr_health.last_success_age_secs;
+            snapshot.refresh_router_consecutive_failures = Some(rr_health.consecutive_failures);
+
             tracing::info!(
                 failure_events = snapshot.failure_events,
                 success_events = snapshot.success_events,
@@ -1091,6 +1143,11 @@ impl Ring {
                 contract_module_cache_entries = mc.contract_entries,
                 contract_module_cache_total_bytes = mc.contract_total_bytes,
                 contract_module_cache_evictions_total = mc.contract_evictions_total,
+                broadcast_stream_attempts_total = bs.streaming_attempts_total,
+                broadcast_stream_failures_total = bs.streaming_failures_total,
+                broadcast_stream_failures_last_snapshot = broadcast_stream_failures_delta,
+                refresh_router_last_success_age_secs = ?rr_health.last_success_age_secs,
+                refresh_router_consecutive_failures = rr_health.consecutive_failures,
                 "router_snapshot"
             );
 
@@ -4047,6 +4104,145 @@ fn classify_suspend_jump(boot_elapsed: Duration, mono_elapsed: Duration) -> Dura
     boot_elapsed.saturating_sub(mono_elapsed)
 }
 
+/// Compute the per-snapshot window delta of a monotonic counter and advance the
+/// running previous-total in one step (#4440).
+///
+/// `current_total` is this snapshot's lifetime count; `prev_total` is the count
+/// at the previous snapshot. Returns `current_total - prev_total` (saturating,
+/// so a counter reset can never underflow to a huge bogus rate) and stores
+/// `current_total` into `*prev_total` for the next call. Extracted from the
+/// snapshot loop and unit-tested because a future reorder of the
+/// compute-then-advance steps would silently zero the broadcast-failure incident
+/// signal with no test failure otherwise.
+fn window_delta(current_total: u64, prev_total: &mut u64) -> u64 {
+    let delta = current_total.saturating_sub(*prev_total);
+    *prev_total = current_total;
+    delta
+}
+
+/// Process-global health gauges for monitored background tasks (#4440).
+///
+/// A task that the [`BackgroundTaskMonitor`](crate::node::background_task_monitor)
+/// only watches for *death* can still run for hours while every individual run
+/// fails — `refresh_router`'s `get_router_events` errors were made non-fatal by
+/// the v0.2.74 #4438 hotfix (a transient fd-exhaustion read failure must not
+/// kill the node), so a *persistent* failure is now completely silent. This
+/// records, per monitored task, the time of the last successful run and the
+/// current run of consecutive failures, so the snapshot task can emit
+/// `last_success_age` / `consecutive_failures` gauges on the existing
+/// `router_snapshot` cadence (partially addresses #4440 item (a)).
+///
+/// The task *publishes* (`record_success` / `record_failure`) and the `Ring`
+/// snapshot task *reads* (`refresh_router`), mirroring `MODULE_CACHE_METRICS` /
+/// `BROADCAST_STREAM_METRICS`. Currently scoped to `refresh_router`, the one
+/// monitored task with a non-fatal per-run failure mode; add fields here if
+/// another monitored task grows the same pattern.
+///
+/// Per-node meaning holds only in single-node-per-process production. In a
+/// multi-node simulation every node's `refresh_router` shares this
+/// process-global, so the snapshot reads the aggregate (last-write-wins
+/// last-success across nodes; the consecutive-failure run is shared) — same
+/// caveat as `MODULE_CACHE_METRICS` / `BROADCAST_STREAM_METRICS`.
+static BACKGROUND_TASK_HEALTH: std::sync::LazyLock<BackgroundTaskHealth> =
+    std::sync::LazyLock::new(BackgroundTaskHealth::new);
+
+/// Monotonic process clock for the background-task health gauges. `tokio::time`
+/// so the age respects `start_paused(true)` virtual time under simulation
+/// (a `std::time::Instant` would advance in real wall-clock and break
+/// deterministic tests). Sampled at publish time and at snapshot read time; the
+/// age is the difference, so the absolute epoch is irrelevant.
+static BACKGROUND_TASK_HEALTH_EPOCH: std::sync::LazyLock<Instant> =
+    std::sync::LazyLock::new(Instant::now);
+
+/// Health gauges for one monitored background task. See [`BACKGROUND_TASK_HEALTH`].
+struct TaskHealth {
+    /// Millis-since-[`BACKGROUND_TASK_HEALTH_EPOCH`] of the last successful run,
+    /// or [`NO_SUCCESS`](Self::NO_SUCCESS) if the task has never succeeded.
+    last_success_millis: AtomicU64,
+    /// Consecutive failures since the last success (reset to 0 on success).
+    consecutive_failures: AtomicU64,
+}
+
+impl TaskHealth {
+    /// Sentinel for "no successful run yet". `u64::MAX` millis is ~584 million
+    /// years of uptime, so it can never collide with a real elapsed value.
+    const NO_SUCCESS: u64 = u64::MAX;
+
+    const fn new() -> Self {
+        Self {
+            last_success_millis: AtomicU64::new(Self::NO_SUCCESS),
+            consecutive_failures: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Per-task background-task health, currently just `refresh_router`. See
+/// [`BACKGROUND_TASK_HEALTH`].
+struct BackgroundTaskHealth {
+    refresh_router: TaskHealth,
+}
+
+/// A point-in-time read of one task's health for telemetry emission.
+#[derive(Debug, Clone, Copy)]
+struct TaskHealthSnapshot {
+    /// Seconds since the last successful run, or `None` if it never succeeded.
+    last_success_age_secs: Option<u64>,
+    /// Consecutive failures since the last success.
+    consecutive_failures: u64,
+}
+
+impl BackgroundTaskHealth {
+    fn new() -> Self {
+        Self {
+            refresh_router: TaskHealth::new(),
+        }
+    }
+
+    /// Record a successful run of `refresh_router`: stamp the last-success time
+    /// and clear the consecutive-failure run. Cheap `Relaxed` atomics.
+    fn record_refresh_router_success(&self) {
+        let elapsed_millis = BACKGROUND_TASK_HEALTH_EPOCH.elapsed().as_millis() as u64;
+        self.refresh_router
+            .last_success_millis
+            .store(elapsed_millis, std::sync::atomic::Ordering::Relaxed);
+        self.refresh_router
+            .consecutive_failures
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record a failed run of `refresh_router` (transient `get_router_events`
+    /// error). Bumps the consecutive-failure run; does not touch last-success.
+    fn record_refresh_router_failure(&self) {
+        self.refresh_router
+            .consecutive_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Read `refresh_router`'s health for telemetry.
+    fn refresh_router_snapshot(&self) -> TaskHealthSnapshot {
+        let last_success_millis = self
+            .refresh_router
+            .last_success_millis
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let consecutive_failures = self
+            .refresh_router
+            .consecutive_failures
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let last_success_age_secs = if last_success_millis == TaskHealth::NO_SUCCESS {
+            None
+        } else {
+            // saturating: if the clock and the stored stamp disagree (they
+            // shouldn't — same monotonic source), never underflow to a huge age.
+            let now_millis = BACKGROUND_TASK_HEALTH_EPOCH.elapsed().as_millis() as u64;
+            Some(now_millis.saturating_sub(last_success_millis) / 1000)
+        };
+        TaskHealthSnapshot {
+            last_success_age_secs,
+            consecutive_failures,
+        }
+    }
+}
+
 /// Best-effort snapshot of this process's open file-descriptor count and the
 /// `RLIMIT_NOFILE` soft limit, for the node-health telemetry gauges (#4440).
 ///
@@ -4129,6 +4325,156 @@ mod fd_usage_tests {
             soft >= open,
             "open fds ({open}) must not exceed the soft limit ({soft})"
         );
+    }
+}
+
+#[cfg(test)]
+mod background_task_health_tests {
+    //! Validates the background-task health gauges (#4440): a persistently
+    //! failing `refresh_router` (non-fatal since the #4438 hotfix) must surface
+    //! as a rising `consecutive_failures` and a stale `last_success_age`, and a
+    //! task that has never succeeded must report `None` age (not a bogus zero).
+    //! Tests a LOCAL `BackgroundTaskHealth` so they never touch the shared
+    //! process-global.
+
+    use super::BackgroundTaskHealth;
+
+    /// Before any success, the age is `None` (the `NO_SUCCESS` sentinel), not a
+    /// misleading age of 0. Failures accumulate without touching last-success.
+    #[tokio::test(start_paused = true)]
+    async fn never_succeeded_reports_none_age_and_accumulates_failures() {
+        let h = BackgroundTaskHealth::new();
+        let s = h.refresh_router_snapshot();
+        assert_eq!(
+            s.last_success_age_secs, None,
+            "no success yet => None age, never a bogus 0"
+        );
+        assert_eq!(s.consecutive_failures, 0);
+
+        h.record_refresh_router_failure();
+        h.record_refresh_router_failure();
+        let s = h.refresh_router_snapshot();
+        assert_eq!(
+            s.last_success_age_secs, None,
+            "still never succeeded after failures"
+        );
+        assert_eq!(s.consecutive_failures, 2, "failures accumulate");
+    }
+
+    /// A success stamps the time (age starts at ~0 and grows with virtual time)
+    /// and clears the consecutive-failure run; a later failure run grows again
+    /// while the age keeps climbing from the last success.
+    #[tokio::test(start_paused = true)]
+    async fn success_resets_failures_and_stamps_age() {
+        let h = BackgroundTaskHealth::new();
+        h.record_refresh_router_failure();
+        h.record_refresh_router_failure();
+
+        h.record_refresh_router_success();
+        let s = h.refresh_router_snapshot();
+        assert_eq!(s.consecutive_failures, 0, "success clears the failure run");
+        assert_eq!(
+            s.last_success_age_secs,
+            Some(0),
+            "age is ~0 immediately after success"
+        );
+
+        // Advance virtual time; the age must reflect time since last success.
+        tokio::time::advance(std::time::Duration::from_secs(90)).await;
+        let s = h.refresh_router_snapshot();
+        assert_eq!(
+            s.last_success_age_secs,
+            Some(90),
+            "age grows with time since last success"
+        );
+
+        // A new failure run grows consecutive_failures but does NOT refresh the
+        // last-success stamp — the age keeps climbing, which is the signal that
+        // refresh is stuck.
+        h.record_refresh_router_failure();
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        let s = h.refresh_router_snapshot();
+        assert_eq!(s.consecutive_failures, 1);
+        assert_eq!(
+            s.last_success_age_secs,
+            Some(100),
+            "age unaffected by failures; still measured from last success"
+        );
+    }
+
+    /// Source-scrape pin: the startup read in `refresh_router` (the `match`
+    /// before the periodic loop) must record into the health gauge on every
+    /// arm, with the SAME semantics as the loop — both `Ok` arms record a
+    /// success, the `Err` arm records a failure. Without this, a node whose
+    /// startup read succeeds but whose later periodic refreshes all fail would
+    /// report `last_success_age_secs == null` forever, masking that it did
+    /// succeed once.
+    ///
+    /// Asserting against the process-global `BACKGROUND_TASK_HEALTH` after
+    /// running `refresh_router` would be racy (concurrent tests share the
+    /// global), so this pins the call sites in source instead — three startup
+    /// records plus two in the loop = five total.
+    #[test]
+    fn refresh_router_records_health_on_startup_and_in_loop() {
+        let src = include_str!("ring.rs");
+        // Restrict to the `refresh_router` fn body so unrelated mentions (this
+        // test, the rustdoc on the metrics struct) don't count. The body runs
+        // from its signature to the start of the next method.
+        let start = src
+            .find("async fn refresh_router")
+            .expect("refresh_router fn present");
+        let after = &src[start..];
+        let end = after
+            .find("async fn emit_router_snapshot_telemetry")
+            .expect("next method present");
+        let body = &after[..end];
+
+        let successes = body.matches(".record_refresh_router_success()").count();
+        let failures = body.matches(".record_refresh_router_failure()").count();
+        // Startup: 2 Ok arms (success) + 1 Err arm (failure). Loop: 1 Ok
+        // (success) + 1 Err (failure). Total 3 success + 2 failure.
+        assert_eq!(
+            successes, 3,
+            "refresh_router must record a success on both startup Ok arms and \
+             the loop Ok arm (got {successes}); a dropped startup record would \
+             mask a startup-only success in the health gauge"
+        );
+        assert_eq!(
+            failures, 2,
+            "refresh_router must record a failure on both the startup Err arm \
+             and the loop Err arm (got {failures})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod window_delta_tests {
+    //! Pins the per-snapshot window-delta of the monotonic broadcast-failure
+    //! counter (#4440): it must return `current - prev` AND advance `prev` to
+    //! `current`, so a reorder of those two steps (which would silently zero
+    //! the incident signal) fails CI.
+
+    use super::window_delta;
+
+    #[test]
+    fn broadcast_failure_window_delta_computes_and_advances_prev() {
+        let mut prev: u64 = 10;
+        // First window: 13 - 10 = 3, and prev advances to 13.
+        assert_eq!(window_delta(13, &mut prev), 3, "delta over the window");
+        assert_eq!(prev, 13, "prev advanced to current");
+        // No new failures: 13 - 13 = 0, prev stays 13.
+        assert_eq!(window_delta(13, &mut prev), 0, "no failures => zero delta");
+        assert_eq!(prev, 13);
+        // Next window: 20 - 13 = 7, prev advances to 20.
+        assert_eq!(window_delta(20, &mut prev), 7, "delta resumes from prev");
+        assert_eq!(prev, 20, "prev advanced to current again");
+        // Counter reset / restart must saturate to 0, never underflow.
+        assert_eq!(
+            window_delta(5, &mut prev),
+            0,
+            "reset saturates, no underflow"
+        );
+        assert_eq!(prev, 5, "prev tracks the reset value");
     }
 }
 

@@ -11,6 +11,7 @@
 //! older entries with newer state when a duplicate is enqueued.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use freenet_stdlib::prelude::{ContractKey, WrappedState};
@@ -27,6 +28,89 @@ use super::p2p_protoc::P2pBridge;
 /// production, hence kept at module scope rather than inside the cfg-gated
 /// `queue` submodule.
 const STREAM_COMPLETION_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Process-global UPDATE-broadcast stream-assembly telemetry (#4440).
+///
+/// The streaming broadcast path (`broadcast_to_single_peer`'s `use_streaming`
+/// branch) sends a multi-fragment state transfer to one subscriber peer. Each
+/// invocation records exactly one attempt, and a failure on any of its three
+/// exits is counted: the initial metadata send returning `Err` (the stream
+/// never landed), `send_stream_with_completion` returning `Err` (dispatch
+/// failed before any fragment), or a post-dispatch non-`Delivered`
+/// `BroadcastDeliveryOutcome` (explicit `Dropped`, a dropped completion oneshot,
+/// or a `STREAM_COMPLETION_TIMEOUT`). All three are stream-assembly / transfer
+/// failures — the exact signal that flagged the v0.2.73 incident, where
+/// nova/vega saw ~1500-2300 broadcast stream-assembly failures/hr against a ~0
+/// baseline and central telemetry had no gauge for it. (The two early-send
+/// exits are the congestion failure mode that would otherwise bias the gauge
+/// LOW precisely when it matters most.)
+///
+/// These broadcast tasks are spawned per (contract, peer) from the global
+/// `BroadcastQueue` worker, unreachable from the `Ring` telemetry-snapshot task
+/// that emits `router_snapshot`. Like [`MODULE_CACHE_METRICS`] /
+/// [`TRANSPORT_METRICS`], the failure site therefore *publishes* into this
+/// process-global and the snapshot task *reads* it on the existing ~5-minute
+/// cadence — no per-failure event is emitted.
+///
+/// Both counters are monotonic; the snapshot task differences them across the
+/// cadence to derive a per-window failure rate (see
+/// `Ring::emit_router_snapshot_telemetry`).
+///
+/// Per-node meaning holds only in single-node-per-process production. In a
+/// multi-node simulation every node shares this process-global, so the snapshot
+/// reads the aggregate across all in-process nodes (same caveat as
+/// [`MODULE_CACHE_METRICS`]).
+///
+/// [`MODULE_CACHE_METRICS`]: crate::wasm_runtime::MODULE_CACHE_METRICS
+/// [`TRANSPORT_METRICS`]: crate::transport::metrics::TRANSPORT_METRICS
+pub(crate) static BROADCAST_STREAM_METRICS: BroadcastStreamMetrics = BroadcastStreamMetrics::new();
+
+/// Monotonic counters for UPDATE-broadcast streaming transfers. See
+/// [`BROADCAST_STREAM_METRICS`].
+pub(crate) struct BroadcastStreamMetrics {
+    /// Total streaming broadcast transfers attempted (one per peer that took the
+    /// streaming branch and reached the completion-await point).
+    streaming_attempts_total: AtomicU64,
+    /// Total streaming broadcast transfers that did NOT reach `Delivered`
+    /// (dropped, oneshot dropped, or completion timeout).
+    streaming_failures_total: AtomicU64,
+}
+
+/// A point-in-time read of [`BROADCAST_STREAM_METRICS`] for telemetry emission.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BroadcastStreamMetricsSnapshot {
+    pub streaming_attempts_total: u64,
+    pub streaming_failures_total: u64,
+}
+
+impl BroadcastStreamMetrics {
+    const fn new() -> Self {
+        Self {
+            streaming_attempts_total: AtomicU64::new(0),
+            streaming_failures_total: AtomicU64::new(0),
+        }
+    }
+
+    /// Record one completed streaming broadcast attempt. `delivered == false`
+    /// means a stream-assembly / transfer failure. Cheap `Relaxed` atomics — the
+    /// counters are summed/differenced by the collector, not used for ordering.
+    fn record_attempt(&self, delivered: bool) {
+        self.streaming_attempts_total
+            .fetch_add(1, Ordering::Relaxed);
+        if !delivered {
+            self.streaming_failures_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Read both counters for telemetry.
+    pub(crate) fn snapshot(&self) -> BroadcastStreamMetricsSnapshot {
+        BroadcastStreamMetricsSnapshot {
+            streaming_attempts_total: self.streaming_attempts_total.load(Ordering::Relaxed),
+            streaming_failures_total: self.streaming_failures_total.load(Ordering::Relaxed),
+        }
+    }
+}
 
 /// Whether we should broadcast a state change for `key` at all: only if we
 /// host it or are actively serving it (a live local-client or downstream
@@ -626,7 +710,13 @@ pub(super) async fn broadcast_to_single_peer(
         };
 
         let send_res = bridge.send(peer_addr, net_msg).await;
-        if send_res.is_ok() {
+        if send_res.is_err() {
+            // Telemetry gauge (#4440): the initial metadata send failed, so the
+            // streaming broadcast never landed. This is a real streaming-
+            // broadcast failure — and exactly the congestion failure mode that
+            // would otherwise bias the gauge LOW when it matters most.
+            BROADCAST_STREAM_METRICS.record_attempt(false);
+        } else {
             // Create completion channel for the broadcast queue to track
             // when the actual stream transfer finishes.
             let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
@@ -641,6 +731,10 @@ pub(super) async fn broadcast_to_single_peer(
                 )
                 .await
             {
+                // Telemetry gauge (#4440): stream dispatch failed before any
+                // fragment was handed to the transport — also a streaming-
+                // broadcast failure.
+                BROADCAST_STREAM_METRICS.record_attempt(false);
                 tracing::warn!(
                     tx = %update_tx,
                     peer = %peer_addr,
@@ -669,6 +763,17 @@ pub(super) async fn broadcast_to_single_peer(
                     new_state.size(),
                     payload_size,
                 );
+                // Telemetry gauge (#4440): post-dispatch outcome — a drop,
+                // dropped completion oneshot, or completion timeout is the
+                // stream-assembly / transfer failure (`!delivered`). Together
+                // with the two earlier exits above, exactly one
+                // `record_attempt` fires per streaming broadcast invocation,
+                // covering initial-send failure, stream-dispatch failure, and
+                // post-dispatch drop/timeout/dropped-oneshot. Process-global
+                // counter, read on the router_snapshot cadence — NOT a
+                // per-failure event. This is the exact signal that flagged the
+                // v0.2.73 incident.
+                BROADCAST_STREAM_METRICS.record_attempt(delivered);
                 if delivered {
                     tracing::debug!(
                         tx = %update_tx,
@@ -748,7 +853,41 @@ mod tests {
     use crate::transport::{BroadcastDeliveryOutcome, TransportKeypair};
     use crate::util::time_source::SharedMockTimeSource;
 
-    use super::{record_streaming_delivery, streaming_completion_delivered};
+    use super::{
+        BroadcastStreamMetrics, record_streaming_delivery, streaming_completion_delivered,
+    };
+
+    /// `BroadcastStreamMetrics` counts every attempt and, separately, only the
+    /// non-`delivered` attempts (#4440). Tests a LOCAL instance so it stays
+    /// deterministic and never touches the concurrently-shared process-global
+    /// `BROADCAST_STREAM_METRICS`.
+    #[test]
+    fn broadcast_stream_metrics_counts_attempts_and_failures() {
+        let m = BroadcastStreamMetrics::new();
+        let s = m.snapshot();
+        assert_eq!(s.streaming_attempts_total, 0, "starts at zero");
+        assert_eq!(s.streaming_failures_total, 0, "starts at zero");
+
+        // A delivered attempt bumps attempts only.
+        m.record_attempt(true);
+        let s = m.snapshot();
+        assert_eq!(s.streaming_attempts_total, 1);
+        assert_eq!(s.streaming_failures_total, 0, "delivered is not a failure");
+
+        // A non-delivered attempt bumps both — this is the stream-assembly
+        // failure signal that flagged the v0.2.73 incident.
+        m.record_attempt(false);
+        let s = m.snapshot();
+        assert_eq!(s.streaming_attempts_total, 2, "every attempt counts");
+        assert_eq!(s.streaming_failures_total, 1, "the drop is counted");
+
+        // Counters are monotonic and accumulate.
+        m.record_attempt(false);
+        m.record_attempt(true);
+        let s = m.snapshot();
+        assert_eq!(s.streaming_attempts_total, 4);
+        assert_eq!(s.streaming_failures_total, 2);
+    }
 
     fn make_contract_key(seed: u8) -> ContractKey {
         ContractKey::from_id_and_code(
@@ -1110,6 +1249,57 @@ mod tests {
             "broadcast_to_single_peer must gate on should_broadcast_contract BEFORE \
              calling get_contract_summary (#4473) — otherwise the summarize storm \
              fires for every phantom contract before the gate can skip it"
+        );
+    }
+
+    /// Source-scrape pin: the streaming branch of `broadcast_to_single_peer`
+    /// must record the broadcast-stream gauge on ALL THREE of its exits (#4440),
+    /// not just the success arm. The two early-failure exits — initial metadata
+    /// `bridge.send(...)` returning Err, and `send_stream_with_completion(...)`
+    /// returning Err — are exactly the congestion failure mode the v0.2.73
+    /// incident exhibited. If a future edit drops one of those
+    /// `record_attempt(false)` calls, the gauge would silently undercount and
+    /// bias the incident signal LOW precisely when it matters most, with no
+    /// test failure otherwise. (The post-dispatch `record_attempt(delivered)` is
+    /// the third site.)
+    ///
+    /// Asserting against the process-global `BROADCAST_STREAM_METRICS` after
+    /// running the broadcast would be racy (concurrent tests share the global),
+    /// so this pins the call sites in source instead — mirroring the
+    /// `refresh_router` health-gauge pin in `ring.rs`.
+    #[test]
+    fn broadcast_to_single_peer_records_attempt_on_every_streaming_exit_pin() {
+        let src = include_str!("broadcast_queue.rs");
+        // Slice the `broadcast_to_single_peer` fn body so the unrelated
+        // `record_attempt` calls in the metrics unit test (and this test's own
+        // docs) don't count: from its signature to the start of the next fn.
+        let fn_start = src
+            .find("pub(super) async fn broadcast_to_single_peer(")
+            .expect("broadcast_to_single_peer not found");
+        let after = &src[fn_start..];
+        // The next item after the fn is the `#[cfg(test)] mod tests`.
+        let fn_end = after
+            .find("\nmod tests {")
+            .or_else(|| after.find("\n#[cfg(test)]"))
+            .expect("end of broadcast_to_single_peer (start of tests module) not found");
+        let body = &after[..fn_end];
+
+        let record_calls = body.matches(".record_attempt(").count();
+        assert_eq!(
+            record_calls, 3,
+            "broadcast_to_single_peer's streaming branch must call record_attempt \
+             on all three exits (initial-send Err, dispatch Err, post-dispatch \
+             outcome) — got {record_calls}. A dropped early-exit record silently \
+             biases the v0.2.73 incident gauge LOW under congestion."
+        );
+        // Two of the three must be the explicit-failure form, so a refactor that
+        // collapses an early exit into the success path (losing the `false`)
+        // also trips this pin.
+        let failure_calls = body.matches(".record_attempt(false)").count();
+        assert_eq!(
+            failure_calls, 2,
+            "exactly the two early-failure exits must record record_attempt(false) \
+             (got {failure_calls}); the third exit records record_attempt(delivered)"
         );
     }
 }

@@ -1853,6 +1853,11 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "delegate_module_cache_total_bytes": snapshot.delegate_module_cache_total_bytes,
                 "delegate_module_cache_budget_bytes": snapshot.delegate_module_cache_budget_bytes,
                 "delegate_module_cache_evictions_total": snapshot.delegate_module_cache_evictions_total,
+                "broadcast_stream_attempts_total": snapshot.broadcast_stream_attempts_total,
+                "broadcast_stream_failures_total": snapshot.broadcast_stream_failures_total,
+                "broadcast_stream_failures_last_snapshot": snapshot.broadcast_stream_failures_last_snapshot,
+                "refresh_router_last_success_age_secs": snapshot.refresh_router_last_success_age_secs,
+                "refresh_router_consecutive_failures": snapshot.refresh_router_consecutive_failures,
                 "per_op_curves": snapshot.per_op_curves,
             })
         }
@@ -1910,6 +1915,35 @@ mod tests {
             ("delegate_module_cache_total_bytes", 23),
             ("delegate_module_cache_budget_bytes", 29),
             ("delegate_module_cache_evictions_total", 31),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the UPDATE-broadcast stream-assembly gauges and the background-task
+    /// health gauges (#4440) must also reach the hand-mirrored OTLP body — same
+    /// footgun as the fd / module-cache gauges above. The broadcast
+    /// stream-assembly failure rate is the signal that flagged the v0.2.73
+    /// incident, so a silent drop here would re-blind us to a re-enable going
+    /// wrong.
+    #[test]
+    fn router_snapshot_json_includes_broadcast_and_bgtask_gauges() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.broadcast_stream_attempts_total = Some(37);
+        info.broadcast_stream_failures_total = Some(41);
+        info.broadcast_stream_failures_last_snapshot = Some(43);
+        info.refresh_router_last_success_age_secs = Some(47);
+        info.refresh_router_consecutive_failures = Some(53);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("broadcast_stream_attempts_total", 37),
+            ("broadcast_stream_failures_total", 41),
+            ("broadcast_stream_failures_last_snapshot", 43),
+            ("refresh_router_last_success_age_secs", 47),
+            ("refresh_router_consecutive_failures", 53),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

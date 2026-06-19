@@ -190,6 +190,31 @@ pub(crate) struct RouterSnapshotInfo {
     pub delegate_module_cache_total_bytes: Option<u64>,
     pub delegate_module_cache_budget_bytes: Option<u64>,
     pub delegate_module_cache_evictions_total: Option<u64>,
+    /// UPDATE-broadcast stream-assembly gauges (#4440), populated by `Ring` from
+    /// the process-global `BROADCAST_STREAM_METRICS` the broadcast queue
+    /// publishes into. A streaming broadcast that fails to reach `Delivered`
+    /// (dropped, oneshot dropped, or completion timeout) is a stream-assembly /
+    /// transfer failure — the exact signal that flagged the v0.2.73 incident
+    /// (nova/vega ~1500-2300 failures/hr vs ~0 baseline) and the one that would
+    /// catch a re-enable going wrong. `None` until the first streaming broadcast.
+    ///
+    /// `*_total` are monotonic lifetime counters (the collector differences them
+    /// across the cadence to derive a rate); `*_failures_last_snapshot` is the
+    /// per-snapshot delta `Ring` samples directly, so the incident signal is
+    /// legible without a stateful collector.
+    pub broadcast_stream_attempts_total: Option<u64>,
+    pub broadcast_stream_failures_total: Option<u64>,
+    pub broadcast_stream_failures_last_snapshot: Option<u64>,
+    /// Background-task health gauges (#4440), populated by `Ring` from the
+    /// process-global `BACKGROUND_TASK_HEALTH` the monitored tasks publish into.
+    /// `refresh_router`'s transient `get_router_events` errors were made
+    /// non-fatal by the v0.2.74 #4438 hotfix, so a persistently-failing refresh
+    /// is now silent; these make it observable (partially addresses #4440 (a)).
+    /// `last_success_age_secs` is seconds since the last successful run (`None`
+    /// until the first success); `consecutive_failures` is the current run of
+    /// failures since the last success.
+    pub refresh_router_last_success_age_secs: Option<u64>,
+    pub refresh_router_consecutive_failures: Option<u64>,
     /// Per-operation-type estimator curves, keyed by op type name (e.g., "GET").
     pub per_op_curves: HashMap<String, PerOpCurves>,
     /// Renegade predictor diagnostics. These (and `renegade_accuracy_pairs`) are
@@ -971,6 +996,13 @@ impl Router {
             delegate_module_cache_total_bytes: None,
             delegate_module_cache_budget_bytes: None,
             delegate_module_cache_evictions_total: None,
+            // Broadcast stream-assembly + background-task health gauges,
+            // populated by Ring on the snapshot cadence (#4440).
+            broadcast_stream_attempts_total: None,
+            broadcast_stream_failures_total: None,
+            broadcast_stream_failures_last_snapshot: None,
+            refresh_router_last_success_age_secs: None,
+            refresh_router_consecutive_failures: None,
             // Renegade predictor diagnostics
             renegade_failure_events: self.renegade_predictor.len(),
             renegade_response_time_events: self.renegade_predictor.stage_sizes().1,

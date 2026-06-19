@@ -51,6 +51,10 @@ use serde::{Deserialize, Serialize};
 pub(crate) use network_bridge::{
     ConnectionError, EventLoopNotificationsSender, NetworkBridge, OpExecutionPayload, WaiterReply,
 };
+// Re-export the UPDATE-broadcast stream-assembly telemetry global (#4440) so the
+// `Ring` snapshot task can read it (the broadcast queue lives behind the private
+// `network_bridge` module). Mirrors `crate::wasm_runtime::MODULE_CACHE_METRICS`.
+pub(crate) use network_bridge::broadcast_queue::BROADCAST_STREAM_METRICS;
 #[cfg(test)]
 pub(crate) use network_bridge::{EventLoopNotificationsReceiver, event_loop_notification_channel};
 // Re-export types for dev_tool and testing
