@@ -3607,11 +3607,27 @@ fn run_fanout_liveness_scenario_inner(
         ));
     }
 
+    // The controlled-sim test client paces every triggered operation with a
+    // fixed ~3s virtual-time gap (see `run_controlled_simulation`). The
+    // operation sequence here is O(N): 1 PUT + N subscribes + SUSTAINED_UPDATES
+    // updates, so the *operation phase* alone needs `(1 + N + SUSTAINED_UPDATES)
+    // * 3s` of virtual time before the post-op settle even begins. At N=8/16 the
+    // fixed 300s budget covered this, but at incident scale (N=40-80) the
+    // sequence overruns 300s and the simulation reports "Ran for duration: 300s
+    // … without completing" before any liveness can be assessed — a budget
+    // overrun, NOT a topology-formation or event-loop problem. Scale the budget
+    // with N so the operation phase always fits, with generous headroom.
+    const PER_OP_PACING_SECS: u64 = 3;
+    const POST_OP_WAIT_SECS: u64 = 120;
+    let op_count = (1 + subscribers + SUSTAINED_UPDATES) as u64;
+    // op-phase + post-op settle + a 90s margin for startup + final propagation.
+    let sim_duration_secs = op_count * PER_OP_PACING_SECS + POST_OP_WAIT_SECS + 90;
+
     let result = sim.run_controlled_simulation(
         seed,
         operations,
-        Duration::from_secs(300), // simulation duration (virtual)
-        Duration::from_secs(120), // post-op propagation wait (virtual)
+        Duration::from_secs(sim_duration_secs), // simulation duration (virtual)
+        Duration::from_secs(POST_OP_WAIT_SECS), // post-op propagation wait (virtual)
     );
     assert!(
         result.turmoil_result.is_ok(),
