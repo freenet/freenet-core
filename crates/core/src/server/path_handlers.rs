@@ -1039,6 +1039,11 @@ async fn sandbox_content_body(
 /// one durable identity per visitor. The bridge presents it on the proxied
 /// WebSocket upgrade as `?userToken=<token>`.
 ///
+/// On a non-`https:` page the IIFE returns undefined BEFORE touching
+/// `localStorage`, so the durable token is never loaded, minted, or transmitted
+/// over a plaintext wire (client mirror of the backend REFUSE-PLAINTEXT-TOKEN
+/// invariant — see `decide_user_token`).
+///
 /// `localStorage` access is wrapped in try/catch so that a browser with storage
 /// disabled (private mode quirks, embedded webviews) degrades to an undefined
 /// token rather than throwing before the bridge starts; an undefined token means
@@ -1046,6 +1051,16 @@ async fn sandbox_content_body(
 /// as a local/anonymous one (see `decide_user_token`).
 const SHELL_USER_TOKEN_JS: &str = r#"var __freenet_user_token = (function() {
   'use strict';
+  // REFUSE-PLAINTEXT-TOKEN (client mirror of the backend invariant, #4381):
+  // never load OR mint the durable token on a non-secure page. The token is a
+  // high-value, node-independent bearer secret; the backend won't HONOR it over
+  // plaintext, but only the client can stop it from being TRANSMITTED in the
+  // first place. Returning undefined here (BEFORE any localStorage access) means
+  // an http page never reads a previously-minted token either, so the stored
+  // value is never put on a ws:// URL. The TLS proxy serves the shell over
+  // https in the intended hosted deployment; a direct http://localhost dev hit
+  // simply gets no token (Local), which is the correct/expected behavior.
+  if (location.protocol !== 'https:') { return undefined; }
   try {
     var KEY = '__freenet_user_token__';
     var t = localStorage.getItem(KEY);
@@ -1480,7 +1495,13 @@ function freenetBridge(authToken, userToken) {
         // can scope a per-user delegate-secret namespace (P2 of #4381). The
         // token is undefined in non-hosted mode, so the param is omitted (and,
         // combined with the delete above, the URL carries no userToken at all).
-        if (userToken) { u.searchParams.set('userToken', userToken); }
+        // The `location.protocol === 'https:'` guard is a SECOND, independent
+        // REFUSE-PLAINTEXT-TOKEN barrier (the first is in SHELL_USER_TOKEN_JS,
+        // which never mints the token on an http page): two guards so a future
+        // refactor of either site can't reopen the plaintext-leak path. The
+        // shell is same-origin with the node, so `location.protocol` reflects
+        // whether the shell itself was served over TLS.
+        if (userToken && location.protocol === 'https:') { u.searchParams.set('userToken', userToken); }
         var ws = new WebSocket(u.toString(), msg.protocols || undefined);
         ws.binaryType = 'arraybuffer';
         connections.set(msg.id, ws);
@@ -4205,7 +4226,7 @@ mod tests {
             "bridge must append userToken to the real WebSocket URL"
         );
         assert!(
-            SHELL_BRIDGE_JS.contains("if (userToken)"),
+            SHELL_BRIDGE_JS.contains("if (userToken"),
             "bridge must only append userToken when present (non-hosted = undefined)"
         );
         assert!(
@@ -4215,6 +4236,55 @@ mod tests {
         assert!(
             SHELL_USER_TOKEN_JS.contains("__freenet_user_token__"),
             "user-token snippet must persist under the durable localStorage key"
+        );
+    }
+
+    /// REFUSE-PLAINTEXT-TOKEN, client side (Codex review, #4513): the durable
+    /// per-user token is a high-value bearer secret and must never cross a
+    /// plaintext wire. Two INDEPENDENT guards enforce this so a refactor of
+    /// either can't reopen the leak:
+    ///   1. `SHELL_USER_TOKEN_JS` returns undefined on a non-https page BEFORE
+    ///      touching localStorage (never loads/mints/transmits the token), and
+    ///   2. the bridge WS-open handler gates the `userToken` append on
+    ///      `location.protocol === 'https:'`.
+    #[test]
+    fn user_token_never_transmitted_over_plaintext() {
+        // Guard 1: the https check must precede any localStorage access in the
+        // minting IIFE, so an http page returns undefined without reading the
+        // stored token.
+        let https_guard = SHELL_USER_TOKEN_JS
+            .find("location.protocol !== 'https:'")
+            .expect("user-token snippet must refuse to run on a non-https page");
+        // Anchor on the actual localStorage READ (`localStorage.getItem`), not
+        // the bare word "localStorage" which also appears in the rationale
+        // comment above the guard.
+        let first_storage_access = SHELL_USER_TOKEN_JS
+            .find("localStorage.getItem")
+            .expect("user-token snippet must read from localStorage");
+        assert!(
+            https_guard < first_storage_access,
+            "the https guard must run BEFORE any localStorage access so an http \
+             page never even reads a previously-minted token"
+        );
+        assert!(
+            SHELL_USER_TOKEN_JS.contains("return undefined"),
+            "the non-https branch must yield an undefined token"
+        );
+
+        // Guard 2: the bridge append is gated on https as a second barrier.
+        assert!(
+            SHELL_BRIDGE_JS.contains("location.protocol === 'https:'"),
+            "bridge must gate the userToken append on a secure connection"
+        );
+        let https_attach_guard = SHELL_BRIDGE_JS
+            .find("userToken && location.protocol === 'https:'")
+            .expect("bridge must only attach userToken over https");
+        let set_user = SHELL_BRIDGE_JS
+            .find("u.searchParams.set('userToken', userToken)")
+            .expect("bridge must have a userToken append site");
+        assert!(
+            https_attach_guard < set_user,
+            "the https guard must precede the userToken append"
         );
     }
 
@@ -4237,8 +4307,11 @@ mod tests {
         let set_auth = SHELL_BRIDGE_JS
             .find("u.searchParams.set('authToken', authToken)")
             .expect("bridge must inject the shell's authToken");
+        // Anchor on the userToken append itself rather than the full
+        // conditional, whose guard expression is allowed to evolve (it now also
+        // carries the https barrier — see user_token_never_transmitted_over_plaintext).
         let conditional_set_user = SHELL_BRIDGE_JS
-            .find("if (userToken) { u.searchParams.set('userToken', userToken); }")
+            .find("u.searchParams.set('userToken', userToken)")
             .expect("bridge must conditionally inject the shell's minted userToken");
 
         // The deletes must precede BOTH injection points, so a caller value can
