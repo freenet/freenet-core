@@ -5,6 +5,15 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use super::wrapper::log_wrapper_event;
 
+// First-run / legacy-migration marker helpers live in the parent `service`
+// module (platform-independent so they can be unit-tested on Linux CI); the
+// macOS startup self-heal path below references them.
+#[cfg(target_os = "macos")]
+use super::{
+    first_run_marker_path, is_first_run_at, legacy_migration_marker_path,
+    mark_first_run_complete_at,
+};
+
 // ── Launch at Login (macOS) ──
 //
 // On macOS, the DMG-installed Freenet.app does not auto-start on login by
@@ -59,7 +68,7 @@ pub(super) fn is_launch_at_login_enabled_at(plist: &Path) -> bool {
 /// Exposed at `pub(super)` so `update.rs` can detect bundle context for
 /// its DMG-swap auto-update path.
 #[allow(dead_code)]
-pub(super) fn macos_app_bundle_path(exe: &Path) -> Option<PathBuf> {
+pub(crate) fn macos_app_bundle_path(exe: &Path) -> Option<PathBuf> {
     for ancestor in exe.ancestors() {
         if ancestor
             .file_name()
@@ -269,7 +278,7 @@ fn launchctl_bootout(_plist: &Path) {}
 
 /// Enable launch-at-login: write the plist and ask launchd to load it.
 #[allow(dead_code)]
-pub(super) fn enable_launch_at_login(executable: &Path) -> std::io::Result<()> {
+pub(crate) fn enable_launch_at_login(executable: &Path) -> std::io::Result<()> {
     let Some(plist) = launch_agent_plist_path() else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -289,7 +298,7 @@ pub(super) fn enable_launch_at_login(executable: &Path) -> std::io::Result<()> {
 }
 
 #[allow(dead_code)]
-pub(super) fn disable_launch_at_login() -> std::io::Result<()> {
+pub(crate) fn disable_launch_at_login() -> std::io::Result<()> {
     let Some(plist) = launch_agent_plist_path() else {
         return Ok(());
     };
@@ -299,7 +308,7 @@ pub(super) fn disable_launch_at_login() -> std::io::Result<()> {
 
 /// User-facing query: is launch-at-login currently on?
 #[allow(dead_code)]
-pub(super) fn is_launch_at_login_enabled() -> bool {
+pub(crate) fn is_launch_at_login_enabled() -> bool {
     launch_agent_plist_path()
         .map(|p| is_launch_at_login_enabled_at(&p))
         .unwrap_or(false)
@@ -340,13 +349,13 @@ pub(super) fn first_run_launch_at_login_action(
 /// rationale as `first_run_launch_at_login_action`.
 #[derive(Debug, PartialEq, Eq)]
 #[allow(dead_code)]
-pub(super) enum ToggleLaunchAtLoginOutcome {
+pub(crate) enum ToggleLaunchAtLoginOutcome {
     Enable,
     Disable,
 }
 
 #[allow(dead_code)]
-pub(super) fn toggle_launch_at_login_outcome(
+pub(crate) fn toggle_launch_at_login_outcome(
     currently_enabled: bool,
 ) -> ToggleLaunchAtLoginOutcome {
     if currently_enabled {

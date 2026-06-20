@@ -7,11 +7,14 @@ use super::launch_at_login::macos_launch_at_login_startup;
 use super::single_instance::{AcquireWrapperLockOutcome, acquire_wrapper_single_instance_lock};
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
+use super::single_instance::FIRST_RUN_OPENER_SPAWNED;
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use super::DASHBOARD_URL;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use super::open_url_in_browser;
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-use super::single_instance::FIRST_RUN_OPENER_SPAWNED;
+// First-run marker helpers + dashboard reachability probe live in the parent
+// `service` module; the first-run onboarding opener below references them.
 use super::{
     SENTINEL_RESTART, SENTINEL_STOP, WRAPPER_EXIT_ALREADY_RUNNING, WRAPPER_EXIT_UPDATE_NEEDED,
     WRAPPER_INITIAL_BACKOFF_SECS, WRAPPER_MAX_BACKOFF_SECS, WRAPPER_MAX_CONSECUTIVE_FAILURES,
