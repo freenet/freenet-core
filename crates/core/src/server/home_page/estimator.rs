@@ -1,5 +1,18 @@
 use super::*;
 
+/// Choose the top of the failure-probability chart's y-axis.
+///
+/// Failure probabilities for a healthy peer are tiny (often well under 0.1),
+/// so a fixed 0.0–1.0 axis squashes the fitted curve flat against the bottom
+/// and its shape is unreadable. Instead, scale the top of the axis to twice the
+/// curve's value at the right edge of the plot (the largest distance shown,
+/// 0.5), so the line occupies roughly the lower half of the chart. The PAV
+/// failure estimator is monotonically increasing in distance, so the right edge
+/// is the curve's maximum and 2x leaves headroom above the whole line.
+///
+/// Returns 1.0 (the original full-range axis) when there is no failure signal at
+/// the right edge, avoiding a degenerate zero-height axis. The result is capped
+/// at 1.0 since a probability can never exceed 1.0.
 pub fn failure_chart_y_max(curve_points: &[(f64, f64)], peer_adjustment: Option<f64>) -> f64 {
     // y-value at the largest sampled distance (the right edge of the chart).
     let right_edge = curve_points
