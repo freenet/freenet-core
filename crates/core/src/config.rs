@@ -1586,7 +1586,19 @@ pub struct WebsocketApiArgs {
     /// OFF by default. When off, `userToken` is ignored and every connection is
     /// single-user, byte-for-byte today's behavior. Enable only on a node you
     /// intend to operate as a shared public proxy for untrusted users.
-    #[arg(long = "hosted-mode", env = "FREENET_HOSTED_MODE")]
+    ///
+    /// `--hosted-mode` is THE operator switch, so it works as a BARE flag:
+    /// `--hosted-mode` => `Some(true)`; `--hosted-mode=false` (or
+    /// `--hosted-mode false`) => `Some(false)`; absent => `None`. Kept as
+    /// `Option<bool>` (not a plain `bool` with `default_value`) so config-file /
+    /// env layering can still leave it unset (`None`) and the CLI only overrides
+    /// when actually present — `None` is then resolved to `false` in `build`.
+    #[arg(
+        long = "hosted-mode",
+        env = "FREENET_HOSTED_MODE",
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
     #[serde(rename = "hosted-mode", skip_serializing_if = "Option::is_none")]
     pub hosted_mode: Option<bool>,
 }
@@ -3195,6 +3207,69 @@ mod tests {
             reparsed.ws_api.hosted_mode,
             "hosted_mode=true must survive a TOML serialize/deserialize round-trip"
         );
+    }
+
+    /// `--hosted-mode` is the operator switch for the feature, so it MUST work as
+    /// a BARE flag (clap optional-value form), while staying `Option<bool>` so
+    /// config-file/env layering can leave it unset. Asserts the three forms:
+    ///   bare `--hosted-mode`        => Some(true)
+    ///   `--hosted-mode=false`       => Some(false)
+    ///   absent                      => None
+    #[test]
+    fn hosted_mode_cli_accepts_bare_flag_and_explicit_value() {
+        use clap::Parser;
+
+        // The arg also reads FREENET_HOSTED_MODE via clap's `env`. Clear it for
+        // the duration of this test so the env of the test runner can't mask the
+        // CLI-form assertions, then restore it. SAFETY: this is the only test
+        // that touches FREENET_HOSTED_MODE.
+        let saved = std::env::var_os("FREENET_HOSTED_MODE");
+        unsafe {
+            std::env::remove_var("FREENET_HOSTED_MODE");
+        }
+
+        // Bare `--hosted-mode` => Some(true) (default_missing_value).
+        let bare = ConfigArgs::try_parse_from(["freenet", "--hosted-mode"])
+            .expect("bare --hosted-mode should parse");
+        assert_eq!(
+            bare.ws_api.hosted_mode,
+            Some(true),
+            "bare --hosted-mode must mean Some(true)"
+        );
+
+        // `--hosted-mode=false` => Some(false) (explicit override off).
+        let explicit_false = ConfigArgs::try_parse_from(["freenet", "--hosted-mode=false"])
+            .expect("--hosted-mode=false should parse");
+        assert_eq!(
+            explicit_false.ws_api.hosted_mode,
+            Some(false),
+            "--hosted-mode=false must mean Some(false)"
+        );
+
+        // `--hosted-mode true` (space-separated value) => Some(true).
+        let explicit_true = ConfigArgs::try_parse_from(["freenet", "--hosted-mode", "true"])
+            .expect("--hosted-mode true should parse");
+        assert_eq!(
+            explicit_true.ws_api.hosted_mode,
+            Some(true),
+            "--hosted-mode true must mean Some(true)"
+        );
+
+        // Absent => None (so config-file/env can still supply the value, and
+        // `build()` resolves None to false).
+        let absent =
+            ConfigArgs::try_parse_from(["freenet"]).expect("no hosted-mode flag should parse");
+        assert_eq!(
+            absent.ws_api.hosted_mode, None,
+            "absent --hosted-mode must leave it None for config/env layering"
+        );
+
+        // Restore the env var for any other test in this process.
+        unsafe {
+            if let Some(v) = saved {
+                std::env::set_var("FREENET_HOSTED_MODE", v);
+            }
+        }
     }
 
     #[tokio::test]
