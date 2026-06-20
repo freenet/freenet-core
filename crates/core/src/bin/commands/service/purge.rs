@@ -223,7 +223,7 @@ pub fn remove_dir_if_empty_pub(path: &Path) {
 /// `%APPDATA%\The Freenet Project Inc\Freenet\` once its `config` subfolder
 /// is gone). Any error other than "not empty" is swallowed; the parent is
 /// expendable and we should not fail the uninstall over it.
-fn remove_dir_if_empty(path: &Path) {
+pub(super) fn remove_dir_if_empty(path: &Path) {
     if !path.is_dir() {
         return;
     }
