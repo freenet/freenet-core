@@ -321,8 +321,6 @@ impl ConfigArgs {
             }
         };
 
-        let should_persist = cfg.is_none();
-
         // merge the configuration from the file with the command line arguments
         if let Some(cfg) = cfg {
             self.secrets.merge(cfg.secrets);
@@ -906,15 +904,19 @@ impl ConfigArgs {
             gateways.save_to_file(&gateways_file)?;
         }
 
-        if should_persist {
-            let path = this.config_dir().join("config.toml");
-            tracing::info!(path = ?path, "Persisting configuration");
-            let mut file = File::create(path)?;
-            file.write_all(
-                toml::to_string(&this)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
-                    .as_bytes(),
-            )?;
+        // Persist on first run (no file yet) or when the effective config
+        // changed — e.g. the operator passed a new CLI flag — so config.toml
+        // stays the source of truth (#4275). Comparing against the file's
+        // current contents (written by the same serializer) keeps an unchanged
+        // restart a no-op, so operator hand-edits survive.
+        let config_path = this.config_dir().join("config.toml");
+        let new_config_toml = toml::to_string(&this)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let current = std::fs::read_to_string(&config_path).ok();
+        if current.as_deref() != Some(new_config_toml.as_str()) {
+            tracing::info!(path = ?config_path, "Persisting configuration");
+            let mut file = File::create(&config_path)?;
+            file.write_all(new_config_toml.as_bytes())?;
         }
 
         Ok(this)
@@ -3738,6 +3740,51 @@ mod tests {
             cfg.network_api.total_bandwidth_limit,
             Some(50_000_000),
             "CLI --total-bandwidth-limit must override the config.toml value"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_flag_set_on_a_later_run_is_persisted_to_config() {
+        // #4275 (B2): config.toml was only written on the first run, so a value
+        // passed on the CLI when the file already existed applied for that run
+        // but was lost on the next bare restart. It must be persisted instead.
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // First run creates config.toml (no total_bandwidth_limit).
+        clap_bare_args(temp_dir.path()).build().await.unwrap();
+
+        // Later run passes a new value on the CLI.
+        let mut args = clap_bare_args(temp_dir.path());
+        args.network_api.total_bandwidth_limit = Some(50_000_000);
+        args.build().await.unwrap();
+
+        // A subsequent bare run must see the persisted value.
+        let cfg = clap_bare_args(temp_dir.path()).build().await.unwrap();
+        assert_eq!(
+            cfg.network_api.total_bandwidth_limit,
+            Some(50_000_000),
+            "a CLI flag set on a later run must be written back to config.toml"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_restart_does_not_rewrite_unchanged_config() {
+        // The re-persist must only fire when something changed: a no-op restart
+        // must leave config.toml byte-identical, so operator hand-edits survive.
+        // Uses clap_bare_args (all-None) so the rebuild reads every value back
+        // from the file; local_args would re-pick a random network port each
+        // build (ConfigArgs::default) and look like a spurious change.
+        let temp_dir = tempfile::tempdir().unwrap();
+        clap_bare_args(temp_dir.path()).build().await.unwrap();
+
+        let path = temp_dir.path().join("config.toml");
+        let before = std::fs::read_to_string(&path).unwrap();
+        clap_bare_args(temp_dir.path()).build().await.unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+
+        assert_eq!(
+            before, after,
+            "a no-op restart must not rewrite config.toml"
         );
     }
 
