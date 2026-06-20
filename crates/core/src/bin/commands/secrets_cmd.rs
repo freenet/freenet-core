@@ -27,9 +27,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use chacha20poly1305::aead::{OsRng, rand_core::RngCore};
 use chrono::{DateTime, Utc};
 use freenet::dev_tool::{
-    KEK_SIZE, KekBackendKind, RestoreError, RetentionPolicy, build_backend_for, list_snapshots,
-    load_from_backend, read_backend_marker, replace_backend_marker, restore_snapshot_file,
-    snapshot_dir_for_encoded, thin_snapshots, write_backend_marker,
+    BundleKeyMaterial, ExportError, KEK_SIZE, KekBackendKind, RestoreError, RetentionPolicy,
+    SecretScope, Secrets, SecretsStore, Storage, TargetScope, UserSecretContext, build_backend_for,
+    export_bundle, import_bundle, list_snapshots, load_from_backend, read_backend_marker,
+    replace_backend_marker, restore_snapshot_file, snapshot_dir_for_encoded, thin_snapshots,
+    write_backend_marker, write_bundle_file,
 };
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -67,6 +69,21 @@ pub enum SecretsCommand {
     /// value is itself snapshotted first, so the restore is reversible.
     /// The node MUST be stopped.
     SnapshotRestore(SnapshotRestoreArgs),
+    /// Export a scope's delegate secrets into a single encrypted, portable
+    /// bundle file (P3 of #4381). Primary use: a hosted user downloading
+    /// their per-user secrets to re-import into their own peer; also backs
+    /// up a normal node's Local secrets. The node MUST be stopped.
+    ///
+    /// SECURITY: the bundle is ALWAYS encrypted at rest (passphrase- or
+    /// token-derived key). Building it requires the node to decrypt each
+    /// secret in memory, so an operator running this command observes the
+    /// plaintext during the export — inherent to the hosted model.
+    Export(ExportArgs),
+    /// Import a secrets bundle produced by `secrets export` (P3 of #4381),
+    /// re-placing each secret under its original delegate. Default target is
+    /// the single-user (Local) scope — the path a user takes when moving to
+    /// their own peer. The node MUST be stopped.
+    Import(ImportArgs),
 }
 
 #[derive(clap::Parser, Clone, Debug)]
@@ -160,6 +177,84 @@ pub struct SnapshotRestoreArgs {
     pub yes: bool,
 }
 
+#[derive(clap::Parser, Clone, Debug)]
+pub struct ExportArgs {
+    /// Path to the node's secrets directory (the on-disk secret blobs).
+    #[clap(long, value_parser)]
+    pub secrets_dir: PathBuf,
+    /// Path to the node's data directory (the ReDb `db` file with the
+    /// secrets index). This is the node's `--db-dir` (or the data dir under
+    /// which the runtime created `db`), NOT the secrets dir. Required because
+    /// the export walks the secrets index to enumerate what to gather.
+    #[clap(long, value_parser)]
+    pub db_dir: PathBuf,
+    /// Export ALL single-user (Local) secrets — the normal-node backup case.
+    /// Mutually exclusive with `--user-token`.
+    #[clap(long, conflicts_with = "user_token")]
+    pub local: bool,
+    /// Export every per-user secret for the user identified by this opaque
+    /// token (the hosted → self-host migration case). Mutually exclusive with
+    /// `--local`.
+    #[clap(long)]
+    pub user_token: Option<String>,
+    /// Encrypt the bundle under a key derived from this passphrase (Argon2id).
+    /// Mutually exclusive with `--use-token-key`.
+    #[clap(long, conflicts_with = "use_token_key")]
+    pub passphrase: Option<String>,
+    /// Encrypt the bundle under a key derived from the `--user-token` (HKDF),
+    /// so a hosted user who only has their token needs no separate passphrase.
+    /// Requires `--user-token`. Mutually exclusive with `--passphrase`.
+    #[clap(long, requires = "user_token")]
+    pub use_token_key: bool,
+    /// Output file for the encrypted bundle. Refuses to overwrite an existing
+    /// file. Written owner-only (0o600 on Unix).
+    #[clap(long, value_parser)]
+    pub out: PathBuf,
+}
+
+#[derive(clap::Parser, Clone, Debug)]
+pub struct ImportArgs {
+    /// The encrypted bundle file produced by `secrets export`.
+    #[clap(value_parser)]
+    pub bundle: PathBuf,
+    /// Path to the target node's secrets directory.
+    #[clap(long, value_parser)]
+    pub secrets_dir: PathBuf,
+    /// Path to the target node's data directory (the ReDb `db`). See the
+    /// matching `--db-dir` note on `export`.
+    #[clap(long, value_parser)]
+    pub db_dir: PathBuf,
+    /// Decrypt the bundle with this passphrase (an Argon2id-keyed bundle).
+    /// Mutually exclusive with `--use-token-key`.
+    #[clap(long, conflicts_with = "use_token_key")]
+    pub passphrase: Option<String>,
+    /// Decrypt the bundle with the user token (a token-keyed bundle). The same
+    /// token used at export with `--use-token-key`. Mutually exclusive with
+    /// `--passphrase`. May also serve as the import target when combined with
+    /// `--into-user`.
+    #[clap(long)]
+    pub token: Option<String>,
+    /// Decrypt with the user token (alias-free flag form): equivalent to
+    /// passing `--token` for decryption. Present for symmetry with export's
+    /// `--use-token-key`; requires `--token`.
+    #[clap(long, requires = "token")]
+    pub use_token_key: bool,
+    /// Place imported secrets at the single-user (Local) scope. This is the
+    /// DEFAULT when neither `--local` nor `--into-user` is given — it is the
+    /// path a user takes when migrating to their own peer. Mutually exclusive
+    /// with `--into-user`.
+    #[clap(long, conflicts_with = "into_user")]
+    pub local: bool,
+    /// Place imported secrets under a per-user scope keyed by this token
+    /// (round-trip / re-hosting). Mutually exclusive with `--local`.
+    #[clap(long)]
+    pub into_user: Option<String>,
+    /// Overwrite an existing secret at the same delegate+id. Without this an
+    /// existing value is left untouched and reported as skipped.
+    #[clap(long)]
+    pub overwrite: bool,
+}
+
 pub async fn run(config: SecretsCliConfig) -> Result<()> {
     match config.command {
         SecretsCommand::KekStatus(args) => kek_status(args).await,
@@ -168,6 +263,8 @@ pub async fn run(config: SecretsCliConfig) -> Result<()> {
         SecretsCommand::KekMigrate(args) => kek_migrate(args).await,
         SecretsCommand::SnapshotList(args) => snapshot_list(args).await,
         SecretsCommand::SnapshotRestore(args) => snapshot_restore(args).await,
+        SecretsCommand::Export(args) => secrets_export(args).await,
+        SecretsCommand::Import(args) => secrets_import(args).await,
     }
 }
 
@@ -662,6 +759,158 @@ async fn snapshot_restore(args: SnapshotRestoreArgs) -> Result<()> {
         ),
         Err(RestoreError::Io(e)) => Err(anyhow::Error::new(e).context("snapshot restore failed")),
     }
+}
+
+/// Open the target node's `SecretsStore` for an export/import operation.
+///
+/// The store needs both the on-disk secrets dir (the blobs) and the ReDb
+/// `Storage` under the data dir (the index). Both are required because the
+/// export enumerates the index; the snapshot CLIs above only touch the
+/// filesystem, which is why they don't need the db dir.
+async fn open_store(secrets_dir: &PathBuf, db_dir: &PathBuf) -> Result<SecretsStore> {
+    if !secrets_dir.exists() {
+        bail!("secrets dir {} does not exist", secrets_dir.display());
+    }
+    let db = Storage::new(db_dir)
+        .await
+        .with_context(|| format!("failed to open secrets index db under {}", db_dir.display()))?;
+    // Load the node's persisted `Secrets` (delegate cipher / legacy nonce) so
+    // the Local-scope legacy-decrypt fallback chain matches the running node.
+    // User-scope secrets don't use this (they derive purely from the token),
+    // and post-#4140 Local secrets derive from the node KEK; this only matters
+    // for pre-#4140 Local blobs written under the auto-persisted cipher.
+    let secrets = Secrets::load_for_secrets_dir(secrets_dir)
+        .with_context(|| format!("failed to load node secrets from {}", secrets_dir.display()))?;
+    SecretsStore::new(secrets_dir.clone(), secrets, db)
+        .map_err(|e| anyhow!("failed to open secrets store: {e}"))
+}
+
+/// Map an [`ExportError`] to an `anyhow::Error`, keeping the auth-failure case
+/// as a clear, actionable message.
+fn map_export_err(e: ExportError) -> anyhow::Error {
+    match e {
+        ExportError::AuthFailed => anyhow!(
+            "bundle authentication failed: wrong passphrase/token, mismatched key method \
+             (passphrase vs token), or a corrupt bundle. No secrets were written."
+        ),
+        other => anyhow::Error::new(other),
+    }
+}
+
+async fn secrets_export(args: ExportArgs) -> Result<()> {
+    // Exactly one of --local / --user-token selects the source scope.
+    if !args.local && args.user_token.is_none() {
+        bail!("specify the source scope: --local (all single-user secrets) or --user-token <tok>");
+    }
+
+    // Exactly one key method. Token-keyed export requires --user-token (clap
+    // enforces `requires`), so --use-token-key implies the user scope.
+    if args.passphrase.is_none() && !args.use_token_key {
+        bail!("specify how to encrypt the bundle: --passphrase <p> or --use-token-key");
+    }
+
+    let store = open_store(&args.secrets_dir, &args.db_dir).await?;
+
+    // Build the source scope. For the user scope we derive a UserSecretContext
+    // from the token; its `.scope()` borrows the context, so the context must
+    // outlive the export call.
+    let user_ctx = args
+        .user_token
+        .as_ref()
+        .map(|t| UserSecretContext::from_token(t.as_bytes()));
+    let scope = if args.local {
+        SecretScope::Local
+    } else {
+        // user_ctx is Some here (checked above).
+        user_ctx
+            .as_ref()
+            .expect("user scope selected => context built")
+            .scope()
+    };
+
+    // Build the bundle key material. The borrow must outlive `export_bundle`.
+    let material = if let Some(pass) = args.passphrase.as_ref() {
+        BundleKeyMaterial::Passphrase(pass.as_bytes())
+    } else {
+        // --use-token-key: token is present (clap `requires = "user_token"`).
+        BundleKeyMaterial::Token(
+            args.user_token
+                .as_ref()
+                .expect("--use-token-key requires --user-token")
+                .as_bytes(),
+        )
+    };
+
+    eprintln!(
+        "Note: building the bundle decrypts every secret in this node's memory. \
+         If this node is operated by someone other than you (hosted mode), they \
+         can observe the plaintext during this export. The bundle FILE is always \
+         encrypted at rest."
+    );
+
+    let bundle = export_bundle(&store, scope, &material).map_err(map_export_err)?;
+    write_bundle_file(&args.out, &bundle).map_err(|e| match e {
+        ExportError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists => anyhow!(
+            "refusing to overwrite existing file {}: choose a fresh --out path",
+            args.out.display()
+        ),
+        other => anyhow::Error::new(other).context("failed to write bundle file"),
+    })?;
+
+    println!(
+        "Wrote encrypted secrets bundle to {} ({} bytes).",
+        args.out.display(),
+        bundle.len()
+    );
+    Ok(())
+}
+
+async fn secrets_import(args: ImportArgs) -> Result<()> {
+    if args.passphrase.is_none() && args.token.is_none() {
+        bail!("specify how to decrypt the bundle: --passphrase <p> or --token <tok>");
+    }
+    if args.passphrase.is_some() && args.token.is_some() {
+        bail!("pass only one of --passphrase or --token to decrypt the bundle");
+    }
+
+    let bundle = fs::read(&args.bundle)
+        .with_context(|| format!("failed to read bundle file {}", args.bundle.display()))?;
+
+    let mut store = open_store(&args.secrets_dir, &args.db_dir).await?;
+
+    let material = if let Some(pass) = args.passphrase.as_ref() {
+        BundleKeyMaterial::Passphrase(pass.as_bytes())
+    } else {
+        BundleKeyMaterial::Token(
+            args.token
+                .as_ref()
+                .expect("token present when passphrase absent")
+                .as_bytes(),
+        )
+    };
+
+    // Target scope: Local by default (the self-host migration path), or a
+    // per-user scope when --into-user is given. The owned TargetScope holds
+    // any UserSecretContext for the duration of the import.
+    let target = match args.into_user.as_ref() {
+        Some(tok) => TargetScope::user_from_token(tok.as_bytes()),
+        None => TargetScope::Local,
+    };
+
+    let report = import_bundle(&mut store, &bundle, &material, &target, args.overwrite)
+        .map_err(map_export_err)?;
+
+    println!("Imported {} secret(s).", report.imported);
+    if !report.skipped.is_empty() {
+        println!(
+            "Skipped {} secret(s) that already existed (re-run with --overwrite to replace):",
+            report.skipped.len()
+        );
+        for (delegate, secret) in &report.skipped {
+            println!("  delegate {delegate} secret {secret}");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1185,5 +1434,189 @@ mod tests {
             std::fs::read(secrets_dir.join("D").join("S")).unwrap(),
             b"suffix-one"
         );
+    }
+
+    // ----- export / import CLI handlers -----
+
+    use freenet::dev_tool::SecretsStore as TestStore;
+    use freenet_stdlib::prelude::{Delegate, SecretsId};
+    use zeroize::Zeroizing as Zng;
+
+    /// Seed a Local-scope secret into a fresh node layout and return the
+    /// `(secrets_dir, db_dir)` paths. The seeding store (and its exclusive
+    /// ReDb lock) is dropped before returning so the CLI handler can re-open.
+    async fn seed_local_secret(
+        root: &std::path::Path,
+        delegate_code: u8,
+        secret_id: &[u8],
+        plaintext: &[u8],
+    ) -> (PathBuf, PathBuf) {
+        let secrets_dir = root.join("secrets");
+        let db_dir = root.join("data");
+        std::fs::create_dir_all(&secrets_dir).unwrap();
+        std::fs::create_dir_all(&db_dir).unwrap();
+        {
+            let db = Storage::new(&db_dir).await.unwrap();
+            let secrets = Secrets::load_for_secrets_dir(&secrets_dir).unwrap();
+            let mut store = TestStore::new(secrets_dir.clone(), secrets, db).unwrap();
+            let d = Delegate::from((&vec![delegate_code].into(), &vec![].into()));
+            let s = SecretsId::new(secret_id.to_vec());
+            store
+                .store_secret(
+                    d.key(),
+                    &s,
+                    SecretScope::Local,
+                    Zng::new(plaintext.to_vec()),
+                )
+                .unwrap();
+        }
+        (secrets_dir, db_dir)
+    }
+
+    fn export_args(
+        secrets_dir: &std::path::Path,
+        db_dir: &std::path::Path,
+        out: &std::path::Path,
+        passphrase: &str,
+    ) -> ExportArgs {
+        ExportArgs {
+            secrets_dir: secrets_dir.to_path_buf(),
+            db_dir: db_dir.to_path_buf(),
+            local: true,
+            user_token: None,
+            passphrase: Some(passphrase.to_string()),
+            use_token_key: false,
+            out: out.to_path_buf(),
+        }
+    }
+
+    fn import_args(
+        bundle: &std::path::Path,
+        secrets_dir: &std::path::Path,
+        db_dir: &std::path::Path,
+        passphrase: &str,
+    ) -> ImportArgs {
+        ImportArgs {
+            bundle: bundle.to_path_buf(),
+            secrets_dir: secrets_dir.to_path_buf(),
+            db_dir: db_dir.to_path_buf(),
+            passphrase: Some(passphrase.to_string()),
+            token: None,
+            use_token_key: false,
+            local: true,
+            into_user: None,
+            overwrite: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_export_then_import_round_trip() {
+        let src = tempfile::tempdir().unwrap();
+        let (secrets_dir, db_dir) =
+            seed_local_secret(src.path(), 1, b"cli-secret", b"cli-plaintext").await;
+        let bundle_path = src.path().join("bundle.bin");
+
+        secrets_export(export_args(&secrets_dir, &db_dir, &bundle_path, "pw"))
+            .await
+            .expect("export must succeed");
+        assert!(bundle_path.exists(), "bundle file written");
+        // Encrypted at rest: the file bytes don't contain the known plaintext.
+        let bytes = std::fs::read(&bundle_path).unwrap();
+        assert!(
+            !bytes
+                .windows(b"cli-plaintext".len())
+                .any(|w| w == b"cli-plaintext"),
+            "bundle must not contain plaintext at rest"
+        );
+
+        // Import into a fresh node.
+        let dst = tempfile::tempdir().unwrap();
+        let dst_secrets = dst.path().join("secrets");
+        let dst_db = dst.path().join("data");
+        std::fs::create_dir_all(&dst_secrets).unwrap();
+        std::fs::create_dir_all(&dst_db).unwrap();
+        secrets_import(import_args(&bundle_path, &dst_secrets, &dst_db, "pw"))
+            .await
+            .expect("import must succeed");
+
+        // Verify by reopening the destination store and reading the secret.
+        let db = Storage::new(&dst_db).await.unwrap();
+        let secrets = Secrets::load_for_secrets_dir(&dst_secrets).unwrap();
+        let store = TestStore::new(dst_secrets.clone(), secrets, db).unwrap();
+        let d = Delegate::from((&vec![1u8].into(), &vec![].into()));
+        let s = SecretsId::new(b"cli-secret".to_vec());
+        let got = store
+            .get_secret(d.key(), &s, SecretScope::Local)
+            .expect("imported secret present");
+        assert_eq!(got.to_vec(), b"cli-plaintext");
+    }
+
+    #[tokio::test]
+    async fn cli_export_refuses_to_overwrite_out() {
+        let src = tempfile::tempdir().unwrap();
+        let (secrets_dir, db_dir) = seed_local_secret(src.path(), 2, b"s", b"p").await;
+        let out = src.path().join("exists.bin");
+        std::fs::write(&out, b"prior").unwrap();
+        let err = secrets_export(export_args(&secrets_dir, &db_dir, &out, "pw"))
+            .await
+            .expect_err("must refuse to overwrite an existing --out");
+        assert!(
+            err.to_string().contains("refusing to overwrite"),
+            "got: {err}"
+        );
+        // Prior file untouched.
+        assert_eq!(std::fs::read(&out).unwrap(), b"prior");
+    }
+
+    #[tokio::test]
+    async fn cli_import_wrong_passphrase_fails_no_write() {
+        let src = tempfile::tempdir().unwrap();
+        let (secrets_dir, db_dir) = seed_local_secret(src.path(), 3, b"s", b"p").await;
+        let bundle_path = src.path().join("b.bin");
+        secrets_export(export_args(&secrets_dir, &db_dir, &bundle_path, "right"))
+            .await
+            .expect("export");
+
+        let dst = tempfile::tempdir().unwrap();
+        let dst_secrets = dst.path().join("secrets");
+        let dst_db = dst.path().join("data");
+        std::fs::create_dir_all(&dst_secrets).unwrap();
+        std::fs::create_dir_all(&dst_db).unwrap();
+        let err = secrets_import(import_args(&bundle_path, &dst_secrets, &dst_db, "wrong"))
+            .await
+            .expect_err("wrong passphrase must fail");
+        assert!(
+            err.to_string().contains("authentication failed"),
+            "got: {err}"
+        );
+
+        // Destination store has no secrets.
+        let db = Storage::new(&dst_db).await.unwrap();
+        let secrets = Secrets::load_for_secrets_dir(&dst_secrets).unwrap();
+        let store = TestStore::new(dst_secrets.clone(), secrets, db).unwrap();
+        assert!(
+            store
+                .export_scope_entries(SecretScope::Local)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_export_requires_scope_and_key() {
+        let src = tempfile::tempdir().unwrap();
+        let (secrets_dir, db_dir) = seed_local_secret(src.path(), 4, b"s", b"p").await;
+        let out = src.path().join("o.bin");
+        // No scope selected.
+        let mut a = export_args(&secrets_dir, &db_dir, &out, "pw");
+        a.local = false;
+        let err = secrets_export(a).await.expect_err("no scope must error");
+        assert!(err.to_string().contains("source scope"), "got: {err}");
+
+        // No key method.
+        let mut a = export_args(&secrets_dir, &db_dir, &out, "pw");
+        a.passphrase = None;
+        let err = secrets_export(a).await.expect_err("no key must error");
+        assert!(err.to_string().contains("encrypt the bundle"), "got: {err}");
     }
 }

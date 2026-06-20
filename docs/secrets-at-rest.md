@@ -106,6 +106,12 @@ freenet secrets kek-rotate        --secrets-dir <path> --yes   # NOT YET IMPLEME
 freenet secrets snapshot-list     --secrets-dir <path> [--delegate <key>] [--secret <id>]
 freenet secrets snapshot-restore  --secrets-dir <path> --delegate <key> --secret <id> \
                                   --timestamp-ms <ms> [--suffix <n>] --yes
+freenet secrets export            --secrets-dir <path> --db-dir <path> \
+                                  {--local | --user-token <tok>} \
+                                  {--passphrase <p> | --use-token-key} --out <file>
+freenet secrets import   <file>   --secrets-dir <path> --db-dir <path> \
+                                  {--passphrase <p> | --token <tok>} \
+                                  [--local | --into-user <tok>] [--overwrite]
 ```
 
 `kek-init` opts in to a specific backend BEFORE first start. It refuses
@@ -155,6 +161,66 @@ consequence: if you restore from a snapshot older than the 2-year
 `.snapshots/` afterward. The restore itself is unaffected (the value is
 already the active secret by then) and stays reversible — the prior
 active value is captured as a fresh snapshot before the overwrite.
+
+### Export / import a portable secrets bundle (#4035, P3 of #4381)
+
+Unlike snapshot-restore, `export`/`import` move secrets BETWEEN nodes.
+`export` gathers every secret in a scope into a single encrypted file;
+`import` re-places them on another node.
+
+The primary use case is the hosted → self-host migration (#4381): a user
+who tried Freenet through a hosted gateway exports their per-user
+delegate secrets (`--user-token <tok>`) and re-imports them into their
+own peer (`import --local`). The same surface also backs up a normal
+node's single-user secrets (`export --local`).
+
+Both commands need `--secrets-dir` (the on-disk secret blobs) AND
+`--db-dir` (the node's data directory, holding the ReDb secrets index).
+The export walks the index to know what to gather, so unlike the
+snapshot commands it can't run on the secrets tree alone. The node MUST
+be stopped (the ReDb file is opened exclusively).
+
+**Scope selection.** `export` takes exactly one source scope:
+`--local` (all single-user secrets) or `--user-token <tok>` (every
+per-user secret for that one hosted user, across all delegates).
+`import` places secrets at `--local` by default (the self-host target);
+`--into-user <tok>` re-files them under a per-user scope instead.
+
+**Bundle format.** The output file is
+`[MAGIC "FNSX"][version][kdf_id][16B salt][24B nonce][AEAD]`. The AEAD
+plaintext is a CBOR document `{schema_version, source_scope,
+created_unix_secs, entries:[{delegate_key, code_hash, secret_hash,
+plaintext}]}`. The header is bound as AEAD additional data, so any
+tampering with the version / salt / nonce fails authentication cleanly.
+Each entry records the delegate key + code hash so the original
+`DelegateKey` is reconstructible on the import node — and because a
+`DelegateKey` is content-derived from the delegate's wasm+params, a
+re-installed webapp shipping the same delegate yields the same key, so
+the imported secrets line up without any per-app migration table.
+
+**Encryption at rest.** The bundle file is ALWAYS encrypted. The key is
+derived either from a user passphrase (`--passphrase`, Argon2id over the
+per-bundle salt) or from the opaque user token (`--use-token-key` on
+export / `--token` on import, HKDF-SHA256 — handy for a hosted user who
+only has their token). The two methods are not interchangeable: a
+passphrase bundle opened with token material (or vice-versa) fails
+authentication. A wrong passphrase/token fails before ANY write, so a
+failed import never leaves a partial state.
+
+**Operator sees plaintext during export.** Building the bundle requires
+the node to DECRYPT every secret in memory (it can, by construction — it
+holds the scope DEK). So an operator running `export` on a hosted node
+observes the plaintext for the duration of the export. This is inherent
+to the hosted model (the node already runs the delegate) and is flagged
+on stderr when the command runs. A user who wants zero operator exposure
+should self-host from the start rather than migrate out later. The
+bundle FILE, by contrast, is never written in plaintext.
+
+**Collision handling.** On import, a secret that already exists at the
+same delegate+id is left untouched and reported as skipped, unless
+`--overwrite` is passed (in which case the prior value is snapshotted
+first, like a normal write). `--out` on export refuses to overwrite an
+existing file.
 
 ## File permissions (PR #4195 / issue #4141)
 
