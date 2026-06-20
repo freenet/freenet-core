@@ -862,9 +862,13 @@ fn shell_page(
     // origin and cannot. One token in localStorage = ONE identity per visitor
     // across every contract app on this node — the intended design.
     //
-    // When hosted mode is OFF the output is byte-for-byte identical to the
-    // pre-#4381 shell: no snippet, a 1-arg `freenetBridge(...)` call. The token
-    // is generated client-side from `crypto.getRandomValues` and is NEVER
+    // When hosted mode is OFF the shell is BEHAVIOURALLY identical to the
+    // pre-#4381 shell: no token snippet, and the same single-argument
+    // `freenetBridge(...)` call at the same site. Note this is behavioural, not
+    // literal byte-equality — the always-injected SHELL_BRIDGE_JS itself gained
+    // a `userToken` argument and an inert, undefined-guarded `if (userToken)`
+    // branch that never fires when the bridge is called with one argument. The
+    // token is generated client-side from `crypto.getRandomValues` and is NEVER
     // derived from any request input, so there is no injection vector.
     let (user_token_script, bridge_call) = if hosted_mode {
         (
@@ -1456,12 +1460,26 @@ function freenetBridge(authToken, userToken) {
           sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
           return;
         }
+        // Strip any caller-supplied credentials BEFORE we inject our own, so
+        // the sandboxed app can never choose its own auth/user identity by
+        // putting these params on the WebSocket URL it asks us to open. This
+        // matters most for `userToken`: the conditional `set` below is skipped
+        // when our minted token is undefined (localStorage disabled / private
+        // mode in hosted mode), and without this delete a caller-supplied
+        // `userToken` (from the app, or reflected via a deep-link into the WS
+        // URL) would survive and let the app pick its own per-user secret
+        // namespace. The app must NEVER influence the namespace — only the
+        // shell-minted token may reach the backend. `authToken` is deleted for
+        // symmetric defense-in-depth even though the unconditional `set` below
+        // already overrides any caller value.
+        u.searchParams.delete('authToken');
+        u.searchParams.delete('userToken');
         // Inject auth token into the WebSocket URL
         u.searchParams.set('authToken', authToken);
         // In hosted mode also present the durable per-user token so the node
         // can scope a per-user delegate-secret namespace (P2 of #4381). The
-        // token is undefined in non-hosted mode, so the param is omitted and
-        // the URL is byte-for-byte what it was before.
+        // token is undefined in non-hosted mode, so the param is omitted (and,
+        // combined with the delete above, the URL carries no userToken at all).
         if (userToken) { u.searchParams.set('userToken', userToken); }
         var ws = new WebSocket(u.toString(), msg.protocols || undefined);
         ws.binaryType = 'arraybuffer';
@@ -4197,6 +4215,43 @@ mod tests {
         assert!(
             SHELL_USER_TOKEN_JS.contains("__freenet_user_token__"),
             "user-token snippet must persist under the durable localStorage key"
+        );
+    }
+
+    /// Isolation-boundary regression (Codex review, #4513): the sandboxed app
+    /// must never be able to choose its own per-user (or auth) identity by
+    /// putting a `userToken` / `authToken` on the WebSocket URL it asks the
+    /// shell to open. The bridge must STRIP any caller-supplied credentials
+    /// before injecting its own, and the strip must run BEFORE the conditional
+    /// `set('userToken', ...)` — otherwise a caller token survives whenever the
+    /// shell's minted token is undefined (localStorage disabled / private mode),
+    /// letting the app pick its own secret namespace.
+    #[test]
+    fn bridge_js_strips_caller_supplied_user_token_before_injecting() {
+        let delete_user = SHELL_BRIDGE_JS
+            .find("u.searchParams.delete('userToken')")
+            .expect("bridge must delete any caller-supplied userToken");
+        let delete_auth = SHELL_BRIDGE_JS
+            .find("u.searchParams.delete('authToken')")
+            .expect("bridge must delete any caller-supplied authToken (defense-in-depth)");
+        let set_auth = SHELL_BRIDGE_JS
+            .find("u.searchParams.set('authToken', authToken)")
+            .expect("bridge must inject the shell's authToken");
+        let conditional_set_user = SHELL_BRIDGE_JS
+            .find("if (userToken) { u.searchParams.set('userToken', userToken); }")
+            .expect("bridge must conditionally inject the shell's minted userToken");
+
+        // The deletes must precede BOTH injection points, so a caller value can
+        // never survive — including the undefined-token path where the
+        // conditional set is skipped entirely.
+        assert!(
+            delete_user < conditional_set_user,
+            "delete('userToken') must run before the conditional set so a caller \
+             token cannot survive when the shell's token is undefined"
+        );
+        assert!(
+            delete_user < set_auth && delete_auth < set_auth,
+            "credential deletes must run before the authToken injection"
         );
     }
 
