@@ -88,9 +88,11 @@ pub mod tracer;
 // other crate modules that import from crate::tracing.
 #[cfg(feature = "trace-ot")]
 pub(crate) use register::CombinedRegister;
+// `NetLogMessage` and `EventFlushHandle` are part of the public `tracing` API
+// (used by external crates, e.g. crates/core/tests), so they must stay `pub`.
+pub use register::{EventFlushHandle, NetLogMessage};
 pub(crate) use register::{
-    DynamicRegister, EventFlushHandle, EventRegister, ListenerLogId, NetEventLog, NetEventRegister,
-    NetLogMessage,
+    DynamicRegister, EventRegister, ListenerLogId, NetEventLog, NetEventRegister,
 };
 // NEW_RECORDS_TS is needed by metrics_client's opentelemetry_tracer
 pub(crate) use event_kind::{ConnectEvent, GetEvent, PutEvent, SubscribeEvent, UpdateEvent};
