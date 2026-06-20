@@ -3261,9 +3261,11 @@ mod tests {
 
         // The arg also reads FREENET_HOSTED_MODE via clap's `env`. Clear it for
         // the duration of this test so the env of the test runner can't mask the
-        // CLI-form assertions, then restore it. SAFETY: this is the only test
-        // that touches FREENET_HOSTED_MODE.
+        // CLI-form assertions, then restore it.
         let saved = std::env::var_os("FREENET_HOSTED_MODE");
+        // SAFETY: this is the only test that touches FREENET_HOSTED_MODE, and it
+        // restores the prior value below; nextest per-process isolation means no
+        // other thread observes the transient unset.
         unsafe {
             std::env::remove_var("FREENET_HOSTED_MODE");
         }
@@ -3305,6 +3307,8 @@ mod tests {
         );
 
         // Restore the env var for any other test in this process.
+        // SAFETY: restores the value saved above; same single-test /
+        // nextest-isolation rationale as the unset.
         unsafe {
             if let Some(v) = saved {
                 std::env::set_var("FREENET_HOSTED_MODE", v);

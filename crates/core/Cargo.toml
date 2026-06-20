@@ -33,6 +33,11 @@ path = "src/bin/freenet.rs"
 ahash = { workspace = true }
 anyhow = { workspace = true }
 aes-gcm = { workspace = true }
+# Argon2id for passphrase-derived bundle keys in `freenet secrets export/import`
+# (P3 of #4381). `zeroize` wipes the derived output buffer; we use the low-level
+# `Argon2::hash_password_into` API (not the PHC-string `password_hash` path) so
+# the feature set is minimal.
+argon2 = { version = "0.5", features = ["zeroize"] }
 axum = { default-features = false, features = ["http1", "matched-path", "query", "tower-log", "ws", "json"], workspace = true }
 bincode = { workspace = true }
 blake3 = { workspace = true }
@@ -42,6 +47,10 @@ byteorder = { workspace = true }
 bytes = { workspace = true }
 chacha20poly1305 = { workspace = true }
 chrono = { workspace = true }
+# CBOR (de)serialization of the self-describing secret-export bundle payload
+# (P3 of #4381). Already a transitive dep via fdev/website-contract; pulled in
+# here directly for the export/import module.
+ciborium = "0.2"
 clap = { features = ["derive", "env"], workspace = true }
 cookie = "0.18"
 ctrlc = { features = ["termination"], workspace = true }
@@ -88,6 +97,9 @@ wasmtime = { workspace = true, optional = true }
 wasmparser = { workspace = true }
 xz2 = { workspace = true }
 reqwest = { workspace = true }
+# Hidden (no-echo) prompt for the `freenet secrets export/import` passphrase, so
+# secrets don't have to be passed on argv (where they leak via `ps`/history).
+rpassword = "7"
 x25519-dalek = { workspace = true }
 sha2 = { workspace = true }
 

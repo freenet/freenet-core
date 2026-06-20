@@ -895,9 +895,15 @@ impl SecretsStore {
                     .get(delegate)
                     .map(|entry| entry.value().iter().copied().collect())
                     .unwrap_or_default();
-                if !current.contains(&secret_key) {
-                    current.push(secret_key);
+                // Idempotent: if the hash is already indexed, do nothing — no
+                // ReDb write, no map churn. This makes the import skip-branch's
+                // index-reconcile a genuine no-op in the common (already-correct)
+                // case, so re-running an import doesn't issue N redundant fsync'd
+                // ReDb writes for the already-present entries.
+                if current.contains(&secret_key) {
+                    return Ok(());
                 }
+                current.push(secret_key);
                 self.db
                     .store_secrets_index(delegate, &current)
                     .map_err(|e| anyhow::anyhow!("Failed to store secrets index: {e}"))?;
@@ -911,9 +917,10 @@ impl SecretsStore {
                     .get(&map_key)
                     .map(|entry| entry.value().iter().copied().collect())
                     .unwrap_or_default();
-                if !current.contains(&secret_key) {
-                    current.push(secret_key);
+                if current.contains(&secret_key) {
+                    return Ok(());
                 }
+                current.push(secret_key);
                 self.db
                     .store_user_secrets_index(delegate, id.as_bytes(), &current)
                     .map_err(|e| anyhow::anyhow!("Failed to store user secrets index: {e}"))?;
@@ -1048,7 +1055,7 @@ impl SecretsStore {
                     &legacy_chain,
                     self.legacy_migration_encryption.as_ref(),
                     &blob,
-                    key,
+                    &key.encode(),
                 )
             }
             SecretScope::User { dek_secret, .. } => {
@@ -1058,7 +1065,7 @@ impl SecretsStore {
                 // (wrong user) fails AEAD on the only attempted cipher and
                 // returns `Encryption`.
                 let encryption = self.derive_user_dek(delegate, dek_secret);
-                decrypt_secret_blob(&encryption, &[], None, &blob, key)
+                decrypt_secret_blob(&encryption, &[], None, &blob, &key.encode())
             }
         }
     }
@@ -1236,6 +1243,231 @@ impl SecretsStore {
 
         Ok(())
     }
+
+    // ===================== Export / import (P3 of #4381) =====================
+    //
+    // The export path enumerates every `(DelegateKey, secret_hash)` the store
+    // holds for a scope (from the in-memory index, which mirrors ReDb), reads
+    // the active on-disk blob, and decrypts it. It recovers only the
+    // `bs58(hash)` on-disk name — NOT the `SecretsId` pre-image, which the
+    // store never persists (the ReDb index stores `SecretsId::hash` only). So
+    // both export and import are keyed on the raw 32-byte hash. That is
+    // sufficient: `store_secret`/`get_secret` only ever use `key.encode()`
+    // (= `bs58(hash)`) for the on-disk path and `*key.hash()` for the index;
+    // the pre-image is dead weight for storage. Reconstructing the original
+    // `DelegateKey` on the import node is deterministic (it is content-derived
+    // from the delegate's wasm+params), so a re-installed webapp shipping the
+    // same delegate yields the same key and the imported secrets line up.
+
+    /// Enumerate every `(DelegateKey, secret_hash)` held for `scope`.
+    ///
+    /// Reads from the in-memory index maps (kept in lock-step with ReDb), so
+    /// it reflects exactly what `get_secret` could read. For `User` scope only
+    /// the `id` field of the scope is consulted (the `dek_secret` is unused
+    /// here — enumeration is a metadata walk, not a decrypt).
+    fn enumerate_scope(&self, scope: &SecretScope<'_>) -> Vec<(DelegateKey, SecretKey)> {
+        let mut out = Vec::new();
+        match scope {
+            SecretScope::Local => {
+                for entry in self.key_to_secret_part.iter() {
+                    let delegate = entry.key().clone();
+                    for hash in entry.value() {
+                        out.push((delegate.clone(), *hash));
+                    }
+                }
+            }
+            SecretScope::User { id, .. } => {
+                for entry in self.user_key_to_secret_part.iter() {
+                    let (delegate, user) = entry.key();
+                    if user != *id {
+                        continue;
+                    }
+                    for hash in entry.value() {
+                        out.push((delegate.clone(), *hash));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Read + decrypt the active secret blob named `bs58(secret_hash)` under
+    /// `scope`. The by-hash analogue of [`Self::get_secret`]; it exists because
+    /// the export enumeration only ever recovers the hash, never a `SecretsId`.
+    /// Decrypt logic (cipher selection + legacy-fallback chain) is identical to
+    /// `get_secret`.
+    fn read_secret_by_hash(
+        &self,
+        delegate: &DelegateKey,
+        secret_hash: &SecretKey,
+        scope: &SecretScope<'_>,
+    ) -> Result<Zeroizing<Vec<u8>>, SecretStoreError> {
+        let encoded = bs58::encode(secret_hash)
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into_string();
+        let secret_path = self.scope_dir(delegate, scope).join(&encoded);
+        let blob = fs::read(&secret_path).map_err(|_| {
+            // We only have the secret hash here, not a `SecretsId` (the
+            // pre-image is never persisted), so we can't build a
+            // `MissingSecret(SecretsId)`. Surface an IO/NotFound error carrying
+            // the encoded path instead; export treats any read error as fatal.
+            SecretStoreError::IO(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("secret blob not found at {}", secret_path.display()),
+            ))
+        })?;
+        match scope {
+            SecretScope::Local => {
+                let encryption = self.cipher_for_read(delegate);
+                let legacy_chain = [&self.default_encryption];
+                decrypt_secret_blob(
+                    &encryption,
+                    &legacy_chain,
+                    self.legacy_migration_encryption.as_ref(),
+                    &blob,
+                    &encoded,
+                )
+            }
+            SecretScope::User { dek_secret, .. } => {
+                let encryption = self.derive_user_dek(delegate, dek_secret);
+                decrypt_secret_blob(&encryption, &[], None, &blob, &encoded)
+            }
+        }
+    }
+
+    /// Gather every secret under `scope`, decrypted, as portable export
+    /// entries. The returned plaintexts live in `Zeroizing` buffers so they
+    /// are wiped when the caller drops them.
+    ///
+    /// A per-entry read/decrypt failure is fatal (returned as `Err`): a
+    /// silently-skipped secret would produce a bundle the user believes is
+    /// complete but isn't, which is worse for a backup than a hard failure.
+    /// In practice every enumerated entry is decryptable by construction (the
+    /// node wrote it), so this only fires on genuine on-disk corruption.
+    pub fn export_scope_entries(
+        &self,
+        scope: SecretScope<'_>,
+    ) -> Result<Vec<ExportSecretEntry>, SecretStoreError> {
+        let refs = self.enumerate_scope(&scope);
+        let mut entries = Vec::with_capacity(refs.len());
+        for (delegate, secret_hash) in refs {
+            let plaintext = self.read_secret_by_hash(&delegate, &secret_hash, &scope)?;
+            entries.push(ExportSecretEntry {
+                delegate_key: delegate,
+                secret_hash,
+                plaintext,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Place a single decrypted secret (identified by its 32-byte hash) under
+    /// `scope`, re-encrypting it under this node's scope DEK. The import-side
+    /// analogue of `store_secret`, keyed on the hash because the bundle does
+    /// not carry a `SecretsId` pre-image.
+    ///
+    /// When a secret already exists at the target path: if `overwrite` is
+    /// false, the on-disk value is left as-is and `Ok(false)` is returned (the
+    /// caller reports it as skipped) — but the index is still reconciled
+    /// (idempotent ensure) so a prior partial import that wrote the file but
+    /// failed before indexing converges on retry. If `overwrite` is true, the
+    /// value is rewritten (the prior value is snapshotted first by the normal
+    /// `store_secret` write discipline) and re-indexed. Returns `Ok(true)` only
+    /// when a new value was written.
+    pub fn import_secret_by_hash(
+        &mut self,
+        delegate: &DelegateKey,
+        secret_hash: &SecretKey,
+        scope: SecretScope<'_>,
+        plaintext: Zeroizing<Vec<u8>>,
+        overwrite: bool,
+    ) -> RuntimeResult<bool> {
+        let encoded = bs58::encode(secret_hash)
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into_string();
+        let scope_path = self.scope_dir(delegate, &scope);
+        let secret_file_path = scope_path.join(&encoded);
+        if secret_file_path.exists() && !overwrite {
+            // Skip the rewrite — but still RECONCILE the index. A prior import
+            // can crash (or hit a transient ReDb error) AFTER the file landed
+            // but BEFORE `add_to_index` committed, leaving the secret on disk
+            // yet absent from the index. Without this repair, a retry takes
+            // this early branch, reports "skipped", and never indexes the
+            // secret — so it stays invisible to index-based enumeration/export
+            // forever (silent data loss on the next migration). `add_to_index`
+            // is idempotent (no-ops when the hash is already present), so this
+            // is safe in the common case where the index is already correct and
+            // converges the file-without-index case on retry. Report `false`
+            // (not rewritten) regardless.
+            self.add_to_index(delegate, &scope, *secret_hash)?;
+            return Ok(false);
+        }
+
+        // Select / derive the scope DEK exactly as `store_secret` does so the
+        // imported blob is readable by `get_secret` afterwards.
+        let encryption = match &scope {
+            SecretScope::Local => self.cipher_for(delegate).clone(),
+            SecretScope::User { dek_secret, .. } => self.derive_user_dek(delegate, dek_secret),
+        };
+
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let aead = encryption
+            .cipher
+            .encrypt(&nonce, plaintext.as_slice())
+            .map_err(SecretStoreError::Encryption)?;
+        let mut ciphertext = Vec::with_capacity(HEADER_LEN + aead.len());
+        ciphertext.push(VERSION_V1);
+        ciphertext.extend_from_slice(nonce.as_slice());
+        ciphertext.extend_from_slice(&aead);
+
+        fs::create_dir_all(&scope_path)?;
+        if let Err(e) = ensure_owner_only_tree(&self.base_path, &scope_path) {
+            tracing::warn!(path = %scope_path.display(), error = %e, "chmod scope dir tree failed");
+        }
+
+        // Snapshot the prior value before an overwrite, mirroring
+        // `store_secret`'s durability discipline so an import that clobbers an
+        // existing secret stays reversible.
+        if self.snapshots_enabled
+            && secret_file_path.exists()
+            && let Err(e) = snapshot_active_value(&scope_path, &encoded, &secret_file_path)
+        {
+            tracing::warn!(
+                "failed to snapshot prior secret value during import for delegate {}: {e}",
+                delegate.encode()
+            );
+        }
+
+        let tmp_path = secret_file_path.with_extension("tmp");
+        {
+            let mut file = create_owner_only(&tmp_path)?;
+            file.write_all(&ciphertext)?;
+            file.sync_all()?;
+        }
+        if let Err(err) = fs::rename(&tmp_path, &secret_file_path) {
+            if let Err(rm_err) = fs::remove_file(&tmp_path) {
+                tracing::debug!(
+                    "failed to clean up tmp file {tmp_path:?} after rename failure: {rm_err}"
+                );
+            }
+            return Err(err.into());
+        }
+
+        self.add_to_index(delegate, &scope, *secret_hash)?;
+        Ok(true)
+    }
+}
+
+/// A single decrypted secret gathered by [`SecretsStore::export_scope_entries`].
+///
+/// Identified by its delegate key + the 32-byte secret hash (the on-disk name
+/// is `bs58(secret_hash)`); the `SecretsId` pre-image is not recoverable and is
+/// not needed to re-place the secret on another node. The `plaintext` is held
+/// in `Zeroizing` so it is wiped when this entry is dropped.
+pub struct ExportSecretEntry {
+    pub delegate_key: DelegateKey,
+    pub secret_hash: [u8; 32],
+    pub plaintext: Zeroizing<Vec<u8>>,
 }
 
 /// Decrypt an on-disk secret blob, transparently supporting every
@@ -1269,7 +1501,12 @@ fn decrypt_secret_blob(
     legacy_chain: &[&Encryption],
     legacy_migration: Option<&Encryption>,
     blob: &[u8],
-    key: &SecretsId,
+    // Encoded secret id, for log context ONLY. Taken as `&str` (not
+    // `&SecretsId`) so the by-hash export read path — which only ever
+    // recovers the on-disk `bs58(hash)` name, never the `SecretsId`
+    // pre-image — can share this exact decrypt logic. `get_secret`
+    // passes `&key.encode()`, which is the same `bs58(hash)` string.
+    key: &str,
 ) -> Result<Zeroizing<Vec<u8>>, SecretStoreError> {
     // Decryption strategy. The format + cipher have rotated three
     // times across the secrets-at-rest hardening sequence:
@@ -1343,7 +1580,7 @@ fn decrypt_secret_blob(
     ))
 }
 
-fn log_legacy_decrypt(key: &SecretsId, idx: usize, is_migration: bool, format: &str) {
+fn log_legacy_decrypt(key: &str, idx: usize, is_migration: bool, format: &str) {
     if is_migration {
         tracing::warn!(
             key = %key,
@@ -1475,7 +1712,7 @@ mod test {
             .ciphers
             .get(delegate.key())
             .expect("cipher registered");
-        let plaintext = decrypt_secret_blob(encryption, &[], None, &blob, &secret_id)
+        let plaintext = decrypt_secret_blob(encryption, &[], None, &blob, &secret_id.encode())
             .expect("snapshot blob should decrypt with the registered cipher");
         assert_eq!(plaintext.to_vec(), b"v1".to_vec());
         Ok(())
@@ -4092,5 +4329,143 @@ mod test {
                 "a SecretsId must never encode to the reserved `users/` path segment"
             );
         }
+    }
+
+    /// Regression: an import whose file write succeeded but whose index write
+    /// failed (transient crash) leaves the secret on disk but UNINDEXED. A retry
+    /// without `--overwrite` must take the skip branch AND repair the index, so
+    /// the secret becomes visible to index-based enumeration again. Without the
+    /// reconcile, the secret would be silently lost on the next migration.
+    #[tokio::test]
+    async fn import_skip_branch_repairs_missing_index_entry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![70].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        let secret_id = SecretsId::new(vec![71]);
+        let secret_hash = *secret_id.hash();
+
+        // Normal store: writes the file AND indexes the hash.
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"value".to_vec()),
+        )?;
+
+        // Simulate the post-write / pre-index crash window: drop the hash from
+        // BOTH the ReDb index and the in-memory mirror, leaving the file on
+        // disk. (The real failure is `add_to_index` erroring after the rename;
+        // the resulting on-disk state is exactly this.)
+        store.db.store_secrets_index(delegate.key(), &[])?;
+        store.key_to_secret_part.remove(delegate.key());
+
+        // Pre-condition: file present, index empty → invisible to enumeration.
+        let file_path = secrets_dir
+            .join(delegate.key().encode())
+            .join(secret_id.encode());
+        assert!(file_path.exists(), "secret file should still be on disk");
+        assert!(
+            store.export_scope_entries(SecretScope::Local)?.is_empty(),
+            "pre-condition: unindexed secret must be invisible to enumeration"
+        );
+
+        // Retry the import WITHOUT overwrite. It must skip the rewrite
+        // (Ok(false)) but reconcile the index.
+        let wrote = store.import_secret_by_hash(
+            delegate.key(),
+            &secret_hash,
+            SecretScope::Local,
+            Zeroizing::new(b"value".to_vec()),
+            false,
+        )?;
+        assert!(
+            !wrote,
+            "existing file must not be rewritten without --overwrite"
+        );
+
+        // Post-condition: the hash is back in BOTH the ReDb index and the
+        // in-memory map, and enumeration (the export source) sees it again.
+        assert!(
+            store
+                .db
+                .get_secrets_index(delegate.key())?
+                .unwrap_or_default()
+                .contains(&secret_hash),
+            "ReDb index must be repaired"
+        );
+        assert!(
+            store
+                .key_to_secret_part
+                .get(delegate.key())
+                .map(|e| e.value().contains(&secret_hash))
+                .unwrap_or(false),
+            "in-memory index must be repaired"
+        );
+        let entries = store.export_scope_entries(SecretScope::Local)?;
+        assert_eq!(entries.len(), 1, "secret must be enumerable after repair");
+        assert_eq!(entries[0].secret_hash, secret_hash);
+        assert_eq!(entries[0].plaintext.to_vec(), b"value");
+        Ok(())
+    }
+
+    /// Same convergence guarantee for the per-user index table.
+    #[tokio::test]
+    async fn import_skip_branch_repairs_missing_user_index_entry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![72].into(), &vec![].into()));
+        let ctx = UserSecretContext::from_token(b"converge-user");
+        let secret_id = SecretsId::new(vec![73]);
+        let secret_hash = *secret_id.hash();
+
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            ctx.scope(),
+            Zeroizing::new(b"uval".to_vec()),
+        )?;
+
+        // Drop the user-index row + in-memory mirror, leaving the file.
+        store
+            .db
+            .store_user_secrets_index(delegate.key(), ctx.user_id().as_bytes(), &[])?;
+        store
+            .user_key_to_secret_part
+            .remove(&(delegate.key().clone(), *ctx.user_id()));
+
+        assert!(
+            store.export_scope_entries(ctx.scope())?.is_empty(),
+            "pre-condition: unindexed user secret invisible"
+        );
+
+        let wrote = store.import_secret_by_hash(
+            delegate.key(),
+            &secret_hash,
+            ctx.scope(),
+            Zeroizing::new(b"uval".to_vec()),
+            false,
+        )?;
+        assert!(!wrote);
+
+        let entries = store.export_scope_entries(ctx.scope())?;
+        assert_eq!(
+            entries.len(),
+            1,
+            "user secret must be enumerable after repair"
+        );
+        assert_eq!(entries[0].secret_hash, secret_hash);
+        Ok(())
     }
 }
