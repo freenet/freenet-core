@@ -364,7 +364,7 @@ pub use launch_at_login::{
 pub use macos::generate_plist;
 
 #[cfg(target_os = "windows")]
-pub use windows::kill_freenet_service_processes;
+pub(crate) use windows::kill_freenet_service_processes;
 #[cfg(target_os = "windows")]
 pub use windows::stop_and_remove_service;
 
@@ -412,6 +412,33 @@ fn service_logs(_error_only: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard for the service.rs submodule split: it dropped
+    /// `spawn_first_run_dashboard_opener` entirely (only the call site
+    /// survived) and left several Windows-only items unimported, breaking the
+    /// Windows build. Linux CI compiles none of those `#[cfg(windows)]` paths,
+    /// so the breakage shipped to `main` silently. These source-scrape pins run
+    /// on every platform and fail fast if the Windows-critical wiring is
+    /// dropped again.
+    #[test]
+    fn windows_first_run_wiring_is_present() {
+        let wrapper = include_str!("service/wrapper.rs");
+        assert!(
+            wrapper.contains("fn spawn_first_run_dashboard_opener("),
+            "wrapper.rs must define spawn_first_run_dashboard_opener — the split \
+             dropped it, breaking the Windows build."
+        );
+        assert!(
+            wrapper.contains("use super::single_instance::FIRST_RUN_OPENER_SPAWNED;"),
+            "wrapper.rs must import FIRST_RUN_OPENER_SPAWNED from single_instance."
+        );
+        let windows = include_str!("service/windows.rs");
+        assert!(
+            windows.contains("use super::log_utils::find_latest_log_file;"),
+            "windows.rs must import find_latest_log_file from log_utils."
+        );
+    }
+
     // Pull test-helper functions from submodules that are not re-exported at the
     // service.rs level (they are pub(super) in their submodule, making them
     // visible here via explicit `use`).
