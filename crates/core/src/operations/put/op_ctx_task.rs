@@ -1217,6 +1217,23 @@ where
                     phase = "relay_put_terminus",
                     "PUT relay: chain descended here and next hop moves away; finalizing here (#4363)"
                 );
+                // Finalize the operation at this closest-seen node (#4363
+                // placement) but STILL replicate the contract one hop onward so
+                // the UPDATE broadcast tree stays connected (#4509 convergence).
+                // See `relay_put_replicate_forward` for why both are required.
+                if let Some(next_addr) = peer.socket_addr() {
+                    relay_put_replicate_forward(
+                        op_manager,
+                        next_addr,
+                        key,
+                        contract.clone(),
+                        related_contracts.clone(),
+                        merged_value.clone(),
+                        htl,
+                        new_skip_list.clone(),
+                    )
+                    .await;
+                }
                 let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
                 return relay_put_finalize_local(
                     op_manager,
@@ -1777,6 +1794,104 @@ async fn relay_put_store_locally(
     Ok(merged_value)
 }
 
+/// Fire-and-forget a replication-only `PutMsg::Request` to `next_addr`
+/// when the #4363 terminus guard finalizes the operation locally.
+///
+/// # Why the guard must still replicate (issue #4509 convergence fix)
+///
+/// The terminus guard makes the *closest-seen* node the authoritative
+/// finalizer (it sends the upstream `PutMsg::Response`, so the originator's
+/// reply and `hop_count` reflect placement at the contract neighbourhood —
+/// the #4363 goal). But finalizing must NOT also stop the contract from
+/// replicating onward: this codebase forms the UPDATE broadcast tree along
+/// the PUT forward path (each relay `host_contract` + `announce_contract_hosted`
+/// in `relay_put_store_locally`). If the guard simply returns after the
+/// upstream Response, the next hop — and everything past it — never receives
+/// the contract, so a later UPDATE that the router fans out to one of those
+/// peers fails with `missing contract` and the network splits into divergent
+/// state groups (observed in `test_six_peer_contract_lifecycle`: contract on
+/// 4/6 peers, a 2/2 v20-vs-v30 split, node-2's updates reaching no one).
+///
+/// To keep placement (#4363) AND replication breadth (convergence), the guard
+/// finalizes locally *and* forwards a replication copy onward with a FRESH
+/// transaction so it does not collide with the upstream finalization waiter
+/// (the originator is already satisfied by this node's Response). The forward
+/// is fire-and-forget: no reply is awaited, and the downstream relay drives
+/// its own replication (including re-applying the same guard one hop deeper).
+/// The skip list — which already contains `upstream_addr` and `own_addr` —
+/// rides along unchanged, and HTL is decremented, so the replication copy is
+/// bounded and cannot loop back upstream. This is the "ensure terminated PUTs
+/// still replicate to the contract neighbourhood" resolution.
+#[allow(clippy::too_many_arguments)]
+async fn relay_put_replicate_forward(
+    op_manager: &OpManager,
+    next_addr: SocketAddr,
+    key: ContractKey,
+    contract: ContractContainer,
+    related_contracts: RelatedContracts<'static>,
+    merged_value: WrappedState,
+    htl: usize,
+    skip_list: HashSet<SocketAddr>,
+) {
+    // The replication copy is sent as a single `PutMsg::Request`. For a
+    // payload that would need streaming we skip the replication forward rather
+    // than re-implement the piped-stream upgrade here: the local store already
+    // placed the authoritative replica at this closest-seen node (#4363), and
+    // the convergence regression this restores (#4509) is on the small-state
+    // non-streaming path. A large-contract terminus is rare; skipping leaves
+    // placement correct and only forgoes the extra broadcast-path replica.
+    let payload = PutStreamingPayload {
+        contract: contract.clone(),
+        related_contracts: related_contracts.clone(),
+        value: merged_value.clone(),
+    };
+    let payload_size = bincode::serialized_size(&payload).unwrap_or(u64::MAX) as usize;
+    if crate::operations::should_use_streaming(op_manager.streaming_threshold, payload_size) {
+        tracing::debug!(
+            contract = %key,
+            target = %next_addr,
+            payload_size,
+            phase = "relay_put_terminus_replicate",
+            "PUT relay: terminus replication skipped for streaming-size payload (placement still correct)"
+        );
+        return;
+    }
+
+    // Fresh tx: the upstream Response under `incoming_tx` already satisfies
+    // the originator's waiter; reusing it would (a) make the downstream relay
+    // bubble a second Response back to a node with no waiter and (b) trip the
+    // per-node dedup gate on `incoming_tx`. A new transaction keeps the
+    // replication copy a clean, independent fire-and-forget op.
+    let replication_tx = Transaction::new::<PutMsg>();
+    let forward = NetMessage::from(PutMsg::Request {
+        id: replication_tx,
+        contract,
+        related_contracts,
+        value: merged_value,
+        htl: htl.saturating_sub(1),
+        skip_list,
+    });
+    let mut ctx = op_manager.op_ctx(replication_tx);
+    if let Err(err) = ctx.send_fire_and_forget(next_addr, forward).await {
+        tracing::debug!(
+            replication_tx = %replication_tx,
+            contract = %key,
+            target = %next_addr,
+            error = %err,
+            phase = "relay_put_terminus_replicate",
+            "PUT relay: terminus replication forward failed (best-effort)"
+        );
+    } else {
+        tracing::debug!(
+            replication_tx = %replication_tx,
+            contract = %key,
+            target = %next_addr,
+            phase = "relay_put_terminus_replicate",
+            "PUT relay: finalized locally but forwarded replication copy onward (#4509)"
+        );
+    }
+}
+
 /// Finalize at this node when there's no next hop. Emits `put_success`
 /// telemetry and sends `PutMsg::Response` upstream.
 ///
@@ -2235,6 +2350,13 @@ where
     // just stops piping the replica to a farther peer the contract
     // neighbourhood will never descend to. The away-move alone is not a
     // sufficient stop condition; see `put_routing_should_terminate`.
+    // When the terminus guard fires it drops `next_hop` (stops piping), but
+    // the contract must still replicate one hop onward to keep the UPDATE
+    // broadcast tree connected (#4509 convergence — see
+    // `relay_put_replicate_forward`). The streaming payload isn't assembled
+    // until step 5, so we remember the next-hop address here and forward a
+    // replication copy after the local store in step 6.
+    let mut terminus_replicate_to: Option<SocketAddr> = None;
     let next_hop = match next_hop {
         Some(peer) => {
             let target = crate::ring::Location::from(&contract_key);
@@ -2260,6 +2382,7 @@ where
                     phase = "relay_put_streaming_terminus",
                     "PUT streaming relay: chain descended here and next hop moves away; finalizing here (#4363)"
                 );
+                terminus_replicate_to = peer.socket_addr();
                 None
             } else {
                 Some(peer)
@@ -2447,6 +2570,10 @@ where
     }
 
     // ── Step 6: Store contract locally (shared helper with slice A) ──────
+    // Clone the contract/related-contracts for a possible terminus replication
+    // forward (#4509) before the store consumes `related_contracts`.
+    let replicate_payload =
+        terminus_replicate_to.map(|addr| (addr, contract.clone(), related_contracts.clone()));
     let merged_value = relay_put_store_locally(
         op_manager,
         incoming_tx,
@@ -2457,6 +2584,24 @@ where
         htl,
     )
     .await?;
+
+    // Terminus guard fired (#4363) on the streaming path: finalize here but
+    // still replicate the assembled contract one hop onward so the UPDATE
+    // broadcast tree stays connected (#4509). Mirrors the non-streaming guard
+    // branch; see `relay_put_replicate_forward`.
+    if let Some((next_addr, contract, related_contracts)) = replicate_payload {
+        relay_put_replicate_forward(
+            op_manager,
+            next_addr,
+            key,
+            contract,
+            related_contracts,
+            merged_value.clone(),
+            htl,
+            new_skip_list.clone(),
+        )
+        .await;
+    }
 
     // ── Step 7: Await downstream reply (if piping), then bubble upstream ──
     //
@@ -4134,26 +4279,36 @@ mod tests {
              the away-routing wander",
         );
         // The guard sits inside the `Some(peer)` next-hop arm, which must
-        // resolve the next hop's socket address (`peer.socket_addr()`)
-        // before the request is forwarded. The guard MUST precede that.
-        let resolve_addr_pos = body
-            .find("peer.socket_addr()")
-            .expect("next-hop socket_addr resolution missing in driver");
+        // resolve the next hop's socket address before the request is
+        // forwarded downstream via `send_to_and_await`. The guard MUST
+        // precede that forward.
+        let forward_pos = body
+            .find("ctx.send_to_and_await(")
+            .expect("downstream forward (send_to_and_await) missing in driver");
         assert!(
-            guard_pos < resolve_addr_pos,
-            "the #4363 terminus guard MUST run BEFORE the next hop's \
-             address is resolved/forwarded, otherwise a non-improving \
-             next hop is still sent the PUT and the replica overshoots \
-             the contract neighbourhood"
+            guard_pos < forward_pos,
+            "the #4363 terminus guard MUST run BEFORE the downstream \
+             forward, otherwise a non-improving next hop is still sent the \
+             PUT and the replica overshoots the contract neighbourhood"
         );
 
-        // The guard must finalize locally on its terminus branch, not just
-        // log: the early return goes through relay_put_finalize_local.
-        let guard_region = &body[guard_pos..resolve_addr_pos];
+        // The guard must finalize locally on its terminus branch (so the
+        // closest-seen node is the authoritative finalizer, #4363) AND still
+        // replicate the contract one hop onward (so the UPDATE broadcast tree
+        // stays connected, #4509) — not just log, and not fall through to the
+        // forward. Both calls live in the terminus branch before the forward.
+        let guard_region = &body[guard_pos..forward_pos];
         assert!(
             guard_region.contains("relay_put_finalize_local("),
             "the terminus branch MUST finalize locally via \
              relay_put_finalize_local, not fall through to the forward"
+        );
+        assert!(
+            guard_region.contains("relay_put_replicate_forward("),
+            "the terminus branch MUST still replicate the contract onward via \
+             relay_put_replicate_forward (#4509) — finalizing without \
+             replicating orphans the UPDATE broadcast path and splits the \
+             network into divergent state groups"
         );
     }
 
@@ -4193,6 +4348,21 @@ mod tests {
              derived (i.e. before the piped-forward decision), so a \
              non-improving next hop is dropped and the driver finalizes \
              locally"
+        );
+
+        // The streaming guard records the dropped next hop in
+        // `terminus_replicate_to` and, after the local store, replicates the
+        // contract one hop onward via `relay_put_replicate_forward` (#4509) so
+        // the streaming path does not orphan the UPDATE broadcast tree either.
+        assert!(
+            body.contains("terminus_replicate_to"),
+            "streaming guard MUST record the dropped next hop in \
+             terminus_replicate_to for the #4509 replication forward"
+        );
+        assert!(
+            body.contains("relay_put_replicate_forward("),
+            "streaming terminus path MUST still replicate the contract onward \
+             via relay_put_replicate_forward (#4509)"
         );
     }
 
