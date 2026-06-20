@@ -1587,6 +1587,18 @@ pub struct WebsocketApiArgs {
     /// single-user, byte-for-byte today's behavior. Enable only on a node you
     /// intend to operate as a shared public proxy for untrusted users.
     ///
+    /// SECURE-CONNECTION REQUIREMENT (refuse-plaintext-token, #4381): even with
+    /// hosted mode on, the durable `userToken` is honored ONLY over a connection
+    /// whose source is **loopback** — a browser on the same host, or a
+    /// TLS-terminating reverse proxy **colocated on the same host** (which may
+    /// also forward `X-Forwarded-Proto: https`). A token presented over a
+    /// non-loopback connection (direct plaintext from the network, or a TLS
+    /// proxy on a **different** host such as a remote load balancer) is
+    /// **rejected** with `403` — fail-closed, so an exposed plaintext port can't
+    /// leak tokens. So: terminate TLS on the SAME host as the node and have the
+    /// proxy connect over loopback. A remote/off-host TLS terminator is not
+    /// supported today and would need future explicit trusted-proxy-IP config.
+    ///
     /// `--hosted-mode` is THE operator switch, so it works as a BARE flag:
     /// `--hosted-mode` => `Some(true)`; `--hosted-mode=false` (or
     /// `--hosted-mode false`) => `Some(false)`; absent => `None`. Kept as

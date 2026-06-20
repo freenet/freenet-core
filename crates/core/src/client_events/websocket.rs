@@ -730,10 +730,16 @@ enum UserTokenDecision {
     /// dropping the token — silently falling back to `Local` would put the user
     /// on the WRONG (shared) namespace under a public plaintext deployment.
     RejectInsecure,
-    /// No per-user scoping: treat as single-user (`SecretScope::Local`). This is
-    /// the flag-off path, the no-token path, and the empty-token path — all of
-    /// which are byte-for-byte the pre-#4381 behavior, so no token is read for
-    /// scope and no rejection ever fires.
+    /// No per-user scoping: treat as single-user (`SecretScope::Local`). Reached
+    /// for the flag-off path and the no-token path (`has_token == false`) — both
+    /// byte-for-byte the pre-#4381 behavior, so no rejection fires.
+    ///
+    /// NOTE: an EMPTY token (`?userToken=` with no value) is mapped to `Local`
+    /// too, but that happens at the CALL SITE, which passes `has_token = false`
+    /// for an empty token (matching `derive_user_context`'s empty-is-absent
+    /// rule). This pure fn keys only on the `has_token` bool and never inspects
+    /// token contents — so an empty token must NOT reach here as `has_token ==
+    /// true`, or it would be wrongly rejected as insecure.
     Local,
 }
 
@@ -986,29 +992,39 @@ async fn connection_info(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.eq_ignore_ascii_case("https"));
 
-    let user_context =
-        match decide_user_token(hosted_mode.0, user_token.is_some(), source_ip, xfp_https) {
-            UserTokenDecision::Honor => derive_user_context(hosted_mode.0, user_token.as_deref()),
-            UserTokenDecision::Local => None,
-            UserTokenDecision::RejectInsecure => {
-                // Fail LOUD, not silent. Dropping the token and falling back to Local
-                // would silently put the user on the WRONG (shared) namespace under a
-                // public plaintext deployment; rejecting surfaces the misconfiguration
-                // to the operator/user instead. Do not log the token (high-value
-                // credential); log only the non-secret source IP and path.
-                tracing::warn!(
-                    source_ip = ?source_ip,
-                    request_path = req.uri().path(),
-                    "Rejected hosted user token over an insecure connection \
-                     (not loopback / no trusted X-Forwarded-Proto: https)"
-                );
-                return (
-                    StatusCode::FORBIDDEN,
-                    "hosted user token requires a secure (TLS/loopback) connection",
-                )
-                    .into_response();
-            }
-        };
+    // `has_token` is a NON-EMPTY check, matching `derive_user_context`'s
+    // empty-is-absent semantics. The browser shell sends `?userToken=` (empty)
+    // for a brand-new user who has no token yet; that connection must fall
+    // through to Local (single-user) so the client can connect and GET a token,
+    // NOT be locked out with a 403. Both helpers must agree on "empty": an empty
+    // token is treated as no token, so it is never gated.
+    let user_context = match decide_user_token(
+        hosted_mode.0,
+        user_token.as_deref().is_some_and(|t| !t.is_empty()),
+        source_ip,
+        xfp_https,
+    ) {
+        UserTokenDecision::Honor => derive_user_context(hosted_mode.0, user_token.as_deref()),
+        UserTokenDecision::Local => None,
+        UserTokenDecision::RejectInsecure => {
+            // Fail LOUD, not silent. Dropping the token and falling back to Local
+            // would silently put the user on the WRONG (shared) namespace under a
+            // public plaintext deployment; rejecting surfaces the misconfiguration
+            // to the operator/user instead. Do not log the token (high-value
+            // credential); log only the non-secret source IP and path.
+            tracing::warn!(
+                source_ip = ?source_ip,
+                request_path = req.uri().path(),
+                "Rejected hosted user token over an insecure connection \
+                 (not loopback / no trusted X-Forwarded-Proto: https)"
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                "hosted user token requires a secure (TLS/loopback) connection",
+            )
+                .into_response();
+        }
+    };
 
     // Do NOT log credentials. The auth token, the user token, and the full
     // request URI are all sensitive: the URI query string carries
@@ -2251,6 +2267,45 @@ mod tests {
         );
     }
 
+    /// Regression: an EMPTY `userToken` (`?userToken=` => `Some("")`) must be
+    /// treated as no token (Local), NOT rejected as insecure. The call site
+    /// computes `has_token` as a NON-EMPTY check, so an empty token over a
+    /// remote/non-loopback hosted connection falls through to Local — a
+    /// brand-new remote user whose client sends an empty `userToken=` connects
+    /// as single-user to GET a token, instead of being locked out with a 403.
+    /// This mirrors `derive_user_context`'s empty-is-absent semantics so the two
+    /// helpers agree on "empty".
+    #[test]
+    fn gate_empty_token_is_local_not_rejected() {
+        // Replicate the call-site computation of `has_token`.
+        let has_token = |t: Option<&str>| t.is_some_and(|t| !t.is_empty());
+
+        // Empty token + hosted on + remote source => Local (the regression).
+        assert_eq!(
+            decide_user_token(true, has_token(Some("")), Some(PUBLIC_V4), false),
+            UserTokenDecision::Local,
+            "empty userToken over a remote hosted connection must be Local, not rejected"
+        );
+        // Empty token + hosted on + loopback => Local (no spurious Honor either).
+        assert_eq!(
+            decide_user_token(true, has_token(Some("")), Some(LOOPBACK_V4), false),
+            UserTokenDecision::Local,
+        );
+        // Sanity: a NON-empty token over the same remote source IS rejected, so
+        // the empty-token allowance is specifically about emptiness.
+        assert_eq!(
+            decide_user_token(true, has_token(Some("alice")), Some(PUBLIC_V4), false),
+            UserTokenDecision::RejectInsecure,
+        );
+        // Whitespace is intentionally a real (non-empty) token, consistent with
+        // derive_user_context — so it IS gated (rejected over a remote source).
+        assert_eq!(
+            decide_user_token(true, has_token(Some(" ")), Some(PUBLIC_V4), false),
+            UserTokenDecision::RejectInsecure,
+            "whitespace token is non-empty => treated as a real token"
+        );
+    }
+
     /// Integration-level check that the `connection_info` middleware actually
     /// enforces the gate end-to-end (not just the pure helper): it reads the
     /// `ConnectInfo<SocketAddr>` source, the `X-Forwarded-Proto` header, and the
@@ -2368,6 +2423,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+
+        // Hosted ON + EMPTY token (`/?userToken=`) + remote => 200, NOT 403.
+        // A brand-new remote user whose client sends an empty userToken must be
+        // able to connect (as Local) to GET a real token, not be locked out.
+        let resp = router(true)
+            .oneshot(req(Some(""), Some(public), false))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "empty userToken over a remote hosted connection must be Local (200), not rejected"
+        );
     }
 
     fn test_conn_state(encoding: EncodingProtocol) -> ConnectionState {
