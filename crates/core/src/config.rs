@@ -1282,14 +1282,19 @@ fn parse_gateway(input: &str, secrets_dir: &Path) -> anyhow::Result<GatewayConfi
 impl NetworkArgs {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.is_gateway {
-            // For gateways, require both public address and port
+            // A gateway advertises its own identity (peer_id) from its public
+            // address + port and, unlike a NAT'd peer, can never learn or
+            // correct it later. Require both explicitly; otherwise peer_id is
+            // None and the gateway boots with no ring location. See #4324.
             if self.public_address.is_none() {
                 return Err(anyhow::anyhow!(
-                    "Gateway nodes must specify a public network address"
+                    "Gateway nodes must specify a public network address (--public-network-address)"
                 ));
             }
-            if self.public_port.is_none() && self.network_port.is_none() {
-                return Err(anyhow::anyhow!("Gateway nodes must specify a network port"));
+            if self.public_port.is_none() {
+                return Err(anyhow::anyhow!(
+                    "Gateway nodes must specify a public network port (--public-network-port)"
+                ));
             }
         }
         Ok(())
@@ -4278,25 +4283,25 @@ mod tests {
         (server, url)
     }
 
-    /// Regression test for #4268: an isolated gateway started with
-    /// `--is-gateway --public-network-address X --network-port Y` (and no
-    /// `--public-network-port`) has a `None` `peer_id`, because `peer_id` is
-    /// derived from `public_address.zip(public_port)`. On first boot — remote
-    /// index unreachable/empty, no on-disk `gateways.toml`, and no
-    /// `--gateway`/`--gateways` — the file-load fallback branch must still
-    /// allow the gateway to start with an empty bootstrap list.
+    /// Regression test for #4268: an isolated gateway — remote index
+    /// unreachable/empty, no on-disk `gateways.toml`, and no
+    /// `--gateway`/`--gateways` — must still be allowed to start with an empty
+    /// bootstrap list. Before the #4268 fix, the file-load fallback branch
+    /// guarded on `peer_id.is_none()` and wrongly rejected such a gateway with
+    /// "Cannot initialize node without gateways". This is the file-load
+    /// analogue of the `--skip-load-from-network` guard fixed in PR #4264.
     ///
-    /// Before the fix, the branch guarded on `peer_id.is_none()`, so this
-    /// configuration was wrongly rejected with "Cannot initialize node without
-    /// gateways". This is the file-load analogue of the
-    /// `--skip-load-from-network` guard fixed in PR #4264.
+    /// The gateway is configured with both `--public-network-address` and
+    /// `--public-network-port` (required for gateways since #4324), so it has a
+    /// valid `peer_id`. This test pins the *bootstrap* behavior, independent of
+    /// identity derivation.
     ///
     /// Note: `skip_load_from_network` is intentionally NOT set here — that flag
     /// would route an `is_gateway` node through the earlier
     /// `skip_load && is_gateway` branch and never reach the file-load guard
     /// this test exercises.
     #[tokio::test]
-    async fn test_file_load_branch_isolated_gateway_without_public_port_succeeds() {
+    async fn test_file_load_branch_isolated_gateway_succeeds() {
         let temp_dir = tempfile::tempdir().unwrap();
         let config_dir = temp_dir.path();
         // No gateways.toml is written: the config_dir is empty, so File::open
@@ -4314,11 +4319,9 @@ mod tests {
             },
             network_api: NetworkArgs {
                 is_gateway: true,
-                // public_address + network_port (NOT public_port) is the valid
-                // isolated-gateway configuration that yields peer_id == None.
                 public_address: Some("203.0.113.10".parse().unwrap()),
+                public_port: Some(31337),
                 network_port: Some(31337),
-                public_port: None,
                 ..Default::default()
             },
             ..Default::default()
@@ -4335,15 +4338,56 @@ mod tests {
             "isolated gateway should start with no bootstrap gateways, got {:?}",
             cfg.gateways
         );
-        // This PR intentionally does NOT change peer_id derivation: a gateway
-        // configured with --network-port but no --public-network-port still has
-        // peer_id == None (peer_id = public_address.zip(public_port)). That
-        // pre-existing behavior is out of scope here; whether such a gateway
-        // should derive peer_id from network_port is tracked separately. The
-        // fix only ensures build() no longer rejects this valid configuration.
         assert!(
-            cfg.peer_id.is_none(),
-            "expected peer_id to remain None for a gateway without --public-network-port"
+            cfg.peer_id.is_some(),
+            "expected peer_id to be derived from public address + port"
+        );
+    }
+
+    /// Regression test for #4324: a gateway started with
+    /// `--is-gateway --public-network-address X --network-port Y` but NO
+    /// `--public-network-port` must be rejected at config-build time.
+    ///
+    /// Such a gateway would otherwise derive `peer_id == None` (peer_id =
+    /// `public_address.zip(public_port)`) → `own_addr == None` → no ring
+    /// location. Unlike a NAT'd peer, a gateway has no upstream to learn or
+    /// correct its address later, so it would stay degraded permanently. The
+    /// agreed fix (maintainer consensus on the issue) is to fail fast and
+    /// require the public port explicitly, rather than silently falling back
+    /// to the local bind port.
+    #[tokio::test]
+    async fn test_gateway_without_public_port_is_rejected() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path();
+
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir.to_path_buf()),
+                data_dir: Some(config_dir.to_path_buf()),
+                log_dir: Some(config_dir.to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                is_gateway: true,
+                // network_port set but no public_port: it no longer substitutes
+                // for the public port, so this must be rejected.
+                public_address: Some("203.0.113.10".parse().unwrap()),
+                network_port: Some(31337),
+                public_port: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = args
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect_err("gateway without --public-network-port must be rejected");
+        assert!(
+            err.to_string().contains("public network port"),
+            "expected error to mention the missing public network port, got: {err}"
         );
     }
 
