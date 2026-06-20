@@ -383,6 +383,27 @@ impl Secrets {
     pub fn transport_keypair(&self) -> &TransportKeypair {
         &self.transport_keypair
     }
+
+    /// Load the persisted `Secrets` for an existing node's secrets directory,
+    /// the same way the node does at startup (auto-loading the persisted
+    /// `delegate_cipher` / `transport_keypair` from the dir, falling back to
+    /// the legacy nonce). Used by out-of-band tooling — e.g. the `freenet
+    /// secrets export/import` CLI (#4035) — that needs to open a node's
+    /// `SecretsStore` without a full `Config`. No `--cipher` / `--nonce`
+    /// overrides are applied: the on-disk persisted values are authoritative.
+    ///
+    /// NOTE: like the node's own startup, this will CREATE a fresh
+    /// `delegate_cipher` / `transport_keypair` if the directory has none. For
+    /// the export/import tools that only ever run against an already-initialized
+    /// node, the files always exist, so no new key is generated in practice.
+    pub fn load_for_secrets_dir(secrets_dir: &Path) -> std::io::Result<Self> {
+        SecretArgs {
+            transport_keypair: None,
+            nonce: None,
+            cipher: None,
+        }
+        .build(Some(secrets_dir))
+    }
 }
 
 fn read_nonce(path_to_nonce: impl AsRef<Path>) -> std::io::Result<[u8; NONCE_SIZE]> {

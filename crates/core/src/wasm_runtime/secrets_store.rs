@@ -1048,7 +1048,7 @@ impl SecretsStore {
                     &legacy_chain,
                     self.legacy_migration_encryption.as_ref(),
                     &blob,
-                    key,
+                    &key.encode(),
                 )
             }
             SecretScope::User { dek_secret, .. } => {
@@ -1058,7 +1058,7 @@ impl SecretsStore {
                 // (wrong user) fails AEAD on the only attempted cipher and
                 // returns `Encryption`.
                 let encryption = self.derive_user_dek(delegate, dek_secret);
-                decrypt_secret_blob(&encryption, &[], None, &blob, key)
+                decrypt_secret_blob(&encryption, &[], None, &blob, &key.encode())
             }
         }
     }
@@ -1236,6 +1236,215 @@ impl SecretsStore {
 
         Ok(())
     }
+
+    // ===================== Export / import (P3 of #4381) =====================
+    //
+    // The export path enumerates every `(DelegateKey, secret_hash)` the store
+    // holds for a scope (from the in-memory index, which mirrors ReDb), reads
+    // the active on-disk blob, and decrypts it. It recovers only the
+    // `bs58(hash)` on-disk name — NOT the `SecretsId` pre-image, which the
+    // store never persists (the ReDb index stores `SecretsId::hash` only). So
+    // both export and import are keyed on the raw 32-byte hash. That is
+    // sufficient: `store_secret`/`get_secret` only ever use `key.encode()`
+    // (= `bs58(hash)`) for the on-disk path and `*key.hash()` for the index;
+    // the pre-image is dead weight for storage. Reconstructing the original
+    // `DelegateKey` on the import node is deterministic (it is content-derived
+    // from the delegate's wasm+params), so a re-installed webapp shipping the
+    // same delegate yields the same key and the imported secrets line up.
+
+    /// Enumerate every `(DelegateKey, secret_hash)` held for `scope`.
+    ///
+    /// Reads from the in-memory index maps (kept in lock-step with ReDb), so
+    /// it reflects exactly what `get_secret` could read. For `User` scope only
+    /// the `id` field of the scope is consulted (the `dek_secret` is unused
+    /// here — enumeration is a metadata walk, not a decrypt).
+    fn enumerate_scope(&self, scope: &SecretScope<'_>) -> Vec<(DelegateKey, SecretKey)> {
+        let mut out = Vec::new();
+        match scope {
+            SecretScope::Local => {
+                for entry in self.key_to_secret_part.iter() {
+                    let delegate = entry.key().clone();
+                    for hash in entry.value() {
+                        out.push((delegate.clone(), *hash));
+                    }
+                }
+            }
+            SecretScope::User { id, .. } => {
+                for entry in self.user_key_to_secret_part.iter() {
+                    let (delegate, user) = entry.key();
+                    if user != *id {
+                        continue;
+                    }
+                    for hash in entry.value() {
+                        out.push((delegate.clone(), *hash));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Read + decrypt the active secret blob named `bs58(secret_hash)` under
+    /// `scope`. The by-hash analogue of [`Self::get_secret`]; it exists because
+    /// the export enumeration only ever recovers the hash, never a `SecretsId`.
+    /// Decrypt logic (cipher selection + legacy-fallback chain) is identical to
+    /// `get_secret`.
+    fn read_secret_by_hash(
+        &self,
+        delegate: &DelegateKey,
+        secret_hash: &SecretKey,
+        scope: &SecretScope<'_>,
+    ) -> Result<Zeroizing<Vec<u8>>, SecretStoreError> {
+        let encoded = bs58::encode(secret_hash)
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into_string();
+        let secret_path = self.scope_dir(delegate, scope).join(&encoded);
+        let blob = fs::read(&secret_path).map_err(|_| {
+            // No `SecretsId` to name; surface the encoded id via a synthetic
+            // pre-image-less id is impossible, so use an IO error carrying the
+            // path. Callers treat any error as "skip + report".
+            SecretStoreError::IO(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("secret blob not found at {}", secret_path.display()),
+            ))
+        })?;
+        match scope {
+            SecretScope::Local => {
+                let encryption = self.cipher_for_read(delegate);
+                let legacy_chain = [&self.default_encryption];
+                decrypt_secret_blob(
+                    &encryption,
+                    &legacy_chain,
+                    self.legacy_migration_encryption.as_ref(),
+                    &blob,
+                    &encoded,
+                )
+            }
+            SecretScope::User { dek_secret, .. } => {
+                let encryption = self.derive_user_dek(delegate, dek_secret);
+                decrypt_secret_blob(&encryption, &[], None, &blob, &encoded)
+            }
+        }
+    }
+
+    /// Gather every secret under `scope`, decrypted, as portable export
+    /// entries. The returned plaintexts live in `Zeroizing` buffers so they
+    /// are wiped when the caller drops them.
+    ///
+    /// A per-entry read/decrypt failure is fatal (returned as `Err`): a
+    /// silently-skipped secret would produce a bundle the user believes is
+    /// complete but isn't, which is worse for a backup than a hard failure.
+    /// In practice every enumerated entry is decryptable by construction (the
+    /// node wrote it), so this only fires on genuine on-disk corruption.
+    pub fn export_scope_entries(
+        &self,
+        scope: SecretScope<'_>,
+    ) -> Result<Vec<ExportSecretEntry>, SecretStoreError> {
+        let refs = self.enumerate_scope(&scope);
+        let mut entries = Vec::with_capacity(refs.len());
+        for (delegate, secret_hash) in refs {
+            let plaintext = self.read_secret_by_hash(&delegate, &secret_hash, &scope)?;
+            entries.push(ExportSecretEntry {
+                delegate_key: delegate,
+                secret_hash,
+                plaintext,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Place a single decrypted secret (identified by its 32-byte hash) under
+    /// `scope`, re-encrypting it under this node's scope DEK. The import-side
+    /// analogue of `store_secret`, keyed on the hash because the bundle does
+    /// not carry a `SecretsId` pre-image.
+    ///
+    /// When a secret already exists at the target path: if `overwrite` is
+    /// false, returns `Ok(false)` and writes nothing (the caller reports it as
+    /// skipped); if true, overwrites (the prior value is snapshotted first by
+    /// the normal `store_secret` write discipline). Returns `Ok(true)` when a
+    /// new value was written.
+    pub fn import_secret_by_hash(
+        &mut self,
+        delegate: &DelegateKey,
+        secret_hash: &SecretKey,
+        scope: SecretScope<'_>,
+        plaintext: Zeroizing<Vec<u8>>,
+        overwrite: bool,
+    ) -> RuntimeResult<bool> {
+        let encoded = bs58::encode(secret_hash)
+            .with_alphabet(bs58::Alphabet::BITCOIN)
+            .into_string();
+        let scope_path = self.scope_dir(delegate, &scope);
+        let secret_file_path = scope_path.join(&encoded);
+        if secret_file_path.exists() && !overwrite {
+            return Ok(false);
+        }
+
+        // Select / derive the scope DEK exactly as `store_secret` does so the
+        // imported blob is readable by `get_secret` afterwards.
+        let encryption = match &scope {
+            SecretScope::Local => self.cipher_for(delegate).clone(),
+            SecretScope::User { dek_secret, .. } => self.derive_user_dek(delegate, dek_secret),
+        };
+
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let aead = encryption
+            .cipher
+            .encrypt(&nonce, plaintext.as_slice())
+            .map_err(SecretStoreError::Encryption)?;
+        let mut ciphertext = Vec::with_capacity(HEADER_LEN + aead.len());
+        ciphertext.push(VERSION_V1);
+        ciphertext.extend_from_slice(nonce.as_slice());
+        ciphertext.extend_from_slice(&aead);
+
+        fs::create_dir_all(&scope_path)?;
+        if let Err(e) = ensure_owner_only_tree(&self.base_path, &scope_path) {
+            tracing::warn!(path = %scope_path.display(), error = %e, "chmod scope dir tree failed");
+        }
+
+        // Snapshot the prior value before an overwrite, mirroring
+        // `store_secret`'s durability discipline so an import that clobbers an
+        // existing secret stays reversible.
+        if self.snapshots_enabled
+            && secret_file_path.exists()
+            && let Err(e) = snapshot_active_value(&scope_path, &encoded, &secret_file_path)
+        {
+            tracing::warn!(
+                "failed to snapshot prior secret value during import for delegate {}: {e}",
+                delegate.encode()
+            );
+        }
+
+        let tmp_path = secret_file_path.with_extension("tmp");
+        {
+            let mut file = create_owner_only(&tmp_path)?;
+            file.write_all(&ciphertext)?;
+            file.sync_all()?;
+        }
+        if let Err(err) = fs::rename(&tmp_path, &secret_file_path) {
+            if let Err(rm_err) = fs::remove_file(&tmp_path) {
+                tracing::debug!(
+                    "failed to clean up tmp file {tmp_path:?} after rename failure: {rm_err}"
+                );
+            }
+            return Err(err.into());
+        }
+
+        self.add_to_index(delegate, &scope, *secret_hash)?;
+        Ok(true)
+    }
+}
+
+/// A single decrypted secret gathered by [`SecretsStore::export_scope_entries`].
+///
+/// Identified by its delegate key + the 32-byte secret hash (the on-disk name
+/// is `bs58(secret_hash)`); the `SecretsId` pre-image is not recoverable and is
+/// not needed to re-place the secret on another node. The `plaintext` is held
+/// in `Zeroizing` so it is wiped when this entry is dropped.
+pub struct ExportSecretEntry {
+    pub delegate_key: DelegateKey,
+    pub secret_hash: [u8; 32],
+    pub plaintext: Zeroizing<Vec<u8>>,
 }
 
 /// Decrypt an on-disk secret blob, transparently supporting every
@@ -1269,7 +1478,12 @@ fn decrypt_secret_blob(
     legacy_chain: &[&Encryption],
     legacy_migration: Option<&Encryption>,
     blob: &[u8],
-    key: &SecretsId,
+    // Encoded secret id, for log context ONLY. Taken as `&str` (not
+    // `&SecretsId`) so the by-hash export read path — which only ever
+    // recovers the on-disk `bs58(hash)` name, never the `SecretsId`
+    // pre-image — can share this exact decrypt logic. `get_secret`
+    // passes `&key.encode()`, which is the same `bs58(hash)` string.
+    key: &str,
 ) -> Result<Zeroizing<Vec<u8>>, SecretStoreError> {
     // Decryption strategy. The format + cipher have rotated three
     // times across the secrets-at-rest hardening sequence:
@@ -1343,7 +1557,7 @@ fn decrypt_secret_blob(
     ))
 }
 
-fn log_legacy_decrypt(key: &SecretsId, idx: usize, is_migration: bool, format: &str) {
+fn log_legacy_decrypt(key: &str, idx: usize, is_migration: bool, format: &str) {
     if is_migration {
         tracing::warn!(
             key = %key,
@@ -1475,7 +1689,7 @@ mod test {
             .ciphers
             .get(delegate.key())
             .expect("cipher registered");
-        let plaintext = decrypt_secret_blob(encryption, &[], None, &blob, &secret_id)
+        let plaintext = decrypt_secret_blob(encryption, &[], None, &blob, &secret_id.encode())
             .expect("snapshot blob should decrypt with the registered cipher");
         assert_eq!(plaintext.to_vec(), b"v1".to_vec());
         Ok(())
