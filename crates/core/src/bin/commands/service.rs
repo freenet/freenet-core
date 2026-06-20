@@ -2805,8 +2805,15 @@ echo "RC=$?"
         let (_, after_fn_start) = src
             .split_once("fn taskkill_pid(")
             .expect("taskkill_pid definition not found");
-        let (body, _) = after_fn_start
-            .split_once("\nfn ")
+        // Locate the end of taskkill_pid by finding the next top-level
+        // function. In the submodule file the next fn may carry a pub
+        // visibility modifier, so try all common patterns in order.
+        let body = after_fn_start
+            .split_once("\npub(super) fn ")
+            .or_else(|| after_fn_start.split_once("\npub(crate) fn "))
+            .or_else(|| after_fn_start.split_once("\npub fn "))
+            .or_else(|| after_fn_start.split_once("\nfn "))
+            .map(|(b, _)| b)
             .expect("could not locate end of taskkill_pid");
         let code_only: String = body
             .lines()
