@@ -95,7 +95,7 @@ pub(super) fn kill_pattern_escalating(uid: &str, pattern: &str, grace_secs: usiz
 /// PIDs of user-scoped processes whose command line matches `pattern`
 /// (`pgrep -f`). Empty on any error.
 #[cfg(unix)]
-fn pids_matching(uid: &str, pattern: &str) -> Vec<u32> {
+pub(super) fn pids_matching(uid: &str, pattern: &str) -> Vec<u32> {
     std::process::Command::new("pgrep")
         .args(["-f", "-u", uid, pattern])
         .output()
@@ -199,7 +199,7 @@ pub fn should_purge(purge: bool, keep_data: bool) -> Result<bool> {
 }
 
 /// Remove a directory if it exists, printing what is being removed.
-fn remove_if_exists(label: &str, path: &Path) -> Result<()> {
+pub(super) fn remove_if_exists(label: &str, path: &Path) -> Result<()> {
     if path.exists() {
         println!("Removing {label}: {}", path.display());
         std::fs::remove_dir_all(path)
@@ -315,10 +315,10 @@ pub(super) fn linux_system_purge_dirs(home: &Path) -> [(&'static str, PathBuf); 
 #[derive(Debug, Default, Clone)]
 pub(super) struct DataLeaves {
     /// `data_local_dir` — on Windows this is `%LOCALAPPDATA%\...\data`.
-    data_local: Option<PathBuf>,
+    pub(super) data_local: Option<PathBuf>,
     /// Pre-#3739 Roaming data path, only populated on Windows where it
     /// differs from `data_local`.
-    data_roaming: Option<PathBuf>,
+    pub(super) data_roaming: Option<PathBuf>,
     /// `config_dir` (Roaming on Windows, e.g.
     /// `%APPDATA%\...\Freenet\config`). Only populated when it differs
     /// from both data paths (matches the macOS case where
@@ -328,7 +328,7 @@ pub(super) struct DataLeaves {
     /// config-file scan) still resolve through `config_dir()`, and an
     /// older install may have written to it before the live node
     /// switched to Local AppData. Cleaning both is correct.
-    config: Option<PathBuf>,
+    pub(super) config: Option<PathBuf>,
     /// `config_local_dir` (Local on Windows, e.g.
     /// `%LOCALAPPDATA%\...\Freenet\config`). This is what the running
     /// node actually writes to (`Config::build` in config.rs uses
@@ -339,14 +339,14 @@ pub(super) struct DataLeaves {
     /// to avoid double removal — on Linux/macOS the `directories`
     /// crate aliases `config_local_dir` to `config_dir`, so this
     /// stays `None` and the existing leaves cover those platforms.
-    config_local: Option<PathBuf>,
+    pub(super) config_local: Option<PathBuf>,
     /// `cache_dir` for the uppercase project bundle.
-    cache: Option<PathBuf>,
+    pub(super) cache: Option<PathBuf>,
     /// Lowercase-variant cache used by the webapp cache on case-sensitive
     /// filesystems.
-    cache_lowercase: Option<PathBuf>,
+    pub(super) cache_lowercase: Option<PathBuf>,
     /// Log dir (as returned by `tracing::get_log_dir`).
-    log: Option<PathBuf>,
+    pub(super) log: Option<PathBuf>,
     /// Whether the parents of our leaves are Freenet-owned and therefore
     /// safe to collapse if empty.
     ///
@@ -364,11 +364,11 @@ pub(super) struct DataLeaves {
     /// worst delete an otherwise-empty shared root on a fresh account. The
     /// safety must be enforced at the type level, not left to
     /// `remove_dir_if_empty`'s runtime check.
-    collapse_parents: bool,
+    pub(super) collapse_parents: bool,
 }
 
 impl DataLeaves {
-    fn from_project_dirs() -> Self {
+    pub(super) fn from_project_dirs() -> Self {
         let mut leaves = DataLeaves::default();
 
         if let Some(dirs) = ProjectDirs::from("", "The Freenet Project Inc", "Freenet") {
