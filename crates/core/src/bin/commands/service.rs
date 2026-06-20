@@ -187,17 +187,17 @@ fn open_url_in_browser(url: &str) {
 
 /// Path of the first-run marker file, if we can determine a data directory.
 #[allow(dead_code)] // Used by the tray wrapper on Windows/macOS only
-fn first_run_marker_path() -> Option<PathBuf> {
+pub(super) fn first_run_marker_path() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join("freenet").join(".first-run-complete"))
 }
 
 #[allow(dead_code)]
-fn is_first_run_at(marker: &Path) -> bool {
+pub(super) fn is_first_run_at(marker: &Path) -> bool {
     !marker.exists()
 }
 
 #[allow(dead_code)]
-fn mark_first_run_complete_at(marker: &Path) -> std::io::Result<()> {
+pub(super) fn mark_first_run_complete_at(marker: &Path) -> std::io::Result<()> {
     if let Some(parent) = marker.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -211,12 +211,12 @@ fn mark_first_run_complete_at(marker: &Path) -> std::io::Result<()> {
 /// onboarding state. The migration is its own one-shot, tracked by its own
 /// marker, so it runs once for existing DMG users too.
 #[allow(dead_code)]
-fn legacy_migration_marker_path() -> Option<PathBuf> {
+pub(super) fn legacy_migration_marker_path() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join("freenet").join(".legacy-migration-complete"))
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn dashboard_port_is_listening() -> bool {
+pub(super) fn dashboard_port_is_listening() -> bool {
     use std::net::TcpStream;
     use std::time::Duration;
     let Ok(addr) = DASHBOARD_ADDR.parse::<std::net::SocketAddr>() else {
@@ -354,14 +354,14 @@ pub use macos::stop_and_remove_service;
 
 // Re-exports for tray.rs (Launch at Login toggle and state query).
 #[cfg(target_os = "macos")]
-pub use launch_at_login::{
+pub(crate) use launch_at_login::{
     ToggleLaunchAtLoginOutcome, disable_launch_at_login, enable_launch_at_login,
     is_launch_at_login_enabled, macos_app_bundle_path, toggle_launch_at_login_outcome,
 };
 
 // Re-exports for update.rs (macOS plist generation).
 #[cfg(target_os = "macos")]
-pub use macos::generate_plist;
+pub(crate) use macos::generate_plist;
 
 #[cfg(target_os = "windows")]
 pub(crate) use windows::kill_freenet_service_processes;
@@ -2882,7 +2882,7 @@ echo "RC=$?"
         let plist_path = home.join("org.freenet.node.plist");
 
         for path in [&wrapper_path, &hash_path, &bak_path, &plist_path] {
-            fs::write(path, b"x").expect("write fixture file");
+            fs::write(path, b"x" as &[u8]).expect("write fixture file");
             assert!(path.exists(), "fixture {} should exist", path.display());
         }
 

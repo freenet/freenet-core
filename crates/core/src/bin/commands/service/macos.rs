@@ -23,7 +23,7 @@ pub(super) fn install_service(system: bool) -> Result<()> {
 /// writes the script), the update path, and the uninstall path (which
 /// removes it). Keep this in sync with `update.rs`'s wrapper derivation.
 #[cfg(target_os = "macos")]
-fn wrapper_script_path(home_dir: &Path) -> PathBuf {
+pub(super) fn wrapper_script_path(home_dir: &Path) -> PathBuf {
     home_dir.join(".local/bin/freenet-service-wrapper.sh")
 }
 
@@ -37,7 +37,7 @@ fn wrapper_script_path(home_dir: &Path) -> PathBuf {
 /// Regression target for #4290: install wrote three files, uninstall
 /// removed zero, leaving stale wrapper artifacts in `~/.local/bin`.
 #[cfg(target_os = "macos")]
-fn remove_wrapper_files(wrapper_path: &Path) -> Result<()> {
+pub(super) fn remove_wrapper_files(wrapper_path: &Path) -> Result<()> {
     use std::fs;
 
     // `.sh` itself, plus the `.sh.hash` sidecar (#4286) and any `.sh.bak`
@@ -352,7 +352,7 @@ done
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn generate_plist(wrapper_path: &Path, log_dir: &Path) -> String {
+pub(crate) fn generate_plist(wrapper_path: &Path, log_dir: &Path) -> String {
     // Note: wrapper_path is the auto-update wrapper script, not the freenet binary directly.
     // The wrapper handles the loop: run freenet, check exit code, update if needed.
     format!(
@@ -433,7 +433,7 @@ pub fn stop_and_remove_service(_system: bool) -> Result<bool> {
 /// `$HOME` or shelling out to `launchctl` (which only runs when the plist is
 /// present).
 #[cfg(target_os = "macos")]
-fn stop_and_remove_service_at(home_dir: &Path) -> Result<bool> {
+pub(super) fn stop_and_remove_service_at(home_dir: &Path) -> Result<bool> {
     use std::fs;
 
     let plist_path = home_dir.join("Library/LaunchAgents/org.freenet.node.plist");
