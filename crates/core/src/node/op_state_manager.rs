@@ -2876,6 +2876,10 @@ mod tests {
             "node/network_bridge/p2p_protoc.rs",
             include_str!("network_bridge/p2p_protoc.rs"),
         ),
+        (
+            "node/network_bridge/p2p_protoc/broadcast.rs",
+            include_str!("network_bridge/p2p_protoc/broadcast.rs"),
+        ),
     ];
 
     /// Returns true if `forward_window` names a best-effort gossip event
