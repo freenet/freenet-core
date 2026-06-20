@@ -134,5 +134,5 @@ pub(super) struct WrapperSingleInstanceLock;
 /// Checking a real wall-clock Instant plus polling a TCP port means we
 /// also can't reuse the per-launch marker file itself as a latch.
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-static FIRST_RUN_OPENER_SPAWNED: std::sync::atomic::AtomicBool =
+pub(super) static FIRST_RUN_OPENER_SPAWNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
