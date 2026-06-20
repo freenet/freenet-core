@@ -883,6 +883,24 @@ fn shell_page(
         // fail-closed branch never triggers and behavior is unchanged.
         (String::new(), format!("freenetBridge(\"{auth_token}\");"))
     };
+
+    // Hosted-mode "shell chrome": a thin, host-controlled bar rendered OUTSIDE
+    // the sandboxed app iframe. It is the only place a per-user-data action
+    // (export to your own peer) can live — the durable user token is held by
+    // the shell and must never reach the sandbox — and the only place the
+    // "this is a hosted proxy, not private" disclosure cannot be hidden or
+    // spoofed by the contract app. Empty (and the layout unchanged) when hosted
+    // mode is off. The export control is a placeholder until the node-side
+    // export endpoint lands (P3 `secrets export` over HTTP, scoped to the
+    // connection's user token).
+    let (hosted_styles, hosted_bar) = if hosted_mode {
+        (
+            format!("\n<style>{HOSTED_BAR_STYLES}</style>"),
+            format!("{HOSTED_BAR_HTML}\n<script>{HOSTED_BAR_JS}</script>"),
+        )
+    } else {
+        (String::new(), String::new())
+    };
     let html = format!(
         r##"<!DOCTYPE html>
 <html lang="en">
@@ -891,10 +909,10 @@ fn shell_page(
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Freenet</title>
 <link rel="icon" type="image/svg+xml" href="{favicon}">
-<style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none;display:block}}</style>
+<style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none;display:block}}</style>{hosted_styles}
 </head>
 <body>
-<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-modals" allow="clipboard-read; clipboard-write" data-src="{iframe_src}"></iframe>
+{hosted_bar}<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-modals" allow="clipboard-read; clipboard-write" data-src="{iframe_src}"></iframe>
 <script>
 {SHELL_BRIDGE_JS}
 </script>
@@ -1081,6 +1099,58 @@ const SHELL_USER_TOKEN_JS: &str = r#"var __freenet_user_token = (function() {
   } catch (e) {
     return undefined;
   }
+})();"#;
+
+/// Styles for the hosted-mode "shell chrome" bar (see `shell_page`). Rendered
+/// only when hosted mode is on; the bar lives OUTSIDE the sandboxed app iframe.
+const HOSTED_BAR_STYLES: &str = r#"body{display:flex;flex-direction:column}
+iframe{flex:1 1 auto;height:auto}
+#fnbar{flex:0 0 auto;display:flex;align-items:center;gap:10px;height:34px;padding:0 12px;box-sizing:border-box;background:#fafafa;border-bottom:1px solid #e5e5e5;font:13px/1 system-ui,-apple-system,Segoe UI,sans-serif;color:#555}
+#fnbar .fn{font-weight:600;color:#222;letter-spacing:.02em}
+#fnbar .nt{flex:1 1 auto;min-width:0;color:#777;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#fnacct{position:relative;flex:0 0 auto}
+#fnbar button{font:inherit;color:#222;background:#fff;border:1px solid #cfcfcf;border-radius:4px;padding:3px 10px;cursor:pointer}
+#fnbar button:hover{border-color:#999}
+#fnpop{position:absolute;top:30px;right:0;width:300px;background:#fff;border:1px solid #d8d8d8;border-radius:6px;box-shadow:0 6px 20px rgba(0,0,0,.12);padding:14px;color:#444;font-weight:400;cursor:auto;display:none;z-index:10}
+#fnpop.open{display:block}
+#fnpop h4{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#999;margin:0 0 4px}
+#fnpop p{margin:0 0 8px;color:#666;line-height:1.45}
+#fnpop .sec{margin-bottom:14px}
+#fnpop .sec:last-child{margin-bottom:0}
+#fnpop .row{display:flex;gap:8px;align-items:center}
+#fnok{color:#2a8a55;font-size:12px}"#;
+
+/// Markup for the hosted-mode bar: the always-visible "not private" disclosure
+/// plus an Account popover with the access-key backup/restore and the
+/// export-to-your-own-peer action. The access key is the per-user token, read
+/// from the shell-only `__freenet_user_token` global — it never enters the
+/// sandboxed iframe. The Export action is a placeholder until the node-side
+/// export endpoint lands.
+const HOSTED_BAR_HTML: &str = r#"<div id="fnbar" role="region" aria-label="Hosted proxy notice"><span class="fn">Freenet</span><span class="nt">Hosted proxy, not private. Your data is stored on this server.</span><span id="fnacct"><button id="fnacctbtn" type="button">Account</button><div id="fnpop"><div class="sec"><h4>Access key</h4><p>This key is your login to your data on this server. Save it to get back in from another browser, or after clearing storage. Lose it and your data here can't be recovered.</p><div class="row"><button class="act" id="fncopy">Copy key</button><button class="act" id="fnrestore">Restore from key</button><span id="fnok"></span></div></div><div class="sec"><h4>Your own peer</h4><p>Export your data to run it on your own Freenet node, fully decentralized.</p><div class="row"><button class="act" id="fnexport">Export data</button></div></div></div></span></div>"#;
+
+/// Behavior for the hosted-mode bar (toggle popover, copy/restore the access
+/// key, export placeholder). Runs in the trusted shell context.
+const HOSTED_BAR_JS: &str = r#"(function(){
+  var acct=document.getElementById('fnacct');
+  var pop=document.getElementById('fnpop');
+  var ok=document.getElementById('fnok');
+  function setOk(m){ok.textContent=m;setTimeout(function(){if(ok.textContent===m)ok.textContent='';},2500);}
+  document.getElementById('fnacctbtn').addEventListener('click',function(e){e.stopPropagation();pop.classList.toggle('open');});
+  document.addEventListener('click',function(e){if(!acct.contains(e.target))pop.classList.remove('open');});
+  document.getElementById('fncopy').addEventListener('click',function(){
+    var t=(typeof __freenet_user_token!=='undefined')?__freenet_user_token:null;
+    if(!t){setOk('No key on this connection');return;}
+    if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(function(){setOk('Copied to clipboard');},function(){window.prompt('Copy your access key:',t);});}
+    else{window.prompt('Copy your access key:',t);}
+  });
+  document.getElementById('fnrestore').addEventListener('click',function(){
+    var v=window.prompt('Paste your saved access key to restore access to your data:');
+    if(!v){return;} v=v.trim(); if(!v){return;}
+    try{localStorage.setItem('__freenet_user_token__',v);location.reload();}catch(e){setOk('Storage unavailable');}
+  });
+  document.getElementById('fnexport').addEventListener('click',function(){
+    alert('Export your delegate data to your own Freenet peer.\n\nThis downloads an encrypted bundle you can import on your own node with: freenet secrets import\n\n(Coming soon.)');
+  });
 })();"#;
 
 /// JavaScript for the shell page's postMessage bridge.
@@ -3560,6 +3630,52 @@ mod tests {
             "iframe sandbox missing `allow-downloads` — user-initiated \
              file downloads from sandboxed webapps will be silently blocked \
              by the browser. Got HTML:\n{html}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_page_hosted_mode_renders_proxy_chrome_bar() {
+        // The hosted-mode "shell chrome" bar lives OUTSIDE the sandboxed iframe
+        // and carries the "not private" disclosure plus the Account popover
+        // (access-key backup/restore + export-to-your-own-peer). It must render
+        // in hosted mode and be ABSENT in non-hosted mode so a normal
+        // single-user node is unaffected.
+        let token = AuthToken::generate();
+        let hosted = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, true).unwrap(),
+        )
+        .await;
+        assert!(
+            hosted.contains(r#"id="fnbar""#),
+            "hosted bar missing: {hosted}"
+        );
+        assert!(
+            hosted.contains("not private"),
+            "always-visible disclosure missing"
+        );
+        assert!(
+            hosted.contains("Access key") && hosted.contains("Restore from key"),
+            "access-key backup/restore controls missing"
+        );
+        assert!(hosted.contains("Export data"), "export control missing");
+        // The access key is read from the shell-only token global; it is never
+        // injected into the sandboxed iframe.
+        assert!(
+            hosted.contains("__freenet_user_token"),
+            "access-key source global missing"
+        );
+
+        let plain = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, false).unwrap(),
+        )
+        .await;
+        assert!(
+            !plain.contains(r#"id="fnbar""#),
+            "non-hosted shell must not render the proxy chrome bar"
+        );
+        assert!(
+            !plain.contains("Export data"),
+            "non-hosted shell must not render the export control"
         );
     }
 
