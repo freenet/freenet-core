@@ -330,6 +330,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                 metadata_bytes,
             },
             sent_packet_tracker.as_ref(),
+            packet_size,
             token,
             PacketStream::Stream(stream_id),
         )
@@ -719,6 +720,7 @@ pub(super) async fn pipe_stream<S: super::super::Socket, T: TimeSource>(
                 metadata_bytes,
             },
             sent_packet_tracker.as_ref(),
+            packet_size,
             token,
             PacketStream::Stream(outbound_stream_id),
         )
