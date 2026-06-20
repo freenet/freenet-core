@@ -86,21 +86,28 @@ Current wire-gated floors:
 - `SUBSCRIBE_HINT_MIN_VERSION` in `crates/core/src/node/network_bridge/p2p_protoc.rs`
   (SubscribeHint placement migration, #4404).
 
-  **DO NOT lower this to the release version.** It is intentionally **parked at
-  `(0, 3, 0)`** — above every shipped 0.2.x release — to keep the placement
-  migration **DEACTIVATED**. The migration's directed-subscribe / hint-broadcast
-  load drove a network-wide UPDATE-broadcast degradation after the v0.2.73
-  release, and v0.2.74 disabled it by raising this floor above all live peers
-  (the SEND side **and** the inbound-hint RECEIVE gate in `node.rs` both read
-  this floor, so the migration is dormant in both directions). This is the one
-  wire-gated floor that does **NOT** follow the "set to the first-shipping
-  release version" rule above.
+  Set to **`(0, 2, 80)`** and FROZEN. 0.2.80 is the first release that ships
+  SubscribeHint together with the #4145 event-loop fix (#4499) that makes the
+  migration load-safe, so this floor now follows the general "set to the
+  first-shipping release version, then freeze" rule above. The SEND gate emits a
+  hint only to peers reported at `>= 0.2.80`; the inbound-hint RECEIVE gate (in
+  `node.rs`) acts on a hint only if THIS node is itself `>= 0.2.80` (a proxy: the
+  per-connection sender version is not exposed at the receive handler, so the
+  load-bearing receiver gates on its own version, which guarantees the node that
+  takes on migration load always has the #4145 fix). Because pre-0.2.80 releases
+  have parked floors and emit no hints, in practice hints flow only between
+  `>= 0.2.80` peers, so activation ramps with fleet upgrade rather than switching
+  on everywhere at once. **DO NOT bump this floor on later releases** (raising it
+  above the first-shipping version would silently stop sending to fully-capable
+  peers).
 
-  Lowering it to the release version would **silently re-enable** the migration
-  and reproduce the degradation. Leave it at `(0, 3, 0)` until the
-  broadcast-backpressure load issue (#4145) is fixed; only then drop it to the
-  release that first ships a load-safe SubscribeHint and freeze it there per the
-  general rule.
+  History: the migration first shipped in v0.2.73 and its directed-subscribe /
+  hint-broadcast load drove a network-wide UPDATE-broadcast degradation by
+  amplifying the latent #4145 event-loop wedge. v0.2.74 disabled it by parking
+  this floor at `(0, 3, 0)`, above all live peers. It was re-enabled at
+  `(0, 2, 80)` only after #4145 was fixed (#4499), the fix was validated at
+  incident-scale fan-out, and the broadcast-assembly-failure telemetry (#4498)
+  was deployed to record a baseline and watch the rollout.
 
 When a NEW wire-gated feature first ships (not this one), set its floor to
 **exactly that release version** and freeze it, as described above.
