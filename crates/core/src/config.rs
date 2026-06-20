@@ -1588,36 +1588,28 @@ pub struct WebsocketApiArgs {
     /// intend to operate as a shared public proxy for untrusted users.
     ///
     /// SECURE-CONNECTION REQUIREMENT (refuse-plaintext-token, #4381): even with
-    /// hosted mode on, the durable `userToken` is honored ONLY over a connection
-    /// whose source is **loopback** AND that is demonstrably not plaintext from
-    /// the browser. Concretely, honored in exactly two cases:
-    ///
-    /// - **(a)** loopback source with a **local `Host`** (`localhost` /
-    ///   `127.0.0.1` / `[::1]`, any port) — a direct local browser, or a proxy
-    ///   addressed as localhost; the loopback hop is the whole path, so TLS is
-    ///   irrelevant. (This is the dev/desktop default and keeps working over
-    ///   plaintext.)
-    /// - **(b)** loopback source with a **non-local `Host`** (a public name like
-    ///   `try.freenet.org`, i.e. the request came through a reverse proxy) AND
-    ///   `X-Forwarded-Proto: https` — the proxy attests the browser→proxy hop was
-    ///   TLS.
+    /// hosted mode on, the durable `userToken` is honored ONLY over a **loopback**
+    /// connection carrying `X-Forwarded-Proto: https` — i.e. behind a
+    /// TLS-terminating reverse proxy colocated on the same host. The loopback
+    /// source proves the proxy→node hop is local; the `https` XFP is positive
+    /// evidence (set by the TLS terminator) that the browser→proxy hop used TLS.
     ///
     /// Everything else is **rejected** with `403` (fail-closed): a non-loopback
-    /// source, or a loopback source with a public `Host` but no/`http` XFP. The
-    /// last case is the important one — a same-host reverse proxy accidentally
-    /// serving **public plaintext http** still presents a loopback source, so a
-    /// loopback source ALONE is not enough; the public `Host` without an `https`
-    /// attestation reveals the plaintext browser→proxy hop and the token is
-    /// refused. A loopback source proves only the proxy→node hop is local, not
-    /// that the upstream browser→proxy hop used TLS.
+    /// source, OR a loopback source without `X-Forwarded-Proto: https` (header
+    /// missing or `http`). A direct plaintext connection — even loopback — is
+    /// refused. `Host` is deliberately NOT consulted: it is proxy-rewritable
+    /// (nginx's default rewrites it to the upstream `127.0.0.1:7509`), so it
+    /// cannot grant trust; only the `https` XFP can.
     ///
-    /// OPERATOR NOTE: terminate TLS on the SAME host as the node and have the
-    /// proxy connect over loopback, AND make the proxy set
-    /// `X-Forwarded-Proto: https` (Caddy does this by default; for nginx add
-    /// `proxy_set_header X-Forwarded-Proto $scheme;`) — otherwise tokens are
-    /// refused for any non-localhost `Host`. A TLS terminator on a **different**
-    /// host (remote load balancer) is not supported today (its source is not
-    /// loopback) and would need future explicit trusted-proxy-IP config.
+    /// OPERATOR NOTE: front the node with a TLS-terminating reverse proxy on the
+    /// SAME host that connects over loopback and sets `X-Forwarded-Proto: https`.
+    /// Caddy does this by default; nginx must be configured with
+    /// `proxy_set_header X-Forwarded-Proto https;` (or `$scheme`). A developer
+    /// testing hosted mode locally must likewise front it with a TLS proxy or
+    /// send the header (`curl -H 'X-Forwarded-Proto: https'`) — a plain plaintext
+    /// loopback request is refused. A TLS terminator on a **different** host
+    /// (remote load balancer) is not supported today (its source is not loopback)
+    /// and would need future explicit trusted-proxy-IP config.
     ///
     /// `--hosted-mode` is THE operator switch, so it works as a BARE flag:
     /// `--hosted-mode` => `Some(true)`; `--hosted-mode=false` (or
