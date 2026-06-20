@@ -53,21 +53,42 @@ async fn runtime_version() -> impl IntoResponse {
 async fn web_home_v1(
     key: Path<String>,
     rs: Extension<HttpClientApiRequest>,
+    Extension(hosted_mode): Extension<crate::server::HostedMode>,
     config: axum::extract::State<Config>,
     headers: axum::http::HeaderMap,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Result<axum::response::Response, WebSocketApiError> {
-    web_home(key, rs, config, headers, ApiVersion::V1, query).await
+    web_home(
+        key,
+        rs,
+        config,
+        headers,
+        ApiVersion::V1,
+        query,
+        hosted_mode.0,
+    )
+    .await
 }
 
 async fn web_subpages_v1(
     Path((key, last_path)): Path<(String, String)>,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
+    Extension(hosted_mode): Extension<crate::server::HostedMode>,
     headers: axum::http::HeaderMap,
     axum::extract::State(config): axum::extract::State<Config>,
     Extension(rs): Extension<HttpClientApiRequest>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
-    web_subpages(key, last_path, ApiVersion::V1, query, headers, &config, rs).await
+    web_subpages(
+        key,
+        last_path,
+        ApiVersion::V1,
+        query,
+        headers,
+        &config,
+        rs,
+        hosted_mode.0,
+    )
+    .await
 }
 
 /// Redirect `/v1/contract/web/{key}` (no trailing slash) to

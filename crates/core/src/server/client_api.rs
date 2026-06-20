@@ -189,6 +189,7 @@ async fn web_home(
     req_headers: axum::http::HeaderMap,
     api_version: ApiVersion,
     query_string: Option<String>,
+    hosted_mode: bool,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     // Check if this is the sandboxed iframe requesting its content
     let is_sandbox = query_string
@@ -201,7 +202,16 @@ async fn web_home(
     }
 
     // Root document load: render the shell that wraps the contract root.
-    render_shell_response(key, &config, api_version, query_string, None, rs).await
+    render_shell_response(
+        key,
+        &config,
+        api_version,
+        query_string,
+        None,
+        rs,
+        hosted_mode,
+    )
+    .await
 }
 
 /// Generates a shell page response: a fresh auth token + secure cookie,
@@ -222,6 +232,7 @@ async fn render_shell_response(
     query_string: Option<String>,
     sub_path: Option<&str>,
     rs: HttpClientApiRequest,
+    hosted_mode: bool,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     use headers::{Header, HeaderMapExt};
 
@@ -241,9 +252,16 @@ async fn render_shell_response(
         .build();
 
     let token_header = headers::Authorization::bearer(token.as_str()).unwrap();
-    let contract_response =
-        path_handlers::contract_home(key, rs, token.clone(), api_version, query_string, sub_path)
-            .await?;
+    let contract_response = path_handlers::contract_home(
+        key,
+        rs,
+        token.clone(),
+        api_version,
+        query_string,
+        sub_path,
+        hosted_mode,
+    )
+    .await?;
 
     let mut response = contract_response.into_response();
     response.headers_mut().typed_insert(token_header);
@@ -277,6 +295,7 @@ async fn render_shell_response(
     Ok(response)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn web_subpages(
     key: String,
     last_path: String,
@@ -285,6 +304,7 @@ async fn web_subpages(
     req_headers: axum::http::HeaderMap,
     config: &Config,
     request_sender: HttpClientApiRequest,
+    hosted_mode: bool,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     let is_sandbox = query_string
         .as_ref()
@@ -337,6 +357,7 @@ async fn web_subpages(
             query_string,
             Some(&last_path),
             request_sender,
+            hosted_mode,
         )
         .await;
     }
@@ -935,6 +956,7 @@ mod tests {
                     headers,
                     &localhost_config(),
                     sender,
+                    false,
                 )
                 .await
                 .map(|_| ())
@@ -968,6 +990,7 @@ mod tests {
             headers,
             &localhost_config(),
             dead_request_sender(),
+            false,
         )
         .await
         .expect("sandbox document load must redirect, not error");
@@ -987,6 +1010,7 @@ mod tests {
             axum::http::HeaderMap::new(),
             &localhost_config(),
             dead_request_sender(),
+            false,
         )
         .await;
         match res {
