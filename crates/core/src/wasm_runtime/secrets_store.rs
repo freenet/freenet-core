@@ -895,9 +895,15 @@ impl SecretsStore {
                     .get(delegate)
                     .map(|entry| entry.value().iter().copied().collect())
                     .unwrap_or_default();
-                if !current.contains(&secret_key) {
-                    current.push(secret_key);
+                // Idempotent: if the hash is already indexed, do nothing — no
+                // ReDb write, no map churn. This makes the import skip-branch's
+                // index-reconcile a genuine no-op in the common (already-correct)
+                // case, so re-running an import doesn't issue N redundant fsync'd
+                // ReDb writes for the already-present entries.
+                if current.contains(&secret_key) {
+                    return Ok(());
                 }
+                current.push(secret_key);
                 self.db
                     .store_secrets_index(delegate, &current)
                     .map_err(|e| anyhow::anyhow!("Failed to store secrets index: {e}"))?;
@@ -911,9 +917,10 @@ impl SecretsStore {
                     .get(&map_key)
                     .map(|entry| entry.value().iter().copied().collect())
                     .unwrap_or_default();
-                if !current.contains(&secret_key) {
-                    current.push(secret_key);
+                if current.contains(&secret_key) {
+                    return Ok(());
                 }
+                current.push(secret_key);
                 self.db
                     .store_user_secrets_index(delegate, id.as_bytes(), &current)
                     .map_err(|e| anyhow::anyhow!("Failed to store user secrets index: {e}"))?;
@@ -1360,10 +1367,13 @@ impl SecretsStore {
     /// not carry a `SecretsId` pre-image.
     ///
     /// When a secret already exists at the target path: if `overwrite` is
-    /// false, returns `Ok(false)` and writes nothing (the caller reports it as
-    /// skipped); if true, overwrites (the prior value is snapshotted first by
-    /// the normal `store_secret` write discipline). Returns `Ok(true)` when a
-    /// new value was written.
+    /// false, the on-disk value is left as-is and `Ok(false)` is returned (the
+    /// caller reports it as skipped) — but the index is still reconciled
+    /// (idempotent ensure) so a prior partial import that wrote the file but
+    /// failed before indexing converges on retry. If `overwrite` is true, the
+    /// value is rewritten (the prior value is snapshotted first by the normal
+    /// `store_secret` write discipline) and re-indexed. Returns `Ok(true)` only
+    /// when a new value was written.
     pub fn import_secret_by_hash(
         &mut self,
         delegate: &DelegateKey,
@@ -1378,6 +1388,18 @@ impl SecretsStore {
         let scope_path = self.scope_dir(delegate, &scope);
         let secret_file_path = scope_path.join(&encoded);
         if secret_file_path.exists() && !overwrite {
+            // Skip the rewrite — but still RECONCILE the index. A prior import
+            // can crash (or hit a transient ReDb error) AFTER the file landed
+            // but BEFORE `add_to_index` committed, leaving the secret on disk
+            // yet absent from the index. Without this repair, a retry takes
+            // this early branch, reports "skipped", and never indexes the
+            // secret — so it stays invisible to index-based enumeration/export
+            // forever (silent data loss on the next migration). `add_to_index`
+            // is idempotent (no-ops when the hash is already present), so this
+            // is safe in the common case where the index is already correct and
+            // converges the file-without-index case on retry. Report `false`
+            // (not rewritten) regardless.
+            self.add_to_index(delegate, &scope, *secret_hash)?;
             return Ok(false);
         }
 
@@ -4307,5 +4329,143 @@ mod test {
                 "a SecretsId must never encode to the reserved `users/` path segment"
             );
         }
+    }
+
+    /// Regression: an import whose file write succeeded but whose index write
+    /// failed (transient crash) leaves the secret on disk but UNINDEXED. A retry
+    /// without `--overwrite` must take the skip branch AND repair the index, so
+    /// the secret becomes visible to index-based enumeration again. Without the
+    /// reconcile, the secret would be silently lost on the next migration.
+    #[tokio::test]
+    async fn import_skip_branch_repairs_missing_index_entry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![70].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        let secret_id = SecretsId::new(vec![71]);
+        let secret_hash = *secret_id.hash();
+
+        // Normal store: writes the file AND indexes the hash.
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"value".to_vec()),
+        )?;
+
+        // Simulate the post-write / pre-index crash window: drop the hash from
+        // BOTH the ReDb index and the in-memory mirror, leaving the file on
+        // disk. (The real failure is `add_to_index` erroring after the rename;
+        // the resulting on-disk state is exactly this.)
+        store.db.store_secrets_index(delegate.key(), &[])?;
+        store.key_to_secret_part.remove(delegate.key());
+
+        // Pre-condition: file present, index empty → invisible to enumeration.
+        let file_path = secrets_dir
+            .join(delegate.key().encode())
+            .join(secret_id.encode());
+        assert!(file_path.exists(), "secret file should still be on disk");
+        assert!(
+            store.export_scope_entries(SecretScope::Local)?.is_empty(),
+            "pre-condition: unindexed secret must be invisible to enumeration"
+        );
+
+        // Retry the import WITHOUT overwrite. It must skip the rewrite
+        // (Ok(false)) but reconcile the index.
+        let wrote = store.import_secret_by_hash(
+            delegate.key(),
+            &secret_hash,
+            SecretScope::Local,
+            Zeroizing::new(b"value".to_vec()),
+            false,
+        )?;
+        assert!(
+            !wrote,
+            "existing file must not be rewritten without --overwrite"
+        );
+
+        // Post-condition: the hash is back in BOTH the ReDb index and the
+        // in-memory map, and enumeration (the export source) sees it again.
+        assert!(
+            store
+                .db
+                .get_secrets_index(delegate.key())?
+                .unwrap_or_default()
+                .contains(&secret_hash),
+            "ReDb index must be repaired"
+        );
+        assert!(
+            store
+                .key_to_secret_part
+                .get(delegate.key())
+                .map(|e| e.value().contains(&secret_hash))
+                .unwrap_or(false),
+            "in-memory index must be repaired"
+        );
+        let entries = store.export_scope_entries(SecretScope::Local)?;
+        assert_eq!(entries.len(), 1, "secret must be enumerable after repair");
+        assert_eq!(entries[0].secret_hash, secret_hash);
+        assert_eq!(entries[0].plaintext.to_vec(), b"value");
+        Ok(())
+    }
+
+    /// Same convergence guarantee for the per-user index table.
+    #[tokio::test]
+    async fn import_skip_branch_repairs_missing_user_index_entry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+
+        let delegate = Delegate::from((&vec![72].into(), &vec![].into()));
+        let ctx = UserSecretContext::from_token(b"converge-user");
+        let secret_id = SecretsId::new(vec![73]);
+        let secret_hash = *secret_id.hash();
+
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            ctx.scope(),
+            Zeroizing::new(b"uval".to_vec()),
+        )?;
+
+        // Drop the user-index row + in-memory mirror, leaving the file.
+        store
+            .db
+            .store_user_secrets_index(delegate.key(), ctx.user_id().as_bytes(), &[])?;
+        store
+            .user_key_to_secret_part
+            .remove(&(delegate.key().clone(), *ctx.user_id()));
+
+        assert!(
+            store.export_scope_entries(ctx.scope())?.is_empty(),
+            "pre-condition: unindexed user secret invisible"
+        );
+
+        let wrote = store.import_secret_by_hash(
+            delegate.key(),
+            &secret_hash,
+            ctx.scope(),
+            Zeroizing::new(b"uval".to_vec()),
+            false,
+        )?;
+        assert!(!wrote);
+
+        let entries = store.export_scope_entries(ctx.scope())?;
+        assert_eq!(
+            entries.len(),
+            1,
+            "user secret must be enumerable after repair"
+        );
+        assert_eq!(entries[0].secret_hash, secret_hash);
+        Ok(())
     }
 }
