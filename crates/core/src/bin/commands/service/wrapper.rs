@@ -19,13 +19,13 @@ use super::{
 /// State for the wrapper backoff state machine.
 #[derive(Debug, Clone)]
 pub(super) struct WrapperState {
-    backoff_secs: u64,
-    consecutive_failures: u32,
-    port_conflict_kills: u32,
+    pub(super) backoff_secs: u64,
+    pub(super) consecutive_failures: u32,
+    pub(super) port_conflict_kills: u32,
 }
 
 impl WrapperState {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             backoff_secs: WRAPPER_INITIAL_BACKOFF_SECS,
             consecutive_failures: 0,
