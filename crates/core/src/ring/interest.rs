@@ -81,6 +81,24 @@ use crate::config::GlobalRng;
 /// Maximum number of entries in the delta memoization cache.
 const DELTA_CACHE_SIZE: usize = 1024;
 
+/// Maximum number of interested peers tracked per contract (#3798 Gap 2,
+/// anti-amplification hardening).
+///
+/// `interested_peers[contract]` is the per-contract fan-out set: every
+/// `BroadcastStateChange` for a contract pays O(N) cost in this map's size, so
+/// an adversary controlling many IPs/keys could inflate it without bound and
+/// multiply the cost of every state update. Bounding the set at insertion time
+/// (reject on overflow) caps that fan-out, mirroring
+/// `MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT` in `ring/hosting.rs`, which guards
+/// the structurally identical `downstream_subscribers` map.
+///
+/// Value: equal to `MAX_DOWNSTREAM_SUBSCRIBERS_PER_CONTRACT` (512). The two maps
+/// gate the same fan-out and a downstream subscriber is also an interested peer,
+/// so a smaller cap here would reject peers the hosting map already admits. The
+/// per-key-cap rule (`code-style.md`) only requires bounding at or below that
+/// value; matching it keeps the two fan-out caps coherent.
+pub(crate) const MAX_INTERESTED_PEERS_PER_CONTRACT: usize = 512;
+
 /// Timeout for contract handler queries in the broadcast path (summary and
 /// delta computation). Much shorter than the default 300s to prevent spawned
 /// broadcast tasks from accumulating when the contract handler is slow.
@@ -377,6 +395,16 @@ impl<T: TimeSource + Sync> InterestManager<T> {
     /// Register a peer's interest in a contract.
     ///
     /// Returns true if this is a new interest (peer wasn't previously tracked).
+    ///
+    /// Registration of a *new* peer is rejected (returns false, no insertion)
+    /// once `interested_peers[contract]` is at
+    /// [`MAX_INTERESTED_PEERS_PER_CONTRACT`] (#3798 Gap 2): this map is the
+    /// per-contract `BroadcastStateChange` fan-out set, and an unbounded set is
+    /// an amplification vector — an adversary with many IPs/keys could inflate
+    /// it to multiply the cost of every state update. A renewal of an
+    /// already-tracked peer is never rejected (it refreshes in place and does
+    /// not grow the set), mirroring `add_downstream_subscriber` in
+    /// `ring/hosting.rs`.
     pub fn register_peer_interest(
         &self,
         contract: &ContractKey,
@@ -394,6 +422,22 @@ impl<T: TimeSource + Sync> InterestManager<T> {
         // change for these four sites — see PR notes.
         let mut entry = self.interested_peers.entry(*contract).or_default();
         let is_new = !entry.contains_key(&peer);
+        // #3798 Gap 2: bound the per-contract fan-out set at insertion time.
+        // Only NEW peers can grow the set, so the cap is checked only on the
+        // is_new path — a renewal refreshes in place and is always admitted.
+        // Rejected peers are simply not registered (no LRU eviction: evicting
+        // an existing broadcast target to admit an attacker's peer would be a
+        // worse outcome than rejecting the newcomer). The caller observes the
+        // `false` return exactly as it would for a renewal — it will not flush
+        // pending broadcasts to / count an unregistered peer.
+        if is_new && entry.len() >= MAX_INTERESTED_PEERS_PER_CONTRACT {
+            tracing::warn!(
+                contract = %contract,
+                limit = MAX_INTERESTED_PEERS_PER_CONTRACT,
+                "Interested-peer limit reached for contract, rejecting peer interest registration"
+            );
+            return false;
+        }
         entry.insert(peer.clone(), PeerInterest::new(summary, is_upstream, now));
 
         // Maintain reverse index for O(1) peer disconnect cleanup
@@ -1231,6 +1275,102 @@ mod tests {
 
         // Remove again returns false
         assert!(!manager.remove_peer_interest(&contract, &peer));
+    }
+
+    /// #3798 Gap 2: the per-contract interested-peer set is capped at
+    /// MAX_INTERESTED_PEERS_PER_CONTRACT. Fill exactly to the cap (all admitted,
+    /// the under-cap happy path), then assert the (cap+1)th NEW peer is rejected
+    /// (returns false, not inserted) so the fan-out set cannot grow unbounded.
+    #[test]
+    fn test_register_peer_interest_caps_per_contract_fanout() {
+        let (manager, _time) = make_manager();
+        let contract = make_contract_key(1);
+
+        // Fill to exactly the cap; every distinct new peer is admitted.
+        let mut peers = Vec::with_capacity(MAX_INTERESTED_PEERS_PER_CONTRACT);
+        for _ in 0..MAX_INTERESTED_PEERS_PER_CONTRACT {
+            let peer = make_peer_key(0);
+            assert!(
+                manager.register_peer_interest(&contract, peer.clone(), None, false),
+                "new peer under the cap must be admitted"
+            );
+            peers.push(peer);
+        }
+        assert_eq!(
+            manager.get_interested_peers(&contract).len(),
+            MAX_INTERESTED_PEERS_PER_CONTRACT,
+            "set should hold exactly the cap"
+        );
+
+        // The cap+1th NEW peer is rejected: returns false and is not inserted.
+        let overflow_peer = make_peer_key(0);
+        assert!(
+            !manager.register_peer_interest(&contract, overflow_peer.clone(), None, false),
+            "new peer over the cap must be rejected"
+        );
+        assert!(
+            manager
+                .get_peer_interest(&contract, &overflow_peer)
+                .is_none(),
+            "rejected peer must not be inserted"
+        );
+        assert_eq!(
+            manager.get_interested_peers(&contract).len(),
+            MAX_INTERESTED_PEERS_PER_CONTRACT,
+            "set must not grow past the cap on overflow"
+        );
+
+        // A renewal of an already-tracked peer at the cap is NOT rejected: it
+        // refreshes in place (returns false because it is not new) and the set
+        // size stays at the cap.
+        let renewed = peers[0].clone();
+        assert!(
+            !manager.register_peer_interest(&contract, renewed.clone(), None, true),
+            "renewal of an existing peer returns false (not new)"
+        );
+        assert!(
+            manager.get_peer_interest(&contract, &renewed).is_some(),
+            "renewed peer must still be tracked"
+        );
+        assert_eq!(
+            manager.get_interested_peers(&contract).len(),
+            MAX_INTERESTED_PEERS_PER_CONTRACT,
+            "renewal at the cap must not change the set size"
+        );
+
+        // After freeing a slot, a new peer is admitted again — the cap is a
+        // live ceiling, not a permanent lockout.
+        assert!(manager.remove_peer_interest(&contract, &peers[1]));
+        let post_evict_peer = make_peer_key(0);
+        assert!(
+            manager.register_peer_interest(&contract, post_evict_peer.clone(), None, false),
+            "a new peer must be admitted once a slot frees up"
+        );
+        assert!(
+            manager
+                .get_peer_interest(&contract, &post_evict_peer)
+                .is_some()
+        );
+    }
+
+    /// The cap is strictly per-contract: a peer rejected on one contract because
+    /// that contract is full is still admitted on a different, unsaturated
+    /// contract.
+    #[test]
+    fn test_register_peer_interest_cap_is_per_contract() {
+        let (manager, _time) = make_manager();
+        let full = make_contract_key(1);
+        let other = make_contract_key(2);
+
+        for _ in 0..MAX_INTERESTED_PEERS_PER_CONTRACT {
+            assert!(manager.register_peer_interest(&full, make_peer_key(0), None, false));
+        }
+        // Saturated contract rejects a new peer...
+        let peer = make_peer_key(0);
+        assert!(!manager.register_peer_interest(&full, peer.clone(), None, false));
+        // ...but the same peer registers fine on a different contract.
+        assert!(manager.register_peer_interest(&other, peer.clone(), None, false));
+        assert!(manager.get_peer_interest(&other, &peer).is_some());
     }
 
     #[test]
