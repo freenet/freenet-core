@@ -1006,6 +1006,73 @@ async fn run_relay_put<CB>(
     }
 }
 
+/// Greedy-routing termination guard for the relay PUT path (#4363).
+///
+/// A PUT is forwarded hop-by-hop toward the contract location, but the
+/// router selects the next hop by learned routing predictions, not by
+/// strict geometric distance. On a sparse/bootstrap topology this lets
+/// the chain overshoot the contract neighbourhood: it descends close to
+/// the target, then the only forwardable peers sit *farther* away, and
+/// the request keeps wandering — finalizing (and placing its
+/// authoritative replica) far from where greedy GETs will look.
+///
+/// This is the PUT analogue of the ring's accept-only-at-terminus rule
+/// (`.claude/rules/ring.md`): a node is the routing terminus once it
+/// cannot forward to a peer strictly closer to the target than itself.
+/// When that holds, finalize here — the closest-seen node along the
+/// chain — rather than push the request (and a worse-placed replica) to
+/// a farther peer.
+///
+/// Returns `true` when the relay should stop forwarding and finalize
+/// locally.
+///
+/// Termination is intentionally preferred over re-routing to some other,
+/// closer candidate: once the router's predicted-best next hop is
+/// non-improving, this node is already the closest-seen point on the
+/// chain, so finalizing here places the authoritative replica where
+/// greedy GETs will descend rather than gambling on a different forward
+/// that the skip-list/HTL machinery would have to unwind.
+///
+/// # Choice of `k`
+///
+/// The issue framed this as "move away for *k* consecutive hops, then
+/// terminate at the closest-seen node". We use the strongest correct
+/// stop condition, `k == 1`: terminate as soon as the only available
+/// next hop is not strictly closer than this node. Rationale:
+///
+/// - Each relay is an independent task with no shared routing history,
+///   so a `k > 1` consecutive-away counter would have to be threaded
+///   through the `PutMsg::Request` wire format (a positional bincode
+///   field add + `MIN_COMPATIBLE_VERSION` bump) — disproportionate for
+///   this fix and out of scope for one logical change.
+/// - `k == 1` *is* the classic greedy-routing terminus and the same
+///   condition the ring already uses for connection acceptance, so it
+///   keeps PUT placement consistent with topology formation.
+/// - The skip-list still prevents loops, and HTL still bounds the chain,
+///   so terminating early never strands a PUT — it just stops it
+///   overshooting the neighbourhood it already reached.
+///
+/// The guard only fires when both locations are known; a node with no
+/// location (pre-join / unknown addr) cannot reason about "closer", so
+/// it falls back to the previous forward-always behaviour.
+fn put_routing_should_terminate(
+    own_loc: Option<Location>,
+    next_hop_loc: Option<Location>,
+    target: Location,
+) -> bool {
+    let (own_loc, next_hop_loc) = match (own_loc, next_hop_loc) {
+        (Some(own), Some(next)) => (own, next),
+        // Unknown own/next location: cannot compare distances, so keep
+        // the prior forward-always behaviour rather than guess.
+        _ => return false,
+    };
+    let own_dist = own_loc.distance(target).as_f64();
+    let next_dist = next_hop_loc.distance(target).as_f64();
+    // Terminate when the next hop is NOT strictly closer to the target
+    // than we are: this node is a greedy local optimum (the terminus).
+    next_dist >= own_dist
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_relay_put<CB>(
     op_manager: &Arc<OpManager>,
@@ -1061,6 +1128,41 @@ where
 
     let (next_peer, next_addr) = match next_hop {
         Some(peer) => {
+            // Greedy-routing terminus guard (#4363): if the best next
+            // hop is not strictly closer to the contract location than
+            // this node, stop forwarding and finalize here. This is the
+            // closest-seen node along the chain; pushing the request to
+            // a farther peer would overshoot the contract neighbourhood
+            // and place the authoritative replica where greedy GETs
+            // never descend.
+            let target = crate::ring::Location::from(&key);
+            // own_location() is the address-derived ring position (not the
+            // configured get_stored_location()); this matches the
+            // is_subscription_root precedent, which also reasons about "am
+            // I the routing terminus" from the address-derived location.
+            let own_loc = op_manager.ring.connection_manager.own_location().location();
+            let next_hop_loc = peer.location();
+            if put_routing_should_terminate(own_loc, next_hop_loc, target) {
+                tracing::info!(
+                    tx = %incoming_tx,
+                    contract = %key,
+                    own_location = ?own_loc.map(|l| l.as_f64()),
+                    next_hop_location = ?next_hop_loc.map(|l| l.as_f64()),
+                    target_location = %target.as_f64(),
+                    phase = "relay_put_terminus",
+                    "PUT relay: next hop not closer than self; finalizing here (#4363)"
+                );
+                let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+                return relay_put_finalize_local(
+                    op_manager,
+                    incoming_tx,
+                    key,
+                    merged_value,
+                    upstream_addr,
+                    hop_count,
+                )
+                .await;
+            }
             let addr = match peer.socket_addr() {
                 Some(a) => a,
                 None => {
@@ -2060,6 +2162,35 @@ where
         None
     };
 
+    // Greedy-routing terminus guard (#4363), streaming path. Mirrors the
+    // non-streaming `drive_relay_put` guard: if the best next hop is not
+    // strictly closer to the contract location than this node, drop it so
+    // the driver finalizes locally (the stream is assembled and stored
+    // here in step 5/6 regardless) instead of piping the replica to a
+    // farther peer the contract neighbourhood will never descend to.
+    let next_hop = match next_hop {
+        Some(peer) => {
+            let target = crate::ring::Location::from(&contract_key);
+            let own_loc = op_manager.ring.connection_manager.own_location().location();
+            let next_hop_loc = peer.location();
+            if put_routing_should_terminate(own_loc, next_hop_loc, target) {
+                tracing::info!(
+                    tx = %incoming_tx,
+                    contract = %contract_key,
+                    own_location = ?own_loc.map(|l| l.as_f64()),
+                    next_hop_location = ?next_hop_loc.map(|l| l.as_f64()),
+                    target_location = %target.as_f64(),
+                    phase = "relay_put_streaming_terminus",
+                    "PUT streaming relay: next hop not closer than self; finalizing here (#4363)"
+                );
+                None
+            } else {
+                Some(peer)
+            }
+        }
+        None => None,
+    };
+
     let next_hop_addr = next_hop.as_ref().and_then(|p| p.socket_addr());
 
     // ── Step 3: If next hop + streaming appropriate, set up piped forward ─
@@ -2411,6 +2542,102 @@ mod tests {
 
     fn dummy_tx() -> Transaction {
         Transaction::new::<PutMsg>()
+    }
+
+    /// Regression for #4363: on a sparse/bootstrap topology a PUT
+    /// descended to within ring distance 0.03 of the contract location
+    /// (0.211), then the router forwarded it AWAY to a node at 0.868
+    /// (distance 0.343), where it finalized — so greedy GETs descending
+    /// to 0.211 never found the replica.
+    ///
+    /// `put_routing_should_terminate` is the greedy-terminus guard that
+    /// stops the wander: when sitting on the close node (≈0.181, i.e.
+    /// distance 0.03 from the 0.211 target) and the only forwardable
+    /// next hop (0.868, distance 0.343) is FARTHER, the relay must
+    /// terminate here instead of forwarding to the farther peer.
+    #[test]
+    fn put_routing_terminates_when_next_hop_moves_away_from_target() {
+        let target = Location::new(0.211);
+        // Close node: distance 0.03 from target (matches the hop-3 node
+        // in the diagnostic run).
+        let own = Location::new(0.181);
+        // The wander destination from the issue: distance 0.343.
+        let next_hop = Location::new(0.868);
+
+        // Sanity: this reproduces the geometry the issue describes.
+        assert!(
+            (own.distance(target).as_f64() - 0.03).abs() < 1e-9,
+            "own node should be ~0.03 from target"
+        );
+        assert!(
+            next_hop.distance(target).as_f64() > own.distance(target).as_f64(),
+            "next hop must be farther than own node (the away-move)"
+        );
+
+        assert!(
+            put_routing_should_terminate(Some(own), Some(next_hop), target),
+            "must terminate when the only next hop moves away from the target"
+        );
+    }
+
+    /// Happy path: when the next hop is strictly closer to the target
+    /// than this node, the relay keeps forwarding (no premature stop).
+    #[test]
+    fn put_routing_forwards_when_next_hop_is_closer() {
+        let target = Location::new(0.211);
+        let own = Location::new(0.5); // distance 0.289
+        let next_hop = Location::new(0.3); // distance 0.089 — closer
+        assert!(
+            next_hop.distance(target).as_f64() < own.distance(target).as_f64(),
+            "test setup: next hop must be closer"
+        );
+        assert!(
+            !put_routing_should_terminate(Some(own), Some(next_hop), target),
+            "must keep forwarding when the next hop makes progress"
+        );
+    }
+
+    /// Boundary: a next hop at exactly the same distance as this node is
+    /// not progress, so the relay terminates (the `>=` half of the
+    /// strictly-closer rule). Prevents two equidistant peers from
+    /// ping-ponging the request.
+    #[test]
+    fn put_routing_terminates_on_equal_distance_next_hop() {
+        let target = Location::new(0.5);
+        // Both 0.1 from target (one CCW, one CW) → equal distance. Using
+        // values away from the 0.0/1.0 wrap-around keeps the two
+        // subtractions bit-identical so the equality is exact.
+        let own = Location::new(0.4);
+        let next_hop = Location::new(0.6);
+        assert_eq!(
+            own.distance(target).as_f64(),
+            next_hop.distance(target).as_f64(),
+            "test setup: both peers equidistant from target"
+        );
+        assert!(
+            put_routing_should_terminate(Some(own), Some(next_hop), target),
+            "equal-distance next hop is not progress; must terminate"
+        );
+    }
+
+    /// Edge: unknown own or next-hop location must fall back to the
+    /// prior forward-always behaviour (cannot reason about "closer").
+    #[test]
+    fn put_routing_does_not_terminate_when_location_unknown() {
+        let target = Location::new(0.211);
+        let known = Location::new(0.181);
+        assert!(
+            !put_routing_should_terminate(None, Some(known), target),
+            "unknown own location must not trigger termination"
+        );
+        assert!(
+            !put_routing_should_terminate(Some(known), None, target),
+            "unknown next-hop location must not trigger termination"
+        );
+        assert!(
+            !put_routing_should_terminate(None, None, target),
+            "both unknown must not trigger termination"
+        );
     }
 
     /// Issue #4251 follow-up: the PUT relay wrappers must mirror the UPDATE
@@ -3106,12 +3333,12 @@ mod tests {
         // than an opaque String, AND tracks hop_count for telemetry.
         assert!(
             impl_body.contains("type Terminal = (Result<ContractKey, PutTerminalError>"),
-            "PutRetryDriver::Terminal must be 
-             (Result<ContractKey, PutTerminalError>, Option<usize>); 
-             changing this back to bare ContractKey re-introduces the issue 
-             #4111 failure mode (no way to express a terminal error); 
-             changing the error half back to `String` drops the structured 
-             classification (LocalRejection vs Relayed); dropping hop_count 
+            "PutRetryDriver::Terminal must be
+             (Result<ContractKey, PutTerminalError>, Option<usize>);
+             changing this back to bare ContractKey re-introduces the issue
+             #4111 failure mode (no way to express a terminal error);
+             changing the error half back to `String` drops the structured
+             classification (LocalRejection vs Relayed); dropping hop_count
              breaks the telemetry contract from PR #4248."
         );
     }
@@ -3730,6 +3957,88 @@ mod tests {
         assert!(
             helper_src.contains("announce_contract_hosted"),
             "helper MUST call announce_contract_hosted for first-time hosting"
+        );
+    }
+
+    /// Wiring pin for #4363: the greedy-routing terminus guard
+    /// (`put_routing_should_terminate`) MUST be invoked in the
+    /// non-streaming relay body, BEFORE the chosen next hop is forwarded
+    /// to. The `put_routing_should_terminate` unit tests only exercise
+    /// the helper in isolation — without this pin, deleting the call site
+    /// (re-introducing the #4363 wander) would leave every unit test
+    /// green. This locks the guard into the call path the same way
+    /// `drive_relay_put_stores_locally_before_forwarding` locks the
+    /// store-before-forward ordering.
+    #[test]
+    fn drive_relay_put_applies_terminus_guard_before_forwarding() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = drive_relay_put_body(src);
+
+        let guard_pos = body.find("put_routing_should_terminate(").expect(
+            "drive_relay_put MUST call put_routing_should_terminate \
+             (the #4363 greedy-terminus guard); deleting it re-introduces \
+             the away-routing wander",
+        );
+        // The guard sits inside the `Some(peer)` next-hop arm, which must
+        // resolve the next hop's socket address (`peer.socket_addr()`)
+        // before the request is forwarded. The guard MUST precede that.
+        let resolve_addr_pos = body
+            .find("peer.socket_addr()")
+            .expect("next-hop socket_addr resolution missing in driver");
+        assert!(
+            guard_pos < resolve_addr_pos,
+            "the #4363 terminus guard MUST run BEFORE the next hop's \
+             address is resolved/forwarded, otherwise a non-improving \
+             next hop is still sent the PUT and the replica overshoots \
+             the contract neighbourhood"
+        );
+
+        // The guard must finalize locally on its terminus branch, not just
+        // log: the early return goes through relay_put_finalize_local.
+        let guard_region = &body[guard_pos..resolve_addr_pos];
+        assert!(
+            guard_region.contains("relay_put_finalize_local("),
+            "the terminus branch MUST finalize locally via \
+             relay_put_finalize_local, not fall through to the forward"
+        );
+    }
+
+    /// Wiring pin for #4363 (streaming path): the streaming relay driver
+    /// uses the same `closest_potentially_hosting` next-hop selection, so
+    /// it MUST apply the same terminus guard before piping the replica to
+    /// the next hop. Without this pin the streaming path could silently
+    /// regress to the unguarded away-routing wander while the
+    /// non-streaming path stays fixed.
+    #[test]
+    fn drive_relay_put_streaming_applies_terminus_guard_before_next_hop() {
+        let src = include_str!("op_ctx_task.rs");
+        let start = src
+            .find("async fn drive_relay_put_streaming")
+            .expect("drive_relay_put_streaming not found");
+        // End the body at the end-of-driver marker so the scrape stays
+        // within the streaming fn.
+        let end = src[start..]
+            .find("\n// ── End of relay PUT driver")
+            .expect("streaming driver body end not found")
+            + start;
+        let body = &src[start..end];
+
+        let guard_pos = body.find("put_routing_should_terminate(").expect(
+            "drive_relay_put_streaming MUST call put_routing_should_terminate \
+             (the #4363 greedy-terminus guard) so the streaming path does not \
+             pipe a replica to a non-improving next hop",
+        );
+        // next_hop_addr is derived right before the piped-forward decision;
+        // the guard must drop the non-improving hop before that point.
+        let next_hop_addr_pos = body
+            .find("let next_hop_addr = next_hop")
+            .expect("next_hop_addr derivation missing in streaming driver");
+        assert!(
+            guard_pos < next_hop_addr_pos,
+            "the #4363 terminus guard MUST run BEFORE next_hop_addr is \
+             derived (i.e. before the piped-forward decision), so a \
+             non-improving next hop is dropped and the driver finalizes \
+             locally"
         );
     }
 
