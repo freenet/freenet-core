@@ -40,6 +40,24 @@ pub(super) const MAX_BREADTH: usize = 3;
 /// SUBSCRIBE-only.)
 pub(super) const MAX_RETRIES: usize = 10;
 
+/// Base inter-attempt delay for the Phase 2b client-subscribe retry loop.
+///
+/// The task-per-transaction driver loops `send_and_await` → advance →
+/// `send_and_await` with no time spent in the event loop between
+/// attempts. Legacy got incidental backoff from cycling through the
+/// event loop; the task-per-tx driver does not. Without a delay, a
+/// contract no peer hosts lets one client subscribe burn
+/// `MAX_BREADTH * MAX_RETRIES` (= 30) attempts as fast as the network
+/// replies — a topology-wide DoS vector (see #3808).
+///
+/// 50ms is the issue's suggested ballpark: large enough to break the
+/// tight reply-driven spin loop (worst case 30 attempts now span ~1.5s
+/// of pacing instead of completing in a few network round-trips), small
+/// enough to be negligible against the `OPERATION_TTL`-bounded per-attempt
+/// cost of a real subscribe. Per-attempt jitter (±20%) is applied on top
+/// to avoid synchronised retry waves across many clients.
+pub(super) const RETRY_BASE_DELAY: Duration = Duration::from_millis(50);
+
 /// Timeout for waiting on contract storage notification.
 /// Used when a subscription arrives before the contract has been propagated via PUT.
 pub(super) const CONTRACT_WAIT_TIMEOUT_MS: u64 = 2_000;
