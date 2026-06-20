@@ -83,6 +83,13 @@ fn sandbox_origin_from_headers(headers: &axum::http::HeaderMap) -> String {
         .get("x-forwarded-host")
         .or_else(|| headers.get(axum::http::header::HOST))
         .and_then(|h| h.to_str().ok())
+        // `X-Forwarded-Host`, like `X-Forwarded-Proto`, may be a comma-separated
+        // list when the request traverses multiple proxies (or a proxy appends
+        // rather than overwrites). The first entry is the original client-facing
+        // host; using the whole list would yield an invalid CSP origin like
+        // `https://public.example, proxy.internal` and re-break the app.
+        .map(|host| host.split(',').next().unwrap_or(host).trim())
+        .filter(|host| !host.is_empty())
         .map(|host| format!("{scheme}://{host}"))
         .unwrap_or_else(|| "'self'".to_string())
 }
@@ -1275,5 +1282,18 @@ mod tests {
     #[test]
     fn sandbox_origin_no_host_falls_back_to_self() {
         assert_eq!(sandbox_origin_from_headers(&hdrs(&[])), "'self'");
+    }
+
+    /// Multi-proxy: comma-separated `X-Forwarded-Host`/`-Proto` must use the
+    /// first (client-facing) entry, not the whole list (which is an invalid
+    /// CSP origin that would re-break the app).
+    #[test]
+    fn sandbox_origin_uses_first_of_comma_separated_forwarded_values() {
+        let origin = sandbox_origin_from_headers(&hdrs(&[
+            ("host", "127.0.0.1:7509"),
+            ("x-forwarded-proto", "https, http"),
+            ("x-forwarded-host", "public.example, proxy.internal"),
+        ]));
+        assert_eq!(origin, "https://public.example");
     }
 }
