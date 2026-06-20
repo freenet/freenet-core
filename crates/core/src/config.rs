@@ -1587,6 +1587,46 @@ pub struct WebsocketApiArgs {
     /// single-user, byte-for-byte today's behavior. Enable only on a node you
     /// intend to operate as a shared public proxy for untrusted users.
     ///
+    /// SECURE-CONNECTION REQUIREMENT (refuse-plaintext-token, #4381): even with
+    /// hosted mode on, the durable `userToken` is honored ONLY over a **loopback**
+    /// connection carrying `X-Forwarded-Proto: https` — i.e. behind a
+    /// TLS-terminating reverse proxy colocated on the same host. The loopback
+    /// source proves the proxy→node hop is local; the `https` XFP is positive
+    /// evidence (set by the TLS terminator) that the browser→proxy hop used TLS.
+    ///
+    /// Everything else is **rejected** with `403` (fail-closed): a non-loopback
+    /// source, OR a loopback source without `X-Forwarded-Proto: https` (header
+    /// missing or `http`). A direct plaintext connection — even loopback — is
+    /// refused. `Host` is deliberately NOT consulted: it is proxy-rewritable
+    /// (nginx's default rewrites it to the upstream `127.0.0.1:7509`), so it
+    /// cannot grant trust; only the `https` XFP can.
+    ///
+    /// OPERATOR NOTE (REQUIRED proxy config): front the node with a
+    /// TLS-terminating reverse proxy on the SAME host that connects over
+    /// loopback. The proxy MUST (a) SET / OVERWRITE `X-Forwarded-Proto` itself to
+    /// the real browser→proxy scheme, AND (b) STRIP any client-supplied
+    /// `X-Forwarded-*` headers, so a client cannot forge the TLS attestation.
+    /// Caddy does both by default. nginx requires
+    /// `proxy_set_header X-Forwarded-Proto $scheme;` (a literal `https` is fine
+    /// for an HTTPS-only server block) and must NOT pass through a client-supplied
+    /// `X-Forwarded-Proto` — nginx forwards unknown client headers by default, so
+    /// the explicit `proxy_set_header` overwrite is what stops pass-through.
+    ///
+    /// SECURITY NOTE (known limitation): the node trusts `X-Forwarded-Proto` from
+    /// a loopback source and cannot tell a header the proxy SET from one it merely
+    /// PASSED THROUGH from the client. If the proxy is misconfigured to forward a
+    /// client-supplied `X-Forwarded-Proto: https` over a plaintext listener, a
+    /// client could spoof it and the token would be honored over cleartext. The
+    /// node cannot detect this pass-through misconfiguration; correct proxy
+    /// configuration is the operator's responsibility.
+    ///
+    /// A developer testing hosted mode locally must likewise front it with a TLS
+    /// proxy or send the header (`curl -H 'X-Forwarded-Proto: https'` from
+    /// loopback) — a plain plaintext loopback request is refused. A TLS terminator
+    /// on a **different** host (remote load balancer) is not supported today (its
+    /// source is not loopback) and would need future explicit trusted-proxy-IP
+    /// config.
+    ///
     /// `--hosted-mode` is THE operator switch, so it works as a BARE flag:
     /// `--hosted-mode` => `Some(true)`; `--hosted-mode=false` (or
     /// `--hosted-mode false`) => `Some(false)`; absent => `None`. Kept as

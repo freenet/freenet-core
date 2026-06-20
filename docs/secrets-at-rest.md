@@ -317,3 +317,88 @@ Files written under the pre-#4195 binary are NOT auto-migrated to
 existing per-secret blobs on disk should run a one-time
 `chmod -R u=rwX,go= <secrets_dir>` after upgrading to close that gap.
 Files written by the post-#4195 binary land at `0o600` directly.
+
+## Hosted mode: per-user secrets over a secure connection (#4381)
+
+Hosted mode (`--hosted-mode`, OFF by default) lets one node serve many
+untrusted web users, each getting their own per-user delegate-secret
+namespace derived from a durable `userToken` they present on the
+WebSocket upgrade. When hosted mode is OFF, `userToken` is ignored and
+every connection is single-user — byte-for-byte the pre-#4381 behavior.
+
+The `userToken` is a durable, node-independent, high-value credential:
+it names a per-user secret namespace and is valid against any hosted
+node. So the node honors it ONLY over a connection it can prove is
+secure.
+
+### The gate
+
+With hosted mode on, the per-user token is honored ONLY over a
+**loopback** connection carrying **`X-Forwarded-Proto: https`** — i.e.
+the request reached the node from `127.0.0.1` / `[::1]` and arrived with
+an `https` forwarded-proto header. That is the shape produced by a
+TLS-terminating reverse proxy running on the same host as the node:
+
+- the **loopback source** proves the proxy→node hop is local (the
+  plaintext API port was not exposed to the network for this
+  connection), and
+- the **`https` `X-Forwarded-Proto`** is positive evidence, set by the
+  TLS terminator, that the browser→proxy hop used TLS.
+
+Everything else is rejected with `403` (fail-closed):
+
+| source | `X-Forwarded-Proto` | outcome |
+|---|---|---|
+| loopback | `https` | honored |
+| loopback | missing or `http` | **403** |
+| non-loopback | any | **403** |
+| unknown | any | **403** |
+
+A direct plaintext connection — even from loopback — is refused: without
+the `https` attestation the node cannot rule out that the token crossed
+the network in cleartext. The request `Host` header is deliberately NOT
+consulted: it is proxy-rewritable (nginx's default rewrites it to the
+upstream `127.0.0.1:7509`), so it cannot grant trust; only the `https`
+`X-Forwarded-Proto` can.
+
+### Operator responsibility (REQUIRED proxy configuration)
+
+The node trusts `X-Forwarded-Proto` only from a loopback source, but it
+cannot tell a header the proxy *set* from one the proxy merely *passed
+through* from the client. Making the attestation trustworthy is the
+operator's job. The proxy fronting a hosted node MUST:
+
+1. **SET / OVERWRITE `X-Forwarded-Proto` itself**, to the real scheme of
+   the browser→proxy hop.
+2. **STRIP any client-supplied `X-Forwarded-*` headers** before
+   forwarding, so a client cannot inject its own
+   `X-Forwarded-Proto: https`.
+
+- **Caddy** does both by default — it sets `X-Forwarded-Proto` and does
+  not pass through a client-supplied value. No extra configuration
+  needed.
+- **nginx** requires `proxy_set_header X-Forwarded-Proto $scheme;` (a
+  literal `proxy_set_header X-Forwarded-Proto https;` is fine for an
+  HTTPS-only server block) AND must NOT forward a client-supplied
+  `X-Forwarded-Proto`. nginx forwards unknown client request headers by
+  default, so an explicit `proxy_set_header` that overwrites the value is
+  the mechanism that also stops pass-through — make sure no `http`/server
+  block leaks the client value through.
+
+### Security note (known limitation)
+
+The node trusts `X-Forwarded-Proto` from a loopback source. If the proxy
+is **misconfigured to forward a client-supplied `X-Forwarded-Proto:
+https` over a plaintext listener**, a client could spoof the TLS
+attestation and the token would be honored over cleartext. The node
+cannot detect this pass-through misconfiguration — it sees a loopback
+source and an `https` header and has no way to know the header came from
+the client rather than the proxy.
+
+Correct proxy configuration (set-and-strip, above) is therefore the
+operator's responsibility. This is an accepted limitation, not a
+shared-secret handshake: the early hosted operators are the Freenet team,
+who control their own proxy configuration. A developer testing hosted
+mode locally must likewise front the node with a TLS proxy or send the
+header manually (`curl -H 'X-Forwarded-Proto: https'` from loopback) — a
+plain plaintext loopback request is refused.
