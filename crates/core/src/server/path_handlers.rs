@@ -375,6 +375,7 @@ pub(super) async fn contract_home(
     api_version: ApiVersion,
     query_string: Option<String>,
     sub_path: Option<&str>,
+    hosted_mode: bool,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
     let instance_id = ContractInstanceId::from_bytes(&key).map_err(|err| {
         debug!("contract_home: Failed to parse contract key: {}", err);
@@ -400,7 +401,14 @@ pub(super) async fn contract_home(
     // Return the shell page instead of the contract HTML directly.
     // The shell page wraps the contract in a sandboxed iframe for
     // origin isolation (GHSA-824h-7x5x-wfmf).
-    match shell_page(&assigned_token, &key, api_version, query_string, sub_path) {
+    match shell_page(
+        &assigned_token,
+        &key,
+        api_version,
+        query_string,
+        sub_path,
+        hosted_mode,
+    ) {
         Ok(b) => Ok(b.into_response()),
         Err(err) => {
             tracing::error!("Failed to generate shell page: {err}");
@@ -787,6 +795,7 @@ fn shell_page(
     api_version: ApiVersion,
     query_string: Option<String>,
     sub_path: Option<&str>,
+    hosted_mode: bool,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
     let version_prefix = api_version.prefix();
     // For a deep-link reload (#3841) the iframe must load the requested
@@ -845,6 +854,35 @@ fn shell_page(
          <path d='{}' fill='%23007FFF' fill-rule='evenodd'/></svg>",
         super::home_page::RABBIT_SVG_PATH,
     );
+    // Per-user durable token plumbing (P2-frontend of #4381). In hosted mode
+    // the shell page mints/loads a durable per-user bearer secret from
+    // `localStorage` and hands it to the bridge so the proxied WebSocket
+    // upgrade carries `?userToken=<token>`. The shell is same-origin with the
+    // node (so it CAN use localStorage); the sandboxed iframe is a different
+    // origin and cannot. One token in localStorage = ONE identity per visitor
+    // across every contract app on this node — the intended design.
+    //
+    // When hosted mode is OFF the shell is BEHAVIOURALLY identical to the
+    // pre-#4381 shell: no token snippet, and the same single-argument
+    // `freenetBridge(...)` call at the same site. Note this is behavioural, not
+    // literal byte-equality — the always-injected SHELL_BRIDGE_JS itself gained
+    // a `userToken` argument and an inert, undefined-guarded `if (userToken)`
+    // branch that never fires when the bridge is called with one argument. The
+    // token is generated client-side from `crypto.getRandomValues` and is NEVER
+    // derived from any request input, so there is no injection vector.
+    let (user_token_script, bridge_call) = if hosted_mode {
+        (
+            format!("<script>\n{SHELL_USER_TOKEN_JS}\n</script>\n"),
+            // Third arg `true` puts the bridge in hosted mode so it can fail
+            // closed when it has no per-user token (http, or storage failure) —
+            // see the hostedNoToken branch in SHELL_BRIDGE_JS.
+            format!("freenetBridge(\"{auth_token}\", __freenet_user_token, true);"),
+        )
+    } else {
+        // Non-hosted: the original 1-arg call. `hostedMode` is undefined, so the
+        // fail-closed branch never triggers and behavior is unchanged.
+        (String::new(), format!("freenetBridge(\"{auth_token}\");"))
+    };
     let html = format!(
         r##"<!DOCTYPE html>
 <html lang="en">
@@ -860,7 +898,7 @@ fn shell_page(
 <script>
 {SHELL_BRIDGE_JS}
 </script>
-<script>freenetBridge("{auth_token}");</script>
+{user_token_script}<script>{bridge_call}</script>
 </body>
 </html>"##
     );
@@ -996,6 +1034,55 @@ async fn sandbox_content_body(
     Ok(Html(body))
 }
 
+/// JavaScript that mints (or loads) the durable per-user token in hosted mode.
+///
+/// Injected into the shell page (P2-frontend of #4381) ONLY when the node runs
+/// in hosted mode. The shell is same-origin with the node, so it can persist a
+/// token in `localStorage`; the sandboxed iframe cannot. The token is a 32-byte
+/// secret minted from `crypto.getRandomValues` (never from request input), hex
+/// encoded, and reused across every visit and every contract app on this node —
+/// one durable identity per visitor. The bridge presents it on the proxied
+/// WebSocket upgrade as `?userToken=<token>`.
+///
+/// On a non-`https:` page the IIFE returns undefined BEFORE touching
+/// `localStorage`, so the durable token is never loaded, minted, or transmitted
+/// over a plaintext wire (client mirror of the backend REFUSE-PLAINTEXT-TOKEN
+/// invariant — see `decide_user_token`).
+///
+/// `localStorage` access is wrapped in try/catch so that a browser with storage
+/// disabled (private mode quirks, embedded webviews) degrades to an undefined
+/// token rather than throwing before the bridge starts; an undefined token means
+/// the bridge omits the `userToken` param and the backend treats the connection
+/// as a local/anonymous one (see `decide_user_token`).
+const SHELL_USER_TOKEN_JS: &str = r#"var __freenet_user_token = (function() {
+  'use strict';
+  // REFUSE-PLAINTEXT-TOKEN (client mirror of the backend invariant, #4381):
+  // never load OR mint the durable token on a non-secure page. The token is a
+  // high-value, node-independent bearer secret; the backend won't HONOR it over
+  // plaintext, but only the client can stop it from being TRANSMITTED in the
+  // first place. Returning undefined here (BEFORE any localStorage access) means
+  // an http page never reads a previously-minted token either, so the stored
+  // value is never put on a ws:// URL. The TLS proxy serves the shell over
+  // https in the intended hosted deployment; a direct http://localhost dev hit
+  // simply gets no token (Local), which is the correct/expected behavior.
+  if (location.protocol !== 'https:') { return undefined; }
+  try {
+    var KEY = '__freenet_user_token__';
+    var t = localStorage.getItem(KEY);
+    if (!t) {
+      var b = new Uint8Array(32);
+      crypto.getRandomValues(b);
+      t = Array.prototype.map.call(b, function(x) {
+        return ('0' + x.toString(16)).slice(-2);
+      }).join('');
+      localStorage.setItem(KEY, t);
+    }
+    return t;
+  } catch (e) {
+    return undefined;
+  }
+})();"#;
+
 /// JavaScript for the shell page's postMessage bridge.
 ///
 /// The bridge listens for WebSocket requests from the sandboxed iframe,
@@ -1003,8 +1090,14 @@ async fn sandbox_content_body(
 /// forwards messages in both directions. Only allows connections to the
 /// local API server itself (same origin) to prevent the contract from using the
 /// bridge as an open proxy to other localhost services.
+///
+/// `userToken` is the durable per-user bearer secret minted by
+/// `SHELL_USER_TOKEN_JS` in hosted mode; it is `undefined` in non-hosted mode
+/// (the bridge is then called with a single argument) and, when present, is
+/// appended to the real WebSocket URL as `?userToken=<token>` so the node can
+/// scope a per-user delegate-secret namespace (P2 of #4381).
 const SHELL_BRIDGE_JS: &str = r#"
-function freenetBridge(authToken) {
+function freenetBridge(authToken, userToken, hostedMode) {
   'use strict';
   var LOCAL_API_ORIGIN = location.origin;
   var MAX_CONNECTIONS = 32;
@@ -1012,6 +1105,67 @@ function freenetBridge(authToken) {
   var connections = new Map();
   var lastClipboard = 0;
   var lastDownload = 0;
+
+  // FAIL CLOSED whenever a HOSTED browser has no usable per-user token (#4381).
+  //
+  // In hosted mode a browser must ALWAYS operate under its own per-user token;
+  // there is no legitimate "hosted browser as anonymous Local" state — that is
+  // exactly the shared-namespace contamination we refuse. The backend's
+  // permissive no-token -> Local mapping exists for the gate's own first-connect
+  // reasons, but the shell enforces per-user for browsers by refusing when it
+  // has no token.
+  //
+  // `userToken` ends up undefined for either reason, and BOTH must fail closed:
+  //   - hosted + http: the plaintext-transmit guards (SHELL_USER_TOKEN_JS's
+  //     `location.protocol !== 'https:'` early return + the attach-side https
+  //     guard) deliberately withhold the token, so it arrives undefined here.
+  //   - hosted + https + storage/crypto failure: localStorage unavailable, or
+  //     crypto.getRandomValues / setItem throws, so SHELL_USER_TOKEN_JS's catch
+  //     returns undefined.
+  // Keying off `!userToken` (rather than re-checking the protocol) covers both
+  // with one condition. hosted + https + token-minted -> userToken truthy ->
+  // operate (per-user), unchanged. Non-hosted -> hostedMode undefined -> false
+  // -> inert, unchanged.
+  //
+  // We do NOT load the app iframe (so it cannot operate on the shared Local
+  // namespace) and we render a clear message instead; the WS-open handler
+  // below also refuses every connection while in this state, as a second
+  // independent barrier.
+  var hostedNoToken = hostedMode === true && !userToken;
+  if (hostedNoToken) {
+    var msg = document.createElement('div');
+    msg.setAttribute('role', 'alert');
+    msg.style.cssText =
+      'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;'
+      + 'padding:2rem;font:16px/1.5 system-ui,sans-serif;color:#1a1a1a;'
+      + 'background:#fff;text-align:center;box-sizing:border-box;';
+    var inner = document.createElement('div');
+    inner.style.maxWidth = '32rem';
+    var h = document.createElement('h1');
+    h.style.cssText = 'font-size:1.25rem;margin:0 0 0.75rem;';
+    h.textContent = 'Per-user isolation unavailable';
+    var p = document.createElement('p');
+    // Generic wording: the token may be missing because of a plaintext (http)
+    // connection OR because browser storage is unavailable. Both disable
+    // per-user isolation, so the app must not load in either case.
+    p.textContent =
+      'This hosted Freenet node requires HTTPS and browser storage for '
+      + 'per-user data isolation. Because that is unavailable here, the app '
+      + 'will not load. Reconnect using an https:// address in a browser with '
+      + 'storage enabled.';
+    inner.appendChild(h);
+    inner.appendChild(p);
+    msg.appendChild(inner);
+    // Remove the (not-yet-loaded, data-src) iframe and show the message. The
+    // iframe never had its .src set, so the app never started.
+    if (iframe && iframe.parentNode) { iframe.parentNode.removeChild(iframe); }
+    document.body.appendChild(msg);
+    document.title = 'Freenet — isolation unavailable';
+    // Keep listening for iframe messages purely so the WS-open handler can
+    // return an 'error' to any app that somehow loaded; but we never set
+    // iframe.src, so in practice nothing runs. Fall through to install the
+    // message listener (whose 'open' case refuses while hostedNoToken).
+  } else {
 
   // Build iframe src from data-src, appending any URL hash for deep
   // linking. Using data-src (not src) in the HTML means the iframe
@@ -1041,8 +1195,10 @@ function freenetBridge(authToken) {
       );
     } catch(e) {}
   }
+  } // end of the non-fail-closed iframe-load block
 
   function sendToIframe(msg) {
+    if (!iframe || !iframe.contentWindow) return;
     iframe.contentWindow.postMessage(msg, '*');
   }
 
@@ -1365,6 +1521,17 @@ function freenetBridge(authToken) {
 
     switch (msg.type) {
       case 'open': {
+        // FAIL CLOSED (#4381): a hosted browser with no per-user token must
+        // never open a socket, because that connection would land on the
+        // SHARED Local namespace (cross-user contamination). The token is
+        // absent over plaintext http (withheld) or on a storage/crypto
+        // failure. Refuse every open while hosted+no-token — a second
+        // independent barrier on top of not loading the iframe at all (see the
+        // hostedNoToken block at the top of freenetBridge).
+        if (hostedNoToken) {
+          sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
+          return;
+        }
         // Limit concurrent connections to prevent resource exhaustion
         if (connections.size >= MAX_CONNECTIONS) {
           sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
@@ -1387,8 +1554,33 @@ function freenetBridge(authToken) {
           sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
           return;
         }
+        // Strip any caller-supplied credentials BEFORE we inject our own, so
+        // the sandboxed app can never choose its own auth/user identity by
+        // putting these params on the WebSocket URL it asks us to open. This
+        // matters most for `userToken`: the conditional `set` below is skipped
+        // when our minted token is undefined (localStorage disabled / private
+        // mode in hosted mode), and without this delete a caller-supplied
+        // `userToken` (from the app, or reflected via a deep-link into the WS
+        // URL) would survive and let the app pick its own per-user secret
+        // namespace. The app must NEVER influence the namespace — only the
+        // shell-minted token may reach the backend. `authToken` is deleted for
+        // symmetric defense-in-depth even though the unconditional `set` below
+        // already overrides any caller value.
+        u.searchParams.delete('authToken');
+        u.searchParams.delete('userToken');
         // Inject auth token into the WebSocket URL
         u.searchParams.set('authToken', authToken);
+        // In hosted mode also present the durable per-user token so the node
+        // can scope a per-user delegate-secret namespace (P2 of #4381). The
+        // token is undefined in non-hosted mode, so the param is omitted (and,
+        // combined with the delete above, the URL carries no userToken at all).
+        // The `location.protocol === 'https:'` guard is a SECOND, independent
+        // REFUSE-PLAINTEXT-TOKEN barrier (the first is in SHELL_USER_TOKEN_JS,
+        // which never mints the token on an http page): two guards so a future
+        // refactor of either site can't reopen the plaintext-leak path. The
+        // shell is same-origin with the node, so `location.protocol` reflects
+        // whether the shell itself was served over TLS.
+        if (userToken && location.protocol === 'https:') { u.searchParams.set('userToken', userToken); }
         var ws = new WebSocket(u.toString(), msg.protocols || undefined);
         ws.binaryType = 'arraybuffer';
         connections.set(msg.id, ws);
@@ -3359,9 +3551,10 @@ mod tests {
         // and Safari because the iframe sandbox omitted `allow-downloads`.
         // Lock the token in so a future refactor does not regress the fix.
         let token = AuthToken::generate();
-        let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None, None).unwrap())
-                .await;
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, false).unwrap(),
+        )
+        .await;
         assert!(
             html.contains("allow-downloads"),
             "iframe sandbox missing `allow-downloads` — user-initiated \
@@ -3373,9 +3566,10 @@ mod tests {
     #[tokio::test]
     async fn shell_page_contains_iframe_and_bridge() {
         let token = AuthToken::generate();
-        let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None, None).unwrap())
-                .await;
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, false).unwrap(),
+        )
+        .await;
 
         // Shell page must contain sandboxed iframe
         assert!(
@@ -3448,9 +3642,10 @@ mod tests {
     #[tokio::test]
     async fn shell_page_permission_overlay_present_and_safe() {
         let token = AuthToken::generate();
-        let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None, None).unwrap())
-                .await;
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, false).unwrap(),
+        )
+        .await;
 
         // Overlay root and accessibility attributes
         assert!(
@@ -3622,9 +3817,10 @@ mod tests {
     #[tokio::test]
     async fn shell_page_iframe_uses_data_src_for_deep_linking() {
         let token = AuthToken::generate();
-        let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None, None).unwrap())
-                .await;
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, false).unwrap(),
+        )
+        .await;
 
         // The iframe must NOT have a src attribute (which would trigger an
         // immediate load before JS can append the hash fragment).
@@ -3645,9 +3841,10 @@ mod tests {
     async fn shell_page_forwards_query_params_to_iframe() {
         let token = AuthToken::generate();
         let qs = Some("invitation=abc123&room=test".to_string());
-        let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs, None).unwrap())
-                .await;
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, qs, None, false).unwrap(),
+        )
+        .await;
 
         // Query params should be forwarded to iframe src
         assert!(
@@ -3677,7 +3874,15 @@ mod tests {
 
         // Directory-style deep link.
         let html = response_body(
-            shell_page(&token, "testkey123", ApiVersion::V1, None, Some("news/")).unwrap(),
+            shell_page(
+                &token,
+                "testkey123",
+                ApiVersion::V1,
+                None,
+                Some("news/"),
+                false,
+            )
+            .unwrap(),
         )
         .await;
         assert!(
@@ -3693,6 +3898,7 @@ mod tests {
                 ApiVersion::V1,
                 None,
                 Some("about/team"),
+                false,
             )
             .unwrap(),
         )
@@ -3704,9 +3910,10 @@ mod tests {
 
         // `None` sub-path keeps the iframe pointed at the contract root —
         // pins that the new parameter does not change root-load behaviour.
-        let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None, None).unwrap())
-                .await;
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, false).unwrap(),
+        )
+        .await;
         assert!(
             html.contains(r#"data-src="/v1/contract/web/testkey123/?__sandbox=1""#),
             "root load must still point the iframe at the contract root; got: {html}"
@@ -3800,9 +4007,17 @@ mod tests {
         let handler = {
             let key = key.clone();
             tokio::spawn(async move {
-                contract_home(key, sender, token, ApiVersion::V1, None, Some("news/"))
-                    .await
-                    .map(|resp| resp.into_response())
+                contract_home(
+                    key,
+                    sender,
+                    token,
+                    ApiVersion::V1,
+                    None,
+                    Some("news/"),
+                    false,
+                )
+                .await
+                .map(|resp| resp.into_response())
             })
         };
 
@@ -3917,9 +4132,10 @@ mod tests {
     async fn shell_page_strips_sandbox_prefixed_params() {
         let token = AuthToken::generate();
         let qs = Some("__sandbox_extra=evil&invitation=abc&__sandboxFoo=bar".to_string());
-        let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs, None).unwrap())
-                .await;
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, qs, None, false).unwrap(),
+        )
+        .await;
 
         // __sandbox-prefixed params must be stripped
         assert!(
@@ -3950,9 +4166,10 @@ mod tests {
     async fn shell_page_strips_auth_token_from_forwarded_query() {
         let token = AuthToken::generate();
         let qs = Some("authToken=attacker_value&invite=abc&authTokenExtra=x".to_string());
-        let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs, None).unwrap())
-                .await;
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, qs, None, false).unwrap(),
+        )
+        .await;
         assert!(
             !html.contains("attacker_value"),
             "attacker-supplied authToken value must not reach iframe src"
@@ -3978,9 +4195,10 @@ mod tests {
     async fn shell_page_escapes_html_in_query_params() {
         let token = AuthToken::generate();
         let qs = Some("foo=\"><script>alert(1)</script>".to_string());
-        let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs, None).unwrap())
-                .await;
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, qs, None, false).unwrap(),
+        )
+        .await;
 
         // The double quote and angle brackets must be escaped
         assert!(
@@ -3990,6 +4208,296 @@ mod tests {
         assert!(
             html.contains("&quot;"),
             "double quote should be HTML-escaped"
+        );
+    }
+
+    /// Hosted mode (P2-frontend of #4381): the shell page must mint/load a
+    /// durable per-user token in `localStorage` and hand it to the bridge as a
+    /// second argument, so the proxied WebSocket upgrade carries
+    /// `?userToken=<token>`.
+    #[tokio::test]
+    async fn shell_page_hosted_mode_injects_user_token() {
+        let token = AuthToken::generate();
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, true).unwrap(),
+        )
+        .await;
+
+        // The localStorage token-minting snippet must be present.
+        assert!(
+            html.contains("__freenet_user_token__"),
+            "hosted-mode shell must include the durable localStorage token key; got: {html}"
+        );
+        assert!(
+            html.contains("crypto.getRandomValues"),
+            "hosted-mode token must be minted from crypto.getRandomValues, not request input"
+        );
+        assert!(
+            html.contains("localStorage.setItem"),
+            "hosted-mode token must be persisted to localStorage"
+        );
+        // The bridge must be called with the user-token argument AND the
+        // hosted-mode flag (so it can fail closed over http).
+        assert!(
+            html.contains(&format!(
+                "freenetBridge(\"{}\", __freenet_user_token, true);",
+                token.as_str()
+            )),
+            "hosted-mode shell must call freenetBridge with the user token and hosted flag; got: {html}"
+        );
+        // The bridge must NOT be called in the 1-arg form in hosted mode.
+        assert!(
+            !html.contains(&format!("freenetBridge(\"{}\");", token.as_str())),
+            "hosted-mode shell must not emit the 1-arg freenetBridge call"
+        );
+    }
+
+    /// Non-hosted mode must be byte-for-byte the pre-#4381 shell: no token
+    /// snippet, the original 1-arg `freenetBridge(...)` call, and no `userToken`
+    /// string anywhere. This is the no-regression guard for the default path.
+    #[tokio::test]
+    async fn shell_page_non_hosted_mode_omits_user_token() {
+        let token = AuthToken::generate();
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, false).unwrap(),
+        )
+        .await;
+
+        // The per-user-token MINTING machinery (the localStorage snippet and
+        // its `__freenet_user_token` variable) must be absent: a non-hosted
+        // visitor never gets a durable identity. Note the always-injected
+        // `SHELL_BRIDGE_JS` still *mentions* `userToken` as an inert, undefined
+        // closure argument guarded by `if (userToken)`, so we deliberately do
+        // not assert the substring `userToken` is wholly absent — we assert the
+        // minting snippet and the 2-arg call (the parts that actually activate
+        // the feature) are absent.
+        assert!(
+            !html.contains("__freenet_user_token"),
+            "non-hosted shell must not mint a per-user token; got: {html}"
+        );
+        assert!(
+            !html.contains("localStorage.setItem"),
+            "non-hosted shell must not persist a per-user token; got: {html}"
+        );
+        assert!(
+            !html.contains(", __freenet_user_token)"),
+            "non-hosted shell must not call freenetBridge with a user token"
+        );
+        // The original single-argument bridge call must be emitted unchanged
+        // (byte-for-byte the pre-#4381 output).
+        assert!(
+            html.contains(&format!("freenetBridge(\"{}\");", token.as_str())),
+            "non-hosted shell must emit the original 1-arg freenetBridge call; got: {html}"
+        );
+    }
+
+    /// Pins that the per-user-token machinery is wired through the bridge JS
+    /// itself (not just the page wrapper): the WS-open handler must append the
+    /// `userToken` query param to the real WebSocket URL when a token is set,
+    /// and `SHELL_USER_TOKEN_JS` must mint it from OS entropy.
+    #[test]
+    fn bridge_js_appends_user_token_param() {
+        assert!(
+            SHELL_BRIDGE_JS.contains("function freenetBridge(authToken, userToken, hostedMode)"),
+            "bridge function must accept the per-user token and hosted-mode arguments"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("u.searchParams.set('userToken', userToken)"),
+            "bridge must append userToken to the real WebSocket URL"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("if (userToken"),
+            "bridge must only append userToken when present (non-hosted = undefined)"
+        );
+        assert!(
+            SHELL_USER_TOKEN_JS.contains("crypto.getRandomValues"),
+            "user-token snippet must mint the token from OS entropy"
+        );
+        assert!(
+            SHELL_USER_TOKEN_JS.contains("__freenet_user_token__"),
+            "user-token snippet must persist under the durable localStorage key"
+        );
+    }
+
+    /// REFUSE-PLAINTEXT-TOKEN, client side (Codex review, #4513): the durable
+    /// per-user token is a high-value bearer secret and must never cross a
+    /// plaintext wire. Two INDEPENDENT guards enforce this so a refactor of
+    /// either can't reopen the leak:
+    ///   1. `SHELL_USER_TOKEN_JS` returns undefined on a non-https page BEFORE
+    ///      touching localStorage (never loads/mints/transmits the token), and
+    ///   2. the bridge WS-open handler gates the `userToken` append on
+    ///      `location.protocol === 'https:'`.
+    #[test]
+    fn user_token_never_transmitted_over_plaintext() {
+        // Guard 1: the https check must precede any localStorage access in the
+        // minting IIFE, so an http page returns undefined without reading the
+        // stored token.
+        let https_guard = SHELL_USER_TOKEN_JS
+            .find("location.protocol !== 'https:'")
+            .expect("user-token snippet must refuse to run on a non-https page");
+        // Anchor on the actual localStorage READ (`localStorage.getItem`), not
+        // the bare word "localStorage" which also appears in the rationale
+        // comment above the guard.
+        let first_storage_access = SHELL_USER_TOKEN_JS
+            .find("localStorage.getItem")
+            .expect("user-token snippet must read from localStorage");
+        assert!(
+            https_guard < first_storage_access,
+            "the https guard must run BEFORE any localStorage access so an http \
+             page never even reads a previously-minted token"
+        );
+        assert!(
+            SHELL_USER_TOKEN_JS.contains("return undefined"),
+            "the non-https branch must yield an undefined token"
+        );
+
+        // Guard 2: the bridge append is gated on https as a second barrier.
+        assert!(
+            SHELL_BRIDGE_JS.contains("location.protocol === 'https:'"),
+            "bridge must gate the userToken append on a secure connection"
+        );
+        let https_attach_guard = SHELL_BRIDGE_JS
+            .find("userToken && location.protocol === 'https:'")
+            .expect("bridge must only attach userToken over https");
+        let set_user = SHELL_BRIDGE_JS
+            .find("u.searchParams.set('userToken', userToken)")
+            .expect("bridge must have a userToken append site");
+        assert!(
+            https_attach_guard < set_user,
+            "the https guard must precede the userToken append"
+        );
+    }
+
+    /// FAIL CLOSED, not shared-Local (Codex review, #4381): a HOSTED browser
+    /// with no per-user token must REFUSE to operate, not silently connect onto
+    /// the shared Local delegate-secret namespace. The token is absent for two
+    /// reasons that BOTH must fail closed — plaintext http (token withheld by
+    /// the transmit guards) and https-but-storage/crypto-failure (mint throws,
+    /// catch returns undefined). The unified `hostedMode === true && !userToken`
+    /// condition covers both, so the test keys off the token-absent condition
+    /// rather than re-checking the protocol. The shell must (a) not load the
+    /// app, showing a message instead, and (b) refuse all WebSocket opens.
+    #[tokio::test]
+    async fn hosted_shell_fails_closed_when_no_user_token() {
+        // The hosted shell page must pass the hosted flag to the bridge so it
+        // CAN fail closed; without the third `true` arg the bridge can't tell
+        // it's hosted.
+        let token = AuthToken::generate();
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, true).unwrap(),
+        )
+        .await;
+        assert!(
+            html.contains(&format!(
+                "freenetBridge(\"{}\", __freenet_user_token, true);",
+                token.as_str()
+            )),
+            "hosted shell must pass the hosted flag (true) to the bridge; got: {html}"
+        );
+
+        // Unified guard: hosted AND no token (for ANY reason). Keying off
+        // `!userToken` covers both the http (token withheld) and the
+        // https-but-storage-failure (mint returned undefined) cases with one
+        // condition. Requires hostedMode === true so non-hosted (hostedMode
+        // undefined) is always inert, and a truthy token (hosted+https+minted)
+        // operates normally.
+        assert!(
+            SHELL_BRIDGE_JS.contains("hostedMode === true && !userToken"),
+            "fail-closed must require hosted mode AND an absent token (any cause)"
+        );
+        // The guard must NOT re-check the protocol — that would miss the
+        // https+storage-failure case (token undefined despite https).
+        assert!(
+            !SHELL_BRIDGE_JS.contains("hostedMode === true && location.protocol"),
+            "fail-closed must not key off the protocol (misses https+no-storage)"
+        );
+
+        // Effect 1 — the app is not loaded: the iframe is removed and a message
+        // is shown instead. Anchor on the removeChild of the iframe and the
+        // alert role.
+        assert!(
+            SHELL_BRIDGE_JS.contains("removeChild(iframe)"),
+            "fail-closed must not load the app iframe"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("role', 'alert'") || SHELL_BRIDGE_JS.contains("'alert'"),
+            "fail-closed must render a visible alert message"
+        );
+
+        // Effect 2 — the WS-open handler refuses while hostedNoToken, BEFORE it
+        // would otherwise open a socket on the shared Local namespace. Assert the
+        // refusal check precedes the real WebSocket construction.
+        let refuse = SHELL_BRIDGE_JS
+            .find("if (hostedNoToken)")
+            .expect("WS-open handler must refuse while hosted+no-token");
+        let open_socket = SHELL_BRIDGE_JS
+            .find("new WebSocket(u.toString()")
+            .expect("bridge must have a WebSocket open site");
+        assert!(
+            refuse < open_socket,
+            "the hostedNoToken refusal must precede opening the real socket"
+        );
+    }
+
+    /// Non-hosted mode must NEVER reach the fail-closed path: the bridge is
+    /// called with one argument, so `hostedMode` is undefined and the whole
+    /// hostedNoToken branch is inert — the app loads and connects over http
+    /// exactly as before #4381. (Single-user nodes commonly run over http.)
+    #[tokio::test]
+    async fn non_hosted_shell_never_fails_closed() {
+        let token = AuthToken::generate();
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, false).unwrap(),
+        )
+        .await;
+        // The 1-arg call leaves hostedMode undefined; `=== true` is then false.
+        assert!(
+            html.contains(&format!("freenetBridge(\"{}\");", token.as_str())),
+            "non-hosted shell must use the 1-arg freenetBridge call; got: {html}"
+        );
+        assert!(
+            !html.contains(", true);"),
+            "non-hosted shell must not pass the hosted-mode flag to the bridge"
+        );
+    }
+
+    /// Isolation-boundary regression (Codex review, #4513): the sandboxed app
+    /// must never be able to choose its own per-user (or auth) identity by
+    /// putting a `userToken` / `authToken` on the WebSocket URL it asks the
+    /// shell to open. The bridge must STRIP any caller-supplied credentials
+    /// before injecting its own, and the strip must run BEFORE the conditional
+    /// `set('userToken', ...)` — otherwise a caller token survives whenever the
+    /// shell's minted token is undefined (localStorage disabled / private mode),
+    /// letting the app pick its own secret namespace.
+    #[test]
+    fn bridge_js_strips_caller_supplied_user_token_before_injecting() {
+        let delete_user = SHELL_BRIDGE_JS
+            .find("u.searchParams.delete('userToken')")
+            .expect("bridge must delete any caller-supplied userToken");
+        let delete_auth = SHELL_BRIDGE_JS
+            .find("u.searchParams.delete('authToken')")
+            .expect("bridge must delete any caller-supplied authToken (defense-in-depth)");
+        let set_auth = SHELL_BRIDGE_JS
+            .find("u.searchParams.set('authToken', authToken)")
+            .expect("bridge must inject the shell's authToken");
+        // Anchor on the userToken append itself rather than the full
+        // conditional, whose guard expression is allowed to evolve (it now also
+        // carries the https barrier — see user_token_never_transmitted_over_plaintext).
+        let conditional_set_user = SHELL_BRIDGE_JS
+            .find("u.searchParams.set('userToken', userToken)")
+            .expect("bridge must conditionally inject the shell's minted userToken");
+
+        // The deletes must precede BOTH injection points, so a caller value can
+        // never survive — including the undefined-token path where the
+        // conditional set is skipped entirely.
+        assert!(
+            delete_user < conditional_set_user,
+            "delete('userToken') must run before the conditional set so a caller \
+             token cannot survive when the shell's token is undefined"
+        );
+        assert!(
+            delete_user < set_auth && delete_auth < set_auth,
+            "credential deletes must run before the authToken injection"
         );
     }
 

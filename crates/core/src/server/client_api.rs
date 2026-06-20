@@ -189,6 +189,7 @@ async fn web_home(
     req_headers: axum::http::HeaderMap,
     api_version: ApiVersion,
     query_string: Option<String>,
+    hosted_mode: bool,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     // Check if this is the sandboxed iframe requesting its content
     let is_sandbox = query_string
@@ -201,7 +202,16 @@ async fn web_home(
     }
 
     // Root document load: render the shell that wraps the contract root.
-    render_shell_response(key, &config, api_version, query_string, None, rs).await
+    render_shell_response(
+        key,
+        &config,
+        api_version,
+        query_string,
+        None,
+        rs,
+        hosted_mode,
+    )
+    .await
 }
 
 /// Generates a shell page response: a fresh auth token + secure cookie,
@@ -222,6 +232,7 @@ async fn render_shell_response(
     query_string: Option<String>,
     sub_path: Option<&str>,
     rs: HttpClientApiRequest,
+    hosted_mode: bool,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     use headers::{Header, HeaderMapExt};
 
@@ -241,9 +252,16 @@ async fn render_shell_response(
         .build();
 
     let token_header = headers::Authorization::bearer(token.as_str()).unwrap();
-    let contract_response =
-        path_handlers::contract_home(key, rs, token.clone(), api_version, query_string, sub_path)
-            .await?;
+    let contract_response = path_handlers::contract_home(
+        key,
+        rs,
+        token.clone(),
+        api_version,
+        query_string,
+        sub_path,
+        hosted_mode,
+    )
+    .await?;
 
     let mut response = contract_response.into_response();
     response.headers_mut().typed_insert(token_header);
@@ -277,6 +295,26 @@ async fn render_shell_response(
     Ok(response)
 }
 
+/// Reads the `HostedMode` flag for the contract-web (shell) route, TOLERANTLY.
+///
+/// The shell route is the per-user-token *minting/UX* point, not the security
+/// gate. Unlike the WebSocket `connection_info` middleware — where a missing
+/// `Extension<HostedMode>` MUST fail loud (a dropped flag there could silently
+/// put public users on a shared Local namespace) — this route must fail SAFE to
+/// off: absent extension ⇒ `HostedMode(false)` ⇒ the shell mints no userToken ⇒
+/// unchanged (non-hosted) behavior.
+///
+/// Why tolerant: only `serve_client_api_in_impl` installs the `Extension`. The
+/// public `HttpClientApi::as_router` composition path returns a router WITHOUT
+/// it, so a required extractor here would make `/v{1,2}/contract/web/...` reject
+/// with a missing-extension 500 even for plain sandbox requests — a regression
+/// for that supported standalone composition mode. The production serve path
+/// still installs the real `Extension`, so hosted mode works there.
+fn hosted_mode_or_default(ext: Option<Extension<crate::server::HostedMode>>) -> bool {
+    ext.map(|Extension(hm)| hm.0).unwrap_or(false)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn web_subpages(
     key: String,
     last_path: String,
@@ -285,6 +323,7 @@ async fn web_subpages(
     req_headers: axum::http::HeaderMap,
     config: &Config,
     request_sender: HttpClientApiRequest,
+    hosted_mode: bool,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     let is_sandbox = query_string
         .as_ref()
@@ -337,6 +376,7 @@ async fn web_subpages(
             query_string,
             Some(&last_path),
             request_sender,
+            hosted_mode,
         )
         .await;
     }
@@ -630,6 +670,87 @@ mod tests {
         assert!(is_html_page("page.HTML"));
         assert!(is_html_page("page.htm"));
         assert!(is_html_page("dir/page.html"));
+    }
+
+    /// The shell-route HostedMode read must fail SAFE to off: an absent
+    /// extension maps to `false` (no userToken minted), a present one to its
+    /// real value. This is the inverse of the WS gate, which fails loud.
+    #[test]
+    fn hosted_mode_or_default_absent_is_off() {
+        assert!(
+            !hosted_mode_or_default(None),
+            "absent HostedMode extension must map to hosted-off"
+        );
+        assert!(
+            !hosted_mode_or_default(Some(Extension(crate::server::HostedMode(false)))),
+            "present HostedMode(false) must stay off"
+        );
+        assert!(
+            hosted_mode_or_default(Some(Extension(crate::server::HostedMode(true)))),
+            "present HostedMode(true) must be honored"
+        );
+    }
+
+    /// Regression (Codex re-review of #4513): the contract-web shell route must
+    /// NOT require an `Extension<HostedMode>`. Only `serve_client_api_in_impl`
+    /// installs that layer; the public `HttpClientApi::as_router` composition
+    /// path does not. A required extractor here made `/v{1,2}/contract/web/...`
+    /// reject with axum's missing-extension 500 even for plain requests — a
+    /// regression for that supported standalone composition mode.
+    ///
+    /// We drive the REAL `as_router` router (the one lacking the layer). The
+    /// returned `HttpClientApi` owns the proxy receiver; we drop it so the
+    /// shell render's `NewConnection` send fails fast (closed channel) instead
+    /// of blocking. The point is only that the request reaches the handler body
+    /// — proving the extractor tolerated the absent extension — so we assert the
+    /// response body is NOT axum's "Missing request extension" rejection.
+    #[tokio::test]
+    async fn contract_web_route_does_not_require_hosted_mode_extension() {
+        use axum::body::to_bytes;
+        use tower::ServiceExt;
+
+        // A syntactically valid contract key so routing + key parsing succeed
+        // and execution reaches the shell-render body.
+        let key = "EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr";
+
+        for uri in [
+            format!("/v1/contract/web/{key}/"),
+            format!("/v2/contract/web/{key}/"),
+        ] {
+            // `as_router` is the standalone composition path with NO HostedMode
+            // layer. EXPLICITLY drop the returned `HttpClientApi` (it owns the
+            // proxy receiver) so the handler's `NewConnection` send hits a
+            // closed channel and fails fast — otherwise the shell render would
+            // block awaiting a `NewId` reply that nothing services. A bare
+            // `_api` binding would keep the receiver alive to end-of-scope, so
+            // we `drop` it by name.
+            let (api, router) = HttpClientApi::as_router(&"127.0.0.1:0".parse().unwrap());
+            drop(api);
+
+            let req = axum::http::Request::builder()
+                .uri(&uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            // Timeout guard: if a future change makes this route block (e.g. the
+            // send no longer fails fast), surface it as a clear assertion rather
+            // than a CI hang.
+            let resp =
+                tokio::time::timeout(std::time::Duration::from_secs(10), router.oneshot(req))
+                    .await
+                    .unwrap_or_else(|_| panic!("{uri} shell route hung instead of returning"))
+                    .unwrap();
+
+            // Whatever the handler does downstream (here: a fast NodeError from
+            // the closed channel), it must NOT be axum's extractor rejection.
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert!(
+                !body.contains("Missing request extension"),
+                "{uri} must tolerate an absent HostedMode extension, not 500 on \
+                 the missing extractor; got status {status}, body: {body}"
+            );
+        }
     }
 
     #[test]
@@ -935,6 +1056,7 @@ mod tests {
                     headers,
                     &localhost_config(),
                     sender,
+                    false,
                 )
                 .await
                 .map(|_| ())
@@ -968,6 +1090,7 @@ mod tests {
             headers,
             &localhost_config(),
             dead_request_sender(),
+            false,
         )
         .await
         .expect("sandbox document load must redirect, not error");
@@ -987,6 +1110,7 @@ mod tests {
             axum::http::HeaderMap::new(),
             &localhost_config(),
             dead_request_sender(),
+            false,
         )
         .await;
         match res {
