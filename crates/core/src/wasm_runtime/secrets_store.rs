@@ -1152,7 +1152,11 @@ impl SecretsStore {
             }
         };
         if blob.len() < HEADER_LEN || blob.first().copied() != Some(VERSION_V1) {
-            tracing::warn!(path = %path.display(), "key registry blob malformed; ignoring");
+            tracing::warn!(
+                path = %path.display(),
+                "key registry blob MALFORMED; ignoring (enumeration empty for this scope; a \
+                 subsequent register/deregister will overwrite it, dropping prior keys)"
+            );
             return Vec::new();
         }
         let encryption = self.encryption_for_scope_read(delegate, scope);
@@ -1162,7 +1166,9 @@ impl SecretsStore {
             Err(_) => {
                 tracing::warn!(
                     path = %path.display(),
-                    "key registry decrypt failed; enumeration will be empty for this scope"
+                    "key registry decrypt FAILED; enumeration returns empty for this scope and \
+                     the NEXT register_key/deregister_key will rewrite the registry from empty, \
+                     dropping any keys this corrupt blob held (secret VALUES are unaffected)"
                 );
                 Vec::new()
             }
@@ -1219,7 +1225,20 @@ impl SecretsStore {
         if let Err(e) = ensure_owner_only_tree(&self.base_path, &scope_path) {
             tracing::warn!(path = %scope_path.display(), error = %e, "chmod scope dir tree failed (key registry)");
         }
-        let tmp_path = path.with_extension("keys.tmp");
+        // `.with_extension(...)` is wrong for the `.keys` dotfile: a
+        // leading-dot filename is all stem with no extension, so
+        // `.with_extension("keys.tmp")` would yield `.keys.keys.tmp`.
+        // Build the sibling tmp path by appending the suffix to the full
+        // file name instead, giving `.keys.tmp`. A fixed suffix is safe
+        // because `&mut self` precludes concurrent in-process writers.
+        let tmp_path = {
+            let mut name = path
+                .file_name()
+                .map(|n| n.to_os_string())
+                .unwrap_or_else(|| std::ffi::OsString::from(KEY_REGISTRY_FILE));
+            name.push(".tmp");
+            scope_path.join(name)
+        };
         let write_res = (|| -> std::io::Result<()> {
             let mut file = create_owner_only(&tmp_path)?;
             file.write_all(&blob)?;
@@ -1228,7 +1247,12 @@ impl SecretsStore {
         })();
         if let Err(e) = write_res {
             tracing::warn!(path = %path.display(), error = %e, "failed to persist key registry");
-            let _ = fs::remove_file(&tmp_path);
+            // Best-effort cleanup of the orphaned tmp file; a leftover tmp is
+            // harmless (the next write unlinks it via `create_owner_only`) so
+            // a failure to remove it here is intentionally ignored.
+            if let Err(rm_err) = fs::remove_file(&tmp_path) {
+                tracing::debug!(path = %tmp_path.display(), error = %rm_err, "tmp registry cleanup failed (harmless)");
+            }
         }
     }
 
@@ -1236,6 +1260,18 @@ impl SecretsStore {
     /// after a secret VALUE has been durably committed by `store_secret`.
     /// Idempotent (re-storing an existing key is a no-op for the registry) and
     /// capped at [`MAX_REGISTERED_KEYS_PER_SCOPE`] to bound amplification.
+    ///
+    /// Best-effort / advisory, with one honest caveat: if the existing
+    /// registry blob is unreadable (decrypt/parse failure),
+    /// [`read_key_registry`](Self::read_key_registry) returns an empty list
+    /// (logging loudly), so this re-write persists ONLY the new key and any
+    /// previously-registered keys that the corrupt blob held are dropped from
+    /// the registry. This never affects the secret VALUES themselves — only
+    /// future enumeration — but it does mean a single corrupt registry write
+    /// can shrink the enumerable key set. We accept this rather than aborting
+    /// the store (the value write has already committed) or risking an
+    /// ever-growing un-prunable registry; the loud warn in `read_key_registry`
+    /// is the operator's signal that enumeration coverage regressed.
     fn register_key(
         &self,
         delegate: &DelegateKey,
@@ -2092,6 +2128,60 @@ mod test {
         assert_eq!(
             store.list_secret_keys(delegate.key(), SecretScope::Local, b""),
             vec![b"room:carol".to_vec()]
+        );
+        Ok(())
+    }
+
+    /// Regression for the registry tmp-path nit: the registry file is the
+    /// dotfile `.keys`, which is all-stem with no extension, so the old
+    /// `path.with_extension("keys.tmp")` produced `.keys.keys.tmp` — a tmp
+    /// file with the wrong name (and, on a write error, a stray file under a
+    /// name the cleanup path didn't expect). After a successful registry
+    /// write the scope dir must contain exactly the active `.keys` file and
+    /// NO `.keys`-derived tmp sibling (neither `.keys.tmp` nor the buggy
+    /// `.keys.keys.tmp`).
+    #[tokio::test]
+    async fn key_registry_tmp_path_is_correct() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+        let delegate = Delegate::from((&vec![12].into(), &vec![].into()));
+
+        store.store_secret(
+            delegate.key(),
+            &SecretsId::new(b"room:dave".to_vec()),
+            SecretScope::Local,
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+
+        let scope_dir = secrets_dir.join(delegate.key().encode());
+        let names: Vec<String> = std::fs::read_dir(&scope_dir)?
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+
+        // The registry landed under exactly the dotfile name.
+        assert!(
+            names.iter().any(|n| n == KEY_REGISTRY_FILE),
+            "expected active registry file {KEY_REGISTRY_FILE:?}, dir held {names:?}"
+        );
+        // The rename consumed the tmp file; neither the correct tmp name nor
+        // the buggy double-stem name may survive.
+        assert!(
+            !names.iter().any(|n| n == ".keys.tmp"),
+            "stray .keys.tmp left behind: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == ".keys.keys.tmp"),
+            "buggy .keys.keys.tmp tmp name produced: {names:?}"
+        );
+
+        // And the registry is still functional after the corrected write.
+        assert_eq!(
+            store.list_secret_keys(delegate.key(), SecretScope::Local, b""),
+            vec![b"room:dave".to_vec()]
         );
         Ok(())
     }
