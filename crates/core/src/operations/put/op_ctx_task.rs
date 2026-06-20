@@ -1026,51 +1026,101 @@ async fn run_relay_put<CB>(
 /// Returns `true` when the relay should stop forwarding and finalize
 /// locally.
 ///
-/// Termination is intentionally preferred over re-routing to some other,
-/// closer candidate: once the router's predicted-best next hop is
-/// non-improving, this node is already the closest-seen point on the
-/// chain, so finalizing here places the authoritative replica where
-/// greedy GETs will descend rather than gambling on a different forward
-/// that the skip-list/HTL machinery would have to unwind.
+/// # The away-move alone is NOT sufficient (issue direction A)
 ///
-/// # Choice of `k`
+/// Issue #4363 frames the fix precisely: terminate at the closest-seen
+/// node "when the routing chain moves *away* from the target location
+/// **for k consecutive hops**". The naive `k == 1` reading — "the next
+/// hop is non-improving, so stop" — is WRONG on the sparse/bootstrap
+/// topologies this code runs on, and regresses placement instead of
+/// fixing it:
 ///
-/// The issue framed this as "move away for *k* consecutive hops, then
-/// terminate at the closest-seen node". We use the strongest correct
-/// stop condition, `k == 1`: terminate as soon as the only available
-/// next hop is not strictly closer than this node. Rationale:
+/// - The originator's own loopback relay runs this guard at full HTL
+///   from a node whose location is unrelated to the contract. Its only
+///   forwardable peer is frequently *farther* from the target than the
+///   originator itself (the originator just happens to sit closer to a
+///   random contract location than its handful of bootstrap peers). A
+///   `k == 1` guard finalizes the PUT *at the originator*, so the
+///   contract is never forwarded into its neighbourhood at all — and a
+///   later greedy SUBSCRIBE/GET descending toward the contract location
+///   "not found after exhaustive search". (Regression caught by
+///   `test_multiple_clients_subscription` /
+///   `test_nat_peer_remote_subscription_receives_update`.)
+/// - More generally, "the next hop is farther" is the *normal* state for
+///   every hop before the chain has actually reached the contract
+///   neighbourhood; treating it as a terminus stops forward replication
+///   dead.
 ///
-/// - Each relay is an independent task with no shared routing history,
-///   so a `k > 1` consecutive-away counter would have to be threaded
-///   through the `PutMsg::Request` wire format (a positional bincode
-///   field add + `MIN_COMPATIBLE_VERSION` bump) — disproportionate for
-///   this fix and out of scope for one logical change.
-/// - `k == 1` *is* the classic greedy-routing terminus and the same
-///   condition the ring already uses for connection acceptance, so it
-///   keeps PUT placement consistent with topology formation.
-/// - The skip-list still prevents loops, and HTL still bounds the chain,
-///   so terminating early never strands a PUT — it just stops it
-///   overshooting the neighbourhood it already reached.
+/// # Closest-seen as a no-wire-format proxy (k == 2)
 ///
-/// The guard only fires when both locations are known; a node with no
-/// location (pre-join / unknown addr) cannot reason about "closer", so
-/// it falls back to the previous forward-always behaviour.
+/// We cannot thread a shared "closest distance seen so far" / consecutive
+/// away-hop counter through the relay without a positional add to the
+/// `PutMsg::Request` wire format (and a `MIN_COMPATIBLE_VERSION` bump).
+/// But the inbound hop already carries exactly the evidence direction (A)
+/// needs: the location of the **upstream** node that forwarded this
+/// Request to us. If `upstream → own` was itself a step *toward* the
+/// target (this node is strictly closer to the target than its
+/// upstream), then the chain has been making progress and this node is
+/// the closest-seen point so far; an outbound non-improving hop from here
+/// is the genuine overshoot the issue describes. We therefore require
+/// BOTH:
+///
+///   1. `own` is strictly closer to `target` than `upstream` — the chain
+///      descended to reach us (closest-seen so far), AND
+///   2. `next_hop` is not strictly closer to `target` than `own` — the
+///      only forwardable hop moves away.
+///
+/// This is effectively `k == 2` (one observed descending hop in, one
+/// observed away hop out) realized entirely from state already on hand,
+/// with no wire-format change. It is the minimal condition that fixes
+/// #4363's overshoot without terminating chains that have not yet reached
+/// the neighbourhood:
+///
+/// - At the originator loopback, `upstream == own`, so clause (1) is
+///   false → never self-terminate → the PUT is forwarded normally.
+/// - On a chain still descending toward the target, clause (2) is false
+///   → keep forwarding.
+/// - Only once the chain has provably descended to a local minimum and
+///   the next hop would climb back out do we finalize — placing the
+///   authoritative replica at the closest-seen node, exactly as the
+///   ring's accept-only-at-terminus rule places connections.
+///
+/// The skip-list still prevents loops and HTL still bounds the chain, so
+/// the guard only ever *shortens* an overshooting tail; it never strands
+/// a PUT that had further legitimate progress to make.
+///
+/// The guard only fires when all three locations are known; a node with
+/// no location (pre-join / unknown addr) or an unresolvable upstream
+/// cannot reason about "closer", so it falls back to forward-always.
 fn put_routing_should_terminate(
+    upstream_loc: Option<Location>,
     own_loc: Option<Location>,
     next_hop_loc: Option<Location>,
     target: Location,
 ) -> bool {
-    let (own_loc, next_hop_loc) = match (own_loc, next_hop_loc) {
-        (Some(own), Some(next)) => (own, next),
-        // Unknown own/next location: cannot compare distances, so keep
-        // the prior forward-always behaviour rather than guess.
+    let (upstream_loc, own_loc, next_hop_loc) = match (upstream_loc, own_loc, next_hop_loc) {
+        (Some(up), Some(own), Some(next)) => (up, own, next),
+        // Unknown upstream/own/next location: cannot compare distances,
+        // so keep the prior forward-always behaviour rather than guess.
         _ => return false,
     };
+    let upstream_dist = upstream_loc.distance(target).as_f64();
     let own_dist = own_loc.distance(target).as_f64();
     let next_dist = next_hop_loc.distance(target).as_f64();
-    // Terminate when the next hop is NOT strictly closer to the target
-    // than we are: this node is a greedy local optimum (the terminus).
-    next_dist >= own_dist
+
+    // Clause (1): the chain descended to reach us. The inbound hop
+    // (upstream → own) moved strictly closer to the target, so this node
+    // is the closest-seen point so far. At the originator loopback
+    // `upstream == own`, making this strictly-less comparison false and
+    // leaving the originator unguarded.
+    let descended_to_here = own_dist < upstream_dist;
+
+    // Clause (2): the only forwardable next hop is NOT strictly closer to
+    // the target than we are — forwarding would climb back out of the
+    // neighbourhood we just reached (the #4363 overshoot).
+    let next_hop_moves_away = next_dist >= own_dist;
+
+    descended_to_here && next_hop_moves_away
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1128,29 +1178,44 @@ where
 
     let (next_peer, next_addr) = match next_hop {
         Some(peer) => {
-            // Greedy-routing terminus guard (#4363): if the best next
-            // hop is not strictly closer to the contract location than
-            // this node, stop forwarding and finalize here. This is the
-            // closest-seen node along the chain; pushing the request to
-            // a farther peer would overshoot the contract neighbourhood
-            // and place the authoritative replica where greedy GETs
-            // never descend.
+            // Greedy-routing terminus guard (#4363): finalize here only
+            // when the chain has provably descended to this node (the
+            // closest-seen point) AND the best next hop would climb back
+            // out of the contract neighbourhood. Forwarding past an
+            // overshoot would place the authoritative replica where
+            // greedy GETs never descend; terminating *before* the chain
+            // has reached the neighbourhood (e.g. at the originator
+            // loopback) would strand the contract far from the target —
+            // see `put_routing_should_terminate` for why the away-move
+            // alone is not a sufficient stop condition.
             let target = crate::ring::Location::from(&key);
             // own_location() is the address-derived ring position (not the
             // configured get_stored_location()); this matches the
             // is_subscription_root precedent, which also reasons about "am
             // I the routing terminus" from the address-derived location.
             let own_loc = op_manager.ring.connection_manager.own_location().location();
+            // Upstream location resolves the inbound hop so the guard can
+            // tell "the chain descended to reach me" from "I just happen
+            // to sit closer to a random contract than my bootstrap peers".
+            // At the originator loopback (`upstream_addr == own_addr`) this
+            // resolves to our own location, leaving the originator
+            // unguarded by construction.
+            let upstream_loc = op_manager
+                .ring
+                .connection_manager
+                .get_peer_by_addr(upstream_addr)
+                .and_then(|p| p.location());
             let next_hop_loc = peer.location();
-            if put_routing_should_terminate(own_loc, next_hop_loc, target) {
+            if put_routing_should_terminate(upstream_loc, own_loc, next_hop_loc, target) {
                 tracing::info!(
                     tx = %incoming_tx,
                     contract = %key,
+                    upstream_location = ?upstream_loc.map(|l| l.as_f64()),
                     own_location = ?own_loc.map(|l| l.as_f64()),
                     next_hop_location = ?next_hop_loc.map(|l| l.as_f64()),
                     target_location = %target.as_f64(),
                     phase = "relay_put_terminus",
-                    "PUT relay: next hop not closer than self; finalizing here (#4363)"
+                    "PUT relay: chain descended here and next hop moves away; finalizing here (#4363)"
                 );
                 let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
                 return relay_put_finalize_local(
@@ -2163,25 +2228,37 @@ where
     };
 
     // Greedy-routing terminus guard (#4363), streaming path. Mirrors the
-    // non-streaming `drive_relay_put` guard: if the best next hop is not
-    // strictly closer to the contract location than this node, drop it so
-    // the driver finalizes locally (the stream is assembled and stored
-    // here in step 5/6 regardless) instead of piping the replica to a
-    // farther peer the contract neighbourhood will never descend to.
+    // non-streaming `drive_relay_put` guard: finalize here only when the
+    // chain has descended to this node AND the next hop would climb back
+    // out (the overshoot). The stream is assembled and stored here in
+    // step 5/6 regardless, so terminating never drops the contract — it
+    // just stops piping the replica to a farther peer the contract
+    // neighbourhood will never descend to. The away-move alone is not a
+    // sufficient stop condition; see `put_routing_should_terminate`.
     let next_hop = match next_hop {
         Some(peer) => {
             let target = crate::ring::Location::from(&contract_key);
             let own_loc = op_manager.ring.connection_manager.own_location().location();
+            // Resolve the inbound hop so the guard can require "the chain
+            // descended to reach me" before treating an away-move as
+            // overshoot. Originator loopback resolves to our own location
+            // (unresolvable upstream), leaving it unguarded.
+            let upstream_loc = op_manager
+                .ring
+                .connection_manager
+                .get_peer_by_addr(upstream_addr)
+                .and_then(|p| p.location());
             let next_hop_loc = peer.location();
-            if put_routing_should_terminate(own_loc, next_hop_loc, target) {
+            if put_routing_should_terminate(upstream_loc, own_loc, next_hop_loc, target) {
                 tracing::info!(
                     tx = %incoming_tx,
                     contract = %contract_key,
+                    upstream_location = ?upstream_loc.map(|l| l.as_f64()),
                     own_location = ?own_loc.map(|l| l.as_f64()),
                     next_hop_location = ?next_hop_loc.map(|l| l.as_f64()),
                     target_location = %target.as_f64(),
                     phase = "relay_put_streaming_terminus",
-                    "PUT streaming relay: next hop not closer than self; finalizing here (#4363)"
+                    "PUT streaming relay: chain descended here and next hop moves away; finalizing here (#4363)"
                 );
                 None
             } else {
@@ -2551,13 +2628,19 @@ mod tests {
     /// to 0.211 never found the replica.
     ///
     /// `put_routing_should_terminate` is the greedy-terminus guard that
-    /// stops the wander: when sitting on the close node (≈0.181, i.e.
-    /// distance 0.03 from the 0.211 target) and the only forwardable
-    /// next hop (0.868, distance 0.343) is FARTHER, the relay must
-    /// terminate here instead of forwarding to the farther peer.
+    /// stops the wander: when the chain has DESCENDED to the close node
+    /// (≈0.181, distance 0.03 from the 0.211 target) from a farther
+    /// upstream, and the only forwardable next hop (0.868, distance
+    /// 0.343) is FARTHER, the relay must terminate here instead of
+    /// forwarding to the farther peer.
     #[test]
     fn put_routing_terminates_when_next_hop_moves_away_from_target() {
         let target = Location::new(0.211);
+        // Upstream that forwarded to us — farther from the target, so the
+        // inbound hop was a descending move (the chain reached us by
+        // getting closer). Without this, the away-move alone is the
+        // normal pre-neighbourhood state and MUST NOT terminate.
+        let upstream = Location::new(0.868); // distance 0.343
         // Close node: distance 0.03 from target (matches the hop-3 node
         // in the diagnostic run).
         let own = Location::new(0.181);
@@ -2570,21 +2653,81 @@ mod tests {
             "own node should be ~0.03 from target"
         );
         assert!(
+            own.distance(target).as_f64() < upstream.distance(target).as_f64(),
+            "inbound hop must be a descending move (own closer than upstream)"
+        );
+        assert!(
             next_hop.distance(target).as_f64() > own.distance(target).as_f64(),
             "next hop must be farther than own node (the away-move)"
         );
 
         assert!(
-            put_routing_should_terminate(Some(own), Some(next_hop), target),
-            "must terminate when the only next hop moves away from the target"
+            put_routing_should_terminate(Some(upstream), Some(own), Some(next_hop), target),
+            "must terminate when the chain descended here and the only next \
+             hop moves away from the target"
+        );
+    }
+
+    /// Regression for the #4509 over-aggressive guard. The originator's
+    /// own loopback relay runs with `upstream == own` (the loopback maps
+    /// `source_addr=None` to `upstream_addr=own_addr`). It frequently sits
+    /// closer to a random contract than its sparse bootstrap peers, so a
+    /// guard that fired on the away-move alone would finalize the PUT *at
+    /// the originator* — never forwarding the contract into its
+    /// neighbourhood, and making later SUBSCRIBE/GET fail "not found after
+    /// exhaustive search" (`test_multiple_clients_subscription`) /
+    /// "not cached locally" (`test_nat_peer_remote_subscription_*`). With
+    /// `upstream == own`, clause (1) "descended to here" is false, so the
+    /// originator MUST keep forwarding even though its only next hop is
+    /// farther.
+    #[test]
+    fn put_routing_does_not_terminate_at_originator_loopback() {
+        let target = Location::new(0.211);
+        // Originator sits closer to the contract than its only peer, but
+        // the inbound hop is a self-loop (upstream == own).
+        let own = Location::new(0.181); // distance 0.03
+        let next_hop = Location::new(0.868); // distance 0.343 — farther
+        assert!(
+            next_hop.distance(target).as_f64() > own.distance(target).as_f64(),
+            "test setup: next hop is farther (the away-move the old guard tripped on)"
+        );
+        assert!(
+            !put_routing_should_terminate(Some(own), Some(own), Some(next_hop), target),
+            "originator loopback (upstream == own) must NEVER self-terminate — \
+             the chain has not descended anywhere yet"
+        );
+    }
+
+    /// Normal forward replication on a chain that has NOT yet reached the
+    /// neighbourhood: the inbound hop did not descend (upstream was closer
+    /// or equal), so even a non-improving next hop must keep forwarding.
+    /// This is the dominant case on sparse/bootstrap topologies and the
+    /// one the over-aggressive `k == 1` guard regressed.
+    #[test]
+    fn put_routing_forwards_when_chain_has_not_descended() {
+        let target = Location::new(0.211);
+        // Upstream was already as close as us (no descending inbound hop).
+        let upstream = Location::new(0.181); // distance 0.03
+        let own = Location::new(0.5); // distance 0.289 — we moved AWAY coming in
+        let next_hop = Location::new(0.868); // distance 0.343 — also farther
+        assert!(
+            own.distance(target).as_f64() > upstream.distance(target).as_f64(),
+            "test setup: inbound hop did not descend"
+        );
+        assert!(
+            !put_routing_should_terminate(Some(upstream), Some(own), Some(next_hop), target),
+            "must keep forwarding when the chain has not descended to us — \
+             terminating here would strand the contract far from the target"
         );
     }
 
     /// Happy path: when the next hop is strictly closer to the target
-    /// than this node, the relay keeps forwarding (no premature stop).
+    /// than this node, the relay keeps forwarding (no premature stop) —
+    /// regardless of the inbound hop.
     #[test]
     fn put_routing_forwards_when_next_hop_is_closer() {
         let target = Location::new(0.211);
+        let upstream = Location::new(0.7); // distance 0.489 (descending inbound)
         let own = Location::new(0.5); // distance 0.289
         let next_hop = Location::new(0.3); // distance 0.089 — closer
         assert!(
@@ -2592,18 +2735,20 @@ mod tests {
             "test setup: next hop must be closer"
         );
         assert!(
-            !put_routing_should_terminate(Some(own), Some(next_hop), target),
+            !put_routing_should_terminate(Some(upstream), Some(own), Some(next_hop), target),
             "must keep forwarding when the next hop makes progress"
         );
     }
 
-    /// Boundary: a next hop at exactly the same distance as this node is
-    /// not progress, so the relay terminates (the `>=` half of the
-    /// strictly-closer rule). Prevents two equidistant peers from
-    /// ping-ponging the request.
+    /// Boundary: once the chain has descended here, a next hop at exactly
+    /// the same distance as this node is not progress, so the relay
+    /// terminates (the `>=` half of the strictly-closer rule). Prevents
+    /// two equidistant peers from ping-ponging the request.
     #[test]
     fn put_routing_terminates_on_equal_distance_next_hop() {
         let target = Location::new(0.5);
+        // Upstream farther than us so clause (1) holds (we descended here).
+        let upstream = Location::new(0.8); // distance 0.3
         // Both 0.1 from target (one CCW, one CW) → equal distance. Using
         // values away from the 0.0/1.0 wrap-around keeps the two
         // subtractions bit-identical so the equality is exact.
@@ -2615,28 +2760,37 @@ mod tests {
             "test setup: both peers equidistant from target"
         );
         assert!(
-            put_routing_should_terminate(Some(own), Some(next_hop), target),
-            "equal-distance next hop is not progress; must terminate"
+            own.distance(target).as_f64() < upstream.distance(target).as_f64(),
+            "test setup: inbound hop descended"
+        );
+        assert!(
+            put_routing_should_terminate(Some(upstream), Some(own), Some(next_hop), target),
+            "equal-distance next hop is not progress; must terminate once descended"
         );
     }
 
-    /// Edge: unknown own or next-hop location must fall back to the
+    /// Edge: unknown upstream/own/next-hop location must fall back to the
     /// prior forward-always behaviour (cannot reason about "closer").
     #[test]
     fn put_routing_does_not_terminate_when_location_unknown() {
         let target = Location::new(0.211);
         let known = Location::new(0.181);
+        let farther = Location::new(0.868);
         assert!(
-            !put_routing_should_terminate(None, Some(known), target),
+            !put_routing_should_terminate(None, Some(known), Some(farther), target),
+            "unknown upstream location must not trigger termination"
+        );
+        assert!(
+            !put_routing_should_terminate(Some(farther), None, Some(known), target),
             "unknown own location must not trigger termination"
         );
         assert!(
-            !put_routing_should_terminate(Some(known), None, target),
+            !put_routing_should_terminate(Some(farther), Some(known), None, target),
             "unknown next-hop location must not trigger termination"
         );
         assert!(
-            !put_routing_should_terminate(None, None, target),
-            "both unknown must not trigger termination"
+            !put_routing_should_terminate(None, None, None, target),
+            "all unknown must not trigger termination"
         );
     }
 
