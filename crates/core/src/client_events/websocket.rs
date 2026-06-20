@@ -762,32 +762,79 @@ fn is_loopback_source(ip: std::net::IpAddr) -> bool {
     }
 }
 
+/// Whether the request `Host` header names a LOCAL host: the literal hostname
+/// `localhost`, or a loopback IP literal (`127.0.0.0/8` / `[::1]`), with or
+/// without a `:port` suffix.
+///
+/// Used to distinguish a **direct** local browser (`Host: localhost:7509`, the
+/// dominant dev/desktop case — must keep working over plaintext) from a request
+/// that came **through a reverse proxy** addressed by a public name
+/// (`Host: try.freenet.org`), which needs HTTPS evidence before its token is
+/// honored. A loopback SOURCE only proves the proxy→node hop is local; the Host
+/// distinguishes "the loopback hop is the whole path" (local Host) from "there
+/// was an upstream browser→proxy hop whose TLS we must verify" (non-local Host).
+///
+/// Reuses [`parse_host_header_ip`] (the same strict `Host`-IP parser the
+/// CSWSH/CIDR check uses) for the IP-literal case, and matches the bare
+/// `localhost` name that [`HostAllowlistBuilder::add_localhost`] registers, so
+/// this notion of "localhost host" stays consistent with the rest of the layer.
+/// Conservative by construction: a public hostname has no loopback IP literal
+/// and is not `localhost`, so it returns `false` (→ HTTPS required).
+fn host_header_is_local(host_header: &str) -> bool {
+    let host = host_header.trim();
+    // Bare hostname `localhost`, optionally with a `:port` suffix. Match the
+    // host-part case-insensitively; reject `localhost.evil.com` by splitting on
+    // the first `:` only and comparing the whole host-part.
+    let host_part = host.rsplit_once(':').map_or(host, |(h, _)| h);
+    if host_part.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    // Loopback IP literal (`127.0.0.1[:port]`, `[::1][:port]`, `127.x.y.z`, …).
+    match parse_host_header_ip(host) {
+        Some(ip) => is_loopback_source(ip),
+        None => false,
+    }
+}
+
 /// The security-critical gate: decide whether to honor a per-user `userToken`.
 ///
 /// HONOR only when the connection is demonstrably secure, so an operator who
-/// accidentally exposes the plaintext HTTP port to the internet cannot leak the
-/// durable, node-independent token. A connection is "secure" when:
+/// accidentally exposes a plaintext HTTP port to the internet — directly OR
+/// through a reverse proxy — cannot leak the durable, node-independent token.
 ///
-/// - the source address is **loopback** (`127.0.0.0/8` / `::1`) — a direct local
-///   browser, or a TLS-terminating reverse proxy colocated on the same host; OR
-/// - it carries `X-Forwarded-Proto: https` **and** the source is **loopback** (a
-///   TLS-terminating proxy on the same host that forwards the original scheme).
+/// A loopback SOURCE proves only that the proxy→node hop is local; it does NOT
+/// prove the browser→proxy hop used TLS. A same-host reverse proxy accidentally
+/// serving public **plaintext** http still presents a loopback source. So we
+/// bring the request `Host` into the decision to distinguish a direct local
+/// browser (safe) from a proxied request (needs HTTPS evidence):
 ///
-/// `X-Forwarded-Proto` is trusted **only** from a loopback source. From any
-/// off-host source it is client-spoofable (`curl -H 'X-Forwarded-Proto: https'`),
-/// so it is never trusted there — which is why a loopback source is required on
-/// BOTH branches above, and the XFP branch can only ever *agree* with the plain
-/// loopback branch, never widen it. We keep `xfp_https` as an explicit input so
-/// the "XFP from a remote source is ignored" property is directly unit-tested
-/// and so the trust rule is encoded at the boundary rather than implied.
+/// 1. **source loopback + Host LOCAL** (`localhost` / `127.0.0.1` / `[::1]`,
+///    any port) ⇒ `Honor`. The loopback hop IS the whole path: a direct local
+///    browser, or a proxy addressed as localhost. TLS is irrelevant here. This
+///    is the dominant safe case (dev / desktop) and MUST keep working over
+///    plaintext.
+/// 2. **source loopback + Host NON-local** (a public hostname, e.g.
+///    `try.freenet.org` ⇒ the request came through a proxy) ⇒ `Honor` ONLY if
+///    `X-Forwarded-Proto: https` is present (the proxy attests the browser→proxy
+///    hop was TLS); otherwise `RejectInsecure`. This closes the plaintext-proxy
+///    gap: public Host + no/`http` XFP ⇒ reject.
+/// 3. **source non-loopback** (any Host / XFP) ⇒ `RejectInsecure`. The token
+///    crossed the network to reach the node directly; never honor it.
 ///
-/// Decision table (only reached when hosted mode is on and a token is present):
+/// `X-Forwarded-Proto` is trusted **only** from a loopback source (branches 1–2
+/// both require loopback). From an off-host source it is client-spoofable
+/// (`curl -H 'X-Forwarded-Proto: https'`) and is never consulted (branch 3).
 ///
-/// | source     | xfp_https | outcome          |
-/// |------------|-----------|------------------|
-/// | loopback   | any       | `Honor`          |
-/// | non-loop   | any       | `RejectInsecure` |
-/// | `None`     | any       | `RejectInsecure` |
+/// Decision table (only reached when hosted mode is on and a non-empty token is
+/// present — see the call site's `has_token` non-empty check):
+///
+/// | source     | host_is_local | xfp_https | outcome          |
+/// |------------|---------------|-----------|------------------|
+/// | loopback   | true          | any       | `Honor`          |
+/// | loopback   | false         | true      | `Honor`          |
+/// | loopback   | false         | false     | `RejectInsecure` |
+/// | non-loop   | any           | any       | `RejectInsecure` |
+/// | `None`     | any           | any       | `RejectInsecure` |
 ///
 /// A missing source IP (`None`) is treated as insecure (fail closed): we cannot
 /// prove loopback, so we must not honor the token. In production `ConnectInfo`
@@ -796,6 +843,7 @@ fn decide_user_token(
     hosted_mode: bool,
     has_token: bool,
     source_ip: Option<std::net::IpAddr>,
+    host_is_local: bool,
     xfp_https: bool,
 ) -> UserTokenDecision {
     // Flag off, or no token presented: single-user, no rejection. This is the
@@ -805,26 +853,23 @@ fn decide_user_token(
         return UserTokenDecision::Local;
     }
 
-    // Hosted mode + a token: honor only over a demonstrably secure connection.
-    // `xfp_https` is only meaningful when the source is loopback; from any other
-    // source it is spoofable and must not flip the decision. Both honoring
-    // branches therefore require loopback, so the secure condition reduces to
-    // "loopback source" — but we evaluate `xfp_https` explicitly so the trust
-    // boundary (and its unit tests) stay self-documenting.
-    let secure = match source_ip {
-        Some(ip) if is_loopback_source(ip) => {
-            // Loopback: secure regardless of XFP (direct browser or same-host
-            // TLS proxy). A loopback-sourced `X-Forwarded-Proto: https` is the
-            // same-host reverse-proxy case and also secure — same outcome.
-            let _ = xfp_https;
-            true
-        }
-        // Non-loopback source: NEVER secure, even with `X-Forwarded-Proto:
-        // https`, because that header is client-spoofable from off-host.
-        Some(_) | None => false,
+    // Hosted mode + a token: the source MUST be loopback. A non-loopback source
+    // means the token reached the node directly over the network — never honor.
+    let Some(ip) = source_ip else {
+        // No source IP: cannot prove loopback ⇒ fail closed.
+        return UserTokenDecision::RejectInsecure;
     };
+    if !is_loopback_source(ip) {
+        return UserTokenDecision::RejectInsecure;
+    }
 
-    if secure {
+    // Source is loopback. Now distinguish "the loopback hop is the whole path"
+    // (direct local browser / localhost-addressed proxy ⇒ safe regardless of
+    // TLS) from "there was an upstream browser→proxy hop" (public Host ⇒ the
+    // proxy MUST attest TLS via `X-Forwarded-Proto: https`, else we'd honor a
+    // token that may have crossed the network in cleartext). `xfp_https` is
+    // trusted here ONLY because we've already proven the source is loopback.
+    if host_is_local || xfp_https {
         UserTokenDecision::Honor
     } else {
         UserTokenDecision::RejectInsecure
@@ -967,10 +1012,12 @@ async fn connection_info(
     // REFUSE-PLAINTEXT-TOKEN invariant (#4381): a `userToken` is a durable,
     // node-independent, high-value credential that names a per-user secret
     // namespace. Honor it ONLY over a demonstrably secure connection, so an
-    // operator who accidentally exposes the plaintext HTTP port to the internet
-    // cannot leak it. "Secure" = loopback source (direct browser or same-host
-    // TLS-terminating proxy), optionally carrying a loopback-sourced
-    // `X-Forwarded-Proto: https`. See `decide_user_token` for the full rationale.
+    // operator who accidentally exposes a plaintext HTTP port to the internet —
+    // directly OR through a reverse proxy — cannot leak it. "Secure" requires a
+    // loopback source AND either a local `Host` (direct local browser /
+    // localhost-addressed proxy) or a `X-Forwarded-Proto: https` (a same-host
+    // TLS proxy attesting the browser→proxy hop was TLS). See `decide_user_token`
+    // for the full rationale and truth table.
     //
     // Source IP: read from the `ConnectInfo<SocketAddr>` request extension that
     // `axum::serve(..).into_make_service_with_connect_info::<SocketAddr>()` injects
@@ -979,13 +1026,24 @@ async fn connection_info(
     // missing ConnectInfo (only possible in unit tests that omit it) yields
     // `None` and fails CLOSED in the gate below, instead of 500-ing the request.
     //
+    // Host: a loopback source proves only the proxy→node hop is local, NOT that
+    // the browser→proxy hop used TLS. `host_is_local` distinguishes a direct
+    // local browser (`Host: localhost:7509` ⇒ the loopback hop is the whole path)
+    // from a proxied request addressed by a public name (`Host: try.freenet.org`
+    // ⇒ there was an upstream hop whose TLS must be attested via XFP).
+    //
     // `X-Forwarded-Proto` is trusted ONLY when the source is loopback; from any
-    // off-host source it is client-spoofable, so `decide_user_token` ignores it
-    // unless the source is already loopback.
+    // off-host source it is client-spoofable, so `decide_user_token` consults it
+    // only after the source is already proven loopback.
     let source_ip = req
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|ci| ci.0.ip());
+    let host_is_local = req
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(host_header_is_local);
     let xfp_https = req
         .headers()
         .get("x-forwarded-proto")
@@ -1002,6 +1060,7 @@ async fn connection_info(
         hosted_mode.0,
         user_token.as_deref().is_some_and(|t| !t.is_empty()),
         source_ip,
+        host_is_local,
         xfp_https,
     ) {
         UserTokenDecision::Honor => derive_user_context(hosted_mode.0, user_token.as_deref()),
@@ -1014,9 +1073,12 @@ async fn connection_info(
             // credential); log only the non-secret source IP and path.
             tracing::warn!(
                 source_ip = ?source_ip,
+                host_is_local,
+                xfp_https,
                 request_path = req.uri().path(),
                 "Rejected hosted user token over an insecure connection \
-                 (not loopback / no trusted X-Forwarded-Proto: https)"
+                 (need loopback source AND either a local Host or a \
+                 loopback-sourced X-Forwarded-Proto: https)"
             );
             return (
                 StatusCode::FORBIDDEN,
@@ -2143,6 +2205,13 @@ mod tests {
     const PUBLIC_V4: IpAddr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)); // TEST-NET-3
     const LAN_V4: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)); // private but NOT loopback
 
+    // Local-Host flag values for readability at call sites: the second source of
+    // truth (alongside the source IP) the gate consults once the source is
+    // loopback. `LOCAL_HOST` = a direct local browser (`Host: localhost`);
+    // `PROXY_HOST` = a public-named reverse-proxy request (`Host: try.freenet.org`).
+    const LOCAL_HOST: bool = true;
+    const PROXY_HOST: bool = false;
+
     /// `is_loopback_source` accepts loopback v4/v6 and v4-mapped-v6 loopback,
     /// and rejects everything else — including a private-but-not-loopback LAN IP
     /// (loopback, not "private", is the trust anchor for the token gate).
@@ -2163,108 +2232,164 @@ mod tests {
         ));
     }
 
-    /// Flag OFF: the gate is inert. A presented token over ANY source (even a
-    /// remote, plaintext one) is `Local` — no rejection path fires. This proves
-    /// the whole invariant is hosted-mode-gated and flag-off is unchanged.
+    /// `host_header_is_local` accepts the literal `localhost` and loopback IP
+    /// literals (with/without port), and rejects public hostnames and
+    /// non-loopback IPs — so a proxied request addressed by a public name is
+    /// classified non-local (and thus requires HTTPS evidence downstream).
+    #[test]
+    fn host_header_is_local_detection() {
+        // localhost name, with and without port; case-insensitive.
+        assert!(host_header_is_local("localhost"));
+        assert!(host_header_is_local("localhost:7509"));
+        assert!(host_header_is_local("LocalHost:7509"));
+        // loopback IP literals.
+        assert!(host_header_is_local("127.0.0.1"));
+        assert!(host_header_is_local("127.0.0.1:7509"));
+        assert!(host_header_is_local("127.0.0.5:7509")); // 127/8
+        assert!(host_header_is_local("[::1]"));
+        assert!(host_header_is_local("[::1]:7509"));
+        // Public hostnames and non-loopback IPs are NOT local.
+        assert!(!host_header_is_local("try.freenet.org"));
+        assert!(!host_header_is_local("try.freenet.org:443"));
+        assert!(!host_header_is_local("localhost.evil.com")); // not the localhost name
+        assert!(!host_header_is_local("192.168.1.50:7509")); // LAN, not loopback
+        assert!(!host_header_is_local("203.0.113.7")); // public
+        assert!(!host_header_is_local("")); // empty/garbage
+    }
+
+    /// Flag OFF: the gate is inert. A presented token over ANY source/Host/XFP
+    /// (even a remote, plaintext one) is `Local` — no rejection path fires. This
+    /// proves the whole invariant is hosted-mode-gated and flag-off is unchanged.
     #[test]
     fn gate_flag_off_is_always_local_never_rejects() {
         for source in [Some(PUBLIC_V4), Some(LAN_V4), Some(LOOPBACK_V4), None] {
-            for xfp in [false, true] {
-                assert_eq!(
-                    decide_user_token(false, true, source, xfp),
-                    UserTokenDecision::Local,
-                    "flag off must be Local for source={source:?} xfp={xfp}"
-                );
+            for host_local in [LOCAL_HOST, PROXY_HOST] {
+                for xfp in [false, true] {
+                    assert_eq!(
+                        decide_user_token(false, true, source, host_local, xfp),
+                        UserTokenDecision::Local,
+                        "flag off must be Local for source={source:?} host_local={host_local} xfp={xfp}"
+                    );
+                }
             }
         }
     }
 
-    /// No token (any mode/source): `Local`, never rejected. Token-less
+    /// No token (any mode/source/Host/XFP): `Local`, never rejected. Token-less
     /// connections are unaffected by the gate in all modes.
     #[test]
     fn gate_no_token_is_always_local() {
         for hosted in [false, true] {
             for source in [Some(PUBLIC_V4), Some(LOOPBACK_V4), None] {
+                for host_local in [LOCAL_HOST, PROXY_HOST] {
+                    for xfp in [false, true] {
+                        assert_eq!(
+                            decide_user_token(hosted, false, source, host_local, xfp),
+                            UserTokenDecision::Local,
+                            "no token must be Local for hosted={hosted} source={source:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Hosted ON + token + loopback source + LOCAL Host => Honor, regardless of
+    /// XFP. This is the dominant safe case — a direct local browser
+    /// (`Host: localhost`) over plaintext MUST keep working (dev / desktop).
+    #[test]
+    fn gate_loopback_local_host_is_honored() {
+        for source in [LOOPBACK_V4, LOOPBACK_V4_ALT, LOOPBACK_V6] {
+            for xfp in [false, true] {
                 assert_eq!(
-                    decide_user_token(hosted, false, source, false),
-                    UserTokenDecision::Local,
-                    "no token must be Local for hosted={hosted} source={source:?}"
-                );
-                assert_eq!(
-                    decide_user_token(hosted, false, source, true),
-                    UserTokenDecision::Local,
+                    decide_user_token(true, true, Some(source), LOCAL_HOST, xfp),
+                    UserTokenDecision::Honor,
+                    "loopback {source:?} + local Host (xfp={xfp}) must be honored — \
+                     do NOT break the direct-local-browser path"
                 );
             }
         }
     }
 
-    /// Hosted ON + token + loopback source => Honor (case a), regardless of XFP.
+    /// Hosted ON + token + loopback source + NON-local Host + `X-Forwarded-Proto:
+    /// https` => Honor. The intended TLS-terminating reverse proxy on the same
+    /// host: the proxy attests the browser→proxy hop was TLS.
     #[test]
-    fn gate_hosted_token_loopback_is_honored() {
-        for source in [LOOPBACK_V4, LOOPBACK_V4_ALT, LOOPBACK_V6] {
+    fn gate_loopback_proxy_host_with_https_is_honored() {
+        for source in [LOOPBACK_V4, LOOPBACK_V6] {
             assert_eq!(
-                decide_user_token(true, true, Some(source), false),
+                decide_user_token(true, true, Some(source), PROXY_HOST, true),
                 UserTokenDecision::Honor,
-                "loopback {source:?} without XFP must be honored"
-            );
-            // Loopback + X-Forwarded-Proto: https (same-host TLS proxy, case b).
-            assert_eq!(
-                decide_user_token(true, true, Some(source), true),
-                UserTokenDecision::Honor,
-                "loopback {source:?} with XFP https must be honored"
+                "loopback + public Host + XFP=https (intended TLS proxy) must be honored"
             );
         }
     }
 
-    /// Hosted ON + token + non-loopback source + plaintext (no XFP) => REJECT.
-    /// This is the core leak-prevention case: a directly-exposed plaintext port
-    /// on the public internet must not honor the durable token.
+    /// THE PLAINTEXT-PROXY GAP (new coverage): hosted ON + token + loopback
+    /// source + NON-local Host + NO XFP => REJECT. A same-host reverse proxy
+    /// accidentally serving public PLAINTEXT http forwards to the loopback node
+    /// and presents a loopback source — but the browser→proxy hop crossed the
+    /// network in cleartext. Loopback source alone must NOT honor the token; the
+    /// public Host with no HTTPS attestation closes the gap.
     #[test]
-    fn gate_hosted_token_remote_plaintext_is_rejected() {
+    fn gate_loopback_proxy_host_no_https_is_rejected() {
+        for source in [LOOPBACK_V4, LOOPBACK_V6] {
+            assert_eq!(
+                decide_user_token(true, true, Some(source), PROXY_HOST, false),
+                UserTokenDecision::RejectInsecure,
+                "loopback + public Host + NO XFP (plaintext-proxy gap) must be rejected"
+            );
+        }
+    }
+
+    /// Hosted ON + token + loopback source + NON-local Host + `X-Forwarded-Proto:
+    /// http` (explicitly not https) => REJECT. An `http` attestation means the
+    /// browser→proxy hop was plaintext; only `https` qualifies.
+    #[test]
+    fn gate_loopback_proxy_host_xfp_http_is_rejected() {
+        // The call site only sets xfp_https=true for a literal "https"; an "http"
+        // value resolves to xfp_https=false, which the gate rejects for a proxy Host.
         assert_eq!(
-            decide_user_token(true, true, Some(PUBLIC_V4), false),
+            decide_user_token(true, true, Some(LOOPBACK_V4), PROXY_HOST, false),
             UserTokenDecision::RejectInsecure,
-        );
-        // A private-but-not-loopback LAN source is also rejected: a LAN-exposed
-        // plaintext port is still a token-leak surface (the trust anchor is
-        // loopback, NOT "is_private_ip").
-        assert_eq!(
-            decide_user_token(true, true, Some(LAN_V4), false),
-            UserTokenDecision::RejectInsecure,
+            "XFP=http (plaintext browser→proxy hop) must be rejected"
         );
     }
 
-    /// Hosted ON + token + non-loopback source + `X-Forwarded-Proto: https` =>
-    /// REJECT. XFP is client-spoofable from off-host, so it is NEVER trusted from
-    /// a non-loopback source; it must not upgrade a remote plaintext connection
-    /// to "secure".
+    /// Hosted ON + token + non-loopback source => REJECT for ANY Host/XFP. The
+    /// token reached the node directly over the network. XFP is client-spoofable
+    /// from off-host and is never consulted here. Covers the directly-exposed
+    /// plaintext port and the LAN-exposed port (trust anchor is loopback, NOT
+    /// "is_private_ip").
     #[test]
-    fn gate_xfp_from_remote_source_is_not_trusted() {
-        assert_eq!(
-            decide_user_token(true, true, Some(PUBLIC_V4), true),
-            UserTokenDecision::RejectInsecure,
-            "spoofable XFP from a public source must NOT be honored"
-        );
-        assert_eq!(
-            decide_user_token(true, true, Some(LAN_V4), true),
-            UserTokenDecision::RejectInsecure,
-            "spoofable XFP from a LAN source must NOT be honored"
-        );
+    fn gate_non_loopback_source_is_always_rejected() {
+        for source in [PUBLIC_V4, LAN_V4] {
+            for host_local in [LOCAL_HOST, PROXY_HOST] {
+                for xfp in [false, true] {
+                    assert_eq!(
+                        decide_user_token(true, true, Some(source), host_local, xfp),
+                        UserTokenDecision::RejectInsecure,
+                        "non-loopback {source:?} must be rejected (host_local={host_local} xfp={xfp}) \
+                         — spoofable XFP/Host must NOT widen a remote source"
+                    );
+                }
+            }
+        }
     }
 
-    /// Hosted ON + token + unknown source (`None`) => REJECT (fail closed). We
-    /// cannot prove loopback, so we must not honor. In production ConnectInfo is
-    /// always present; `None` only arises if the plumbing is missing.
+    /// Hosted ON + token + unknown source (`None`) => REJECT (fail closed) for any
+    /// Host/XFP. We cannot prove loopback, so we must not honor. In production
+    /// ConnectInfo is always present; `None` only arises if the plumbing is missing.
     #[test]
     fn gate_missing_source_fails_closed() {
-        assert_eq!(
-            decide_user_token(true, true, None, false),
-            UserTokenDecision::RejectInsecure,
-        );
-        assert_eq!(
-            decide_user_token(true, true, None, true),
-            UserTokenDecision::RejectInsecure,
-        );
+        for host_local in [LOCAL_HOST, PROXY_HOST] {
+            for xfp in [false, true] {
+                assert_eq!(
+                    decide_user_token(true, true, None, host_local, xfp),
+                    UserTokenDecision::RejectInsecure,
+                );
+            }
+        }
     }
 
     /// Regression: an EMPTY `userToken` (`?userToken=` => `Some("")`) must be
@@ -2282,25 +2407,50 @@ mod tests {
 
         // Empty token + hosted on + remote source => Local (the regression).
         assert_eq!(
-            decide_user_token(true, has_token(Some("")), Some(PUBLIC_V4), false),
+            decide_user_token(
+                true,
+                has_token(Some("")),
+                Some(PUBLIC_V4),
+                PROXY_HOST,
+                false
+            ),
             UserTokenDecision::Local,
             "empty userToken over a remote hosted connection must be Local, not rejected"
         );
-        // Empty token + hosted on + loopback => Local (no spurious Honor either).
+        // Empty token + hosted on + loopback + proxy Host => Local (no spurious
+        // Honor and no rejection either — empty is absent before the gate runs).
         assert_eq!(
-            decide_user_token(true, has_token(Some("")), Some(LOOPBACK_V4), false),
+            decide_user_token(
+                true,
+                has_token(Some("")),
+                Some(LOOPBACK_V4),
+                PROXY_HOST,
+                false
+            ),
             UserTokenDecision::Local,
         );
         // Sanity: a NON-empty token over the same remote source IS rejected, so
         // the empty-token allowance is specifically about emptiness.
         assert_eq!(
-            decide_user_token(true, has_token(Some("alice")), Some(PUBLIC_V4), false),
+            decide_user_token(
+                true,
+                has_token(Some("alice")),
+                Some(PUBLIC_V4),
+                PROXY_HOST,
+                false
+            ),
             UserTokenDecision::RejectInsecure,
         );
         // Whitespace is intentionally a real (non-empty) token, consistent with
         // derive_user_context — so it IS gated (rejected over a remote source).
         assert_eq!(
-            decide_user_token(true, has_token(Some(" ")), Some(PUBLIC_V4), false),
+            decide_user_token(
+                true,
+                has_token(Some(" ")),
+                Some(PUBLIC_V4),
+                PROXY_HOST,
+                false
+            ),
             UserTokenDecision::RejectInsecure,
             "whitespace token is non-empty => treated as a real token"
         );
@@ -2339,9 +2489,13 @@ mod tests {
                 .layer(Extension(crate::server::AllowedSourceCidrs::default()))
         }
 
+        // `host` is the literal `Host` header value (None => omit the header,
+        // which the gate classifies as non-local). The gate also reads
+        // `X-Forwarded-Proto` and the `ConnectInfo<SocketAddr>` source.
         fn req(
             hosted_uri_token: Option<&str>,
             source: Option<SocketAddr>,
+            host: Option<&str>,
             xfp_https: bool,
         ) -> Request<Body> {
             let uri = match hosted_uri_token {
@@ -2349,6 +2503,9 @@ mod tests {
                 None => "/".to_string(),
             };
             let mut builder = Request::builder().uri(uri);
+            if let Some(h) = host {
+                builder = builder.header(axum::http::header::HOST, h);
+            }
             if xfp_https {
                 builder = builder.header("x-forwarded-proto", "https");
             }
@@ -2360,10 +2517,12 @@ mod tests {
 
         let loopback: SocketAddr = ([127, 0, 0, 1], 12345).into();
         let public: SocketAddr = ([203, 0, 113, 7], 443).into();
+        let local_host = Some("localhost:7509");
+        let proxy_host = Some("try.freenet.org");
 
         // Hosted ON + token + remote plaintext => 403 (the leak-prevention case).
         let resp = router(true)
-            .oneshot(req(Some("alice"), Some(public), false))
+            .oneshot(req(Some("alice"), Some(public), proxy_host, false))
             .await
             .unwrap();
         assert_eq!(
@@ -2374,7 +2533,7 @@ mod tests {
 
         // Hosted ON + token + remote + spoofed XFP https => still 403.
         let resp = router(true)
-            .oneshot(req(Some("alice"), Some(public), true))
+            .oneshot(req(Some("alice"), Some(public), proxy_host, true))
             .await
             .unwrap();
         assert_eq!(
@@ -2383,27 +2542,44 @@ mod tests {
             "XFP from a remote source must not bypass the gate"
         );
 
-        // Hosted ON + token + loopback => 200 (honored, context derived).
+        // Hosted ON + token + loopback + LOCAL Host => 200 (direct local browser).
         let resp = router(true)
-            .oneshot(req(Some("alice"), Some(loopback), false))
+            .oneshot(req(Some("alice"), Some(loopback), local_host, false))
             .await
             .unwrap();
         assert_eq!(
             resp.status(),
             StatusCode::OK,
-            "loopback hosted token must be honored"
+            "loopback + local Host hosted token must be honored (direct local browser)"
         );
 
-        // Hosted ON + token + loopback + XFP https => 200 (same-host TLS proxy).
+        // THE PLAINTEXT-PROXY GAP: loopback source + PUBLIC Host + NO XFP => 403.
+        // A same-host proxy serving public plaintext http presents a loopback
+        // source but the browser→proxy hop was cleartext — must be rejected.
         let resp = router(true)
-            .oneshot(req(Some("alice"), Some(loopback), true))
+            .oneshot(req(Some("alice"), Some(loopback), proxy_host, false))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "loopback + public Host + no XFP (plaintext-proxy gap) must be rejected"
+        );
+
+        // Loopback + PUBLIC Host + XFP https => 200 (intended same-host TLS proxy).
+        let resp = router(true)
+            .oneshot(req(Some("alice"), Some(loopback), proxy_host, true))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "loopback + public Host + XFP=https (TLS proxy) must be honored"
+        );
 
         // Hosted OFF + token + remote => 200 (gate inert; token ignored, Local).
         let resp = router(false)
-            .oneshot(req(Some("alice"), Some(public), false))
+            .oneshot(req(Some("alice"), Some(public), proxy_host, false))
             .await
             .unwrap();
         assert_eq!(
@@ -2414,12 +2590,12 @@ mod tests {
 
         // No token + remote (any mode) => 200 (unaffected by the gate).
         let resp = router(true)
-            .oneshot(req(None, Some(public), false))
+            .oneshot(req(None, Some(public), proxy_host, false))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let resp = router(false)
-            .oneshot(req(None, Some(public), false))
+            .oneshot(req(None, Some(public), proxy_host, false))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2428,7 +2604,7 @@ mod tests {
         // A brand-new remote user whose client sends an empty userToken must be
         // able to connect (as Local) to GET a real token, not be locked out.
         let resp = router(true)
-            .oneshot(req(Some(""), Some(public), false))
+            .oneshot(req(Some(""), Some(public), proxy_host, false))
             .await
             .unwrap();
         assert_eq!(
