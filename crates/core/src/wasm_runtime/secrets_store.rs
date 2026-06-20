@@ -1300,9 +1300,10 @@ impl SecretsStore {
             .into_string();
         let secret_path = self.scope_dir(delegate, scope).join(&encoded);
         let blob = fs::read(&secret_path).map_err(|_| {
-            // No `SecretsId` to name; surface the encoded id via a synthetic
-            // pre-image-less id is impossible, so use an IO error carrying the
-            // path. Callers treat any error as "skip + report".
+            // We only have the secret hash here, not a `SecretsId` (the
+            // pre-image is never persisted), so we can't build a
+            // `MissingSecret(SecretsId)`. Surface an IO/NotFound error carrying
+            // the encoded path instead; export treats any read error as fatal.
             SecretStoreError::IO(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!("secret blob not found at {}", secret_path.display()),

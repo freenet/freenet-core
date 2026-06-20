@@ -70,7 +70,7 @@ use freenet_stdlib::prelude::{CodeHash, DelegateKey};
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::secrets_store::{ExportSecretEntry, SecretScope, SecretsStore, UserSecretContext};
 
@@ -142,12 +142,30 @@ impl BundleKeyMaterial<'_> {
 /// overhead avoided by `serde_bytes`, which we deliberately do NOT add as a
 /// dependency: a backup artifact's correctness and self-description matter far
 /// more than a few bytes of CBOR framing.
+///
+/// `plaintext` is the only secret field. A manual [`Drop`] wipes it via
+/// [`Zeroize::zeroize`] so the in-memory copies this struct holds — both the
+/// payload `seal_bundle` builds on export and the payload `open_bundle`
+/// deserializes on import — are scrubbed when dropped, matching the module's
+/// "plaintext lives only in zeroizing buffers" guarantee. (`Zeroizing<Vec<u8>>`
+/// would be cleaner but does not implement serde's `Serialize`/`Deserialize`,
+/// so we keep a plain `Vec<u8>` for the wire and wipe it on drop instead.)
 #[derive(Serialize, Deserialize)]
 struct BundleEntry {
     delegate_key: Vec<u8>,
     code_hash: Vec<u8>,
     secret_hash: Vec<u8>,
     plaintext: Vec<u8>,
+}
+
+impl Drop for BundleEntry {
+    fn drop(&mut self) {
+        // Only the plaintext is secret; the key/hash fields are public
+        // identifiers, so wiping `plaintext` alone is sufficient. Dropping a
+        // `Vec<BundleEntry>` drops each entry, so wiping here covers the whole
+        // `BundlePayload.entries` vector without a separate `Drop` on the payload.
+        self.plaintext.zeroize();
+    }
 }
 
 /// The CBOR-serialized, then encrypted, body of a bundle.
@@ -178,6 +196,12 @@ pub enum ExportError {
     CborDe(String),
     #[error("argon2 key derivation failed: {0}")]
     Argon2(String),
+    /// The AEAD `encrypt` call failed while SEALING a bundle. Distinct from
+    /// [`Self::AuthFailed`] (a DECRYPT/authentication failure) so an export-side
+    /// error isn't misreported as "wrong passphrase". In practice this only
+    /// fires on absurd input sizes; it is not reachable for normal bundles.
+    #[error("bundle encryption failed")]
+    EncryptFailed,
     #[error("bundle authentication failed: wrong passphrase/token or corrupt bundle")]
     AuthFailed,
     #[error("not a freenet secrets bundle (bad magic)")]
@@ -301,8 +325,10 @@ fn seal_bundle(
             },
         )
         .map_err(|_| {
-            // Encryption only fails on absurd input sizes; treat as auth-class.
-            ExportError::AuthFailed
+            // Encryption only fails on absurd input sizes (not reachable for a
+            // real bundle). Report it as an export-side encrypt failure, NOT
+            // AuthFailed — the latter reads as "wrong passphrase" on decrypt.
+            ExportError::EncryptFailed
         })?;
     out.extend_from_slice(&ciphertext);
     Ok(out)
@@ -389,8 +415,13 @@ pub fn export_bundle(
 /// [`ImportReport::skipped`]; when true, it is overwritten (the prior value is
 /// snapshotted first).
 ///
-/// Decryption is all-or-nothing: a wrong passphrase/token or a corrupt bundle
-/// fails before ANY write, so a failed import never leaves a partial state.
+/// Atomicity is limited to the DECRYPT phase: [`open_bundle`] is all-or-nothing,
+/// so a wrong passphrase/token or a corrupt bundle fails before ANY write. The
+/// per-entry WRITE loop is NOT transactional — if entry K fails to write,
+/// entries `0..K` are already committed. Re-running the same import is safe:
+/// entries are idempotent by their `(delegate, secret_hash)` key (an
+/// already-present secret is skipped, or with `--overwrite` re-written to the
+/// same value), so a retry converges without duplicating or corrupting state.
 pub fn import_bundle(
     store: &mut SecretsStore,
     bundle: &[u8],
@@ -840,6 +871,48 @@ mod test {
         let report =
             import_bundle(&mut fresh, &bundle, &pass, &TargetScope::Local, false).expect("import");
         assert_eq!(report, ImportReport::default());
+    }
+
+    #[tokio::test]
+    async fn tampering_with_header_or_ciphertext_fails_auth() {
+        // Pins the AAD guarantee: a single flipped byte in the header region
+        // (bound as AEAD additional data) or in the ciphertext body must make
+        // decryption fail with AuthFailed, never silently succeed.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = new_store(tmp.path()).await;
+        let d = delegate(11);
+        let s = SecretsId::new(b"tamper".to_vec());
+        store
+            .store_secret(
+                d.key(),
+                &s,
+                SecretScope::Local,
+                Zeroizing::new(b"sensitive".to_vec()),
+            )
+            .unwrap();
+        let pass = BundleKeyMaterial::Passphrase(b"pw");
+        let bundle = export_bundle(&store, SecretScope::Local, &pass).expect("export");
+        // Sanity: the untampered bundle opens.
+        open_bundle(&bundle, &pass).expect("untampered bundle must open");
+
+        // (a) Flip a salt byte in the header. Salt lives at offset 6..6+SALT_LEN
+        // (after MAGIC(4) + version(1) + kdf_id(1)) and is part of the AAD, so a
+        // flip both changes the derived key AND breaks the AAD binding.
+        let mut header_tampered = bundle.clone();
+        header_tampered[6] ^= 0x01;
+        match open_bundle(&header_tampered, &pass) {
+            Err(ExportError::AuthFailed) => {}
+            other => panic!("header tamper must fail auth, got {:?}", other.err()),
+        }
+
+        // (b) Flip a ciphertext byte (just past the header).
+        let mut body_tampered = bundle.clone();
+        let last = body_tampered.len() - 1;
+        body_tampered[last] ^= 0x01;
+        match open_bundle(&body_tampered, &pass) {
+            Err(ExportError::AuthFailed) => {}
+            other => panic!("ciphertext tamper must fail auth, got {:?}", other.err()),
+        }
     }
 
     fn read_local(store: &SecretsStore, d: &Delegate<'static>, hash: &[u8; 32]) -> Vec<u8> {

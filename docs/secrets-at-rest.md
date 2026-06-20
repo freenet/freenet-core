@@ -204,8 +204,13 @@ per-bundle salt) or from the opaque user token (`--use-token-key` on
 export / `--token` on import, HKDF-SHA256 — handy for a hosted user who
 only has their token). The two methods are not interchangeable: a
 passphrase bundle opened with token material (or vice-versa) fails
-authentication. A wrong passphrase/token fails before ANY write, so a
-failed import never leaves a partial state.
+authentication. A wrong passphrase/token (or a corrupt bundle) fails
+during the decrypt phase, before ANY write. The per-entry write loop
+itself is not transactional, so a write that fails partway leaves the
+already-written entries committed — but re-running the import is safe:
+entries are idempotent by their `(delegate, secret_hash)` key (an
+existing secret is skipped, or re-written to the same value with
+`--overwrite`), so a retry converges.
 
 **Operator sees plaintext during export.** Building the bundle requires
 the node to DECRYPT every secret in memory (it can, by construction — it

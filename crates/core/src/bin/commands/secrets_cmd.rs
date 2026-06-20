@@ -806,6 +806,21 @@ async fn secrets_export(args: ExportArgs) -> Result<()> {
         bail!("specify how to encrypt the bundle: --passphrase <p> or --use-token-key");
     }
 
+    // Refuse to export against a non-existent node database. `Storage::new`
+    // CREATES `<db_dir>/db` if absent, so a wrong/empty --db-dir would silently
+    // open a brand-new empty index and emit a valid-looking but EMPTY bundle —
+    // the operator would think they had a backup but captured nothing. Require
+    // the db file to already exist for export (import may legitimately create a
+    // fresh db on a new peer). The "db" filename mirrors `Storage::new`.
+    let db_file = args.db_dir.join("db");
+    if !db_file.exists() {
+        bail!(
+            "no node database found at {} — is --db-dir correct and is the node initialized? \
+             (export refuses to run against a missing/empty database to avoid emitting an empty bundle)",
+            db_file.display()
+        );
+    }
+
     let store = open_store(&args.secrets_dir, &args.db_dir).await?;
 
     // Build the source scope. For the user scope we derive a UserSecretContext
@@ -1620,5 +1635,31 @@ mod tests {
         a.passphrase = None;
         let err = secrets_export(a).await.expect_err("no key must error");
         assert!(err.to_string().contains("encrypt the bundle"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn cli_export_refuses_missing_db() {
+        // A --db-dir that exists but lacks the node's `db` file must NOT be
+        // silently opened as a fresh empty index (which would emit an empty
+        // bundle). Export must error clearly instead.
+        let src = tempfile::tempdir().unwrap();
+        let secrets_dir = src.path().join("secrets");
+        let db_dir = src.path().join("data"); // exists, but no `db` file inside
+        std::fs::create_dir_all(&secrets_dir).unwrap();
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let out = src.path().join("o.bin");
+
+        let err = secrets_export(export_args(&secrets_dir, &db_dir, &out, "pw"))
+            .await
+            .expect_err("missing db must error");
+        assert!(
+            err.to_string().contains("no node database found"),
+            "got: {err}"
+        );
+        // No bundle file was written.
+        assert!(
+            !out.exists(),
+            "no bundle should be written on the error path"
+        );
     }
 }
