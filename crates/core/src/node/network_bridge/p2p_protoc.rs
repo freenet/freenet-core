@@ -3418,7 +3418,9 @@ mod tests {
         /// #4145 / #4499.
         #[test]
         fn placement_migration_active_at_reenable_floor() {
-            assert_eq!(SUBSCRIBE_HINT_MIN_VERSION, (0, 2, 80));
+            // The `supported(0,2,80)` + `!supported(0,2,79)` pair below pins the
+            // floor to exactly `(0, 2, 80)`: an accidental change moves the
+            // activation set and trips these asserts.
             // At or above the floor: active.
             assert!(version_supports_subscribe_hint(
                 Some((0, 2, 80)),

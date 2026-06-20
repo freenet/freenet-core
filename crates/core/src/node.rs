@@ -3371,9 +3371,8 @@ mod tests {
         /// 0.2.79 until the re-enable release bumps it to the floor version).
         #[test]
         fn receive_gate_active_at_reenable_floor() {
-            // Pin the re-enable floor value: an accidental change here moves the
-            // migration's activation set.
-            assert_eq!(SUBSCRIBE_HINT_MIN_VERSION, (0, 2, 80));
+            // The `supported(0,2,80)` + `!supported(0,2,79)` pair pins the floor
+            // to exactly `(0, 2, 80)`; an accidental change trips these asserts.
             // Peers at or above the floor are acted on.
             assert!(version_supports_subscribe_hint(
                 Some((0, 2, 80)),
