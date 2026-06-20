@@ -194,12 +194,20 @@ pub struct ExportArgs {
     pub local: bool,
     /// Export every per-user secret for the user identified by this opaque
     /// token (the hosted → self-host migration case). Mutually exclusive with
-    /// `--local`.
-    #[clap(long)]
+    /// `--local`. Pass `--user-token` ALONE to select the user scope and source
+    /// the token safely (from `FREENET_USER_TOKEN`, else an interactive prompt),
+    /// or `--user-token <tok>` to provide it inline. WARNING: an inline value is
+    /// exposed via the process listing and shell history — prefer the env var or
+    /// the prompt.
+    #[clap(long, num_args = 0..=1, default_missing_value = "")]
     pub user_token: Option<String>,
-    /// Encrypt the bundle under a key derived from this passphrase (Argon2id).
-    /// Mutually exclusive with `--use-token-key`.
-    #[clap(long, conflicts_with = "use_token_key")]
+    /// Encrypt the bundle under a key derived from a passphrase (Argon2id). This
+    /// is the DEFAULT key method. The passphrase is read from
+    /// `FREENET_SECRET_PASSPHRASE`, else this flag's inline value, else an
+    /// interactive hidden prompt (pass `--passphrase` alone to force the
+    /// prompt). WARNING: an inline value is exposed via the process listing and
+    /// shell history — prefer the env var or the prompt.
+    #[clap(long, num_args = 0..=1, default_missing_value = "", conflicts_with = "use_token_key")]
     pub passphrase: Option<String>,
     /// Encrypt the bundle under a key derived from the `--user-token` (HKDF),
     /// so a hosted user who only has their token needs no separate passphrase.
@@ -224,13 +232,25 @@ pub struct ImportArgs {
     /// matching `--db-dir` note on `export`.
     #[clap(long, value_parser)]
     pub db_dir: PathBuf,
-    /// Decrypt the bundle with this passphrase (an Argon2id-keyed bundle).
-    /// Mutually exclusive with `--token`.
-    #[clap(long, conflicts_with = "token")]
+    /// Decrypt the bundle with a passphrase (Argon2id-keyed bundle). This is the
+    /// DEFAULT decrypt method. The passphrase is read from
+    /// `FREENET_SECRET_PASSPHRASE`, else this flag's inline value, else an
+    /// interactive hidden prompt (pass `--passphrase` alone to force the
+    /// prompt). WARNING: an inline value is exposed via the process listing and
+    /// shell history — prefer the env var or the prompt.
+    #[clap(long, num_args = 0..=1, default_missing_value = "", conflicts_with = "use_token_key")]
     pub passphrase: Option<String>,
-    /// Decrypt the bundle with the user token (a token-keyed bundle, i.e. one
-    /// exported with `--use-token-key`). Mutually exclusive with `--passphrase`.
+    /// Decrypt the bundle with the user token instead of a passphrase (a bundle
+    /// exported with `--use-token-key`). Selects the token-decrypt method; the
+    /// token value is resolved like `--token`. Mutually exclusive with
+    /// `--passphrase`.
     #[clap(long)]
+    pub use_token_key: bool,
+    /// The user token value for token-decrypt (used with `--use-token-key`).
+    /// Resolved from `FREENET_USER_TOKEN`, else this flag's inline value, else an
+    /// interactive prompt. WARNING: an inline value is exposed via the process
+    /// listing and shell history — prefer the env var or the prompt.
+    #[clap(long, num_args = 0..=1, default_missing_value = "", conflicts_with = "passphrase")]
     pub token: Option<String>,
     /// Place imported secrets at the single-user (Local) scope. This is the
     /// DEFAULT when neither `--local` nor `--into-user` is given — it is the
@@ -239,8 +259,11 @@ pub struct ImportArgs {
     #[clap(long, conflicts_with = "into_user")]
     pub local: bool,
     /// Place imported secrets under a per-user scope keyed by this token
-    /// (round-trip / re-hosting). Mutually exclusive with `--local`.
-    #[clap(long)]
+    /// (round-trip / re-hosting). Mutually exclusive with `--local`. Pass
+    /// `--into-user` alone to be prompted for the token, or `--into-user <tok>`
+    /// to provide it inline (exposed via the process listing — prefer the
+    /// prompt).
+    #[clap(long, num_args = 0..=1, default_missing_value = "")]
     pub into_user: Option<String>,
     /// Overwrite an existing secret at the same delegate+id. Without this an
     /// existing value is left untouched and reported as skipped.
@@ -794,17 +817,102 @@ fn map_export_err(e: ExportError) -> anyhow::Error {
     anyhow::Error::new(e)
 }
 
+/// Resolve a secret input (passphrase / user token) from the safest available
+/// source, so secrets don't have to be passed on argv (where they leak via the
+/// process table and shell history).
+///
+/// Priority:
+///   1. Environment variable `env_var` (when `Some`), if set and non-empty.
+///   2. The CLI `flag` value, if provided (last-resort convenience; the caller's
+///      `--help` warns it is exposed via process listing).
+///   3. An interactive prompt, when stdin is a TTY (hidden/no-echo for
+///      passphrases). Non-interactive + no env + no flag is an error.
+///
+/// The result is `Zeroizing<String>` so it is wiped on drop. `label` names the
+/// secret in the prompt and in the not-provided error. `env_var` is `None` for
+/// inputs that have no dedicated env var (e.g. the `--into-user` target token,
+/// which would be ambiguous with the decrypt token's env var).
+///
+/// Note on ordering: env beats flag deliberately — a script that sets the env
+/// var should win over a stale flag, and it lets the unit test assert the
+/// preference without a TTY. (Both are non-interactive sources; a human at a
+/// terminal who passes neither gets the prompt.)
+fn resolve_secret(
+    flag: Option<&str>,
+    env_var: Option<&str>,
+    label: &str,
+    hidden: bool,
+) -> Result<Zeroizing<String>> {
+    use std::io::IsTerminal;
+
+    if let Some(env_var) = env_var
+        && let Some(v) = std::env::var_os(env_var)
+        && !v.is_empty()
+    {
+        let s = v
+            .into_string()
+            .map_err(|_| anyhow!("{env_var} is not valid UTF-8"))?;
+        return Ok(Zeroizing::new(s));
+    }
+
+    // A non-empty flag value is the last-resort source. An EMPTY flag value
+    // (e.g. bare `--user-token` via default_missing_value) means "flag present
+    // to select the scope, but source the value safely" — fall through to the
+    // prompt rather than using "".
+    if let Some(flag) = flag
+        && !flag.is_empty()
+    {
+        return Ok(Zeroizing::new(flag.to_string()));
+    }
+
+    if std::io::stdin().is_terminal() {
+        let prompt = format!("Enter {label}: ");
+        let value = if hidden {
+            // No-echo prompt for passphrases.
+            rpassword::prompt_password(&prompt)
+                .with_context(|| format!("failed to read {label} from the terminal"))?
+        } else {
+            use std::io::Write as _;
+            eprint!("{prompt}");
+            std::io::stderr().flush().ok();
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .with_context(|| format!("failed to read {label} from the terminal"))?;
+            line.trim_end_matches(['\r', '\n']).to_string()
+        };
+        if value.is_empty() {
+            bail!("empty {label}; aborting");
+        }
+        return Ok(Zeroizing::new(value));
+    }
+
+    let env_hint = match env_var {
+        Some(e) => format!("set {e}, "),
+        None => String::new(),
+    };
+    bail!(
+        "no {label} provided: {env_hint}pass the corresponding flag, or run interactively \
+         (stdin is not a TTY, so there is nothing to prompt)"
+    )
+}
+
+/// Environment variable names for the safe secret sources. Documented in the
+/// CLI `--help` for each flag so operators know the preferred input path.
+const ENV_PASSPHRASE: &str = "FREENET_SECRET_PASSPHRASE";
+const ENV_USER_TOKEN: &str = "FREENET_USER_TOKEN";
+
 async fn secrets_export(args: ExportArgs) -> Result<()> {
     // Exactly one of --local / --user-token selects the source scope.
     if !args.local && args.user_token.is_none() {
         bail!("specify the source scope: --local (all single-user secrets) or --user-token <tok>");
     }
 
-    // Exactly one key method. Token-keyed export requires --user-token (clap
-    // enforces `requires`), so --use-token-key implies the user scope.
-    if args.passphrase.is_none() && !args.use_token_key {
-        bail!("specify how to encrypt the bundle: --passphrase <p> or --use-token-key");
-    }
+    // Key method: `--use-token-key` derives the bundle key from the user token
+    // (requires --user-token, enforced by clap). Otherwise the default is a
+    // passphrase, resolved below from env / flag / interactive prompt — so the
+    // operator does NOT have to pass it on argv. No "neither specified" error:
+    // absent --use-token-key we resolve a passphrase (prompting if interactive).
 
     // Refuse to export against a non-existent node database. `Storage::new`
     // CREATES `<db_dir>/db` if absent, so a wrong/empty --db-dir would silently
@@ -823,30 +931,55 @@ async fn secrets_export(args: ExportArgs) -> Result<()> {
 
     let store = open_store(&args.secrets_dir, &args.db_dir).await?;
 
+    // Resolve the user token (scope selector, and bundle key when
+    // --use-token-key) from a safe source. Only needed for the user scope.
+    // `args.local` and `--user-token` are mutually exclusive (clap), so the
+    // token is resolved exactly when a user-scope export was requested.
+    let user_token: Option<Zeroizing<String>> = if args.local {
+        None
+    } else {
+        Some(resolve_secret(
+            args.user_token.as_deref(),
+            Some(ENV_USER_TOKEN),
+            "user token",
+            false,
+        )?)
+    };
+
     // Build the source scope. For the user scope we derive a UserSecretContext
-    // from the token; its `.scope()` borrows the context, so the context must
-    // outlive the export call.
-    let user_ctx = args
-        .user_token
+    // from the resolved token; its `.scope()` borrows the context, so the
+    // context must outlive the export call.
+    let user_ctx = user_token
         .as_ref()
         .map(|t| UserSecretContext::from_token(t.as_bytes()));
     let scope = if args.local {
         SecretScope::Local
     } else {
-        // user_ctx is Some here (checked above).
         user_ctx
             .as_ref()
             .expect("user scope selected => context built")
             .scope()
     };
 
-    // Build the bundle key material. The borrow must outlive `export_bundle`.
-    let material = if let Some(pass) = args.passphrase.as_ref() {
+    // Resolve the passphrase (only on the passphrase-key path) from a safe
+    // source, hidden-prompted if interactive. The owned buffers must outlive
+    // `export_bundle` since `BundleKeyMaterial` borrows them.
+    let passphrase: Option<Zeroizing<String>> = if args.use_token_key {
+        None
+    } else {
+        Some(resolve_secret(
+            args.passphrase.as_deref(),
+            Some(ENV_PASSPHRASE),
+            "passphrase",
+            true,
+        )?)
+    };
+    let material = if let Some(pass) = passphrase.as_ref() {
         BundleKeyMaterial::Passphrase(pass.as_bytes())
     } else {
-        // --use-token-key: token is present (clap `requires = "user_token"`).
+        // --use-token-key: derive the bundle key from the resolved user token.
         BundleKeyMaterial::Token(
-            args.user_token
+            user_token
                 .as_ref()
                 .expect("--use-token-key requires --user-token")
                 .as_bytes(),
@@ -884,33 +1017,55 @@ async fn secrets_export(args: ExportArgs) -> Result<()> {
 }
 
 async fn secrets_import(args: ImportArgs) -> Result<()> {
-    if args.passphrase.is_none() && args.token.is_none() {
-        bail!("specify how to decrypt the bundle: --passphrase <p> or --token <tok>");
-    }
-    if args.passphrase.is_some() && args.token.is_some() {
-        bail!("pass only one of --passphrase or --token to decrypt the bundle");
-    }
-
     let bundle = fs::read(&args.bundle)
         .with_context(|| format!("failed to read bundle file {}", args.bundle.display()))?;
 
     let mut store = open_store(&args.secrets_dir, &args.db_dir).await?;
 
-    let material = if let Some(pass) = args.passphrase.as_ref() {
-        BundleKeyMaterial::Passphrase(pass.as_bytes())
+    // Decrypt method: token-decrypt when --use-token-key, else passphrase
+    // (the default). The secret VALUE for the chosen method is resolved from a
+    // safe source (env / flag / prompt) so it need not appear on argv. The
+    // owned buffer must outlive `import_bundle` (BundleKeyMaterial borrows it).
+    let secret = if args.use_token_key {
+        resolve_secret(
+            args.token.as_deref(),
+            Some(ENV_USER_TOKEN),
+            "user token",
+            false,
+        )?
     } else {
-        BundleKeyMaterial::Token(
-            args.token
-                .as_ref()
-                .expect("token present when passphrase absent")
-                .as_bytes(),
-        )
+        resolve_secret(
+            args.passphrase.as_deref(),
+            Some(ENV_PASSPHRASE),
+            "passphrase",
+            true,
+        )?
+    };
+    let material = if args.use_token_key {
+        BundleKeyMaterial::Token(secret.as_bytes())
+    } else {
+        BundleKeyMaterial::Passphrase(secret.as_bytes())
     };
 
     // Target scope: Local by default (the self-host migration path), or a
-    // per-user scope when --into-user is given. The owned TargetScope holds
-    // any UserSecretContext for the duration of the import.
-    let target = match args.into_user.as_ref() {
+    // per-user scope when --into-user is given. The token for the target scope
+    // is also resolved from a safe source. The owned TargetScope holds any
+    // UserSecretContext for the duration of the import.
+    let into_user_token: Option<Zeroizing<String>> = if args.into_user.is_some() {
+        // A dedicated env var would be ambiguous with the decrypt token's env
+        // var, so the target-scope token resolves from its flag or an
+        // interactive prompt only (env_var = None). Most imports use --local and
+        // skip this entirely.
+        Some(resolve_secret(
+            args.into_user.as_deref(),
+            None,
+            "target user token (--into-user)",
+            false,
+        )?)
+    } else {
+        None
+    };
+    let target = match into_user_token.as_ref() {
         Some(tok) => TargetScope::user_from_token(tok.as_bytes()),
         None => TargetScope::Local,
     };
@@ -1519,6 +1674,7 @@ mod tests {
             secrets_dir: secrets_dir.to_path_buf(),
             db_dir: db_dir.to_path_buf(),
             passphrase: Some(passphrase.to_string()),
+            use_token_key: false,
             token: None,
             local: true,
             into_user: None,
@@ -1630,11 +1786,23 @@ mod tests {
         let err = secrets_export(a).await.expect_err("no scope must error");
         assert!(err.to_string().contains("source scope"), "got: {err}");
 
-        // No key method.
+        // No passphrase source: the flag is None, FREENET_SECRET_PASSPHRASE is
+        // unset, and the test runner's stdin is not a TTY — so passphrase
+        // resolution must error clearly (the default key method now resolves
+        // from env/flag/prompt rather than requiring the flag).
+        // SAFETY: test-scoped env mutation; nextest per-process isolation.
+        unsafe {
+            std::env::remove_var(ENV_PASSPHRASE);
+        }
         let mut a = export_args(&secrets_dir, &db_dir, &out, "pw");
         a.passphrase = None;
-        let err = secrets_export(a).await.expect_err("no key must error");
-        assert!(err.to_string().contains("encrypt the bundle"), "got: {err}");
+        let err = secrets_export(a)
+            .await
+            .expect_err("no passphrase source must error");
+        assert!(
+            err.to_string().contains("no passphrase provided"),
+            "got: {err}"
+        );
     }
 
     #[tokio::test]
@@ -1660,6 +1828,57 @@ mod tests {
         assert!(
             !out.exists(),
             "no bundle should be written on the error path"
+        );
+    }
+
+    // ----- resolve_secret -----
+
+    #[test]
+    fn resolve_secret_prefers_env_over_flag() {
+        // Use a unique env var name so this test can't race other tests that
+        // read the production FREENET_* vars.
+        let env_name = "FREENET_TEST_RESOLVE_PREF";
+        // SAFETY: a test-private env var name not read elsewhere; set then
+        // removed within this test. nextest runs each test in its own process.
+        unsafe {
+            std::env::set_var(env_name, "from-env");
+        }
+        let got = resolve_secret(Some("from-flag"), Some(env_name), "thing", false)
+            .expect("env source must resolve");
+        assert_eq!(&*got, "from-env", "env must win over the flag");
+        unsafe {
+            std::env::remove_var(env_name);
+        }
+    }
+
+    #[test]
+    fn resolve_secret_falls_back_to_flag() {
+        // Env var unset (and unique to this test) → the flag value is used.
+        let env_name = "FREENET_TEST_RESOLVE_FLAG";
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var(env_name);
+        }
+        let got = resolve_secret(Some("flag-value"), Some(env_name), "thing", false)
+            .expect("flag source must resolve");
+        assert_eq!(&*got, "flag-value");
+    }
+
+    #[test]
+    fn resolve_secret_errors_when_no_source_in_non_interactive() {
+        // No env, no flag. Under `cargo test`/nextest stdin is not a TTY, so the
+        // prompt branch is skipped and this must error clearly (not hang).
+        let env_name = "FREENET_TEST_RESOLVE_MISSING";
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var(env_name);
+        }
+        let err = resolve_secret(None, Some(env_name), "passphrase", true)
+            .expect_err("no source in non-interactive mode must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no passphrase provided") && msg.contains(env_name),
+            "error should name the secret and the env var, got: {msg}"
         );
     }
 }

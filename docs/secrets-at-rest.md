@@ -107,12 +107,24 @@ freenet secrets snapshot-list     --secrets-dir <path> [--delegate <key>] [--sec
 freenet secrets snapshot-restore  --secrets-dir <path> --delegate <key> --secret <id> \
                                   --timestamp-ms <ms> [--suffix <n>] --yes
 freenet secrets export            --secrets-dir <path> --db-dir <path> \
-                                  {--local | --user-token <tok>} \
-                                  {--passphrase <p> | --use-token-key} --out <file>
+                                  {--local | --user-token [tok]} \
+                                  [--passphrase [p] | --use-token-key] --out <file>
 freenet secrets import   <file>   --secrets-dir <path> --db-dir <path> \
-                                  {--passphrase <p> | --token <tok>} \
-                                  [--local | --into-user <tok>] [--overwrite]
+                                  [--passphrase [p] | --use-token-key [--token tok]] \
+                                  [--local | --into-user [tok]] [--overwrite]
 ```
+
+Secret inputs (passphrase, user token) are read from a SAFE source so they
+need not appear on the command line, where they leak via the process table
+(`ps`) and shell history. For each secret the resolution order is:
+**(1)** an environment variable — `FREENET_SECRET_PASSPHRASE` for the
+passphrase, `FREENET_USER_TOKEN` for the user token; **(2)** the
+corresponding flag, if given (last-resort convenience; `--help` warns it is
+exposed); **(3)** an interactive prompt when stdin is a TTY (no-echo for the
+passphrase). In a non-interactive context with neither env nor flag set, the
+command errors rather than hanging. The default key method is the passphrase;
+`--use-token-key` selects token-keyed crypto instead (export requires
+`--user-token`; import reads `FREENET_USER_TOKEN` / `--token` / a prompt).
 
 `kek-init` opts in to a specific backend BEFORE first start. It refuses
 to run if the backend marker already exists — use `kek-migrate` after

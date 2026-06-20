@@ -97,6 +97,9 @@ wasmtime = { workspace = true, optional = true }
 wasmparser = { workspace = true }
 xz2 = { workspace = true }
 reqwest = { workspace = true }
+# Hidden (no-echo) prompt for the `freenet secrets export/import` passphrase, so
+# secrets don't have to be passed on argv (where they leak via `ps`/history).
+rpassword = "7"
 x25519-dalek = { workspace = true }
 sha2 = { workspace = true }
 
