@@ -1,7 +1,9 @@
 //! Implementation of native API's exported and available in the WASM modules.
 
 use dashmap::DashMap;
-use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, DelegateKey, SecretsId};
+use freenet_stdlib::prelude::{
+    ContractInstanceId, ContractKey, DelegateKey, SecretsId, encode_secret_key_list,
+};
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -1454,6 +1456,131 @@ pub(super) mod delegate_secrets {
                 error_codes::ERR_SECRET_NOT_FOUND
             }
         }
+    }
+
+    /// Read the `prefix` argument from WASM memory and return the serialized
+    /// (length-prefixed) byte form of the matching stored keys for this
+    /// delegate+scope. Shared by `list_secrets_len` and `list_secrets` so the
+    /// length the guest allocates exactly matches the bytes it later receives.
+    ///
+    /// Returns `Err(error_code)` on any precondition failure; `Ok(bytes)`
+    /// otherwise (an empty `bytes` means "no matching keys").
+    fn collect_list_secrets(prefix_ptr: i64, prefix_len: i32) -> Result<Vec<u8>, i32> {
+        let id = current_instance_id();
+        if id == -1 {
+            tracing::warn!("delegate list_secrets called outside process()");
+            return Err(error_codes::ERR_NOT_IN_PROCESS);
+        }
+        if prefix_len < 0 {
+            tracing::warn!("delegate list_secrets called with negative prefix_len: {prefix_len}");
+            return Err(error_codes::ERR_INVALID_PARAM);
+        }
+        let Some(info) = MEM_ADDR.get(&id) else {
+            tracing::warn!("instance mem space not recorded for {id}");
+            return Err(error_codes::ERR_NOT_IN_PROCESS);
+        };
+        let Some(env) = DELEGATE_ENV.get(&id) else {
+            tracing::warn!("delegate call env not set for instance {id}");
+            return Err(error_codes::ERR_NOT_IN_PROCESS);
+        };
+
+        // A zero-length prefix is the "list all" case and needs no memory read.
+        let prefix: Vec<u8> = if prefix_len == 0 {
+            Vec::new()
+        } else {
+            let Some(prefix_src) = validate_and_compute_ptr::<u8>(
+                prefix_ptr,
+                info.start_ptr,
+                prefix_len as usize,
+                info.mem_size,
+            ) else {
+                tracing::error!("Memory bounds violation in delegate list_secrets (prefix)");
+                return Err(error_codes::ERR_MEMORY_BOUNDS);
+            };
+            // SAFETY: `prefix_src` was validated by `validate_and_compute_ptr`
+            // to point to `prefix_len` bytes within the WASM linear memory.
+            unsafe { std::slice::from_raw_parts(prefix_src, prefix_len as usize) }.to_vec()
+        };
+
+        let keys =
+            env.secret_store()
+                .list_secret_keys(&env.delegate_key, env.secret_scope(), &prefix);
+        Ok(encode_secret_key_list(keys.iter().map(|k| k.as_slice())))
+    }
+
+    /// Return the byte length of the serialized key list (see
+    /// `collect_list_secrets`) so the delegate can size its output buffer.
+    ///
+    /// ## Returns
+    /// - Non-negative: serialized length in bytes (0 = no matching keys)
+    /// - `ERR_NOT_IN_PROCESS`: called outside process()
+    /// - `ERR_INVALID_PARAM`: negative prefix length
+    pub(crate) fn list_secrets_len(prefix_ptr: i64, prefix_len: i32) -> i32 {
+        match collect_list_secrets(prefix_ptr, prefix_len) {
+            Ok(bytes) => {
+                if bytes.len() > i32::MAX as usize {
+                    i32::MAX
+                } else {
+                    bytes.len() as i32
+                }
+            }
+            Err(code) => code,
+        }
+    }
+
+    /// Write the serialized key list to WASM memory at `out_ptr` (max
+    /// `out_len` bytes).
+    ///
+    /// ## Returns
+    /// - Non-negative: number of bytes written
+    /// - `ERR_NOT_IN_PROCESS`: called outside process()
+    /// - `ERR_INVALID_PARAM`: negative length
+    /// - `ERR_BUFFER_TOO_SMALL`: output buffer is too small (use
+    ///   `list_secrets_len` first)
+    pub(crate) fn list_secrets(
+        prefix_ptr: i64,
+        prefix_len: i32,
+        out_ptr: i64,
+        out_len: i32,
+    ) -> i32 {
+        if out_len < 0 {
+            tracing::warn!("delegate list_secrets called with negative out_len: {out_len}");
+            return error_codes::ERR_INVALID_PARAM;
+        }
+        let bytes = match collect_list_secrets(prefix_ptr, prefix_len) {
+            Ok(b) => b,
+            Err(code) => return code,
+        };
+        if bytes.is_empty() {
+            return 0;
+        }
+        if bytes.len() > out_len as usize {
+            tracing::debug!(
+                "delegate list_secrets buffer too small: need {}, have {}",
+                bytes.len(),
+                out_len
+            );
+            return error_codes::ERR_BUFFER_TOO_SMALL;
+        }
+
+        let id = current_instance_id();
+        let Some(info) = MEM_ADDR.get(&id) else {
+            tracing::warn!("instance mem space not recorded for {id}");
+            return error_codes::ERR_NOT_IN_PROCESS;
+        };
+        let Some(dst) =
+            validate_and_compute_ptr::<u8>(out_ptr, info.start_ptr, bytes.len(), info.mem_size)
+        else {
+            tracing::error!("Memory bounds violation in delegate list_secrets (output)");
+            return error_codes::ERR_MEMORY_BOUNDS;
+        };
+        // SAFETY: `dst` was validated by `validate_and_compute_ptr` to point to
+        // `bytes.len()` bytes within WASM linear memory, and `bytes` is a valid
+        // slice of that length.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+        }
+        bytes.len() as i32
     }
 }
 

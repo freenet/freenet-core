@@ -1256,6 +1256,36 @@ impl WasmtimeEngine {
             )
             .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
+        linker
+            .func_wrap(
+                "freenet_delegate_secrets",
+                "__frnt__delegate__list_secrets_len",
+                |mut caller: Caller<'_, HostState>, prefix_ptr: i64, prefix_len: i32| {
+                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+                    refresh_mem_addr_from_caller(&mut caller, id);
+                    native_api::delegate_secrets::list_secrets_len(prefix_ptr, prefix_len)
+                },
+            )
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
+
+        linker
+            .func_wrap(
+                "freenet_delegate_secrets",
+                "__frnt__delegate__list_secrets",
+                |mut caller: Caller<'_, HostState>,
+                 prefix_ptr: i64,
+                 prefix_len: i32,
+                 out_ptr: i64,
+                 out_len: i32| {
+                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+                    refresh_mem_addr_from_caller(&mut caller, id);
+                    native_api::delegate_secrets::list_secrets(
+                        prefix_ptr, prefix_len, out_ptr, out_len,
+                    )
+                },
+            )
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
+
         // Delegate contracts namespace (async host functions for V2 delegates)
         // These are registered as async to support future async operations,
         // but currently complete synchronously (ReDb reads).
