@@ -715,6 +715,116 @@ fn derive_user_context(hosted_mode: bool, user_token: Option<&str>) -> Option<Us
     }
 }
 
+/// Outcome of the "should this connection's user token be honored?" gate.
+///
+/// Pure decision over `(hosted_mode, has_token, source_ip, xfp_https)`, factored
+/// out of the `connection_info` middleware so the security property is provable
+/// without standing up a WS stack (refuse-plaintext-token invariant of #4381).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UserTokenDecision {
+    /// Honor the token: derive the per-user secret context from it.
+    Honor,
+    /// Hosted mode + a token were present, but the connection is not
+    /// demonstrably secure (not loopback, not a loopback-sourced
+    /// `X-Forwarded-Proto: https`). Reject the upgrade rather than silently
+    /// dropping the token — silently falling back to `Local` would put the user
+    /// on the WRONG (shared) namespace under a public plaintext deployment.
+    RejectInsecure,
+    /// No per-user scoping: treat as single-user (`SecretScope::Local`). This is
+    /// the flag-off path, the no-token path, and the empty-token path — all of
+    /// which are byte-for-byte the pre-#4381 behavior, so no token is read for
+    /// scope and no rejection ever fires.
+    Local,
+}
+
+/// Whether a source IP is loopback (`127.0.0.0/8`, `::1`), after normalizing an
+/// IPv4-mapped IPv6 source (`::ffff:127.0.0.1`) from a dual-stack socket.
+///
+/// Loopback is the trust anchor for honoring a durable per-user token: a direct
+/// local browser, or a TLS-terminating reverse proxy colocated on the same host,
+/// both connect from loopback. Anything off-host cannot forge a loopback source
+/// (the kernel sets it from the accepted socket — see `ConnectInfo<SocketAddr>`
+/// in `private_network_filter`), so it is a sound, non-spoofable signal that the
+/// plaintext HTTP port was NOT exposed to the network for this connection.
+fn is_loopback_source(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.is_loopback(),
+            None => v6.is_loopback(),
+        },
+    }
+}
+
+/// The security-critical gate: decide whether to honor a per-user `userToken`.
+///
+/// HONOR only when the connection is demonstrably secure, so an operator who
+/// accidentally exposes the plaintext HTTP port to the internet cannot leak the
+/// durable, node-independent token. A connection is "secure" when:
+///
+/// - the source address is **loopback** (`127.0.0.0/8` / `::1`) — a direct local
+///   browser, or a TLS-terminating reverse proxy colocated on the same host; OR
+/// - it carries `X-Forwarded-Proto: https` **and** the source is **loopback** (a
+///   TLS-terminating proxy on the same host that forwards the original scheme).
+///
+/// `X-Forwarded-Proto` is trusted **only** from a loopback source. From any
+/// off-host source it is client-spoofable (`curl -H 'X-Forwarded-Proto: https'`),
+/// so it is never trusted there — which is why a loopback source is required on
+/// BOTH branches above, and the XFP branch can only ever *agree* with the plain
+/// loopback branch, never widen it. We keep `xfp_https` as an explicit input so
+/// the "XFP from a remote source is ignored" property is directly unit-tested
+/// and so the trust rule is encoded at the boundary rather than implied.
+///
+/// Decision table (only reached when hosted mode is on and a token is present):
+///
+/// | source     | xfp_https | outcome          |
+/// |------------|-----------|------------------|
+/// | loopback   | any       | `Honor`          |
+/// | non-loop   | any       | `RejectInsecure` |
+/// | `None`     | any       | `RejectInsecure` |
+///
+/// A missing source IP (`None`) is treated as insecure (fail closed): we cannot
+/// prove loopback, so we must not honor the token. In production `ConnectInfo`
+/// always yields the peer address; `None` only arises in unit tests that omit it.
+fn decide_user_token(
+    hosted_mode: bool,
+    has_token: bool,
+    source_ip: Option<std::net::IpAddr>,
+    xfp_https: bool,
+) -> UserTokenDecision {
+    // Flag off, or no token presented: single-user, no rejection. This is the
+    // ONLY path when hosted mode is off, so the whole invariant is hosted-gated
+    // and the flag-off behavior is byte-for-byte unchanged.
+    if !hosted_mode || !has_token {
+        return UserTokenDecision::Local;
+    }
+
+    // Hosted mode + a token: honor only over a demonstrably secure connection.
+    // `xfp_https` is only meaningful when the source is loopback; from any other
+    // source it is spoofable and must not flip the decision. Both honoring
+    // branches therefore require loopback, so the secure condition reduces to
+    // "loopback source" — but we evaluate `xfp_https` explicitly so the trust
+    // boundary (and its unit tests) stay self-documenting.
+    let secure = match source_ip {
+        Some(ip) if is_loopback_source(ip) => {
+            // Loopback: secure regardless of XFP (direct browser or same-host
+            // TLS proxy). A loopback-sourced `X-Forwarded-Proto: https` is the
+            // same-host reverse-proxy case and also secure — same outcome.
+            let _ = xfp_https;
+            true
+        }
+        // Non-loopback source: NEVER secure, even with `X-Forwarded-Proto:
+        // https`, because that header is client-spoofable from off-host.
+        Some(_) | None => false,
+    };
+
+    if secure {
+        UserTokenDecision::Honor
+    } else {
+        UserTokenDecision::RejectInsecure
+    }
+}
+
 async fn connection_info(
     Query(ConnectionInfo {
         auth_token: auth_token_q,
@@ -818,7 +928,8 @@ async fn connection_info(
         }
     }
 
-    // Derive the per-connection user secret context (hosted mode, P2 of #4381).
+    // Derive the per-connection user secret context (hosted mode, P2 of #4381),
+    // gated by the refuse-plaintext-token secure-connection check below.
     //
     // SECURITY-CRITICAL boundary: this is the ONE place a `UserSecretContext` is
     // constructed. It happens here, at connection establishment, from the user
@@ -846,7 +957,58 @@ async fn connection_info(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_owned())
         .or(user_token_q);
-    let user_context = derive_user_context(hosted_mode.0, user_token.as_deref());
+
+    // REFUSE-PLAINTEXT-TOKEN invariant (#4381): a `userToken` is a durable,
+    // node-independent, high-value credential that names a per-user secret
+    // namespace. Honor it ONLY over a demonstrably secure connection, so an
+    // operator who accidentally exposes the plaintext HTTP port to the internet
+    // cannot leak it. "Secure" = loopback source (direct browser or same-host
+    // TLS-terminating proxy), optionally carrying a loopback-sourced
+    // `X-Forwarded-Proto: https`. See `decide_user_token` for the full rationale.
+    //
+    // Source IP: read from the `ConnectInfo<SocketAddr>` request extension that
+    // `axum::serve(..).into_make_service_with_connect_info::<SocketAddr>()` injects
+    // for every connection (the same plumbing `private_network_filter` extracts).
+    // We read it from `req.extensions()` rather than as a typed extractor so a
+    // missing ConnectInfo (only possible in unit tests that omit it) yields
+    // `None` and fails CLOSED in the gate below, instead of 500-ing the request.
+    //
+    // `X-Forwarded-Proto` is trusted ONLY when the source is loopback; from any
+    // off-host source it is client-spoofable, so `decide_user_token` ignores it
+    // unless the source is already loopback.
+    let source_ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    let xfp_https = req
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("https"));
+
+    let user_context =
+        match decide_user_token(hosted_mode.0, user_token.is_some(), source_ip, xfp_https) {
+            UserTokenDecision::Honor => derive_user_context(hosted_mode.0, user_token.as_deref()),
+            UserTokenDecision::Local => None,
+            UserTokenDecision::RejectInsecure => {
+                // Fail LOUD, not silent. Dropping the token and falling back to Local
+                // would silently put the user on the WRONG (shared) namespace under a
+                // public plaintext deployment; rejecting surfaces the misconfiguration
+                // to the operator/user instead. Do not log the token (high-value
+                // credential); log only the non-secret source IP and path.
+                tracing::warn!(
+                    source_ip = ?source_ip,
+                    request_path = req.uri().path(),
+                    "Rejected hosted user token over an insecure connection \
+                     (not loopback / no trusted X-Forwarded-Proto: https)"
+                );
+                return (
+                    StatusCode::FORBIDDEN,
+                    "hosted user token requires a secure (TLS/loopback) connection",
+                )
+                    .into_response();
+            }
+        };
 
     // Do NOT log credentials. The auth token, the user token, and the full
     // request URI are all sensitive: the URI query string carries
@@ -1953,6 +2115,259 @@ mod tests {
         let b = derive_user_context(true, Some("bob")).unwrap();
         assert_eq!(a.user_id(), a_again.user_id());
         assert_ne!(a.user_id(), b.user_id());
+    }
+
+    // ---- refuse-plaintext-token secure-connection gate (#4381) ----
+
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    const LOOPBACK_V4: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST); // 127.0.0.1
+    const LOOPBACK_V4_ALT: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 5)); // 127/8
+    const LOOPBACK_V6: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST); // ::1
+    const PUBLIC_V4: IpAddr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)); // TEST-NET-3
+    const LAN_V4: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)); // private but NOT loopback
+
+    /// `is_loopback_source` accepts loopback v4/v6 and v4-mapped-v6 loopback,
+    /// and rejects everything else — including a private-but-not-loopback LAN IP
+    /// (loopback, not "private", is the trust anchor for the token gate).
+    #[test]
+    fn loopback_source_detection() {
+        assert!(is_loopback_source(LOOPBACK_V4));
+        assert!(is_loopback_source(LOOPBACK_V4_ALT));
+        assert!(is_loopback_source(LOOPBACK_V6));
+        // ::ffff:127.0.0.1 (IPv4-mapped loopback from a dual-stack socket).
+        assert!(is_loopback_source(
+            "::ffff:127.0.0.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(!is_loopback_source(PUBLIC_V4));
+        assert!(!is_loopback_source(LAN_V4));
+        // ::ffff:8.8.8.8 (mapped public) must not be treated as loopback.
+        assert!(!is_loopback_source(
+            "::ffff:8.8.8.8".parse::<IpAddr>().unwrap()
+        ));
+    }
+
+    /// Flag OFF: the gate is inert. A presented token over ANY source (even a
+    /// remote, plaintext one) is `Local` — no rejection path fires. This proves
+    /// the whole invariant is hosted-mode-gated and flag-off is unchanged.
+    #[test]
+    fn gate_flag_off_is_always_local_never_rejects() {
+        for source in [Some(PUBLIC_V4), Some(LAN_V4), Some(LOOPBACK_V4), None] {
+            for xfp in [false, true] {
+                assert_eq!(
+                    decide_user_token(false, true, source, xfp),
+                    UserTokenDecision::Local,
+                    "flag off must be Local for source={source:?} xfp={xfp}"
+                );
+            }
+        }
+    }
+
+    /// No token (any mode/source): `Local`, never rejected. Token-less
+    /// connections are unaffected by the gate in all modes.
+    #[test]
+    fn gate_no_token_is_always_local() {
+        for hosted in [false, true] {
+            for source in [Some(PUBLIC_V4), Some(LOOPBACK_V4), None] {
+                assert_eq!(
+                    decide_user_token(hosted, false, source, false),
+                    UserTokenDecision::Local,
+                    "no token must be Local for hosted={hosted} source={source:?}"
+                );
+                assert_eq!(
+                    decide_user_token(hosted, false, source, true),
+                    UserTokenDecision::Local,
+                );
+            }
+        }
+    }
+
+    /// Hosted ON + token + loopback source => Honor (case a), regardless of XFP.
+    #[test]
+    fn gate_hosted_token_loopback_is_honored() {
+        for source in [LOOPBACK_V4, LOOPBACK_V4_ALT, LOOPBACK_V6] {
+            assert_eq!(
+                decide_user_token(true, true, Some(source), false),
+                UserTokenDecision::Honor,
+                "loopback {source:?} without XFP must be honored"
+            );
+            // Loopback + X-Forwarded-Proto: https (same-host TLS proxy, case b).
+            assert_eq!(
+                decide_user_token(true, true, Some(source), true),
+                UserTokenDecision::Honor,
+                "loopback {source:?} with XFP https must be honored"
+            );
+        }
+    }
+
+    /// Hosted ON + token + non-loopback source + plaintext (no XFP) => REJECT.
+    /// This is the core leak-prevention case: a directly-exposed plaintext port
+    /// on the public internet must not honor the durable token.
+    #[test]
+    fn gate_hosted_token_remote_plaintext_is_rejected() {
+        assert_eq!(
+            decide_user_token(true, true, Some(PUBLIC_V4), false),
+            UserTokenDecision::RejectInsecure,
+        );
+        // A private-but-not-loopback LAN source is also rejected: a LAN-exposed
+        // plaintext port is still a token-leak surface (the trust anchor is
+        // loopback, NOT "is_private_ip").
+        assert_eq!(
+            decide_user_token(true, true, Some(LAN_V4), false),
+            UserTokenDecision::RejectInsecure,
+        );
+    }
+
+    /// Hosted ON + token + non-loopback source + `X-Forwarded-Proto: https` =>
+    /// REJECT. XFP is client-spoofable from off-host, so it is NEVER trusted from
+    /// a non-loopback source; it must not upgrade a remote plaintext connection
+    /// to "secure".
+    #[test]
+    fn gate_xfp_from_remote_source_is_not_trusted() {
+        assert_eq!(
+            decide_user_token(true, true, Some(PUBLIC_V4), true),
+            UserTokenDecision::RejectInsecure,
+            "spoofable XFP from a public source must NOT be honored"
+        );
+        assert_eq!(
+            decide_user_token(true, true, Some(LAN_V4), true),
+            UserTokenDecision::RejectInsecure,
+            "spoofable XFP from a LAN source must NOT be honored"
+        );
+    }
+
+    /// Hosted ON + token + unknown source (`None`) => REJECT (fail closed). We
+    /// cannot prove loopback, so we must not honor. In production ConnectInfo is
+    /// always present; `None` only arises if the plumbing is missing.
+    #[test]
+    fn gate_missing_source_fails_closed() {
+        assert_eq!(
+            decide_user_token(true, true, None, false),
+            UserTokenDecision::RejectInsecure,
+        );
+        assert_eq!(
+            decide_user_token(true, true, None, true),
+            UserTokenDecision::RejectInsecure,
+        );
+    }
+
+    /// Integration-level check that the `connection_info` middleware actually
+    /// enforces the gate end-to-end (not just the pure helper): it reads the
+    /// `ConnectInfo<SocketAddr>` source, the `X-Forwarded-Proto` header, and the
+    /// `userToken`, and returns 403 for an insecure hosted token while passing
+    /// everything else through. Builds a minimal router that layers
+    /// `connection_info` over a trivial 200 handler, mirroring the production
+    /// extension stack (`HostedMode`, `AllowedHosts`, `AllowedSourceCidrs`).
+    ///
+    /// These requests are NOT WebSocket upgrades (no `Upgrade: websocket`), so
+    /// the Origin/Host CSWSH check is skipped — this isolates the user-token gate.
+    #[tokio::test]
+    async fn middleware_rejects_insecure_hosted_token_and_passes_rest() {
+        use axum::{Extension, Router, body::Body, http::Request, http::StatusCode, routing::get};
+        use std::net::SocketAddr;
+        use tower::ServiceExt;
+
+        async fn handler() -> &'static str {
+            "ok"
+        }
+
+        // `connection_info` inserts `Extension<Option<UserSecretContext>>`,
+        // `Extension<Option<AuthToken>>`, and `Extension<EncodingProtocol>` and
+        // then calls the next service; the trivial handler ignores them. The
+        // three extractor Extensions it READS must be present or it 500s.
+        fn router(hosted: bool) -> Router {
+            Router::new()
+                .route("/", get(handler))
+                .layer(axum::middleware::from_fn(connection_info))
+                .layer(Extension(crate::server::HostedMode(hosted)))
+                .layer(Extension(crate::server::AllowedHosts::default()))
+                .layer(Extension(crate::server::AllowedSourceCidrs::default()))
+        }
+
+        fn req(
+            hosted_uri_token: Option<&str>,
+            source: Option<SocketAddr>,
+            xfp_https: bool,
+        ) -> Request<Body> {
+            let uri = match hosted_uri_token {
+                Some(t) => format!("/?userToken={t}"),
+                None => "/".to_string(),
+            };
+            let mut builder = Request::builder().uri(uri);
+            if xfp_https {
+                builder = builder.header("x-forwarded-proto", "https");
+            }
+            if let Some(addr) = source {
+                builder = builder.extension(axum::extract::ConnectInfo(addr));
+            }
+            builder.body(Body::empty()).unwrap()
+        }
+
+        let loopback: SocketAddr = ([127, 0, 0, 1], 12345).into();
+        let public: SocketAddr = ([203, 0, 113, 7], 443).into();
+
+        // Hosted ON + token + remote plaintext => 403 (the leak-prevention case).
+        let resp = router(true)
+            .oneshot(req(Some("alice"), Some(public), false))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "insecure hosted token must be rejected at the middleware"
+        );
+
+        // Hosted ON + token + remote + spoofed XFP https => still 403.
+        let resp = router(true)
+            .oneshot(req(Some("alice"), Some(public), true))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "XFP from a remote source must not bypass the gate"
+        );
+
+        // Hosted ON + token + loopback => 200 (honored, context derived).
+        let resp = router(true)
+            .oneshot(req(Some("alice"), Some(loopback), false))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "loopback hosted token must be honored"
+        );
+
+        // Hosted ON + token + loopback + XFP https => 200 (same-host TLS proxy).
+        let resp = router(true)
+            .oneshot(req(Some("alice"), Some(loopback), true))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Hosted OFF + token + remote => 200 (gate inert; token ignored, Local).
+        let resp = router(false)
+            .oneshot(req(Some("alice"), Some(public), false))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "flag off must not reject; token is ignored, not gated"
+        );
+
+        // No token + remote (any mode) => 200 (unaffected by the gate).
+        let resp = router(true)
+            .oneshot(req(None, Some(public), false))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = router(false)
+            .oneshot(req(None, Some(public), false))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     fn test_conn_state(encoding: EncodingProtocol) -> ConnectionState {
