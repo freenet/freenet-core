@@ -1809,16 +1809,13 @@ mod executor_pin_tests {
             // deferrable-mode loop is ~700 chars; 1 500 chars comfortably
             // covers the immediate loop body without accidentally capturing the
             // non-deferrable join_all block that appears ~2 600 chars later.
-            let serial_network_fetch = body
-                .split("for id in &unique_ids")
-                .skip(1)
-                .any(|seg| {
-                    // Bound the look-ahead to the immediate loop body so that
-                    // `fetch_related_via_network` in a later branch of the same
-                    // function is not falsely attributed to this `for` loop.
-                    let window = &seg[..seg.len().min(1_500)];
-                    window.contains("fetch_related_via_network")
-                });
+            let serial_network_fetch = body.split("for id in &unique_ids").skip(1).any(|seg| {
+                // Bound the look-ahead to the immediate loop body so that
+                // `fetch_related_via_network` in a later branch of the same
+                // function is not falsely attributed to this `for` loop.
+                let window = &seg[..seg.len().min(1_500)];
+                window.contains("fetch_related_via_network")
+            });
             assert!(
                 !serial_network_fetch,
                 "{name} must not iterate serially over &unique_ids to call \
