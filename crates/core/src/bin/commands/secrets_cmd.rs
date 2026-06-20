@@ -225,20 +225,13 @@ pub struct ImportArgs {
     #[clap(long, value_parser)]
     pub db_dir: PathBuf,
     /// Decrypt the bundle with this passphrase (an Argon2id-keyed bundle).
-    /// Mutually exclusive with `--use-token-key`.
-    #[clap(long, conflicts_with = "use_token_key")]
+    /// Mutually exclusive with `--token`.
+    #[clap(long, conflicts_with = "token")]
     pub passphrase: Option<String>,
-    /// Decrypt the bundle with the user token (a token-keyed bundle). The same
-    /// token used at export with `--use-token-key`. Mutually exclusive with
-    /// `--passphrase`. May also serve as the import target when combined with
-    /// `--into-user`.
+    /// Decrypt the bundle with the user token (a token-keyed bundle, i.e. one
+    /// exported with `--use-token-key`). Mutually exclusive with `--passphrase`.
     #[clap(long)]
     pub token: Option<String>,
-    /// Decrypt with the user token (alias-free flag form): equivalent to
-    /// passing `--token` for decryption. Present for symmetry with export's
-    /// `--use-token-key`; requires `--token`.
-    #[clap(long, requires = "token")]
-    pub use_token_key: bool,
     /// Place imported secrets at the single-user (Local) scope. This is the
     /// DEFAULT when neither `--local` nor `--into-user` is given — it is the
     /// path a user takes when migrating to their own peer. Mutually exclusive
@@ -767,7 +760,10 @@ async fn snapshot_restore(args: SnapshotRestoreArgs) -> Result<()> {
 /// `Storage` under the data dir (the index). Both are required because the
 /// export enumerates the index; the snapshot CLIs above only touch the
 /// filesystem, which is why they don't need the db dir.
-async fn open_store(secrets_dir: &PathBuf, db_dir: &PathBuf) -> Result<SecretsStore> {
+async fn open_store(
+    secrets_dir: &std::path::Path,
+    db_dir: &std::path::Path,
+) -> Result<SecretsStore> {
     if !secrets_dir.exists() {
         bail!("secrets dir {} does not exist", secrets_dir.display());
     }
@@ -781,20 +777,21 @@ async fn open_store(secrets_dir: &PathBuf, db_dir: &PathBuf) -> Result<SecretsSt
     // for pre-#4140 Local blobs written under the auto-persisted cipher.
     let secrets = Secrets::load_for_secrets_dir(secrets_dir)
         .with_context(|| format!("failed to load node secrets from {}", secrets_dir.display()))?;
-    SecretsStore::new(secrets_dir.clone(), secrets, db)
+    SecretsStore::new(secrets_dir.to_path_buf(), secrets, db)
         .map_err(|e| anyhow!("failed to open secrets store: {e}"))
 }
 
 /// Map an [`ExportError`] to an `anyhow::Error`, keeping the auth-failure case
-/// as a clear, actionable message.
+/// as a clear, actionable message and passing every other variant through with
+/// its own `Display`.
 fn map_export_err(e: ExportError) -> anyhow::Error {
-    match e {
-        ExportError::AuthFailed => anyhow!(
+    if matches!(e, ExportError::AuthFailed) {
+        return anyhow!(
             "bundle authentication failed: wrong passphrase/token, mismatched key method \
              (passphrase vs token), or a corrupt bundle. No secrets were written."
-        ),
-        other => anyhow::Error::new(other),
+        );
     }
+    anyhow::Error::new(e)
 }
 
 async fn secrets_export(args: ExportArgs) -> Result<()> {
@@ -849,12 +846,18 @@ async fn secrets_export(args: ExportArgs) -> Result<()> {
     );
 
     let bundle = export_bundle(&store, scope, &material).map_err(map_export_err)?;
-    write_bundle_file(&args.out, &bundle).map_err(|e| match e {
-        ExportError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists => anyhow!(
-            "refusing to overwrite existing file {}: choose a fresh --out path",
-            args.out.display()
-        ),
-        other => anyhow::Error::new(other).context("failed to write bundle file"),
+    write_bundle_file(&args.out, &bundle).map_err(|e| {
+        // Special-case the refuse-to-clobber path with a clearer message;
+        // everything else passes through with its own Display.
+        if let ExportError::Io(io) = &e
+            && io.kind() == std::io::ErrorKind::AlreadyExists
+        {
+            return anyhow!(
+                "refusing to overwrite existing file {}: choose a fresh --out path",
+                args.out.display()
+            );
+        }
+        anyhow::Error::new(e).context("failed to write bundle file")
     })?;
 
     println!(
@@ -1502,7 +1505,6 @@ mod tests {
             db_dir: db_dir.to_path_buf(),
             passphrase: Some(passphrase.to_string()),
             token: None,
-            use_token_key: false,
             local: true,
             into_user: None,
             overwrite: false,
