@@ -3338,6 +3338,32 @@ mod tests {
             SUBSCRIBE_HINT_MIN_VERSION, own_crate_version, version_supports_subscribe_hint,
         };
 
+        // Superseded: the placement migration was RE-ENABLED at `(0, 2, 80)` by
+        // PR #4511 (#4145 fixed in #4499). This test pinned the v0.2.74
+        // deactivation (own version below the parked floor, so all inbound hints
+        // ignored) and now documents that prior behavior; its `own < floor`
+        // assert no longer holds once the crate reaches the floor. Replaced by
+        // `receive_gate_active_at_reenable_floor` below.
+        #[ignore]
+        #[test]
+        fn receive_gate_ignores_hint_while_deactivated() {
+            let own = own_crate_version();
+            assert!(
+                own < SUBSCRIBE_HINT_MIN_VERSION,
+                "own version {own:?} must be below the parked floor \
+                 {SUBSCRIBE_HINT_MIN_VERSION:?} for the migration to stay off"
+            );
+            assert!(
+                !version_supports_subscribe_hint(Some(own), SUBSCRIBE_HINT_MIN_VERSION),
+                "while deactivated, the receive gate must IGNORE inbound hints \
+                 (own version below the floor)"
+            );
+            assert!(!version_supports_subscribe_hint(
+                Some((0, 2, 73)),
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+        }
+
         /// At the re-enable floor the receive gate ACTS on hints from peers at or
         /// above the floor and IGNORES hints from pre-floor peers (wire-compat).
         /// Uses explicit versions rather than `own_crate_version` so the assertion

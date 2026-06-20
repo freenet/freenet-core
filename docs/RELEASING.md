@@ -89,12 +89,17 @@ Current wire-gated floors:
   Set to **`(0, 2, 80)`** and FROZEN. 0.2.80 is the first release that ships
   SubscribeHint together with the #4145 event-loop fix (#4499) that makes the
   migration load-safe, so this floor now follows the general "set to the
-  first-shipping release version, then freeze" rule above. Both the SEND gate
-  and the inbound-hint RECEIVE gate in `node.rs` read this floor, so only peer
-  pairs both on `>= 0.2.80` exchange hints, and activation ramps with fleet
-  upgrade rather than switching on everywhere at once. **DO NOT bump this floor
-  on later releases** (raising it above the first-shipping version would silently
-  stop sending to fully-capable peers).
+  first-shipping release version, then freeze" rule above. The SEND gate emits a
+  hint only to peers reported at `>= 0.2.80`; the inbound-hint RECEIVE gate (in
+  `node.rs`) acts on a hint only if THIS node is itself `>= 0.2.80` (a proxy: the
+  per-connection sender version is not exposed at the receive handler, so the
+  load-bearing receiver gates on its own version, which guarantees the node that
+  takes on migration load always has the #4145 fix). Because pre-0.2.80 releases
+  have parked floors and emit no hints, in practice hints flow only between
+  `>= 0.2.80` peers, so activation ramps with fleet upgrade rather than switching
+  on everywhere at once. **DO NOT bump this floor on later releases** (raising it
+  above the first-shipping version would silently stop sending to fully-capable
+  peers).
 
   History: the migration first shipped in v0.2.73 and its directed-subscribe /
   hint-broadcast load drove a network-wide UPDATE-broadcast degradation by

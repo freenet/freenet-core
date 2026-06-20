@@ -3387,6 +3387,28 @@ mod tests {
             assert!(!version_supports_subscribe_hint(None, (0, 0, 0)));
         }
 
+        // Superseded: the placement migration was RE-ENABLED at `(0, 2, 80)` by
+        // PR #4511 (#4145 fixed in #4499). This test pinned the v0.2.74
+        // deactivation (dormant for every 0.2.x peer) and now documents that
+        // prior behavior; its asserts no longer hold against the lowered floor.
+        // Replaced by `placement_migration_active_at_reenable_floor` below.
+        #[ignore]
+        #[test]
+        fn placement_migration_deactivated_for_all_0_2_x() {
+            assert!(!version_supports_subscribe_hint(
+                Some((0, 2, 73)),
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+            assert!(!version_supports_subscribe_hint(
+                Some((0, 2, 255)),
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+            assert!(!version_supports_subscribe_hint(
+                None,
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+        }
+
         /// Pin the PRODUCTION constant (not the local `FLOOR`): the placement
         /// migration is RE-ENABLED at `(0, 2, 80)` (#4499 made it load-safe), so
         /// peers at or above that floor participate while pre-floor 0.2.x peers
