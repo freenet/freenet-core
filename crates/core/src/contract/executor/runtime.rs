@@ -1,8 +1,12 @@
+mod executor_impl;
+mod pool;
+
 use super::*;
 use super::{
     ContractExecutor, ContractRequest, ContractResponse, ExecutorError, InitCheckResult,
     RequestError, Response, SLOW_INIT_THRESHOLD, STALE_INIT_THRESHOLD, StateStoreError, now_nanos,
 };
+pub use pool::RuntimePool;
 
 /// Maximum number of related contracts a single validation can request.
 /// Bounds worst-case first-time cost: N GETs of up to 50MB each.
@@ -125,10 +129,6 @@ fn subscriber_limit_error(instance_id: ContractInstanceId, cause: &str) -> Box<R
         cause: cause.to_string().into(),
     }))
 }
-
-mod executor_impl;
-mod pool;
-pub use pool::RuntimePool;
 
 // ============================================================================
 // ContractExecutor for Executor<Runtime> - delegates to bridged methods
