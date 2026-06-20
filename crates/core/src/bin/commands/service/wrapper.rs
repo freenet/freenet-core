@@ -8,6 +8,8 @@ use super::single_instance::{AcquireWrapperLockOutcome, acquire_wrapper_single_i
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use super::DASHBOARD_URL;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use super::open_url_in_browser;
 use super::{
     SENTINEL_RESTART, SENTINEL_STOP, WRAPPER_EXIT_ALREADY_RUNNING, WRAPPER_EXIT_UPDATE_NEEDED,
     WRAPPER_INITIAL_BACKOFF_SECS, WRAPPER_MAX_BACKOFF_SECS, WRAPPER_MAX_CONSECUTIVE_FAILURES,

@@ -352,6 +352,17 @@ pub use macos::generate_wrapper_script;
 #[cfg(target_os = "macos")]
 pub use macos::stop_and_remove_service;
 
+// Re-exports for tray.rs (Launch at Login toggle and state query).
+#[cfg(target_os = "macos")]
+pub use launch_at_login::{
+    ToggleLaunchAtLoginOutcome, disable_launch_at_login, enable_launch_at_login,
+    is_launch_at_login_enabled, macos_app_bundle_path, toggle_launch_at_login_outcome,
+};
+
+// Re-exports for update.rs (macOS plist generation).
+#[cfg(target_os = "macos")]
+pub use macos::generate_plist;
+
 #[cfg(target_os = "windows")]
 pub use windows::kill_freenet_service_processes;
 #[cfg(target_os = "windows")]
