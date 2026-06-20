@@ -46,6 +46,47 @@ fn sandbox_csp_for_origin(origin: &str) -> String {
     )
 }
 
+/// Derive the browser-facing origin to interpolate into the sandbox CSP from
+/// the request headers, honoring a TLS-terminating reverse proxy's forwarded
+/// scheme and host.
+///
+/// The CSP origin MUST match the origin the *browser* actually used, or the
+/// CSP blocks the webapp's own assets. Behind a TLS proxy (the supported
+/// hosted-mode deployment) the browser's origin is `https://<public-host>`,
+/// while the node itself is reached over loopback `http`. We therefore:
+///
+/// - use `https` when `X-Forwarded-Proto: https` is present (set by the
+///   trusted proxy — same forwarded-header trust model as the hosted-mode
+///   token gate, which already requires the operator's proxy to set/strip
+///   `X-Forwarded-*`); otherwise `http`.
+/// - prefer `X-Forwarded-Host` over `Host` for the host:port, since a proxy
+///   may rewrite the upstream `Host` to its loopback target (nginx does this
+///   by default) while preserving the original in `X-Forwarded-Host`.
+///
+/// A direct connection carries neither forwarded header and falls back to the
+/// previous behavior: `http://<Host>`. `'self'` only as a last resort when no
+/// host is available at all.
+///
+/// Note: the forwarded headers are client-spoofable through a careless proxy,
+/// but the CSP is defence-in-depth, not a trust boundary — a mismatched origin
+/// only *breaks* the sandboxed app (too-strict CSP), it cannot widen what the
+/// opaque-origin iframe may reach. So honoring them here is safe.
+fn sandbox_origin_from_headers(headers: &axum::http::HeaderMap) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').next().unwrap_or(v).trim())
+        .filter(|v| v.eq_ignore_ascii_case("https"))
+        .map(|_| "https")
+        .unwrap_or("http");
+    headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(axum::http::header::HOST))
+        .and_then(|h| h.to_str().ok())
+        .map(|host| format!("{scheme}://{host}"))
+        .unwrap_or_else(|| "'self'".to_string())
+}
+
 mod permission_prompts;
 mod v1;
 mod v2;
@@ -543,12 +584,10 @@ async fn serve_sandbox_response(
     let mut response = contract_response.into_response();
     add_sandbox_cors_headers(&mut response);
     // See `sandbox_csp_for_origin` for why we interpolate a concrete origin
-    // rather than using `'self'`.
-    let local_api_origin = req_headers
-        .get(axum::http::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .map(|host| format!("http://{host}"))
-        .unwrap_or_else(|| "'self'".to_string());
+    // rather than using `'self'`, and `sandbox_origin_from_headers` for why we
+    // honor the proxy's forwarded scheme/host (so the CSP matches the browser's
+    // real `https://` origin behind a TLS-terminating reverse proxy).
+    let local_api_origin = sandbox_origin_from_headers(req_headers);
     let csp = sandbox_csp_for_origin(&local_api_origin);
     if let Ok(csp_value) = axum::http::HeaderValue::from_str(&csp) {
         response
@@ -1171,5 +1210,70 @@ mod tests {
         let csp = sandbox_csp_for_origin("http://192.168.1.42:7509");
         assert!(csp.contains("http://192.168.1.42:7509"));
         assert!(!csp.contains("127.0.0.1"));
+    }
+
+    fn hdrs(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    /// Regression for the live-deploy bug: behind a TLS-terminating reverse
+    /// proxy the browser's origin is `https://<public-host>`, but the sandbox
+    /// CSP origin was hardcoded to `http://<Host>` — so the CSP blocked the
+    /// webapp's own `https://` assets and the app never loaded. The origin must
+    /// honor `X-Forwarded-Proto: https`.
+    #[test]
+    fn sandbox_origin_honors_forwarded_https_scheme() {
+        let origin = sandbox_origin_from_headers(&hdrs(&[
+            ("host", "127.0.0.1:7509"),
+            ("x-forwarded-proto", "https"),
+            ("x-forwarded-host", "localhost:8443"),
+        ]));
+        // https scheme + the public host the browser actually used.
+        assert_eq!(origin, "https://localhost:8443");
+        // And the resulting CSP allows that exact (https) origin.
+        let csp = sandbox_csp_for_origin(&origin);
+        assert!(csp.contains("https://localhost:8443"));
+        assert!(!csp.contains("http://localhost:8443"));
+    }
+
+    /// A proxy that preserves Host (e.g. Caddy) needs no `X-Forwarded-Host`:
+    /// the scheme still upgrades from `X-Forwarded-Proto`.
+    #[test]
+    fn sandbox_origin_forwarded_proto_without_forwarded_host_uses_host() {
+        let origin = sandbox_origin_from_headers(&hdrs(&[
+            ("host", "try.example.org"),
+            ("x-forwarded-proto", "https"),
+        ]));
+        assert_eq!(origin, "https://try.example.org");
+    }
+
+    /// A direct (no-proxy) connection is unchanged: `http://<Host>`.
+    #[test]
+    fn sandbox_origin_direct_connection_is_http_host() {
+        assert_eq!(
+            sandbox_origin_from_headers(&hdrs(&[("host", "127.0.0.1:7509")])),
+            "http://127.0.0.1:7509"
+        );
+        // Explicit `X-Forwarded-Proto: http` must NOT upgrade to https.
+        assert_eq!(
+            sandbox_origin_from_headers(&hdrs(&[
+                ("host", "127.0.0.1:7509"),
+                ("x-forwarded-proto", "http"),
+            ])),
+            "http://127.0.0.1:7509"
+        );
+    }
+
+    /// No host at all → `'self'` fallback (unchanged).
+    #[test]
+    fn sandbox_origin_no_host_falls_back_to_self() {
+        assert_eq!(sandbox_origin_from_headers(&hdrs(&[])), "'self'");
     }
 }
