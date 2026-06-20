@@ -1,3 +1,6 @@
+// `anyhow::{Context, Result}` is only used by the cfg-gated `tail_with_rotation`;
+// `Path` is used by the unconditional `find_latest_log_file`.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use anyhow::{Context, Result};
 use std::path::Path;
 

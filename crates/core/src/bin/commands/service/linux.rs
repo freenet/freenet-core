@@ -1,4 +1,8 @@
+// Every item in this module is `#[cfg(target_os = "linux")]`, so gate the
+// imports too — otherwise they are unused on macOS/Windows builds.
+#[cfg(target_os = "linux")]
 use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
 use std::path::Path;
 
 /// Path to the system-wide systemd service file.
