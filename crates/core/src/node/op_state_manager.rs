@@ -2867,6 +2867,10 @@ mod tests {
             include_str!("../contract/executor/runtime.rs"),
         ),
         (
+            "contract/executor/runtime/executor_impl.rs",
+            include_str!("../contract/executor/runtime/executor_impl.rs"),
+        ),
+        (
             "contract/executor/mock_runtime.rs",
             include_str!("../contract/executor/mock_runtime.rs"),
         ),
