@@ -873,9 +873,14 @@ fn shell_page(
     let (user_token_script, bridge_call) = if hosted_mode {
         (
             format!("<script>\n{SHELL_USER_TOKEN_JS}\n</script>\n"),
-            format!("freenetBridge(\"{auth_token}\", __freenet_user_token);"),
+            // Third arg `true` puts the bridge in hosted mode so it can fail
+            // closed on a plaintext (http) connection — see the hostedInsecure
+            // branch in SHELL_BRIDGE_JS.
+            format!("freenetBridge(\"{auth_token}\", __freenet_user_token, true);"),
         )
     } else {
+        // Non-hosted: the original 1-arg call. `hostedMode` is undefined, so the
+        // fail-closed branch never triggers and behavior is unchanged.
         (String::new(), format!("freenetBridge(\"{auth_token}\");"))
     };
     let html = format!(
@@ -1092,7 +1097,7 @@ const SHELL_USER_TOKEN_JS: &str = r#"var __freenet_user_token = (function() {
 /// appended to the real WebSocket URL as `?userToken=<token>` so the node can
 /// scope a per-user delegate-secret namespace (P2 of #4381).
 const SHELL_BRIDGE_JS: &str = r#"
-function freenetBridge(authToken, userToken) {
+function freenetBridge(authToken, userToken, hostedMode) {
   'use strict';
   var LOCAL_API_ORIGIN = location.origin;
   var MAX_CONNECTIONS = 32;
@@ -1100,6 +1105,56 @@ function freenetBridge(authToken, userToken) {
   var connections = new Map();
   var lastClipboard = 0;
   var lastDownload = 0;
+
+  // FAIL CLOSED on a hosted node reached over plaintext http (#4381).
+  //
+  // Refusing-to-transmit the userToken (SHELL_USER_TOKEN_JS + the bridge's
+  // https guard) stops the secret from leaking, but on its own it would leave
+  // the connection as hosted+no-token, which the backend treats as the SHARED
+  // Local namespace. Every browser user on a misconfigured (http) public
+  // hosted node would then silently share ONE delegate-secret namespace =
+  // cross-user data contamination. Degrading to shared-Local is worse than
+  // refusing, so a hosted shell served over http must REFUSE to operate, not
+  // fall back to anonymous Local. (The token is minted client-side on the
+  // https load, so there is no legitimate "anonymous Local first connect" to
+  // preserve in hosted mode — a hosted user is always https-with-token or
+  // refused. Non-hosted single-user nodes never reach this branch.)
+  //
+  // We do NOT load the app iframe (so it cannot operate on the shared Local
+  // namespace) and we render a clear message instead; the WS-open handler
+  // below also refuses every connection while in this state, as a second
+  // independent barrier.
+  var hostedInsecure = hostedMode === true && location.protocol !== 'https:';
+  if (hostedInsecure) {
+    var msg = document.createElement('div');
+    msg.setAttribute('role', 'alert');
+    msg.style.cssText =
+      'position:fixed;inset:0;display:flex;align-items:center;justify-content:center;'
+      + 'padding:2rem;font:16px/1.5 system-ui,sans-serif;color:#1a1a1a;'
+      + 'background:#fff;text-align:center;box-sizing:border-box;';
+    var inner = document.createElement('div');
+    inner.style.maxWidth = '32rem';
+    var h = document.createElement('h1');
+    h.style.cssText = 'font-size:1.25rem;margin:0 0 0.75rem;';
+    h.textContent = 'Insecure connection';
+    var p = document.createElement('p');
+    p.textContent =
+      'This hosted Freenet node must be accessed over HTTPS. Per-user data '
+      + 'isolation is disabled over an insecure connection, so the app will '
+      + 'not load. Reconnect using an https:// address.';
+    inner.appendChild(h);
+    inner.appendChild(p);
+    msg.appendChild(inner);
+    // Remove the (not-yet-loaded, data-src) iframe and show the message. The
+    // iframe never had its .src set, so the app never started.
+    if (iframe && iframe.parentNode) { iframe.parentNode.removeChild(iframe); }
+    document.body.appendChild(msg);
+    document.title = 'Freenet — HTTPS required';
+    // Keep listening for iframe messages purely so the WS-open handler can
+    // return an 'error' to any app that somehow loaded; but we never set
+    // iframe.src, so in practice nothing runs. Fall through to install the
+    // message listener (whose 'open' case refuses while hostedInsecure).
+  } else {
 
   // Build iframe src from data-src, appending any URL hash for deep
   // linking. Using data-src (not src) in the HTML means the iframe
@@ -1129,8 +1184,10 @@ function freenetBridge(authToken, userToken) {
       );
     } catch(e) {}
   }
+  } // end of the non-fail-closed iframe-load block
 
   function sendToIframe(msg) {
+    if (!iframe || !iframe.contentWindow) return;
     iframe.contentWindow.postMessage(msg, '*');
   }
 
@@ -1453,6 +1510,16 @@ function freenetBridge(authToken, userToken) {
 
     switch (msg.type) {
       case 'open': {
+        // FAIL CLOSED (#4381): a hosted node served over plaintext http must
+        // never let the app open a socket, because that connection would land
+        // on the SHARED Local namespace (no per-user token over http). Refuse
+        // every open while hosted+insecure — a second independent barrier on
+        // top of not loading the iframe at all (see the hostedInsecure block
+        // at the top of freenetBridge).
+        if (hostedInsecure) {
+          sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
+          return;
+        }
         // Limit concurrent connections to prevent resource exhaustion
         if (connections.size >= MAX_CONNECTIONS) {
           sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
@@ -4157,13 +4224,14 @@ mod tests {
             html.contains("localStorage.setItem"),
             "hosted-mode token must be persisted to localStorage"
         );
-        // The bridge must be called with the user-token argument (2-arg form).
+        // The bridge must be called with the user-token argument AND the
+        // hosted-mode flag (so it can fail closed over http).
         assert!(
             html.contains(&format!(
-                "freenetBridge(\"{}\", __freenet_user_token);",
+                "freenetBridge(\"{}\", __freenet_user_token, true);",
                 token.as_str()
             )),
-            "hosted-mode shell must call freenetBridge with the user token; got: {html}"
+            "hosted-mode shell must call freenetBridge with the user token and hosted flag; got: {html}"
         );
         // The bridge must NOT be called in the 1-arg form in hosted mode.
         assert!(
@@ -4218,8 +4286,8 @@ mod tests {
     #[test]
     fn bridge_js_appends_user_token_param() {
         assert!(
-            SHELL_BRIDGE_JS.contains("function freenetBridge(authToken, userToken)"),
-            "bridge function must accept the per-user token argument"
+            SHELL_BRIDGE_JS.contains("function freenetBridge(authToken, userToken, hostedMode)"),
+            "bridge function must accept the per-user token and hosted-mode arguments"
         );
         assert!(
             SHELL_BRIDGE_JS.contains("u.searchParams.set('userToken', userToken)"),
@@ -4285,6 +4353,87 @@ mod tests {
         assert!(
             https_attach_guard < set_user,
             "the https guard must precede the userToken append"
+        );
+    }
+
+    /// FAIL CLOSED, not shared-Local (Codex review, #4381): a HOSTED node
+    /// reached over plaintext http must REFUSE to operate, not silently connect
+    /// every visitor onto the shared Local delegate-secret namespace (which the
+    /// not-transmitting-the-token guards alone would leave it doing). The shell
+    /// must (a) not load the app, showing a message instead, and (b) refuse all
+    /// WebSocket opens — both gated on `hostedMode === true && non-https`.
+    #[tokio::test]
+    async fn hosted_shell_fails_closed_over_plaintext_http() {
+        // The hosted shell page must pass the hosted flag to the bridge so it
+        // CAN fail closed; without the third `true` arg the bridge can't tell
+        // it's hosted.
+        let token = AuthToken::generate();
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, true).unwrap(),
+        )
+        .await;
+        assert!(
+            html.contains(&format!(
+                "freenetBridge(\"{}\", __freenet_user_token, true);",
+                token.as_str()
+            )),
+            "hosted shell must pass the hosted flag (true) to the bridge; got: {html}"
+        );
+
+        // Guard condition: hosted AND non-https. Must require BOTH so it never
+        // triggers in non-hosted mode (hostedMode is undefined there) or over
+        // https.
+        assert!(
+            SHELL_BRIDGE_JS.contains("hostedMode === true && location.protocol !== 'https:'"),
+            "fail-closed must require hosted mode AND a non-https connection"
+        );
+
+        // Effect 1 — the app is not loaded: the iframe is removed and a message
+        // is shown instead. Anchor on the removeChild of the iframe and the
+        // alert role.
+        assert!(
+            SHELL_BRIDGE_JS.contains("removeChild(iframe)"),
+            "fail-closed must not load the app iframe"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("role', 'alert'") || SHELL_BRIDGE_JS.contains("'alert'"),
+            "fail-closed must render a visible alert message"
+        );
+
+        // Effect 2 — the WS-open handler refuses while hostedInsecure, BEFORE it
+        // would otherwise open a socket on the shared Local namespace. Assert the
+        // refusal check precedes the real WebSocket construction.
+        let refuse = SHELL_BRIDGE_JS
+            .find("if (hostedInsecure)")
+            .expect("WS-open handler must refuse while hosted+insecure");
+        let open_socket = SHELL_BRIDGE_JS
+            .find("new WebSocket(u.toString()")
+            .expect("bridge must have a WebSocket open site");
+        assert!(
+            refuse < open_socket,
+            "the hostedInsecure refusal must precede opening the real socket"
+        );
+    }
+
+    /// Non-hosted mode must NEVER reach the fail-closed path: the bridge is
+    /// called with one argument, so `hostedMode` is undefined and the whole
+    /// hostedInsecure branch is inert — the app loads and connects over http
+    /// exactly as before #4381. (Single-user nodes commonly run over http.)
+    #[tokio::test]
+    async fn non_hosted_shell_never_fails_closed() {
+        let token = AuthToken::generate();
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, false).unwrap(),
+        )
+        .await;
+        // The 1-arg call leaves hostedMode undefined; `=== true` is then false.
+        assert!(
+            html.contains(&format!("freenetBridge(\"{}\");", token.as_str())),
+            "non-hosted shell must use the 1-arg freenetBridge call; got: {html}"
+        );
+        assert!(
+            !html.contains(", true);"),
+            "non-hosted shell must not pass the hosted-mode flag to the bridge"
         );
     }
 
