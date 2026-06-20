@@ -1813,7 +1813,13 @@ mod executor_pin_tests {
                 // Bound the look-ahead to the immediate loop body so that
                 // `fetch_related_via_network` in a later branch of the same
                 // function is not falsely attributed to this `for` loop.
-                let window = &seg[..seg.len().min(1_500)];
+                // Back the end index up to a UTF-8 char boundary so a
+                // multi-byte character straddling byte 1 500 doesn't panic.
+                let mut end = seg.len().min(1_500);
+                while end > 0 && !seg.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let window = &seg[..end];
                 window.contains("fetch_related_via_network")
             });
             assert!(
@@ -1837,8 +1843,14 @@ mod executor_pin_tests {
             "inline UPDATE-side parallel-fetch marker missing from \
              executor_impl.rs — #4077 regressed",
         );
+        // Clamp to a UTF-8 char boundary (and to the string length) so a
+        // multi-byte character near byte 2 000 doesn't panic the slice.
+        let mut window_end = after_marker.len().min(2_000);
+        while window_end > 0 && !after_marker.is_char_boundary(window_end) {
+            window_end -= 1;
+        }
         assert!(
-            after_marker[..2_000].contains("join_all"),
+            after_marker[..window_end].contains("join_all"),
             "UPDATE-side inline related fetch in bridged_upsert_contract_state \
              must call futures::future::join_all (#4077)"
         );
