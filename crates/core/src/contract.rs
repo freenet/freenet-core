@@ -42,6 +42,7 @@ use tracing::Instrument;
 use self::executor::DelegateNotificationReceiver;
 use self::user_input::{CallerIdentity, UserInputPrompter};
 use crate::config::GlobalExecutor;
+use crate::wasm_runtime::UserSecretContext;
 
 /// Maximum iterations when handling contract requests to prevent infinite loops
 const MAX_CONTRACT_REQUEST_ITERATIONS: usize = 100;
@@ -405,6 +406,7 @@ async fn handle_delegate_with_contract_requests<CH, P>(
     contract_handler: &mut CH,
     initial_req: DelegateRequest<'static>,
     origin_contract: Option<&ContractInstanceId>,
+    user_context: Option<&UserSecretContext>,
     delegate_key: &DelegateKey,
     prompter: &P,
 ) -> Vec<OutboundDelegateMsg>
@@ -441,7 +443,7 @@ where
         // Execute the delegate request
         let values = match contract_handler
             .executor()
-            .execute_delegate_request(current_req, origin_contract, None)
+            .execute_delegate_request(current_req, origin_contract, None, user_context)
             .await
         {
             Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse { key: _, values }) => {
@@ -822,7 +824,15 @@ where
                 };
                 match contract_handler
                     .executor()
-                    .execute_delegate_request(target_req, None, Some(delegate_key))
+                    // Inter-delegate hop: `user_context = None`. A
+                    // delegate-to-delegate message does NOT carry the
+                    // originating connection's per-user secret namespace — the
+                    // target delegate's secrets are its own, scoped to whatever
+                    // (if any) user context its own connections present. This
+                    // keeps the per-user namespace bound to the connection
+                    // boundary, not propagated transitively through delegate
+                    // messages (part of the #4381 unforgeability invariant).
+                    .execute_delegate_request(target_req, None, Some(delegate_key), None)
                     .await
                 {
                     Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
@@ -1654,6 +1664,10 @@ async fn handle_delegate_notification<CH, P>(
         contract_handler,
         req,
         None,
+        // Contract-state-change notification: not driven by a client
+        // connection, so there is no user token and no per-user secret
+        // namespace. Secrets stay `SecretScope::Local`.
+        None,
         &delegate_key,
         prompter,
     )
@@ -2023,11 +2037,16 @@ where
         ContractHandlerEvent::DelegateRequest {
             req,
             origin_contract,
+            user_context,
         } => {
             let delegate_key = req.key().clone();
             tracing::debug!(
                 delegate_key = %delegate_key,
                 ?origin_contract,
+                // `user_context`'s Debug redacts the dek_secret; logging the
+                // (non-secret) user_id here is safe and useful for tracing
+                // which namespace a hosted-mode request touched.
+                ?user_context,
                 "Processing delegate request"
             );
 
@@ -2036,6 +2055,7 @@ where
                 contract_handler,
                 req,
                 origin_contract.as_ref(),
+                user_context.as_ref(),
                 &delegate_key,
                 prompter,
             )

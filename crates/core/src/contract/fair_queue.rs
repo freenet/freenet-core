@@ -778,6 +778,7 @@ mod tests {
                         inbound: vec![],
                     },
                     origin_contract: None,
+                    user_context: None,
                 },
             ),
             (

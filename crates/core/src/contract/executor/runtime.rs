@@ -64,7 +64,7 @@ fn byte_multiset_eq(a: &[u8], b: &[u8]) -> bool {
 
 use crate::node::OpManager;
 use crate::wasm_runtime::{
-    BackendEngine, MAX_STATE_SIZE, ModuleCache, RuntimeConfig, SharedModuleCache,
+    BackendEngine, MAX_STATE_SIZE, ModuleCache, RuntimeConfig, SharedModuleCache, UserSecretContext,
 };
 
 use dashmap::DashMap;
@@ -945,9 +945,10 @@ impl ContractExecutor for RuntimePool {
         req: DelegateRequest<'_>,
         origin_contract: Option<&ContractInstanceId>,
         caller_delegate: Option<&DelegateKey>,
+        user_context: Option<&UserSecretContext>,
     ) -> Response {
         let mut executor = self.pop_executor().await;
-        let result = executor.delegate_request(req, origin_contract, caller_delegate);
+        let result = executor.delegate_request(req, origin_contract, caller_delegate, user_context);
         self.return_checked(executor, "execute_delegate_request")
             .await;
         result
@@ -3278,8 +3279,9 @@ impl ContractExecutor for Executor<Runtime> {
         req: DelegateRequest<'_>,
         origin_contract: Option<&ContractInstanceId>,
         caller_delegate: Option<&DelegateKey>,
+        user_context: Option<&UserSecretContext>,
     ) -> Response {
-        self.delegate_request(req, origin_contract, caller_delegate)
+        self.delegate_request(req, origin_contract, caller_delegate, user_context)
     }
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
@@ -3475,7 +3477,9 @@ impl Executor<Runtime> {
     ) -> Response {
         match req {
             ClientRequest::ContractOp(op) => self.contract_requests(op, id, updates).await,
-            ClientRequest::DelegateOp(op) => self.delegate_request(op, None, None),
+            // Local-node path (no hosted-mode connection): always single-user
+            // (`user_context = None`), so secrets stay `SecretScope::Local`.
+            ClientRequest::DelegateOp(op) => self.delegate_request(op, None, None, None),
             ClientRequest::Disconnect { cause } => {
                 if let Some(cause) = cause {
                     tracing::info!("disconnecting cause: {cause}");
@@ -3648,6 +3652,7 @@ impl Executor<Runtime> {
         req: DelegateRequest<'_>,
         origin_contract: Option<&ContractInstanceId>,
         caller_delegate: Option<&DelegateKey>,
+        user_context: Option<&UserSecretContext>,
     ) -> Response {
         // Mutual exclusion invariant: a single inbound delegate request is
         // either dispatched on behalf of a contract-backed web app
@@ -3748,6 +3753,12 @@ impl Executor<Runtime> {
                     &key,
                     &params,
                     origin.as_ref(),
+                    // The per-user secret scope, present only in hosted mode and
+                    // derived solely from the connection token. It is delivered
+                    // here on a SEPARATE channel from `origin`/the request body,
+                    // so neither WASM nor any delegate-message content can set or
+                    // change which user's namespace a secret op touches.
+                    user_context,
                     inbound
                         .into_iter()
                         .map(InboundDelegateMsg::into_owned)

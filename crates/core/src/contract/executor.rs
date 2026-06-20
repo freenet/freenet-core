@@ -29,7 +29,7 @@ use crate::node::OpManager;
 use crate::operations::get::GetResult;
 use crate::wasm_runtime::{
     ContractRuntimeInterface, ContractStore, DelegateRuntimeInterface, DelegateStore, Runtime,
-    SecretsStore, StateStorage, StateStore, StateStoreError,
+    SecretsStore, StateStorage, StateStore, StateStoreError, UserSecretContext,
 };
 use crate::{
     client_events::{ClientId, HostResult},
@@ -575,11 +575,24 @@ pub(crate) trait ContractExecutor: Send + 'static {
     /// the receiver's `MessageOrigin`. At most one of these two arguments is
     /// expected to be `Some` at a given call site, and only `caller_delegate`
     /// is used for inter-delegate dispatch (issue #3860).
+    ///
+    /// `user_context` carries the per-connection per-user secret namespace
+    /// (hosted mode, P2 of #4381). It is derived ONCE at the WS connection
+    /// boundary from the connection's user token and is `None` outside hosted
+    /// mode or when no token was presented. When `Some`, the delegate's secret
+    /// host functions operate on that user's namespace; when `None` they use
+    /// the single-user [`crate::wasm_runtime::SecretScope::Local`] path,
+    /// byte-for-byte today's behavior. Crucially this is a SEPARATE channel
+    /// from `origin_contract`/`caller_delegate` and the request body: nothing
+    /// the delegate or client can put in a message can set or forge it. The
+    /// inter-delegate dispatch path passes `None` (a delegate-to-delegate hop
+    /// does not inherit the originating connection's user namespace).
     fn execute_delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
         origin_contract: Option<&ContractInstanceId>,
         caller_delegate: Option<&DelegateKey>,
+        user_context: Option<&UserSecretContext>,
     ) -> impl Future<Output = Response> + Send;
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo>;

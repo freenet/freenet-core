@@ -179,6 +179,7 @@ impl Default for ConfigArgs {
                 token_cleanup_interval_seconds: None,
                 allowed_host: None,
                 allowed_source_cidrs: None,
+                hosted_mode: None,
             },
             secrets: Default::default(),
             log_level: Some(tracing::log::LevelFilter::Info),
@@ -351,6 +352,9 @@ impl ConfigArgs {
                         .collect(),
                 );
             }
+            self.ws_api
+                .hosted_mode
+                .get_or_insert(cfg.ws_api.hosted_mode);
             self.network_api
                 .address
                 .get_or_insert(cfg.network_api.address);
@@ -796,6 +800,7 @@ impl ConfigArgs {
                     })
                     .transpose()?
                     .unwrap_or_default(),
+                hosted_mode: self.ws_api.hosted_mode.unwrap_or(false),
             },
             secrets,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
@@ -1573,6 +1578,29 @@ pub struct WebsocketApiArgs {
         skip_serializing_if = "Option::is_none"
     )]
     pub allowed_source_cidrs: Option<Vec<String>>,
+
+    /// Opt-in hosted mode (P2 of #4381): honor a per-connection durable user
+    /// token (the `userToken` query parameter on the WebSocket upgrade) and
+    /// give that connection its own per-user delegate-secret namespace.
+    ///
+    /// OFF by default. When off, `userToken` is ignored and every connection is
+    /// single-user, byte-for-byte today's behavior. Enable only on a node you
+    /// intend to operate as a shared public proxy for untrusted users.
+    ///
+    /// `--hosted-mode` is THE operator switch, so it works as a BARE flag:
+    /// `--hosted-mode` => `Some(true)`; `--hosted-mode=false` (or
+    /// `--hosted-mode false`) => `Some(false)`; absent => `None`. Kept as
+    /// `Option<bool>` (not a plain `bool` with `default_value`) so config-file /
+    /// env layering can still leave it unset (`None`) and the CLI only overrides
+    /// when actually present — `None` is then resolved to `false` in `build`.
+    #[arg(
+        long = "hosted-mode",
+        env = "FREENET_HOSTED_MODE",
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    #[serde(rename = "hosted-mode", skip_serializing_if = "Option::is_none")]
+    pub hosted_mode: Option<bool>,
 }
 
 /// Default telemetry endpoint (nova.locut.us OTLP collector).
@@ -1758,6 +1786,18 @@ pub struct WebsocketApiConfig {
     /// Empty means only loopback + RFC1918 / IPv6 ULA are accepted.
     #[serde(default, rename = "allowed-source-cidrs")]
     pub allowed_source_cidrs: Vec<ipnet::IpNet>,
+
+    /// Opt-in hosted mode (P2 of #4381). When `true`, a WebSocket connection
+    /// that presents a durable per-user token (the `userToken` query parameter)
+    /// gets a per-user delegate-secret namespace derived from that token; when
+    /// `false` (the default), the `userToken` parameter is ignored entirely and
+    /// every connection is single-user — byte-for-byte the pre-#4381 behavior.
+    ///
+    /// This flag ONLY governs whether the WS boundary derives a per-user
+    /// context; everything downstream is driven by whether a context was
+    /// derived, so with the flag off the entire feature is inert.
+    #[serde(default, rename = "hosted-mode")]
+    pub hosted_mode: bool,
 }
 
 #[inline]
@@ -1779,6 +1819,7 @@ impl From<SocketAddr> for WebsocketApiConfig {
             token_cleanup_interval_seconds: default_token_cleanup_interval_seconds(),
             allowed_hosts: Vec::new(),
             allowed_source_cidrs: Vec::new(),
+            hosted_mode: false,
         }
     }
 }
@@ -1793,6 +1834,7 @@ impl Default for WebsocketApiConfig {
             token_cleanup_interval_seconds: default_token_cleanup_interval_seconds(),
             allowed_hosts: Vec::new(),
             allowed_source_cidrs: Vec::new(),
+            hosted_mode: false,
         }
     }
 }
@@ -3111,6 +3153,123 @@ mod tests {
             1024 * 1024 * 1024,
             "default hosting budget should be 1 GiB"
         );
+    }
+
+    /// Hosted mode (P2 of #4381) is OFF unless explicitly enabled. This is the
+    /// inert-by-default guarantee: a node built with no hosted-mode flag never
+    /// honors a user token and stays single-user.
+    #[tokio::test]
+    async fn hosted_mode_defaults_to_off() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            ..Default::default()
+        };
+        let cfg = args.build().await.unwrap();
+        assert!(
+            !cfg.ws_api.hosted_mode,
+            "hosted_mode must default to false (inert unless explicitly enabled)"
+        );
+    }
+
+    /// When explicitly enabled, hosted mode resolves to `true` and survives a
+    /// TOML round-trip (so it works from a config file, not just the CLI flag).
+    #[tokio::test]
+    async fn hosted_mode_explicit_true_round_trips() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            ws_api: WebsocketApiArgs {
+                hosted_mode: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cfg = args.build().await.unwrap();
+        assert!(
+            cfg.ws_api.hosted_mode,
+            "explicit --hosted-mode should resolve to true"
+        );
+
+        let serialized = toml::to_string(&cfg).unwrap();
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert!(
+            reparsed.ws_api.hosted_mode,
+            "hosted_mode=true must survive a TOML serialize/deserialize round-trip"
+        );
+    }
+
+    /// `--hosted-mode` is the operator switch for the feature, so it MUST work as
+    /// a BARE flag (clap optional-value form), while staying `Option<bool>` so
+    /// config-file/env layering can leave it unset. Asserts the three forms:
+    ///   bare `--hosted-mode`        => Some(true)
+    ///   `--hosted-mode=false`       => Some(false)
+    ///   absent                      => None
+    #[test]
+    fn hosted_mode_cli_accepts_bare_flag_and_explicit_value() {
+        use clap::Parser;
+
+        // The arg also reads FREENET_HOSTED_MODE via clap's `env`. Clear it for
+        // the duration of this test so the env of the test runner can't mask the
+        // CLI-form assertions, then restore it. SAFETY: this is the only test
+        // that touches FREENET_HOSTED_MODE.
+        let saved = std::env::var_os("FREENET_HOSTED_MODE");
+        unsafe {
+            std::env::remove_var("FREENET_HOSTED_MODE");
+        }
+
+        // Bare `--hosted-mode` => Some(true) (default_missing_value).
+        let bare = ConfigArgs::try_parse_from(["freenet", "--hosted-mode"])
+            .expect("bare --hosted-mode should parse");
+        assert_eq!(
+            bare.ws_api.hosted_mode,
+            Some(true),
+            "bare --hosted-mode must mean Some(true)"
+        );
+
+        // `--hosted-mode=false` => Some(false) (explicit override off).
+        let explicit_false = ConfigArgs::try_parse_from(["freenet", "--hosted-mode=false"])
+            .expect("--hosted-mode=false should parse");
+        assert_eq!(
+            explicit_false.ws_api.hosted_mode,
+            Some(false),
+            "--hosted-mode=false must mean Some(false)"
+        );
+
+        // `--hosted-mode true` (space-separated value) => Some(true).
+        let explicit_true = ConfigArgs::try_parse_from(["freenet", "--hosted-mode", "true"])
+            .expect("--hosted-mode true should parse");
+        assert_eq!(
+            explicit_true.ws_api.hosted_mode,
+            Some(true),
+            "--hosted-mode true must mean Some(true)"
+        );
+
+        // Absent => None (so config-file/env can still supply the value, and
+        // `build()` resolves None to false).
+        let absent =
+            ConfigArgs::try_parse_from(["freenet"]).expect("no hosted-mode flag should parse");
+        assert_eq!(
+            absent.ws_api.hosted_mode, None,
+            "absent --hosted-mode must leave it None for config/env layering"
+        );
+
+        // Restore the env var for any other test in this process.
+        unsafe {
+            if let Some(v) = saved {
+                std::env::set_var("FREENET_HOSTED_MODE", v);
+            }
+        }
     }
 
     #[tokio::test]

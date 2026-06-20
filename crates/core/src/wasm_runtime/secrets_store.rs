@@ -60,10 +60,10 @@ type SecretKey = [u8; 32];
 /// Identifier for a per-user secret namespace.
 ///
 /// A `UserId` is a 32-byte opaque tag that partitions a delegate's secret
-/// storage into independent per-user namespaces. It is INERT in this release:
-/// no production caller constructs one yet (the WS/token plumbing that will
-/// feed it lands in P2 of #4381). It exists so the storage layer can carry the
-/// per-user dimension end-to-end and be exercised by tests.
+/// storage into independent per-user namespaces. In hosted mode (P2 of #4381)
+/// it is derived from a connection's user token via [`user_id`] and carried in
+/// a [`UserSecretContext`]; outside hosted mode no `UserId` is constructed and
+/// every secret operation stays [`SecretScope::Local`].
 ///
 /// The bytes are not secret on their own (they only name a namespace), so
 /// `UserId` does NOT zeroize — unlike the `dek_secret` that travels alongside
@@ -109,7 +109,9 @@ impl std::fmt::Debug for UserId {
 /// DEK, same ReDb table). `User` adds an optional per-user dimension whose
 /// DEK is derived purely from a caller-provided `dek_secret` (NOT the node
 /// KEK), making per-user secrets portable by design (P3 export). The `User`
-/// scope is INERT in this release — only tests construct it.
+/// scope is selected only in hosted mode (P2 of #4381), when a connection
+/// presents a user token; the borrowed `id`/`dek_secret` come from that
+/// connection's [`UserSecretContext`].
 ///
 /// The `dek_secret` is borrowed as `&Zeroizing<[u8; 32]>` so the caller
 /// retains ownership and the value is wiped when the caller drops it; the
@@ -125,20 +127,83 @@ pub enum SecretScope<'a> {
     },
 }
 
+/// A per-connection user secret namespace, derived ONCE at the WebSocket
+/// connection boundary from a durable user token (P2 of #4381, hosted mode).
+///
+/// This is the owned counterpart to [`SecretScope::User`]: it holds the
+/// `user_id` tag and the `dek_secret` (the latter in `Zeroizing` so it is
+/// wiped on drop), and lends them out as a borrowed [`SecretScope::User`] via
+/// [`Self::scope`] for the duration of a single secret operation.
+///
+/// # Security invariant
+///
+/// A `UserSecretContext` is constructed in EXACTLY ONE place — at WS
+/// connection establishment, from the connection's user token (see
+/// [`UserSecretContext::from_token`]). It then travels immutably with the
+/// connection. Nothing reachable from a delegate's WASM, a delegate message
+/// body, a `ClientRequest`, or the app contract id can construct, mutate, or
+/// substitute it: the only public constructor takes the raw token bytes and
+/// derives both fields deterministically via the domain-separated [`user_id`]
+/// / [`user_dek_secret`] hashes. This is what makes the per-user namespace
+/// unforgeable from inside the sandbox.
+#[derive(Clone)]
+pub struct UserSecretContext {
+    user_id: UserId,
+    dek_secret: Zeroizing<[u8; 32]>,
+}
+
+impl UserSecretContext {
+    /// Derive a `UserSecretContext` from a connection's opaque user token.
+    ///
+    /// This is the ONLY constructor. Both the namespace tag and the DEK
+    /// secret come solely from `token` via the domain-separated derivations,
+    /// so the resulting scope cannot be influenced by anything other than the
+    /// token presented at the connection boundary.
+    ///
+    /// The token is sensitive; this never logs it or the derived secret.
+    pub fn from_token(token: &[u8]) -> Self {
+        Self {
+            user_id: user_id(token),
+            dek_secret: user_dek_secret(token),
+        }
+    }
+
+    /// The non-secret namespace tag for this user. Safe to log.
+    pub fn user_id(&self) -> &UserId {
+        &self.user_id
+    }
+
+    /// Borrow this context as a [`SecretScope::User`] for one secret call.
+    ///
+    /// The returned scope borrows `self`, so the `dek_secret` is never copied
+    /// into a longer-lived buffer — it lives exactly as long as `self`.
+    pub fn scope(&self) -> SecretScope<'_> {
+        SecretScope::User {
+            id: &self.user_id,
+            dek_secret: &self.dek_secret,
+        }
+    }
+}
+
+impl std::fmt::Debug for UserSecretContext {
+    /// Render only the non-secret `user_id`. The `dek_secret` is NEVER
+    /// included so that `{:?}` on any struct that transitively holds a
+    /// `UserSecretContext` (e.g. the `DelegateRequest` contract-handler event)
+    /// cannot leak key material into logs.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserSecretContext")
+            .field("user_id", &self.user_id)
+            .field("dek_secret", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Domain-separation prefix for [`user_id`]. Distinct from
 /// [`USER_DEK_SECRET_DOMAIN`] so the same token cannot yield a user id that
 /// collides with a dek-secret (and vice-versa).
-///
-/// `allow(dead_code)` in non-test builds: these are landed INERT for P2 of
-/// #4381 (the token threading that consumes them is a later phase). Tests
-/// exercise them now so the derivation is pinned before any caller depends on
-/// it.
-#[cfg_attr(not(test), allow(dead_code))]
 const USER_ID_DOMAIN: &[u8] = b"freenet-user-id";
 
-/// Domain-separation prefix for [`user_dek_secret`]. See [`USER_ID_DOMAIN`]
-/// for the inert-until-P2 rationale.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Domain-separation prefix for [`user_dek_secret`].
 const USER_DEK_SECRET_DOMAIN: &[u8] = b"freenet-user-dek";
 
 /// Derive a [`UserId`] from an opaque bearer token.
@@ -147,13 +212,11 @@ const USER_DEK_SECRET_DOMAIN: &[u8] = b"freenet-user-dek";
 /// distinct from [`user_dek_secret`]'s so the two derivations are
 /// independent: knowing a user's id reveals nothing about their dek-secret.
 ///
-/// INERT in this release: the token threading that will call this lands in
-/// P2 of #4381. Provided now (with tests) so the derivation is pinned before
-/// any caller depends on it.
+/// Consumed by [`UserSecretContext::from_token`] at the WS connection boundary
+/// (P2 of #4381, hosted mode).
 ///
 /// The token is sensitive; this function never logs it. The returned id is a
 /// non-secret namespace tag, so it is not wrapped in `Zeroizing`.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn user_id(token: &[u8]) -> UserId {
     let mut hasher = blake3::Hasher::new();
     hasher.update(USER_ID_DOMAIN);
@@ -168,9 +231,8 @@ pub fn user_id(token: &[u8]) -> UserId {
 /// from [`user_id`] guarantees `user_id(token) != user_dek_secret(token)`
 /// as byte strings for every token.
 ///
-/// INERT in this release (see [`user_id`]). The token is sensitive; this
-/// function never logs it or the derived secret.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Consumed by [`UserSecretContext::from_token`] (see [`user_id`]). The token
+/// is sensitive; this function never logs it or the derived secret.
 pub fn user_dek_secret(token: &[u8]) -> Zeroizing<[u8; 32]> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(USER_DEK_SECRET_DOMAIN);

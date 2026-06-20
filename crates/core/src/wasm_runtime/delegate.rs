@@ -13,6 +13,7 @@ use super::native_api::{
     self, CURRENT_DELEGATE_INSTANCE, DELEGATE_ENV, DelegateCallEnv, DelegateContextEntry,
     InstanceId,
 };
+use super::secrets_store::UserSecretContext;
 use super::{Runtime, RuntimeResult};
 use crate::wasm_runtime::delegate_api::DelegateApiVersion;
 
@@ -59,6 +60,7 @@ pub(crate) trait DelegateRuntimeInterface {
         key: &DelegateKey,
         params: &Parameters,
         origin: Option<&MessageOrigin>,
+        user_context: Option<&UserSecretContext>,
         inbound: Vec<InboundDelegateMsg>,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>>;
 
@@ -83,6 +85,7 @@ impl Runtime {
         delegate_key: &DelegateKey,
         params: &Parameters<'_>,
         origin: Option<&MessageOrigin>,
+        user_context: Option<&UserSecretContext>,
         msg: &InboundDelegateMsg,
         context: Vec<u8>,
         handle: &InstanceHandle,
@@ -134,6 +137,12 @@ impl Runtime {
                 &mut self.delegate_store,
                 0, // creation_depth: always 0 for top-level calls
                 origin_contracts,
+                // Clone the connection's user context into the env so the
+                // owned `dek_secret` outlives every secret call during this
+                // `process()` invocation. The context is read-only here; the
+                // delegate cannot mutate or forge it. `None` outside hosted
+                // mode keeps secret ops on `SecretScope::Local`.
+                user_context.cloned(),
             )
         };
 
@@ -500,6 +509,7 @@ impl DelegateRuntimeInterface for Runtime {
         delegate_key: &DelegateKey,
         params: &Parameters,
         origin: Option<&MessageOrigin>,
+        user_context: Option<&UserSecretContext>,
         inbound: Vec<InboundDelegateMsg>,
     ) -> RuntimeResult<Vec<OutboundDelegateMsg>> {
         let mut results = Vec::with_capacity(inbound.len());
@@ -570,6 +580,7 @@ impl DelegateRuntimeInterface for Runtime {
                             delegate_key,
                             params,
                             origin,
+                            user_context,
                             &app_msg,
                             std::mem::take(&mut context),
                             &running.handle,
@@ -595,6 +606,7 @@ impl DelegateRuntimeInterface for Runtime {
                             delegate_key,
                             params,
                             origin,
+                            user_context,
                             &InboundDelegateMsg::UserResponse(response),
                             std::mem::take(&mut context),
                             &running.handle,
@@ -620,6 +632,7 @@ impl DelegateRuntimeInterface for Runtime {
                             delegate_key,
                             params,
                             origin,
+                            user_context,
                             &InboundDelegateMsg::GetContractResponse(response),
                             std::mem::take(&mut context),
                             &running.handle,
@@ -649,6 +662,7 @@ impl DelegateRuntimeInterface for Runtime {
                             delegate_key,
                             params,
                             origin,
+                            user_context,
                             &msg,
                             std::mem::take(&mut context),
                             &running.handle,
@@ -679,6 +693,7 @@ impl DelegateRuntimeInterface for Runtime {
                             delegate_key,
                             params,
                             origin,
+                            user_context,
                             &other,
                             std::mem::take(&mut context),
                             &running.handle,
@@ -949,6 +964,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -975,8 +991,13 @@ mod test {
             context: contract_request.context.clone(),
         });
 
-        let final_outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response])?;
+        let final_outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![response],
+        )?;
 
         assert_eq!(final_outbound.len(), 1);
         let final_msg = match &final_outbound[0] {
@@ -1032,6 +1053,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -1054,8 +1076,13 @@ mod test {
             context: contract_request.context.clone(),
         });
 
-        let final_outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response])?;
+        let final_outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![response],
+        )?;
 
         let final_msg = match &final_outbound[0] {
             OutboundDelegateMsg::ApplicationMessage(msg) => msg,
@@ -1111,6 +1138,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -1135,8 +1163,13 @@ mod test {
             context: req1.context,
         });
 
-        let outbound2 =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response1])?;
+        let outbound2 = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![response1],
+        )?;
 
         assert_eq!(outbound2.len(), 1);
         let req2 = match &outbound2[0] {
@@ -1159,8 +1192,13 @@ mod test {
             context: req2.context,
         });
 
-        let outbound3 =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response2])?;
+        let outbound3 = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![response2],
+        )?;
 
         assert_eq!(outbound3.len(), 1);
         let req3 = match &outbound3[0] {
@@ -1183,8 +1221,13 @@ mod test {
             context: req3.context,
         });
 
-        let final_outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response3])?;
+        let final_outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![response3],
+        )?;
 
         assert_eq!(final_outbound.len(), 1);
         let final_msg = match &final_outbound[0] {
@@ -1248,6 +1291,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -1309,6 +1353,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![contract_response],
         )?;
 
@@ -1364,8 +1409,13 @@ mod test {
         let payload: Vec<u8> = bincode::serialize(&InboundAppMessage::CreateInboxRequest).unwrap();
         let create_msg = ApplicationMessage::new(payload);
         let inbound = InboundDelegateMsg::ApplicationMessage(create_msg);
-        let outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![inbound])?;
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![inbound],
+        )?;
 
         let expected_payload =
             bincode::serialize(&OutboundAppMessage::CreateInboxResponse(vec![1])).unwrap();
@@ -1379,8 +1429,13 @@ mod test {
             bincode::serialize(&InboundAppMessage::PleaseSignMessage(vec![1, 2, 3])).unwrap();
         let sign_msg = ApplicationMessage::new(payload);
         let inbound = InboundDelegateMsg::ApplicationMessage(sign_msg);
-        let outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![inbound])?;
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![inbound],
+        )?;
 
         let expected_payload =
             bincode::serialize(&OutboundAppMessage::MessageSigned(vec![4, 5, 2])).unwrap();
@@ -1417,7 +1472,7 @@ mod test {
         ];
 
         let outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, messages)?;
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, None, messages)?;
 
         assert_eq!(outbound.len(), 2);
 
@@ -1501,6 +1556,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
 
@@ -1526,6 +1582,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -1581,6 +1638,7 @@ mod test {
         let _outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -1657,6 +1715,7 @@ mod test {
             runtime.inbound_app_message(
                 d.key(),
                 &vec![].into(),
+                None,
                 None,
                 vec![InboundDelegateMsg::ApplicationMessage(msg)],
             )?;
@@ -1752,6 +1811,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(
                 ApplicationMessage::new(payload),
             )],
@@ -1774,6 +1834,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(
                 ApplicationMessage::new(payload),
@@ -1849,6 +1910,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(
                 ApplicationMessage::new(payload),
             )],
@@ -1910,6 +1972,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
 
@@ -1936,6 +1999,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
 
@@ -1944,6 +2008,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -1984,6 +2049,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -2029,6 +2095,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
 
@@ -2052,6 +2119,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -2118,6 +2186,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
 
@@ -2161,6 +2230,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -2219,6 +2289,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
 
@@ -2227,6 +2298,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -2250,6 +2322,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -2309,7 +2382,7 @@ mod test {
             .collect();
 
         let outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, messages)?;
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, None, messages)?;
 
         assert_eq!(outbound.len(), 3);
 
@@ -2374,6 +2447,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
 
@@ -2382,6 +2456,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -2405,6 +2480,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
         let response: OutboundAppMessage = match &outbound[0] {
@@ -2426,6 +2502,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -2472,6 +2549,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
         let response: OutboundAppMessage = match &outbound[0] {
@@ -2511,6 +2589,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -2580,7 +2659,7 @@ mod test {
         ];
 
         let outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, messages)?;
+            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, None, messages)?;
 
         assert_eq!(outbound.len(), 2);
 
@@ -2653,6 +2732,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
         let response: OutboundAppMessage = match &outbound[0] {
@@ -2693,6 +2773,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(msg)],
         )?;
@@ -2780,6 +2861,7 @@ mod test {
                         delegate1_clone.key(),
                         &vec![].into(),
                         None,
+                        None,
                         vec![InboundDelegateMsg::ApplicationMessage(msg)],
                     )
                     .unwrap();
@@ -2795,6 +2877,7 @@ mod test {
                     .inbound_app_message(
                         delegate1_clone.key(),
                         &vec![].into(),
+                        None,
                         None,
                         vec![InboundDelegateMsg::ApplicationMessage(msg)],
                     )
@@ -2860,6 +2943,7 @@ mod test {
                         delegate2_clone.key(),
                         &vec![].into(),
                         None,
+                        None,
                         vec![InboundDelegateMsg::ApplicationMessage(msg)],
                     )
                     .unwrap();
@@ -2875,6 +2959,7 @@ mod test {
                     .inbound_app_message(
                         delegate2_clone.key(),
                         &vec![].into(),
+                        None,
                         None,
                         vec![InboundDelegateMsg::ApplicationMessage(msg)],
                     )
@@ -2988,8 +3073,13 @@ mod test {
         let payload: Vec<u8> = bincode::serialize(&InboundAppMessage::CreateInboxRequest).unwrap();
         let create_msg = ApplicationMessage::new(payload);
         let inbound = InboundDelegateMsg::ApplicationMessage(create_msg);
-        let outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![inbound])?;
+        let outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![inbound],
+        )?;
 
         let expected_payload =
             bincode::serialize(&OutboundAppMessage::CreateInboxResponse(vec![1])).unwrap();
@@ -3126,6 +3216,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -3213,6 +3304,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
@@ -3326,6 +3418,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
@@ -3535,6 +3628,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -3560,8 +3654,13 @@ mod test {
             context: put_request.context.clone(),
         });
 
-        let final_outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response])?;
+        let final_outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![response],
+        )?;
 
         assert_eq!(
             final_outbound.len(),
@@ -3623,6 +3722,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -3648,8 +3748,13 @@ mod test {
             context: update_request.context.clone(),
         });
 
-        let final_outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response])?;
+        let final_outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![response],
+        )?;
 
         assert_eq!(
             final_outbound.len(),
@@ -3713,6 +3818,7 @@ mod test {
             delegate.key(),
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -3738,8 +3844,13 @@ mod test {
             context: subscribe_request.context.clone(),
         });
 
-        let final_outbound =
-            runtime.inbound_app_message(delegate.key(), &vec![].into(), None, vec![response])?;
+        let final_outbound = runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![response],
+        )?;
 
         assert_eq!(
             final_outbound.len(),
@@ -3804,6 +3915,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             delegate.key(),
             &vec![].into(),
+            None,
             None,
             vec![notification],
         )?;
@@ -3916,6 +4028,7 @@ mod test {
             &delegate_key,
             &vec![].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -3965,6 +4078,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             &delegate_key,
             &vec![].into(),
+            None,
             None,
             vec![subscribe_response],
         )?;
@@ -4025,8 +4139,13 @@ mod test {
             context: DelegateContext::default(),
         });
 
-        let outbound =
-            runtime.inbound_app_message(&delegate_key, &vec![].into(), None, vec![notification])?;
+        let outbound = runtime.inbound_app_message(
+            &delegate_key,
+            &vec![].into(),
+            None,
+            None,
+            vec![notification],
+        )?;
 
         // --- Step 4: Verify delegate responds correctly ---
         assert_eq!(outbound.len(), 1, "Expected one outbound from notification");
@@ -4243,6 +4362,7 @@ mod test {
             &key_a,
             &vec![1u8].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -4305,6 +4425,7 @@ mod test {
         let outbound = runtime.inbound_app_message(
             &key_b,
             &vec![2u8].into(),
+            None,
             None,
             vec![InboundDelegateMsg::DelegateMessage(delegate_msg)],
         )?;
@@ -4376,6 +4497,7 @@ mod test {
             &key_b,
             &vec![2u8].into(),
             Some(&origin),
+            None,
             vec![InboundDelegateMsg::DelegateMessage(delegate_msg)],
         )?;
 
@@ -4437,6 +4559,7 @@ mod test {
             &key_a,
             &vec![1u8].into(),
             None,
+            None,
             vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
         )?;
 
@@ -4462,6 +4585,7 @@ mod test {
         let outbound_b = runtime_b.inbound_app_message(
             &key_b,
             &vec![2u8].into(),
+            None,
             None,
             vec![InboundDelegateMsg::DelegateMessage(send_msg)],
         )?;
@@ -4548,6 +4672,7 @@ mod test {
             &key_a,
             &vec![1u8].into(),
             None,
+            None,
             vec![
                 InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload1)),
                 InboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(payload2)),
@@ -4587,5 +4712,378 @@ mod test {
         }
 
         Ok(())
+    }
+
+    /// Hosted-mode per-user secret namespace tests (P2 of #4381).
+    ///
+    /// These drive the real secret host functions (`set_secret`/`get_secret`/
+    /// `has_secret`/`remove_secret`) through `inbound_app_message` with varying
+    /// `user_context` values, and assert that the namespace a delegate's secret
+    /// operations land in is determined SOLELY by the `user_context` argument —
+    /// the connection-boundary credential — and never by the message body, the
+    /// delegate key, or the origin.
+    mod hosted_user_secrets {
+        use super::delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+        use super::*;
+        use crate::wasm_runtime::UserSecretContext;
+
+        /// Drive a single `delegate2` app message through `inbound_app_message`
+        /// under the given `user_context` and decode the single outbound
+        /// `OutboundAppMessage` reply. This is the one place the test exercises
+        /// the secret scope: `user_context` is the ONLY thing that varies the
+        /// namespace; `key`, `params`, `origin`, and the message body are held
+        /// identical across users by the callers below.
+        fn run(
+            runtime: &mut Runtime,
+            delegate_key: &DelegateKey,
+            user_context: Option<&UserSecretContext>,
+            msg: InboundAppMessage,
+        ) -> OutboundAppMessage {
+            let payload = bincode::serialize(&msg).expect("serialize inbound");
+            let app_msg = ApplicationMessage::new(payload);
+            let outbound = runtime
+                .inbound_app_message(
+                    delegate_key,
+                    &vec![].into(),
+                    None, // origin: identical for every user — not the scope source
+                    user_context,
+                    vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+                )
+                .expect("inbound_app_message");
+            let OutboundDelegateMsg::ApplicationMessage(m) = &outbound[0] else {
+                panic!("Expected ApplicationMessage reply, got {:?}", &outbound[0]);
+            };
+            bincode::deserialize(&m.payload).expect("decode outbound")
+        }
+
+        fn store(
+            runtime: &mut Runtime,
+            key: &DelegateKey,
+            ctx: Option<&UserSecretContext>,
+            sk: Vec<u8>,
+            sv: Vec<u8>,
+        ) {
+            let resp = run(
+                runtime,
+                key,
+                ctx,
+                InboundAppMessage::StoreSecret { key: sk, value: sv },
+            );
+            assert!(
+                matches!(resp, OutboundAppMessage::SecretStored),
+                "store should succeed, got {resp:?}"
+            );
+        }
+
+        fn get(
+            runtime: &mut Runtime,
+            key: &DelegateKey,
+            ctx: Option<&UserSecretContext>,
+            sk: Vec<u8>,
+        ) -> Option<Vec<u8>> {
+            let resp = run(
+                runtime,
+                key,
+                ctx,
+                InboundAppMessage::GetNonExistentSecret(sk),
+            );
+            let OutboundAppMessage::SecretResult(v) = resp else {
+                panic!("Expected SecretResult, got {resp:?}");
+            };
+            v
+        }
+
+        fn has(
+            runtime: &mut Runtime,
+            key: &DelegateKey,
+            ctx: Option<&UserSecretContext>,
+            sk: Vec<u8>,
+        ) -> bool {
+            let resp = run(runtime, key, ctx, InboundAppMessage::HasSecret(sk));
+            let OutboundAppMessage::SecretExists(b) = resp else {
+                panic!("Expected SecretExists, got {resp:?}");
+            };
+            b
+        }
+
+        /// Two different user tokens get disjoint secret namespaces under the
+        /// SAME delegate: A's secret is invisible to B, B's to A, and each can
+        /// read only its own — even though the secret KEY is identical.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn two_users_have_disjoint_secret_namespaces()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+            let key = delegate.key().clone();
+
+            let ctx_a = UserSecretContext::from_token(b"token-A");
+            let ctx_b = UserSecretContext::from_token(b"token-B");
+
+            // Same secret KEY for both users; different values.
+            let sk = vec![7u8, 7, 7];
+            let val_a = vec![0xAA; 16];
+            let val_b = vec![0xBB; 16];
+
+            store(&mut runtime, &key, Some(&ctx_a), sk.clone(), val_a.clone());
+            store(&mut runtime, &key, Some(&ctx_b), sk.clone(), val_b.clone());
+
+            // Each user reads back ONLY its own value.
+            assert_eq!(
+                get(&mut runtime, &key, Some(&ctx_a), sk.clone()),
+                Some(val_a)
+            );
+            assert_eq!(
+                get(&mut runtime, &key, Some(&ctx_b), sk.clone()),
+                Some(val_b)
+            );
+
+            // A cannot read B's namespace and vice-versa is implied by the
+            // distinct values above; assert existence is per-namespace too.
+            assert!(has(&mut runtime, &key, Some(&ctx_a), sk.clone()));
+            assert!(has(&mut runtime, &key, Some(&ctx_b), sk.clone()));
+
+            // Removing A's secret leaves B's intact (independent namespaces).
+            let resp = run(
+                &mut runtime,
+                &key,
+                Some(&ctx_a),
+                InboundAppMessage::RemoveSecret(sk.clone()),
+            );
+            assert!(matches!(resp, OutboundAppMessage::SecretRemoved));
+            assert!(
+                !has(&mut runtime, &key, Some(&ctx_a), sk.clone()),
+                "A's secret should be gone"
+            );
+            assert!(
+                has(&mut runtime, &key, Some(&ctx_b), sk.clone()),
+                "B's secret must survive A's removal"
+            );
+
+            std::mem::drop(temp_dir);
+            Ok(())
+        }
+
+        /// A secret written with NO user context (single-user `Local`) is NOT
+        /// visible under any user token, and vice-versa: the Local namespace
+        /// and every User namespace are mutually disjoint. This proves that
+        /// turning hosted mode on for a connection (token present) does not
+        /// expose — or collide with — the node's pre-existing single-user
+        /// secrets, so the flag-off behavior is preserved byte-for-byte.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn local_and_user_namespaces_are_disjoint() -> Result<(), Box<dyn std::error::Error>>
+        {
+            let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+            let key = delegate.key().clone();
+            let ctx_a = UserSecretContext::from_token(b"token-A");
+
+            let sk = vec![9u8, 9, 9];
+            let local_val = vec![0x11; 8];
+            let user_val = vec![0x22; 8];
+
+            // Write under Local (no token).
+            store(&mut runtime, &key, None, sk.clone(), local_val.clone());
+            // Same key under user A.
+            store(
+                &mut runtime,
+                &key,
+                Some(&ctx_a),
+                sk.clone(),
+                user_val.clone(),
+            );
+
+            // Each side sees only its own.
+            assert_eq!(get(&mut runtime, &key, None, sk.clone()), Some(local_val));
+            assert_eq!(
+                get(&mut runtime, &key, Some(&ctx_a), sk.clone()),
+                Some(user_val)
+            );
+
+            // A key written only under Local is invisible to a user, and a
+            // key written only under a user is invisible to Local.
+            let local_only = vec![1u8];
+            store(&mut runtime, &key, None, local_only.clone(), vec![1]);
+            assert!(
+                !has(&mut runtime, &key, Some(&ctx_a), local_only.clone()),
+                "Local-only secret must be invisible to a user"
+            );
+
+            let user_only = vec![2u8];
+            store(&mut runtime, &key, Some(&ctx_a), user_only.clone(), vec![2]);
+            assert!(
+                !has(&mut runtime, &key, None, user_only),
+                "User-only secret must be invisible to Local"
+            );
+
+            std::mem::drop(temp_dir);
+            Ok(())
+        }
+
+        /// INVARIANT: the secret namespace is a pure function of `user_context`.
+        /// Holding the delegate key, params, origin, and message body byte-for-byte
+        /// identical, swapping ONLY the `user_context` swaps the namespace —
+        /// nothing in the message body can reach across to another user's
+        /// secrets. This is the core unforgeability property: a delegate (or a
+        /// client crafting the message body) cannot select WHICH user's
+        /// namespace it operates on, because that choice is carried entirely by
+        /// the out-of-band `user_context` argument.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn namespace_is_determined_solely_by_user_context()
+        -> Result<(), Box<dyn std::error::Error>> {
+            let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+            let key = delegate.key().clone();
+
+            let ctx_a = UserSecretContext::from_token(b"alice");
+            let ctx_b = UserSecretContext::from_token(b"bob");
+
+            // IDENTICAL message body for the write — only the context differs.
+            let sk = vec![5u8, 5];
+            store(&mut runtime, &key, Some(&ctx_a), sk.clone(), vec![0xA1]);
+
+            // Reading the SAME key, with the SAME body, under a DIFFERENT
+            // context yields nothing: the body did not carry the namespace.
+            assert_eq!(
+                get(&mut runtime, &key, Some(&ctx_b), sk.clone()),
+                None,
+                "A different user_context must NOT see user A's secret, even with an identical request body"
+            );
+            // And re-reading under A's context still finds it.
+            assert_eq!(
+                get(&mut runtime, &key, Some(&ctx_a), sk.clone()),
+                Some(vec![0xA1])
+            );
+
+            // Re-deriving the context from the same token reproduces the same
+            // namespace (the derivation is deterministic in the token alone).
+            let ctx_a_again = UserSecretContext::from_token(b"alice");
+            assert_eq!(
+                get(&mut runtime, &key, Some(&ctx_a_again), sk),
+                Some(vec![0xA1])
+            );
+
+            std::mem::drop(temp_dir);
+            Ok(())
+        }
+
+        /// The same token always maps to the same `UserId`, and two different
+        /// tokens map to different `UserId`s — pinned here so the connection
+        /// boundary's identity derivation can't silently change and re-key every
+        /// hosted user's secrets. (The dek_secret is never asserted on directly;
+        /// it is exercised end-to-end by the namespace tests above.)
+        #[test]
+        fn user_id_is_a_stable_function_of_the_token() {
+            let a1 = UserSecretContext::from_token(b"token-A");
+            let a2 = UserSecretContext::from_token(b"token-A");
+            let b = UserSecretContext::from_token(b"token-B");
+            assert_eq!(a1.user_id(), a2.user_id(), "same token => same UserId");
+            assert_ne!(
+                a1.user_id(),
+                b.user_id(),
+                "different tokens => different UserId"
+            );
+        }
+
+        /// The `Debug` impl must never leak the `dek_secret`. A struct that
+        /// transitively holds a `UserSecretContext` (e.g. the delegate-request
+        /// contract-handler event) is logged with `{:?}`, so a non-redacting
+        /// Debug would write key material to the logs.
+        #[test]
+        fn debug_redacts_the_dek_secret() {
+            let ctx = UserSecretContext::from_token(b"super-secret-token");
+            let rendered = format!("{ctx:?}");
+            assert!(
+                rendered.contains("redacted"),
+                "dek_secret must be redacted in Debug, got: {rendered}"
+            );
+            // The non-secret user_id is fine to show.
+            assert!(
+                rendered.contains(&ctx.user_id().encode()),
+                "user_id should appear in Debug"
+            );
+        }
+
+        /// The per-user namespace does NOT propagate across a delegate-to-delegate
+        /// hop. When delegate A (running under user X's connection) sends a
+        /// `SendDelegateMessage` to delegate B, the executor delivers it to B with
+        /// `user_context = None` and `origin = Some(MessageOrigin::Delegate(A))`
+        /// (see `contract.rs::handle_delegate_with_contract_requests`, the
+        /// `execute_delegate_request(target_req, None, Some(delegate_key), None)`
+        /// call). So B's secret op MUST land in B's `Local` namespace, never under
+        /// user X — the user namespace is bound to the originating connection, not
+        /// transitively inherited through the inter-delegate hop.
+        ///
+        /// This test drives B exactly the way the executor drives it for that hop:
+        /// `origin = Delegate(A)`, `user_context = None`. It is parameterised over
+        /// the user X whose namespace must stay untouched.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn user_namespace_does_not_propagate_across_inter_delegate_hop()
+        -> Result<(), Box<dyn std::error::Error>> {
+            // Register two distinct delegates (A the sender, B the target). Only B
+            // performs the secret op; A's key is used solely to attest the
+            // inter-delegate origin the executor would inject.
+            let (delegate_b, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+            let key_b = delegate_b.key().clone();
+            // Synthetic sender delegate A (key only — its WASM is irrelevant here;
+            // we are testing what B's secrets bind to, given the hop's arguments).
+            let key_a = DelegateKey::new([0xA1u8; 32], CodeHash::new([0xA2u8; 32]));
+
+            // User X's connection: a secret B stores DIRECTLY under X's context.
+            let ctx_x = UserSecretContext::from_token(b"user-X");
+            let sk = vec![0xEE, 0xEE];
+            let x_value = vec![0x58; 8]; // 'X'
+            store(
+                &mut runtime,
+                &key_b,
+                Some(&ctx_x),
+                sk.clone(),
+                x_value.clone(),
+            );
+
+            // Now deliver to B the way the executor delivers an inter-delegate hop
+            // that originated from A (which was itself invoked under user X):
+            //   origin = Some(MessageOrigin::Delegate(A)),  user_context = None.
+            // B stores under the SAME secret key but a different value.
+            let hop_value = vec![0x42; 8]; // 'B' — the inter-delegate write
+            let origin = MessageOrigin::Delegate(key_a.clone());
+            let payload = bincode::serialize(&InboundAppMessage::StoreSecret {
+                key: sk.clone(),
+                value: hop_value.clone(),
+            })
+            .expect("serialize");
+            let app_msg = ApplicationMessage::new(payload);
+            let outbound = runtime
+                .inbound_app_message(
+                    &key_b,
+                    &vec![].into(),
+                    Some(&origin), // attested inter-delegate origin (A)
+                    None,          // user_context = None: the hop does NOT carry X
+                    vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+                )
+                .expect("inbound_app_message");
+            let OutboundDelegateMsg::ApplicationMessage(m) = &outbound[0] else {
+                panic!("Expected ApplicationMessage reply, got {:?}", &outbound[0]);
+            };
+            let resp: OutboundAppMessage = bincode::deserialize(&m.payload).expect("decode");
+            assert!(
+                matches!(resp, OutboundAppMessage::SecretStored),
+                "inter-delegate-hop store should succeed, got {resp:?}"
+            );
+
+            // The hop's write landed in B's Local namespace...
+            assert_eq!(
+                get(&mut runtime, &key_b, None, sk.clone()),
+                Some(hop_value),
+                "inter-delegate-hop secret must be in B's Local namespace"
+            );
+            // ...and user X's namespace is UNTOUCHED — it still holds X's value,
+            // NOT the value written during the A->B hop. This is the property:
+            // the hop did not write into (or read from) X's namespace.
+            assert_eq!(
+                get(&mut runtime, &key_b, Some(&ctx_x), sk),
+                Some(x_value),
+                "user X's secret must be unchanged by the inter-delegate hop"
+            );
+
+            std::mem::drop(temp_dir);
+            Ok(())
+        }
     }
 }
