@@ -2,6 +2,8 @@
 use anyhow::Context;
 #[cfg(target_os = "windows")]
 use anyhow::Result;
+#[cfg(target_os = "windows")]
+use super::log_utils::find_latest_log_file;
 
 // Windows implementation
 // Note: Windows service management requires either:

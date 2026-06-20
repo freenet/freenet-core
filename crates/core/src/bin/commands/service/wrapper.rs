@@ -10,11 +10,62 @@ use super::single_instance::{AcquireWrapperLockOutcome, acquire_wrapper_single_i
 use super::DASHBOARD_URL;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use super::open_url_in_browser;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use super::single_instance::FIRST_RUN_OPENER_SPAWNED;
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+use super::{
+    dashboard_port_is_listening, first_run_marker_path, is_first_run_at, mark_first_run_complete_at,
+};
 use super::{
     SENTINEL_RESTART, SENTINEL_STOP, WRAPPER_EXIT_ALREADY_RUNNING, WRAPPER_EXIT_UPDATE_NEEDED,
     WRAPPER_INITIAL_BACKOFF_SECS, WRAPPER_MAX_BACKOFF_SECS, WRAPPER_MAX_CONSECUTIVE_FAILURES,
     WRAPPER_MAX_PORT_CONFLICT_KILLS,
 };
+
+/// Spawn a short-lived thread that waits for the dashboard HTTP server to
+/// come up, then opens it in the browser and writes the first-run marker.
+/// The thread gives up after a generous timeout. If the daemon is crashing
+/// repeatedly we'd rather skip first-run and retry next launch than open
+/// a "connection refused" page in the user's browser.
+///
+/// Caller is responsible for gating on `FIRST_RUN_OPENER_SPAWNED` so we
+/// don't start more than one opener per process lifetime.
+#[cfg(any(target_os = "windows", target_os = "macos"))]
+fn spawn_first_run_dashboard_opener(log_dir: &Path) {
+    // Import locally so we use the unqualified `Instant::now()` form. Wall-
+    // clock time is correct here: this is tray/CLI onboarding, not sim-
+    // reachable core code, and the deadline is about what the user's
+    // patience will tolerate. See `crates/core/src/bin/freenet.rs` for
+    // similar bin-side wall-clock usage.
+    use std::time::{Duration, Instant};
+
+    let log_dir = log_dir.to_path_buf();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if dashboard_port_is_listening() {
+                open_url_in_browser(DASHBOARD_URL);
+                if let Some(marker) = first_run_marker_path() {
+                    match mark_first_run_complete_at(&marker) {
+                        Ok(()) => {
+                            log_wrapper_event(&log_dir, "First-run onboarding: dashboard opened")
+                        }
+                        Err(e) => log_wrapper_event(
+                            &log_dir,
+                            &format!("Failed to write first-run marker: {e}"),
+                        ),
+                    }
+                }
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        log_wrapper_event(
+            &log_dir,
+            "First-run dashboard open skipped: dashboard never became reachable",
+        );
+    });
+}
 
 /// State for the wrapper backoff state machine.
 #[derive(Debug, Clone)]

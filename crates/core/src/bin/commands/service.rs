@@ -364,7 +364,7 @@ pub use launch_at_login::{
 pub use macos::generate_plist;
 
 #[cfg(target_os = "windows")]
-pub use windows::kill_freenet_service_processes;
+pub(crate) use windows::kill_freenet_service_processes;
 #[cfg(target_os = "windows")]
 pub use windows::stop_and_remove_service;
 
