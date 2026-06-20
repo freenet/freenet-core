@@ -53,7 +53,9 @@ async fn runtime_version() -> impl IntoResponse {
 async fn web_home_v1(
     key: Path<String>,
     rs: Extension<HttpClientApiRequest>,
-    Extension(hosted_mode): Extension<crate::server::HostedMode>,
+    // Tolerant: see `hosted_mode_or_default` — absent ⇒ hosted-off, so the
+    // standalone `as_router` composition (no HostedMode layer) doesn't 500.
+    hosted_mode: Option<Extension<crate::server::HostedMode>>,
     config: axum::extract::State<Config>,
     headers: axum::http::HeaderMap,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
@@ -65,7 +67,7 @@ async fn web_home_v1(
         headers,
         ApiVersion::V1,
         query,
-        hosted_mode.0,
+        hosted_mode_or_default(hosted_mode),
     )
     .await
 }
@@ -73,7 +75,8 @@ async fn web_home_v1(
 async fn web_subpages_v1(
     Path((key, last_path)): Path<(String, String)>,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
-    Extension(hosted_mode): Extension<crate::server::HostedMode>,
+    // Tolerant: see `hosted_mode_or_default`.
+    hosted_mode: Option<Extension<crate::server::HostedMode>>,
     headers: axum::http::HeaderMap,
     axum::extract::State(config): axum::extract::State<Config>,
     Extension(rs): Extension<HttpClientApiRequest>,
@@ -86,7 +89,7 @@ async fn web_subpages_v1(
         headers,
         &config,
         rs,
-        hosted_mode.0,
+        hosted_mode_or_default(hosted_mode),
     )
     .await
 }
