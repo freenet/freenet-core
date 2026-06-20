@@ -33,19 +33,20 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use freenet_stdlib::client_api::{ContractResponse, ErrorKind, HostResponse};
 use freenet_stdlib::prelude::ContractInstanceId;
 
 use crate::client_events::HostResult;
-use crate::config::{GlobalExecutor, OPERATION_TTL};
+use crate::config::{GlobalExecutor, GlobalRng, OPERATION_TTL};
 use crate::message::{NetMessage, NetMessageV1, Transaction};
 use crate::node::OpManager;
 use crate::operations::{OpError, VisitedPeers};
 use crate::ring::{PeerKeyLocation, RingError};
 
 use super::{
-    InitialRequest, MAX_BREADTH, MAX_RETRIES, SubscribeMsg, SubscribeMsgResult,
+    InitialRequest, MAX_BREADTH, MAX_RETRIES, RETRY_BASE_DELAY, SubscribeMsg, SubscribeMsgResult,
     complete_local_subscription, prepare_initial_request, register_downstream_subscriber,
 };
 
@@ -764,6 +765,12 @@ async fn drive_client_subscribe_inner(
                     Some((next_target, next_addr)) => {
                         current_target = next_target;
                         current_target_addr = next_addr;
+                        // Phase 2b spin-loop guard (#3808): pace retries
+                        // with a small jittered delay before re-sending.
+                        // Without this the driver re-issues immediately on
+                        // each reply, burning the whole retry budget at
+                        // network speed against a contract no peer hosts.
+                        sleep_before_retry().await;
                         continue;
                     }
                     None => {
@@ -808,6 +815,12 @@ async fn drive_client_subscribe_inner(
                     Some((next_target, next_addr)) => {
                         current_target = next_target;
                         current_target_addr = next_addr;
+                        // Phase 2b spin-loop guard (#3808): pace retries
+                        // with a small jittered delay before re-sending.
+                        // Without this the driver re-issues immediately on
+                        // each reply, burning the whole retry budget at
+                        // network speed against a contract no peer hosts.
+                        sleep_before_retry().await;
                         continue;
                     }
                     None => {
@@ -942,6 +955,12 @@ async fn drive_client_subscribe_inner(
                     Some((next_target, next_addr)) => {
                         current_target = next_target;
                         current_target_addr = next_addr;
+                        // Phase 2b spin-loop guard (#3808): pace retries
+                        // with a small jittered delay before re-sending.
+                        // Without this the driver re-issues immediately on
+                        // each reply, burning the whole retry budget at
+                        // network speed against a contract no peer hosts.
+                        sleep_before_retry().await;
                         continue;
                     }
                     None => {
@@ -1115,6 +1134,36 @@ where
 
     // 3. Exhausted.
     None
+}
+
+/// Compute the jittered inter-attempt delay for one subscribe retry.
+///
+/// Applies ±20% random jitter to [`RETRY_BASE_DELAY`] using [`GlobalRng`]
+/// (deterministic under the simulation harness) so synchronised retry
+/// waves across many clients are spread out. Pulled out as a pure
+/// function so the jitter bounds are unit-testable without a runtime.
+fn jittered_retry_delay() -> Duration {
+    // Sample in [0.8, 1.2): at least the ±20% the retry/backoff rule
+    // mandates. `random_range` over an f64 range is half-open, so the
+    // realised multiplier never reaches 1.2 exactly — still well within
+    // the "at least ±20%" requirement and below the 1s plain-sleep cap.
+    let factor: f64 = GlobalRng::random_range(0.8..1.2);
+    RETRY_BASE_DELAY.mul_f64(factor)
+}
+
+/// Sleep the jittered inter-attempt delay before the next subscribe
+/// attempt.
+///
+/// `tokio::time::sleep` is auto-paused in test builds with
+/// `start_paused(true)` (the same primitive this file already uses for
+/// `request_sent_at`), so simulation tests advance virtual time rather
+/// than blocking on a wall clock. The delay is bounded well under 1s
+/// ([`RETRY_BASE_DELAY`] = 50ms × <1.2), which the retry/backoff rule
+/// explicitly exempts from the interruptible-sleep requirement: there is
+/// no per-attempt cancellation signal in this task-per-tx driver, and a
+/// sub-100ms sleep cannot meaningfully delay task teardown.
+async fn sleep_before_retry() {
+    tokio::time::sleep(jittered_retry_delay()).await;
 }
 
 /// Publish the driver's outcome to the client, routing on the explicit
@@ -3128,5 +3177,90 @@ mod tests {
             i += 1;
         }
         panic!("unterminated fn body for {signature_prefix}");
+    }
+
+    // ---- #3808: inter-attempt retry pacing (jitter + delay) ----
+
+    /// The jittered delay must always stay within the ±20% band around
+    /// `RETRY_BASE_DELAY` the retry/backoff rule mandates: never below
+    /// 0.8× (could degenerate to a spin loop) and strictly below 1.2×
+    /// (the half-open `random_range` upper bound). Sampled across many
+    /// seeds so a bad jitter formula can't slip through on one lucky seed.
+    #[test]
+    fn jittered_retry_delay_stays_within_plus_minus_20_percent() {
+        let lo = RETRY_BASE_DELAY.mul_f64(0.8);
+        let hi = RETRY_BASE_DELAY.mul_f64(1.2);
+        for seed in 0..256u64 {
+            let _guard = GlobalRng::seed_guard(seed);
+            for _ in 0..32 {
+                let d = jittered_retry_delay();
+                assert!(
+                    d >= lo,
+                    "delay {d:?} below 0.8× base {lo:?} (seed {seed}) — \
+                     would weaken the spin-loop guard"
+                );
+                assert!(
+                    d < hi,
+                    "delay {d:?} at/above 1.2× base {hi:?} (seed {seed})"
+                );
+            }
+        }
+    }
+
+    /// The delay must be bounded well under the 1s plain-`sleep` cap the
+    /// retry/backoff rule sets for non-interruptible sleeps. A regression
+    /// that bumped `RETRY_BASE_DELAY` past ~830ms would silently violate
+    /// that exemption; pin the worst case here.
+    #[test]
+    fn jittered_retry_delay_under_one_second_cap() {
+        for seed in 0..64u64 {
+            let _guard = GlobalRng::seed_guard(seed);
+            for _ in 0..32 {
+                assert!(
+                    jittered_retry_delay() < Duration::from_secs(1),
+                    "inter-attempt delay must stay under the 1s plain-sleep cap"
+                );
+            }
+        }
+    }
+
+    /// Under a fixed seed the jitter is deterministic (it routes through
+    /// `GlobalRng`, not `rand::thread_rng()`), so the simulation harness
+    /// reproduces identical pacing across runs. Guards against a
+    /// regression to non-deterministic randomness.
+    #[test]
+    fn jittered_retry_delay_is_deterministic_under_seed() {
+        let first = {
+            let _guard = GlobalRng::seed_guard(0xC0FFEE);
+            [jittered_retry_delay(), jittered_retry_delay()]
+        };
+        let second = {
+            let _guard = GlobalRng::seed_guard(0xC0FFEE);
+            [jittered_retry_delay(), jittered_retry_delay()]
+        };
+        assert_eq!(first, second, "jitter must be GlobalRng-deterministic");
+    }
+
+    /// Source-scrape pin: every `advance_to_next_peer` success arm in the
+    /// driver loop MUST pace the next attempt via `sleep_before_retry`
+    /// before its `continue`. This is the #3808 DoS guard — a retry path
+    /// that skips the delay re-opens the topology-wide spin loop. The
+    /// count is tied to the three terminal-outcome arms (wire_error,
+    /// timeout, not_found) that advance and retry.
+    #[test]
+    fn every_retry_advance_paces_before_continue() {
+        let src = include_str!("op_ctx_task.rs");
+        let body = extract_fn_body(src, "async fn drive_client_subscribe_inner(");
+        let advance_arms = body.matches("current_target_addr = next_addr;").count();
+        let paced = body.matches("sleep_before_retry().await;").count();
+        assert_eq!(
+            advance_arms, 3,
+            "expected 3 advance-and-retry arms (wire_error, timeout, not_found)"
+        );
+        assert_eq!(
+            paced, advance_arms,
+            "every advance-and-retry arm must call sleep_before_retry() \
+             before continue (#3808 spin-loop guard)"
+        );
     }
 }
