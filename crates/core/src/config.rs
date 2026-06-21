@@ -3895,6 +3895,7 @@ mod tests {
                 token_cleanup_interval_seconds: 321,
                 allowed_hosts: vec!["my-host".to_string()],
                 allowed_source_cidrs: vec!["10.0.0.0/8".parse().unwrap()],
+                hosted_mode: true,
             },
             secrets: base.secrets.clone(),
             log_level: tracing::log::LevelFilter::Debug,
@@ -4057,6 +4058,7 @@ mod tests {
             token_cleanup_interval_seconds,
             allowed_hosts,
             allowed_source_cidrs,
+            hosted_mode,
         } = ws_api;
         assert_eq!(ws_address, seed.ws_api.address, "ws_api.address");
         assert_eq!(ws_port, seed.ws_api.port, "ws_api.port");
@@ -4073,6 +4075,7 @@ mod tests {
             allowed_source_cidrs, seed.ws_api.allowed_source_cidrs,
             "allowed_source_cidrs"
         );
+        assert_eq!(hosted_mode, seed.ws_api.hosted_mode, "ws_api.hosted_mode");
 
         let TelemetryConfig {
             enabled,
