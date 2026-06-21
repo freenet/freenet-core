@@ -647,7 +647,60 @@ async fn drive_client_subscribe_inner(
     let mut current_target_addr: std::net::SocketAddr = target_addr;
     let mut is_first_attempt = true;
 
+    // Renewal task budget (issue #4350). `recover_orphaned_subscriptions`
+    // wraps each renewal task in an outer cancel deadline
+    // (`Ring::renewal_outer_cancel`); before this fix the driver's per-attempt
+    // wait used the global `OPERATION_TTL` (60 s) while the outer deadline was
+    // only 25 s, so a peer replying between 25 s and 60 s was killed by the
+    // outer cancel mid-`await`, discarding the in-flight reply onto the
+    // already-dropped renewal receiver.
+    //
+    // The renewal path now gives itself a total budget
+    // (`Ring::RENEWAL_TASK_BUDGET`, 20 s) and clamps EACH attempt's timeout to
+    // the budget remaining until that deadline. This bounds not just the first
+    // attempt but every retry: no attempt can still be awaiting when the outer
+    // cancel fires, so a slow peer produces at most one clean, in-task timeout
+    // per cycle (clean failure + telemetry on the exhaustion branch below)
+    // instead of a mid-await cancellation that discards an in-flight reply. The
+    // outer cancel is sized (in `renewal_outer_cancel`) to also clear the
+    // driver's post-loop `release_pending_op_slot` cleanup. Client / executor /
+    // directed subscribes have no outer cancel deadline and keep `OPERATION_TTL`
+    // with no budget (`renewal_deadline = None`).
+    let renewal_deadline =
+        is_renewal.then(|| tokio::time::Instant::now() + crate::ring::Ring::RENEWAL_TASK_BUDGET);
+
     loop {
+        // For renewals, clamp this attempt's wait to the budget remaining until
+        // the task deadline (capped at `RENEWAL_PER_ATTEMPT_TIMEOUT`). When the
+        // remaining budget is too small to complete a useful round-trip, stop
+        // cleanly and let the next recovery cycle retry rather than starting an
+        // attempt that the outer cancel would cut short. Non-renewal paths use
+        // the global `OPERATION_TTL`.
+        let attempt_timeout = match renewal_deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining < crate::ring::Ring::RENEWAL_MIN_ATTEMPT_BUDGET {
+                    tracing::debug!(
+                        tx = %client_tx,
+                        contract = %instance_id,
+                        retries,
+                        remaining_ms = remaining.as_millis() as u64,
+                        "subscribe renewal: task budget exhausted; stopping before outer cancel"
+                    );
+                    return Ok(DriverOutcome::Publish(Err(ErrorKind::OperationError {
+                        cause: format!(
+                            "renewal to {instance_id} ran out of task budget after {} rounds",
+                            retries + 1
+                        )
+                        .into(),
+                    }
+                    .into())));
+                }
+                remaining.min(crate::ring::Ring::RENEWAL_PER_ATTEMPT_TIMEOUT)
+            }
+            None => OPERATION_TTL,
+        };
+
         // Fresh attempt tx: single-use-per-tx for send_and_await.
         let attempt_tx = Transaction::new::<SubscribeMsg>();
 
@@ -707,7 +760,7 @@ async fn drive_client_subscribe_inner(
         // `crates/core/`'s timing primitives.
         let request_sent_at = tokio::time::Instant::now();
         let round_trip = tokio::time::timeout(
-            OPERATION_TTL,
+            attempt_timeout,
             ctx.send_to_and_await(current_target_addr, NetMessage::from(request)),
         )
         .await;
@@ -786,8 +839,11 @@ async fn drive_client_subscribe_inner(
                 }
             }
             Err(_) => {
-                // OPERATION_TTL elapsed without the peer producing a
-                // terminal reply. Distinct from `wire_error` (which is
+                // `attempt_timeout` elapsed without the peer producing a
+                // terminal reply (`OPERATION_TTL` for client/executor/directed
+                // subscribes; for renewals, the remaining task budget clamped
+                // at `RENEWAL_PER_ATTEMPT_TIMEOUT` — see #4350). Distinct from
+                // `wire_error` (which is
                 // an infrastructure failure on the executor/send side)
                 // and from `not_found` (a legitimate wire-level
                 // response). `outcome=timeout` (review finding T-4).
@@ -798,7 +854,8 @@ async fn drive_client_subscribe_inner(
                     retries,
                     attempts_at_hop,
                     outcome = "timeout",
-                    timeout_secs = OPERATION_TTL.as_secs(),
+                    timeout_secs = attempt_timeout.as_secs(),
+                    is_renewal,
                     "subscribe: attempt timed out; advancing to next peer"
                 );
                 match advance_to_next_peer(
@@ -3135,6 +3192,64 @@ mod tests {
             "the subscribe_timeout event must be handed to \
              op_manager.ring.register_events(..) so it reaches the telemetry \
              pipeline (#3445)."
+        );
+    }
+
+    /// Issue #4350 pin: the renewal driver must (a) establish a task budget
+    /// (`renewal_deadline`) from `Ring::RENEWAL_TASK_BUDGET` on the renewal
+    /// path, (b) clamp EACH attempt's timeout to the budget remaining until
+    /// that deadline (so retries — not just the first attempt — can't outlive
+    /// the outer cancel), and (c) feed that per-attempt `attempt_timeout` into
+    /// the `tokio::time::timeout` wrapping `send_to_and_await`. Non-renewal
+    /// paths keep `OPERATION_TTL`. A regression that hardcoded `OPERATION_TTL`
+    /// for renewals, or that used a fixed per-attempt timeout instead of the
+    /// remaining budget, would let a slow peer's reply be killed by the 25 s
+    /// outer cancel in `recover_orphaned_subscriptions`, re-introducing the
+    /// discarded-reply drops. The behavioural effect is covered by
+    /// `op_ctx::tests::renewal_per_attempt_timeout_fires_before_outer_cancel`.
+    #[test]
+    fn renewal_driver_clamps_attempt_timeout_to_remaining_budget() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let prod = production_source(SOURCE);
+        let body = extract_fn_body(prod, "async fn drive_client_subscribe_inner(");
+
+        // (a) The renewal task budget is established from the config-tied
+        // constant and gated on the renewal path.
+        assert!(
+            body.contains("let renewal_deadline =")
+                && body.contains("is_renewal.then(")
+                && body.contains("crate::ring::Ring::RENEWAL_TASK_BUDGET"),
+            "drive_client_subscribe_inner must establish a renewal task \
+             deadline from Ring::RENEWAL_TASK_BUDGET on the is_renewal path \
+             (issue #4350)."
+        );
+        // (b) Each attempt's timeout is the remaining budget, capped at the
+        // per-attempt ceiling — not a fixed constant — and non-renewal keeps
+        // OPERATION_TTL.
+        assert!(
+            body.contains("saturating_duration_since")
+                && body.contains("crate::ring::Ring::RENEWAL_PER_ATTEMPT_TIMEOUT")
+                && body.contains("crate::ring::Ring::RENEWAL_MIN_ATTEMPT_BUDGET")
+                && body.contains("None => OPERATION_TTL"),
+            "each renewal attempt must clamp its timeout to the remaining \
+             budget (min RENEWAL_PER_ATTEMPT_TIMEOUT, floor \
+             RENEWAL_MIN_ATTEMPT_BUDGET), with OPERATION_TTL on the non-renewal \
+             path (issue #4350)."
+        );
+        // (c) The per-attempt round-trip must be wrapped in the computed
+        // `attempt_timeout`, not a hardcoded constant.
+        let timeout_pos = body
+            .find("ctx.send_to_and_await(current_target_addr")
+            .expect("send_to_and_await call site must exist");
+        let before = &body[..timeout_pos];
+        let wrap_pos = before
+            .rfind("tokio::time::timeout(")
+            .expect("send_to_and_await must be wrapped in tokio::time::timeout");
+        assert!(
+            before[wrap_pos..].contains("attempt_timeout"),
+            "the per-attempt send_to_and_await must be wrapped in \
+             tokio::time::timeout(attempt_timeout, ..), not a hardcoded \
+             OPERATION_TTL (issue #4350)."
         );
     }
 
