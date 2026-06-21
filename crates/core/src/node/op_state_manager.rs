@@ -597,7 +597,11 @@ impl OpManager {
 
     /// Timeout for sending notifications to the event loop.
     /// If the channel is full for this long, the event loop is stuck and sending will never succeed.
-    const NOTIFICATION_SEND_TIMEOUT: Duration = Duration::from_secs(30);
+    ///
+    /// `pub(crate)` so the renewal outer-cancel deadline in
+    /// [`crate::ring::Ring`] can reserve enough headroom for a worst-case
+    /// backpressured `release_pending_op_slot` cleanup (issue #4350).
+    pub(crate) const NOTIFICATION_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
     // `notify_op_change` (legacy state-machine re-entry primitive)
     // is gone: every op routes outbound messages through

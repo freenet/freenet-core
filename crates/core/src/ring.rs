@@ -36,10 +36,47 @@ use crate::tracing::{NetEventLog, NetEventRegister};
 use crate::transport::TransportPublicKey;
 use crate::util::{Contains, time_source::InstantTimeSrc};
 use crate::{
-    config::{GlobalExecutor, GlobalRng},
+    config::{GlobalExecutor, GlobalRng, OPERATION_TTL},
     message::Transaction,
     node::{self, EventLoopNotificationsSender, NodeConfig, OpManager, PeerId},
     router::Router,
+};
+
+// Issue #4350 invariants, pinned at compile time so a future edit to any of the
+// renewal-timing constants can't silently reopen the discarded-reply bug. The
+// outer cancel deadline is defined in `renewal_outer_cancel` as exactly
+// `RENEWAL_TASK_BUDGET + NOTIFICATION_SEND_TIMEOUT + RENEWAL_OUTER_DEADLINE_MARGIN`,
+// so it clears the driver's worst case (a full-budget slow attempt plus a fully
+// backpressured `release_pending_op_slot` cleanup) by exactly the margin. These
+// asserts pin the surrounding relationships that definition depends on.
+const _: () = {
+    let budget = Ring::RENEWAL_TASK_BUDGET.as_secs();
+    // The cleanup-headroom margin must be non-zero: the outer cancel
+    // (= budget + cleanup + margin) has to be STRICTLY greater than the
+    // worst-case self-termination time (budget + cleanup), or it could fire
+    // exactly as cleanup completes (issue #4350, Codex review).
+    assert!(
+        Ring::RENEWAL_OUTER_DEADLINE_MARGIN.as_secs() > 0,
+        "RENEWAL_OUTER_DEADLINE_MARGIN must be > 0 so the outer cancel strictly \
+         exceeds BUDGET + cleanup timeout (issue #4350)"
+    );
+    // A renewal must be allowed at least one real attempt: the no-start floor
+    // has to sit below the total budget.
+    assert!(
+        Ring::RENEWAL_MIN_ATTEMPT_BUDGET.as_secs() < budget,
+        "RENEWAL_MIN_ATTEMPT_BUDGET must be < RENEWAL_TASK_BUDGET (issue #4350)"
+    );
+    // No single attempt may exceed the total budget.
+    assert!(
+        Ring::RENEWAL_PER_ATTEMPT_TIMEOUT.as_secs() <= budget,
+        "RENEWAL_PER_ATTEMPT_TIMEOUT must be <= RENEWAL_TASK_BUDGET (issue #4350)"
+    );
+    // The per-attempt renewal wait stays below the global operation TTL so a
+    // renewal never out-waits a normal client subscribe attempt.
+    assert!(
+        Ring::RENEWAL_PER_ATTEMPT_TIMEOUT.as_secs() < OPERATION_TTL.as_secs(),
+        "RENEWAL_PER_ATTEMPT_TIMEOUT must be < OPERATION_TTL (issue #4350)"
+    );
 };
 
 mod broken_invariants;
@@ -1222,6 +1259,75 @@ impl Ring {
     /// but failed to establish subscription (no upstream in subscription tree).
     pub(crate) const SUBSCRIPTION_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 
+    /// Total wall-clock budget the renewal driver gives **itself** across all
+    /// of a renewal's network attempts.
+    ///
+    /// Issue #4350: `recover_orphaned_subscriptions` wraps each renewal task in
+    /// an outer cancel deadline ([`Self::renewal_outer_cancel`]), but the
+    /// renewal driver's per-attempt network wait used the global
+    /// [`OPERATION_TTL`] (60 s) while the old outer deadline was only 25 s. A
+    /// peer answering between 25 s and 60 s was killed by the outer cancel
+    /// *mid-await* — the in-flight reply then landed on the renewal task's
+    /// already-dropped capacity-1 receiver (the dominant source of
+    /// `try_forward_driver_reply` closed-receiver drops; log-level fixed in
+    /// PR #4351). The driver now clamps **each** attempt's timeout to the budget
+    /// remaining until this deadline, so no attempt — first or retry — can still
+    /// be awaiting when the outer cancel fires.
+    ///
+    /// Derived from the config interval (most of one recovery cycle) rather than
+    /// independently hardcoded. 20 s.
+    pub(crate) const RENEWAL_TASK_BUDGET: Duration =
+        Duration::from_secs(Self::SUBSCRIPTION_RECOVERY_INTERVAL.as_secs() - 10);
+
+    /// Maximum single-attempt network wait on the renewal path. Each attempt is
+    /// actually capped at `min(this, remaining task budget)` (see
+    /// [`Self::RENEWAL_TASK_BUDGET`]); this is the ceiling for the first
+    /// attempt when the full budget is available. Set equal to the total budget
+    /// so a single slow peer may consume the whole budget in one attempt;
+    /// multi-peer renewals naturally get shorter per-attempt waits as the
+    /// remaining budget shrinks.
+    pub(crate) const RENEWAL_PER_ATTEMPT_TIMEOUT: Duration = Self::RENEWAL_TASK_BUDGET;
+
+    /// Slack between a renewal task's worst-case self-termination time
+    /// (`RENEWAL_TASK_BUDGET` + a fully backpressured `release_pending_op_slot`
+    /// cleanup) and the hard outer cancel deadline. Gives the driver room to
+    /// finish its own cleanup and telemetry before the outer cancel could fire.
+    /// 5 s.
+    pub(crate) const RENEWAL_OUTER_DEADLINE_MARGIN: Duration = Duration::from_secs(5);
+
+    /// Hard outer cancel deadline wrapping each spawned renewal task in
+    /// `recover_orphaned_subscriptions`. Pure backstop for a *genuinely wedged*
+    /// driver: in normal operation the driver self-terminates within
+    /// [`Self::RENEWAL_TASK_BUDGET`] (slow peer) and then runs cleanup, so this
+    /// deadline never fires.
+    ///
+    /// Issue #4350 (Codex review): it must clear the driver's worst case —
+    /// `RENEWAL_TASK_BUDGET` (a full slow attempt) **plus** a fully
+    /// backpressured `release_pending_op_slot`, which awaits up to
+    /// [`OpManager::NOTIFICATION_SEND_TIMEOUT`] (30 s) — or the outer cancel
+    /// could interrupt cleanup, leaving the per-attempt waiter in
+    /// `pending_op_results` (the very closed-receiver drop this change removes).
+    /// Deadline = `BUDGET (20 s) + NOTIFICATION_SEND_TIMEOUT (30 s) +
+    /// RENEWAL_OUTER_DEADLINE_MARGIN (5 s) = 55 s`.
+    ///
+    /// Outliving the 30 s recovery interval is safe: `mark_subscription_pending`
+    /// (released via `SubscriptionRecoveryGuard` on completion **or** cancel)
+    /// blocks a second concurrent renewal for the same contract, and the
+    /// per-cycle spawn count is bounded by `MAX_RECOVERY_ATTEMPTS_PER_INTERVAL`
+    /// and the channel-capacity gates — so a long-running task can't accumulate.
+    pub(crate) fn renewal_outer_cancel() -> Duration {
+        Self::RENEWAL_TASK_BUDGET
+            + crate::node::OpManager::NOTIFICATION_SEND_TIMEOUT
+            + Self::RENEWAL_OUTER_DEADLINE_MARGIN
+    }
+
+    /// Floor below which the renewal driver will **not** start another attempt:
+    /// a remaining budget this small can't complete a useful network round-trip
+    /// before the task budget (and then the outer cancel) elapses, so the
+    /// driver stops cleanly and lets the next 30 s recovery cycle retry rather
+    /// than starting an attempt doomed to be cut short. 2 s.
+    pub(crate) const RENEWAL_MIN_ATTEMPT_BUDGET: Duration = Duration::from_secs(2);
+
     /// Interval for periodic GET subscription cache sweep.
     pub(crate) const GET_SUBSCRIPTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -1464,22 +1570,29 @@ impl Ring {
                         // `result_router_tx`. `is_renewal=true` so
                         // the responder skips sending state.
                         //
-                        // Outer renewal-cycle timeout: cap each renewal task at
-                        // a fraction of the renewal interval so a stuck driver
-                        // (slow peer, blocked op_execution_sender) self-cancels
-                        // within one cycle instead of leaking past
-                        // `mark_subscription_pending` semantics. The driver's
-                        // per-attempt `OPERATION_TTL` (60 s) bounds individual
-                        // peer waits; this outer timeout bounds total task
-                        // lifetime. Without it, sustained slow-peer load could
-                        // accumulate background renewal tasks faster than they
-                        // complete (90+ contracts × multi-attempt ×
-                        // OPERATION_TTL on a gateway).
+                        // Outer renewal cancel deadline: a pure backstop for a
+                        // *genuinely wedged* driver. In normal operation the
+                        // renewal driver self-terminates within
+                        // `RENEWAL_TASK_BUDGET` (slow peer) and then runs its
+                        // cleanup, so this deadline never fires.
+                        //
+                        // Issue #4350: the driver clamps each attempt's wait to
+                        // the budget remaining until its own task deadline
+                        // (`RENEWAL_TASK_BUDGET`, 20 s), so no attempt — first
+                        // or retry — is still awaiting when this outer cancel
+                        // fires; and the deadline is sized
+                        // (`renewal_outer_cancel`, 55 s) to clear the driver's
+                        // worst case (full-budget attempt + a fully
+                        // backpressured `release_pending_op_slot` cleanup, up to
+                        // `NOTIFICATION_SEND_TIMEOUT`). A task outliving the 30 s
+                        // recovery interval is safe: `mark_subscription_pending`
+                        // (released by `SubscriptionRecoveryGuard` on completion
+                        // or cancel) blocks a second concurrent renewal for the
+                        // same contract.
                         let renewal_tx = crate::message::Transaction::new::<
                             crate::operations::subscribe::SubscribeMsg,
                         >();
-                        let renewal_deadline = Self::SUBSCRIPTION_RECOVERY_INTERVAL
-                            .saturating_sub(Duration::from_secs(5));
+                        let renewal_deadline = Self::renewal_outer_cancel();
                         let outcome_enum = match tokio::time::timeout(
                             renewal_deadline,
                             crate::operations::subscribe::run_renewal_subscribe(
