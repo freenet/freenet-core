@@ -426,8 +426,9 @@ mod tests {
     fn gate_honors_ipv4_mapped_loopback() {
         // `::ffff:127.0.0.1` from a dual-stack socket normalizes to loopback.
         let headers = headers_with(Some("tok-abc"), Some("https"));
-        let mapped = Some(IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped()));
-        assert!(is_loopback_source(mapped.unwrap()));
+        let addr = IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped());
+        let mapped = Some(addr);
+        assert!(is_loopback_source(addr));
         let (_, token) =
             export_user_context_or_reject(&headers, mapped, true).expect("mapped loopback honored");
         assert_eq!(token, b"tok-abc");
