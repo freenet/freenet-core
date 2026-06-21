@@ -70,10 +70,14 @@ pub(crate) struct NodeP2P {
 /// and the redb file lock held for the process lifetime (issue #4401).
 ///
 /// On drop it:
-///   1. aborts the stored detached task handles (executor + client-events, plus
+///   1. triggers the ring's background-task shutdown token so the long-lived
+///      `Ring::new` loops (governance reaper, interest heartbeat, connection
+///      maintenance, telemetry) stop promptly instead of waiting out their
+///      longest sleep (issue #4278),
+///   2. aborts the stored detached task handles (executor + client-events, plus
 ///      the session-actor / result-router / initial-join / aggressive-connect
 ///      tasks once they exist), and
-///   2. clears the ring's redb `Storage` clones via `clear_redb_storage()`.
+///   3. clears the ring's redb `Storage` clones via `clear_redb_storage()`.
 ///
 /// ## Exhaustive redb `Arc<Database>` holder set (verified for #4401)
 ///
@@ -120,6 +124,16 @@ impl Drop for ShutdownTeardown {
             return;
         }
         self.fired = true;
+        // Signal the Ring's long-lived background tasks (governance reaper,
+        // interest heartbeat, connection maintenance, telemetry loops, etc.)
+        // to stop. They race this token against their sleeps via
+        // `tokio::select!`, so a graceful shutdown returns promptly instead of
+        // waiting up to ~5 minutes for the longest outstanding sleep to elapse.
+        // Unlike the abort handles below, these tasks are only *observed* by
+        // the BackgroundTaskMonitor (their JoinHandles are consumed there, not
+        // aborted), so the cancellation token is the mechanism that actually
+        // stops them. See issue #4278.
+        self.ring.trigger_shutdown();
         for abort in &self.aborts {
             abort.abort();
         }

@@ -42,6 +42,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1.18"
 tokio-tungstenite = "0.27.0"
+tokio-util = "0.7"
 tower-http = { version = "0.7", features = ["fs", "trace"] }
 
 # Crypto
