@@ -284,12 +284,15 @@ async fn register_subscription_listener(
         "Registering subscription listener"
     );
     let register_listener = op_manager
-        .notify_contract_handler(ContractHandlerEvent::RegisterSubscriberListener {
-            key: instance_id,
-            client_id,
-            summary: None, // No summary for GET/PUT-based subscriptions
-            subscriber_listener: subscription_listener,
-        })
+        .notify_contract_handler_prioritized(
+            ContractHandlerEvent::RegisterSubscriberListener {
+                key: instance_id,
+                client_id,
+                summary: None, // No summary for GET/PUT-based subscriptions
+                subscriber_listener: subscription_listener,
+            },
+            crate::contract::Priority::ClientLocal,
+        )
         .await
         .inspect_err(|err| {
             tracing::error!(
@@ -1049,10 +1052,13 @@ async fn process_open_request(
                             Err(err) if !subscribe => {
                                 // Not joined yet — check if we can serve from local cache
                                 let local_result = op_manager
-                                    .notify_contract_handler(ContractHandlerEvent::GetQuery {
-                                        instance_id: key,
-                                        return_contract_code,
-                                    })
+                                    .notify_contract_handler_prioritized(
+                                        ContractHandlerEvent::GetQuery {
+                                            instance_id: key,
+                                            return_contract_code,
+                                        },
+                                        crate::contract::Priority::ClientLocal,
+                                    )
                                     .await;
                                 if let Ok(ContractHandlerEvent::GetResponse {
                                     key: Some(full_key),
@@ -1091,10 +1097,13 @@ async fn process_open_request(
                         // if subscribed (cache is fresh), otherwise fetch from network.
                         // See PR #2388 for why always-local-first was problematic.
                         let (full_key, state, contract) = match op_manager
-                            .notify_contract_handler(ContractHandlerEvent::GetQuery {
-                                instance_id: key,
-                                return_contract_code,
-                            })
+                            .notify_contract_handler_prioritized(
+                                ContractHandlerEvent::GetQuery {
+                                    instance_id: key,
+                                    return_contract_code,
+                                },
+                                crate::contract::Priority::ClientLocal,
+                            )
                             .await
                         {
                             Ok(ContractHandlerEvent::GetResponse {
@@ -1338,11 +1347,12 @@ async fn process_open_request(
                         // GET+subscribe=true and PUT+subscribe=true bypass this check
                         // because those operations inherently fetch/provide the WASM.
                         match op_manager
-                            .notify_contract_handler(
+                            .notify_contract_handler_prioritized(
                                 crate::contract::ContractHandlerEvent::GetQuery {
                                     instance_id: key,
                                     return_contract_code: true,
                                 },
+                                crate::contract::Priority::ClientLocal,
                             )
                             .await
                         {
@@ -1408,13 +1418,14 @@ async fn process_open_request(
                         };
 
                         let register_listener = op_manager
-                            .notify_contract_handler(
+                            .notify_contract_handler_prioritized(
                                 ContractHandlerEvent::RegisterSubscriberListener {
                                     key,
                                     client_id,
                                     summary,
                                     subscriber_listener,
                                 },
+                                crate::contract::Priority::ClientLocal,
                             )
                             .await
                             .inspect_err(|err| {
@@ -1663,11 +1674,14 @@ async fn process_open_request(
                 let user_context = request.user_context;
 
                 let res = match op_manager
-                    .notify_contract_handler(ContractHandlerEvent::DelegateRequest {
-                        req,
-                        origin_contract,
-                        user_context,
-                    })
+                    .notify_contract_handler_prioritized(
+                        ContractHandlerEvent::DelegateRequest {
+                            req,
+                            origin_contract,
+                            user_context,
+                        },
+                        crate::contract::Priority::ClientLocal,
+                    )
                     .await
                 {
                     Ok(ContractHandlerEvent::DelegateResponse(res)) => {

@@ -9,6 +9,7 @@ use freenet_stdlib::prelude::*;
 
 mod executor;
 mod fair_queue;
+pub(crate) use fair_queue::Priority;
 pub(crate) mod governance;
 mod handler;
 pub mod storages;
@@ -1048,7 +1049,7 @@ where
         // single-digit microseconds even at peak load.
         for _ in 0..fair_queue::MAX_DRAIN_BATCH {
             match contract_handler.channel().try_recv_from_sender()? {
-                Some((id, event)) => {
+                Some((id, event, priority)) => {
                     // Process ClientDisconnect inline — it's a lightweight cleanup
                     // operation that should never be delayed or compete with
                     // DelegateRequest events for the default queue's limited capacity.
@@ -1058,10 +1059,14 @@ where
                         contract_handler.channel().drop_waiting_response(id);
                         continue;
                     }
-                    if let Err(rejected) = fair_queue.try_push(id, event) {
-                        track_pending_reclamation_if_evict(&mut contract_handler, &rejected);
-                        send_queue_full_response(contract_handler.channel(), rejected).await;
-                    }
+                    push_with_background_eviction(
+                        &mut contract_handler,
+                        &mut fair_queue,
+                        id,
+                        event,
+                        priority,
+                    )
+                    .await;
                 }
                 None => break,
             }
@@ -1104,11 +1109,15 @@ where
         // or a delegate notification.
         tokio::select! {
             result = contract_handler.channel().recv_from_sender() => {
-                let (id, event) = result?;
-                if let Err(rejected) = fair_queue.try_push(id, event) {
-                    track_pending_reclamation_if_evict(&mut contract_handler, &rejected);
-                    send_queue_full_response(contract_handler.channel(), rejected).await;
-                }
+                let (id, event, priority) = result?;
+                push_with_background_eviction(
+                    &mut contract_handler,
+                    &mut fair_queue,
+                    id,
+                    event,
+                    priority,
+                )
+                .await;
             }
             Some(resume) = resume_rx.recv() => {
                 handle_deferred_resume(&mut contract_handler, &mut deferral_ctx, resume).await?;
@@ -1531,6 +1540,54 @@ where
 ///
 /// This closes disk-leak edge case #1 in PR #4212 review round 7
 /// (other variants are no-ops here — they have their own error paths).
+/// Push an event into the fair queue, shedding queued `Background` work to make
+/// room when a higher-priority (foreground) event would otherwise be rejected
+/// (#4534).
+///
+/// A `ClientLocal`/`NetworkRelay` event that hits the soft admission cap first
+/// triggers [`FairEventQueue::evict_background`]; the evicted background events
+/// get best-effort queue-full responses (they re-emit on their next cycle), and
+/// the foreground event is retried once. If it still cannot be admitted (or it
+/// was itself `Background`), it gets the normal queue-full response.
+async fn push_with_background_eviction<CH>(
+    contract_handler: &mut CH,
+    fair_queue: &mut fair_queue::FairEventQueue,
+    id: handler::EventId,
+    event: ContractHandlerEvent,
+    priority: fair_queue::Priority,
+) where
+    CH: ContractHandler + Send + 'static,
+{
+    let rejected = match fair_queue.try_push(id, event, priority) {
+        Ok(()) => return,
+        Err(rejected) => rejected,
+    };
+
+    // Only foreground work earns an eviction attempt; a rejected Background
+    // event is simply shed (it must not displace other Background work).
+    if priority > fair_queue::Priority::Background && fair_queue.background_queued() > 0 {
+        // Reclaim at most the reserve's worth of slots in one shot — enough to
+        // admit a burst of client work without unbounded eviction churn.
+        let evicted = fair_queue.evict_background(fair_queue::CLIENT_LOCAL_RESERVE);
+        for shed in evicted {
+            track_pending_reclamation_if_evict(contract_handler, &shed);
+            send_queue_full_response(contract_handler.channel(), Box::new(shed)).await;
+        }
+        // Retry the foreground push now that space was freed.
+        match fair_queue.try_push(rejected.id, rejected.event, rejected.priority) {
+            Ok(()) => return,
+            Err(still_rejected) => {
+                track_pending_reclamation_if_evict(contract_handler, &still_rejected);
+                send_queue_full_response(contract_handler.channel(), still_rejected).await;
+                return;
+            }
+        }
+    }
+
+    track_pending_reclamation_if_evict(contract_handler, &rejected);
+    send_queue_full_response(contract_handler.channel(), rejected).await;
+}
+
 fn track_pending_reclamation_if_evict<CH>(
     contract_handler: &mut CH,
     rejected: &fair_queue::RejectedEvent,
@@ -2573,7 +2630,7 @@ mod tests {
         });
 
         // Receive on the handler side (populates waiting_response)
-        let (id, received_event) =
+        let (id, received_event, priority) =
             tokio::time::timeout(Duration::from_millis(200), rcv_halve.recv_from_sender())
                 .await
                 .expect("timeout waiting for event")
@@ -2582,6 +2639,7 @@ mod tests {
         let rejected = Box::new(fair_queue::RejectedEvent {
             id,
             event: received_event,
+            priority,
         });
 
         (rejected, handle)
@@ -2894,7 +2952,7 @@ mod tests {
         // so the two futures make progress cooperatively to completion.
         let send_fut = send_halve.send_to_handler(event);
         let recv_fut = async {
-            let (id, received) = handler
+            let (id, received, _priority) = handler
                 .channel()
                 .recv_from_sender()
                 .await
@@ -2931,7 +2989,7 @@ mod tests {
         };
         let send_fut = send_halve.send_to_handler(event);
         let recv_fut = async {
-            let (id, received) = handler
+            let (id, received, _priority) = handler
                 .channel()
                 .recv_from_sender()
                 .await

@@ -382,11 +382,25 @@ impl ContractHandlerChannel<SenderHalve> {
     const CH_EV_RESPONSE_TIME_OUT: Duration = Duration::from_secs(300);
 
     /// Send an event to the contract handler and receive a response event if successful.
+    ///
+    /// Defaults to [`Priority::DEFAULT`] (`NetworkRelay`). Callers on a
+    /// local-client path should use [`send_to_handler_prioritized`] with
+    /// [`Priority::ClientLocal`] (#4534).
     pub async fn send_to_handler(
         &self,
         ev: ContractHandlerEvent,
     ) -> Result<ContractHandlerEvent, ContractError> {
-        self.send_to_handler_with_timeout(ev, Self::CH_EV_RESPONSE_TIME_OUT)
+        self.send_to_handler_prioritized(ev, super::fair_queue::Priority::DEFAULT)
+            .await
+    }
+
+    /// Send an event at an explicit priority class and await its response.
+    pub async fn send_to_handler_prioritized(
+        &self,
+        ev: ContractHandlerEvent,
+        priority: super::fair_queue::Priority,
+    ) -> Result<ContractHandlerEvent, ContractError> {
+        self.send_to_handler_with_timeout(ev, Self::CH_EV_RESPONSE_TIME_OUT, priority)
             .await
     }
 
@@ -398,6 +412,7 @@ impl ContractHandlerChannel<SenderHalve> {
         &self,
         ev: ContractHandlerEvent,
         timeout: Duration,
+        priority: super::fair_queue::Priority,
     ) -> Result<ContractHandlerEvent, ContractError> {
         let id = EV_ID.with(|c| {
             let v = c.get();
@@ -407,7 +422,12 @@ impl ContractHandlerChannel<SenderHalve> {
         let (result, result_receiver) = tokio::sync::oneshot::channel();
         self.end
             .event_sender
-            .send(InternalCHEvent { ev, id, result })
+            .send(InternalCHEvent {
+                ev,
+                id,
+                priority,
+                result,
+            })
             .map_err(|err| ContractError::ChannelDropped(Box::new(err.0.ev)))?;
         match tokio::time::timeout(timeout, result_receiver).await {
             Ok(Ok((_, res))) => Ok(res),
@@ -418,10 +438,19 @@ impl ContractHandlerChannel<SenderHalve> {
     /// Send an event to the contract handler without waiting for a response.
     ///
     /// Used for fire-and-forget events like `ClientDisconnect` that don't
-    /// produce a response.
+    /// produce a response. Defaults to [`Priority::DEFAULT`].
     pub fn send_to_handler_fire_and_forget(
         &self,
         ev: ContractHandlerEvent,
+    ) -> Result<(), ContractError> {
+        self.send_to_handler_fire_and_forget_prioritized(ev, super::fair_queue::Priority::DEFAULT)
+    }
+
+    /// Fire-and-forget send at an explicit priority class.
+    pub fn send_to_handler_fire_and_forget_prioritized(
+        &self,
+        ev: ContractHandlerEvent,
+        priority: super::fair_queue::Priority,
     ) -> Result<(), ContractError> {
         let id = EV_ID.with(|c| {
             let v = c.get();
@@ -433,7 +462,12 @@ impl ContractHandlerChannel<SenderHalve> {
         let (result, _) = tokio::sync::oneshot::channel();
         self.end
             .event_sender
-            .send(InternalCHEvent { ev, id, result })
+            .send(InternalCHEvent {
+                ev,
+                id,
+                priority,
+                result,
+            })
             .map_err(|err| ContractError::ChannelDropped(Box::new(err.0.ev)))?;
         Ok(())
     }
@@ -618,10 +652,16 @@ impl ContractHandlerChannel<ContractHandlerHalve> {
 
     pub async fn recv_from_sender(
         &mut self,
-    ) -> Result<(EventId, ContractHandlerEvent), ContractError> {
-        if let Some(InternalCHEvent { ev, id, result }) = self.end.event_receiver.recv().await {
+    ) -> Result<(EventId, ContractHandlerEvent, super::fair_queue::Priority), ContractError> {
+        if let Some(InternalCHEvent {
+            ev,
+            id,
+            priority,
+            result,
+        }) = self.end.event_receiver.recv().await
+        {
             self.end.waiting_response.insert(id, result);
-            return Ok((EventId { id }, ev));
+            return Ok((EventId { id }, ev, priority));
         }
         Err(ContractError::NoEvHandlerResponse)
     }
@@ -630,13 +670,20 @@ impl ContractHandlerChannel<ContractHandlerHalve> {
     ///
     /// Returns `Ok(None)` if the channel is empty, `Err` if the channel is closed.
     /// Used by the fair-queue drain loop to batch-fill the fair queue before processing.
+    #[allow(clippy::type_complexity)]
     pub fn try_recv_from_sender(
         &mut self,
-    ) -> Result<Option<(EventId, ContractHandlerEvent)>, ContractError> {
+    ) -> Result<Option<(EventId, ContractHandlerEvent, super::fair_queue::Priority)>, ContractError>
+    {
         match self.end.event_receiver.try_recv() {
-            Ok(InternalCHEvent { ev, id, result }) => {
+            Ok(InternalCHEvent {
+                ev,
+                id,
+                priority,
+                result,
+            }) => {
                 self.end.waiting_response.insert(id, result);
-                Ok(Some((EventId { id }, ev)))
+                Ok(Some((EventId { id }, ev, priority)))
             }
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(None),
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -656,6 +703,8 @@ struct InternalCHEvent {
     ev: ContractHandlerEvent,
     id: u64,
     // client_id: Option<ClientId>,
+    /// Scheduling/admission priority class for the fair queue (#4534).
+    priority: super::fair_queue::Priority,
     result: tokio::sync::oneshot::Sender<(EventId, ContractHandlerEvent)>,
 }
 
@@ -982,7 +1031,7 @@ pub mod test {
                 })
                 .await
         });
-        let (id, ev) =
+        let (id, ev, _priority) =
             tokio::time::timeout(Duration::from_millis(100), rcv_halve.recv_from_sender())
                 .await??;
 
@@ -1049,7 +1098,7 @@ pub mod test {
         });
 
         // Receive the event from the handler side
-        let (id, ev) =
+        let (id, ev, _priority) =
             tokio::time::timeout(Duration::from_millis(100), rcv_halve.recv_from_sender())
                 .await??;
 
@@ -1238,7 +1287,7 @@ pub mod test {
         // try_recv should succeed
         let result = rcv_halve.try_recv_from_sender();
         assert!(result.is_ok());
-        let (id, event) = result.unwrap().expect("should have received an event");
+        let (id, event, _priority) = result.unwrap().expect("should have received an event");
         // Verify we got a valid EventId (any u64 is valid)
 
         let ContractHandlerEvent::PutQuery { state, .. } = event else {
