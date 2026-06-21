@@ -1,5 +1,4 @@
-
-(function() {
+(function () {
   'use strict';
   // Shared handler for both `click` (primary button) and `auxclick`
   // (non-primary, i.e. middle-click). Middle-click is dispatched via
@@ -32,7 +31,7 @@
     var isCrossOrigin = true;
     try {
       isCrossOrigin = target.origin !== location.origin;
-    } catch(err) {}
+    } catch (err) {}
     if (isCrossOrigin) {
       e.preventDefault();
       // Forward shift-key state so the shell can honour shift-click
@@ -42,12 +41,15 @@
       // tab placement when window.open is called directly from a
       // user gesture, and all three collapse to a plain new tab
       // regardless of what we forward. Keep the contract minimal.
-      window.parent.postMessage({
-        __freenet_shell__: true,
-        type: 'open_url',
-        url: target.href,
-        shiftKey: !!e.shiftKey
-      }, '*');
+      window.parent.postMessage(
+        {
+          __freenet_shell__: true,
+          type: 'open_url',
+          url: target.href,
+          shiftKey: !!e.shiftKey,
+        },
+        '*',
+      );
       return;
     }
     // Same-origin link. Respect explicit non-_self targets so webapps
@@ -55,9 +57,14 @@
     if (target.target && target.target !== '_self') return;
     // Same-origin in-contract link: request navigation via shell
     e.preventDefault();
-    window.parent.postMessage({
-      __freenet_shell__: true, type: 'navigate', href: target.href
-    }, '*');
+    window.parent.postMessage(
+      {
+        __freenet_shell__: true,
+        type: 'navigate',
+        href: target.href,
+      },
+      '*',
+    );
   }
   document.addEventListener('click', handleAnchorClick, true);
   // Catch middle-click and other non-primary button activations.
