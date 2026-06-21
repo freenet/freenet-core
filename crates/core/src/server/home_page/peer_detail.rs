@@ -19,29 +19,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
 
     let Some(peer) = peer else {
         return format!(
-            r##"<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Peer Not Found — Freenet</title>
-<style>{CSS}{PEER_CSS}</style><script>{JS}</script>
-</head><body>
-<header>
-    <div class="header-left">
-        <a href="/" class="logo-link"><img src="https://freenet.org/freenet_logo.svg" alt="Freenet" class="logo"></a>
-        <a href="/" class="header-title">FREENET</a>
-        <span class="header-sep">/</span>
-        <span class="header-scope">Peer</span>
-    </div>
-    <div class="header-right">
-        <button class="theme-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle dark/light mode">
-            <span id="theme-icon">☀️</span>
-        </button>
-    </div>
-</header>
-<main>
-    <div class="card"><h2>Peer Not Found</h2><p class="empty">No connected peer with address <code>{addr}</code>. The peer may have disconnected.</p>
-    <p style="margin-top:0.75rem"><a href="/" style="color:var(--accent-light);font-family:var(--font-mono);font-size:0.85rem">&larr; Back to dashboard</a></p></div>
-</main></body></html>"##,
+            include_str!("assets/peer_not_found.html"),
             CSS = CSS,
             PEER_CSS = PEER_CSS,
             JS = JS,
@@ -398,40 +376,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
     let version = snap_ref.map(|s| s.version.as_str()).unwrap_or("?");
 
     format!(
-        r##"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Peer {addr} — Freenet</title>
-    <style>{CSS}{PEER_CSS}</style>
-    <script>{JS}</script>
-</head>
-<body>
-    <header>
-        <div class="header-left">
-            <a href="/" class="logo-link"><img src="https://freenet.org/freenet_logo.svg" alt="Freenet" class="logo"></a>
-            <a href="/" class="header-title">FREENET</a>
-            <span class="header-sep">/</span>
-            <span class="header-scope">Peer</span>
-            <span class="header-addr">{addr}</span>
-            <span class="badge">v{version}</span>
-        </div>
-        <div class="header-right">
-            <button class="theme-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle dark/light mode">
-                <span id="theme-icon">☀️</span>
-            </button>
-        </div>
-    </header>
-    <main>
-        {info_card}
-        {model_card}
-        {charts}
-        {renegade_chart}
-        {prediction_card}
-    </main>
-</body>
-</html>"##,
+        include_str!("assets/peer.html"),
         addr = html_escape(&peer.address.to_string()),
         CSS = CSS,
         PEER_CSS = PEER_CSS,

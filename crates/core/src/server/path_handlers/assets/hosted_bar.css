@@ -1,0 +1,16 @@
+body{display:flex;flex-direction:column}
+iframe{flex:1 1 auto;height:auto}
+#fnbar{flex:0 0 auto;display:flex;align-items:center;gap:10px;height:34px;padding:0 12px;box-sizing:border-box;background:#fafafa;border-bottom:1px solid #e5e5e5;font:13px/1 system-ui,-apple-system,Segoe UI,sans-serif;color:#555}
+#fnbar .fn{font-weight:600;color:#222;letter-spacing:.02em}
+#fnbar .nt{flex:1 1 auto;min-width:0;color:#777;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+#fnacct{position:relative;flex:0 0 auto}
+#fnbar button{font:inherit;color:#222;background:#fff;border:1px solid #cfcfcf;border-radius:4px;padding:3px 10px;cursor:pointer}
+#fnbar button:hover{border-color:#999}
+#fnpop{position:absolute;top:30px;right:0;width:300px;background:#fff;border:1px solid #d8d8d8;border-radius:6px;box-shadow:0 6px 20px rgba(0,0,0,.12);padding:14px;color:#444;font-weight:400;cursor:auto;display:none;z-index:10}
+#fnpop.open{display:block}
+#fnpop h4{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#999;margin:0 0 4px}
+#fnpop p{margin:0 0 8px;color:#666;line-height:1.45}
+#fnpop .sec{margin-bottom:14px}
+#fnpop .sec:last-child{margin-bottom:0}
+#fnpop .row{display:flex;gap:8px;align-items:center}
+#fnok{color:#2a8a55;font-size:12px}
