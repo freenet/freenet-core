@@ -2373,10 +2373,12 @@ mod tests {
         // Sanity-check the constants the policy depends on: the sub-budget
         // must be strictly below the aggregate cap, otherwise shadow events
         // could consume the whole budget and the carve-out is meaningless.
-        assert!(
-            MAX_SHADOW_EVENTS_PER_SECOND < MAX_EVENTS_PER_SECOND,
-            "shadow sub-budget must leave room for operational events"
-        );
+        const {
+            assert!(
+                MAX_SHADOW_EVENTS_PER_SECOND < MAX_EVENTS_PER_SECOND,
+                "shadow sub-budget must leave room for operational events"
+            );
+        }
 
         let mut worker = rate_limit_test_worker();
         let now = Instant::now();
