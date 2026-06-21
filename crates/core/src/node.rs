@@ -1827,6 +1827,31 @@ where
                 );
                 return Ok(());
             }
+            // Backpressure-aware migration admission (#4534): refuse to take on
+            // a NEW migrated contract when the contract module cache is already
+            // at/above its occupancy ceiling. Accepting more would push the
+            // hosted working set past cache capacity, forcing recompile-on-
+            // access thrash that fills the fair queue ("contract queue full")
+            // and OOMs memory-bound gateways. This gates ONLY the directed-
+            // subscribe placement nudge; the node's own local client
+            // subscribes/GETs are never gated here. The hint is dropped silently
+            // and the holder re-proposes it on its next migration trigger once
+            // headroom returns.
+            let contract_cache_occupancy = crate::wasm_runtime::contract_cache_occupancy_pct();
+            if !migration_admission_allowed(contract_cache_occupancy) {
+                tracing::debug!(
+                    key = %hint.key,
+                    holder = %hint.holder,
+                    ?source_addr,
+                    occupancy_pct = ?contract_cache_occupancy,
+                    ceiling_pct = MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT,
+                    "Refusing inbound SubscribeHint: contract module cache at/above \
+                     the migration-admission occupancy ceiling — deferring placement \
+                     migration to bound the hosted working set and avoid cache thrash \
+                     (#4534)"
+                );
+                return Ok(());
+            }
             tracing::debug!(
                 key = %hint.key,
                 holder = %hint.holder,
@@ -1895,6 +1920,80 @@ const MAX_STALE_SYNCS_PER_SUMMARIES: usize = 32;
 /// [`MAX_STALE_SYNCS_PER_SUMMARIES`] regardless of `stale_contracts_len`.
 fn stale_sync_emit_budget(stale_contracts_len: usize) -> usize {
     stale_contracts_len.min(MAX_STALE_SYNCS_PER_SUMMARIES)
+}
+
+/// Maximum contract-module-cache occupancy (percent of budget) at which this
+/// node still accepts an inbound placement-migration `SubscribeHint` (#4534).
+///
+/// Above this ceiling, inbound hints are refused so the hosted working set
+/// cannot grow past cache capacity and thrash (module recompile-on-access),
+/// which had filled the contract fair queue and produced client-facing
+/// "contract queue full" outages and gateway OOMs on 0.2.80. The ~10% headroom
+/// below 100% is reserved for the node's own locally-requested contracts, whose
+/// directed subscribes are NOT gated here. Refusal is silent and best-effort:
+/// the holder re-proposes the migration on its next trigger, so placement
+/// migration resumes automatically once occupancy falls back below the ceiling.
+///
+/// Recovery is real but NOT guaranteed: occupancy only drops when cold modules
+/// age out of the LRU faster than new ones compile (the recent distinct-module
+/// byte-sum falls below the ceiling). On a node whose hosted working set
+/// genuinely exceeds the cache budget — the exact #4534 scenario — occupancy
+/// stays pinned near 100% and migration is refused INDEFINITELY by design. That
+/// is the correct conservative behavior (it stops the thrash), but it means this
+/// gate is a stopgap, not a complete fix: on such a node the operator must raise
+/// `FREENET_MODULE_CACHE_BUDGET_BYTES` to actually re-enable placement. #4534
+/// stays open for the cache-sizing / offload-compilation / interest-weighted-
+/// retention directions; this constant implements only the "couple migration
+/// acceptance to cache headroom" one.
+const MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT: u64 = 90;
+
+/// Whether to accept an inbound placement-migration hint given the current
+/// contract-module-cache occupancy. `None` (budget gauge not yet published — no
+/// runtime pool built) admits, since there is no pressure signal to act on.
+///
+/// Split out as a pure function so the threshold logic is unit-testable without
+/// constructing an `OpManager` or touching the global cache gauges (#4534).
+fn migration_admission_allowed(contract_cache_occupancy_pct: Option<u64>) -> bool {
+    match contract_cache_occupancy_pct {
+        Some(pct) => pct < MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT,
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod migration_admission_tests {
+    use super::{
+        MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT, migration_admission_allowed,
+    };
+
+    /// No runtime pool / budget gauge yet → no pressure signal → admit.
+    #[test]
+    fn admits_when_cache_budget_uninitialized() {
+        assert!(migration_admission_allowed(None));
+    }
+
+    /// Below the ceiling the node keeps accepting migration (the #4404 feature
+    /// is not crippled on healthy nodes).
+    #[test]
+    fn admits_below_occupancy_ceiling() {
+        assert!(migration_admission_allowed(Some(0)));
+        assert!(migration_admission_allowed(Some(
+            MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT - 1
+        )));
+    }
+
+    /// At or above the ceiling the node sheds inbound migration — this is the
+    /// #4534 fix. The over-budget transient (> 100%) is refused too.
+    #[test]
+    fn refuses_at_or_above_occupancy_ceiling() {
+        assert!(!migration_admission_allowed(Some(
+            MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT
+        )));
+        assert!(!migration_admission_allowed(Some(
+            MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT + 5
+        )));
+        assert!(!migration_admission_allowed(Some(150)));
+    }
 }
 
 /// Per-contract disposition in the stale-sync emission loop, used to model the

@@ -368,6 +368,51 @@ impl ModuleCacheMetrics {
     }
 }
 
+/// Contract-module-cache occupancy as a percentage of the configured byte
+/// budget, read lock-free from the process-global [`MODULE_CACHE_METRICS`].
+///
+/// Returns `None` when the budget gauge has not been published yet — i.e. no
+/// runtime pool has been built in this process (early startup, or a test / tool
+/// binary with no WASM runtime). Callers treat `None` as "no pressure signal".
+///
+/// Used by the placement-migration admission gate (#4534): once occupancy is at
+/// or above the admission ceiling, the node stops accepting inbound
+/// `SubscribeHint` migrations so the hosted working set cannot grow past cache
+/// capacity and thrash (recompile-on-access), which had filled the contract fair
+/// queue and produced client-facing "contract queue full" outages and gateway
+/// OOMs on 0.2.80.
+///
+/// This is a deliberate PROXY for hosting pressure, not a direct measure of the
+/// hosted set: it reflects *compiled-module-cache bytes*, which a module only
+/// joins when it is first executed (summarize / GET / UPDATE), so it LAGS the
+/// hosted set after a directed subscribe makes the node a holder. The lag is
+/// acceptable here because (a) the hosted set is independently bounded by the
+/// hosting cache's own byte budget and the node's ring-responsibility region, so
+/// a burst cannot grow it without bound, and (b) the gate only ever *refuses*
+/// new load — the failure mode of a stale read is at worst deferring one
+/// migration that would have fit, never accepting one it should have refused
+/// once occupancy has caught up.
+pub(crate) fn contract_cache_occupancy_pct() -> Option<u64> {
+    let snapshot = MODULE_CACHE_METRICS.snapshot();
+    occupancy_pct(
+        snapshot.contract_total_bytes,
+        snapshot.contract_budget_bytes,
+    )
+}
+
+/// Pure occupancy-percent computation, split out so the threshold arithmetic is
+/// unit-testable without touching the process-global gauges. `None` when
+/// `budget_bytes == 0` (gauge uninitialized): with no known budget there is no
+/// meaningful occupancy, so callers must not infer pressure from it.
+fn occupancy_pct(total_bytes: u64, budget_bytes: u64) -> Option<u64> {
+    if budget_bytes == 0 {
+        return None;
+    }
+    // `saturating_mul` guards the (practically impossible) overflow of
+    // `total_bytes * 100`; at realistic cache sizes (a few GiB) it never trips.
+    Some(total_bytes.saturating_mul(100) / budget_bytes)
+}
+
 /// Lower clamp for the default contract-module cache budget (64 MiB).
 ///
 /// Even a tiny VPS should be able to hold a healthy working set of compiled
@@ -1184,5 +1229,47 @@ mod tests {
             "eviction on a contract-labeled cache must bump the global counter \
              (before={before}, after={after})"
         );
+    }
+
+    /// An uninitialized budget gauge yields no occupancy signal (the
+    /// placement-migration gate treats `None` as "no backpressure" — #4534).
+    #[test]
+    fn occupancy_pct_is_none_when_budget_uninitialized() {
+        assert_eq!(occupancy_pct(0, 0), None);
+        assert_eq!(occupancy_pct(1_000, 0), None);
+    }
+
+    /// Occupancy is `total * 100 / budget`, including the over-budget transient
+    /// (> 100%) the cache shows between an insert and the eviction that follows.
+    #[test]
+    fn occupancy_pct_computes_percentage_of_budget() {
+        assert_eq!(occupancy_pct(0, 1_000), Some(0));
+        assert_eq!(occupancy_pct(500, 1_000), Some(50));
+        assert_eq!(occupancy_pct(900, 1_000), Some(90));
+        assert_eq!(occupancy_pct(1_000, 1_000), Some(100));
+        assert_eq!(occupancy_pct(1_500, 1_000), Some(150));
+    }
+
+    /// A fully-occupied 1.5 GiB budget must not overflow `total * 100`.
+    #[test]
+    fn occupancy_pct_handles_gib_scale_without_overflow() {
+        // `1.5 GiB * 100` is ~1.6e11, well within u64; assert no overflow panic.
+        let budget = 1_536u64 * 1024 * 1024;
+        assert_eq!(occupancy_pct(budget, budget), Some(100));
+        // Cleanly-divisible large budget to assert the 90% boundary exactly
+        // (avoids integer-truncation noise from a non-divisible GiB budget).
+        assert_eq!(occupancy_pct(900_000_000, 1_000_000_000), Some(90));
+    }
+
+    /// Floor-division must land 89.x% occupancy on the admit side of the 90%
+    /// decision boundary and exactly-90% on the refuse side — the truncation
+    /// edge the whole gate hinges on (#4534). 899/1000 = 89.9% → 89 (admit);
+    /// 900/1000 = 90.0% → 90 (refuse).
+    #[test]
+    fn occupancy_pct_truncates_below_the_decision_boundary() {
+        assert_eq!(occupancy_pct(899, 1_000), Some(89));
+        assert_eq!(occupancy_pct(900, 1_000), Some(90));
+        // Just over the boundary stays refused.
+        assert_eq!(occupancy_pct(901, 1_000), Some(90));
     }
 }
