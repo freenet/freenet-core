@@ -16,7 +16,9 @@
 #![cfg(feature = "simulation_tests")]
 
 use freenet::config::GlobalTestMetrics;
-use freenet::config::{GlobalRng, GlobalSimulationTime, SimulationTransportOpt};
+use freenet::config::{
+    GlobalRng, GlobalSimulationTime, SimulationIdleTimeout, SimulationTransportOpt,
+};
 use freenet::dev_tool::{
     RequestId, SimNetwork, StreamId, VirtualTime, check_convergence_from_logs,
     reset_channel_id_counter, reset_event_id_counter, reset_global_node_index, reset_nonce_counter,
@@ -778,6 +780,11 @@ fn setup_deterministic_state(seed: u64) {
     // Reset transport optimization — run_simulation_direct() enables it when needed,
     // but tests that reuse a thread should start with production timer behavior.
     SimulationTransportOpt::disable();
+    // Reset the extended idle timeout for the same reason: the simulation
+    // runners (run_simulation_direct / run_controlled_simulation) enable it
+    // themselves, so each test on a reused thread starts from the production
+    // 120s default and the runner is the single source of truth (#4282).
+    SimulationIdleTimeout::disable();
 
     // Clear CRDT contract registrations from prior tests on this thread.
     freenet::dev_tool::clear_crdt_contracts();

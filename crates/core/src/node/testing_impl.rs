@@ -3718,7 +3718,7 @@ impl SimNetwork {
         simulation_duration: Duration,
         post_operations_wait: Duration,
     ) -> ControlledSimulationResult {
-        use crate::config::{GlobalRng, GlobalSimulationTime};
+        use crate::config::{GlobalRng, GlobalSimulationTime, SimulationIdleTimeout};
         use crate::ring::topology_registry::{
             get_all_topology_snapshots, set_current_network_name,
         };
@@ -3733,6 +3733,25 @@ impl SimNetwork {
         const RANGE_MS: u64 = 5 * 365 * 24 * 60 * 60 * 1000; // ~5 years in ms
         let epoch_offset = seed % RANGE_MS;
         GlobalSimulationTime::set_time_ms(BASE_EPOCH_MS + epoch_offset);
+
+        // Extend the connection idle timeout for the duration of this Turmoil
+        // run, exactly as the direct runner (`run_simulation_direct`) already
+        // does. Turmoil builds on tokio `start_paused` virtual time, and the
+        // transport's liveness check uses a `RealTime` source whose clock
+        // auto-advances whenever every task is idle — including while a task
+        // awaits `spawn_blocking` (WASM execution). Under a contended CI runner
+        // that virtual clock can jump past the default 120s idle timeout during
+        // a single blocking call, spuriously tearing down an otherwise-healthy
+        // connection. When that happens the unlucky node loses the link it
+        // needed to reach a caching peer and its GET exhausts, flaking the
+        // 100%-coverage assertion in `test_get_routing_coverage_low_htl` (and
+        // the streaming/GET sim tests generally) on a fixed seed. Enabling the
+        // 24h simulation idle timeout removes the false teardown without
+        // touching keepalive or ACK cadence — see the `SimulationIdleTimeout`
+        // doc comment ("ALL simulation sizes need the extended timeout"). The
+        // flag is thread-local and Turmoil runs every host on this thread, so
+        // setting it here applies to all simulated connections. Issue #4282.
+        SimulationIdleTimeout::enable();
 
         // Set the current network name for topology registration
         set_current_network_name(&self.name);
