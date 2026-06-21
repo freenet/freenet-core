@@ -29,6 +29,36 @@
 //! export-specific twist that a no-token / `Local` outcome is REJECTED (an
 //! export of "no user scope" is meaningless here), whereas the WS path lets a
 //! tokenless connection fall through to `Local`.
+//!
+//! ## Threat model: the token is the entire secret
+//!
+//! The per-user DEK and the bundle key are derived SOLELY from the user token
+//! and are node-KEK-independent BY DESIGN (export portability — a self-hosting
+//! user can decrypt their bundle on a fresh peer that never had the operator's
+//! KEK). There is therefore NO node-side second factor: anyone who presents a
+//! valid token over a secure connection gets that user's data. This is the
+//! intended hosted model (the token already names the per-user namespace and
+//! derives the storage DEK), but it means token confidentiality is the whole
+//! ballgame — hence the strict refuse-plaintext-token gate above.
+//!
+//! ## Known limitation — loop-blocking DoS (P5 follow-up)
+//!
+//! An export enumerates AND AEAD-decrypts EVERY secret in the user's scope
+//! SYNCHRONOUSLY on the single-threaded contract-handling loop (the export runs
+//! inside the `ContractHandlerEvent::ExportUserSecrets` handler, same loop as
+//! every PUT/GET/UPDATE/delegate op), with NO per-user secret-count or
+//! bundle-size cap. So a token-holder with a large per-user secret set — or one
+//! who simply repeats the request — can block ALL other contract operations on
+//! the node for the duration of each export. The request is AUTHENTICATED (a
+//! valid token + secure connection), so this is an authenticated-DoS, not an
+//! anonymous one.
+//!
+//! This is acceptable ONLY because the endpoint ships behind the DEFAULT-OFF
+//! hosted flag and is not yet exposed on shared/public infrastructure. Before
+//! it is, a P5 (abuse/quotas) follow-up MUST add: (1) a per-user export quota
+//! (secret-count / bundle-size / rate cap), and (2) off-loop execution
+//! (`spawn_blocking` or a dedicated worker) so a single user's export cannot
+//! stall the node's contract loop. Tracked as part of P5 (#4381).
 
 use axum::{
     Router,
@@ -59,11 +89,13 @@ const DOWNLOAD_FILENAME: &str = "freenet-data.fnsx";
 /// Per-node handle the export HTTP handler uses to reach the executor (which
 /// owns the `SecretsStore`) through the contract handler.
 ///
-/// Created in `serve_client_api_in_impl`, injected into the HTTP router as an
-/// `Extension`, and ALSO held by the `WebSocketProxy`/`HttpClientApi`. The node
-/// fills it ONCE at startup via [`ClientEventsProxy::set_op_manager`]
-/// (`client_event_handling`), which is the first place the live `op_manager`
-/// meets the client layer.
+/// Created and injected into the HTTP router as an `Extension` in
+/// [`HttpClientApi::as_router_with_origin_contracts`](super::HttpClientApi)
+/// (`client_api.rs`), with the SAME `Arc` also stored on the returned
+/// `HttpClientApi`. The node fills it ONCE at startup via
+/// [`ClientEventsProxy::set_op_manager`], called from `node::p2p_impl` on each
+/// boxed client just before the `ClientEventsCombinator` consumes them — the
+/// first place the live `op_manager` meets the client proxies.
 ///
 /// `Weak` so a torn-down node does not keep its `OpManager` alive (and a stale
 /// handle self-heals to a 503 rather than a use-after-free). Because each node
@@ -95,7 +127,7 @@ impl ExportOpManagerHandle {
 
 /// Registers the hosted-export route for `version`. The handler reaches the node
 /// through the per-node [`ExportOpManagerHandle`] carried as a request
-/// `Extension` (injected by `serve_client_api_in_impl`).
+/// `Extension` (injected in `HttpClientApi::as_router_with_origin_contracts`).
 pub(super) fn routes(version: ApiVersion) -> Router {
     let path = format!("/{}/hosted/export", version.prefix());
     Router::new().route(&path, get(export_handler))
@@ -173,6 +205,13 @@ pub(crate) fn export_user_context_or_reject(
 /// source from `extensions()` directly — the same approach `connection_info`
 /// uses, and necessary because this crate builds `axum` without the feature
 /// that provides the `ConnectInfo` extractor.
+///
+/// PERFORMANCE / DoS: the export runs SYNCHRONOUSLY on the contract-handling
+/// loop and decrypts every secret in the user's scope with no per-user cap, so
+/// an authenticated token-holder can block the node for the export's duration.
+/// Acceptable only behind the default-off hosted flag; a per-user quota +
+/// off-loop execution is a required P5 follow-up before public exposure. See the
+/// module-level "Known limitation" section.
 async fn export_handler(req: axum::extract::Request) -> Response {
     // Tolerant: the standalone `as_router` composition path has no `HostedMode`
     // layer, so a missing extension means hosted-off ⇒ the gate below 403s (it

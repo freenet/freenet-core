@@ -283,6 +283,17 @@ impl Runtime {
     ///
     /// Plaintext exists only in the `Zeroizing` buffers inside `export_bundle`;
     /// the returned bytes are encrypted at rest.
+    ///
+    /// PERFORMANCE / DoS: this enumerates AND AEAD-decrypts EVERY secret in
+    /// `scope`, synchronously, and the hosted-export caller invokes it on the
+    /// single-threaded contract-handling loop with no per-user secret-count or
+    /// bundle-size cap. A large or repeated export by an authenticated
+    /// token-holder therefore blocks all other contract ops for its duration.
+    /// Acceptable only behind the default-off hosted flag; a per-user quota +
+    /// off-loop execution (`spawn_blocking`) is a required P5 follow-up before
+    /// the export endpoint is exposed on shared/public infrastructure. See the
+    /// "Known limitation" section in
+    /// `server::client_api::hosted_export`.
     pub(crate) fn export_secret_bundle(
         &self,
         scope: super::secrets_store::SecretScope<'_>,
