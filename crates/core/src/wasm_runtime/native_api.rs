@@ -2177,3 +2177,94 @@ pub(super) mod delegate_management {
         }
     }
 }
+
+#[cfg(test)]
+mod list_secrets_abi_tests {
+    //! Host-side ABI validation tests for the `list_secrets` hostcall path
+    //! (#4355 / #4523). These exercise ONLY the parameter-validation branches
+    //! that short-circuit before any WASM linear-memory access or
+    //! `DelegateCallEnv` lookup, so no real delegate WASM module is needed.
+    //!
+    //! The success / prefix-filter / buffer-too-small / len-vs-fill-agreement
+    //! arms genuinely require a registered `MEM_ADDR` + `DELEGATE_ENV` (i.e. a
+    //! live delegate instance), so they are covered at the store layer by
+    //! `secrets_store::list_secret_keys_*` and left to end-to-end-through-WASM
+    //! coverage (legitimately deferred: the test-delegate fixture pins the
+    //! published stdlib and cannot drive the new ABI yet).
+
+    use super::CURRENT_DELEGATE_INSTANCE;
+    use super::delegate_secrets::{list_secrets, list_secrets_len};
+    use super::error_codes;
+
+    /// Set the thread-local instance id for the body of `f`, restoring -1
+    /// (the "not in process" sentinel) afterwards so tests don't leak state.
+    fn with_instance_id<R>(id: i64, f: impl FnOnce() -> R) -> R {
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(id));
+        let r = f();
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(-1));
+        r
+    }
+
+    #[test]
+    fn list_secrets_negative_out_len_is_invalid_param() {
+        // `out_len < 0` is rejected by `list_secrets` itself, before any
+        // instance-id / memory lookup, so this holds regardless of context.
+        assert_eq!(
+            list_secrets(0, 0, 0, -1),
+            error_codes::ERR_INVALID_PARAM,
+            "negative out_len must be rejected as ERR_INVALID_PARAM"
+        );
+    }
+
+    #[test]
+    fn list_secrets_outside_process_is_not_in_process() {
+        // Default thread-local id is -1 ("not in process"). A non-negative
+        // out_len passes the first guard, then `collect_list_secrets` rejects
+        // on the id == -1 check.
+        with_instance_id(-1, || {
+            assert_eq!(
+                list_secrets(0, 0, 0, 64),
+                error_codes::ERR_NOT_IN_PROCESS,
+                "calling list_secrets outside process() must be ERR_NOT_IN_PROCESS"
+            );
+        });
+    }
+
+    #[test]
+    fn list_secrets_len_outside_process_is_not_in_process() {
+        with_instance_id(-1, || {
+            assert_eq!(
+                list_secrets_len(0, 0),
+                error_codes::ERR_NOT_IN_PROCESS,
+                "list_secrets_len outside process() must be ERR_NOT_IN_PROCESS"
+            );
+        });
+    }
+
+    #[test]
+    fn list_secrets_len_negative_prefix_is_invalid_param() {
+        // With a non-sentinel instance id the id==-1 guard passes, and the
+        // negative prefix_len is rejected BEFORE the MEM_ADDR lookup, so no
+        // registered instance memory is required to reach ERR_INVALID_PARAM.
+        with_instance_id(0xABCD, || {
+            assert_eq!(
+                list_secrets_len(0, -1),
+                error_codes::ERR_INVALID_PARAM,
+                "negative prefix_len must be rejected as ERR_INVALID_PARAM"
+            );
+        });
+    }
+
+    #[test]
+    fn list_secrets_negative_prefix_is_invalid_param() {
+        // Same negative-prefix guard reached via `list_secrets` (out_len valid,
+        // id non-sentinel) — `collect_list_secrets` rejects prefix_len < 0.
+        with_instance_id(0xABCD, || {
+            assert_eq!(
+                list_secrets(0, -1, 0, 64),
+                error_codes::ERR_INVALID_PARAM,
+                "negative prefix_len via list_secrets must be ERR_INVALID_PARAM"
+            );
+        });
+    }
+}

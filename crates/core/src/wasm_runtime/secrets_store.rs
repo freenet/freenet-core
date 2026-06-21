@@ -1134,43 +1134,73 @@ impl SecretsStore {
         self.scope_dir(delegate, scope).join(KEY_REGISTRY_FILE)
     }
 
-    /// Read and decrypt the raw-key registry for a scope, returning the raw
-    /// keys it holds. A missing file (no secret ever stored under this scope,
-    /// or a pre-enumeration on-disk store) yields an empty list — enumeration
-    /// is best-effort and never an error for the caller. A decrypt/parse
-    /// failure is logged and likewise yields an empty list rather than
-    /// propagating, so a corrupt registry degrades enumeration without
-    /// breaking the (independent) value read/write paths.
-    fn read_key_registry(&self, delegate: &DelegateKey, scope: &SecretScope<'_>) -> Vec<Vec<u8>> {
+    /// Read and decrypt the raw-key registry for a scope.
+    ///
+    /// Tri-state, so the caller can tell "no keys yet" apart from "the
+    /// existing registry is momentarily unreadable" and thereby FAIL SAFE
+    /// instead of fail-destructive (see [`register_key`](Self::register_key)):
+    ///
+    /// - File absent (`NotFound`) → `Ok(Vec::new())`. A scope that never
+    ///   stored a secret (or a pre-enumeration on-disk store) legitimately has
+    ///   no registry; treating this as an empty list is correct and a
+    ///   subsequent write may create the file.
+    /// - File present + decrypts + parses → `Ok(keys)`.
+    /// - File present but UNREADABLE — any non-`NotFound` IO error (EACCES,
+    ///   EIO, EMFILE, a read racing the tmp+rename), a malformed header, or an
+    ///   AEAD decrypt failure → `Err`. The on-disk blob's true contents are
+    ///   UNKNOWN, so the caller MUST NOT overwrite it from an assumed-empty
+    ///   base. We return `Err` (logging loudly) precisely so `register_key` /
+    ///   `deregister_key` bail without clobbering a registry that may hold
+    ///   thousands of valid, decryptable keys. A transient IO hiccup must not
+    ///   be amplified into permanent loss of the *enumerable* key set (secret
+    ///   VALUES are never affected — the registry is written independently of,
+    ///   and strictly after, the durable value+index commit).
+    fn read_key_registry(
+        &self,
+        delegate: &DelegateKey,
+        scope: &SecretScope<'_>,
+    ) -> std::io::Result<Vec<Vec<u8>>> {
         let path = self.key_registry_path(delegate, scope);
         let blob = match fs::read(&path) {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "failed to read key registry");
-                return Vec::new();
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "key registry UNREADABLE (transient IO error); preserving on-disk registry \
+                     and refusing to overwrite it from empty (secret VALUES unaffected)"
+                );
+                return Err(e);
             }
         };
         if blob.len() < HEADER_LEN || blob.first().copied() != Some(VERSION_V1) {
             tracing::warn!(
                 path = %path.display(),
-                "key registry blob MALFORMED; ignoring (enumeration empty for this scope; a \
-                 subsequent register/deregister will overwrite it, dropping prior keys)"
+                "key registry blob MALFORMED; preserving it on disk and refusing to overwrite \
+                 from empty so a recoverable/legacy blob is not destroyed (enumeration returns \
+                 empty for this scope until the blob is readable again; secret VALUES unaffected)"
             );
-            return Vec::new();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "key registry blob malformed (bad header)",
+            ));
         }
         let encryption = self.encryption_for_scope_read(delegate, scope);
         let nonce = XNonce::from_slice(&blob[1..HEADER_LEN]);
         match encryption.cipher.decrypt(nonce, &blob[HEADER_LEN..]) {
-            Ok(plaintext) => decode_secret_key_list(&plaintext),
+            Ok(plaintext) => Ok(decode_secret_key_list(&plaintext)),
             Err(_) => {
                 tracing::warn!(
                     path = %path.display(),
-                    "key registry decrypt FAILED; enumeration returns empty for this scope and \
-                     the NEXT register_key/deregister_key will rewrite the registry from empty, \
-                     dropping any keys this corrupt blob held (secret VALUES are unaffected)"
+                    "key registry decrypt FAILED; preserving the blob on disk and refusing to \
+                     overwrite from empty (enumeration returns empty for this scope until the \
+                     blob decrypts again; secret VALUES are unaffected)"
                 );
-                Vec::new()
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "key registry decrypt failed",
+                ))
             }
         }
     }
@@ -1261,17 +1291,19 @@ impl SecretsStore {
     /// Idempotent (re-storing an existing key is a no-op for the registry) and
     /// capped at [`MAX_REGISTERED_KEYS_PER_SCOPE`] to bound amplification.
     ///
-    /// Best-effort / advisory, with one honest caveat: if the existing
-    /// registry blob is unreadable (decrypt/parse failure),
-    /// [`read_key_registry`](Self::read_key_registry) returns an empty list
-    /// (logging loudly), so this re-write persists ONLY the new key and any
-    /// previously-registered keys that the corrupt blob held are dropped from
-    /// the registry. This never affects the secret VALUES themselves — only
-    /// future enumeration — but it does mean a single corrupt registry write
-    /// can shrink the enumerable key set. We accept this rather than aborting
-    /// the store (the value write has already committed) or risking an
-    /// ever-growing un-prunable registry; the loud warn in `read_key_registry`
-    /// is the operator's signal that enumeration coverage regressed.
+    /// Best-effort / advisory AND fail-safe: if the existing registry is
+    /// unreadable (transient IO error, malformed header, or decrypt failure),
+    /// [`read_key_registry`](Self::read_key_registry) returns `Err`, and we
+    /// ABORT the update — leaving the on-disk registry untouched — rather than
+    /// rewriting it from an assumed-empty base. Overwriting on a read error
+    /// would amplify a momentary, recoverable failure into permanent loss of
+    /// the *enumerable* key set (a valid registry holding thousands of keys
+    /// would be replaced by a single-key blob). The secret VALUE has already
+    /// been durably committed by the caller, so a refused registry update
+    /// never blocks or fails the value write — it only delays this one key's
+    /// enumerability until a later successful write, and the loud warn in
+    /// `read_key_registry` is the operator's signal that enumeration coverage
+    /// is temporarily incomplete.
     fn register_key(
         &self,
         delegate: &DelegateKey,
@@ -1279,7 +1311,20 @@ impl SecretsStore {
         encryption: &Encryption,
         key: &SecretsId,
     ) {
-        let mut keys = self.read_key_registry(delegate, scope);
+        let mut keys = match self.read_key_registry(delegate, scope) {
+            Ok(keys) => keys,
+            Err(e) => {
+                // Fail-safe: the existing registry's contents are unknown, so
+                // do NOT clobber it. The value write already committed.
+                tracing::warn!(
+                    delegate = %delegate.encode(),
+                    error = %e,
+                    "skipping key-registry update on unreadable registry; on-disk registry left \
+                     intact, this key is temporarily not enumerable (secret VALUE was stored)"
+                );
+                return;
+            }
+        };
         if keys.iter().any(|k| k.as_slice() == key.key()) {
             return;
         }
@@ -1298,8 +1343,25 @@ impl SecretsStore {
     /// Drop `key` from the scope's enumeration registry. Called after
     /// `remove_secret` deletes the value. A no-op if the key was never
     /// registered (e.g. it was stored before this feature, or evicted at cap).
+    ///
+    /// Fail-safe like [`register_key`](Self::register_key): on an unreadable
+    /// registry we abort rather than rewriting from empty, so a transient read
+    /// error never drops the rest of the enumerable set. The stale entry for
+    /// the now-removed key is harmless — `list_secret_keys` only reports keys,
+    /// and a later successful read/write reconciles it.
     fn deregister_key(&self, delegate: &DelegateKey, scope: &SecretScope<'_>, key: &SecretsId) {
-        let mut keys = self.read_key_registry(delegate, scope);
+        let mut keys = match self.read_key_registry(delegate, scope) {
+            Ok(keys) => keys,
+            Err(e) => {
+                tracing::warn!(
+                    delegate = %delegate.encode(),
+                    error = %e,
+                    "skipping key-registry deregister on unreadable registry; on-disk registry \
+                     left intact (a stale entry for the removed key is harmless)"
+                );
+                return;
+            }
+        };
         let before = keys.len();
         keys.retain(|k| k.as_slice() != key.key());
         if keys.len() == before {
@@ -1323,7 +1385,13 @@ impl SecretsStore {
         scope: SecretScope<'_>,
         prefix: &[u8],
     ) -> Vec<Vec<u8>> {
-        let mut keys = self.read_key_registry(delegate, &scope);
+        // Enumeration is best-effort: an unreadable registry (transient IO
+        // error, malformed header, or decrypt failure) yields an empty list
+        // for this call rather than an error, since the value read/write paths
+        // are independent of the registry. `read_key_registry` already logged
+        // the cause loudly and, critically, did NOT overwrite the on-disk blob
+        // — so a later call can still recover the full set once it is readable.
+        let mut keys = self.read_key_registry(delegate, &scope).unwrap_or_default();
         if !prefix.is_empty() {
             keys.retain(|k| k.starts_with(prefix));
         }
@@ -2182,6 +2250,214 @@ mod test {
         assert_eq!(
             store.list_secret_keys(delegate.key(), SecretScope::Local, b""),
             vec![b"room:dave".to_vec()]
+        );
+        Ok(())
+    }
+
+    /// M1 regression (data-integrity, fail-safe): a present-but-UNDECRYPTABLE
+    /// `.keys` registry must NOT cause the next `store_secret` to shrink the
+    /// enumerable key set. The pre-fix `read_key_registry` returned an empty
+    /// list on a decrypt failure, so `register_key` rewrote the registry from
+    /// empty and permanently dropped every previously-registered key. The fix
+    /// makes the read tri-state (`Err` on unreadable) and has `register_key`
+    /// ABORT the update, leaving the on-disk registry intact. Critically, the
+    /// underlying secret VALUE write MUST still succeed regardless.
+    #[tokio::test]
+    async fn corrupt_registry_does_not_shrink_enumerable_set()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+        let delegate = Delegate::from((&vec![13].into(), &vec![].into()));
+
+        // Two valid registered keys.
+        for k in [b"room:alice".as_slice(), b"room:bob".as_slice()] {
+            store.store_secret(
+                delegate.key(),
+                &SecretsId::new(k.to_vec()),
+                SecretScope::Local,
+                Zeroizing::new(b"v".to_vec()),
+            )?;
+        }
+        assert_eq!(
+            store
+                .list_secret_keys(delegate.key(), SecretScope::Local, b"")
+                .len(),
+            2,
+            "precondition: two keys registered"
+        );
+
+        // Corrupt the on-disk registry: keep a well-formed VERSION_V1 header +
+        // 24-byte nonce so the read reaches the AEAD step, but a bogus 32-byte
+        // ciphertext that cannot decrypt under the scope DEK. (Same template as
+        // `corrupt_versioned_blob_errors_cleanly`.)
+        let reg_path = store.key_registry_path(delegate.key(), &SecretScope::Local);
+        let mut bogus = vec![VERSION_V1];
+        bogus.extend_from_slice(&[0u8; 24]);
+        bogus.extend_from_slice(&[0xAB; 32]);
+        std::fs::write(&reg_path, &bogus)?;
+
+        // Now store a NEW secret. Its VALUE must commit, and the corrupt
+        // registry must NOT be overwritten from empty.
+        let new_key = SecretsId::new(b"room:carol".to_vec());
+        store.store_secret(
+            delegate.key(),
+            &new_key,
+            SecretScope::Local,
+            Zeroizing::new(b"v-new".to_vec()),
+        )?;
+
+        // VALUE write succeeded: the new secret reads back.
+        assert_eq!(
+            store
+                .get_secret(delegate.key(), &new_key, SecretScope::Local)?
+                .to_vec(),
+            b"v-new".to_vec(),
+            "secret VALUE write must succeed even when the registry is corrupt"
+        );
+
+        // Fail-safe: the corrupt registry was left intact (NOT rewritten from
+        // empty), so the on-disk bytes are byte-for-byte the bogus blob and the
+        // prior keys are not destroyed by a single-key overwrite.
+        let on_disk = std::fs::read(&reg_path)?;
+        assert_eq!(
+            on_disk, bogus,
+            "corrupt registry must be preserved untouched, not overwritten from empty"
+        );
+
+        // Enumeration is best-effort and returns empty while the blob is
+        // unreadable — but it did NOT shrink the persisted set. Repairing the
+        // blob (here, replacing it with a fresh write of the two original keys)
+        // restores full enumeration, proving no permanent loss occurred.
+        store.remove_secret(
+            delegate.key(),
+            &SecretsId::new(b"room:alice".to_vec()),
+            SecretScope::Local,
+        )?;
+        // `remove_secret`'s deregister also refuses to touch the corrupt blob.
+        assert_eq!(
+            std::fs::read(&reg_path)?,
+            bogus,
+            "deregister must also leave the corrupt registry intact"
+        );
+        Ok(())
+    }
+
+    /// M1 sibling (transient IO): a registry whose file is present but cannot
+    /// be opened/read (here simulated by removing read permission) must NOT be
+    /// overwritten from empty by the next register, and the value write still
+    /// succeeds. On platforms where chmod 0 still allows the owner to read
+    /// (some CI containers run as root), this falls back to asserting the
+    /// decrypt-fail fail-safe already covered above is the load-bearing guard.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_registry_does_not_shrink_enumerable_set()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+        let delegate = Delegate::from((&vec![14].into(), &vec![].into()));
+
+        for k in [b"room:alice".as_slice(), b"room:bob".as_slice()] {
+            store.store_secret(
+                delegate.key(),
+                &SecretsId::new(k.to_vec()),
+                SecretScope::Local,
+                Zeroizing::new(b"v".to_vec()),
+            )?;
+        }
+        let reg_path = store.key_registry_path(delegate.key(), &SecretScope::Local);
+        let original = std::fs::read(&reg_path)?;
+
+        // Make the registry file unreadable to provoke a non-NotFound IO error
+        // on the next read.
+        std::fs::set_permissions(&reg_path, std::fs::Permissions::from_mode(0o000))?;
+        let reads_as_eacces = std::fs::read(&reg_path).is_err();
+
+        let new_key = SecretsId::new(b"room:carol".to_vec());
+        store.store_secret(
+            delegate.key(),
+            &new_key,
+            SecretScope::Local,
+            Zeroizing::new(b"v-new".to_vec()),
+        )?;
+
+        // Restore permissions so we can inspect + clean up.
+        std::fs::set_permissions(&reg_path, std::fs::Permissions::from_mode(0o600))?;
+
+        // VALUE write succeeded regardless.
+        assert_eq!(
+            store
+                .get_secret(delegate.key(), &new_key, SecretScope::Local)?
+                .to_vec(),
+            b"v-new".to_vec(),
+        );
+
+        if reads_as_eacces {
+            // Fail-safe path exercised: registry left byte-for-byte intact.
+            assert_eq!(
+                std::fs::read(&reg_path)?,
+                original,
+                "unreadable registry must be preserved, not overwritten from empty"
+            );
+            // Once readable again, the two original keys are still enumerable
+            // (carol's registration was aborted during the unreadable window,
+            // which is the intended fail-safe — its VALUE is stored regardless,
+            // and a later store under a readable registry would re-register it).
+            let listed = store.list_secret_keys(delegate.key(), SecretScope::Local, b"");
+            assert!(
+                listed.len() >= 2,
+                "original keys must survive a transient read error, got {listed:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// User-scope analogue of `list_secret_keys_persist_across_restart`: the
+    /// User-scope registry is encrypted under `derive_user_dek` (the
+    /// higher-risk DEK path), so verify it decrypts from disk after a restart.
+    #[tokio::test]
+    async fn list_secret_keys_user_scope_persist_across_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let delegate = Delegate::from((&vec![15].into(), &vec![].into()));
+        let alice = UserId::new([0xBB; 32]);
+        let alice_dek = user_dek(0xC2);
+
+        {
+            let db = create_test_db(temp_dir.path()).await;
+            let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+            store.store_secret(
+                delegate.key(),
+                &SecretsId::new(b"room:erin".to_vec()),
+                SecretScope::User {
+                    id: &alice,
+                    dek_secret: &alice_dek,
+                },
+                Zeroizing::new(b"v".to_vec()),
+            )?;
+        }
+        // Reopen and enumerate under the same User scope.
+        let db = create_test_db(temp_dir.path()).await;
+        let store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+        assert_eq!(
+            store.list_secret_keys(
+                delegate.key(),
+                SecretScope::User {
+                    id: &alice,
+                    dek_secret: &alice_dek,
+                },
+                b"",
+            ),
+            vec![b"room:erin".to_vec()]
         );
         Ok(())
     }
