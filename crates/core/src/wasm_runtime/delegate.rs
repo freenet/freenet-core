@@ -1749,7 +1749,7 @@ mod test {
         let budget = per_module + per_module / 2; // between 1x and 2x
         {
             let mut cache = runtime.delegate_modules.lock().unwrap();
-            *cache = super::super::ModuleCache::with_label(budget, "delegate");
+            *cache = super::super::ModuleCache::with_label(budget, "delegate", None);
         }
 
         // Load all 6 distinct delegates; the cache must stay within budget.

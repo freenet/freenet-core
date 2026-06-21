@@ -160,6 +160,13 @@ pub(crate) struct Ring {
     /// Directory for persisting the peer address cache. When set, the peer cache
     /// is periodically saved here and loaded on startup for fast reconnection.
     pub(crate) peer_cache_dir: Option<std::path::PathBuf>,
+    /// Per-node compiled-WASM module-cache occupancy + eviction telemetry
+    /// (#4440). Constructed once here and threaded as an `Arc`: the
+    /// `RuntimePool` clones it (via `op_manager.ring`) into its labeled module
+    /// caches, which *publish* into it; the `emit_router_snapshot_telemetry`
+    /// task *reads* it. Threading the `Arc` (rather than a process-global)
+    /// keeps the gauges per-node so unit tests stay isolated (#4488).
+    module_cache_metrics: Arc<crate::wasm_runtime::ModuleCacheMetrics>,
 }
 
 // /// A data type that represents the fact that a peer has been blacklisted
@@ -339,6 +346,10 @@ impl Ring {
             contract_connect_backoff: Mutex::new(HashMap::new()),
             time_source,
             peer_cache_dir,
+            // One sink per node, shared with the module caches via the `Arc`
+            // (the `RuntimePool` reaches it through `op_manager.ring`). See
+            // the field docs and #4488.
+            module_cache_metrics: Arc::new(crate::wasm_runtime::ModuleCacheMetrics::new()),
         };
 
         if let Some(loc) = config.location {
@@ -460,6 +471,14 @@ impl Ring {
 
     pub fn attach_op_manager(&self, op_manager: &Arc<OpManager>) {
         self.op_manager.write().replace(Arc::downgrade(op_manager));
+    }
+
+    /// Shared per-node module-cache telemetry sink (#4440 / #4488). The
+    /// `RuntimePool` clones this into its labeled module caches (which publish
+    /// occupancy/eviction into it) while the snapshot task reads it; threading
+    /// this `Arc` is what replaced the old `MODULE_CACHE_METRICS` process-global.
+    pub(crate) fn module_cache_metrics(&self) -> Arc<crate::wasm_runtime::ModuleCacheMetrics> {
+        self.module_cache_metrics.clone()
     }
 
     fn upgrade_op_manager(&self) -> Option<Arc<OpManager>> {
@@ -1100,9 +1119,10 @@ impl Ring {
             snapshot.fd_soft_limit = fd_soft_limit;
 
             // Compiled-WASM module-cache occupancy + eviction gauges (#4440),
-            // read from the process-global the caches publish into (they live
-            // behind the contract-handler channel, unreachable from here).
-            let mc = crate::wasm_runtime::MODULE_CACHE_METRICS.snapshot();
+            // read from the per-node `Arc` the caches publish into (they live
+            // behind the contract-handler channel, unreachable from here; the
+            // `RuntimePool` shares this `Arc` via `op_manager.ring`).
+            let mc = ring.module_cache_metrics.snapshot();
             snapshot.contract_module_cache_entries = Some(mc.contract_entries);
             snapshot.contract_module_cache_total_bytes = Some(mc.contract_total_bytes);
             snapshot.contract_module_cache_budget_bytes = Some(mc.contract_budget_bytes);
@@ -4133,16 +4153,17 @@ fn window_delta(current_total: u64, prev_total: &mut u64) -> u64 {
 /// `router_snapshot` cadence (partially addresses #4440 item (a)).
 ///
 /// The task *publishes* (`record_success` / `record_failure`) and the `Ring`
-/// snapshot task *reads* (`refresh_router`), mirroring `MODULE_CACHE_METRICS` /
-/// `BROADCAST_STREAM_METRICS`. Currently scoped to `refresh_router`, the one
-/// monitored task with a non-fatal per-run failure mode; add fields here if
-/// another monitored task grows the same pattern.
+/// snapshot task *reads* (`refresh_router`), mirroring `BROADCAST_STREAM_METRICS`
+/// (and the module-cache metrics, which were a sibling process-global until
+/// #4488 threaded them as a per-node `Arc`). Currently scoped to
+/// `refresh_router`, the one monitored task with a non-fatal per-run failure
+/// mode; add fields here if another monitored task grows the same pattern.
 ///
 /// Per-node meaning holds only in single-node-per-process production. In a
 /// multi-node simulation every node's `refresh_router` shares this
 /// process-global, so the snapshot reads the aggregate (last-write-wins
-/// last-success across nodes; the consecutive-failure run is shared) — same
-/// caveat as `MODULE_CACHE_METRICS` / `BROADCAST_STREAM_METRICS`.
+/// last-success across nodes; the consecutive-failure run is shared) — the same
+/// caveat that drove #4488 for the module-cache metrics.
 static BACKGROUND_TASK_HEALTH: std::sync::LazyLock<BackgroundTaskHealth> =
     std::sync::LazyLock::new(BackgroundTaskHealth::new);
 

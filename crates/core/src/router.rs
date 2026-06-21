@@ -176,7 +176,8 @@ pub(crate) struct RouterSnapshotInfo {
     /// `None` on non-unix. Populated by `Ring`; see [`open_fds`](Self::open_fds).
     pub fd_soft_limit: Option<u64>,
     /// Compiled-WASM module-cache gauges (#4440), populated by `Ring` from the
-    /// process-global `MODULE_CACHE_METRICS`. `None` until the WASM runtime has
+    /// per-node `ModuleCacheMetrics` `Arc` the caches publish into (a
+    /// process-global until #4488). `None` until the WASM runtime has
     /// touched the cache. The contract-cache thrash (eviction → recompile) that
     /// drove the #4441 incident was invisible to central telemetry; these make
     /// occupancy and eviction pressure observable on the snapshot cadence. The
