@@ -1619,12 +1619,27 @@ impl Ring {
 
                     let op_manager_clone = op_manager.clone();
                     let contract_key = contract;
+                    let task_shutdown = shutdown.clone();
 
                     GlobalExecutor::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
-                        // Guard ensures complete_subscription_request is called even on panic
+                        // Guard ensures complete_subscription_request is called even on panic.
+                        // Created BEFORE the jitter sleep so an early shutdown return below
+                        // still clears the `mark_subscription_pending` flag set above — the
+                        // guard's Drop marks the request failed (#4278).
                         let guard =
                             SubscriptionRecoveryGuard::new(op_manager_clone.clone(), contract_key);
+
+                        // The jitter can be up to 15s; bail (dropping the guard, which
+                        // completes the pending request as failed) before doing any
+                        // renewal work if the node is shutting down (#4278).
+                        if sleep_or_shutdown(
+                            &task_shutdown,
+                            tokio::time::sleep(Duration::from_millis(jitter_ms)),
+                        )
+                        .await
+                        {
+                            return;
+                        }
 
                         let instance_id = *contract_key.id();
                         // Renewal driver: same machinery as
@@ -3977,8 +3992,9 @@ impl Ring {
             }
         }
 
-        // Intentional teardown parking (#4292): the loop only breaks once the
-        // OpManager has been dropped (node shutdown), so there is no more work
+        // Intentional teardown parking (#4292): the loop only breaks on node
+        // shutdown — either the OpManager has been dropped (the `Detached`
+        // arm) or the shutdown token fired (#4278) — so there is no more work
         // to do. This task is registered with `BackgroundTaskMonitor`; parking
         // on a never-resolving future — rather than returning `Ok(())` — keeps
         // `wait_for_any_exit` from misreading orderly teardown as a fatal
