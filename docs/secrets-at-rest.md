@@ -252,6 +252,8 @@ The secrets tree is owner-only on Unix:
 | `<secrets_dir>/kek_backend` (marker)            | 0o600 |
 | `<secrets_dir>/<delegate>/`                     | 0o700 |
 | `<secrets_dir>/<delegate>/<secret_id>`          | 0o600 |
+| `<secrets_dir>/<delegate>/.keys`                | 0o600 |
+| `<secrets_dir>/<delegate>/users/<user_id>/.keys`| 0o600 |
 | `<secrets_dir>/<delegate>/.snapshots/`          | 0o700 |
 | `<secrets_dir>/<delegate>/.snapshots/<sec>/`    | 0o700 |
 | `<secrets_dir>/<delegate>/.snapshots/<sec>/*`   | 0o600 |
@@ -259,6 +261,40 @@ The secrets tree is owner-only on Unix:
 Modes are set in the same syscall as `O_CREAT` (via
 `OpenOptions::mode`), so there is no race window where a file is
 readable under the process umask.
+
+### Key-enumeration registry: `.keys` (PR #4523 / issue #4355)
+
+Each scope keeps an optional encrypted `.keys` registry that maps its
+stored secrets back to the **raw key bytes** the delegate originally
+supplied to `store_secret`. It backs the `list_secrets` delegate
+hostcall: the durable ReDb index stores only the 32-byte Blake3 hash of
+each key and secret files are hash-named, so without this registry the
+raw key (e.g. an open-ended `room:<owner_vk>` family) is recoverable
+nowhere on disk. One registry lives per scope:
+`<delegate>/.keys` for `Local`, `<delegate>/users/<user_id>/.keys` for
+each `User` scope.
+
+At-rest properties — identical discipline to the secret values it
+describes:
+
+- Encrypted under the **same scope DEK** as that scope's secret values
+  (`Local`: the delegate cipher; `User`: `derive_user_dek`), so no new
+  key material is introduced.
+- Same on-disk layout: `[VERSION_V1][24-byte XChaCha20-Poly1305
+  nonce][AEAD ciphertext + tag]`, with a **fresh per-write nonce** from
+  the OS entropy pool (no nonce reuse across rewrites).
+- Created `0o600` under the owner-only (`0o700`) scope tree, written via
+  the same tmp+fsync+rename atomic discipline (`.keys.tmp` sibling).
+- Bounded at 4096 keys per scope to cap amplification; over-cap keys are
+  still stored and readable as values but are not enumerable.
+
+The registry is **best-effort and independent of the value path**: it is
+written strictly AFTER the durable value+index commit, and a failed or
+unreadable registry only degrades future enumeration — it never blocks
+or loses a secret VALUE. A transient read error or a corrupt/undecryptable
+`.keys` blob is FAIL-SAFE: the on-disk registry is left untouched rather
+than overwritten from empty, so a momentary IO hiccup cannot permanently
+shrink the enumerable key set (it recovers on the next readable write).
 
 ### Defense-in-depth: startup umask (PR follow-up to #4196)
 

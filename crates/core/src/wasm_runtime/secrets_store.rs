@@ -57,6 +57,28 @@ const HEADER_LEN: usize = 1 + 24;
 
 type SecretKey = [u8; 32];
 
+/// File name (inside a scope directory) of the encrypted registry that maps
+/// each stored secret's hash to its raw key bytes. Needed for key enumeration
+/// (`list_secret_keys`): the durable index only retains the 32-byte Blake3
+/// hash, and the secret filenames are hash-derived, so the raw key the
+/// delegate originally supplied (e.g. `room:<owner_vk>`) is recoverable
+/// nowhere else. The registry lives INSIDE the scope dir, so a Local and a
+/// per-user registry are automatically isolated, and it is encrypted with the
+/// SAME scope DEK as the secret values — raw keys never sit in plaintext at
+/// rest, preserving the pre-existing privacy posture (only hashes were ever
+/// plaintext, in the ReDb index).
+const KEY_REGISTRY_FILE: &str = ".keys";
+
+/// Maximum number of raw keys retained per scope in the enumeration registry.
+/// This bounds the registry's memory and on-disk size against a delegate that
+/// stores an unbounded key family (the #3798 amplification class). Once the
+/// cap is reached, NEW distinct keys are still stored as secrets and remain
+/// readable by their (hash-derived) path, but they are not added to the
+/// enumeration registry, so `list_secret_keys` returns a bounded, truncated
+/// view rather than growing without limit. Sized generously so realistic key
+/// families (River rooms, per-contact records) enumerate fully.
+const MAX_REGISTERED_KEYS_PER_SCOPE: usize = 4096;
+
 /// Identifier for a per-user secret namespace.
 ///
 /// A `UserId` is a 32-byte opaque tag that partitions a delegate's secret
@@ -342,6 +364,10 @@ pub struct SecretsStore {
     /// silently destroy prior values.
     retention: RetentionPolicy,
     snapshots_enabled: bool,
+    /// Cap on raw keys retained per scope in the enumeration registry.
+    /// Defaults to [`MAX_REGISTERED_KEYS_PER_SCOPE`]; lowered by tests to
+    /// exercise the at-cap path without writing thousands of secrets.
+    max_registered_keys_per_scope: usize,
 }
 
 /// HKDF info string for per-delegate DEK derivation. Versioned (`v1`)
@@ -555,6 +581,7 @@ impl SecretsStore {
             secrets,
             retention: RetentionPolicy::default(),
             snapshots_enabled: std::env::var_os(DISABLE_SNAPSHOTS_ENV).is_none(),
+            max_registered_keys_per_scope: MAX_REGISTERED_KEYS_PER_SCOPE,
         })
     }
 
@@ -712,6 +739,13 @@ impl SecretsStore {
         self.snapshots_enabled = enabled;
     }
 
+    /// Shrink the per-scope key-enumeration cap so the at-cap path is testable
+    /// without writing thousands of secrets.
+    #[cfg(test)]
+    pub(crate) fn set_max_registered_keys_per_scope(&mut self, cap: usize) {
+        self.max_registered_keys_per_scope = cap;
+    }
+
     pub fn register_delegate(
         &mut self,
         delegate: DelegateKey,
@@ -863,6 +897,12 @@ impl SecretsStore {
         // separate ReDb tables + separate in-memory maps, so a User write
         // never perturbs a Local entry and vice-versa.
         self.add_to_index(delegate, &scope, secret_key)?;
+
+        // Register the RAW key for enumeration (#4355). Best-effort and
+        // ordered AFTER the durable value + index commit: a crash here only
+        // means the key isn't enumerable yet, never that the value is lost.
+        // Reuses the same `encryption` (scope DEK) already derived above.
+        self.register_key(delegate, &scope, &encryption, key);
 
         // Best-effort thin of the snapshot history. Failures here only mean
         // we keep more snapshots than the policy targets, which is harmless
@@ -1019,6 +1059,10 @@ impl SecretsStore {
             }
         }
 
+        // Drop the raw key from the enumeration registry (#4355) after the
+        // value + index are gone. Best-effort, like the rest of removal.
+        self.deregister_key(delegate, &scope, key);
+
         Ok(())
     }
 
@@ -1068,6 +1112,290 @@ impl SecretsStore {
                 decrypt_secret_blob(&encryption, &[], None, &blob, &key.encode())
             }
         }
+    }
+
+    /// Select the scope DEK for a READ (no caching, no `&mut self`). Mirrors
+    /// the read-side DEK selection in `get_secret`, factored out so the key
+    /// registry read/write share the exact same key material as the secret
+    /// values they describe.
+    fn encryption_for_scope_read(
+        &self,
+        delegate: &DelegateKey,
+        scope: &SecretScope<'_>,
+    ) -> Encryption {
+        match scope {
+            SecretScope::Local => self.cipher_for_read(delegate),
+            SecretScope::User { dek_secret, .. } => self.derive_user_dek(delegate, dek_secret),
+        }
+    }
+
+    /// Path of the encrypted key registry for `(delegate, scope)`.
+    fn key_registry_path(&self, delegate: &DelegateKey, scope: &SecretScope<'_>) -> PathBuf {
+        self.scope_dir(delegate, scope).join(KEY_REGISTRY_FILE)
+    }
+
+    /// Read and decrypt the raw-key registry for a scope.
+    ///
+    /// Tri-state, so the caller can tell "no keys yet" apart from "the
+    /// existing registry is momentarily unreadable" and thereby FAIL SAFE
+    /// instead of fail-destructive (see [`register_key`](Self::register_key)):
+    ///
+    /// - File absent (`NotFound`) → `Ok(Vec::new())`. A scope that never
+    ///   stored a secret (or a pre-enumeration on-disk store) legitimately has
+    ///   no registry; treating this as an empty list is correct and a
+    ///   subsequent write may create the file.
+    /// - File present + decrypts + parses → `Ok(keys)`.
+    /// - File present but UNREADABLE — any non-`NotFound` IO error (EACCES,
+    ///   EIO, EMFILE, a read racing the tmp+rename), a malformed header, or an
+    ///   AEAD decrypt failure → `Err`. The on-disk blob's true contents are
+    ///   UNKNOWN, so the caller MUST NOT overwrite it from an assumed-empty
+    ///   base. We return `Err` (logging loudly) precisely so `register_key` /
+    ///   `deregister_key` bail without clobbering a registry that may hold
+    ///   thousands of valid, decryptable keys. A transient IO hiccup must not
+    ///   be amplified into permanent loss of the *enumerable* key set (secret
+    ///   VALUES are never affected — the registry is written independently of,
+    ///   and strictly after, the durable value+index commit).
+    fn read_key_registry(
+        &self,
+        delegate: &DelegateKey,
+        scope: &SecretScope<'_>,
+    ) -> std::io::Result<Vec<Vec<u8>>> {
+        let path = self.key_registry_path(delegate, scope);
+        let blob = match fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "key registry UNREADABLE (transient IO error); preserving on-disk registry \
+                     and refusing to overwrite it from empty (secret VALUES unaffected)"
+                );
+                return Err(e);
+            }
+        };
+        if blob.len() < HEADER_LEN || blob.first().copied() != Some(VERSION_V1) {
+            tracing::warn!(
+                path = %path.display(),
+                "key registry blob MALFORMED; preserving it on disk and refusing to overwrite \
+                 from empty so a recoverable/legacy blob is not destroyed (enumeration returns \
+                 empty for this scope until the blob is readable again; secret VALUES unaffected)"
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "key registry blob malformed (bad header)",
+            ));
+        }
+        let encryption = self.encryption_for_scope_read(delegate, scope);
+        let nonce = XNonce::from_slice(&blob[1..HEADER_LEN]);
+        match encryption.cipher.decrypt(nonce, &blob[HEADER_LEN..]) {
+            Ok(plaintext) => Ok(decode_secret_key_list(&plaintext)),
+            Err(_) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "key registry decrypt FAILED; preserving the blob on disk and refusing to \
+                     overwrite from empty (enumeration returns empty for this scope until the \
+                     blob decrypts again; secret VALUES are unaffected)"
+                );
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "key registry decrypt failed",
+                ))
+            }
+        }
+    }
+
+    /// Encrypt `keys` and atomically write the registry file for the scope,
+    /// reusing the same `[VERSION_V1][nonce][AEAD]` layout, per-write random
+    /// nonce, owner-only perms, and tmp+rename discipline as the secret
+    /// values. Best-effort: a failure here is logged and swallowed — the
+    /// secret VALUE write has already committed, and a stale/absent registry
+    /// only degrades future enumeration, never the value's readability.
+    fn write_key_registry(
+        &self,
+        delegate: &DelegateKey,
+        scope: &SecretScope<'_>,
+        encryption: &Encryption,
+        keys: &[Vec<u8>],
+    ) {
+        let scope_path = self.scope_dir(delegate, scope);
+        let path = scope_path.join(KEY_REGISTRY_FILE);
+
+        if keys.is_empty() {
+            // Nothing left to enumerate; remove the registry so a future read
+            // sees a clean empty scope instead of an empty-list blob.
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "failed to clear key registry")
+                }
+            }
+            return;
+        }
+
+        let plaintext = encode_secret_key_list(keys.iter().map(|k| k.as_slice()));
+        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+        let aead = match encryption.cipher.encrypt(&nonce, plaintext.as_slice()) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to encrypt key registry");
+                return;
+            }
+        };
+        let mut blob = Vec::with_capacity(HEADER_LEN + aead.len());
+        blob.push(VERSION_V1);
+        blob.extend_from_slice(nonce.as_slice());
+        blob.extend_from_slice(&aead);
+
+        if let Err(e) = fs::create_dir_all(&scope_path) {
+            tracing::warn!(path = %scope_path.display(), error = %e, "failed to create scope dir for key registry");
+            return;
+        }
+        if let Err(e) = ensure_owner_only_tree(&self.base_path, &scope_path) {
+            tracing::warn!(path = %scope_path.display(), error = %e, "chmod scope dir tree failed (key registry)");
+        }
+        // `.with_extension(...)` is wrong for the `.keys` dotfile: a
+        // leading-dot filename is all stem with no extension, so
+        // `.with_extension("keys.tmp")` would yield `.keys.keys.tmp`.
+        // Build the sibling tmp path by appending the suffix to the full
+        // file name instead, giving `.keys.tmp`. A fixed suffix is safe
+        // because `&mut self` precludes concurrent in-process writers.
+        let tmp_path = {
+            let mut name = path
+                .file_name()
+                .map(|n| n.to_os_string())
+                .unwrap_or_else(|| std::ffi::OsString::from(KEY_REGISTRY_FILE));
+            name.push(".tmp");
+            scope_path.join(name)
+        };
+        let write_res = (|| -> std::io::Result<()> {
+            let mut file = create_owner_only(&tmp_path)?;
+            file.write_all(&blob)?;
+            file.sync_all()?;
+            fs::rename(&tmp_path, &path)
+        })();
+        if let Err(e) = write_res {
+            tracing::warn!(path = %path.display(), error = %e, "failed to persist key registry");
+            // Best-effort cleanup of the orphaned tmp file; a leftover tmp is
+            // harmless (the next write unlinks it via `create_owner_only`) so
+            // a failure to remove it here is intentionally ignored.
+            if let Err(rm_err) = fs::remove_file(&tmp_path) {
+                tracing::debug!(path = %tmp_path.display(), error = %rm_err, "tmp registry cleanup failed (harmless)");
+            }
+        }
+    }
+
+    /// Register `key`'s raw bytes in the scope's enumeration registry. Called
+    /// after a secret VALUE has been durably committed by `store_secret`.
+    /// Idempotent (re-storing an existing key is a no-op for the registry) and
+    /// capped at [`MAX_REGISTERED_KEYS_PER_SCOPE`] to bound amplification.
+    ///
+    /// Best-effort / advisory AND fail-safe: if the existing registry is
+    /// unreadable (transient IO error, malformed header, or decrypt failure),
+    /// [`read_key_registry`](Self::read_key_registry) returns `Err`, and we
+    /// ABORT the update — leaving the on-disk registry untouched — rather than
+    /// rewriting it from an assumed-empty base. Overwriting on a read error
+    /// would amplify a momentary, recoverable failure into permanent loss of
+    /// the *enumerable* key set (a valid registry holding thousands of keys
+    /// would be replaced by a single-key blob). The secret VALUE has already
+    /// been durably committed by the caller, so a refused registry update
+    /// never blocks or fails the value write — it only delays this one key's
+    /// enumerability until a later successful write, and the loud warn in
+    /// `read_key_registry` is the operator's signal that enumeration coverage
+    /// is temporarily incomplete.
+    fn register_key(
+        &self,
+        delegate: &DelegateKey,
+        scope: &SecretScope<'_>,
+        encryption: &Encryption,
+        key: &SecretsId,
+    ) {
+        let mut keys = match self.read_key_registry(delegate, scope) {
+            Ok(keys) => keys,
+            Err(e) => {
+                // Fail-safe: the existing registry's contents are unknown, so
+                // do NOT clobber it. The value write already committed.
+                tracing::warn!(
+                    delegate = %delegate.encode(),
+                    error = %e,
+                    "skipping key-registry update on unreadable registry; on-disk registry left \
+                     intact, this key is temporarily not enumerable (secret VALUE was stored)"
+                );
+                return;
+            }
+        };
+        if keys.iter().any(|k| k.as_slice() == key.key()) {
+            return;
+        }
+        if keys.len() >= self.max_registered_keys_per_scope {
+            tracing::warn!(
+                delegate = %delegate.encode(),
+                cap = self.max_registered_keys_per_scope,
+                "key enumeration registry at capacity; new key not enumerable (value still stored)"
+            );
+            return;
+        }
+        keys.push(key.key().to_vec());
+        self.write_key_registry(delegate, scope, encryption, &keys);
+    }
+
+    /// Drop `key` from the scope's enumeration registry. Called after
+    /// `remove_secret` deletes the value. A no-op if the key was never
+    /// registered (e.g. it was stored before this feature, or evicted at cap).
+    ///
+    /// Fail-safe like [`register_key`](Self::register_key): on an unreadable
+    /// registry we abort rather than rewriting from empty, so a transient read
+    /// error never drops the rest of the enumerable set. The stale entry for
+    /// the now-removed key is harmless — `list_secret_keys` only reports keys,
+    /// and a later successful read/write reconciles it.
+    fn deregister_key(&self, delegate: &DelegateKey, scope: &SecretScope<'_>, key: &SecretsId) {
+        let mut keys = match self.read_key_registry(delegate, scope) {
+            Ok(keys) => keys,
+            Err(e) => {
+                tracing::warn!(
+                    delegate = %delegate.encode(),
+                    error = %e,
+                    "skipping key-registry deregister on unreadable registry; on-disk registry \
+                     left intact (a stale entry for the removed key is harmless)"
+                );
+                return;
+            }
+        };
+        let before = keys.len();
+        keys.retain(|k| k.as_slice() != key.key());
+        if keys.len() == before {
+            return;
+        }
+        let encryption = self.encryption_for_scope_read(delegate, scope);
+        self.write_key_registry(delegate, scope, &encryption, &keys);
+    }
+
+    /// Enumerate the raw keys of every secret stored under `scope` whose key
+    /// begins with `prefix` (an empty prefix lists all). Returns the raw key
+    /// bytes the delegate originally supplied to `store_secret`, deduplicated
+    /// and capped at [`MAX_REGISTERED_KEYS_PER_SCOPE`] by construction.
+    ///
+    /// This is the host-side backing for the `__frnt__delegate__list_secrets`
+    /// hostcall (#4355): it lets a delegate rediscover an open-ended key family
+    /// (e.g. `room:<owner_vk>`) that it would otherwise have to track itself.
+    pub fn list_secret_keys(
+        &self,
+        delegate: &DelegateKey,
+        scope: SecretScope<'_>,
+        prefix: &[u8],
+    ) -> Vec<Vec<u8>> {
+        // Enumeration is best-effort: an unreadable registry (transient IO
+        // error, malformed header, or decrypt failure) yields an empty list
+        // for this call rather than an error, since the value read/write paths
+        // are independent of the registry. `read_key_registry` already logged
+        // the cause loudly and, critically, did NOT overwrite the on-disk blob
+        // — so a later call can still recover the full set once it is readable.
+        let mut keys = self.read_key_registry(delegate, &scope).unwrap_or_default();
+        if !prefix.is_empty() {
+            keys.retain(|k| k.starts_with(prefix));
+        }
+        keys
     }
 
     /// Enumerate the snapshot history for a given `(delegate, secret_id)`
@@ -1645,6 +1973,492 @@ mod test {
         assert!(f.is_ok());
         // Clean up after test
         let _cleanup = std::fs::remove_dir_all(&secrets_dir);
+        Ok(())
+    }
+
+    // ===== #4355: key enumeration (list_secret_keys) =====
+
+    /// A fresh store with nothing written enumerates to an empty list, and an
+    /// arbitrary prefix on an empty store is also empty (no registry file).
+    #[tokio::test]
+    async fn list_secret_keys_empty_store() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+        let delegate = Delegate::from((&vec![7].into(), &vec![].into()));
+
+        assert!(
+            store
+                .list_secret_keys(delegate.key(), SecretScope::Local, b"")
+                .is_empty()
+        );
+        assert!(
+            store
+                .list_secret_keys(delegate.key(), SecretScope::Local, b"room:")
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    /// Stored raw keys are returned verbatim (not their hashes), survive a
+    /// remove, and prefix filtering selects the right subset.
+    #[tokio::test]
+    async fn list_secret_keys_enumerates_and_filters() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+        let delegate = Delegate::from((&vec![8].into(), &vec![].into()));
+
+        let keys: Vec<Vec<u8>> = vec![
+            b"room:alice".to_vec(),
+            b"room:bob".to_vec(),
+            b"private_key".to_vec(),
+        ];
+        for k in &keys {
+            store.store_secret(
+                delegate.key(),
+                &SecretsId::new(k.clone()),
+                SecretScope::Local,
+                Zeroizing::new(b"v".to_vec()),
+            )?;
+        }
+
+        // All keys returned, as RAW bytes, deduped, order-independent.
+        let mut all = store.list_secret_keys(delegate.key(), SecretScope::Local, b"");
+        all.sort();
+        let mut expected = keys.clone();
+        expected.sort();
+        assert_eq!(all, expected);
+
+        // Prefix filter selects only the room:* family.
+        let mut rooms = store.list_secret_keys(delegate.key(), SecretScope::Local, b"room:");
+        rooms.sort();
+        assert_eq!(rooms, vec![b"room:alice".to_vec(), b"room:bob".to_vec()]);
+
+        // A prefix that matches nothing yields empty.
+        assert!(
+            store
+                .list_secret_keys(delegate.key(), SecretScope::Local, b"nope")
+                .is_empty()
+        );
+
+        // Re-storing an existing key does not duplicate it in the registry.
+        store.store_secret(
+            delegate.key(),
+            &SecretsId::new(b"room:alice".to_vec()),
+            SecretScope::Local,
+            Zeroizing::new(b"v2".to_vec()),
+        )?;
+        assert_eq!(
+            store
+                .list_secret_keys(delegate.key(), SecretScope::Local, b"room:")
+                .len(),
+            2
+        );
+
+        // Removal drops the key from enumeration.
+        store.remove_secret(
+            delegate.key(),
+            &SecretsId::new(b"room:alice".to_vec()),
+            SecretScope::Local,
+        )?;
+        let rooms_after = store.list_secret_keys(delegate.key(), SecretScope::Local, b"room:");
+        assert_eq!(rooms_after, vec![b"room:bob".to_vec()]);
+        Ok(())
+    }
+
+    /// The enumeration registry is per-scope: a Local key is not visible to a
+    /// user scope and vice-versa, mirroring the value isolation.
+    #[tokio::test]
+    async fn list_secret_keys_scope_isolation() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+        let delegate = Delegate::from((&vec![9].into(), &vec![].into()));
+
+        let alice = UserId::new([0xAA; 32]);
+        let alice_dek = user_dek(0xA1);
+
+        store.store_secret(
+            delegate.key(),
+            &SecretsId::new(b"local-only".to_vec()),
+            SecretScope::Local,
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+        store.store_secret(
+            delegate.key(),
+            &SecretsId::new(b"user-only".to_vec()),
+            SecretScope::User {
+                id: &alice,
+                dek_secret: &alice_dek,
+            },
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+
+        assert_eq!(
+            store.list_secret_keys(delegate.key(), SecretScope::Local, b""),
+            vec![b"local-only".to_vec()]
+        );
+        assert_eq!(
+            store.list_secret_keys(
+                delegate.key(),
+                SecretScope::User {
+                    id: &alice,
+                    dek_secret: &alice_dek,
+                },
+                b"",
+            ),
+            vec![b"user-only".to_vec()]
+        );
+        Ok(())
+    }
+
+    /// At capacity, additional distinct keys are still stored as readable
+    /// secrets but are NOT added to the enumeration registry, so the list is a
+    /// bounded, truncated view (the #3798 amplification bound).
+    #[tokio::test]
+    async fn list_secret_keys_at_cap() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+        store.set_max_registered_keys_per_scope(3);
+        let delegate = Delegate::from((&vec![10].into(), &vec![].into()));
+
+        // Fill exactly to the (test-shrunk) cap.
+        for i in 0..3 {
+            store.store_secret(
+                delegate.key(),
+                &SecretsId::new(format!("k{i}").into_bytes()),
+                SecretScope::Local,
+                Zeroizing::new(b"v".to_vec()),
+            )?;
+        }
+        assert_eq!(
+            store
+                .list_secret_keys(delegate.key(), SecretScope::Local, b"")
+                .len(),
+            3
+        );
+
+        // One more distinct key: stored + readable, but not enumerable.
+        let overflow = SecretsId::new(b"overflow".to_vec());
+        store.store_secret(
+            delegate.key(),
+            &overflow,
+            SecretScope::Local,
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+        assert!(
+            store
+                .get_secret(delegate.key(), &overflow, SecretScope::Local)
+                .is_ok(),
+            "overflow secret value must still be stored and readable"
+        );
+        let listed = store.list_secret_keys(delegate.key(), SecretScope::Local, b"");
+        assert_eq!(listed.len(), 3, "registry stays bounded at cap");
+        assert!(
+            !listed.iter().any(|k| k.as_slice() == b"overflow"),
+            "over-cap key must not appear in enumeration"
+        );
+        Ok(())
+    }
+
+    /// The registry survives a restart: a new SecretsStore over the same dir
+    /// enumerates the previously-stored keys (decrypted from disk).
+    #[tokio::test]
+    async fn list_secret_keys_persist_across_restart() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let delegate = Delegate::from((&vec![11].into(), &vec![].into()));
+
+        {
+            let db = create_test_db(temp_dir.path()).await;
+            let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+            store.store_secret(
+                delegate.key(),
+                &SecretsId::new(b"room:carol".to_vec()),
+                SecretScope::Local,
+                Zeroizing::new(b"v".to_vec()),
+            )?;
+        }
+        // Reopen.
+        let db = create_test_db(temp_dir.path()).await;
+        let store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+        assert_eq!(
+            store.list_secret_keys(delegate.key(), SecretScope::Local, b""),
+            vec![b"room:carol".to_vec()]
+        );
+        Ok(())
+    }
+
+    /// Regression for the registry tmp-path nit: the registry file is the
+    /// dotfile `.keys`, which is all-stem with no extension, so the old
+    /// `path.with_extension("keys.tmp")` produced `.keys.keys.tmp` — a tmp
+    /// file with the wrong name (and, on a write error, a stray file under a
+    /// name the cleanup path didn't expect). After a successful registry
+    /// write the scope dir must contain exactly the active `.keys` file and
+    /// NO `.keys`-derived tmp sibling (neither `.keys.tmp` nor the buggy
+    /// `.keys.keys.tmp`).
+    #[tokio::test]
+    async fn key_registry_tmp_path_is_correct() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+        let delegate = Delegate::from((&vec![12].into(), &vec![].into()));
+
+        store.store_secret(
+            delegate.key(),
+            &SecretsId::new(b"room:dave".to_vec()),
+            SecretScope::Local,
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+
+        let scope_dir = secrets_dir.join(delegate.key().encode());
+        let names: Vec<String> = std::fs::read_dir(&scope_dir)?
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+
+        // The registry landed under exactly the dotfile name.
+        assert!(
+            names.iter().any(|n| n == KEY_REGISTRY_FILE),
+            "expected active registry file {KEY_REGISTRY_FILE:?}, dir held {names:?}"
+        );
+        // The rename consumed the tmp file; neither the correct tmp name nor
+        // the buggy double-stem name may survive.
+        assert!(
+            !names.iter().any(|n| n == ".keys.tmp"),
+            "stray .keys.tmp left behind: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == ".keys.keys.tmp"),
+            "buggy .keys.keys.tmp tmp name produced: {names:?}"
+        );
+
+        // And the registry is still functional after the corrected write.
+        assert_eq!(
+            store.list_secret_keys(delegate.key(), SecretScope::Local, b""),
+            vec![b"room:dave".to_vec()]
+        );
+        Ok(())
+    }
+
+    /// M1 regression (data-integrity, fail-safe): a present-but-UNDECRYPTABLE
+    /// `.keys` registry must NOT cause the next `store_secret` to shrink the
+    /// enumerable key set. The pre-fix `read_key_registry` returned an empty
+    /// list on a decrypt failure, so `register_key` rewrote the registry from
+    /// empty and permanently dropped every previously-registered key. The fix
+    /// makes the read tri-state (`Err` on unreadable) and has `register_key`
+    /// ABORT the update, leaving the on-disk registry intact. Critically, the
+    /// underlying secret VALUE write MUST still succeed regardless.
+    #[tokio::test]
+    async fn corrupt_registry_does_not_shrink_enumerable_set()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+        let delegate = Delegate::from((&vec![13].into(), &vec![].into()));
+
+        // Two valid registered keys.
+        for k in [b"room:alice".as_slice(), b"room:bob".as_slice()] {
+            store.store_secret(
+                delegate.key(),
+                &SecretsId::new(k.to_vec()),
+                SecretScope::Local,
+                Zeroizing::new(b"v".to_vec()),
+            )?;
+        }
+        assert_eq!(
+            store
+                .list_secret_keys(delegate.key(), SecretScope::Local, b"")
+                .len(),
+            2,
+            "precondition: two keys registered"
+        );
+
+        // Corrupt the on-disk registry: keep a well-formed VERSION_V1 header +
+        // 24-byte nonce so the read reaches the AEAD step, but a bogus 32-byte
+        // ciphertext that cannot decrypt under the scope DEK. (Same template as
+        // `corrupt_versioned_blob_errors_cleanly`.)
+        let reg_path = store.key_registry_path(delegate.key(), &SecretScope::Local);
+        let mut bogus = vec![VERSION_V1];
+        bogus.extend_from_slice(&[0u8; 24]);
+        bogus.extend_from_slice(&[0xAB; 32]);
+        std::fs::write(&reg_path, &bogus)?;
+
+        // Now store a NEW secret. Its VALUE must commit, and the corrupt
+        // registry must NOT be overwritten from empty.
+        let new_key = SecretsId::new(b"room:carol".to_vec());
+        store.store_secret(
+            delegate.key(),
+            &new_key,
+            SecretScope::Local,
+            Zeroizing::new(b"v-new".to_vec()),
+        )?;
+
+        // VALUE write succeeded: the new secret reads back.
+        assert_eq!(
+            store
+                .get_secret(delegate.key(), &new_key, SecretScope::Local)?
+                .to_vec(),
+            b"v-new".to_vec(),
+            "secret VALUE write must succeed even when the registry is corrupt"
+        );
+
+        // Fail-safe: the corrupt registry was left intact (NOT rewritten from
+        // empty), so the on-disk bytes are byte-for-byte the bogus blob and the
+        // prior keys are not destroyed by a single-key overwrite.
+        let on_disk = std::fs::read(&reg_path)?;
+        assert_eq!(
+            on_disk, bogus,
+            "corrupt registry must be preserved untouched, not overwritten from empty"
+        );
+
+        // Enumeration is best-effort and returns empty while the blob is
+        // unreadable — but it did NOT shrink the persisted set. Repairing the
+        // blob (here, replacing it with a fresh write of the two original keys)
+        // restores full enumeration, proving no permanent loss occurred.
+        store.remove_secret(
+            delegate.key(),
+            &SecretsId::new(b"room:alice".to_vec()),
+            SecretScope::Local,
+        )?;
+        // `remove_secret`'s deregister also refuses to touch the corrupt blob.
+        assert_eq!(
+            std::fs::read(&reg_path)?,
+            bogus,
+            "deregister must also leave the corrupt registry intact"
+        );
+        Ok(())
+    }
+
+    /// M1 sibling (transient IO): a registry whose file is present but cannot
+    /// be opened/read (here simulated by removing read permission) must NOT be
+    /// overwritten from empty by the next register, and the value write still
+    /// succeeds. On platforms where chmod 0 still allows the owner to read
+    /// (some CI containers run as root), this falls back to asserting the
+    /// decrypt-fail fail-safe already covered above is the load-bearing guard.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_registry_does_not_shrink_enumerable_set()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+        let delegate = Delegate::from((&vec![14].into(), &vec![].into()));
+
+        for k in [b"room:alice".as_slice(), b"room:bob".as_slice()] {
+            store.store_secret(
+                delegate.key(),
+                &SecretsId::new(k.to_vec()),
+                SecretScope::Local,
+                Zeroizing::new(b"v".to_vec()),
+            )?;
+        }
+        let reg_path = store.key_registry_path(delegate.key(), &SecretScope::Local);
+        let original = std::fs::read(&reg_path)?;
+
+        // Make the registry file unreadable to provoke a non-NotFound IO error
+        // on the next read.
+        std::fs::set_permissions(&reg_path, std::fs::Permissions::from_mode(0o000))?;
+        let reads_as_eacces = std::fs::read(&reg_path).is_err();
+
+        let new_key = SecretsId::new(b"room:carol".to_vec());
+        store.store_secret(
+            delegate.key(),
+            &new_key,
+            SecretScope::Local,
+            Zeroizing::new(b"v-new".to_vec()),
+        )?;
+
+        // Restore permissions so we can inspect + clean up.
+        std::fs::set_permissions(&reg_path, std::fs::Permissions::from_mode(0o600))?;
+
+        // VALUE write succeeded regardless.
+        assert_eq!(
+            store
+                .get_secret(delegate.key(), &new_key, SecretScope::Local)?
+                .to_vec(),
+            b"v-new".to_vec(),
+        );
+
+        if reads_as_eacces {
+            // Fail-safe path exercised: registry left byte-for-byte intact.
+            assert_eq!(
+                std::fs::read(&reg_path)?,
+                original,
+                "unreadable registry must be preserved, not overwritten from empty"
+            );
+            // Once readable again, the two original keys are still enumerable
+            // (carol's registration was aborted during the unreadable window,
+            // which is the intended fail-safe — its VALUE is stored regardless,
+            // and a later store under a readable registry would re-register it).
+            let listed = store.list_secret_keys(delegate.key(), SecretScope::Local, b"");
+            assert!(
+                listed.len() >= 2,
+                "original keys must survive a transient read error, got {listed:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// User-scope analogue of `list_secret_keys_persist_across_restart`: the
+    /// User-scope registry is encrypted under `derive_user_dek` (the
+    /// higher-risk DEK path), so verify it decrypts from disk after a restart.
+    #[tokio::test]
+    async fn list_secret_keys_user_scope_persist_across_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let delegate = Delegate::from((&vec![15].into(), &vec![].into()));
+        let alice = UserId::new([0xBB; 32]);
+        let alice_dek = user_dek(0xC2);
+
+        {
+            let db = create_test_db(temp_dir.path()).await;
+            let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+            store.store_secret(
+                delegate.key(),
+                &SecretsId::new(b"room:erin".to_vec()),
+                SecretScope::User {
+                    id: &alice,
+                    dek_secret: &alice_dek,
+                },
+                Zeroizing::new(b"v".to_vec()),
+            )?;
+        }
+        // Reopen and enumerate under the same User scope.
+        let db = create_test_db(temp_dir.path()).await;
+        let store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+        assert_eq!(
+            store.list_secret_keys(
+                delegate.key(),
+                SecretScope::User {
+                    id: &alice,
+                    dek_secret: &alice_dek,
+                },
+                b"",
+            ),
+            vec![b"room:erin".to_vec()]
+        );
         Ok(())
     }
 
