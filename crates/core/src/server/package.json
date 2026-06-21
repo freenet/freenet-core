@@ -3,6 +3,9 @@
   "version": "0.0.0",
   "private": true,
   "description": "Prettier/ESLint tooling for the server's extracted JS/CSS/HTML assets (issue #4017). The assets are served from Rust via include_str!; this package only lints/formats them.",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "lint": "npm run lint:prettier && npm run lint:eslint",
     "lint:prettier": "prettier --check \"**/assets/**/*.{js,css,html}\"",
