@@ -53,7 +53,9 @@ pub(crate) use network_bridge::{
 };
 // Re-export the UPDATE-broadcast stream-assembly telemetry global (#4440) so the
 // `Ring` snapshot task can read it (the broadcast queue lives behind the private
-// `network_bridge` module). Mirrors `crate::wasm_runtime::MODULE_CACHE_METRICS`.
+// `network_bridge` module). Mirrors `crate::transport::metrics::TRANSPORT_METRICS`.
+// (The module-cache metrics were a sibling process-global until #4488 made them
+// a per-node `Arc`.)
 pub(crate) use network_bridge::broadcast_queue::BROADCAST_STREAM_METRICS;
 #[cfg(test)]
 pub(crate) use network_bridge::{EventLoopNotificationsReceiver, event_loop_notification_channel};
@@ -1837,7 +1839,11 @@ where
             // subscribes/GETs are never gated here. The hint is dropped silently
             // and the holder re-proposes it on its next migration trigger once
             // headroom returns.
-            let contract_cache_occupancy = crate::wasm_runtime::contract_cache_occupancy_pct();
+            // Read the per-node module-cache occupancy off the same `Ring` the
+            // caches publish into (a process-global until #4488).
+            let contract_cache_occupancy = crate::wasm_runtime::contract_cache_occupancy_pct(
+                &op_manager.ring.module_cache_metrics(),
+            );
             if !migration_admission_allowed(contract_cache_occupancy) {
                 tracing::debug!(
                     key = %hint.key,

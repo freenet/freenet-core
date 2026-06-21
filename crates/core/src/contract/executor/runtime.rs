@@ -978,19 +978,32 @@ mod executor_pin_tests {
             .split("pub async fn new(")
             .nth(1)
             .expect("RuntimePool::new must exist")
+            // Take the first chunk of the function body. Whitespace is collapsed
+            // so the assertions below survive line-wrapping / reformatting of the
+            // (now multi-line, metrics-threaded) cache construction.
             .split("\n    ")
-            .take(60)
-            .collect::<String>();
+            .take(80)
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
             body.contains("config.module_cache_budget_bytes"),
             "RuntimePool::new must size caches from config.module_cache_budget_bytes"
         );
+        // The contract cache is built from `contract_cache_budget` with the
+        // "contract" label; the delegate cache from `delegate_cache_budget` with
+        // the "delegate" label. We assert each piece independently (rather than a
+        // single literal call string) so threading the metrics `Arc` through
+        // `with_label` (#4488) doesn't make this pin brittle.
         assert!(
-            body.contains("ModuleCache::with_label(contract_cache_budget, \"contract\")"),
+            body.contains("ModuleCache::with_label( contract_cache_budget, \"contract\"")
+                || body.contains("ModuleCache::with_label(contract_cache_budget, \"contract\""),
             "RuntimePool::new must build the contract cache from the contract byte budget"
         );
         assert!(
-            body.contains("ModuleCache::with_label(delegate_cache_budget, \"delegate\")"),
+            body.contains("ModuleCache::with_label( delegate_cache_budget, \"delegate\"")
+                || body.contains("ModuleCache::with_label(delegate_cache_budget, \"delegate\""),
             "RuntimePool::new must build the delegate cache from its own (smaller) budget"
         );
         assert!(

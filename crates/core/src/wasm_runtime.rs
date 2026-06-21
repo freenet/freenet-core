@@ -26,7 +26,7 @@ pub(crate) use error::{ContractError, RuntimeInnerError, RuntimeResult};
 pub use mock_state_storage::MockStateStorage;
 pub use module_cache::default_module_cache_budget_bytes;
 pub(crate) use module_cache::{
-    DELEGATE_MODULE_CACHE_BUDGET_DIVISOR, MODULE_CACHE_METRICS, ModuleCache,
+    DELEGATE_MODULE_CACHE_BUDGET_DIVISOR, ModuleCache, ModuleCacheMetrics,
     contract_cache_occupancy_pct,
 };
 // Clamp bounds are referenced only by the config-default round-trip test, which

@@ -148,12 +148,24 @@ impl RuntimePool {
         let delegate_cache_budget = (contract_cache_budget
             / crate::wasm_runtime::DELEGATE_MODULE_CACHE_BUDGET_DIVISOR)
             .max(1);
-        let shared_contract_modules: SharedModuleCache<ContractKey> = Arc::new(Mutex::new(
-            ModuleCache::with_label(contract_cache_budget, "contract"),
-        ));
-        let shared_delegate_modules: SharedModuleCache<DelegateKey> = Arc::new(Mutex::new(
-            ModuleCache::with_label(delegate_cache_budget, "delegate"),
-        ));
+        // Per-node telemetry sink shared with the `Ring` snapshot task (#4440 /
+        // #4488). The caches publish occupancy/eviction into it; the snapshot
+        // task reads the same `Arc` via `Ring`. Threading it (rather than a
+        // process-global) keeps the gauges per-node. Both caches share one sink;
+        // they're routed apart by their `"contract"` / `"delegate"` label.
+        let module_cache_metrics = op_manager.ring.module_cache_metrics();
+        let shared_contract_modules: SharedModuleCache<ContractKey> =
+            Arc::new(Mutex::new(ModuleCache::with_label(
+                contract_cache_budget,
+                "contract",
+                Some(module_cache_metrics.clone()),
+            )));
+        let shared_delegate_modules: SharedModuleCache<DelegateKey> =
+            Arc::new(Mutex::new(ModuleCache::with_label(
+                delegate_cache_budget,
+                "delegate",
+                Some(module_cache_metrics),
+            )));
         // Shared delegate-context cache so a prompt round-trip routed to a
         // different pool executor still finds its `ctx.write()` blob.
         let shared_delegate_contexts = crate::wasm_runtime::new_delegate_context_cache();

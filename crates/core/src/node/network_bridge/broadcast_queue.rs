@@ -47,10 +47,11 @@ const STREAM_COMPLETION_TIMEOUT: Duration = Duration::from_secs(120);
 ///
 /// These broadcast tasks are spawned per (contract, peer) from the global
 /// `BroadcastQueue` worker, unreachable from the `Ring` telemetry-snapshot task
-/// that emits `router_snapshot`. Like [`MODULE_CACHE_METRICS`] /
-/// [`TRANSPORT_METRICS`], the failure site therefore *publishes* into this
-/// process-global and the snapshot task *reads* it on the existing ~5-minute
-/// cadence — no per-failure event is emitted.
+/// that emits `router_snapshot`. Like [`TRANSPORT_METRICS`], the failure site
+/// therefore *publishes* into this process-global and the snapshot task *reads*
+/// it on the existing ~5-minute cadence — no per-failure event is emitted. (The
+/// analogous module-cache telemetry was likewise a process-global until #4488
+/// threaded it as a per-node `Arc`; this static still mirrors `TRANSPORT_METRICS`.)
 ///
 /// Both counters are monotonic; the snapshot task differences them across the
 /// cadence to derive a per-window failure rate (see
@@ -58,10 +59,9 @@ const STREAM_COMPLETION_TIMEOUT: Duration = Duration::from_secs(120);
 ///
 /// Per-node meaning holds only in single-node-per-process production. In a
 /// multi-node simulation every node shares this process-global, so the snapshot
-/// reads the aggregate across all in-process nodes (same caveat as
-/// [`MODULE_CACHE_METRICS`]).
+/// reads the aggregate across all in-process nodes (the same caveat that drove
+/// #4488 for the module-cache metrics).
 ///
-/// [`MODULE_CACHE_METRICS`]: crate::wasm_runtime::MODULE_CACHE_METRICS
 /// [`TRANSPORT_METRICS`]: crate::transport::metrics::TRANSPORT_METRICS
 pub(crate) static BROADCAST_STREAM_METRICS: BroadcastStreamMetrics = BroadcastStreamMetrics::new();
 
