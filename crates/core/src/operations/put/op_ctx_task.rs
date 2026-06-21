@@ -1705,6 +1705,7 @@ fn put_store_priority(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn relay_put_store_locally(
     op_manager: &Arc<OpManager>,
     incoming_tx: Transaction,
