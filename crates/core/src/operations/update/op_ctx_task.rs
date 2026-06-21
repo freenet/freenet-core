@@ -253,7 +253,14 @@ async fn drive_client_update(
                 summary,
                 changed,
                 ..
-            } = match super::update_contract(op_manager, key, update_data, related_contracts).await
+            } = match super::update_contract(
+                op_manager,
+                key,
+                update_data,
+                related_contracts,
+                crate::contract::Priority::ClientLocal,
+            )
+            .await
             {
                 Ok(execution) => execution,
                 Err(err) if err.is_missing_contract_parameters() => {
@@ -333,6 +340,7 @@ async fn drive_client_update(
                 key,
                 update_data.clone(),
                 related_contracts.clone(),
+                crate::contract::Priority::ClientLocal,
             )
             .await;
 
@@ -864,6 +872,7 @@ async fn drive_relay_request_update(
             key,
             UpdateData::State(State::from(value.clone())),
             related_contracts.clone(),
+            crate::contract::Priority::NetworkRelay,
         )
         .await?;
 
@@ -1098,8 +1107,14 @@ async fn drive_relay_broadcast_to(
     }
 
     // ── Step 4: apply broadcast via WASM merge ────────────────────────────
-    let update_result =
-        super::update_contract(op_manager, key, update_data, RelatedContracts::default()).await;
+    let update_result = super::update_contract(
+        op_manager,
+        key,
+        update_data,
+        RelatedContracts::default(),
+        crate::contract::Priority::NetworkRelay,
+    )
+    .await;
 
     let UpdateExecution {
         value: updated_value,
@@ -1616,6 +1631,7 @@ async fn drive_relay_request_update_streaming(
         key,
         UpdateData::State(State::from(value.clone())),
         related_contracts,
+        crate::contract::Priority::NetworkRelay,
     )
     .await?;
 
@@ -1814,6 +1830,7 @@ async fn drive_relay_broadcast_to_streaming(
         key,
         UpdateData::State(State::from(state_bytes.clone())),
         RelatedContracts::default(),
+        crate::contract::Priority::NetworkRelay,
     )
     .await;
 

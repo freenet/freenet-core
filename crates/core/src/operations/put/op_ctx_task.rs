@@ -1150,6 +1150,10 @@ where
     );
 
     // ── Step 1: Store contract locally (all nodes cache) ────────────────────
+    // Originator-loopback (a local client's own PUT, mapped to
+    // upstream_addr=own_addr in dispatch) is ClientLocal so it lands in the
+    // reserved fair-queue lane; a genuine relay store stays NetworkRelay (#4534).
+    let store_priority = put_store_priority(op_manager, upstream_addr);
     let merged_value = relay_put_store_locally(
         op_manager,
         incoming_tx,
@@ -1158,6 +1162,7 @@ where
         &contract,
         related_contracts.clone(),
         htl,
+        store_priority,
     )
     .await?;
 
@@ -1683,6 +1688,23 @@ where
 /// This helper is **relay-only** — it never sets
 /// `mark_local_client_access` (that's originator-side). Errors emit a
 /// `put_failure` telemetry event and propagate.
+/// Fair-queue priority for a relay PUT's local store (#4534).
+///
+/// A local client's own PUT enters the relay driver via originator-loopback,
+/// which dispatch maps to `upstream_addr = own_addr` (see operations.md). That
+/// case is `ClientLocal` so the store uses the reserved admission lane; any
+/// genuine upstream peer is `NetworkRelay`. If our own address is unknown we
+/// fail safe to `NetworkRelay` (never over-prioritize an ambiguous store).
+fn put_store_priority(
+    op_manager: &Arc<OpManager>,
+    upstream_addr: SocketAddr,
+) -> crate::contract::Priority {
+    match op_manager.ring.connection_manager.get_own_addr() {
+        Some(own) if own == upstream_addr => crate::contract::Priority::ClientLocal,
+        _ => crate::contract::Priority::NetworkRelay,
+    }
+}
+
 async fn relay_put_store_locally(
     op_manager: &Arc<OpManager>,
     incoming_tx: Transaction,
@@ -1691,6 +1713,7 @@ async fn relay_put_store_locally(
     contract: &ContractContainer,
     related_contracts: RelatedContracts<'static>,
     htl: usize,
+    priority: crate::contract::Priority,
 ) -> Result<WrappedState, OpError> {
     let was_hosting = op_manager.ring.is_hosting_contract(&key);
     let (merged_value, _state_changed) = match super::put_contract(
@@ -1699,6 +1722,7 @@ async fn relay_put_store_locally(
         value.clone(),
         related_contracts,
         contract,
+        priority,
     )
     .await
     {
@@ -2574,6 +2598,8 @@ where
     // forward (#4509) before the store consumes `related_contracts`.
     let replicate_payload =
         terminus_replicate_to.map(|addr| (addr, contract.clone(), related_contracts.clone()));
+    // Originator-loopback client PUT → ClientLocal reserved lane (#4534).
+    let store_priority = put_store_priority(op_manager, upstream_addr);
     let merged_value = relay_put_store_locally(
         op_manager,
         incoming_tx,
@@ -2582,6 +2608,7 @@ where
         &contract,
         related_contracts,
         htl,
+        store_priority,
     )
     .await?;
 

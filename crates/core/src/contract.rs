@@ -1533,22 +1533,22 @@ where
     })
 }
 
-/// When the fair queue rejects an `EvictContract` event (queue-full),
-/// the hosting-cache entry is already gone — no later sweep would
-/// re-emit on its own. Record the key in the pending-reclamation retry
-/// queue so the periodic sweep retries via `reclaim_evicted_contract`.
-///
-/// This closes disk-leak edge case #1 in PR #4212 review round 7
-/// (other variants are no-ops here — they have their own error paths).
 /// Push an event into the fair queue, shedding queued `Background` work to make
-/// room when a higher-priority (foreground) event would otherwise be rejected
-/// (#4534).
+/// room when a higher-priority (foreground) event is rejected *for lack of
+/// global capacity* (#4534).
 ///
-/// A `ClientLocal`/`NetworkRelay` event that hits the soft admission cap first
-/// triggers [`FairEventQueue::evict_background`]; the evicted background events
-/// get best-effort queue-full responses (they re-emit on their next cycle), and
-/// the foreground event is retried once. If it still cannot be admitted (or it
-/// was itself `Background`), it gets the normal queue-full response.
+/// Eviction is attempted ONLY when ALL of:
+/// - the rejected event is foreground (`> Background`), and
+/// - the rejection reason is [`RejectReason::GlobalCapacity`] — a
+///   [`RejectReason::PerContract`] rejection cannot be helped by evicting
+///   Background (a different tier/contract), so we skip the wasted shed and the
+///   identical-failure retry (review of #4534), and
+/// - there is queued `Background` to shed.
+///
+/// The evicted background events get best-effort queue-full responses (they
+/// re-emit on their next cycle), then the foreground event is retried once. If
+/// it still cannot be admitted (or eviction did not apply), it gets the normal
+/// queue-full response.
 async fn push_with_background_eviction<CH>(
     contract_handler: &mut CH,
     fair_queue: &mut fair_queue::FairEventQueue,
@@ -1563,9 +1563,11 @@ async fn push_with_background_eviction<CH>(
         Err(rejected) => rejected,
     };
 
-    // Only foreground work earns an eviction attempt; a rejected Background
-    // event is simply shed (it must not displace other Background work).
-    if priority > fair_queue::Priority::Background && fair_queue.background_queued() > 0 {
+    let eviction_can_help = priority > fair_queue::Priority::Background
+        && rejected.reason == fair_queue::RejectReason::GlobalCapacity
+        && fair_queue.background_queued() > 0;
+
+    if eviction_can_help {
         // Reclaim at most the reserve's worth of slots in one shot — enough to
         // admit a burst of client work without unbounded eviction churn.
         let evicted = fair_queue.evict_background(fair_queue::CLIENT_LOCAL_RESERVE);
@@ -1588,6 +1590,13 @@ async fn push_with_background_eviction<CH>(
     send_queue_full_response(contract_handler.channel(), rejected).await;
 }
 
+/// When the fair queue rejects an `EvictContract` event (queue-full),
+/// the hosting-cache entry is already gone — no later sweep would
+/// re-emit on its own. Record the key in the pending-reclamation retry
+/// queue so the periodic sweep retries via `reclaim_evicted_contract`.
+///
+/// This closes disk-leak edge case #1 in PR #4212 review round 7
+/// (other variants are no-ops here — they have their own error paths).
 fn track_pending_reclamation_if_evict<CH>(
     contract_handler: &mut CH,
     rejected: &fair_queue::RejectedEvent,
@@ -2640,6 +2649,7 @@ mod tests {
             id,
             event: received_event,
             priority,
+            reason: fair_queue::RejectReason::GlobalCapacity,
         });
 
         (rejected, handle)

@@ -180,6 +180,7 @@ pub(super) async fn put_contract(
     state: WrappedState,
     related_contracts: RelatedContracts<'static>,
     contract: &ContractContainer,
+    priority: crate::contract::Priority,
 ) -> Result<(WrappedState, bool), OpError> {
     // Reject debug-compiled contracts before storing (#2257). This is the
     // shared storage chokepoint for the network/relay PUT path
@@ -201,12 +202,15 @@ pub(super) async fn put_contract(
     }
 
     match op_manager
-        .notify_contract_handler(ContractHandlerEvent::PutQuery {
-            key,
-            state,
-            related_contracts,
-            contract: Some(contract.clone()),
-        })
+        .notify_contract_handler_prioritized(
+            ContractHandlerEvent::PutQuery {
+                key,
+                state,
+                related_contracts,
+                contract: Some(contract.clone()),
+            },
+            priority,
+        )
         .await
     {
         Ok(ContractHandlerEvent::PutResponse {

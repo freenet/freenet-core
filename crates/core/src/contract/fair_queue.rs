@@ -104,6 +104,24 @@ enum QueueKey {
     Default,
 }
 
+/// Why an event was refused admission. Lets the caller decide whether shedding
+/// `Background` could help: it can only free space for a *global-capacity*
+/// rejection, never a *per-contract* one (#4534 review).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum RejectReason {
+    /// The hard `MAX_TOTAL_FAIR_QUEUE` cap, or the soft
+    /// `MAX_TOTAL_FAIR_QUEUE - CLIENT_LOCAL_RESERVE` cap for a sub-`ClientLocal`
+    /// class. Evicting `Background` can free a slot and let a retry succeed.
+    GlobalCapacity,
+    /// This event's own per-contract-per-tier queue is at
+    /// `MAX_QUEUED_PER_CONTRACT`. Evicting `Background` (a different tier and/or
+    /// contract) cannot help; a retry would fail identically.
+    PerContract,
+    /// An event evicted from the queue (not an admission failure). Carried so a
+    /// shed `Background` event flows through the same response path.
+    Evicted,
+}
+
 /// An event that was rejected (admission refused) or evicted (dropped after
 /// being queued) to protect higher-priority capacity.
 pub(super) struct RejectedEvent {
@@ -113,6 +131,8 @@ pub(super) struct RejectedEvent {
     /// shed tier and decide whether a client-facing error is warranted
     /// (`Background` sheds are silent best-effort drops).
     pub priority: Priority,
+    /// Why this event was rejected (or that it was evicted).
+    pub reason: RejectReason,
 }
 
 impl std::fmt::Debug for RejectedEvent {
@@ -121,6 +141,7 @@ impl std::fmt::Debug for RejectedEvent {
             .field("id", &self.id.id)
             .field("event", &self.event)
             .field("priority", &self.priority)
+            .field("reason", &self.reason)
             .finish()
     }
 }
@@ -221,7 +242,19 @@ pub(super) struct FairEventQueue {
     tiers: [PriorityTier; 3],
     /// Total events across all tiers (global backpressure bound).
     total_queued: usize,
+    /// Consecutive `pop()`s that served `ClientLocal` while a lower tier had
+    /// work waiting. Drives the anti-starvation floor (see `pop`): once this
+    /// reaches `RELAY_STARVATION_FLOOR`, the next `pop` force-serves the highest
+    /// non-empty lower tier so sustained client load cannot indefinitely starve
+    /// remote relay / background execution (#4534 review).
+    client_streak: usize,
 }
+
+/// After this many consecutive `ClientLocal` pops (while lower-tier work is
+/// waiting), `pop()` serves one lower-tier event regardless of pending
+/// `ClientLocal`. Bounds relay/background starvation latency to roughly one in
+/// `RELAY_STARVATION_FLOOR + 1` pops while still strongly favouring client work.
+pub(super) const RELAY_STARVATION_FLOOR: usize = 16;
 
 impl FairEventQueue {
     /// Create a new, empty fair event queue.
@@ -229,6 +262,7 @@ impl FairEventQueue {
         Self {
             tiers: Default::default(),
             total_queued: 0,
+            client_streak: 0,
         }
     }
 
@@ -263,28 +297,33 @@ impl FairEventQueue {
                 id,
                 event,
                 priority,
+                reason: RejectReason::GlobalCapacity,
             }));
         }
 
         // Soft cap: classes below ClientLocal must leave the reserve free. If a
         // foreground push (ClientLocal/NetworkRelay) would cross the soft cap,
-        // first try to reclaim space by shedding already-queued Background.
+        // the caller can first try to reclaim space by shedding already-queued
+        // Background (a GlobalCapacity rejection is eviction-recoverable).
         let soft_cap = MAX_TOTAL_FAIR_QUEUE - CLIENT_LOCAL_RESERVE;
         if priority < Priority::ClientLocal && self.total_queued >= soft_cap {
             return Err(Box::new(RejectedEvent {
                 id,
                 event,
                 priority,
+                reason: RejectReason::GlobalCapacity,
             }));
         }
 
         // Per-contract-per-tier cap (DoS protection, preserved from the
-        // original flat queue but now scoped to the tier).
+        // original flat queue but now scoped to the tier). Evicting Background
+        // cannot help here, so this is flagged PerContract.
         if self.tier(priority).len_for(&event) >= MAX_QUEUED_PER_CONTRACT {
             return Err(Box::new(RejectedEvent {
                 id,
                 event,
                 priority,
+                reason: RejectReason::PerContract,
             }));
         }
 
@@ -308,6 +347,7 @@ impl FairEventQueue {
                         id,
                         event,
                         priority,
+                        reason: RejectReason::Evicted,
                     });
                 }
                 None => break,
@@ -327,20 +367,62 @@ impl FairEventQueue {
     /// If the queue still has items, the key is moved to the back (round-robin).
     /// If the queue is now empty, the key is removed.
     ///
-    /// Pop the next event, highest priority class first, round-robin within the
-    /// class (#4534). `ClientLocal` drains fully before `NetworkRelay`, which
-    /// drains fully before `Background` — so newly-arrived background work never
-    /// head-of-line-blocks a pending client request (this is the "don't START
-    /// new background ahead of a client" guarantee; an already-running WASM
-    /// compile still finishes, see issue #4534).
+    /// Pop the next event, strongly favouring higher priority classes but with a
+    /// bounded anti-starvation floor (#4534 + review).
+    ///
+    /// Normally serves the highest non-empty tier (`ClientLocal` → `NetworkRelay`
+    /// → `Background`), round-robin within the tier — so newly-arrived background
+    /// work never head-of-line-blocks a pending client request ("don't START new
+    /// background ahead of a client"; an already-running WASM compile still
+    /// finishes).
+    ///
+    /// To avoid the strict-priority failure mode where sustained `ClientLocal`
+    /// load indefinitely starves remote relay/background execution, after
+    /// `RELAY_STARVATION_FLOOR` consecutive `ClientLocal` pops *with lower-tier
+    /// work waiting*, one lower-tier event is served instead. This bounds
+    /// relay/background latency while keeping the overwhelming majority of slots
+    /// for client work.
     ///
     /// Returns `None` if all tiers are empty.
     pub(super) fn pop(&mut self) -> Option<(EventId, ContractHandlerEvent)> {
-        // Highest index = highest priority (ClientLocal=2 → NetworkRelay=1 → Background=0).
-        for tier in self.tiers.iter_mut().rev() {
-            if let Some((id, event, _priority)) = tier.pop() {
+        let client_nonempty = self.tiers[Priority::ClientLocal as usize].queued > 0;
+        let lower_nonempty = self.tiers[Priority::NetworkRelay as usize].queued > 0
+            || self.tiers[Priority::Background as usize].queued > 0;
+
+        // Anti-starvation: if ClientLocal has monopolized the last
+        // RELAY_STARVATION_FLOOR pops and a lower tier is waiting, serve the
+        // highest non-empty lower tier this round and reset the streak.
+        let force_lower =
+            client_nonempty && lower_nonempty && self.client_streak >= RELAY_STARVATION_FLOOR;
+
+        let order: [Priority; 3] = if force_lower {
+            // Skip ClientLocal this round; drain NetworkRelay then Background.
+            [
+                Priority::NetworkRelay,
+                Priority::Background,
+                // ClientLocal last as a safety net (only reached if both lower
+                // tiers raced to empty between the check and the pop).
+                Priority::ClientLocal,
+            ]
+        } else {
+            [
+                Priority::ClientLocal,
+                Priority::NetworkRelay,
+                Priority::Background,
+            ]
+        };
+
+        for priority in order {
+            if let Some((id, event, _)) = self.tiers[priority as usize].pop() {
                 debug_assert!(self.total_queued > 0);
                 self.total_queued = self.total_queued.saturating_sub(1);
+                // Track the ClientLocal streak only while lower work waits — an
+                // uncontested client burst should not trip the floor.
+                if priority == Priority::ClientLocal && lower_nonempty {
+                    self.client_streak += 1;
+                } else {
+                    self.client_streak = 0;
+                }
                 return Some((id, event));
             }
         }
@@ -525,8 +607,10 @@ mod tests {
     /// next unused event id.
     fn fill_to(queue: &mut FairEventQueue, priority: Priority, target: usize) -> u64 {
         let mut pushed = queue.total_queued();
-        let mut contract_seed = 0u32;
-        let mut event_id = 0u64;
+        // Start high so fill_to's synthetic contracts never collide with the
+        // small hand-picked seeds individual tests use.
+        let mut contract_seed = 1_000_000u32;
+        let mut event_id = 1_000_000u64;
         while pushed < target {
             let batch = (target - pushed).min(MAX_QUEUED_PER_CONTRACT);
             // Vary the contract id by seed so we never hit the per-contract cap.
@@ -1267,5 +1351,126 @@ mod tests {
             .map(|(_, ev)| get_cid(ev))
             .collect();
         assert_eq!(order, vec![a, b, a, b, a, b, a, b]);
+    }
+
+    #[test]
+    fn relay_not_starved_by_sustained_client_load() {
+        // With a permanent backlog of both ClientLocal and NetworkRelay work,
+        // the anti-starvation floor must serve a NetworkRelay event at least
+        // once every (RELAY_STARVATION_FLOOR + 1) pops (#4534 review).
+        let mut queue = FairEventQueue::new();
+        let client = make_contract_id_u32(1);
+        let relay = make_contract_id_u32(2);
+
+        // Saturate both tiers (spread across contracts to dodge per-contract cap).
+        for i in 0..1000u64 {
+            queue
+                .try_push(
+                    make_event_id(i),
+                    make_get_event(make_contract_id_u32(1000 + (i / 50) as u32)),
+                    Priority::ClientLocal,
+                )
+                .unwrap();
+        }
+        for i in 0..1000u64 {
+            queue
+                .try_push(
+                    make_event_id(10_000 + i),
+                    make_get_event(make_contract_id_u32(2000 + (i / 50) as u32)),
+                    Priority::NetworkRelay,
+                )
+                .unwrap();
+        }
+        let _ = (client, relay);
+
+        // Pop a long run and assert NetworkRelay is served on a bounded cadence:
+        // no window of (FLOOR + 1) consecutive pops is all-ClientLocal.
+        let mut gap = 0usize; // pops since last NetworkRelay
+        let mut max_gap = 0usize;
+        let mut relay_served = 0usize;
+        for _ in 0..400 {
+            let (_, ev) = queue.pop().unwrap();
+            let cid = get_cid(ev);
+            // relay contracts are the 2000.. series
+            let is_relay = (2000..3000).any(|s| make_contract_id_u32(s) == cid);
+            if is_relay {
+                relay_served += 1;
+                max_gap = max_gap.max(gap);
+                gap = 0;
+            } else {
+                gap += 1;
+            }
+        }
+        max_gap = max_gap.max(gap);
+        assert!(relay_served > 0, "NetworkRelay must not be fully starved");
+        assert!(
+            max_gap <= RELAY_STARVATION_FLOOR,
+            "gap between relay pops ({max_gap}) must not exceed the floor ({RELAY_STARVATION_FLOOR})"
+        );
+        // Client work still dominates: vastly more client than relay served.
+        assert!(
+            relay_served < 400 / 2,
+            "client work should still dominate scheduling"
+        );
+    }
+
+    #[test]
+    fn uncontested_client_burst_does_not_trip_floor() {
+        // With NO lower-tier work waiting, a long ClientLocal burst is served
+        // back-to-back — the floor only applies when lower work is starved.
+        let mut queue = FairEventQueue::new();
+        for i in 0..200u64 {
+            queue
+                .try_push(
+                    make_event_id(i),
+                    make_get_event(make_contract_id_u32(1000 + (i / 50) as u32)),
+                    Priority::ClientLocal,
+                )
+                .unwrap();
+        }
+        // All 200 pops are ClientLocal (no relay/background to divert to).
+        for _ in 0..200 {
+            assert!(queue.pop().is_some());
+        }
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn per_contract_rejection_keeps_reason() {
+        // A per-contract-cap rejection is flagged PerContract (so the loop skips
+        // the futile Background eviction); a global-cap rejection is
+        // GlobalCapacity.
+        let mut queue = FairEventQueue::new();
+        let key = make_contract_id_u32(1);
+        for i in 0..MAX_QUEUED_PER_CONTRACT as u64 {
+            queue
+                .try_push(
+                    make_event_id(i),
+                    make_get_event(key),
+                    Priority::NetworkRelay,
+                )
+                .unwrap();
+        }
+        let rejected = queue
+            .try_push(
+                make_event_id(999),
+                make_get_event(key),
+                Priority::NetworkRelay,
+            )
+            .expect_err("should reject at per-contract cap");
+        assert_eq!(rejected.reason, RejectReason::PerContract);
+
+        // Fill the rest of the queue to the soft cap with other contracts, then
+        // a NetworkRelay push is refused for GlobalCapacity.
+        let soft_cap = MAX_TOTAL_FAIR_QUEUE - CLIENT_LOCAL_RESERVE;
+        fill_to(&mut queue, Priority::NetworkRelay, soft_cap);
+        let rejected = queue
+            .try_push(
+                make_event_id(1000),
+                make_get_event(make_contract_id_u32(55555)),
+                Priority::NetworkRelay,
+            )
+            .expect_err("should reject at soft cap");
+        assert_eq!(rejected.reason, RejectReason::GlobalCapacity);
     }
 }

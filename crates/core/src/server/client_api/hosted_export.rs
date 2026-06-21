@@ -307,7 +307,11 @@ async fn run_export(
         token: crate::contract::RedactedToken::new(token),
     };
 
-    match op_manager.notify_contract_handler(event).await {
+    // Hosted export is initiated by a local HTTP client → ClientLocal lane (#4534).
+    match op_manager
+        .notify_contract_handler_prioritized(event, crate::contract::Priority::ClientLocal)
+        .await
+    {
         Ok(ContractHandlerEvent::ExportUserSecretsResponse(Ok(bundle))) => Ok(bundle),
         Ok(ContractHandlerEvent::ExportUserSecretsResponse(Err(e))) => {
             // Executor-side failure (e.g. a secret failed to decrypt). Do not
