@@ -285,7 +285,15 @@ pub fn build_estimator_chart(
         let mut right_ext = Vec::new();
 
         for &(x, y) in points {
-            let y = y + adj;
+            // Apply the per-peer adjustment, then clamp to the visible axis floor.
+            // A negative adjustment (a peer faster / more reliable than the global
+            // fit) can drive `y + adj` below the axis — e.g. a negative "response
+            // time", which is physically meaningless — and render the curve below
+            // the x-axis. The router clamps the same per-peer estimate to >= 0 (see
+            // `IsotonicEstimator::estimate_retrieval_time`); clamping to `y_min`
+            // here keeps the drawn curve on-axis and consistent with that, mirroring
+            // the scatter-point clamp above. (`y_min` is 0 for all of these charts.)
+            let y = (y + adj).max(y_min);
             if x < data_lo - 0.001 {
                 left_ext.push((x, y));
             } else if x > data_hi + 0.001 {
@@ -828,4 +836,72 @@ fn mini_chart_placeholder(label: &str, sub: &str) -> String {
         cy = h / 2.0,
         cy2 = h / 2.0 + 14.0,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The plot's bottom edge (x-axis) in SVG user units, matching the geometry in
+    // `build_estimator_chart`: pad_t (10) + plot_h (h 210 - pad_t 10 - pad_b 40 = 160).
+    const PLOT_BOTTOM_Y: f64 = 170.0;
+
+    // Extract the y-coordinates from every path drawn in the given stroke color.
+    fn path_y_coords_for_color(svg: &str, color: &str) -> Vec<f64> {
+        let mut ys = Vec::new();
+        for seg in svg.split("<path") {
+            if !seg.contains(color) {
+                continue;
+            }
+            // The `d="..."` attribute precedes the stroke color in the same element.
+            let Some(start) = seg.find("d=\"") else {
+                continue;
+            };
+            let rest = &seg[start + 3..];
+            let Some(end) = rest.find('"') else {
+                continue;
+            };
+            for token in rest[..end].split_whitespace() {
+                // Tokens look like `M50.0,170.0` or `L256.0,131.4`.
+                let cleaned = token.trim_start_matches(['M', 'L']);
+                if let Some((_, y)) = cleaned.split_once(',') {
+                    if let Ok(v) = y.parse::<f64>() {
+                        ys.push(v);
+                    }
+                }
+            }
+        }
+        ys
+    }
+
+    #[test]
+    fn peer_adjusted_curve_never_renders_below_x_axis() {
+        // Small positive base curve with a strongly-negative peer adjustment: the
+        // raw `y + adj` would be deeply negative and, on a y-axis floored at 0,
+        // would draw the violet "Peer-adjusted" curve well below the x-axis.
+        let curve = [(0.0, 0.10), (0.25, 0.30), (0.50, 0.50)];
+        let svg = build_estimator_chart(
+            "Response Time (s)",
+            &curve,
+            &[],           // no scatter
+            (0.0, 0.5),    // entire range is data (solid line)
+            Some(-1000.0), // strongly-negative peer adjustment
+            None,
+            "0", // y floor (as used for the response-time chart)
+            "auto",
+        );
+
+        // "#8b5cf6" is the violet stroke used only for the peer-adjusted curve.
+        let ys = path_y_coords_for_color(&svg, "#8b5cf6");
+        assert!(
+            !ys.is_empty(),
+            "expected a peer-adjusted curve to be drawn; svg: {svg}"
+        );
+        for y in ys {
+            assert!(
+                y <= PLOT_BOTTOM_Y + 0.05,
+                "peer-adjusted curve drawn below the x-axis (y={y} > {PLOT_BOTTOM_Y})"
+            );
+        }
+    }
 }

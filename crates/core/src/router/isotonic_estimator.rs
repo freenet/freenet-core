@@ -155,19 +155,29 @@ impl IsotonicEstimator {
         // Regression can sometimes produce negative estimates
         let global_estimate = global_estimate.max(0.0);
 
-        Ok(self
-            .peer_adjustments
-            .get(peer)
-            .map_or(global_estimate, |peer_adjustment| {
-                let should_use_peer_adjustment =
-                    peer_adjustment.effective_count >= MIN_POINTS_FOR_REGRESSION as f64;
-                global_estimate
-                    + if should_use_peer_adjustment {
-                        peer_adjustment.value()
-                    } else {
-                        0.0
-                    }
-            }))
+        let adjusted_estimate =
+            self.peer_adjustments
+                .get(peer)
+                .map_or(global_estimate, |peer_adjustment| {
+                    let should_use_peer_adjustment =
+                        peer_adjustment.effective_count >= MIN_POINTS_FOR_REGRESSION as f64;
+                    global_estimate
+                        + if should_use_peer_adjustment {
+                            peer_adjustment.value()
+                        } else {
+                            0.0
+                        }
+                });
+
+        // The per-peer EWMA adjustment is added *after* the global clamp above and
+        // can be negative (a peer that is consistently faster / more reliable than
+        // the global fit). Re-clamp so the per-peer estimate can never go below
+        // zero — these targets (response time, transfer rate, failure probability)
+        // are all physically non-negative, and a negative prediction would both
+        // distort routing cost formulas and render below the x-axis on the
+        // dashboard's "Peer-adjusted" curve. The failure path applies the same
+        // clamp downstream (see `predict_routing_outcome`).
+        Ok(adjusted_estimate.max(0.0))
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -397,6 +407,51 @@ mod tests {
         debug!("Average error: {average_error}");
         // Threshold 0.02 to avoid flaky failures from random seed variation
         assert!(average_error < 0.02);
+    }
+
+    #[test]
+    fn test_peer_adjustment_cannot_produce_negative_estimate() {
+        // A strongly-negative per-peer EWMA adjustment (a peer far faster / more
+        // reliable than the global fit) must not drive the estimate below zero:
+        // these targets are physically non-negative, and a negative estimate both
+        // distorts routing and renders below the x-axis on the dashboard chart.
+        let mut events = Vec::new();
+        for _ in 0..100 {
+            let peer = PeerKeyLocation::random();
+            let contract_location = Location::random();
+            events.push(simulate_positive_request(peer, contract_location));
+        }
+        let mut estimator = IsotonicEstimator::new(events, EstimatorType::Positive);
+
+        // Overwrite one peer's adjustment with a large negative value and enough
+        // effective observations that it is actually applied.
+        let fast_peer = PeerKeyLocation::random();
+        let mut adjustment = Adjustment::new();
+        for _ in 0..10 {
+            adjustment.add(-1000.0);
+        }
+        assert!(
+            adjustment.effective_count >= MIN_POINTS_FOR_REGRESSION as f64,
+            "adjustment must have enough effective observations to be applied"
+        );
+        assert!(
+            adjustment.value() < -1.0,
+            "adjustment must be strongly negative"
+        );
+        estimator
+            .peer_adjustments
+            .insert(fast_peer.clone(), adjustment);
+
+        // Estimate at the peer's own location (distance 0 → smallest global value).
+        let contract_location = fast_peer.location().unwrap();
+        let estimate = estimator
+            .estimate_retrieval_time(&fast_peer, contract_location)
+            .expect("estimator has enough data to produce an estimate");
+
+        assert!(
+            estimate >= 0.0,
+            "per-peer adjusted estimate must be clamped to a non-negative value, got {estimate}"
+        );
     }
 
     #[test]
