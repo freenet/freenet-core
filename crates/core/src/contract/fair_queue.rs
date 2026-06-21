@@ -228,6 +228,8 @@ fn extract_contract_id(event: &ContractHandlerEvent) -> Option<ContractInstanceI
         // These events have no contract identity and are routed to the default queue.
         ContractHandlerEvent::DelegateRequest { .. }
         | ContractHandlerEvent::DelegateResponse(_)
+        | ContractHandlerEvent::ExportUserSecrets { .. }
+        | ContractHandlerEvent::ExportUserSecretsResponse(_)
         | ContractHandlerEvent::PutResponse { .. }
         | ContractHandlerEvent::GetResponse { .. }
         | ContractHandlerEvent::UpdateResponse { .. }

@@ -94,6 +94,7 @@ fn sandbox_origin_from_headers(headers: &axum::http::HeaderMap) -> String {
         .unwrap_or_else(|| "'self'".to_string())
 }
 
+pub(crate) mod hosted_export;
 mod permission_prompts;
 mod v1;
 mod v2;
@@ -148,6 +149,10 @@ pub struct HttpClientApi {
     pub(crate) origin_contracts: OriginContractMap,
     proxy_server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
+    /// Per-node route to the executor for the hosted-mode export endpoint
+    /// (P3-live of #4381). Shared (same `Arc`) with the router's `Extension`;
+    /// the node fills it at startup via `set_op_manager`.
+    export_op_manager: hosted_export::ExportOpManagerHandle,
 }
 
 impl HttpClientApi {
@@ -190,6 +195,12 @@ impl HttpClientApi {
 
         let config = Config { localhost };
 
+        // Per-node route to the executor for the hosted-mode export endpoint.
+        // The SAME handle is injected as a request `Extension` (read by the
+        // export handler) and stored in the returned `HttpClientApi` (filled by
+        // the node via `set_op_manager`).
+        let export_op_manager = hosted_export::ExportOpManagerHandle::default();
+
         let router = Router::new()
             .route("/", axum::routing::get(home_page::homepage))
             .route(
@@ -198,9 +209,16 @@ impl HttpClientApi {
             )
             .merge(v1::routes(config.clone()))
             .merge(v2::routes(config))
+            // Hosted-mode "export my data" endpoint (P3-live of #4381). Gated
+            // by the same refuse-plaintext-token check as the WS userToken; see
+            // `hosted_export`. Reaches the node via the per-node
+            // `ExportOpManagerHandle` Extension below.
+            .merge(hosted_export::routes(ApiVersion::V1))
+            .merge(hosted_export::routes(ApiVersion::V2))
             .merge(permission_prompts::routes())
             .layer(Extension(origin_contracts.clone()))
             .layer(Extension(pending_prompts))
+            .layer(Extension(export_op_manager.clone()))
             .layer(Extension(HttpClientApiRequest(proxy_request_sender)));
 
         (
@@ -208,6 +226,7 @@ impl HttpClientApi {
                 proxy_server_request: request_to_server,
                 origin_contracts,
                 response_channels: HashMap::new(),
+                export_op_manager,
             },
             router,
         )
@@ -692,6 +711,21 @@ impl ClientEventsProxy for HttpClientApi {
             Ok(())
         }
         .boxed()
+    }
+
+    fn set_op_manager(&self, op_manager: &dyn std::any::Any) {
+        // Wire the export endpoint's per-node handle (shared with the router
+        // Extension) to the live node. See `hosted_export`. The caller passes an
+        // `Arc<OpManager>` behind `&dyn Any` to keep the `pub(crate)` `OpManager`
+        // out of the public `ClientEventsProxy` signature; downcast it here.
+        if let Some(op_manager) = op_manager.downcast_ref::<Arc<crate::node::OpManager>>() {
+            self.export_op_manager.set(op_manager);
+        } else {
+            tracing::error!(
+                "HttpClientApi::set_op_manager called with a non-OpManager argument; \
+                 hosted export will be unavailable on this node"
+            );
+        }
     }
 }
 

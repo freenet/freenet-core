@@ -659,6 +659,30 @@ struct InternalCHEvent {
     result: tokio::sync::oneshot::Sender<(EventId, ContractHandlerEvent)>,
 }
 
+/// A user token carried on a [`ContractHandlerEvent::ExportUserSecrets`] event,
+/// held in `Zeroizing` so it is wiped on drop. Its `Debug` redacts the bytes:
+/// `ContractHandlerEvent` derives `Debug` and is logged, and the token is a
+/// high-value, durable credential that must NEVER reach a log line (mirrors how
+/// `UserSecretContext`'s `Debug` redacts its `dek_secret`).
+pub(crate) struct RedactedToken(zeroize::Zeroizing<Vec<u8>>);
+
+impl RedactedToken {
+    pub(crate) fn new(token: Vec<u8>) -> Self {
+        Self(zeroize::Zeroizing::new(token))
+    }
+
+    /// Borrow the raw token bytes (for deriving the bundle key only).
+    pub(crate) fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for RedactedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RedactedToken(<redacted>)")
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ContractHandlerEvent {
     DelegateRequest {
@@ -674,6 +698,25 @@ pub(crate) enum ContractHandlerEvent {
         user_context: Option<UserSecretContext>,
     },
     DelegateResponse(Vec<OutboundDelegateMsg>),
+    /// Export a hosted user's per-user delegate secrets into an encrypted
+    /// bundle (hosted-mode export, P3-live of #4381). Carries the
+    /// connection-derived `user_context` (the forge-proof per-user namespace,
+    /// same channel as `DelegateRequest`) and the raw user `token` used as the
+    /// bundle-key material so the user can re-import with the token they hold.
+    ///
+    /// Like `DelegateRequest::user_context`, `user_context`'s `Debug` redacts
+    /// the dek_secret. The `token` is sensitive (high-value, durable
+    /// credential): it is NOT derived from `Debug`/`Display` (this struct has
+    /// neither field rendered) and must never be logged.
+    ExportUserSecrets {
+        user_context: UserSecretContext,
+        /// Raw user token bytes, redacted in `Debug` and wiped on drop; used
+        /// only to derive the bundle encryption key.
+        token: RedactedToken,
+    },
+    /// Response to an `ExportUserSecrets` request: the encrypted bundle bytes,
+    /// or an executor error.
+    ExportUserSecretsResponse(Result<Vec<u8>, ExecutorError>),
     /// Try to push/put a new value into the contract
     PutQuery {
         key: ContractKey,
@@ -892,6 +935,23 @@ impl std::fmt::Display for ContractHandlerEvent {
                     "evict contract {{ {key}, expected_generation: {expected_generation} }}"
                 )
             }
+            // `token` deliberately omitted (high-value credential). `user_id`
+            // is a non-secret namespace tag, safe to render.
+            ContractHandlerEvent::ExportUserSecrets { user_context, .. } => {
+                write!(
+                    f,
+                    "export user secrets {{ user_id: {:?} }}",
+                    user_context.user_id()
+                )
+            }
+            ContractHandlerEvent::ExportUserSecretsResponse(result) => match result {
+                Ok(bundle) => write!(
+                    f,
+                    "export user secrets response {{ {} bytes }}",
+                    bundle.len()
+                ),
+                Err(e) => write!(f, "export user secrets failed {{ {e} }}"),
+            },
         }
     }
 }

@@ -195,6 +195,14 @@ impl ContractExecutor for Executor<Runtime> {
         self.delegate_request(req, origin_contract, caller_delegate, user_context)
     }
 
+    async fn export_user_secrets(
+        &mut self,
+        user_context: &UserSecretContext,
+        token: &[u8],
+    ) -> Result<Vec<u8>, ExecutorError> {
+        Executor::export_user_secrets(self, user_context, token)
+    }
+
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
         self.get_subscription_info()
     }
@@ -556,6 +564,29 @@ impl Executor<Runtime> {
         }
 
         result
+    }
+
+    /// Export this hosted user's per-user delegate secrets into an encrypted
+    /// bundle, sealed under the user's `token` (hosted-mode export, P3-live of
+    /// #4381).
+    ///
+    /// Runs entirely on the executor (which owns the `SecretsStore` via its
+    /// `Runtime`), so the on-disk redb is touched only by its single writer.
+    /// The bundle is scoped to `user_context.scope()` — strictly the per-user
+    /// namespace, never `Local`. The `token` is the bundle-key material so the
+    /// user re-imports on their own peer with the token they already hold.
+    ///
+    /// The token and the derived key material live only in borrowed/`Zeroizing`
+    /// buffers here and inside `export_secret_bundle`; nothing is logged.
+    pub fn export_user_secrets(
+        &self,
+        user_context: &UserSecretContext,
+        token: &[u8],
+    ) -> Result<Vec<u8>, ExecutorError> {
+        use crate::wasm_runtime::secret_export::BundleKeyMaterial;
+        self.runtime
+            .export_secret_bundle(user_context.scope(), &BundleKeyMaterial::Token(token))
+            .map_err(|e| ExecutorError::other(anyhow::anyhow!("secret export failed: {e}")))
     }
 
     pub fn delegate_request(

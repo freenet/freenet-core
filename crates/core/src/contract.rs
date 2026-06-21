@@ -24,9 +24,9 @@ pub(crate) use executor::{
 pub use executor::mock_runtime::{clear_crdt_contracts, is_crdt_contract, register_crdt_contract};
 pub(crate) use handler::{
     ClientResponsesReceiver, ClientResponsesSender, ContractHandler, ContractHandlerChannel,
-    ContractHandlerEvent, NetworkContractHandler, SenderHalve, SessionMessage, StashedResponder,
-    StoreResponse, WaitingResolution, WaitingTransaction, client_responses_channel,
-    contract_handler_channel,
+    ContractHandlerEvent, NetworkContractHandler, RedactedToken, SenderHalve, SessionMessage,
+    StashedResponder, StoreResponse, WaitingResolution, WaitingTransaction,
+    client_responses_channel, contract_handler_channel,
     in_memory::{
         MemoryContractHandler, MockWasmContractHandler, MockWasmHandlerBuilder,
         SimulationContractHandler, SimulationHandlerBuilder,
@@ -1592,12 +1592,19 @@ async fn send_queue_full_response(
             key: *key,
             delta: Err(make_err()),
         },
+        // Export has a typed response variant, so deliver the queue-full error
+        // through it (the HTTP export handler awaits this exact variant) rather
+        // than dropping the sender and surfacing a generic NoEvHandlerResponse.
+        ContractHandlerEvent::ExportUserSecrets { .. } => {
+            ContractHandlerEvent::ExportUserSecretsResponse(Err(make_err()))
+        }
         // Events without error response variants: drop the oneshot sender to
         // unblock the caller. The caller's receiver will get a RecvError, which
         // maps to ContractError::NoEvHandlerResponse. This prevents leaking
         // entries in the waiting_response map.
         ContractHandlerEvent::DelegateRequest { .. }
         | ContractHandlerEvent::DelegateResponse(_)
+        | ContractHandlerEvent::ExportUserSecretsResponse(_)
         | ContractHandlerEvent::PutResponse { .. }
         | ContractHandlerEvent::GetResponse { .. }
         | ContractHandlerEvent::UpdateResponse { .. }
@@ -2075,6 +2082,34 @@ where
                 );
             }
         }
+        ContractHandlerEvent::ExportUserSecrets {
+            user_context,
+            token,
+        } => {
+            // Hosted-mode export (P3-live of #4381). Runs on the executor (which
+            // owns the SecretsStore) and returns the encrypted bundle bytes.
+            // `user_context` is the forge-proof per-user namespace derived at the
+            // connection boundary; the export reads ONLY that user's scope. Log
+            // only the non-secret user_id — never the token or bundle bytes.
+            tracing::debug!(
+                user_id = ?user_context.user_id(),
+                "Processing hosted-mode secret export request"
+            );
+            let result = contract_handler
+                .executor()
+                .export_user_secrets(&user_context, token.expose())
+                .await;
+            if let Err(error) = contract_handler
+                .channel()
+                .send_to_sender(id, ContractHandlerEvent::ExportUserSecretsResponse(result))
+                .await
+            {
+                tracing::debug!(
+                    error = %error,
+                    "Failed to send EXPORT response (client may have disconnected)"
+                );
+            }
+        }
         ContractHandlerEvent::RegisterSubscriberListener {
             key,
             client_id,
@@ -2215,6 +2250,7 @@ where
             contract_handler.channel().drop_waiting_response(id);
         }
         ContractHandlerEvent::DelegateResponse(_)
+        | ContractHandlerEvent::ExportUserSecretsResponse(_)
         | ContractHandlerEvent::PutResponse { .. }
         | ContractHandlerEvent::GetResponse { .. }
         | ContractHandlerEvent::UpdateResponse { .. }

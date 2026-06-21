@@ -269,6 +269,28 @@ impl Runtime {
         self.state_write_callback = Some(cb);
     }
 
+    /// Export every secret under `scope` from this runtime's secrets store into
+    /// an encrypted [`super::secret_export`] bundle (the live counterpart of the
+    /// offline `freenet secrets export` CLI). The bundle is sealed under
+    /// `material` so the user can later re-import it with the same key.
+    ///
+    /// This is the ONLY route to the `pub(super) secret_store` from outside the
+    /// `wasm_runtime` module: the executor (`contract::executor`) lives in a
+    /// different module tree and cannot touch the field directly, so it wraps
+    /// secret access in `Runtime` methods exactly as `register_delegate` /
+    /// `inbound_app_message` do. Used by the hosted-mode export endpoint
+    /// (P3-live of #4381) to export a single hosted user's per-user secrets.
+    ///
+    /// Plaintext exists only in the `Zeroizing` buffers inside `export_bundle`;
+    /// the returned bytes are encrypted at rest.
+    pub(crate) fn export_secret_bundle(
+        &self,
+        scope: super::secrets_store::SecretScope<'_>,
+        material: &super::secret_export::BundleKeyMaterial<'_>,
+    ) -> Result<Vec<u8>, super::secret_export::ExportError> {
+        super::secret_export::export_bundle(&self.secret_store, scope, material)
+    }
+
     pub fn build_with_config(
         contract_store: ContractStore,
         delegate_store: DelegateStore,

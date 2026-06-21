@@ -636,6 +636,18 @@ impl NodeP2P {
                 Err(e) => anyhow::anyhow!(e),
             })
             .boxed();
+        // Wire each client proxy's HTTP layer to this node's op_manager BEFORE
+        // the combinator consumes them (the combinator moves each boxed client
+        // into a spawned task, after which it can no longer be reached). Only
+        // the HTTP/WS proxies act on this — it routes the hosted-mode export
+        // endpoint to the executor (P3-live of #4381). Per-node, so concurrent
+        // in-process nodes never clobber each other.
+        for client in clients.iter() {
+            // Pass `Arc<OpManager>` behind `&dyn Any` (the trait keeps the
+            // `pub(crate)` OpManager out of its public signature; the proxy
+            // downcasts).
+            client.set_op_manager(&op_manager as &dyn std::any::Any);
+        }
         // Slot 0 = HTTP client API, Slot 1 = WebSocket proxy (from serve_client_api).
         let clients = ClientEventsCombinator::new(clients).with_slot_names(&["http", "websocket"]);
         // Create node controller channel with capacity for shutdown signal
