@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use crate::config::GlobalRng;
 use crate::node::network_status::OpType;
 use crate::ring::{Distance, Location, PeerKeyLocation};
-pub(crate) use isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
+pub(crate) use isotonic_estimator::{
+    AdjustmentMode, EstimatorType, IsotonicEstimator, IsotonicEvent,
+};
 use util::{Mean, TransferSpeed};
 
 /// Default size of the candidate window the prediction-based router considers.
@@ -471,14 +473,21 @@ impl Router {
         }
 
         Router {
-            // Positive because we expect time to increase as distance increases
-            response_start_time_estimator: IsotonicEstimator::new(
+            // Positive because we expect time to increase as distance increases.
+            // Multiplicative per-peer adjustment: a peer's response time deviates
+            // from the global fit by a near-constant ratio, not a constant offset
+            // (validated on production telemetry). See `AdjustmentMode`.
+            response_start_time_estimator: IsotonicEstimator::new_with_mode(
                 success_durations,
                 EstimatorType::Positive,
+                AdjustmentMode::Multiplicative,
             ),
             // Positive because we expect failure probability to increase as distance increase
             failure_estimator: IsotonicEstimator::new(failure_outcomes, EstimatorType::Positive),
-            // Negative because we expect transfer rate to decrease as distance increases
+            // Negative because we expect transfer rate to decrease as distance increases.
+            // Additive for now: transfer rate is the same unbounded multiplicative-scale
+            // quantity as response time and is a strong candidate for multiplicative too,
+            // but current telemetry lacks the per-distance payload data to validate it.
             transfer_rate_estimator: IsotonicEstimator::new(
                 transfer_rates,
                 EstimatorType::Negative,
@@ -491,7 +500,16 @@ impl Router {
                 .collect(),
             per_op_response_time: per_op_response_time
                 .into_iter()
-                .map(|(k, v)| (k, IsotonicEstimator::new(v, EstimatorType::Positive)))
+                .map(|(k, v)| {
+                    (
+                        k,
+                        IsotonicEstimator::new_with_mode(
+                            v,
+                            EstimatorType::Positive,
+                            AdjustmentMode::Multiplicative,
+                        ),
+                    )
+                })
                 .collect(),
             per_op_transfer_rate: per_op_transfer_rate
                 .into_iter()
@@ -550,7 +568,12 @@ impl Router {
                     self.per_op_response_time
                         .entry(ot)
                         .or_insert_with(|| {
-                            IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive)
+                            // Multiplicative to match the global response-time estimator.
+                            IsotonicEstimator::new_with_mode(
+                                std::iter::empty(),
+                                EstimatorType::Positive,
+                                AdjustmentMode::Multiplicative,
+                            )
                         })
                         .add_event(IsotonicEvent {
                             peer: event.peer.clone(),
@@ -1139,6 +1162,72 @@ mod tests {
     use crate::ring::Distance;
 
     use super::*;
+
+    #[test]
+    fn estimators_use_intended_adjustment_modes() {
+        // Pin the per-estimator adjustment modes so a future change can't silently
+        // make failure probability multiplicative (wrong for a bounded [0,1] target)
+        // or response time additive. Response time is multiplicative (validated on
+        // telemetry, #4547); failure and transfer rate stay additive for now.
+        let mut router = Router::new(&[]);
+        // Global estimators.
+        assert_eq!(
+            router.response_start_time_estimator.adjustment_mode(),
+            AdjustmentMode::Multiplicative,
+            "response time must be multiplicative"
+        );
+        assert_eq!(
+            router.failure_estimator.adjustment_mode(),
+            AdjustmentMode::Additive,
+            "failure probability must stay additive (bounded [0,1])"
+        );
+        assert_eq!(
+            router.transfer_rate_estimator.adjustment_mode(),
+            AdjustmentMode::Additive,
+            "transfer rate stays additive pending instrumentation (#4547)"
+        );
+
+        // Per-op estimators are created lazily on the first matching event and must
+        // match their global counterpart's mode. A timed GET success populates all
+        // three (response time + failure + transfer rate) for OpType::Get.
+        router.add_event(RouteEvent {
+            peer: PeerKeyLocation::random(),
+            contract_location: Location::random(),
+            outcome: RouteOutcome::Success {
+                time_to_response_start: Duration::from_millis(100),
+                payload_size: 5000,
+                payload_transfer_time: Duration::from_millis(50),
+            },
+            op_type: Some(OpType::Get),
+        });
+        assert_eq!(
+            router
+                .per_op_response_time
+                .get(&OpType::Get)
+                .unwrap()
+                .adjustment_mode(),
+            AdjustmentMode::Multiplicative,
+            "per-op response time must match the global estimator (multiplicative)"
+        );
+        assert_eq!(
+            router
+                .per_op_failure
+                .get(&OpType::Get)
+                .unwrap()
+                .adjustment_mode(),
+            AdjustmentMode::Additive,
+            "per-op failure must stay additive"
+        );
+        assert_eq!(
+            router
+                .per_op_transfer_rate
+                .get(&OpType::Get)
+                .unwrap()
+                .adjustment_mode(),
+            AdjustmentMode::Additive,
+            "per-op transfer rate must stay additive"
+        );
+    }
 
     #[test]
     fn before_data_select_closest() {

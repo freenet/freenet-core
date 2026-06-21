@@ -5,6 +5,7 @@ use super::estimator::{
     fmt_prediction_prob, fmt_prediction_speed, fmt_prediction_time,
 };
 use super::*;
+use crate::router::AdjustmentMode;
 
 // ─── Peer detail page ────────────────────────────────────────────────────────
 
@@ -255,12 +256,23 @@ pub fn peer_detail_html(address_str: &str) -> String {
                 let fail_y_max =
                     failure_chart_y_max(f_curve, if tab_name == "All" { fail_adj } else { None })
                         .to_string();
+                // The adjustment mode per chart MUST match the router's choice for
+                // that estimator (see `Router::new`): failure + transfer are
+                // additive, response time is multiplicative. The dashboard renders
+                // the peer-adjusted curve with this mode, so a wrong mode would draw
+                // a curve of the wrong SHAPE vs the router's prediction. (The curve
+                // is intentionally a *preview*: the dashboard draws it whenever an
+                // adjustment exists, while the router only applies it once the peer
+                // has `MIN_POINTS_FOR_REGRESSION` effective observations.) When
+                // #4547 flips transfer rate to multiplicative, update its mode here
+                // too — the mode is mirrored, not read from the snapshot.
                 panel_content.push_str(&build_estimator_chart_or_placeholder(
                     "Failure Probability",
                     f_curve,
                     f_points,
                     f_range,
                     if tab_name == "All" { fail_adj } else { None },
+                    AdjustmentMode::Additive,
                     ploc,
                     "0.0",
                     &fail_y_max,
@@ -272,6 +284,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                     rt_points,
                     rt_range,
                     if tab_name == "All" { rt_adj } else { None },
+                    AdjustmentMode::Multiplicative,
                     ploc,
                     "0",
                     "auto",
@@ -283,6 +296,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                     xfer_points,
                     xfer_range,
                     if tab_name == "All" { xfer_adj } else { None },
+                    AdjustmentMode::Additive,
                     ploc,
                     // Transfer rate is a positive B/s value: floor at 0, auto-scale
                     // the top. (Was "auto"/"0", which clamped the max to 0 and gave a
@@ -310,8 +324,9 @@ pub fn peer_detail_html(address_str: &str) -> String {
                 <p style="font-size:0.8em;color:var(--text-muted);">
                     Actual observed outcomes (dots) against ring distance to the contract, with the
                     isotonic fit overlaid (the All tab is the aggregate the router uses; per-op tabs
-                    just break it down and are not consulted separately). "Peer-adjusted" adds this
-                    peer's running EWMA correction to that fit. How tightly the dots hug a monotonic
+                    just break it down and are not consulted separately). "Peer-adjusted" applies this
+                    peer's running EWMA correction to that fit — a multiplicative factor for response
+                    time, an additive offset for failure and transfer rate. How tightly the dots hug a monotonic
                     curve shows how well distance alone predicts the outcome. A separate Renegade
                     model is blended into the final estimate; its accuracy is in the Prediction
                     Accuracy panel below.
