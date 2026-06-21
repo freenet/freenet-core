@@ -828,6 +828,20 @@ impl ContractExecutor for RuntimePool {
         result
     }
 
+    async fn export_user_secrets(
+        &mut self,
+        user_context: &UserSecretContext,
+        token: &[u8],
+    ) -> Result<Vec<u8>, ExecutorError> {
+        // Run on a pooled executor so the on-disk secrets redb is touched only
+        // by its single writer (all pool executors point at the same
+        // `secrets_dir`, but `pop_executor` serializes the checkout).
+        let executor = self.pop_executor().await;
+        let result = executor.export_user_secrets(user_context, token);
+        self.return_checked(executor, "export_user_secrets").await;
+        result
+    }
+
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
         // Read subscription info from shared storage at pool level
         self.shared_notifications

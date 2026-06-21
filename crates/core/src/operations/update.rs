@@ -621,6 +621,8 @@ pub(crate) async fn update_contract(
                             } => state,
                             ContractHandlerEvent::DelegateRequest { .. }
                             | ContractHandlerEvent::DelegateResponse(_)
+                            | ContractHandlerEvent::ExportUserSecrets { .. }
+                            | ContractHandlerEvent::ExportUserSecretsResponse(_)
                             | ContractHandlerEvent::PutQuery { .. }
                             | ContractHandlerEvent::PutResponse { .. }
                             | ContractHandlerEvent::GetQuery { .. }
