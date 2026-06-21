@@ -155,80 +155,7 @@ fn homepage_html() -> String {
     };
 
     format!(
-        r##"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>FN Peer</title>
-    <link rel="icon" type="image/svg+xml" href="{favicon}">
-    <style>{CSS}</style>
-    <script>{JS}</script>
-</head>
-<body>
-    <header>
-        <div class="header-left">
-            <img src="https://freenet.org/freenet_logo.svg" alt="Freenet" class="logo">
-            <span class="header-title">FREENET</span>
-            <span class="header-scope">Local Peer</span>
-            <span class="badge" id="version-badge" data-version="{version}">v{version}</span>
-            <a class="update-badge" id="update-badge" href="https://github.com/freenet/freenet-core/releases/latest" target="_blank" rel="noopener noreferrer" hidden>Update available</a>
-            <span class="pub-key-label">Peer ID</span>
-            <code class="pub-key" id="peer-id" title="Click to copy">{peer_id}</code>{peer_copy_btn}
-            <span class="pub-key-label">Pub key</span>
-            <code class="pub-key" id="pub-key" title="Click to copy">{pub_key}</code>{pub_copy_btn}
-        </div>
-        <div class="header-right">
-            <span class="uptime">Up {uptime}</span>
-            <button class="theme-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle dark/light mode">
-                <span id="theme-icon">☀️</span>
-            </button>
-        </div>
-    </header>
-
-    <div class="version-banner" id="version-mismatch-banner" data-asset-version="{asset_version}" role="alert" hidden></div>
-
-    <main>
-        {status_card}
-        {peers_card}
-        {transfer_card}
-        {governance_card}
-        {ban_list_card}
-        {contracts_card}
-        {ops_card}
-
-        <div class="card">
-            <h2>Freenet Links</h2>
-            <ul class="app-list">
-                <li>
-                    <a href="/v1/contract/web/771DvtPMwt2PumPyrFvsz7fpvU1gogcmb5qtS1yYEEH9/">Atlas</a>
-                    <p class="note">Decentralized search and recommendation engine for Freenet.</p>
-                </li>
-                <li>
-                    <a href="/v1/contract/web/raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv/">River Chat</a>
-                    <p class="note">You'll need an <a href="https://freenet.org/quickstart#invite-form" target="_blank" rel="noopener noreferrer">invite</a> to join the "Freenet Official" room.</p>
-                </li>
-                <li>
-                    <a href="/v1/contract/web/122f6AR7PyF8d8mhczuNQM4xrLtBf5t8g2iB7PEVT7KC/">Freenet Mail</a>
-                    <p class="note">Decentralized email built on Freenet. <a href="https://github.com/freenet/mail" target="_blank" rel="noopener noreferrer">Source</a>.</p>
-                </li>
-                <li>
-                    <a href="/v1/contract/web/EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr/">Delta</a>
-                    <p class="note">A website builder for Freenet.</p>
-                </li>
-                <li>
-                    <a href="/v1/contract/web/DLog47hEsrtuGT4N5XCeMBG45m4n1aWM89tBZXue2E1N/">Ghostkey Identity Vault</a>
-                    <p class="note">Manage Ghostkey identities on Freenet.</p>
-                </li>
-                <li>
-                    <a href="/v1/contract/web/E4m5WbaC4cdbpDjL82WfYUnrM9iMnfaaN8Tsn7UHPMjZ/">freenet.org</a>
-                    <p class="note">The freenet.org website, mirrored on Freenet.</p>
-                </li>
-            </ul>
-        </div>
-    </main>
-</body>
-</html>"##,
+        include_str!("home_page/assets/home.html"),
         CSS = CSS,
         JS = JS,
         favicon = favicon,
@@ -246,6 +173,7 @@ fn homepage_html() -> String {
         peers_card = peers_card,
         transfer_card = transfer_card,
         governance_card = governance_card,
+        ban_list_card = ban_list_card,
         contracts_card = contracts_card,
         ops_card = ops_card,
     )
