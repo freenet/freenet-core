@@ -1473,4 +1473,52 @@ mod tests {
             .expect_err("should reject at soft cap");
         assert_eq!(rejected.reason, RejectReason::GlobalCapacity);
     }
+
+    #[test]
+    fn evict_then_retry_can_still_fail_per_contract() {
+        // Models the `still_rejected` arm of `push_with_background_eviction`:
+        // even after Background is evicted (freeing GLOBAL capacity), a
+        // ClientLocal push to a key whose ClientLocal tier is already at the
+        // per-contract cap still fails — and is flagged PerContract, NOT
+        // GlobalCapacity, so the loop does not loop on a futile re-evict.
+        let mut queue = FairEventQueue::new();
+        let hot = make_contract_id_u32(1);
+
+        // Saturate the hot key's ClientLocal per-contract queue.
+        for i in 0..MAX_QUEUED_PER_CONTRACT as u64 {
+            queue
+                .try_push(make_event_id(i), make_get_event(hot), Priority::ClientLocal)
+                .unwrap();
+        }
+        // Add some evictable Background on other contracts.
+        for i in 0..10u64 {
+            queue
+                .try_push(
+                    make_event_id(1000 + i),
+                    make_get_event(make_contract_id_u32(2000 + i as u32)),
+                    Priority::Background,
+                )
+                .unwrap();
+        }
+
+        // Evicting Background frees global slots...
+        let before = queue.total_queued();
+        let evicted = queue.evict_background(CLIENT_LOCAL_RESERVE);
+        assert_eq!(evicted.len(), 10);
+        assert_eq!(queue.total_queued(), before - 10);
+
+        // ...but a retry on the hot key still fails on the per-contract cap.
+        let rejected = queue
+            .try_push(
+                make_event_id(9999),
+                make_get_event(hot),
+                Priority::ClientLocal,
+            )
+            .expect_err("hot key is at its ClientLocal per-contract cap");
+        assert_eq!(
+            rejected.reason,
+            RejectReason::PerContract,
+            "post-eviction retry failure must be PerContract, not GlobalCapacity"
+        );
+    }
 }

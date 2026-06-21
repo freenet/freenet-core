@@ -613,12 +613,17 @@ pub(crate) async fn update_contract(
             let resolved_state = match previous_state {
                 Some(prev_state) => prev_state,
                 None => {
-                    // Try to fetch current state from store
+                    // Try to fetch current state from store (same priority as
+                    // the rest of this update — keep the ClientLocal lane for a
+                    // client UPDATE that CRDT-merges to no change; #4534).
                     let fetched_state = op_manager
-                        .notify_contract_handler(ContractHandlerEvent::GetQuery {
-                            instance_id: *key.id(),
-                            return_contract_code: false,
-                        })
+                        .notify_contract_handler_prioritized(
+                            ContractHandlerEvent::GetQuery {
+                                instance_id: *key.id(),
+                                return_contract_code: false,
+                            },
+                            priority,
+                        )
                         .await
                         .ok()
                         .and_then(|event| match event {
