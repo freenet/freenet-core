@@ -64,6 +64,51 @@ for every inbound wire message. Pattern per op:
 `RelayState::handle_request`. Production CONNECT runs entirely on the
 drivers in `connect/op_ctx_task.rs`.
 
+## Critical Invariant: Tag Contract-Handler Events with the Right Priority (#4534)
+
+```
+Every event sent to the single-threaded contract_handling loop carries a
+`crate::contract::Priority` (ClientLocal > NetworkRelay > Background).
+The fair queue drains higher classes first, reserves admission capacity
+(CLIENT_LOCAL_RESERVE) for ClientLocal, and sheds Background to make room.
+A mis-tag silently degrades service: tag a client path Background and it
+gets starved/evicted; tag relay/background ClientLocal and it can exhaust
+the reserve meant to protect real client requests.
+
+Rules for choosing the class at a send site:
+
+  ClientLocal  → the event serves a WS/HTTP client connected to THIS node.
+                 Set it at the client-facing entry points:
+                 - client_events.rs request handlers (GET, RegisterSubscriberListener,
+                   DelegateRequest)
+                 - drive_client_update → update_contract(.., ClientLocal)
+                 - hosted_export.rs ExportUserSecrets
+                 - a client's own PUT reaches the relay driver via
+                   originator-loopback (upstream_addr == own_addr); compute it
+                   with put_store_priority() — DO NOT hardcode NetworkRelay on
+                   the relay PUT store path.
+
+  NetworkRelay → serving a remote peer's relayed op (the default). All
+                 drive_relay_* drivers, ResyncResponse apply, broadcast-path
+                 summaries/deltas that propagate a real UPDATE. This is also
+                 `Priority::DEFAULT`, so untagged callers fall here safely.
+
+  Background   → best-effort node-internal work that must yield to client/relay
+                 traffic: the periodic interest-sync summarize
+                 (summary_if_hosted_or_in_use), placement-migration caching,
+                 renewal, and EvictContract disk reclamation. NEVER tag a
+                 client- or peer-visible op Background.
+
+When a shared helper is reached from BOTH a client and a relay path (e.g.
+put_contract, update_contract), thread a `priority` param through rather
+than hardcoding — decide the class at the driver that knows the origin.
+
+The loop's pop() applies a bounded anti-starvation floor
+(RELAY_STARVATION_FLOOR) so sustained ClientLocal load cannot indefinitely
+starve NetworkRelay/Background — but that is a backstop, not a license to
+mis-tag.
+```
+
 ## Critical Invariant: Initialize-Before-Send
 
 ```

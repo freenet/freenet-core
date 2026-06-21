@@ -846,11 +846,28 @@ impl OpManager {
     }
 
     /// Send an event to the contract handler and await a response event from it if successful.
+    ///
+    /// Defaults to [`Priority::DEFAULT`] (`NetworkRelay`). Local-client callers
+    /// should use [`notify_contract_handler_prioritized`] with
+    /// [`Priority::ClientLocal`], and background callers with
+    /// [`Priority::Background`] (#4534).
     pub async fn notify_contract_handler(
         &self,
         msg: ContractHandlerEvent,
     ) -> Result<ContractHandlerEvent, ContractError> {
         self.ch_outbound.send_to_handler(msg).await
+    }
+
+    /// Send an event to the contract handler at an explicit priority class and
+    /// await its response (#4534).
+    pub async fn notify_contract_handler_prioritized(
+        &self,
+        msg: ContractHandlerEvent,
+        priority: crate::contract::Priority,
+    ) -> Result<ContractHandlerEvent, ContractError> {
+        self.ch_outbound
+            .send_to_handler_prioritized(msg, priority)
+            .await
     }
 
     /// Send an event to the contract handler with a custom timeout.
@@ -863,15 +880,22 @@ impl OpManager {
         timeout: std::time::Duration,
     ) -> Result<ContractHandlerEvent, ContractError> {
         self.ch_outbound
-            .send_to_handler_with_timeout(msg, timeout)
+            .send_to_handler_with_timeout(msg, timeout, crate::contract::Priority::DEFAULT)
             .await
     }
 
-    /// Fire-and-forget notification to the contract handler. Used for
-    /// maintenance events (e.g. EvictContract) where no response is needed
-    /// and the caller must not block.
-    pub fn notify_contract_handler_fire_and_forget(&self, ev: ContractHandlerEvent) {
-        if let Err(e) = self.ch_outbound.send_to_handler_fire_and_forget(ev) {
+    /// Fire-and-forget notification to the contract handler at an explicit
+    /// priority class (#4534). Used for maintenance events (e.g. EvictContract)
+    /// where no response is needed and the caller must not block.
+    pub fn notify_contract_handler_fire_and_forget_prioritized(
+        &self,
+        ev: ContractHandlerEvent,
+        priority: crate::contract::Priority,
+    ) {
+        if let Err(e) = self
+            .ch_outbound
+            .send_to_handler_fire_and_forget_prioritized(ev, priority)
+        {
             tracing::warn!(error = %e, "failed to send fire-and-forget event to contract handler");
         }
     }

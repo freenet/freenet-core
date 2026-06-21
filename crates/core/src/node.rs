@@ -2475,8 +2475,10 @@ async fn handle_interest_sync_message(
                 return None;
             };
 
-            // Fetch our summary
-            let summary = get_contract_summary(op_manager, &key).await;
+            // Fetch our summary (serving a peer's ResyncRequest — relay-tier).
+            let summary =
+                get_contract_summary(op_manager, &key, crate::contract::Priority::NetworkRelay)
+                    .await;
             let Some(summary) = summary else {
                 tracing::warn!(
                     contract = %key,
@@ -2654,14 +2656,23 @@ async fn get_contract_state_by_id(
 }
 
 /// Get the contract state summary using the contract's summarize_state method.
+///
+/// `priority` lets the periodic interest-sync path issue the summarize at
+/// [`Priority::Background`](crate::contract::Priority::Background) so the
+/// post-#4473 residual summarize load never starves client work (#4534), while
+/// relay/resync callers keep the default `NetworkRelay` precedence.
 async fn get_contract_summary(
     op_manager: &Arc<OpManager>,
     key: &freenet_stdlib::prelude::ContractKey,
+    priority: crate::contract::Priority,
 ) -> Option<freenet_stdlib::prelude::StateSummary<'static>> {
     use crate::contract::ContractHandlerEvent;
 
     match op_manager
-        .notify_contract_handler(ContractHandlerEvent::GetSummaryQuery { key: *key })
+        .notify_contract_handler_prioritized(
+            ContractHandlerEvent::GetSummaryQuery { key: *key },
+            priority,
+        )
         .await
     {
         Ok(ContractHandlerEvent::GetSummaryResponse {
@@ -2719,7 +2730,9 @@ async fn summary_if_hosted_or_in_use(
     key: &freenet_stdlib::prelude::ContractKey,
 ) -> Option<freenet_stdlib::prelude::StateSummary<'static>> {
     if op_manager.ring.is_hosting_contract(key) || op_manager.ring.contract_in_use(key) {
-        get_contract_summary(op_manager, key).await
+        // Periodic interest-sync summarize: best-effort background work, so it
+        // yields the contract loop to client/relay traffic (#4534 / #4473).
+        get_contract_summary(op_manager, key, crate::contract::Priority::Background).await
     } else {
         None
     }
