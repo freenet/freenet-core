@@ -15,6 +15,15 @@ const MAX_REGRESSION_POINTS: usize = 500;
 /// observation drops below 50% after about 7 newer observations.
 const EWMA_ALPHA: f64 = 0.1;
 
+/// Floor for the global base in [`AdjustmentMode::Multiplicative`]. The global
+/// regression can extrapolate slightly negative near the edges of its data range;
+/// clamping that base to exactly `0.0` before a multiplicative adjustment would
+/// annihilate the peer's factor (`0 * exp(adj) == 0`), predicting a slow peer as
+/// instant. A tiny positive floor keeps `base * exp(adj)` ordered by the per-peer
+/// factor. It is far below any real response time (1 ns) / transfer rate, so it
+/// only affects the degenerate `global <= 0` region.
+const MULTIPLICATIVE_MIN_BASE: f64 = 1e-9;
+
 /// `IsotonicEstimator` provides outcome estimation for a given action, such as
 /// retrieving the state of a contract, based on the distance between the peer
 /// and the contract. It uses an isotonic regression model from the `pav.rs`
@@ -31,10 +40,89 @@ const EWMA_ALPHA: f64 = 0.1;
 pub(crate) struct IsotonicEstimator {
     pub global_regression: IsotonicRegression<f64>,
     pub peer_adjustments: HashMap<PeerKeyLocation, Adjustment>,
+    /// How per-peer adjustments combine with the global estimate. See
+    /// [`AdjustmentMode`].
+    #[serde(skip)]
+    adjustment_mode: AdjustmentMode,
     /// Raw input points in insertion order. When len exceeds
     /// `MAX_REGRESSION_POINTS`, the oldest is evicted via `remove_points`.
     #[serde(skip)]
     raw_points: VecDeque<Point<f64>>,
+}
+
+/// How a per-peer adjustment combines with the global isotonic estimate.
+///
+/// The per-peer adjustment is an EWMA that corrects the global distance→outcome
+/// fit for a specific peer. Whether that correction is best expressed as an
+/// absolute offset or a scaling factor depends on the target:
+///
+/// - **Additive** (`global + adjustment`): the EWMA averages absolute residuals
+///   `observed - global`. Correct for a bounded target such as failure
+///   probability, where "this peer fails 0.05 more often" is the natural unit.
+/// - **Multiplicative** (`global * exp(adjustment)`): the EWMA averages log
+///   ratios `ln(observed) - ln(global)` (a geometric mean of `observed/global`).
+///   Correct for an unbounded, heavy-tailed, multiplicative-scale target such as
+///   response time. Telemetry over 5.3 days / 631 peers showed a peer's deviation
+///   from the global response-time curve is a near-constant *ratio*, not a
+///   constant offset (log-residuals are level-independent for ~88% of peers,
+///   96% observation-weighted, whereas additive residuals grow with the level).
+///   It also makes a negative estimate impossible by construction: `global >= 0`
+///   and `exp(_) > 0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AdjustmentMode {
+    #[default]
+    Additive,
+    Multiplicative,
+}
+
+impl AdjustmentMode {
+    /// The per-event training residual fed to the peer's EWMA, or `None` when the
+    /// event cannot be expressed in this mode's space. Multiplicative requires a
+    /// strictly-positive observation and global estimate (`ln` is undefined at or
+    /// below zero); such events are skipped rather than corrupting the EWMA with
+    /// `NaN`/`-inf`.
+    fn residual(self, observed: f64, global: f64) -> Option<f64> {
+        match self {
+            AdjustmentMode::Additive => Some(observed - global),
+            AdjustmentMode::Multiplicative => {
+                if observed > 0.0 && global > 0.0 {
+                    Some(observed.ln() - global.ln())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Combine a global estimate with a peer's smoothed adjustment value. The
+    /// neutral adjustment is `0.0` in both modes (`global + 0` and
+    /// `global * e^0 = global`), so callers can pass `0.0` for a peer that has no
+    /// usable adjustment yet. Shared by the router and the dashboard so both
+    /// render the identical peer-adjusted value.
+    pub(crate) fn apply(self, global: f64, adjustment: f64) -> f64 {
+        match self {
+            AdjustmentMode::Additive => global + adjustment,
+            AdjustmentMode::Multiplicative => global * adjustment.exp(),
+        }
+    }
+
+    /// Clamp the global estimate to a non-negative base before applying the
+    /// adjustment. The regression can extrapolate slightly negative near its
+    /// data-range edges; both modes must start from a non-negative base.
+    ///
+    /// Additive floors at exactly `0.0` (`0 + adj` still carries the peer's
+    /// absolute correction). Multiplicative floors at a tiny POSITIVE value
+    /// instead: flooring to `0.0` would make `0 * exp(adj) == 0` and erase the
+    /// peer's learned factor entirely — a consistently-slow peer would be
+    /// predicted as instant. The tiny floor keeps `base * exp(adj)` ordered by the
+    /// per-peer factor in that degenerate region while staying far below any real
+    /// value, so normal (positive-base) predictions are unchanged.
+    fn floor_base(self, global: f64) -> f64 {
+        match self {
+            AdjustmentMode::Additive => global.max(0.0),
+            AdjustmentMode::Multiplicative => global.max(MULTIPLICATIVE_MIN_BASE),
+        }
+    }
 }
 
 impl IsotonicEstimator {
@@ -42,8 +130,25 @@ impl IsotonicEstimator {
     // dominated by sparse/noisy data.
     const ADJUSTMENT_PRIOR_SIZE: u64 = 10;
 
-    /// Creates a new `IsotonicEstimator` from a list of historical events.
+    /// Creates a new `IsotonicEstimator` from a list of historical events, using
+    /// [`AdjustmentMode::Additive`] per-peer adjustments.
     pub fn new<I>(history: I, estimator_type: EstimatorType) -> Self
+    where
+        I: IntoIterator<Item = IsotonicEvent>,
+    {
+        Self::new_with_mode(history, estimator_type, AdjustmentMode::Additive)
+    }
+
+    /// Like [`new`](Self::new) but selects how per-peer adjustments combine with
+    /// the global estimate. The mode must be fixed at construction because the
+    /// per-peer EWMA is trained on residuals computed in that mode's space (see
+    /// [`AdjustmentMode::residual`]); it cannot be changed afterwards without
+    /// recomputing every peer's history.
+    pub fn new_with_mode<I>(
+        history: I,
+        estimator_type: EstimatorType,
+        adjustment_mode: AdjustmentMode,
+    ) -> Self
     where
         I: IntoIterator<Item = IsotonicEvent>,
     {
@@ -91,8 +196,9 @@ impl IsotonicEstimator {
                     let global_estimate = global_regression
                         .interpolate(event.route_distance().as_f64())
                         .expect("Regression should always produce an estimate");
-                    let delta = event.result - global_estimate;
-                    adjustment.add(delta);
+                    if let Some(delta) = adjustment_mode.residual(event.result, global_estimate) {
+                        adjustment.add(delta);
+                    }
                 }
                 peer_adjustments.insert(peer_location.clone(), adjustment);
             }
@@ -101,6 +207,7 @@ impl IsotonicEstimator {
         IsotonicEstimator {
             global_regression,
             peer_adjustments,
+            adjustment_mode,
             raw_points: all_points,
         }
     }
@@ -122,16 +229,17 @@ impl IsotonicEstimator {
         }
 
         if self.global_regression.len() >= Self::ADJUSTMENT_PRIOR_SIZE as usize {
-            let adjustment = event.result
-                - self
-                    .global_regression
-                    .interpolate(route_distance.as_f64())
-                    .unwrap();
+            let global_estimate = self
+                .global_regression
+                .interpolate(route_distance.as_f64())
+                .unwrap();
 
-            self.peer_adjustments
-                .entry(event.peer)
-                .or_default()
-                .add(adjustment);
+            if let Some(delta) = self.adjustment_mode.residual(event.result, global_estimate) {
+                self.peer_adjustments
+                    .entry(event.peer)
+                    .or_default()
+                    .add(delta);
+            }
         }
     }
 
@@ -152,8 +260,11 @@ impl IsotonicEstimator {
             .interpolate(distance)
             .ok_or(EstimationError::InsufficientData)?;
 
-        // Regression can sometimes produce negative estimates
-        let global_estimate = global_estimate.max(0.0);
+        // Regression can sometimes produce negative estimates. Floor the base
+        // non-negative before applying the per-peer adjustment; in multiplicative
+        // mode the floor is a tiny positive value so the peer's factor is not
+        // annihilated (see `AdjustmentMode::floor_base`).
+        let global_estimate = self.adjustment_mode.floor_base(global_estimate);
 
         let adjusted_estimate =
             self.peer_adjustments
@@ -161,19 +272,20 @@ impl IsotonicEstimator {
                 .map_or(global_estimate, |peer_adjustment| {
                     let should_use_peer_adjustment =
                         peer_adjustment.effective_count >= MIN_POINTS_FOR_REGRESSION as f64;
-                    global_estimate
-                        + if should_use_peer_adjustment {
-                            peer_adjustment.value()
-                        } else {
-                            0.0
-                        }
+                    if should_use_peer_adjustment {
+                        self.adjustment_mode
+                            .apply(global_estimate, peer_adjustment.value())
+                    } else {
+                        global_estimate
+                    }
                 });
 
-        // The per-peer EWMA adjustment is added *after* the global clamp above and
-        // can be negative (a peer that is consistently faster / more reliable than
-        // the global fit). Re-clamp so the per-peer estimate can never go below
-        // zero — these targets (response time, transfer rate, failure probability)
-        // are all physically non-negative, and a negative prediction would both
+        // The per-peer adjustment is applied *after* the global clamp above. In
+        // additive mode it can be negative (a peer faster / more reliable than the
+        // global fit); in multiplicative mode `global * exp(_)` is already >= 0.
+        // Re-clamp either way so the per-peer estimate can never go below zero —
+        // these targets (response time, transfer rate, failure probability) are
+        // all physically non-negative, and a negative prediction would both
         // distort routing cost formulas and render below the x-axis on the
         // dashboard's "Peer-adjusted" curve. The failure path applies the same
         // clamp downstream (see `predict_routing_outcome`).
@@ -182,6 +294,15 @@ impl IsotonicEstimator {
 
     pub(crate) fn len(&self) -> usize {
         self.global_regression.len()
+    }
+
+    /// The per-peer adjustment mode this estimator was constructed with.
+    /// Test-only: used to pin each estimator's mode (see the router test
+    /// `estimators_use_intended_adjustment_modes`). When the dashboard is wired to
+    /// read the mode (the #4547 follow-up), drop the `cfg(test)` to make it real API.
+    #[cfg(test)]
+    pub(crate) fn adjustment_mode(&self) -> AdjustmentMode {
+        self.adjustment_mode
     }
 
     /// Return the x-range of actual regression data points, or (0, 0) if empty.
@@ -451,6 +572,203 @@ mod tests {
         assert!(
             estimate >= 0.0,
             "per-peer adjusted estimate must be clamped to a non-negative value, got {estimate}"
+        );
+    }
+
+    #[test]
+    fn adjustment_mode_residual_and_apply() {
+        // Additive: residual is the absolute difference; apply adds it back.
+        assert_eq!(
+            AdjustmentMode::Additive.residual(7.0, 10.0),
+            Some(-3.0),
+            "additive residual is observed - global"
+        );
+        assert_eq!(AdjustmentMode::Additive.apply(10.0, -3.0), 7.0);
+
+        // Multiplicative: residual is the log-ratio; apply scales by exp().
+        let r = AdjustmentMode::Multiplicative
+            .residual(20.0, 10.0)
+            .expect("positive inputs");
+        assert!(
+            (r - std::f64::consts::LN_2).abs() < 1e-12,
+            "multiplicative residual of 20/10 must be ln(2), got {r}"
+        );
+        let applied = AdjustmentMode::Multiplicative.apply(10.0, std::f64::consts::LN_2);
+        assert!(
+            (applied - 20.0).abs() < 1e-9,
+            "applying ln(2) to 10 must give 20, got {applied}"
+        );
+
+        // Multiplicative is undefined for non-positive inputs → skipped (None).
+        assert_eq!(AdjustmentMode::Multiplicative.residual(0.0, 10.0), None);
+        assert_eq!(AdjustmentMode::Multiplicative.residual(5.0, 0.0), None);
+        assert_eq!(AdjustmentMode::Multiplicative.residual(-1.0, 10.0), None);
+
+        // Neutral adjustment (0.0) is a no-op in both modes.
+        assert_eq!(AdjustmentMode::Additive.apply(42.0, 0.0), 42.0);
+        assert_eq!(AdjustmentMode::Multiplicative.apply(42.0, 0.0), 42.0);
+
+        // Multiplicative can never produce a negative estimate, even for a huge
+        // negative log-adjustment (the additive failure mode this design avoids).
+        assert!(AdjustmentMode::Multiplicative.apply(10.0, -1000.0) >= 0.0);
+    }
+
+    #[test]
+    fn multiplicative_estimate_scales_global_by_geometric_factor() {
+        // Build a multiplicative-mode estimator with a real global fit.
+        let mut events = Vec::new();
+        for _ in 0..100 {
+            let peer = PeerKeyLocation::random();
+            let contract_location = Location::random();
+            events.push(simulate_positive_request(peer, contract_location));
+        }
+        let mut estimator = IsotonicEstimator::new_with_mode(
+            events,
+            EstimatorType::Positive,
+            AdjustmentMode::Multiplicative,
+        );
+
+        // A peer whose log-adjustment is ln(2): it is consistently ~2x the global.
+        let peer = PeerKeyLocation::random();
+        let mut adjustment = Adjustment::new();
+        for _ in 0..10 {
+            adjustment.add(std::f64::consts::LN_2);
+        }
+        assert!(adjustment.effective_count >= MIN_POINTS_FOR_REGRESSION as f64);
+        estimator.peer_adjustments.insert(peer.clone(), adjustment);
+
+        // At the peer's own location distance is 0; compare against global * 2.
+        let contract_location = peer.location().unwrap();
+        let global = estimator
+            .global_regression
+            .interpolate(0.0)
+            .unwrap()
+            .max(0.0);
+        let estimate = estimator
+            .estimate_retrieval_time(&peer, contract_location)
+            .expect("enough data");
+        let expected = global * 2.0;
+        assert!(
+            (estimate - expected).abs() <= 1e-6 + expected * 1e-9,
+            "multiplicative estimate must be global*exp(ln2)=2*global ({expected}), got {estimate}"
+        );
+
+        // A strongly-negative log-adjustment scales toward (but not below) zero.
+        let mut neg = Adjustment::new();
+        for _ in 0..10 {
+            neg.add(-1000.0);
+        }
+        estimator.peer_adjustments.insert(peer.clone(), neg);
+        let est_neg = estimator
+            .estimate_retrieval_time(&peer, contract_location)
+            .expect("enough data");
+        assert!(
+            (0.0..1e-3).contains(&est_neg),
+            "global*exp(-1000) must round to ~0 and stay non-negative, got {est_neg}"
+        );
+    }
+
+    #[test]
+    fn multiplicative_adjustment_via_add_event_orders_peers_by_ratio() {
+        // End-to-end: build the multiplicative adjustment through the production
+        // path — `add_event` -> `residual` (log-ratio) -> EWMA -> `apply` — rather
+        // than hand-inserting an `Adjustment`. A slow peer (results ~2.0) must end
+        // up predicted slower than a fast peer (results ~0.5) at the same distance.
+        // This is the path a sign error or `ln`/`exp` inversion would corrupt.
+        let mut estimator = IsotonicEstimator::new_with_mode(
+            std::iter::empty(),
+            EstimatorType::Positive,
+            AdjustmentMode::Multiplicative,
+        );
+        for _ in 0..40 {
+            estimator.add_event(IsotonicEvent {
+                peer: PeerKeyLocation::random(),
+                contract_location: Location::random(),
+                result: 1.0,
+            });
+        }
+        let fast_peer = PeerKeyLocation::random();
+        let slow_peer = PeerKeyLocation::random();
+        for _ in 0..20 {
+            estimator.add_event(IsotonicEvent {
+                peer: fast_peer.clone(),
+                contract_location: Location::random(),
+                result: 0.5,
+            });
+            estimator.add_event(IsotonicEvent {
+                peer: slow_peer.clone(),
+                contract_location: Location::random(),
+                result: 2.0,
+            });
+        }
+        // Both query at distance 0 (contract at own location) → identical global
+        // base, so the ordering is decided purely by each peer's learned factor.
+        let est_fast = estimator
+            .estimate_retrieval_time(&fast_peer, fast_peer.location().unwrap())
+            .expect("enough data");
+        let est_slow = estimator
+            .estimate_retrieval_time(&slow_peer, slow_peer.location().unwrap())
+            .expect("enough data");
+        assert!(
+            est_slow > est_fast && est_fast > 0.0,
+            "slow peer (2.0) must estimate higher than fast peer (0.5): slow={est_slow} fast={est_fast}"
+        );
+    }
+
+    #[test]
+    fn multiplicative_skips_non_positive_observations() {
+        // A zero/negative response time can't be expressed in log space; `residual`
+        // returns None and `add_event` must skip the peer entirely rather than
+        // poisoning its EWMA with NaN/-inf.
+        let mut estimator = IsotonicEstimator::new_with_mode(
+            std::iter::empty(),
+            EstimatorType::Positive,
+            AdjustmentMode::Multiplicative,
+        );
+        for _ in 0..15 {
+            estimator.add_event(IsotonicEvent {
+                peer: PeerKeyLocation::random(),
+                contract_location: Location::random(),
+                result: 1.0,
+            });
+        }
+        let peer = PeerKeyLocation::random();
+        estimator.add_event(IsotonicEvent {
+            peer: peer.clone(),
+            contract_location: Location::random(),
+            result: 0.0,
+        });
+        assert!(
+            estimator.peer_adjustments.get(&peer).is_none(),
+            "a non-positive observation must be skipped in multiplicative mode (no adjustment entry created)"
+        );
+    }
+
+    #[test]
+    fn floor_base_preserves_multiplicative_factor_at_degenerate_base() {
+        // Additive floors at exactly 0; multiplicative floors at a tiny positive
+        // value so a degenerate (clamped) base does not annihilate the peer factor.
+        assert_eq!(AdjustmentMode::Additive.floor_base(-1.0), 0.0);
+        assert_eq!(AdjustmentMode::Additive.floor_base(5.0), 5.0);
+        assert_eq!(AdjustmentMode::Multiplicative.floor_base(5.0), 5.0);
+        let base = AdjustmentMode::Multiplicative.floor_base(-1.0);
+        assert!(
+            base > 0.0,
+            "multiplicative base must stay positive, got {base}"
+        );
+
+        // The fix: at a clamped base, a slow peer (adj>0) is still predicted slower
+        // than a fast peer (adj<0). Flooring to 0 (the bug) would tie both at 0.
+        let slow = AdjustmentMode::Multiplicative.apply(base, 0.7);
+        let fast = AdjustmentMode::Multiplicative.apply(base, -0.7);
+        assert!(
+            slow > fast && fast > 0.0,
+            "multiplicative ordering must survive a degenerate base: slow={slow} fast={fast}"
+        );
+        assert_eq!(
+            AdjustmentMode::Multiplicative.apply(0.0, 0.7),
+            0.0,
+            "sanity: a literal-0 base would annihilate the factor — the bug floor_base avoids"
         );
     }
 

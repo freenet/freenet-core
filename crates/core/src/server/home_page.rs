@@ -200,6 +200,7 @@ mod tests {
         FailureSnapshot, HealthLevel, NatStatsSnapshot, NetworkStatusSnapshot, OpStatsSnapshot,
         RingStatsSnapshot,
     };
+    use crate::router::AdjustmentMode;
     use crate::transport::metrics::TransportSnapshot;
     use std::net::SocketAddr;
 
@@ -1005,6 +1006,7 @@ mod tests {
             &[],
             (0.0, 0.0),
             None,
+            AdjustmentMode::Additive,
             None,
             "0",
             "auto",
@@ -1036,6 +1038,7 @@ mod tests {
             &scatter,
             (0.0, 0.5),
             None,
+            AdjustmentMode::Additive,
             None,
             "0.0",
             "1.0",
@@ -1102,6 +1105,7 @@ mod tests {
             &[],
             (0.0, 0.5),
             None,
+            AdjustmentMode::Additive,
             None,
             "0.0",
             "1.0",
@@ -1162,6 +1166,7 @@ mod tests {
             &[],
             (0.0, 0.5),
             None,
+            AdjustmentMode::Additive,
             None,
             "0.0",
             "1.0",
@@ -1184,6 +1189,7 @@ mod tests {
             &[],
             (0.0, 0.5),
             None,
+            AdjustmentMode::Additive,
             None,
             "0.0",
             "0.01",
@@ -1213,6 +1219,7 @@ mod tests {
             &scatter,
             (0.0, 0.5),
             None,
+            AdjustmentMode::Additive,
             None,
             "0.0",
             "0.08",

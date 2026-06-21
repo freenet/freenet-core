@@ -1,4 +1,5 @@
 use super::*;
+use crate::router::AdjustmentMode;
 
 /// Choose the top of the failure-probability chart's y-axis.
 ///
@@ -43,6 +44,7 @@ pub fn build_estimator_chart_or_placeholder(
     scatter_points: &[(f64, f64)],
     data_range: (f64, f64),
     peer_adjustment: Option<f64>,
+    adjustment_mode: AdjustmentMode,
     peer_location: Option<f64>,
     y_min_hint: &str,
     y_max_hint: &str,
@@ -61,6 +63,7 @@ pub fn build_estimator_chart_or_placeholder(
         scatter_points,
         data_range,
         peer_adjustment,
+        adjustment_mode,
         peer_location,
         y_min_hint,
         y_max_hint,
@@ -78,6 +81,7 @@ pub fn build_estimator_chart(
     scatter_points: &[(f64, f64)],
     data_range: (f64, f64),
     peer_adjustment: Option<f64>,
+    adjustment_mode: AdjustmentMode,
     peer_location: Option<f64>,
     y_min_hint: &str,
     y_max_hint: &str,
@@ -126,7 +130,7 @@ pub fn build_estimator_chart(
         // Include peer-adjusted values in range if present
         if let Some(adj) = peer_adjustment {
             for (_, y) in curve_points {
-                let adjusted = y + adj;
+                let adjusted = adjustment_mode.apply(*y, adj);
                 y_min = y_min.min(adjusted);
                 y_max = y_max.max(adjusted);
             }
@@ -272,7 +276,9 @@ pub fn build_estimator_chart(
     }
 
     // Helper: draw a curve with solid line in data range and dashed outside.
-    // `points` are (x, y) pairs; `adj` is an optional y-offset for peer adjustment.
+    // `points` are (x, y) pairs; `adj` is the peer adjustment, combined with each
+    // y via `adjustment_mode.apply` (an additive offset or a multiplicative factor
+    // depending on the mode). `adj == 0.0` is the neutral global curve.
     let draw_curve = |svg: &mut String, points: &[(f64, f64)], adj: f64, color: &str| {
         if points.len() < 2 {
             return;
@@ -285,15 +291,21 @@ pub fn build_estimator_chart(
         let mut right_ext = Vec::new();
 
         for &(x, y) in points {
-            // Apply the per-peer adjustment, then clamp to the visible axis floor.
-            // A negative adjustment (a peer faster / more reliable than the global
-            // fit) can drive `y + adj` below the axis — e.g. a negative "response
-            // time", which is physically meaningless — and render the curve below
-            // the x-axis. The router clamps the same per-peer estimate to >= 0 (see
-            // `IsotonicEstimator::estimate_retrieval_time`); clamping to `y_min`
-            // here keeps the drawn curve on-axis and consistent with that, mirroring
-            // the scatter-point clamp above. (`y_min` is 0 for all of these charts.)
-            let y = (y + adj).max(y_min);
+            // Apply the per-peer adjustment via the same `AdjustmentMode` the
+            // router uses (additive `y + adj`, or multiplicative `y * exp(adj)`),
+            // so the drawn curve matches the router's prediction exactly. For the
+            // un-adjusted global curve `adj == 0.0`, which is the neutral value in
+            // both modes (`y + 0` / `y * e^0`), so it is drawn unchanged.
+            //
+            // Then clamp to the visible axis floor. In additive mode a negative
+            // adjustment (a peer faster / more reliable than the global fit) can
+            // drive the value below the axis — e.g. a negative "response time",
+            // which is physically meaningless. The router clamps the same per-peer
+            // estimate to >= 0 (`IsotonicEstimator::estimate_retrieval_time`);
+            // clamping to `y_min` here keeps the drawn curve on-axis and consistent
+            // with that, mirroring the scatter-point clamp above. (`y_min` is 0 for
+            // all of these charts.)
+            let y = adjustment_mode.apply(y, adj).max(y_min);
             if x < data_lo - 0.001 {
                 left_ext.push((x, y));
             } else if x > data_hi + 0.001 {
@@ -875,19 +887,21 @@ mod tests {
     }
 
     #[test]
-    fn peer_adjusted_curve_never_renders_below_x_axis() {
-        // Small positive base curve with a strongly-negative peer adjustment: the
-        // raw `y + adj` would be deeply negative and, on a y-axis floored at 0,
-        // would draw the violet "Peer-adjusted" curve well below the x-axis.
+    fn peer_adjusted_curve_additive_never_renders_below_x_axis() {
+        // Additive mode: small positive base curve with a strongly-negative peer
+        // adjustment. The raw `y + adj` would be deeply negative and, on a y-axis
+        // floored at 0, would draw the violet "Peer-adjusted" curve below the
+        // x-axis without the clamp.
         let curve = [(0.0, 0.10), (0.25, 0.30), (0.50, 0.50)];
         let svg = build_estimator_chart(
-            "Response Time (s)",
+            "Failure Probability",
             &curve,
             &[],           // no scatter
             (0.0, 0.5),    // entire range is data (solid line)
             Some(-1000.0), // strongly-negative peer adjustment
+            AdjustmentMode::Additive,
             None,
-            "0", // y floor (as used for the response-time chart)
+            "0.0", // y floor
             "auto",
         );
 
@@ -903,5 +917,61 @@ mod tests {
                 "peer-adjusted curve drawn below the x-axis (y={y} > {PLOT_BOTTOM_Y})"
             );
         }
+    }
+
+    #[test]
+    fn peer_adjusted_curve_multiplicative_stays_non_negative() {
+        // Multiplicative mode: a strongly-negative log-adjustment scales the curve
+        // toward zero (`y * exp(-1000) ≈ 0`). It must never render below the axis.
+        let curve = [(0.0, 0.10), (0.25, 0.30), (0.50, 0.50)];
+        let svg = build_estimator_chart(
+            "Response Time (s)",
+            &curve,
+            &[],
+            (0.0, 0.5),
+            Some(-1000.0), // log-ratio: exp(-1000) ≈ 0
+            AdjustmentMode::Multiplicative,
+            None,
+            "0", // y floor as used for the response-time chart
+            "auto",
+        );
+        let ys = path_y_coords_for_color(&svg, "#8b5cf6");
+        assert!(!ys.is_empty(), "expected a peer-adjusted curve; svg: {svg}");
+        for y in ys {
+            assert!(
+                y <= PLOT_BOTTOM_Y + 0.05,
+                "multiplicative peer-adjusted curve drawn below the x-axis (y={y})"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_adjusted_curve_multiplicative_scales_above_global() {
+        // A positive log-adjustment (ln 2) scales the curve UP by 2x, so the violet
+        // peer-adjusted curve must sit ABOVE the teal global curve — i.e. at a
+        // SMALLER SVG y (the y-axis points down). This confirms the chart applies
+        // the multiplicative transform, not an additive offset, and renders it.
+        let curve = [(0.0, 1.0), (0.5, 1.0)]; // flat global at 1.0
+        let svg = build_estimator_chart(
+            "Response Time (s)",
+            &curve,
+            &[],
+            (0.0, 0.5),
+            Some(std::f64::consts::LN_2), // factor exp(ln 2) = 2.0
+            AdjustmentMode::Multiplicative,
+            None,
+            "0",
+            "auto",
+        );
+        let violet = path_y_coords_for_color(&svg, "#8b5cf6");
+        let teal = path_y_coords_for_color(&svg, "var(--accent-primary)");
+        let violet_top = violet.iter().cloned().fold(f64::INFINITY, f64::min);
+        let teal_top = teal.iter().cloned().fold(f64::INFINITY, f64::min);
+        assert!(violet.iter().all(|y| *y <= PLOT_BOTTOM_Y + 0.05));
+        assert!(
+            violet_top < teal_top - 1.0,
+            "multiplicative peer-adjusted curve (factor 2x) should sit above the \
+             global curve: violet_top={violet_top} should be < teal_top={teal_top}"
+        );
     }
 }
