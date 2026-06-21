@@ -55,6 +55,40 @@
 //! introspection hook into the gateway's subscriber set (there is none — see
 //! below).
 //!
+//! ## Why `nat-peer` GETs (with `subscribe=true`) instead of a bare SUBSCRIBE (#4524)
+//!
+//! A bare `ContractRequest::Subscribe` is rejected by the client-event handler
+//! unless the contract WASM/state is already cached on the *local* node
+//! (`client_events.rs`: "Rejecting SUBSCRIBE: contract WASM not cached
+//! locally" — the guard added in #3757 so a node can't be "subscribed but
+//! can't apply updates"). That guard explicitly exempts `GET+subscribe=true`
+//! and `PUT+subscribe=true` because those operations inherently fetch/provide
+//! the WASM ("PUT the contract or GET the contract before subscribing").
+//!
+//! `nat-peer` is the *provable non-host* (half a ring away) and never PUTs the
+//! contract itself, so the only way it can hold the contract locally is to
+//! fetch it. It cannot rely on PUT replication: the originator PUT on
+//! `host-peer` finalizes at `host-peer` (already at the contract location) and
+//! replicates exactly **one hop** toward the contract neighbourhood
+//! (`relay_put_replicate_forward`, #4509), which lands on the *gateway* (closer
+//! to the contract than `nat-peer`) — not on `nat-peer`. So a bare SUBSCRIBE on
+//! `nat-peer` raced contract presence that, for the farthest peer, often never
+//! arrives at all; that is the flake tracked in #4524 (a "contract not cached
+//! locally" rejection ~7-9s in).
+//!
+//! The deterministic fix is to use the supported non-host path: `nat-peer`
+//! issues `GET` with `subscribe=true`. The GET routes *toward* the contract
+//! (so it reliably resolves on `gateway`/`host-peer`), fetches and caches the
+//! body on `nat-peer`, and the GET driver's `auto_subscribe_on_get_response`
+//! then registers the subscription through the SAME relay path a bare SUBSCRIBE
+//! would use — the wire `SubscribeMsg::Request` still carries no address, so
+//! each hop still fills `upstream_addr` from the observed transport
+//! `source_addr` and registers the previous hop as a downstream subscriber.
+//! The NAT observed-address registration the test exists to prove is therefore
+//! still exercised end-to-end; only the unreliable "wait for PUT to replicate
+//! to the farthest peer" precondition is removed. No timeout was bumped and no
+//! assertion was weakened.
+//!
 //! ## Why we assert on the routed notification rather than the subscriber set
 //!
 //! There is no test-visible way to read a node's downstream-subscriber set.
@@ -78,7 +112,7 @@
 
 use anyhow::bail;
 use freenet::dev_tool::Location;
-use freenet::test_utils::{self, TestContext, make_put, make_subscribe, make_update};
+use freenet::test_utils::{self, TestContext, make_get_with_blocking, make_put, make_update};
 use freenet_macros::freenet_test;
 use freenet_stdlib::{
     client_api::{ContractResponse, HostResponse, WebApi},
@@ -150,9 +184,17 @@ async fn await_put_response(
     }
 }
 
-/// Drain `client` until a `SubscribeResponse` for `contract_key` arrives.
-/// Asserts `subscribed == true`. Tolerates interleaved unrelated responses.
-async fn await_subscribe_response(
+/// Drain `client` until a `GetResponse` for `contract_key` arrives, asserting
+/// the contract code came back (`contract: Some(_)`, since the caller requests
+/// `return_contract_code = true`). A GET with `subscribe = true` both fetches
+/// the contract body to the local node and registers the subscription via the
+/// GET driver's `maybe_subscribe_child`; because the caller also passes
+/// `blocking_subscribe = true`, that subscribe is awaited inline before the
+/// `GetResponse` is published, so this response is the non-host-peer's
+/// deterministic "I now hold the contract AND the downstream chain is
+/// registered" signal (issue #4524 — see module docs). Tolerates interleaved
+/// unrelated responses.
+async fn await_get_response(
     client: &mut WebApi,
     contract_key: ContractKey,
     timeout: Duration,
@@ -161,26 +203,28 @@ async fn await_subscribe_response(
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            bail!("timeout waiting for SUBSCRIBE response");
+            bail!("timeout waiting for GET response");
         }
         match tokio::time::timeout(remaining, client.recv()).await {
-            Ok(Ok(HostResponse::ContractResponse(ContractResponse::SubscribeResponse {
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::GetResponse {
                 key,
-                subscribed,
+                contract,
+                ..
             }))) => {
-                assert_eq!(key, contract_key, "SUBSCRIBE response key mismatch");
+                assert_eq!(key, contract_key, "GET response key mismatch");
                 assert!(
-                    subscribed,
-                    "NAT peer subscription must succeed — a false `subscribed` means the \
-                     relaying node could not register the peer (address-filling regression)"
+                    contract.is_some(),
+                    "NAT peer GET must return the contract code (return_contract_code=true) — \
+                     without the WASM cached locally the follow-up subscription would be \
+                     rejected 'not cached locally' (issue #4524)"
                 );
                 return Ok(());
             }
             Ok(Ok(other)) => {
-                tracing::debug!("await_subscribe_response: ignoring {:?}", other);
+                tracing::debug!("await_get_response: ignoring {:?}", other);
             }
-            Ok(Err(e)) => bail!("error waiting for SUBSCRIBE response: {e}"),
-            Err(_) => bail!("timeout waiting for SUBSCRIBE response"),
+            Ok(Err(e)) => bail!("error waiting for GET response: {e}"),
+            Err(_) => bail!("timeout waiting for GET response"),
         }
     }
 }
@@ -379,16 +423,66 @@ async fn test_nat_peer_remote_subscription_receives_update(ctx: &mut TestContext
     }
     tracing::info!("host-peer PUT succeeded");
 
-    // NAT peer subscribes. Its wire Request carries no address — every hop on
-    // the relay path (`nat-peer → gateway → host-peer`) must fill the
-    // observed address from its transport `source_addr` and register the
-    // previous hop as a downstream subscriber.
-    make_subscribe(&mut client_nat, contract_key).await?;
-    await_subscribe_response(&mut client_nat, contract_key, Duration::from_secs(120)).await?;
-    tracing::info!("nat-peer SUBSCRIBE succeeded (relay registered observed addresses)");
-
-    // Give the subscription tree a moment to settle across the hops.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // NAT peer fetches the contract (with BLOCKING auto-subscribe) instead of
+    // issuing a bare SUBSCRIBE. A bare `Subscribe` would be rejected "contract
+    // WASM not cached locally" because nat-peer is the provable non-host and
+    // does not reliably receive the contract via PUT replication (the PUT
+    // replicates one hop toward the contract neighbourhood — onto the closer
+    // gateway, not nat-peer). `GET` routes *toward* the contract, so it reliably
+    // resolves on gateway/host-peer, fetches and caches the body on nat-peer,
+    // and the GET driver registers the subscription through the SAME relay path:
+    // the wire `SubscribeMsg::Request` carries no address, so each hop
+    // (`nat-peer → gateway → host-peer`) must fill the observed address from its
+    // transport `source_addr` and register the previous hop as a downstream
+    // subscriber. This is the deterministic, non-host subscribe path for issue
+    // #4524 (see module docs) — not a sleep, not a bumped timeout.
+    //
+    // `blocking_subscribe = true` is load-bearing: the GET driver awaits the
+    // subscribe child inline (`get::op_ctx_task::maybe_subscribe_child`) before
+    // publishing the `GetResponse`, so by the time the response arrives the
+    // downstream-subscriber chain is fully registered. With the non-blocking
+    // GET the subscribe is spawned fire-and-forget and the `GetResponse` can
+    // arrive *before* registration completes — then the UPDATE below could be
+    // sent too early and the notification would be missed (the original race,
+    // just relocated). Retry under CI resource pressure, mirroring the PUT.
+    const GET_MAX_ATTEMPTS: usize = 3;
+    let mut get_ok = false;
+    let mut last_get_err: Option<anyhow::Error> = None;
+    for attempt in 1..=GET_MAX_ATTEMPTS {
+        tracing::info!("nat-peer GET+subscribe attempt {attempt}/{GET_MAX_ATTEMPTS}");
+        if let Err(e) = make_get_with_blocking(
+            &mut client_nat,
+            contract_key,
+            /* return_contract_code */ true,
+            /* subscribe */ true,
+            /* blocking_subscribe */ true,
+        )
+        .await
+        {
+            last_get_err = Some(e);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+        match await_get_response(&mut client_nat, contract_key, Duration::from_secs(120)).await {
+            Ok(()) => {
+                get_ok = true;
+                break;
+            }
+            Err(e) => {
+                last_get_err = Some(e);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+    }
+    if !get_ok {
+        bail!(
+            "nat-peer GET+subscribe failed after {GET_MAX_ATTEMPTS} attempts: {:?}",
+            last_get_err
+        );
+    }
+    tracing::info!(
+        "nat-peer GET+blocking-subscribe succeeded (relay registered observed addresses)"
+    );
 
     // UPDATE the contract from host-peer (the host, a different node than the
     // subscriber). The NAT peer cannot self-deliver — it is provably not the
