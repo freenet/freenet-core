@@ -1931,8 +1931,20 @@ fn stale_sync_emit_budget(stale_contracts_len: usize) -> usize {
 /// "contract queue full" outages and gateway OOMs on 0.2.80. The ~10% headroom
 /// below 100% is reserved for the node's own locally-requested contracts, whose
 /// directed subscribes are NOT gated here. Refusal is silent and best-effort:
-/// the holder re-proposes the migration on its next trigger once headroom
-/// returns, so placement migration otherwise stays enabled (#4404).
+/// the holder re-proposes the migration on its next trigger, so placement
+/// migration resumes automatically once occupancy falls back below the ceiling.
+///
+/// Recovery is real but NOT guaranteed: occupancy only drops when cold modules
+/// age out of the LRU faster than new ones compile (the recent distinct-module
+/// byte-sum falls below the ceiling). On a node whose hosted working set
+/// genuinely exceeds the cache budget — the exact #4534 scenario — occupancy
+/// stays pinned near 100% and migration is refused INDEFINITELY by design. That
+/// is the correct conservative behavior (it stops the thrash), but it means this
+/// gate is a stopgap, not a complete fix: on such a node the operator must raise
+/// `FREENET_MODULE_CACHE_BUDGET_BYTES` to actually re-enable placement. #4534
+/// stays open for the cache-sizing / offload-compilation / interest-weighted-
+/// retention directions; this constant implements only the "couple migration
+/// acceptance to cache headroom" one.
 const MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT: u64 = 90;
 
 /// Whether to accept an inbound placement-migration hint given the current
