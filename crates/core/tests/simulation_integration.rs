@@ -3550,6 +3550,26 @@ fn run_fanout_liveness_scenario_inner(
             // Closest sim reproduction of the v0.2.73 incident: the migration
             // cascade amplifies the broadcast/summarize load under fan-out.
             sim.enable_placement_migration();
+        } else {
+            // Pin the placement-migration (`SubscribeHint`) cascade OFF for the
+            // baseline direct-star scenario.
+            //
+            // This is NOT a no-op: the cascade gates on the build version being
+            // `>= SUBSCRIBE_HINT_MIN_VERSION` (0.2.80), and this crate is already
+            // past that floor, so #4404 migration is ON by default in sim now.
+            // Left on, the host's UPDATE broadcasts nudge closer subscribers to
+            // re-host the contract and those nudges cascade among subscribers,
+            // fragmenting the intended *direct* star into a shifting multi-level
+            // tree: hosting migrates off the gateway, the host's direct-interest
+            // set no longer covers every subscriber, and a subscriber can end up
+            // hosting a different replica subset than the host — so the converged
+            // replica set is no longer deterministically `host + all subscribers`
+            // and the (e) full-participation invariant cannot hold. The
+            // `migration=false` scenario's premise is a STABLE direct star where
+            // every subscriber holds the same contract the host broadcasts, so it
+            // pins the cascade off at any build version (the migration-ON variant
+            // covers the cascade explicitly). See `disable_placement_migration`.
+            sim.disable_placement_migration();
         }
         if preseed {
             // #4233 topology preseed: wire the gateway directly to every
@@ -3578,7 +3598,7 @@ fn run_fanout_liveness_scenario_inner(
     let mut operations = Vec::new();
 
     // Bootstrap: gateway PUTs + subscribes (becomes the host/source), then every
-    // node subscribes directly to the gateway.
+    // node fetches the contract and subscribes directly to the gateway.
     operations.push(ScheduledOperation::new(
         NodeLabel::gateway(network_name, 0),
         SimOperation::Put {
@@ -3588,9 +3608,33 @@ fn run_fanout_liveness_scenario_inner(
         },
     ));
     for node_idx in 1..=subscribers {
+        // Each subscriber GETs-then-subscribes rather than issuing a bare
+        // `Subscribe`. This is REQUIRED for the subscriber to actually join the
+        // fan-out: a bare `ContractRequest::Subscribe` is rejected by the
+        // client-event handler ("Rejecting SUBSCRIBE: contract WASM not cached
+        // locally", client_events.rs) unless the node already holds the
+        // contract WASM — the production guard that forces a real client to PUT
+        // or GET the contract before subscribing (so it can validate/apply
+        // incoming updates). `GET+subscribe=true` is the documented exempt path:
+        // the GET inherently fetches the WASM+state from the host over the
+        // preseeded connection, and the same op then auto-subscribes
+        // (`auto_subscribe_on_get_response`), registering downstream interest at
+        // the host and joining the broadcast set. The topology preseed only
+        // injects ring connections, not contract state, so without the GET each
+        // subscriber's bare subscribe is rejected at t=0 and only the subset
+        // that happened to receive the contract first (via an early broadcast /
+        // the placement-migration cascade) before its paced op fires gets
+        // through — a race that strands ~half the star (the (e) participation
+        // shortfall). The genuine GET routing + subscribe + interest + broadcast
+        // machinery is exercised end-to-end; only the WASM-acquisition
+        // precondition that a real subscriber must satisfy is made explicit.
         operations.push(ScheduledOperation::new(
             NodeLabel::node(network_name, node_idx),
-            SimOperation::Subscribe { contract_id },
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: true,
+            },
         ));
     }
 
@@ -3754,6 +3798,48 @@ fn run_fanout_liveness_scenario_inner(
         convergence.converged.len(),
         convergence.diverged.len(),
     );
+
+    // (e) FULL PARTICIPATION — preseeded direct star only.
+    //
+    // `is_converged()` (d) and `stale.is_empty()` (a) are necessary but NOT
+    // sufficient: `check_convergence_from_logs` only counts peers that logged
+    // contract state and ignores contracts with < 2 replicas, so a subscriber
+    // that silently never joined the fan-out logs no state and is invisible to
+    // BOTH checks — the gate would then pass with a partial star. This assertion
+    // closes that gap by requiring the converged contract's replica set to be
+    // exactly the host plus EVERY subscriber.
+    //
+    // Scoped to the preseed path because exact participation is a structural
+    // invariant ONLY there: `preseed_direct_star` wires every subscriber
+    // directly to the host at t=0, so every subscriber's GET+subscribe must
+    // reach the host and join the broadcast set (a shortfall means a real loss —
+    // e.g. a `ConnectionManager` cap-rejected preseed connection, or a subscribe
+    // that never reached the host). The organic N=8/16 variants (preseed=false)
+    // form the star via ring-routed CONNECT, which is best-effort at this
+    // harness's bootstrap ceiling — a subscriber can legitimately fail to form
+    // its host connection ("at terminus … rejecting", the very limitation the
+    // preseed primitive exists to bypass), so requiring all N there would assert
+    // an invariant organic formation does not provide. Those variants are gated
+    // by (a)–(d) (no stale peers, bounded backlog, convergence), which hold.
+    if preseed {
+        let expected_replicas = subscribers + 1; // 1 gateway host + N subscribers
+        assert!(
+            !convergence.converged.is_empty(),
+            "#4233 participation (N={subscribers}): no contract reached the >=2-replica \
+             convergence threshold — the fan-out star did not form"
+        );
+        for c in &convergence.converged {
+            assert_eq!(
+                c.replica_count, expected_replicas,
+                "#4233 participation (N={subscribers}): converged contract {} has {} \
+                 replicas, expected {} (host + all subscribers). A subscriber never \
+                 logged contract state, so it silently dropped out of the fan-out \
+                 (preseed cap-rejection or a subscribe that never reached the host); \
+                 the liveness gate would otherwise pass vacuously.",
+                c.contract_key, c.replica_count, expected_replicas,
+            );
+        }
+    }
 
     tracing::info!(
         "#4233 fan-out liveness (N={}) PASSED: no stale peers, \
