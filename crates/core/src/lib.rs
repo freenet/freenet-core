@@ -19,7 +19,10 @@ mod message;
 
 /// Node configuration, implementations and execution (entry points for the binaries).
 mod node;
-pub use node::{EventLoopExitReason, Node, ShutdownHandle, run_local_node, run_network_node};
+pub use node::{
+    EventLoopExitReason, Node, ShutdownHandle, enable_abort_on_fatal_listener_exit, run_local_node,
+    run_network_node,
+};
 
 /// Network operation/transaction state machines.
 mod operations;
@@ -68,7 +71,7 @@ pub mod local_node {
 pub mod dev_tool {
     use super::*;
     pub use crate::config::{
-        Config, GlobalTestMetrics, KEK_SIZE, KekBackend, KekBackendKind, KekError,
+        Config, GlobalTestMetrics, KEK_SIZE, KekBackend, KekBackendKind, KekError, Secrets,
         ensure_kek_loaded, load_from_backend, read_backend_marker, replace_backend_marker,
         write_backend_marker,
     };
@@ -143,13 +146,17 @@ pub mod dev_tool {
         register_topology_snapshot, set_current_network_name, validate_topology,
         validate_topology_from_snapshots,
     };
+    pub use wasm_runtime::secret_export::{
+        BundleKeyMaterial, ExportError, ImportReport, TargetScope, export_bundle, import_bundle,
+        write_bundle_file,
+    };
     pub use wasm_runtime::secret_snapshots::{
         RestoreError, RetentionPolicy, SnapshotMetadata, list_snapshots, restore_snapshot_file,
         snapshot_dir_for_encoded, thin_snapshots,
     };
     pub use wasm_runtime::{
-        ContractStore, DelegateStore, MockStateStorage, Runtime, SecretStoreError, SecretsStore,
-        StateStore,
+        ContractStore, DelegateStore, ExportSecretEntry, MockStateStorage, Runtime, SecretScope,
+        SecretStoreError, SecretsStore, StateStore, UserSecretContext,
     };
 
     // Re-export simulation types for test infrastructure

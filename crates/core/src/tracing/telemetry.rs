@@ -233,6 +233,35 @@ struct TelemetryEvent {
     priority: EventPriority,
 }
 
+/// Best-effort runtime detection of a cargo test/bench harness.
+///
+/// Cargo builds every unit-test, integration-test and bench binary into a
+/// `deps/` directory (e.g. `target/debug/deps/operations_before_join-<hash>`)
+/// and runs it from there. The real node binary is run as `…/freenet` (from a
+/// `bin/` install dir, or `target/<profile>/freenet` under `cargo run`), whose
+/// parent directory is never `deps`. So "the current executable's parent dir is
+/// named `deps`" cleanly distinguishes a cargo test harness from a production
+/// node, regardless of which Cargo features were enabled.
+///
+/// This is the only signal that catches the documented local dev command
+/// `cargo test -p freenet` run WITHOUT `--features testing`: there the library
+/// is a plain dependency (so `cfg!(test)` is false) and the integration tests
+/// build `ConfigArgs::default()` (so `is_test_environment` is false). See
+/// issue #4366.
+///
+/// Best-effort: if `current_exe()` fails we return `false` and fall back to the
+/// compile-time guards, which already cover unit tests and CI.
+fn running_under_cargo_test() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            exe.parent()
+                .and_then(|dir| dir.file_name())
+                .map(|name| name == "deps")
+        })
+        .unwrap_or(false)
+}
+
 impl TelemetryReporter {
     /// Create a new telemetry reporter.
     ///
@@ -240,7 +269,9 @@ impl TelemetryReporter {
     /// best-effort address), used to attribute transport-level events
     /// that have no `NetLogMessage` context.
     ///
-    /// Returns None if telemetry is disabled or in a test environment.
+    /// Returns None if telemetry is disabled, in a `--id` test environment,
+    /// or in a test build/harness (`cfg(test)` / `feature = "testing"` /
+    /// running under cargo test — see `running_under_cargo_test`).
     pub fn new(config: &TelemetryConfig, local_peer_id: String) -> Option<Self> {
         if !config.enabled {
             tracing::info!("Telemetry reporting is disabled");
@@ -248,9 +279,37 @@ impl TelemetryReporter {
         }
 
         // Disable telemetry in test environments (detected via --id flag) to avoid
-        // flooding the collector with CI/integration test data.
+        // flooding the production collector with CI/integration test data.
         if config.is_test_environment {
             tracing::info!("Telemetry disabled in test environment (--id flag detected)");
+            return None;
+        }
+
+        // Belt-and-suspenders guard for test binaries that build `NodeConfig`
+        // directly without going through the `--id` CLI path, so
+        // `is_test_environment` stays false (the integration tests under
+        // `crates/core/tests/*.rs`, e.g. operations_before_join /
+        // hosted_mode_* / in_process_restart / error_notification). Without
+        // this, those tests shipped events — including simulation-loopback
+        // `get_not_found` and one-shot synthetic "gateway" peers — to the
+        // production OTLP collector at `DEFAULT_TELEMETRY_ENDPOINT`,
+        // contaminating network metrics (issue #4366).
+        //
+        // Three overlapping signals, none of which the real node binary
+        // matches, so production telemetry is unaffected:
+        //   - `cfg!(test)`: the library's own unit tests.
+        //   - `cfg!(feature = "testing")`: integration/simulation tests as
+        //     CI compiles them (`--features ...,testing`, see ci.yml /
+        //     simulation-nightly.yml).
+        //   - `running_under_cargo_test()`: a runtime check that also covers
+        //     the *documented* local dev path `cargo test -p freenet` WITHOUT
+        //     `--features testing` (AGENTS.md), where the library links as a
+        //     normal dependency so `cfg!(test)` is false and the integration
+        //     tests build `ConfigArgs::default()` (no `--id`). The real
+        //     `freenet` binary never runs from a cargo `deps/` test harness,
+        //     so it never trips this.
+        if cfg!(test) || cfg!(feature = "testing") || running_under_cargo_test() {
+            tracing::info!("Telemetry disabled in test build/harness");
             return None;
         }
 
@@ -1853,6 +1912,11 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "delegate_module_cache_total_bytes": snapshot.delegate_module_cache_total_bytes,
                 "delegate_module_cache_budget_bytes": snapshot.delegate_module_cache_budget_bytes,
                 "delegate_module_cache_evictions_total": snapshot.delegate_module_cache_evictions_total,
+                "broadcast_stream_attempts_total": snapshot.broadcast_stream_attempts_total,
+                "broadcast_stream_failures_total": snapshot.broadcast_stream_failures_total,
+                "broadcast_stream_failures_last_snapshot": snapshot.broadcast_stream_failures_last_snapshot,
+                "refresh_router_last_success_age_secs": snapshot.refresh_router_last_success_age_secs,
+                "refresh_router_consecutive_failures": snapshot.refresh_router_consecutive_failures,
                 "per_op_curves": snapshot.per_op_curves,
             })
         }
@@ -1861,7 +1925,51 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    // `TelemetryConfig` and `TelemetryReporter` come in via `super::*`.
     use super::*;
+
+    /// Regression for #4366: a test build must NOT initialize a
+    /// `TelemetryReporter` (and thus must not ship events to the production
+    /// OTLP collector) even when the config looks like a real production
+    /// node — `enabled: true`, the production `DEFAULT_TELEMETRY_ENDPOINT`,
+    /// and `is_test_environment: false`. That is exactly the config the
+    /// integration tests under `crates/core/tests/*.rs` build (via
+    /// `ConfigArgs { ..Default::default() }`, which leaves `--id` unset).
+    /// Before the fix they leaked synthetic peers / simulation-loopback
+    /// `get_not_found` events to `nova.locut.us:4318`.
+    ///
+    /// This test runs under `cfg(test)` (and via the cargo `deps/` harness),
+    /// so it pins the shared early-return that all three signals trigger —
+    /// `cfg!(test)`, `cfg!(feature = "testing")` (CI integration/sim runs),
+    /// and `running_under_cargo_test()` (the no-feature `cargo test -p freenet`
+    /// dev path). The production binary trips none of them and is unaffected.
+    #[test]
+    fn telemetry_reporter_suppressed_in_test_build() {
+        let prod_like = TelemetryConfig {
+            enabled: true,
+            endpoint: crate::config::DEFAULT_TELEMETRY_ENDPOINT.to_string(),
+            transport_snapshot_interval_secs: 30,
+            is_test_environment: false,
+            reference_ping_enabled: false,
+            iface_tx_enabled: false,
+        };
+        assert!(
+            TelemetryReporter::new(&prod_like, "peer-under-test".to_string()).is_none(),
+            "test builds must not ship telemetry to the production collector (#4366)"
+        );
+    }
+
+    /// The runtime harness detector must fire for this test binary: cargo
+    /// always runs test binaries from a `deps/` directory. This is the signal
+    /// that covers the documented `cargo test -p freenet` path run without
+    /// `--features testing`, where the compile-time guards don't apply.
+    #[test]
+    fn detects_running_under_cargo_test() {
+        assert!(
+            running_under_cargo_test(),
+            "test binaries run from a cargo deps/ dir and must be detected (#4366)"
+        );
+    }
 
     /// Pin: the manually-mirrored `router_snapshot` OTLP body
     /// (`event_kind_to_json`) must forward the node-health gauges. The body is a
@@ -1910,6 +2018,35 @@ mod tests {
             ("delegate_module_cache_total_bytes", 23),
             ("delegate_module_cache_budget_bytes", 29),
             ("delegate_module_cache_evictions_total", 31),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the UPDATE-broadcast stream-assembly gauges and the background-task
+    /// health gauges (#4440) must also reach the hand-mirrored OTLP body — same
+    /// footgun as the fd / module-cache gauges above. The broadcast
+    /// stream-assembly failure rate is the signal that flagged the v0.2.73
+    /// incident, so a silent drop here would re-blind us to a re-enable going
+    /// wrong.
+    #[test]
+    fn router_snapshot_json_includes_broadcast_and_bgtask_gauges() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.broadcast_stream_attempts_total = Some(37);
+        info.broadcast_stream_failures_total = Some(41);
+        info.broadcast_stream_failures_last_snapshot = Some(43);
+        info.refresh_router_last_success_age_secs = Some(47);
+        info.refresh_router_consecutive_failures = Some(53);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("broadcast_stream_attempts_total", 37),
+            ("broadcast_stream_failures_total", 41),
+            ("broadcast_stream_failures_last_snapshot", 43),
+            ("refresh_router_last_success_age_secs", 47),
+            ("refresh_router_consecutive_failures", 53),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
@@ -2339,10 +2476,12 @@ mod tests {
         // Sanity-check the constants the policy depends on: the sub-budget
         // must be strictly below the aggregate cap, otherwise shadow events
         // could consume the whole budget and the carve-out is meaningless.
-        assert!(
-            MAX_SHADOW_EVENTS_PER_SECOND < MAX_EVENTS_PER_SECOND,
-            "shadow sub-budget must leave room for operational events"
-        );
+        const {
+            assert!(
+                MAX_SHADOW_EVENTS_PER_SECOND < MAX_EVENTS_PER_SECOND,
+                "shadow sub-budget must leave room for operational events"
+            );
+        }
 
         let mut worker = rate_limit_test_worker();
         let now = Instant::now();

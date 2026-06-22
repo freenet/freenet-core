@@ -129,7 +129,7 @@ mod tests {
 
         // Sorting is the exact production trigger (sort_unstable in
         // calculate_estimated_usage_rate).
-        let mut rates = vec![
+        let mut rates = [
             Rate::new_per_second(3.0),
             Rate::new_per_second(1.0),
             Rate::new_per_second(2.0),

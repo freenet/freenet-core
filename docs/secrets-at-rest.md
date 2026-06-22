@@ -106,7 +106,25 @@ freenet secrets kek-rotate        --secrets-dir <path> --yes   # NOT YET IMPLEME
 freenet secrets snapshot-list     --secrets-dir <path> [--delegate <key>] [--secret <id>]
 freenet secrets snapshot-restore  --secrets-dir <path> --delegate <key> --secret <id> \
                                   --timestamp-ms <ms> [--suffix <n>] --yes
+freenet secrets export            --secrets-dir <path> --db-dir <path> \
+                                  {--local | --user-token [tok]} \
+                                  [--passphrase [p] | --use-token-key] --out <file>
+freenet secrets import   <file>   --secrets-dir <path> --db-dir <path> \
+                                  [--passphrase [p] | --use-token-key [--token tok]] \
+                                  [--local | --into-user [tok]] [--overwrite]
 ```
+
+Secret inputs (passphrase, user token) are read from a SAFE source so they
+need not appear on the command line, where they leak via the process table
+(`ps`) and shell history. For each secret the resolution order is:
+**(1)** an environment variable — `FREENET_SECRET_PASSPHRASE` for the
+passphrase, `FREENET_USER_TOKEN` for the user token; **(2)** the
+corresponding flag, if given (last-resort convenience; `--help` warns it is
+exposed); **(3)** an interactive prompt when stdin is a TTY (no-echo for the
+passphrase). In a non-interactive context with neither env nor flag set, the
+command errors rather than hanging. The default key method is the passphrase;
+`--use-token-key` selects token-keyed crypto instead (export requires
+`--user-token`; import reads `FREENET_USER_TOKEN` / `--token` / a prompt).
 
 `kek-init` opts in to a specific backend BEFORE first start. It refuses
 to run if the backend marker already exists — use `kek-migrate` after
@@ -156,6 +174,71 @@ consequence: if you restore from a snapshot older than the 2-year
 already the active secret by then) and stays reversible — the prior
 active value is captured as a fresh snapshot before the overwrite.
 
+### Export / import a portable secrets bundle (#4035, P3 of #4381)
+
+Unlike snapshot-restore, `export`/`import` move secrets BETWEEN nodes.
+`export` gathers every secret in a scope into a single encrypted file;
+`import` re-places them on another node.
+
+The primary use case is the hosted → self-host migration (#4381): a user
+who tried Freenet through a hosted gateway exports their per-user
+delegate secrets (`--user-token <tok>`) and re-imports them into their
+own peer (`import --local`). The same surface also backs up a normal
+node's single-user secrets (`export --local`).
+
+Both commands need `--secrets-dir` (the on-disk secret blobs) AND
+`--db-dir` (the node's data directory, holding the ReDb secrets index).
+The export walks the index to know what to gather, so unlike the
+snapshot commands it can't run on the secrets tree alone. The node MUST
+be stopped (the ReDb file is opened exclusively).
+
+**Scope selection.** `export` takes exactly one source scope:
+`--local` (all single-user secrets) or `--user-token <tok>` (every
+per-user secret for that one hosted user, across all delegates).
+`import` places secrets at `--local` by default (the self-host target);
+`--into-user <tok>` re-files them under a per-user scope instead.
+
+**Bundle format.** The output file is
+`[MAGIC "FNSX"][version][kdf_id][16B salt][24B nonce][AEAD]`. The AEAD
+plaintext is a CBOR document `{schema_version, source_scope,
+created_unix_secs, entries:[{delegate_key, code_hash, secret_hash,
+plaintext}]}`. The header is bound as AEAD additional data, so any
+tampering with the version / salt / nonce fails authentication cleanly.
+Each entry records the delegate key + code hash so the original
+`DelegateKey` is reconstructible on the import node — and because a
+`DelegateKey` is content-derived from the delegate's wasm+params, a
+re-installed webapp shipping the same delegate yields the same key, so
+the imported secrets line up without any per-app migration table.
+
+**Encryption at rest.** The bundle file is ALWAYS encrypted. The key is
+derived either from a user passphrase (`--passphrase`, Argon2id over the
+per-bundle salt) or from the opaque user token (`--use-token-key` on
+export / `--token` on import, HKDF-SHA256 — handy for a hosted user who
+only has their token). The two methods are not interchangeable: a
+passphrase bundle opened with token material (or vice-versa) fails
+authentication. A wrong passphrase/token (or a corrupt bundle) fails
+during the decrypt phase, before ANY write. The per-entry write loop
+itself is not transactional, so a write that fails partway leaves the
+already-written entries committed — but re-running the import is safe:
+entries are idempotent by their `(delegate, secret_hash)` key (an
+existing secret is skipped, or re-written to the same value with
+`--overwrite`), so a retry converges.
+
+**Operator sees plaintext during export.** Building the bundle requires
+the node to DECRYPT every secret in memory (it can, by construction — it
+holds the scope DEK). So an operator running `export` on a hosted node
+observes the plaintext for the duration of the export. This is inherent
+to the hosted model (the node already runs the delegate) and is flagged
+on stderr when the command runs. A user who wants zero operator exposure
+should self-host from the start rather than migrate out later. The
+bundle FILE, by contrast, is never written in plaintext.
+
+**Collision handling.** On import, a secret that already exists at the
+same delegate+id is left untouched and reported as skipped, unless
+`--overwrite` is passed (in which case the prior value is snapshotted
+first, like a normal write). `--out` on export refuses to overwrite an
+existing file.
+
 ## File permissions (PR #4195 / issue #4141)
 
 The secrets tree is owner-only on Unix:
@@ -169,6 +252,8 @@ The secrets tree is owner-only on Unix:
 | `<secrets_dir>/kek_backend` (marker)            | 0o600 |
 | `<secrets_dir>/<delegate>/`                     | 0o700 |
 | `<secrets_dir>/<delegate>/<secret_id>`          | 0o600 |
+| `<secrets_dir>/<delegate>/.keys`                | 0o600 |
+| `<secrets_dir>/<delegate>/users/<user_id>/.keys`| 0o600 |
 | `<secrets_dir>/<delegate>/.snapshots/`          | 0o700 |
 | `<secrets_dir>/<delegate>/.snapshots/<sec>/`    | 0o700 |
 | `<secrets_dir>/<delegate>/.snapshots/<sec>/*`   | 0o600 |
@@ -176,6 +261,40 @@ The secrets tree is owner-only on Unix:
 Modes are set in the same syscall as `O_CREAT` (via
 `OpenOptions::mode`), so there is no race window where a file is
 readable under the process umask.
+
+### Key-enumeration registry: `.keys` (PR #4523 / issue #4355)
+
+Each scope keeps an optional encrypted `.keys` registry that maps its
+stored secrets back to the **raw key bytes** the delegate originally
+supplied to `store_secret`. It backs the `list_secrets` delegate
+hostcall: the durable ReDb index stores only the 32-byte Blake3 hash of
+each key and secret files are hash-named, so without this registry the
+raw key (e.g. an open-ended `room:<owner_vk>` family) is recoverable
+nowhere on disk. One registry lives per scope:
+`<delegate>/.keys` for `Local`, `<delegate>/users/<user_id>/.keys` for
+each `User` scope.
+
+At-rest properties — identical discipline to the secret values it
+describes:
+
+- Encrypted under the **same scope DEK** as that scope's secret values
+  (`Local`: the delegate cipher; `User`: `derive_user_dek`), so no new
+  key material is introduced.
+- Same on-disk layout: `[VERSION_V1][24-byte XChaCha20-Poly1305
+  nonce][AEAD ciphertext + tag]`, with a **fresh per-write nonce** from
+  the OS entropy pool (no nonce reuse across rewrites).
+- Created `0o600` under the owner-only (`0o700`) scope tree, written via
+  the same tmp+fsync+rename atomic discipline (`.keys.tmp` sibling).
+- Bounded at 4096 keys per scope to cap amplification; over-cap keys are
+  still stored and readable as values but are not enumerable.
+
+The registry is **best-effort and independent of the value path**: it is
+written strictly AFTER the durable value+index commit, and a failed or
+unreadable registry only degrades future enumeration — it never blocks
+or loses a secret VALUE. A transient read error or a corrupt/undecryptable
+`.keys` blob is FAIL-SAFE: the on-disk registry is left untouched rather
+than overwritten from empty, so a momentary IO hiccup cannot permanently
+shrink the enumerable key set (it recovers on the next readable write).
 
 ### Defense-in-depth: startup umask (PR follow-up to #4196)
 
@@ -234,3 +353,88 @@ Files written under the pre-#4195 binary are NOT auto-migrated to
 existing per-secret blobs on disk should run a one-time
 `chmod -R u=rwX,go= <secrets_dir>` after upgrading to close that gap.
 Files written by the post-#4195 binary land at `0o600` directly.
+
+## Hosted mode: per-user secrets over a secure connection (#4381)
+
+Hosted mode (`--hosted-mode`, OFF by default) lets one node serve many
+untrusted web users, each getting their own per-user delegate-secret
+namespace derived from a durable `userToken` they present on the
+WebSocket upgrade. When hosted mode is OFF, `userToken` is ignored and
+every connection is single-user — byte-for-byte the pre-#4381 behavior.
+
+The `userToken` is a durable, node-independent, high-value credential:
+it names a per-user secret namespace and is valid against any hosted
+node. So the node honors it ONLY over a connection it can prove is
+secure.
+
+### The gate
+
+With hosted mode on, the per-user token is honored ONLY over a
+**loopback** connection carrying **`X-Forwarded-Proto: https`** — i.e.
+the request reached the node from `127.0.0.1` / `[::1]` and arrived with
+an `https` forwarded-proto header. That is the shape produced by a
+TLS-terminating reverse proxy running on the same host as the node:
+
+- the **loopback source** proves the proxy→node hop is local (the
+  plaintext API port was not exposed to the network for this
+  connection), and
+- the **`https` `X-Forwarded-Proto`** is positive evidence, set by the
+  TLS terminator, that the browser→proxy hop used TLS.
+
+Everything else is rejected with `403` (fail-closed):
+
+| source | `X-Forwarded-Proto` | outcome |
+|---|---|---|
+| loopback | `https` | honored |
+| loopback | missing or `http` | **403** |
+| non-loopback | any | **403** |
+| unknown | any | **403** |
+
+A direct plaintext connection — even from loopback — is refused: without
+the `https` attestation the node cannot rule out that the token crossed
+the network in cleartext. The request `Host` header is deliberately NOT
+consulted: it is proxy-rewritable (nginx's default rewrites it to the
+upstream `127.0.0.1:7509`), so it cannot grant trust; only the `https`
+`X-Forwarded-Proto` can.
+
+### Operator responsibility (REQUIRED proxy configuration)
+
+The node trusts `X-Forwarded-Proto` only from a loopback source, but it
+cannot tell a header the proxy *set* from one the proxy merely *passed
+through* from the client. Making the attestation trustworthy is the
+operator's job. The proxy fronting a hosted node MUST:
+
+1. **SET / OVERWRITE `X-Forwarded-Proto` itself**, to the real scheme of
+   the browser→proxy hop.
+2. **STRIP any client-supplied `X-Forwarded-*` headers** before
+   forwarding, so a client cannot inject its own
+   `X-Forwarded-Proto: https`.
+
+- **Caddy** does both by default — it sets `X-Forwarded-Proto` and does
+  not pass through a client-supplied value. No extra configuration
+  needed.
+- **nginx** requires `proxy_set_header X-Forwarded-Proto $scheme;` (a
+  literal `proxy_set_header X-Forwarded-Proto https;` is fine for an
+  HTTPS-only server block) AND must NOT forward a client-supplied
+  `X-Forwarded-Proto`. nginx forwards unknown client request headers by
+  default, so an explicit `proxy_set_header` that overwrites the value is
+  the mechanism that also stops pass-through — make sure no `http`/server
+  block leaks the client value through.
+
+### Security note (known limitation)
+
+The node trusts `X-Forwarded-Proto` from a loopback source. If the proxy
+is **misconfigured to forward a client-supplied `X-Forwarded-Proto:
+https` over a plaintext listener**, a client could spoof the TLS
+attestation and the token would be honored over cleartext. The node
+cannot detect this pass-through misconfiguration — it sees a loopback
+source and an `https` header and has no way to know the header came from
+the client rather than the proxy.
+
+Correct proxy configuration (set-and-strip, above) is therefore the
+operator's responsibility. This is an accepted limitation, not a
+shared-secret handshake: the early hosted operators are the Freenet team,
+who control their own proxy configuration. A developer testing hosted
+mode locally must likewise front the node with a TLS proxy or send the
+header manually (`curl -H 'X-Forwarded-Proto: https'` from loopback) — a
+plain plaintext loopback request is refused.

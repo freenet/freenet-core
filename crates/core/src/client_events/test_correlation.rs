@@ -34,6 +34,7 @@ mod tests {
             notification_channel: None,
             token: None,
             origin_contract: None,
+            user_context: None,
         };
 
         assert_eq!(req.request_id, request_id);

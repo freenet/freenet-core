@@ -1,0 +1,53 @@
+name: Lint server web assets
+
+# Prettier + ESLint over the JS/CSS/HTML the gateway server serves to clients.
+# These assets used to be embedded as Rust raw-string consts; issue #4017
+# extracted them into real files (loaded via include_str!) so they can be
+# linted. This workflow guards their syntax/style going forward.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/core/src/server/**/assets/**'
+      - 'crates/core/src/server/package.json'
+      - 'crates/core/src/server/package-lock.json'
+      - 'crates/core/src/server/.prettierrc.json'
+      - 'crates/core/src/server/.prettierignore'
+      - 'crates/core/src/server/eslint.config.mjs'
+      - '.github/workflows/lint-assets.yml'
+  pull_request:
+    paths:
+      - 'crates/core/src/server/**/assets/**'
+      - 'crates/core/src/server/package.json'
+      - 'crates/core/src/server/package-lock.json'
+      - 'crates/core/src/server/.prettierrc.json'
+      - 'crates/core/src/server/.prettierignore'
+      - 'crates/core/src/server/eslint.config.mjs'
+      - '.github/workflows/lint-assets.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  lint-assets:
+    name: Prettier + ESLint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: crates/core/src/server/package-lock.json
+
+      - name: Install dependencies
+        working-directory: crates/core/src/server
+        run: npm ci
+
+      - name: Lint (Prettier --check + ESLint)
+        working-directory: crates/core/src/server
+        run: npm run lint

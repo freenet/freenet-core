@@ -53,7 +53,7 @@ jobs:
     if: github.event_name == 'pull_request'
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -88,7 +88,7 @@ jobs:
     # Run in parallel with conventional_commits (both are fast GitHub-hosted checks)
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -157,6 +157,16 @@ jobs:
       - name: Self-test deploy-local-gateway verify_service
         run: bash scripts/release-agent/deploy-local-gateway_test.sh
 
+      # Regression gate for the release-announce River post (the
+      # v0.2.74/v0.2.75 incident: the announce raced the gateway self-update,
+      # a WS-port probe passed, but riverctl's room GET hit a mid-teardown
+      # node and failed "room not found" while the workflow showed green).
+      # The readiness poll (wait_for_room), owner-signing, and logging
+      # functions are extracted verbatim from announce-to-river.sh and
+      # exercised here, so the script and its test cannot drift.
+      - name: Self-test announce-to-river
+        run: bash scripts/release-agent/announce-to-river_test.sh
+
       - name: Check for old-style mod.rs files
         run: |
           # New modules must use foo.rs + foo/ style, not foo/mod.rs
@@ -216,9 +226,15 @@ jobs:
     if: github.event_name == 'pull_request'
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
+      # Self-test the rule #6 blocking-send linter (good/bad fixtures) so a
+      # regression in the matcher fails CI before it can let a real offender
+      # through or wrongly flag clean code.
+      - name: Rule #6 linter self-test
+        run: python3 .github/scripts/check_blocking_sends.py --self-test
 
       - name: Check for banned patterns in new code
         env:
@@ -256,6 +272,20 @@ jobs:
             ERRORS="$ERRORS
           ERROR: tokio::net::UdpSocket used in crates/core/ — use Socket trait instead
           $(echo "$ADDED" | grep -n 'tokio::net::UdpSocket')"
+          fi
+
+          # 6. Blocking .send(...).await on an event-loop-reachable bounded
+          # channel sender (the #4145/#4231/#4466 incident class). Implemented
+          # as a Python linter so it can span multi-line statements, skip
+          # string-literal / comment contents, catch the P2pBridge::send wrapper
+          # form, and honour a `// channel-safety: ok` annotation on the call
+          # line OR the line above. The linter has its own --self-test (run as
+          # the "Rule #6 linter self-test" step above). Diff-scoped to ADDED
+          # lines only. See .claude/rules/channel-safety.md and
+          # .github/scripts/check_blocking_sends.py.
+          if ! BLOCKING_OUT=$(python3 .github/scripts/check_blocking_sends.py "$BASE" "$HEAD"); then
+            ERRORS="$ERRORS
+          $BLOCKING_OUT"
           fi
 
           # 4. Deleted test functions (removed #[test], #[tokio::test],
@@ -306,10 +336,22 @@ jobs:
 
           if [ "$IS_FIX" -gt 0 ] && [ "$HAS_EXEMPT_LABEL" -eq 0 ]; then
             NEW_TESTS=$(echo "$ALL_ADDED_STRIPPED" | grep -cE "$TEST_ATTR_RE" || true)
-            if [ "$NEW_TESTS" -eq 0 ]; then
+            # Some fixes are to shell tooling (e.g. scripts/release-agent/*.sh),
+            # whose regression tests are shell *_test.sh self-tests run in CI,
+            # not Rust #[test]s. Count added assertion lines (`check ...`) in
+            # added *_test.sh files so such fixes aren't forced to claim
+            # test-exempt. Without this, a genuine shell regression test scores
+            # zero against TEST_ATTR_RE (Rust-only) and the fix is wrongly
+            # rejected — the gap that hid the announce-to-river fix's own test.
+            NEW_SHELL_TESTS=$(git diff "$BASE"..."$HEAD" -- '**/*_test.sh' \
+              | grep -E '^\+' | grep -vF '+++' \
+              | grep -cE '^\+[[:space:]]*check[[:space:]]' || true)
+            if [ "$NEW_TESTS" -eq 0 ] && [ "$NEW_SHELL_TESTS" -eq 0 ]; then
               ERRORS="$ERRORS
           ERROR: fix: PR must include at least one new regression test
           Add a test that reproduces the bug (fails without fix, passes with fix).
+          A Rust #[test]/#[tokio::test]/etc. or an added 'check' assertion in a
+          *_test.sh self-test both satisfy this.
           If this fix genuinely cannot have a test, add the 'test-exempt' label with a justification comment."
             fi
           fi
@@ -338,7 +380,7 @@ jobs:
       RUST_MIN_STACK: 268435456
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install mold linker
         run: |
@@ -371,7 +413,7 @@ jobs:
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -409,7 +451,7 @@ jobs:
       RUST_MIN_STACK: 268435456
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install mold linker
         run: |
@@ -530,7 +572,7 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         if: steps.skip_check.outputs.skip != 'true'
 
       - name: Install mold linker
@@ -774,7 +816,7 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         if: steps.skip_check.outputs.skip != 'true'
 
       - name: Install dependencies
@@ -850,7 +892,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 10
           ref: ${{ github.event.pull_request.head.ref }}
@@ -925,7 +967,7 @@ jobs:
     # job to an already-red run (parity with the nightly notify job).
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/river-dev-notify
         with:
           message: "🚨 main CI failed — ${{ github.repository }}@${{ github.sha }} — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

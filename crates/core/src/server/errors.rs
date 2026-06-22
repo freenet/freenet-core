@@ -160,33 +160,7 @@ impl IntoResponse for WebSocketApiError {
 /// duplicating that rendering here we redirect with a meta-refresh. The 503 status
 /// code (set by the caller) tells programmatic clients the node is not yet ready.
 fn connecting_page() -> String {
-    r#"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta http-equiv="refresh" content="3;url=/">
-    <title>Connecting to Freenet</title>
-    <link rel="icon" href="https://freenet.org/favicon.ico">
-    <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-               display: flex; justify-content: center; align-items: center; min-height: 100vh;
-               margin: 0; background: #f5f5f5; }
-        .container { text-align: center; padding: 2rem; }
-        .logo { width: 80px; height: 80px; margin-bottom: 1.5rem; }
-        h1 { color: #333; font-size: 1.5rem; margin-bottom: 0.5rem; }
-        p { color: #666; line-height: 1.5; }
-        a { color: #1976D2; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <img src="https://freenet.org/freenet_logo.svg" alt="Freenet" class="logo">
-        <h1>Connecting to Freenet...</h1>
-        <p>Redirecting to the <a href="/">dashboard</a>...</p>
-    </div>
-</body>
-</html>"#
-        .to_string()
+    include_str!("errors/assets/connecting.html").to_string()
 }
 
 /// How often the retry page reloads (seconds).  Long enough for a

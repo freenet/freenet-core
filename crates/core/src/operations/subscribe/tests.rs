@@ -464,3 +464,38 @@ fn test_subscribe_msg_response_hop_count_roundtrip() {
         }
     }
 }
+
+/// Pin: the inbound `SubscribeHint` arm in `node.rs` MUST consult the
+/// backpressure-aware migration-admission gate (`migration_admission_allowed`)
+/// BEFORE calling `start_directed_subscribe`. Without this gate the node accepts
+/// unbounded placement migration, overruns the module cache, and reproduces the
+/// #4534 "contract queue full" outage / gateway OOM. Anchored from this side so
+/// removing or reordering the gate trips the build.
+#[test]
+fn subscribe_hint_arm_gates_migration_on_cache_backpressure() {
+    const SOURCE: &str = include_str!("../../node.rs");
+    let anchor = "NetMessageV1::SubscribeHint(hint) => {";
+    let branch_start = SOURCE
+        .find(anchor)
+        .expect("SubscribeHint arm not found in node.rs");
+    let next_variant = "NetMessageV1::Aborted(tx) => {";
+    let window_end = SOURCE[branch_start..]
+        .find(next_variant)
+        .expect("could not find end of SubscribeHint arm")
+        + branch_start;
+    let window = &SOURCE[branch_start..window_end];
+
+    let gate = window.find("migration_admission_allowed(").expect(
+        "SubscribeHint arm must call `migration_admission_allowed` to gate \
+         placement migration on module-cache backpressure (#4534)",
+    );
+    let subscribe = window
+        .find("start_directed_subscribe(")
+        .expect("SubscribeHint arm must call `start_directed_subscribe` to act on the hint");
+    assert!(
+        gate < subscribe,
+        "the migration-admission gate must run BEFORE start_directed_subscribe, \
+         else the node starts hosting the migrated contract before checking cache \
+         headroom (#4534)"
+    );
+}

@@ -22,6 +22,7 @@ use tracing::Instrument;
 use either::Either;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
 use parking_lot::{Mutex, RwLock};
+use tokio_util::sync::CancellationToken;
 
 pub use hosting::{
     AddClientSubscriptionResult, ClientDisconnectResult, SubscribeResult,
@@ -36,10 +37,47 @@ use crate::tracing::{NetEventLog, NetEventRegister};
 use crate::transport::TransportPublicKey;
 use crate::util::{Contains, time_source::InstantTimeSrc};
 use crate::{
-    config::{GlobalExecutor, GlobalRng},
+    config::{GlobalExecutor, GlobalRng, OPERATION_TTL},
     message::Transaction,
     node::{self, EventLoopNotificationsSender, NodeConfig, OpManager, PeerId},
     router::Router,
+};
+
+// Issue #4350 invariants, pinned at compile time so a future edit to any of the
+// renewal-timing constants can't silently reopen the discarded-reply bug. The
+// outer cancel deadline is defined in `renewal_outer_cancel` as exactly
+// `RENEWAL_TASK_BUDGET + NOTIFICATION_SEND_TIMEOUT + RENEWAL_OUTER_DEADLINE_MARGIN`,
+// so it clears the driver's worst case (a full-budget slow attempt plus a fully
+// backpressured `release_pending_op_slot` cleanup) by exactly the margin. These
+// asserts pin the surrounding relationships that definition depends on.
+const _: () = {
+    let budget = Ring::RENEWAL_TASK_BUDGET.as_secs();
+    // The cleanup-headroom margin must be non-zero: the outer cancel
+    // (= budget + cleanup + margin) has to be STRICTLY greater than the
+    // worst-case self-termination time (budget + cleanup), or it could fire
+    // exactly as cleanup completes (issue #4350, Codex review).
+    assert!(
+        Ring::RENEWAL_OUTER_DEADLINE_MARGIN.as_secs() > 0,
+        "RENEWAL_OUTER_DEADLINE_MARGIN must be > 0 so the outer cancel strictly \
+         exceeds BUDGET + cleanup timeout (issue #4350)"
+    );
+    // A renewal must be allowed at least one real attempt: the no-start floor
+    // has to sit below the total budget.
+    assert!(
+        Ring::RENEWAL_MIN_ATTEMPT_BUDGET.as_secs() < budget,
+        "RENEWAL_MIN_ATTEMPT_BUDGET must be < RENEWAL_TASK_BUDGET (issue #4350)"
+    );
+    // No single attempt may exceed the total budget.
+    assert!(
+        Ring::RENEWAL_PER_ATTEMPT_TIMEOUT.as_secs() <= budget,
+        "RENEWAL_PER_ATTEMPT_TIMEOUT must be <= RENEWAL_TASK_BUDGET (issue #4350)"
+    );
+    // The per-attempt renewal wait stays below the global operation TTL so a
+    // renewal never out-waits a normal client subscribe attempt.
+    assert!(
+        Ring::RENEWAL_PER_ATTEMPT_TIMEOUT.as_secs() < OPERATION_TTL.as_secs(),
+        "RENEWAL_PER_ATTEMPT_TIMEOUT must be < OPERATION_TTL (issue #4350)"
+    );
 };
 
 mod broken_invariants;
@@ -160,6 +198,28 @@ pub(crate) struct Ring {
     /// Directory for persisting the peer address cache. When set, the peer cache
     /// is periodically saved here and loaded on startup for fast reconnection.
     pub(crate) peer_cache_dir: Option<std::path::PathBuf>,
+    /// Per-node compiled-WASM module-cache occupancy + eviction telemetry
+    /// (#4440). Constructed once here and threaded as an `Arc`: the
+    /// `RuntimePool` clones it (via `op_manager.ring`) into its labeled module
+    /// caches, which *publish* into it; the `emit_router_snapshot_telemetry`
+    /// task *reads* it. Threading the `Arc` (rather than a process-global)
+    /// keeps the gauges per-node so unit tests stay isolated (#4488).
+    module_cache_metrics: Arc<crate::wasm_runtime::ModuleCacheMetrics>,
+    /// Shutdown signal for the long-lived background tasks spawned in
+    /// [`Ring::new`]. Triggered once on node teardown (via
+    /// [`Ring::trigger_shutdown`], fired from `ShutdownTeardown::drop`).
+    ///
+    /// Every long sleep / `interval.tick()` in those loops races this token
+    /// via `tokio::select!` so a shutdown returns promptly instead of waiting
+    /// for the longest outstanding sleep to elapse (up to 5 minutes for
+    /// `interest_heartbeat`). See issue #4278 and
+    /// `.claude/rules/code-style.md` ("Backoff sleeps MUST be interruptible").
+    ///
+    /// `CancellationToken` is level-triggered: once cancelled, every present
+    /// and future `cancelled()` await returns immediately, so there is no
+    /// missed-wakeup race for a task that is between sleeps when shutdown
+    /// fires.
+    shutdown: CancellationToken,
 }
 
 // /// A data type that represents the fact that a peer has been blacklisted
@@ -244,6 +304,41 @@ fn classify_op_manager_ref<T>(slot: &RwLock<Option<Weak<T>>>) -> OpManagerState<
     }
 }
 
+/// Race an `.await` point in a background loop against the Ring shutdown
+/// token. Returns `true` if shutdown fired (the caller should stop its loop)
+/// and `false` if the wrapped future completed first (carry on).
+///
+/// This is the single chokepoint that makes every long sleep / `interval.tick()`
+/// in the [`Ring::new`] background tasks interruptible (issue #4278). Keeping it
+/// in one place means a new loop only has to call this helper to satisfy the
+/// `.claude/rules/code-style.md` "backoff sleeps MUST be interruptible" rule.
+///
+/// `CancellationToken::cancelled` is cancellation-safe and level-triggered, so
+/// wrapping it in `select!` here introduces no missed-wakeup window: if the
+/// token is already cancelled when this is called, the shutdown arm wins
+/// immediately.
+///
+/// **`biased;` justification** (per `.claude/rules/code-style.md`):
+/// - *Why biased:* shutdown must deterministically win when both the timer and
+///   the token are ready in the same poll, so a teardown is never delayed by an
+///   extra sleep cycle.
+/// - *Starvation:* none. The non-shutdown arm is a one-shot timer (`sleep` /
+///   `interval.tick()`), not a high-throughput channel, and the shutdown arm is
+///   terminal (the caller breaks its loop on `true`). No hot arm exists for the
+///   bias to starve, so no per-iteration cap is needed.
+/// - *Cancellation safety:* both arms are cancellation-safe — dropping the
+///   loser (a timer future or `cancelled()`) discards no work.
+async fn sleep_or_shutdown<F>(shutdown: &CancellationToken, wait: F) -> bool
+where
+    F: std::future::Future<Output = ()>,
+{
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => true,
+        _ = wait => false,
+    }
+}
+
 /// Result of pruning a connection.
 #[derive(Debug, Default)]
 pub struct PruneConnectionResult {
@@ -284,11 +379,21 @@ impl Ring {
             Self::DEFAULT_MAX_HOPS_TO_LIVE
         };
 
+        // Single shutdown signal for every long-lived background task spawned
+        // below. Created up front so `refresh_router` (spawned before the
+        // `Ring` struct literal exists) shares the same token that gets moved
+        // into the struct. See issue #4278.
+        let shutdown = CancellationToken::new();
+
         let router = Arc::new(RwLock::new(Router::new(&[])));
         crate::node::network_status::set_router(router.clone());
         task_monitor.register(
             "refresh_router",
-            GlobalExecutor::spawn(Self::refresh_router(router.clone(), event_register.clone())),
+            GlobalExecutor::spawn(Self::refresh_router(
+                router.clone(),
+                event_register.clone(),
+                shutdown.clone(),
+            )),
         );
 
         // Interval for topology snapshot registration (1 second in test mode)
@@ -339,6 +444,11 @@ impl Ring {
             contract_connect_backoff: Mutex::new(HashMap::new()),
             time_source,
             peer_cache_dir,
+            // One sink per node, shared with the module caches via the `Arc`
+            // (the `RuntimePool` reaches it through `op_manager.ring`). See
+            // the field docs and #4488.
+            module_cache_metrics: Arc::new(crate::wasm_runtime::ModuleCacheMetrics::new()),
+            shutdown,
         };
 
         if let Some(loc) = config.location {
@@ -460,6 +570,32 @@ impl Ring {
 
     pub fn attach_op_manager(&self, op_manager: &Arc<OpManager>) {
         self.op_manager.write().replace(Arc::downgrade(op_manager));
+    }
+
+    /// Shared per-node module-cache telemetry sink (#4440 / #4488). The
+    /// `RuntimePool` clones this into its labeled module caches (which publish
+    /// occupancy/eviction into it) while the snapshot task reads it; threading
+    /// this `Arc` is what replaced the old `MODULE_CACHE_METRICS` process-global.
+    pub(crate) fn module_cache_metrics(&self) -> Arc<crate::wasm_runtime::ModuleCacheMetrics> {
+        self.module_cache_metrics.clone()
+    }
+
+    /// Signal the long-lived background tasks (spawned in [`Ring::new`]) to
+    /// shut down. Idempotent and thread-safe — calling it more than once, or
+    /// from multiple threads, is a no-op after the first call.
+    ///
+    /// Fired from `ShutdownTeardown::drop` on every `run_node` exit path so a
+    /// graceful (or error-triggered) shutdown doesn't wait for the longest
+    /// outstanding sleep in those loops to elapse. See issue #4278.
+    pub(crate) fn trigger_shutdown(&self) {
+        self.shutdown.cancel();
+    }
+
+    /// A clone of the background-task shutdown token. Long-lived loops race
+    /// their sleeps against [`CancellationToken::cancelled`] on this token via
+    /// `tokio::select!`.
+    fn shutdown_token(&self) -> CancellationToken {
+        self.shutdown.clone()
     }
 
     fn upgrade_op_manager(&self) -> Option<Arc<OpManager>> {
@@ -584,15 +720,24 @@ impl Ring {
     /// initiate a CONNECT toward the contract's ring location to merge
     /// disconnected subscription subtrees.
     async fn contract_directed_connects(ring: Arc<Self>, interval: Duration) {
+        let shutdown = ring.shutdown_token();
         // Random initial delay to prevent thundering herd.
         let initial_delay = Duration::from_secs(GlobalRng::random_range(30u64..=60u64));
-        tokio::time::sleep(initial_delay).await;
+        if sleep_or_shutdown(&shutdown, tokio::time::sleep(initial_delay)).await {
+            return;
+        }
 
         let mut tick_interval = tokio::time::interval(interval);
         tick_interval.tick().await; // skip first immediate tick
 
         loop {
-            tick_interval.tick().await;
+            if sleep_or_shutdown(&shutdown, async {
+                tick_interval.tick().await;
+            })
+            .await
+            {
+                return;
+            }
 
             // Skip if we have too few connections to be meaningful.
             let conn_count = ring.connection_manager.connection_count();
@@ -738,12 +883,13 @@ impl Ring {
     ///   3. Logs the network-norms summary (median, MAD, threshold,
     ///      sample size) at DEBUG so a busy node doesn't spam INFO.
     ///
-    /// **Cancellation safety:** the loop's only `.await` points are
-    /// `tokio::time::sleep` / `interval.tick()`. No channel sends, no
-    /// long-running operations — the design-doc rule that "the
-    /// dashboard reflects the back-end" is respected here too: the
-    /// reaper writes governance state; readers consume it
-    /// asynchronously.
+    /// **Cancellation safety:** the loop's only `.await` points are the
+    /// shutdown-raced `tokio::time::sleep` / `interval.tick()` (via
+    /// [`sleep_or_shutdown`]). No channel sends, no long-running operations —
+    /// the design-doc rule that "the dashboard reflects the back-end" is
+    /// respected here too: the reaper writes governance state; readers consume
+    /// it asynchronously. On shutdown the loop returns immediately rather than
+    /// finishing the current sleep (#4278).
     async fn governance_reaper_loop(ring: Arc<Self>) {
         // Initial delay so a fleet-wide restart doesn't have every node
         // ticking in lockstep. Derived from the node's own ring location
@@ -762,14 +908,23 @@ impl Ring {
             .unwrap_or(0.5);
         let initial_delay_secs = 30 + ((own_loc * 60.0) as u64);
         let initial_delay = Duration::from_secs(initial_delay_secs);
-        tokio::time::sleep(initial_delay).await;
+        let shutdown = ring.shutdown_token();
+        if sleep_or_shutdown(&shutdown, tokio::time::sleep(initial_delay)).await {
+            return;
+        }
 
         let mut interval = tokio::time::interval(GOVERNANCE_TICK_INTERVAL);
         interval.tick().await; // Skip first immediate tick.
         let mut last_tick = ring.time_source.now();
 
         loop {
-            interval.tick().await;
+            if sleep_or_shutdown(&shutdown, async {
+                interval.tick().await;
+            })
+            .await
+            {
+                return;
+            }
             let now = ring.time_source.now();
             let elapsed = now.saturating_duration_since(last_tick);
             last_tick = now;
@@ -879,15 +1034,24 @@ impl Ring {
     async fn interest_heartbeat(ring: Arc<Self>) {
         use crate::ring::interest::INTEREST_HEARTBEAT_INTERVAL;
 
+        let shutdown = ring.shutdown_token();
         // Random initial delay to prevent synchronized heartbeats across peers
         let initial_delay = Duration::from_secs(GlobalRng::random_range(15u64..=45u64));
-        tokio::time::sleep(initial_delay).await;
+        if sleep_or_shutdown(&shutdown, tokio::time::sleep(initial_delay)).await {
+            return;
+        }
 
         let mut interval = tokio::time::interval(INTEREST_HEARTBEAT_INTERVAL);
         interval.tick().await; // Skip first immediate tick
 
         loop {
-            interval.tick().await;
+            if sleep_or_shutdown(&shutdown, async {
+                interval.tick().await;
+            })
+            .await
+            {
+                return;
+            }
 
             let Some(op_manager) = ring.upgrade_op_manager() else {
                 continue;
@@ -951,9 +1115,13 @@ impl Ring {
                 }
                 peers_sent += 1;
 
-                // Spread sends evenly across the interval (skip delay after last)
-                if i + 1 < num_peers {
-                    tokio::time::sleep(spread_delay).await;
+                // Spread sends evenly across the interval (skip delay after last).
+                // `spread_delay` can be many seconds when peer count is low, so
+                // race it against shutdown too (#4278).
+                if i + 1 < num_peers
+                    && sleep_or_shutdown(&shutdown, tokio::time::sleep(spread_delay)).await
+                {
+                    return;
                 }
             }
 
@@ -984,12 +1152,23 @@ impl Ring {
     /// for the isotonic estimators to converge.
     const ROUTER_HISTORY_LIMIT: usize = 10_000;
 
-    async fn refresh_router<ER: NetEventRegister>(router: Arc<RwLock<Router>>, register: ER) {
+    async fn refresh_router<ER: NetEventRegister>(
+        router: Arc<RwLock<Router>>,
+        register: ER,
+        shutdown: CancellationToken,
+    ) {
         // Load routing history immediately on startup so the router doesn't
         // start cold — without this, peers route suboptimally for ~5 minutes
         // until the first periodic refresh.
+        //
+        // Health gauge (#4440): the startup read is recorded too, with the same
+        // semantics as the periodic loop (any Ok read = success, empty or not).
+        // Without this, a node whose startup read succeeds but whose every later
+        // periodic refresh fails would report `last_success_age_secs == null`
+        // forever — masking that it did succeed once.
         match register.get_router_events(Self::ROUTER_HISTORY_LIMIT).await {
             Ok(history) if !history.is_empty() => {
+                BACKGROUND_TASK_HEALTH.record_refresh_router_success();
                 tracing::info!(
                     events = history.len(),
                     "Restored routing history from event log"
@@ -997,9 +1176,11 @@ impl Ring {
                 *router.write() = Router::new(&history);
             }
             Ok(_) => {
+                BACKGROUND_TASK_HEALTH.record_refresh_router_success();
                 tracing::debug!("No routing history to restore on startup");
             }
             Err(error) => {
+                BACKGROUND_TASK_HEALTH.record_refresh_router_failure();
                 tracing::warn!(%error, "Failed to load routing history on startup, starting cold");
             }
         }
@@ -1007,9 +1188,24 @@ impl Ring {
         let mut interval = tokio::time::interval(Duration::from_secs(60 * 5));
         interval.tick().await;
         loop {
-            interval.tick().await;
+            if sleep_or_shutdown(&shutdown, async {
+                interval.tick().await;
+            })
+            .await
+            {
+                return;
+            }
             let history = match register.get_router_events(Self::ROUTER_HISTORY_LIMIT).await {
-                Ok(h) => h,
+                Ok(h) => {
+                    // Health gauge (#4440): a successful read clears the
+                    // consecutive-failure run and stamps the last-success time so
+                    // a *persistently* failing refresh (silent since the #4438
+                    // non-fatal hotfix) becomes observable on the snapshot
+                    // cadence. The read succeeded regardless of whether the
+                    // history is empty, so record success here, not below.
+                    BACKGROUND_TASK_HEALTH.record_refresh_router_success();
+                    h
+                }
                 Err(error) => {
                     // get_router_events errors are transient and recoverable —
                     // e.g. file-descriptor exhaustion ("os error 24") when the
@@ -1020,6 +1216,11 @@ impl Ring {
                     // panic inside this task is still caught by the
                     // BackgroundTaskMonitor — only this expected, transient read
                     // failure is swallowed here.)
+                    //
+                    // Health gauge (#4440): bump the consecutive-failure run so
+                    // the escalation #4438 deliberately left non-fatal is at
+                    // least visible in telemetry.
+                    BACKGROUND_TASK_HEALTH.record_refresh_router_failure();
                     tracing::error!(
                         error = %error,
                         "Failed to refresh routing history from event log; \
@@ -1039,12 +1240,27 @@ impl Ring {
     /// This captures the isotonic regression curves and model state, including the
     /// connect forward estimator if available via OpManager.
     async fn emit_router_snapshot_telemetry(ring: Arc<Self>, interval_duration: Duration) {
+        let shutdown = ring.shutdown_token();
         let mut interval = tokio::time::interval(interval_duration);
         // Skip the first immediate tick
         interval.tick().await;
 
+        // Previous lifetime broadcast-stream-failure count, so each snapshot can
+        // emit the per-window delta directly (#4440) without a stateful
+        // collector. Loop-local because this task is the sole reader; the
+        // monotonic totals are still emitted for collector-side differencing.
+        let mut prev_broadcast_stream_failures_total: u64 = crate::node::BROADCAST_STREAM_METRICS
+            .snapshot()
+            .streaming_failures_total;
+
         loop {
-            interval.tick().await;
+            if sleep_or_shutdown(&shutdown, async {
+                interval.tick().await;
+            })
+            .await
+            {
+                return;
+            }
 
             let mut snapshot = ring.router.read().snapshot();
 
@@ -1069,9 +1285,10 @@ impl Ring {
             snapshot.fd_soft_limit = fd_soft_limit;
 
             // Compiled-WASM module-cache occupancy + eviction gauges (#4440),
-            // read from the process-global the caches publish into (they live
-            // behind the contract-handler channel, unreachable from here).
-            let mc = crate::wasm_runtime::MODULE_CACHE_METRICS.snapshot();
+            // read from the per-node `Arc` the caches publish into (they live
+            // behind the contract-handler channel, unreachable from here; the
+            // `RuntimePool` shares this `Arc` via `op_manager.ring`).
+            let mc = ring.module_cache_metrics.snapshot();
             snapshot.contract_module_cache_entries = Some(mc.contract_entries);
             snapshot.contract_module_cache_total_bytes = Some(mc.contract_total_bytes);
             snapshot.contract_module_cache_budget_bytes = Some(mc.contract_budget_bytes);
@@ -1080,6 +1297,27 @@ impl Ring {
             snapshot.delegate_module_cache_total_bytes = Some(mc.delegate_total_bytes);
             snapshot.delegate_module_cache_budget_bytes = Some(mc.delegate_budget_bytes);
             snapshot.delegate_module_cache_evictions_total = Some(mc.delegate_evictions_total);
+
+            // UPDATE-broadcast stream-assembly failure gauge (#4440): the exact
+            // signal that flagged the v0.2.73 incident. The broadcast queue
+            // publishes monotonic totals into the process-global; emit the totals
+            // (for collector-side differencing) plus the per-window failure delta
+            // sampled here.
+            let bs = crate::node::BROADCAST_STREAM_METRICS.snapshot();
+            let broadcast_stream_failures_delta = window_delta(
+                bs.streaming_failures_total,
+                &mut prev_broadcast_stream_failures_total,
+            );
+            snapshot.broadcast_stream_attempts_total = Some(bs.streaming_attempts_total);
+            snapshot.broadcast_stream_failures_total = Some(bs.streaming_failures_total);
+            snapshot.broadcast_stream_failures_last_snapshot =
+                Some(broadcast_stream_failures_delta);
+
+            // Background-task health gauges (#4440): make a persistently-failing
+            // (but non-fatal, post-#4438) `refresh_router` observable.
+            let rr_health = BACKGROUND_TASK_HEALTH.refresh_router_snapshot();
+            snapshot.refresh_router_last_success_age_secs = rr_health.last_success_age_secs;
+            snapshot.refresh_router_consecutive_failures = Some(rr_health.consecutive_failures);
 
             tracing::info!(
                 failure_events = snapshot.failure_events,
@@ -1091,6 +1329,11 @@ impl Ring {
                 contract_module_cache_entries = mc.contract_entries,
                 contract_module_cache_total_bytes = mc.contract_total_bytes,
                 contract_module_cache_evictions_total = mc.contract_evictions_total,
+                broadcast_stream_attempts_total = bs.streaming_attempts_total,
+                broadcast_stream_failures_total = bs.streaming_failures_total,
+                broadcast_stream_failures_last_snapshot = broadcast_stream_failures_delta,
+                refresh_router_last_success_age_secs = ?rr_health.last_success_age_secs,
+                refresh_router_consecutive_failures = rr_health.consecutive_failures,
                 "router_snapshot"
             );
 
@@ -1107,12 +1350,19 @@ impl Ring {
     /// This enables the telemetry dashboard to reconstruct historical subscription trees
     /// and show accurate subscription state at any point in time.
     async fn emit_subscription_state_telemetry(ring: Arc<Self>, interval_duration: Duration) {
+        let shutdown = ring.shutdown_token();
         let mut interval = tokio::time::interval(interval_duration);
         // Skip the first immediate tick
         interval.tick().await;
 
         loop {
-            interval.tick().await;
+            if sleep_or_shutdown(&shutdown, async {
+                interval.tick().await;
+            })
+            .await
+            {
+                return;
+            }
 
             // Get subscription states from the new lease-based model
             let subscription_states = ring.get_subscription_states();
@@ -1165,6 +1415,75 @@ impl Ring {
     /// but failed to establish subscription (no upstream in subscription tree).
     pub(crate) const SUBSCRIPTION_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 
+    /// Total wall-clock budget the renewal driver gives **itself** across all
+    /// of a renewal's network attempts.
+    ///
+    /// Issue #4350: `recover_orphaned_subscriptions` wraps each renewal task in
+    /// an outer cancel deadline ([`Self::renewal_outer_cancel`]), but the
+    /// renewal driver's per-attempt network wait used the global
+    /// [`OPERATION_TTL`] (60 s) while the old outer deadline was only 25 s. A
+    /// peer answering between 25 s and 60 s was killed by the outer cancel
+    /// *mid-await* — the in-flight reply then landed on the renewal task's
+    /// already-dropped capacity-1 receiver (the dominant source of
+    /// `try_forward_driver_reply` closed-receiver drops; log-level fixed in
+    /// PR #4351). The driver now clamps **each** attempt's timeout to the budget
+    /// remaining until this deadline, so no attempt — first or retry — can still
+    /// be awaiting when the outer cancel fires.
+    ///
+    /// Derived from the config interval (most of one recovery cycle) rather than
+    /// independently hardcoded. 20 s.
+    pub(crate) const RENEWAL_TASK_BUDGET: Duration =
+        Duration::from_secs(Self::SUBSCRIPTION_RECOVERY_INTERVAL.as_secs() - 10);
+
+    /// Maximum single-attempt network wait on the renewal path. Each attempt is
+    /// actually capped at `min(this, remaining task budget)` (see
+    /// [`Self::RENEWAL_TASK_BUDGET`]); this is the ceiling for the first
+    /// attempt when the full budget is available. Set equal to the total budget
+    /// so a single slow peer may consume the whole budget in one attempt;
+    /// multi-peer renewals naturally get shorter per-attempt waits as the
+    /// remaining budget shrinks.
+    pub(crate) const RENEWAL_PER_ATTEMPT_TIMEOUT: Duration = Self::RENEWAL_TASK_BUDGET;
+
+    /// Slack between a renewal task's worst-case self-termination time
+    /// (`RENEWAL_TASK_BUDGET` + a fully backpressured `release_pending_op_slot`
+    /// cleanup) and the hard outer cancel deadline. Gives the driver room to
+    /// finish its own cleanup and telemetry before the outer cancel could fire.
+    /// 5 s.
+    pub(crate) const RENEWAL_OUTER_DEADLINE_MARGIN: Duration = Duration::from_secs(5);
+
+    /// Hard outer cancel deadline wrapping each spawned renewal task in
+    /// `recover_orphaned_subscriptions`. Pure backstop for a *genuinely wedged*
+    /// driver: in normal operation the driver self-terminates within
+    /// [`Self::RENEWAL_TASK_BUDGET`] (slow peer) and then runs cleanup, so this
+    /// deadline never fires.
+    ///
+    /// Issue #4350 (Codex review): it must clear the driver's worst case —
+    /// `RENEWAL_TASK_BUDGET` (a full slow attempt) **plus** a fully
+    /// backpressured `release_pending_op_slot`, which awaits up to
+    /// [`OpManager::NOTIFICATION_SEND_TIMEOUT`] (30 s) — or the outer cancel
+    /// could interrupt cleanup, leaving the per-attempt waiter in
+    /// `pending_op_results` (the very closed-receiver drop this change removes).
+    /// Deadline = `BUDGET (20 s) + NOTIFICATION_SEND_TIMEOUT (30 s) +
+    /// RENEWAL_OUTER_DEADLINE_MARGIN (5 s) = 55 s`.
+    ///
+    /// Outliving the 30 s recovery interval is safe: `mark_subscription_pending`
+    /// (released via `SubscriptionRecoveryGuard` on completion **or** cancel)
+    /// blocks a second concurrent renewal for the same contract, and the
+    /// per-cycle spawn count is bounded by `MAX_RECOVERY_ATTEMPTS_PER_INTERVAL`
+    /// and the channel-capacity gates — so a long-running task can't accumulate.
+    pub(crate) fn renewal_outer_cancel() -> Duration {
+        Self::RENEWAL_TASK_BUDGET
+            + crate::node::OpManager::NOTIFICATION_SEND_TIMEOUT
+            + Self::RENEWAL_OUTER_DEADLINE_MARGIN
+    }
+
+    /// Floor below which the renewal driver will **not** start another attempt:
+    /// a remaining budget this small can't complete a useful network round-trip
+    /// before the task budget (and then the outer cancel) elapses, so the
+    /// driver stops cleanly and lets the next 30 s recovery cycle retry rather
+    /// than starting an attempt doomed to be cut short. 2 s.
+    pub(crate) const RENEWAL_MIN_ATTEMPT_BUDGET: Duration = Duration::from_secs(2);
+
     /// Interval for periodic GET subscription cache sweep.
     pub(crate) const GET_SUBSCRIPTION_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -1184,12 +1503,19 @@ impl Ring {
     /// that all fail immediately because there's no one to send them to. Telemetry
     /// showed 3 peers with 0 connections generating 96% of all subscribe traffic.
     async fn recover_orphaned_subscriptions(ring: Arc<Self>, interval_duration: Duration) {
+        let shutdown = ring.shutdown_token();
         // Wait indefinitely for the first ring connection before starting
         // subscription recovery. The per-cycle connection check below is the
         // real gate; this just avoids running the loop body with no peers.
+        //
+        // The 500ms poll is itself <1s, but the *loop* can park here forever on
+        // a node that never connects — so race shutdown here too, otherwise a
+        // never-connected node would hang teardown indefinitely (#4278).
         let mut wait_logged = false;
         loop {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            if sleep_or_shutdown(&shutdown, tokio::time::sleep(Duration::from_millis(500))).await {
+                return;
+            }
             if ring.open_connections() > 0 {
                 tracing::info!(
                     hosted_contracts = ring.hosting_contract_keys().len(),
@@ -1210,7 +1536,9 @@ impl Ring {
         // Small jitter (2-5s) after first connection to let the ring stabilize
         // slightly before flooding with subscribe requests.
         let jitter = Duration::from_secs(GlobalRng::random_range(2u64..=5u64));
-        tokio::time::sleep(jitter).await;
+        if sleep_or_shutdown(&shutdown, tokio::time::sleep(jitter)).await {
+            return;
+        }
 
         let mut interval = tokio::time::interval(interval_duration);
         // Skip the first immediate tick — we run the first pass immediately
@@ -1222,8 +1550,12 @@ impl Ring {
         loop {
             if first_pass {
                 first_pass = false;
-            } else {
+            } else if sleep_or_shutdown(&shutdown, async {
                 interval.tick().await;
+            })
+            .await
+            {
+                return;
             }
 
             // Always run expiry sweeps, even when disconnected. Stale
@@ -1393,12 +1725,27 @@ impl Ring {
 
                     let op_manager_clone = op_manager.clone();
                     let contract_key = contract;
+                    let task_shutdown = shutdown.clone();
 
                     GlobalExecutor::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(jitter_ms)).await;
-                        // Guard ensures complete_subscription_request is called even on panic
+                        // Guard ensures complete_subscription_request is called even on panic.
+                        // Created BEFORE the jitter sleep so an early shutdown return below
+                        // still clears the `mark_subscription_pending` flag set above — the
+                        // guard's Drop marks the request failed (#4278).
                         let guard =
                             SubscriptionRecoveryGuard::new(op_manager_clone.clone(), contract_key);
+
+                        // The jitter can be up to 15s; bail (dropping the guard, which
+                        // completes the pending request as failed) before doing any
+                        // renewal work if the node is shutting down (#4278).
+                        if sleep_or_shutdown(
+                            &task_shutdown,
+                            tokio::time::sleep(Duration::from_millis(jitter_ms)),
+                        )
+                        .await
+                        {
+                            return;
+                        }
 
                         let instance_id = *contract_key.id();
                         // Renewal driver: same machinery as
@@ -1407,22 +1754,29 @@ impl Ring {
                         // `result_router_tx`. `is_renewal=true` so
                         // the responder skips sending state.
                         //
-                        // Outer renewal-cycle timeout: cap each renewal task at
-                        // a fraction of the renewal interval so a stuck driver
-                        // (slow peer, blocked op_execution_sender) self-cancels
-                        // within one cycle instead of leaking past
-                        // `mark_subscription_pending` semantics. The driver's
-                        // per-attempt `OPERATION_TTL` (60 s) bounds individual
-                        // peer waits; this outer timeout bounds total task
-                        // lifetime. Without it, sustained slow-peer load could
-                        // accumulate background renewal tasks faster than they
-                        // complete (90+ contracts × multi-attempt ×
-                        // OPERATION_TTL on a gateway).
+                        // Outer renewal cancel deadline: a pure backstop for a
+                        // *genuinely wedged* driver. In normal operation the
+                        // renewal driver self-terminates within
+                        // `RENEWAL_TASK_BUDGET` (slow peer) and then runs its
+                        // cleanup, so this deadline never fires.
+                        //
+                        // Issue #4350: the driver clamps each attempt's wait to
+                        // the budget remaining until its own task deadline
+                        // (`RENEWAL_TASK_BUDGET`, 20 s), so no attempt — first
+                        // or retry — is still awaiting when this outer cancel
+                        // fires; and the deadline is sized
+                        // (`renewal_outer_cancel`, 55 s) to clear the driver's
+                        // worst case (full-budget attempt + a fully
+                        // backpressured `release_pending_op_slot` cleanup, up to
+                        // `NOTIFICATION_SEND_TIMEOUT`). A task outliving the 30 s
+                        // recovery interval is safe: `mark_subscription_pending`
+                        // (released by `SubscriptionRecoveryGuard` on completion
+                        // or cancel) blocks a second concurrent renewal for the
+                        // same contract.
                         let renewal_tx = crate::message::Transaction::new::<
                             crate::operations::subscribe::SubscribeMsg,
                         >();
-                        let renewal_deadline = Self::SUBSCRIPTION_RECOVERY_INTERVAL
-                            .saturating_sub(Duration::from_secs(5));
+                        let renewal_deadline = Self::renewal_outer_cancel();
                         let outcome_enum = match tokio::time::timeout(
                             renewal_deadline,
                             crate::operations::subscribe::run_renewal_subscribe(
@@ -1502,15 +1856,24 @@ impl Ring {
     /// cleans up the local subscription state. The upstream peer will eventually
     /// prune us when updates fail to deliver.
     async fn sweep_get_subscription_cache(ring: Arc<Self>, interval_duration: Duration) {
+        let shutdown = ring.shutdown_token();
         // Add random initial delay to prevent synchronized sweeps across peers
         let initial_delay = Duration::from_secs(GlobalRng::random_range(10u64..=30u64));
-        tokio::time::sleep(initial_delay).await;
+        if sleep_or_shutdown(&shutdown, tokio::time::sleep(initial_delay)).await {
+            return;
+        }
 
         let mut interval = tokio::time::interval(interval_duration);
         interval.tick().await; // Skip first immediate tick
 
         loop {
-            interval.tick().await;
+            if sleep_or_shutdown(&shutdown, async {
+                interval.tick().await;
+            })
+            .await
+            {
+                return;
+            }
 
             // Sweep expired entries from GET subscription cache
             let expired = ring.sweep_expired_get_subscriptions();
@@ -1610,6 +1973,7 @@ impl Ring {
 
         tracing::info!("Topology snapshot registration task started");
 
+        let shutdown = ring.shutdown_token();
         // Add small initial delay to let network stabilize (use short delay in tests)
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1617,7 +1981,13 @@ impl Ring {
         interval.tick().await; // Skip first immediate tick
 
         loop {
-            interval.tick().await;
+            if sleep_or_shutdown(&shutdown, async {
+                interval.tick().await;
+            })
+            .await
+            {
+                return;
+            }
 
             // Only register if we're in a simulation context
             let Some(network_name) = get_current_network_name() else {
@@ -2893,6 +3263,7 @@ impl Ring {
         live_tx_tracker: LiveTransactionTracker,
     ) -> anyhow::Result<()> {
         let is_gateway = self.is_gateway;
+        let shutdown = self.shutdown_token();
         tracing::info!(is_gateway, "Connection maintenance task starting");
         #[cfg(not(test))]
         const CHECK_TICK_DURATION: Duration = Duration::from_secs(60);
@@ -2918,7 +3289,10 @@ impl Ring {
 
         // if the peer is just starting wait a bit before
         // we even attempt acquiring more connections
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        if sleep_or_shutdown(&shutdown, tokio::time::sleep(Duration::from_secs(2))).await {
+            // Shutdown before we ever did any work — park (see #4292 note below).
+            std::future::pending::<()>().await;
+        }
 
         let mut pending_conn_adds = BTreeSet::new();
         let mut last_backoff_cleanup = self.time_source.now();
@@ -3030,6 +3404,19 @@ impl Ring {
 
         let mut this_peer = None;
         'maintenance: loop {
+            // Stop promptly on node teardown. The OpManager-dropped check below
+            // (`OpManagerState::Detached`) is the other exit, but the shutdown
+            // token fires from `ShutdownTeardown::drop` *before* the OpManager
+            // Arc is dropped, so check it here too so we don't keep running a
+            // full maintenance pass during teardown (#4278).
+            if shutdown.is_cancelled() {
+                tracing::info!(
+                    is_gateway,
+                    "Shutdown signalled; connection maintenance ending"
+                );
+                break 'maintenance;
+            }
+
             // Update clock tracking at the top of every iteration (including
             // early-continue paths) so elapsed time doesn't accumulate during
             // startup. The four clock operations below MUST stay back-to-back
@@ -3689,11 +4076,15 @@ impl Ring {
                 // Uses sleep() instead of the check_interval so we don't need a
                 // second Interval object. We reset check_interval on transition
                 // back to steady-state to avoid an immediate burst tick.
+                // The shutdown arm makes the (up to multi-second) wait
+                // interruptible (#4278); the loop's top-of-iteration
+                // `is_cancelled()` check then breaks out.
                 crate::deterministic_select! {
                   _ = refresh_density_map.tick() => {
                     self.refresh_density_request_cache();
                   },
                   _ = tokio::time::sleep(adaptive_duration) => {},
+                  _ = shutdown.cancelled() => {},
                 }
             } else {
                 // Reached min_connections: reset backoff for next time.
@@ -3703,17 +4094,20 @@ impl Ring {
                 // Reset the interval on transition from fast to normal tick so
                 // accumulated missed ticks don't cause an immediate burst.
                 check_interval.reset();
+                // Shutdown arm: interrupt the up-to-60s steady-state tick (#4278).
                 crate::deterministic_select! {
                   _ = refresh_density_map.tick() => {
                     self.refresh_density_request_cache();
                   },
                   _ = check_interval.tick() => {},
+                  _ = shutdown.cancelled() => {},
                 }
             }
         }
 
-        // Intentional teardown parking (#4292): the loop only breaks once the
-        // OpManager has been dropped (node shutdown), so there is no more work
+        // Intentional teardown parking (#4292): the loop only breaks on node
+        // shutdown — either the OpManager has been dropped (the `Detached`
+        // arm) or the shutdown token fired (#4278) — so there is no more work
         // to do. This task is registered with `BackgroundTaskMonitor`; parking
         // on a never-resolving future — rather than returning `Ok(())` — keeps
         // `wait_for_any_exit` from misreading orderly teardown as a fatal
@@ -4047,6 +4441,146 @@ fn classify_suspend_jump(boot_elapsed: Duration, mono_elapsed: Duration) -> Dura
     boot_elapsed.saturating_sub(mono_elapsed)
 }
 
+/// Compute the per-snapshot window delta of a monotonic counter and advance the
+/// running previous-total in one step (#4440).
+///
+/// `current_total` is this snapshot's lifetime count; `prev_total` is the count
+/// at the previous snapshot. Returns `current_total - prev_total` (saturating,
+/// so a counter reset can never underflow to a huge bogus rate) and stores
+/// `current_total` into `*prev_total` for the next call. Extracted from the
+/// snapshot loop and unit-tested because a future reorder of the
+/// compute-then-advance steps would silently zero the broadcast-failure incident
+/// signal with no test failure otherwise.
+fn window_delta(current_total: u64, prev_total: &mut u64) -> u64 {
+    let delta = current_total.saturating_sub(*prev_total);
+    *prev_total = current_total;
+    delta
+}
+
+/// Process-global health gauges for monitored background tasks (#4440).
+///
+/// A task that the [`BackgroundTaskMonitor`](crate::node::background_task_monitor)
+/// only watches for *death* can still run for hours while every individual run
+/// fails — `refresh_router`'s `get_router_events` errors were made non-fatal by
+/// the v0.2.74 #4438 hotfix (a transient fd-exhaustion read failure must not
+/// kill the node), so a *persistent* failure is now completely silent. This
+/// records, per monitored task, the time of the last successful run and the
+/// current run of consecutive failures, so the snapshot task can emit
+/// `last_success_age` / `consecutive_failures` gauges on the existing
+/// `router_snapshot` cadence (partially addresses #4440 item (a)).
+///
+/// The task *publishes* (`record_success` / `record_failure`) and the `Ring`
+/// snapshot task *reads* (`refresh_router`), mirroring `BROADCAST_STREAM_METRICS`
+/// (and the module-cache metrics, which were a sibling process-global until
+/// #4488 threaded them as a per-node `Arc`). Currently scoped to
+/// `refresh_router`, the one monitored task with a non-fatal per-run failure
+/// mode; add fields here if another monitored task grows the same pattern.
+///
+/// Per-node meaning holds only in single-node-per-process production. In a
+/// multi-node simulation every node's `refresh_router` shares this
+/// process-global, so the snapshot reads the aggregate (last-write-wins
+/// last-success across nodes; the consecutive-failure run is shared) — the same
+/// caveat that drove #4488 for the module-cache metrics.
+static BACKGROUND_TASK_HEALTH: std::sync::LazyLock<BackgroundTaskHealth> =
+    std::sync::LazyLock::new(BackgroundTaskHealth::new);
+
+/// Monotonic process clock for the background-task health gauges. `tokio::time`
+/// so the age respects `start_paused(true)` virtual time under simulation
+/// (a `std::time::Instant` would advance in real wall-clock and break
+/// deterministic tests). Sampled at publish time and at snapshot read time; the
+/// age is the difference, so the absolute epoch is irrelevant.
+static BACKGROUND_TASK_HEALTH_EPOCH: std::sync::LazyLock<Instant> =
+    std::sync::LazyLock::new(Instant::now);
+
+/// Health gauges for one monitored background task. See [`BACKGROUND_TASK_HEALTH`].
+struct TaskHealth {
+    /// Millis-since-[`BACKGROUND_TASK_HEALTH_EPOCH`] of the last successful run,
+    /// or [`NO_SUCCESS`](Self::NO_SUCCESS) if the task has never succeeded.
+    last_success_millis: AtomicU64,
+    /// Consecutive failures since the last success (reset to 0 on success).
+    consecutive_failures: AtomicU64,
+}
+
+impl TaskHealth {
+    /// Sentinel for "no successful run yet". `u64::MAX` millis is ~584 million
+    /// years of uptime, so it can never collide with a real elapsed value.
+    const NO_SUCCESS: u64 = u64::MAX;
+
+    const fn new() -> Self {
+        Self {
+            last_success_millis: AtomicU64::new(Self::NO_SUCCESS),
+            consecutive_failures: AtomicU64::new(0),
+        }
+    }
+}
+
+/// Per-task background-task health, currently just `refresh_router`. See
+/// [`BACKGROUND_TASK_HEALTH`].
+struct BackgroundTaskHealth {
+    refresh_router: TaskHealth,
+}
+
+/// A point-in-time read of one task's health for telemetry emission.
+#[derive(Debug, Clone, Copy)]
+struct TaskHealthSnapshot {
+    /// Seconds since the last successful run, or `None` if it never succeeded.
+    last_success_age_secs: Option<u64>,
+    /// Consecutive failures since the last success.
+    consecutive_failures: u64,
+}
+
+impl BackgroundTaskHealth {
+    fn new() -> Self {
+        Self {
+            refresh_router: TaskHealth::new(),
+        }
+    }
+
+    /// Record a successful run of `refresh_router`: stamp the last-success time
+    /// and clear the consecutive-failure run. Cheap `Relaxed` atomics.
+    fn record_refresh_router_success(&self) {
+        let elapsed_millis = BACKGROUND_TASK_HEALTH_EPOCH.elapsed().as_millis() as u64;
+        self.refresh_router
+            .last_success_millis
+            .store(elapsed_millis, std::sync::atomic::Ordering::Relaxed);
+        self.refresh_router
+            .consecutive_failures
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record a failed run of `refresh_router` (transient `get_router_events`
+    /// error). Bumps the consecutive-failure run; does not touch last-success.
+    fn record_refresh_router_failure(&self) {
+        self.refresh_router
+            .consecutive_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Read `refresh_router`'s health for telemetry.
+    fn refresh_router_snapshot(&self) -> TaskHealthSnapshot {
+        let last_success_millis = self
+            .refresh_router
+            .last_success_millis
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let consecutive_failures = self
+            .refresh_router
+            .consecutive_failures
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let last_success_age_secs = if last_success_millis == TaskHealth::NO_SUCCESS {
+            None
+        } else {
+            // saturating: if the clock and the stored stamp disagree (they
+            // shouldn't — same monotonic source), never underflow to a huge age.
+            let now_millis = BACKGROUND_TASK_HEALTH_EPOCH.elapsed().as_millis() as u64;
+            Some(now_millis.saturating_sub(last_success_millis) / 1000)
+        };
+        TaskHealthSnapshot {
+            last_success_age_secs,
+            consecutive_failures,
+        }
+    }
+}
+
 /// Best-effort snapshot of this process's open file-descriptor count and the
 /// `RLIMIT_NOFILE` soft limit, for the node-health telemetry gauges (#4440).
 ///
@@ -4129,6 +4663,156 @@ mod fd_usage_tests {
             soft >= open,
             "open fds ({open}) must not exceed the soft limit ({soft})"
         );
+    }
+}
+
+#[cfg(test)]
+mod background_task_health_tests {
+    //! Validates the background-task health gauges (#4440): a persistently
+    //! failing `refresh_router` (non-fatal since the #4438 hotfix) must surface
+    //! as a rising `consecutive_failures` and a stale `last_success_age`, and a
+    //! task that has never succeeded must report `None` age (not a bogus zero).
+    //! Tests a LOCAL `BackgroundTaskHealth` so they never touch the shared
+    //! process-global.
+
+    use super::BackgroundTaskHealth;
+
+    /// Before any success, the age is `None` (the `NO_SUCCESS` sentinel), not a
+    /// misleading age of 0. Failures accumulate without touching last-success.
+    #[tokio::test(start_paused = true)]
+    async fn never_succeeded_reports_none_age_and_accumulates_failures() {
+        let h = BackgroundTaskHealth::new();
+        let s = h.refresh_router_snapshot();
+        assert_eq!(
+            s.last_success_age_secs, None,
+            "no success yet => None age, never a bogus 0"
+        );
+        assert_eq!(s.consecutive_failures, 0);
+
+        h.record_refresh_router_failure();
+        h.record_refresh_router_failure();
+        let s = h.refresh_router_snapshot();
+        assert_eq!(
+            s.last_success_age_secs, None,
+            "still never succeeded after failures"
+        );
+        assert_eq!(s.consecutive_failures, 2, "failures accumulate");
+    }
+
+    /// A success stamps the time (age starts at ~0 and grows with virtual time)
+    /// and clears the consecutive-failure run; a later failure run grows again
+    /// while the age keeps climbing from the last success.
+    #[tokio::test(start_paused = true)]
+    async fn success_resets_failures_and_stamps_age() {
+        let h = BackgroundTaskHealth::new();
+        h.record_refresh_router_failure();
+        h.record_refresh_router_failure();
+
+        h.record_refresh_router_success();
+        let s = h.refresh_router_snapshot();
+        assert_eq!(s.consecutive_failures, 0, "success clears the failure run");
+        assert_eq!(
+            s.last_success_age_secs,
+            Some(0),
+            "age is ~0 immediately after success"
+        );
+
+        // Advance virtual time; the age must reflect time since last success.
+        tokio::time::advance(std::time::Duration::from_secs(90)).await;
+        let s = h.refresh_router_snapshot();
+        assert_eq!(
+            s.last_success_age_secs,
+            Some(90),
+            "age grows with time since last success"
+        );
+
+        // A new failure run grows consecutive_failures but does NOT refresh the
+        // last-success stamp — the age keeps climbing, which is the signal that
+        // refresh is stuck.
+        h.record_refresh_router_failure();
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        let s = h.refresh_router_snapshot();
+        assert_eq!(s.consecutive_failures, 1);
+        assert_eq!(
+            s.last_success_age_secs,
+            Some(100),
+            "age unaffected by failures; still measured from last success"
+        );
+    }
+
+    /// Source-scrape pin: the startup read in `refresh_router` (the `match`
+    /// before the periodic loop) must record into the health gauge on every
+    /// arm, with the SAME semantics as the loop — both `Ok` arms record a
+    /// success, the `Err` arm records a failure. Without this, a node whose
+    /// startup read succeeds but whose later periodic refreshes all fail would
+    /// report `last_success_age_secs == null` forever, masking that it did
+    /// succeed once.
+    ///
+    /// Asserting against the process-global `BACKGROUND_TASK_HEALTH` after
+    /// running `refresh_router` would be racy (concurrent tests share the
+    /// global), so this pins the call sites in source instead — three startup
+    /// records plus two in the loop = five total.
+    #[test]
+    fn refresh_router_records_health_on_startup_and_in_loop() {
+        let src = include_str!("ring.rs");
+        // Restrict to the `refresh_router` fn body so unrelated mentions (this
+        // test, the rustdoc on the metrics struct) don't count. The body runs
+        // from its signature to the start of the next method.
+        let start = src
+            .find("async fn refresh_router")
+            .expect("refresh_router fn present");
+        let after = &src[start..];
+        let end = after
+            .find("async fn emit_router_snapshot_telemetry")
+            .expect("next method present");
+        let body = &after[..end];
+
+        let successes = body.matches(".record_refresh_router_success()").count();
+        let failures = body.matches(".record_refresh_router_failure()").count();
+        // Startup: 2 Ok arms (success) + 1 Err arm (failure). Loop: 1 Ok
+        // (success) + 1 Err (failure). Total 3 success + 2 failure.
+        assert_eq!(
+            successes, 3,
+            "refresh_router must record a success on both startup Ok arms and \
+             the loop Ok arm (got {successes}); a dropped startup record would \
+             mask a startup-only success in the health gauge"
+        );
+        assert_eq!(
+            failures, 2,
+            "refresh_router must record a failure on both the startup Err arm \
+             and the loop Err arm (got {failures})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod window_delta_tests {
+    //! Pins the per-snapshot window-delta of the monotonic broadcast-failure
+    //! counter (#4440): it must return `current - prev` AND advance `prev` to
+    //! `current`, so a reorder of those two steps (which would silently zero
+    //! the incident signal) fails CI.
+
+    use super::window_delta;
+
+    #[test]
+    fn broadcast_failure_window_delta_computes_and_advances_prev() {
+        let mut prev: u64 = 10;
+        // First window: 13 - 10 = 3, and prev advances to 13.
+        assert_eq!(window_delta(13, &mut prev), 3, "delta over the window");
+        assert_eq!(prev, 13, "prev advanced to current");
+        // No new failures: 13 - 13 = 0, prev stays 13.
+        assert_eq!(window_delta(13, &mut prev), 0, "no failures => zero delta");
+        assert_eq!(prev, 13);
+        // Next window: 20 - 13 = 7, prev advances to 20.
+        assert_eq!(window_delta(20, &mut prev), 7, "delta resumes from prev");
+        assert_eq!(prev, 20, "prev advanced to current again");
+        // Counter reset / restart must saturate to 0, never underflow.
+        assert_eq!(
+            window_delta(5, &mut prev),
+            0,
+            "reset saturates, no underflow"
+        );
+        assert_eq!(prev, 5, "prev tracks the reset value");
     }
 }
 
@@ -5177,6 +5861,7 @@ mod refresh_router_tests {
     use either::Either;
     use futures::FutureExt;
     use parking_lot::RwLock;
+    use tokio_util::sync::CancellationToken;
 
     use crate::ring::PeerKeyLocation;
     use crate::ring::location::Location;
@@ -5252,7 +5937,7 @@ mod refresh_router_tests {
         // within the first few milliseconds.
         tokio::time::timeout(
             Duration::from_millis(100),
-            super::Ring::refresh_router(router.clone(), register),
+            super::Ring::refresh_router(router.clone(), register, CancellationToken::new()),
         )
         .await
         .ok(); // timeout is expected — the function loops forever
@@ -5272,7 +5957,7 @@ mod refresh_router_tests {
 
         tokio::time::timeout(
             Duration::from_millis(100),
-            super::Ring::refresh_router(router.clone(), register),
+            super::Ring::refresh_router(router.clone(), register, CancellationToken::new()),
         )
         .await
         .ok();
@@ -5363,7 +6048,7 @@ mod refresh_router_tests {
         // lets the loop poll well past the injected failures and recover.
         tokio::time::timeout(
             Duration::from_secs(60 * 40),
-            super::Ring::refresh_router(router.clone(), register),
+            super::Ring::refresh_router(router.clone(), register, CancellationToken::new()),
         )
         .await
         .ok(); // timeout is expected — the loop runs forever when healthy
@@ -5386,6 +6071,38 @@ mod refresh_router_tests {
             "router should have recovered and loaded history after the transient \
              errors cleared"
         );
+    }
+
+    /// Regression for #4278: the periodic `refresh_router` loop ticks every 5
+    /// minutes. With the shutdown token cancelled, the task must return
+    /// *promptly* (well within one tick) rather than parking on the 5-minute
+    /// `interval.tick()`. Before the fix there was no token to race against, so
+    /// the only way out of the loop was the 5-minute tick — a shutdown would
+    /// hang for up to that long.
+    ///
+    /// Uses `start_paused`: virtual time only advances when every task is idle,
+    /// so if the loop were genuinely blocked on the 5-minute tick this
+    /// `timeout` would *fire* (the test would fail on the `expect`). The fix
+    /// makes the future resolve at t≈0 because the token is already cancelled.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_router_returns_promptly_on_shutdown() {
+        let register = WarmStartRegister { events: vec![] };
+        let router = Arc::new(RwLock::new(Router::new(&[])));
+
+        let shutdown = CancellationToken::new();
+        // Cancel before we even start: the very first interruptible `.await`
+        // (the 5-minute periodic tick) must observe the cancellation and bail.
+        shutdown.cancel();
+
+        // 1s of *virtual* time is generous; a working loop returns at t≈0,
+        // a broken (uninterruptible) one would block until the 5-minute tick
+        // and trip this timeout.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            super::Ring::refresh_router(router.clone(), register, shutdown),
+        )
+        .await
+        .expect("refresh_router must return promptly once the shutdown token is cancelled");
     }
 }
 
@@ -5551,6 +6268,65 @@ mod instant_now_pin_test {
              (#4277). If you intentionally added or removed a TEST-only call site, \
              update EXPECTED_BARE_INSTANT_NOW; if this fired on PRODUCTION code, \
              migrate it to `self.time_source.now()` instead of bumping the count."
+        );
+    }
+}
+
+#[cfg(test)]
+mod sleep_or_shutdown_tests {
+    use super::sleep_or_shutdown;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    /// The wrapped future completes before shutdown → returns `false` (carry on).
+    #[tokio::test(start_paused = true)]
+    async fn returns_false_when_wait_completes_first() {
+        let shutdown = CancellationToken::new();
+        let cancelled =
+            sleep_or_shutdown(&shutdown, tokio::time::sleep(Duration::from_millis(10))).await;
+        assert!(
+            !cancelled,
+            "an uncancelled token must let the wrapped sleep complete"
+        );
+    }
+
+    /// Shutdown fires mid-wait → returns `true` (stop the loop) and does NOT
+    /// block for the full sleep. Regression for the #4278 failure mode: a
+    /// 5-minute sleep that ignores shutdown.
+    #[tokio::test(start_paused = true)]
+    async fn returns_true_promptly_when_cancelled_mid_wait() {
+        let shutdown = CancellationToken::new();
+        let token = shutdown.clone();
+        // Cancel after a short virtual delay, well before the long sleep ends.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            token.cancel();
+        });
+
+        let start = tokio::time::Instant::now();
+        let cancelled =
+            sleep_or_shutdown(&shutdown, tokio::time::sleep(Duration::from_secs(300))).await;
+        let elapsed = start.elapsed();
+
+        assert!(cancelled, "a cancelled token must short-circuit the sleep");
+        assert!(
+            elapsed < Duration::from_secs(300),
+            "shutdown must not wait out the full 5-minute sleep (waited {elapsed:?})"
+        );
+    }
+
+    /// Already-cancelled token → returns `true` immediately, even with a long
+    /// wait. `CancellationToken` is level-triggered, so a task that reaches the
+    /// helper after shutdown already fired still bails (no missed-wakeup race).
+    #[tokio::test(start_paused = true)]
+    async fn returns_true_when_already_cancelled() {
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let cancelled =
+            sleep_or_shutdown(&shutdown, tokio::time::sleep(Duration::from_secs(300))).await;
+        assert!(
+            cancelled,
+            "an already-cancelled token must short-circuit immediately"
         );
     }
 }

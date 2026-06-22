@@ -1,22 +1,31 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2034
-# ^ FREENET_NODE_URL / NODE_WAIT_* / LOG_FILE are read by the functions
+# shellcheck disable=SC2034,SC2317
+# ^ SC2034: FREENET_NODE_URL / NODE_WAIT_* / LOG_FILE are read by the functions
 #   extracted from announce-to-river.sh via `eval`; shellcheck cannot see
 #   into the eval and would otherwise flag them all as unused.
+#   SC2317: the stub functions (read_room_messages, post_message, curl) are
+#   invoked indirectly from those eval'd functions, so shellcheck wrongly
+#   reports their bodies as unreachable.
 #
-# Regression test for announce-to-river.sh (issue #4208).
+# Regression test for announce-to-river.sh (issues #4208 and the
+# v0.2.74/v0.2.75 lost-announcement race).
 #
-# Covers the two functions the #4208 fix touches:
-#   - wait_for_node(): the bounded node-reachability poll that lets the
-#     announce survive the gateway restarting the local node mid-release,
-#     instead of failing on a single probe that races the restart window.
+# Covers the functions the fixes touch:
+#   - wait_for_room(): the bounded readiness poll that gates the post on the
+#     room actually being READABLE (a riverctl room GET succeeding), not just
+#     on the WS port answering. The earlier wait_for_node() port probe passed
+#     while the old node was being torn down for the gateway self-update, so
+#     riverctl's room GET hit a mid-teardown node and failed "room not found"
+#     — the silent drop that lost v0.2.74 and v0.2.75. wait_for_room() rides
+#     out that window by retrying the real read.
 #   - log(): now writes a persistent log file only when LOG_FILE is set
 #     (the old unconditional /var/log default emitted "Permission denied"
 #     on every call because the announce user cannot write there).
+#   - post_message(): signs with the owner key via --signing-key-file.
 #
-# Both functions are extracted verbatim from announce-to-river.sh and
-# eval'd here, so the test exercises the real implementation and cannot
-# drift from it. curl is stubbed and NODE_WAIT_INTERVAL=0 keeps it instant.
+# All functions are extracted verbatim from announce-to-river.sh and eval'd
+# here, so the test exercises the real implementation and cannot drift from
+# it. read_room_state is stubbed and NODE_WAIT_INTERVAL=0 keeps it instant.
 #
 # Run manually with: bash scripts/release-agent/announce-to-river_test.sh
 
@@ -36,7 +45,7 @@ trap 'rm -rf "$TMP"' EXIT
 # Pull the two functions verbatim so the test runs the real code, not a
 # copy that could drift. Mirrors scripts/release_state_restore_test.sh.
 eval "$(awk '/^log\(\) \{/,/^}/' "$ANNOUNCE_SH")"
-eval "$(awk '/^wait_for_node\(\) \{/,/^}/' "$ANNOUNCE_SH")"
+eval "$(awk '/^wait_for_room\(\) \{/,/^}/' "$ANNOUNCE_SH")"
 
 FAILURES=0
 check() {
@@ -87,46 +96,61 @@ rc=0
 log "ignored" 2>/dev/null || rc=$?
 check "log() survives an unwritable LOG_FILE" "$rc" "0"
 
-# ── wait_for_node() ──────────────────────────────────────────────────
+# ── wait_for_room() ──────────────────────────────────────────────────
+#
+# The lost-announcement fix. The probe now gates on a real room READ
+# (read_room_state, a riverctl GET) succeeding rather than on a WS-port
+# answer, so it can't be fooled by the old node still answering the port
+# while it is being torn down for the gateway self-update. The crucial
+# difference from the old wait_for_node(): a node that is up at the port
+# layer but whose room GET fails counts as NOT ready, so the poll keeps
+# waiting through the restart instead of declaring success and letting the
+# post hit a mid-teardown node (the v0.2.74/v0.2.75 silent drop).
 
 FREENET_NODE_URL="http://stub/"
 NODE_WAIT_INTERVAL=0
 LOG_FILE=""
 
-# curl stub: fails for the first CURL_FAIL_COUNT calls, then succeeds.
-CURL_CALLS=0
-CURL_FAIL_COUNT=0
-curl() {
-    CURL_CALLS=$((CURL_CALLS + 1))
-    (( CURL_CALLS > CURL_FAIL_COUNT ))
+# read_room_state stub: fails for the first READ_FAIL_COUNT calls (room not
+# yet retrievable — node restarting / mid-teardown), then succeeds. This
+# stands in for the real riverctl `message list` GET. Stubbing the probe
+# function directly keeps the test independent of riverctl/cargo while still
+# exercising the genuine wait_for_room() loop body.
+READ_CALLS=0
+READ_FAIL_COUNT=0
+read_room_state() {
+    READ_CALLS=$((READ_CALLS + 1))
+    (( READ_CALLS > READ_FAIL_COUNT ))
 }
 
-# Node already up: succeeds on the first probe.
+# Room already readable: succeeds on the first probe.
 NODE_WAIT_ATTEMPTS=60
-CURL_CALLS=0
-CURL_FAIL_COUNT=0
+READ_CALLS=0
+READ_FAIL_COUNT=0
 rc=0
-wait_for_node 2>/dev/null || rc=$?
-check "wait_for_node() succeeds when the node is already up" "$rc" "0"
-check "wait_for_node() probes once when the node is up" "$CURL_CALLS" "1"
+wait_for_room 2>/dev/null || rc=$?
+check "wait_for_room() succeeds when the room is already readable" "$rc" "0"
+check "wait_for_room() probes once when the room is readable" "$READ_CALLS" "1"
 
-# Node down then up: the poll bridges the restart window (issue #4208).
+# Room unreadable then readable: the poll bridges the restart window. This is
+# the case the old port-only probe got wrong — the read fails while the node
+# is mid-teardown, and only succeeds once the restarted node has the room.
 NODE_WAIT_ATTEMPTS=60
-CURL_CALLS=0
-CURL_FAIL_COUNT=3
+READ_CALLS=0
+READ_FAIL_COUNT=3
 rc=0
-wait_for_node 2>/dev/null || rc=$?
-check "wait_for_node() succeeds once the node returns" "$rc" "0"
-check "wait_for_node() keeps probing across the down-window" "$CURL_CALLS" "4"
+wait_for_room 2>/dev/null || rc=$?
+check "wait_for_room() succeeds once the room becomes readable" "$rc" "0"
+check "wait_for_room() keeps probing across the down-window" "$READ_CALLS" "4"
 
-# Node never returns: the poll gives up after NODE_WAIT_ATTEMPTS.
+# Room never readable: the poll gives up after NODE_WAIT_ATTEMPTS.
 NODE_WAIT_ATTEMPTS=3
-CURL_CALLS=0
-CURL_FAIL_COUNT=9999
+READ_CALLS=0
+READ_FAIL_COUNT=9999
 rc=0
-wait_for_node 2>/dev/null || rc=$?
-check "wait_for_node() fails when the node never returns" "$rc" "1"
-check "wait_for_node() honours NODE_WAIT_ATTEMPTS as the bound" "$CURL_CALLS" "3"
+wait_for_room 2>/dev/null || rc=$?
+check "wait_for_room() fails when the room never becomes readable" "$rc" "1"
+check "wait_for_room() honours NODE_WAIT_ATTEMPTS as the bound" "$READ_CALLS" "3"
 
 # ── post_message() ───────────────────────────────────────────────────
 #
@@ -165,6 +189,91 @@ check "post_message runs riverctl from the source repo" \
     "$(printf '%s' "$cargo_args" | grep -cF -- "run --quiet -p riverctl" || true)" "1"
 check "post_message sets RIVER_SKIP_CONTRACT_CHECK for the riverctl run" \
     "$cargo_skip" "1"
+
+# ── verify_converged() ───────────────────────────────────────────────
+#
+# The post-send convergence check, the PR's SECOND silent-drop defense.
+# riverctl exits 0 even when the room contract silently drops the delta, so
+# the script re-reads room state and confirms the message text is present.
+# verify_converged is extracted verbatim; read_room_messages (the riverctl
+# `message list` GET) is stubbed so the test is hermetic.
+#
+# The load-bearing property: verify_converged must CAPTURE the listing into a
+# variable before grepping, NOT pipe `read_room_messages | grep -qF`. Under
+# `set -o pipefail`, a piped `grep -q` exits on first match and SIGPIPEs the
+# still-writing producer (exit 141), so pipefail would report a genuinely
+# converged message as a FAILURE — the inverse of the bug being fixed. The
+# large-output test below pins that: the match is EARLY in a big listing, so a
+# piped implementation gets SIGPIPE (rc=141) when grep exits before the
+# producer finishes, while capture-then-grep returns 0. (A last-line match
+# would NOT trigger it — grep must read all output — which is why the producer
+# emits the match first, then a large tail.)
+# shellcheck disable=SC2317  # stubs below are called indirectly via eval'd verify_converged
+eval "$(awk '/^verify_converged\(\) \{/,/^}/' "$ANNOUNCE_SH")"
+
+# Re-assert pipefail is on (matches the real script's `set -euo pipefail`), so
+# the SIGPIPE-resistance test below is meaningful.
+set -o pipefail
+
+MESSAGE="Freenet v0.2.75 released: https://example/v0.2.75"
+
+# Message present EARLY, followed by a large tail. A piped
+# read_room_messages|grep -qF would SIGPIPE the still-writing producer (rc=141)
+# under pipefail and report failure despite the match. Capture-then-grep
+# returns 0. Verified: against a piped impl this assertion fails (rc=141);
+# against capture-then-grep it passes.
+read_room_messages() {
+    echo "[15:23:44 - Room Owner]: $MESSAGE"
+    for i in $(seq 1 500000); do echo "[old line $i]: filler chatter to overrun the 64KB pipe buffer"; done
+}
+rc=0
+verify_converged || rc=$?
+check "verify_converged() returns 0 when present early in large output (no SIGPIPE false-failure)" "$rc" "0"
+
+# Message absent: the delta was silently dropped — must fail (exit nonzero).
+read_room_messages() {
+    echo "[15:00:00 - Room Owner]: Freenet v0.2.74 released: https://example/v0.2.74"
+}
+rc=0
+verify_converged || rc=$?
+check "verify_converged() returns nonzero when the message is absent" "$rc" "1"
+
+# riverctl read itself fails (empty output): must be treated as not-converged.
+read_room_messages() { return 1; }
+rc=0
+verify_converged || rc=$?
+check "verify_converged() returns nonzero when the room read fails" "$rc" "1"
+
+# grep -F literalness: a message with regex metacharacters / leading dash is
+# matched literally (the `--` and `-F` are load-bearing).
+MESSAGE="-n release [v1.2.3] (50%) a.b*c"
+read_room_messages() { echo "noise"; echo "x $MESSAGE y"; }
+rc=0
+verify_converged || rc=$?
+check "verify_converged() matches messages with regex/dash metacharacters literally" "$rc" "0"
+
+# ── send_message_checked() exit-code preservation ────────────────────
+#
+# Regression for the Codex finding: the success path originally used
+# `if ! post_message`, under which `set -e` resets `$?` to 0 inside the
+# if-body, so a real riverctl failure was logged/exited as rc=0 — masking the
+# failed announcement and skipping verification. The fix wraps the send in
+# send_message_checked(), which captures the code with `post_message || rc=$?`
+# and returns it. send_message_checked is extracted VERBATIM here, so reverting
+# it to `if ! post_message` (which yields rc=0 on failure) fails this assertion.
+eval "$(awk '/^send_message_checked\(\) \{/,/^}/' "$ANNOUNCE_SH")"
+
+# riverctl send fails: send_message_checked must return riverctl's real code.
+post_message() { return 7; }
+rc=0
+send_message_checked 2>/dev/null || rc=$?
+check "send_message_checked() preserves a send failure code (not masked to 0)" "$rc" "7"
+
+# riverctl send succeeds: send_message_checked returns 0.
+post_message() { return 0; }
+rc=0
+send_message_checked 2>/dev/null || rc=$?
+check "send_message_checked() returns 0 on a successful send" "$rc" "0"
 
 # ── result ───────────────────────────────────────────────────────────
 

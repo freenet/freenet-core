@@ -737,10 +737,12 @@ mod tests {
     /// counting retry / deferred re-emissions as fresh misses.
     #[test]
     fn broadcast_path_feeds_propagation_stats_pin_test() {
+        // `handle_broadcast_state_change` lives in the `broadcast` submodule
+        // after the p2p_protoc.rs split.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src/node/network_bridge/p2p_protoc.rs");
+            .join("src/node/network_bridge/p2p_protoc/broadcast.rs");
         let source = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("must read p2p_protoc.rs at {}: {e}", path.display()));
+            .unwrap_or_else(|e| panic!("must read broadcast.rs at {}: {e}", path.display()));
 
         let call_count = source
             .matches("update_propagation_stats.record_broadcast(")

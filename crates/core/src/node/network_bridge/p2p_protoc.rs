@@ -38,7 +38,7 @@ use crate::transport::{
 use crate::{
     client_events::ClientId,
     config::GlobalExecutor,
-    contract::{ContractHandlerChannel, ExecutorTransactionStream, WaitingResolution},
+    contract::{ContractHandlerChannel, ExecutorTransactionStream, SenderHalve, WaitingResolution},
     message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
     node::{
         NetEventRegister, NodeConfig, OpManager, PeerId, WaiterReply, process_message_decoupled,
@@ -47,6 +47,11 @@ use crate::{
     tracing::NetEventLog,
 };
 use freenet_stdlib::client_api::{ContractResponse, HostResponse};
+
+mod broadcast;
+mod connection_lifecycle;
+mod dispatch;
+mod migration;
 
 /// Returns the process RSS (Resident Set Size) in bytes by reading /proc/self/statm.
 /// Returns None on non-Linux platforms or if the read fails.
@@ -94,6 +99,63 @@ impl std::fmt::Display for EventLoopExitReason {
 }
 
 impl std::error::Error for EventLoopExitReason {}
+
+/// Upper bound on how long the network event listener will wait for the contract
+/// handler to answer a *diagnostics* `QuerySubscriptions` query (#4549).
+///
+/// These queries run inline on the event loop. The handler's own response timeout
+/// is `CH_EV_RESPONSE_TIME_OUT` (300s); without an outer bound a saturated handler
+/// would stall the entire network event loop for up to 5 minutes per diagnostics
+/// poll. A diagnostics query is best-effort, so cap the wait and serve an empty
+/// result on timeout rather than freezing (or, previously, killing) the listener.
+const QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Best-effort, bounded query to the contract handler for application-level
+/// subscriptions, used by the diagnostics arms of the network event loop (#4549).
+///
+/// This runs INLINE on the network event loop, so it must be both bounded and
+/// non-fatal: a saturated contract handler previously made the bare
+/// `notify_contract_handler(QuerySubscriptions ...).await?` return
+/// `NoEvHandlerResponse` only after the 300s handler timeout, which killed the
+/// whole network event listener ("Network event listener exited: no response
+/// received from handler") and took the gateway network-dead. Here the wait is
+/// capped at [`QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT`] and ANY failure (timeout,
+/// channel error, missing response) yields an empty list. A genuinely-dead
+/// contract handler causes the `contract_executor_task` to exit, which the
+/// `run_node` supervisor observes via its `deterministic_select!` and brings the
+/// node down — so de-fatalizing this diagnostics query does not mask a dead
+/// handler.
+async fn query_app_subscriptions_bounded(
+    ch_outbound: &ContractHandlerChannel<SenderHalve>,
+) -> Vec<crate::message::SubscriptionInfo> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    match timeout(
+        QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT,
+        ch_outbound.send_to_handler(ContractHandlerEvent::QuerySubscriptions { callback: tx }),
+    )
+    .await
+    {
+        Ok(Ok(_)) => match timeout(Duration::from_secs(1), rx.recv()).await {
+            Ok(Some(QueryResult::NetworkDebug(info))) => info.application_subscriptions,
+            _ => Vec::new(),
+        },
+        Ok(Err(err)) => {
+            tracing::warn!(
+                error = %err,
+                "QuerySubscriptions diagnostics: contract handler error; \
+                 serving empty app subscriptions"
+            );
+            Vec::new()
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                "QuerySubscriptions diagnostics: contract handler did not respond within \
+                 timeout; serving empty app subscriptions"
+            );
+            Vec::new()
+        }
+    }
+}
 
 pub(crate) enum P2pBridgeEvent {
     Message(PeerKeyLocation, Box<NetMessage>),
@@ -234,6 +296,85 @@ impl P2pBridge {
             .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
         Ok(())
     }
+
+    /// Resolve the `PeerKeyLocation` to address a message to `target_addr`,
+    /// preferring the connection-manager record, then a configured gateway key,
+    /// then (as a normal transient fallback during handshake) our own key.
+    fn resolve_target(&self, target_addr: SocketAddr) -> PeerKeyLocation {
+        if let Some(target) = self
+            .op_manager
+            .ring
+            .connection_manager
+            .get_peer_by_addr(target_addr)
+        {
+            return target;
+        }
+        if let Some(gw_peer) = self
+            .gateways
+            .iter()
+            .find(|gw| gw.socket_addr() == Some(target_addr))
+            .cloned()
+        {
+            tracing::debug!(
+                peer_addr = %target_addr,
+                phase = "send",
+                "Using gateway public key for reconnection"
+            );
+            return gw_peer;
+        }
+        // Truly unknown peer - use own key as last resort. This is a normal
+        // transient state during connection handshakes when the peer's public
+        // key hasn't been established yet.
+        tracing::debug!(
+            peer_addr = %target_addr,
+            phase = "send",
+            "Sending to unknown peer address with no known public key"
+        );
+        PeerKeyLocation::new(
+            (*self.op_manager.ring.connection_manager.pub_key).clone(),
+            target_addr,
+        )
+    }
+
+    /// Non-blocking variant of [`NetworkBridge::send`] for callers that run
+    /// INLINE on the network event-loop task.
+    ///
+    /// `send` does `ev_listener_tx.send(..).await` on the cap-512 bridge channel
+    /// that the event loop itself drains; awaiting it from an on-loop caller is a
+    /// self-deadlock cycle under fan-out back-pressure (#4145). This variant uses
+    /// `try_send`: on a full or closed channel it drops the message and returns
+    /// `SendNotCompleted` so the caller can log it. The dropped message is
+    /// recovered by the caller's own path (op retry, or the periodic
+    /// InterestSync / subscription-renewal re-sync for interest/cache fan-out) —
+    /// see each call site's rationale. Returns `Ok(())` on a successful enqueue.
+    fn try_send(&self, target_addr: SocketAddr, msg: NetMessage) -> super::ConnResult<()> {
+        let target = self.resolve_target(target_addr);
+        self.op_manager.sending_transaction(&target, &msg);
+        match self
+            .ev_listener_tx
+            .try_send(P2pBridgeEvent::Message(target, Box::new(msg)))
+        {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    peer_addr = %target_addr,
+                    phase = "backpressure",
+                    "Event-loop bridge channel full; dropped outbound message from an \
+                     on-loop caller (will be recovered by op retry / periodic re-sync). \
+                     Sustained occurrences indicate fan-out / migration load."
+                );
+                Err(ConnectionError::SendNotCompleted(target_addr))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!(
+                    peer_addr = %target_addr,
+                    phase = "send",
+                    "Event-loop bridge channel closed; dropping outbound message"
+                );
+                Err(ConnectionError::SendNotCompleted(target_addr))
+            }
+        }
+    }
 }
 
 impl NetworkBridge for P2pBridge {
@@ -283,58 +424,16 @@ impl NetworkBridge for P2pBridge {
         // from P2pBridge::send() flow through handle_bridge_msg → OutboundMessageWithTarget
         // → the shared handler which calls register_events(from_outbound_msg(...)).
         // Tracing here would cause duplicate events.
-
-        // Look up the full PeerKeyLocation from connection manager for transaction tracking
-        let target_loc = self
-            .op_manager
-            .ring
-            .connection_manager
-            .get_peer_by_addr(target_addr);
-        if let Some(ref target) = target_loc {
-            self.op_manager.sending_transaction(target, &msg);
-            self.ev_listener_tx
-                .send(P2pBridgeEvent::Message(target.clone(), Box::new(msg)))
-                .await
-                .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
-        } else {
-            // No known peer at this address - try to find the public key from gateways
-            let gateway_peer = self
-                .gateways
-                .iter()
-                .find(|gw| gw.socket_addr() == Some(target_addr))
-                .cloned();
-
-            if let Some(gw_peer) = gateway_peer {
-                tracing::debug!(
-                    peer_addr = %target_addr,
-                    phase = "send",
-                    "Using gateway public key for reconnection"
-                );
-                self.op_manager.sending_transaction(&gw_peer, &msg);
-                self.ev_listener_tx
-                    .send(P2pBridgeEvent::Message(gw_peer, Box::new(msg)))
-                    .await
-                    .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
-            } else {
-                // Truly unknown peer - use own key as last resort.
-                // This is a normal transient state during connection handshakes
-                // when the peer's public key hasn't been established yet.
-                tracing::debug!(
-                    peer_addr = %target_addr,
-                    phase = "send",
-                    "Sending to unknown peer address with no known public key"
-                );
-                let temp_peer = PeerKeyLocation::new(
-                    (*self.op_manager.ring.connection_manager.pub_key).clone(),
-                    target_addr,
-                );
-                self.op_manager.sending_transaction(&temp_peer, &msg);
-                self.ev_listener_tx
-                    .send(P2pBridgeEvent::Message(temp_peer, Box::new(msg)))
-                    .await
-                    .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
-            }
-        }
+        let target = self.resolve_target(target_addr);
+        self.op_manager.sending_transaction(&target, &msg);
+        // channel-safety: ok — NetworkBridge::send is the OFF-loop producer API
+        // (op-driver / contract / broadcast tasks producing INTO the event loop);
+        // blocking here is the intended back-pressure on those callers. On-loop
+        // callers must use Self::try_send instead (#4145).
+        self.ev_listener_tx
+            .send(P2pBridgeEvent::Message(target, Box::new(msg)))
+            .await
+            .map_err(|_| ConnectionError::SendNotCompleted(target_addr))?;
         Ok(())
     }
 
@@ -606,29 +705,31 @@ pub(in crate::node) struct P2pConnManager {
 /// Minimum negotiated protocol version a peer must report before we send it a
 /// [`SubscribeHint`](crate::message::NetMessageV1::SubscribeHint).
 ///
-/// DEACTIVATED after the v0.2.73 UPDATE-broadcast-degradation incident. Set to
-/// `(0, 3, 0)`, which is ABOVE every shipped 0.2.x release, so the gate
-/// (`remote.is_some_and(|v| v >= floor)`, fail-closed on unknown) evaluates to
-/// `false` for all 0.2.x peers and the placement-migration wire behavior never
-/// fires in production. The placement-migration path (directed subscribes plus
-/// the `ConsiderContractMigration` emits) amplified the #4145/#4231
-/// broadcast-backpressure surface and drove a network-wide UPDATE-broadcast
-/// degradation on 0.2.73. The migration code is intentionally left in place;
-/// re-enable it by LOWERING this floor back to the release that first ships a
-/// load-safe SubscribeHint once the broadcast-backpressure load issue is fixed.
+/// RE-ENABLED at `(0, 2, 80)` after the #4145 event-loop fix (#4499) made the
+/// migration load-safe. 0.2.80 is the first release that ships SubscribeHint with
+/// that fix, so the floor follows the standard "set to the first-shipping release
+/// version, then FREEZE" rule. The gate (`remote.is_some_and(|v| v >= floor)`,
+/// fail-closed on unknown) sends a hint only to peers on `>= 0.2.80`, so the
+/// migration activates among upgraded peers and ramps with fleet upgrade rather
+/// than switching on everywhere at once.
 ///
-/// Original (pre-deactivation) contract, still true mechanically: a peer is only
-/// sent SubscribeHint if its negotiated version is >= this; older peers cannot
-/// deserialize the new wire variant and would drop the connection. None (unknown,
-/// e.g. joiner->gateway) is treated as unsupported.
+/// History: the migration first shipped in v0.2.73, where the placement-migration
+/// path (directed subscribes plus the `ConsiderContractMigration` emits) amplified
+/// the #4145/#4231 broadcast-backpressure surface and drove a network-wide
+/// UPDATE-broadcast degradation. v0.2.74 disabled it by raising this floor to
+/// `(0, 3, 0)`, above every shipped 0.2.x peer. It was re-enabled at `(0, 2, 80)`
+/// only after #4145 was fixed (#4499), validated at incident-scale fan-out, and
+/// the broadcast-assembly-failure telemetry (#4498) was deployed.
 ///
-/// WHEN RE-ENABLING — UPDATE AT RELEASE TIME, then FREEZE: set this to the exact
-/// release version that first ships the load-safe SubscribeHint and do NOT keep
-/// bumping it afterward to track the crate version. Once shipped in release R,
-/// peers running R can deserialize the variant, so the floor must stay at R
-/// forever — raising it above R would silently stop sending hints to
-/// fully-capable R peers. (This is why there is no `floor` vs `CARGO_PKG_VERSION`
-/// unit test; see docs/RELEASING.md.)
+/// Wire-compat contract: a peer is only sent SubscribeHint if its negotiated
+/// version is `>=` this floor; older peers cannot deserialize the wire variant and
+/// would drop the connection. None (unknown, e.g. joiner->gateway) is treated as
+/// unsupported.
+///
+/// DO NOT bump this floor on later releases. Once shipped in 0.2.80, peers running
+/// 0.2.80+ can deserialize the variant, so the floor must stay at 0.2.80 forever;
+/// raising it would silently stop sending hints to fully-capable peers. (This is
+/// why there is no `floor` vs `CARGO_PKG_VERSION` unit test; see docs/RELEASING.md.)
 ///
 /// This is a single non-cfg constant: deliberately NOT lowered under any test
 /// feature, because `testing` is pulled into the SHIPPED release binary (`fdev`
@@ -644,17 +745,23 @@ pub(in crate::node) struct P2pConnManager {
 /// enough, because a 0.2.74 node would otherwise still ACT on hints sent by a
 /// pre-floor 0.2.73 peer and keep the (deactivated) migration load alive during
 /// the staggered rollout.
-pub(crate) const SUBSCRIBE_HINT_MIN_VERSION: (u8, u8, u16) = (0, 3, 0);
+///
+/// Set to `(0, 2, 80)`: the first release that ships SubscribeHint together with
+/// the #4145 event-loop fix (#4499) that makes the migration load-safe. The
+/// migration is RE-ENABLED at this floor, and the value is now FROZEN per the
+/// general wire-gated-floor rule in `docs/RELEASING.md` (do NOT bump it on later
+/// releases). Only peer pairs both on `>= 0.2.80` exchange hints, so activation
+/// ramps with fleet upgrade rather than switching on everywhere at once.
+pub(crate) const SUBSCRIBE_HINT_MIN_VERSION: (u8, u8, u16) = (0, 2, 80);
 
 /// This node's own crate version as a `(major, minor, patch)` tuple, parsed at
 /// compile time from `CARGO_PKG_VERSION`.
 ///
 /// Used by the INBOUND `SubscribeHint` receive gate (see [`crate::node`]) to ask
 /// "is the placement migration active for a node running THIS version?" via
-/// [`version_supports_subscribe_hint`]. With the floor parked at `(0, 3, 0)` and
-/// our own version on the 0.2.x line, the gate evaluates to "migration off →
-/// ignore inbound hints"; lowering the floor re-activates both the send and the
-/// receive side together.
+/// [`version_supports_subscribe_hint`]. With the floor at `(0, 2, 80)`, a node on
+/// `>= 0.2.80` acts on inbound hints and a pre-floor node ignores them; the send
+/// and receive sides share this floor so they activate together.
 pub(crate) const fn own_crate_version() -> (u8, u8, u16) {
     parse_crate_version(env!("CARGO_PKG_VERSION"))
 }
@@ -771,238 +878,6 @@ where
 }
 
 impl P2pConnManager {
-    /// Whether the peer at `addr` reports a negotiated protocol version new
-    /// enough to understand [`SubscribeHint`](crate::message::NetMessageV1::SubscribeHint).
-    ///
-    /// `None` (unknown version) is treated as unsupported, since an older peer
-    /// would fail to deserialize the new wire variant and drop the connection.
-    fn peer_supports_subscribe_hint(&self, addr: &SocketAddr) -> bool {
-        let remote = self.connections.get(addr).and_then(|e| e.remote_version);
-        // Production floor, unless a sim test opted into the cascade by setting a
-        // per-node override (never set in production — see NodeConfig).
-        let floor = self
-            .bridge
-            .op_manager
-            .ring
-            .connection_manager
-            .subscribe_hint_floor_override()
-            .unwrap_or(SUBSCRIBE_HINT_MIN_VERSION);
-        version_supports_subscribe_hint(remote, floor)
-    }
-
-    /// Pick the single best peer to nudge into hosting `key`, or `None`.
-    ///
-    /// Directed-subscribe placement (#4404): we host `key` but a connected
-    /// neighbor may be strictly closer to the contract's key in the ring than
-    /// we are. Nudging that neighbor to subscribe-and-host migrates the
-    /// contract toward its ideal location. We pick ONLY the single closest
-    /// qualifying neighbor (not a fan-out), and ONLY when it is strictly
-    /// closer than us and not already hosting.
-    ///
-    /// A candidate qualifies iff it has a known socket address, a known ring
-    /// location, is not already hosting `key` (per neighbor-hosting state),
-    /// reports a protocol version new enough to understand `SubscribeHint`, and
-    /// is strictly closer to the contract location than we are. Returns the
-    /// qualifying candidate with the smallest distance to the contract, breaking
-    /// ties deterministically by public-key bytes.
-    ///
-    /// The version filter is applied HERE (before the pure selection core) so
-    /// that an old/unknown-version peer that happens to be closest does not
-    /// suppress migration: we fall through to the next-closest peer that CAN
-    /// receive the hint. This matters during a mixed-version rolling upgrade.
-    fn select_migration_target(
-        &self,
-        key: &freenet_stdlib::prelude::ContractKey,
-    ) -> Option<PeerKeyLocation> {
-        let contract_loc = Location::from(key);
-        let me = self
-            .bridge
-            .op_manager
-            .ring
-            .connection_manager
-            .own_location();
-        let my_dist = contract_loc.distance(me.location()?);
-
-        let hosting: HashSet<TransportPublicKey> = self
-            .bridge
-            .op_manager
-            .neighbor_hosting
-            .neighbors_with_contract(key)
-            .into_iter()
-            .collect();
-
-        let connections = self
-            .bridge
-            .op_manager
-            .ring
-            .connection_manager
-            .get_connections_by_location();
-
-        pick_closest_migration_target(
-            contract_loc,
-            my_dist,
-            &hosting,
-            connections
-                .values()
-                .flatten()
-                .map(|conn| &conn.location)
-                // Only peers that can understand the appended wire variant are
-                // eligible; a closer but too-old peer is skipped so the next
-                // eligible peer is chosen (mixed-version safety).
-                .filter(|pkl| {
-                    pkl.socket_addr()
-                        .is_some_and(|addr| self.peer_supports_subscribe_hint(&addr))
-                }),
-        )
-    }
-
-    /// Best-effort nudge for a single contract we host: if there is a closer,
-    /// non-hosting neighbor that understands `SubscribeHint`, tell it we are
-    /// the current holder so it can directed-subscribe and host `key`.
-    ///
-    /// No-op if we do not host `key` or if there is no qualifying target
-    /// (closer, non-hosting, AND version-supported — the selection skips peers
-    /// too old to understand the hint). Fire-and-forget and
-    /// NON-BLOCKING: the nudge is dispatched with `try_send`, so a congested
-    /// bridge channel drops the hint (logged at debug) rather than stalling the
-    /// connection-handling event loop — see `.claude/rules/channel-safety.md`.
-    /// Migration is reconsidered on the next hosting/peer event, so a dropped
-    /// hint is self-healing.
-    fn consider_contract_migration(&self, key: freenet_stdlib::prelude::ContractKey) {
-        if !self.bridge.op_manager.ring.is_hosting_contract(&key) {
-            return;
-        }
-        let Some(target) = self.select_migration_target(&key) else {
-            return;
-        };
-        let Some(addr) = target.socket_addr() else {
-            return;
-        };
-        // Defense-in-depth: `select_migration_target` already filters to
-        // version-supported peers, but re-gate here so a SubscribeHint can NEVER
-        // be sent to a peer too old to deserialize it (which would drop the
-        // connection) even if the selection path changes.
-        if !self.peer_supports_subscribe_hint(&addr) {
-            return;
-        }
-        // The migration target is a connected neighbor we just looked up and
-        // version-checked, so it resolves via `get_peer_by_addr`.
-        let Some(target_pkl) = self
-            .bridge
-            .op_manager
-            .ring
-            .connection_manager
-            .get_peer_by_addr(addr)
-        else {
-            return;
-        };
-        let me = self
-            .bridge
-            .op_manager
-            .ring
-            .connection_manager
-            .own_location();
-        let msg = NetMessage::V1(NetMessageV1::SubscribeHint(
-            crate::message::SubscribeHintMsg { key, holder: me },
-        ));
-        self.bridge
-            .op_manager
-            .sending_transaction(&target_pkl, &msg);
-        // Non-blocking dispatch: never `.send().await` from the event loop.
-        if let Err(e) = self
-            .bridge
-            .ev_listener_tx
-            .try_send(P2pBridgeEvent::Message(target_pkl, Box::new(msg)))
-        {
-            tracing::debug!(%addr, %key, error = %e, "SubscribeHint nudge dropped (bridge busy or closed)");
-        }
-    }
-
-    /// On gaining a new neighbor, reconsider migrating each contract we host.
-    ///
-    /// The new peer may be the closest non-hosting neighbor for some of our
-    /// contracts; `consider_contract_migration` recomputes the single best
-    /// target per contract, so we do not special-case `peer_addr` here beyond
-    /// an early skip when the new peer is not even closer than us. The number
-    /// of contracts examined per call is capped at
-    /// [`MIGRATION_SCAN_CAP_PER_NEW_PEER`] so we never do an unbounded inline
-    /// scan + nudge fan-out from the event loop (channel-safety).
-    fn consider_migration_for_new_peer(&self, peer_addr: SocketAddr) {
-        let new_peer_loc = self
-            .connections
-            .get(&peer_addr)
-            .and_then(|e| e.pub_key.as_ref())
-            .and_then(|pk| {
-                self.bridge
-                    .op_manager
-                    .ring
-                    .connection_manager
-                    .get_peer_by_addr(peer_addr)
-                    .filter(|p| p.pub_key() == pk)
-                    .and_then(|p| p.location())
-            })
-            .or_else(|| {
-                self.bridge
-                    .op_manager
-                    .ring
-                    .connection_manager
-                    .get_peer_by_addr(peer_addr)
-                    .and_then(|p| p.location())
-            });
-        let my_loc = self
-            .bridge
-            .op_manager
-            .ring
-            .connection_manager
-            .own_location()
-            .location();
-
-        let keys = self.bridge.op_manager.ring.hosting_contract_keys();
-        let total = keys.len();
-        if total == 0 {
-            return;
-        }
-        // Bound the per-event scan: examine at most
-        // MIGRATION_SCAN_CAP_PER_NEW_PEER keys even when most of them skip the
-        // cheap test below, so a node hosting thousands of contracts can't walk
-        // its entire hosting set on every new connection (unbounded work on the
-        // connection-handling path). A rotating start offset (the
-        // `migration_scan_cursor`) makes successive events cover different
-        // windows, so contracts past the cap are reached on later events rather
-        // than being starved in a fixed prefix.
-        let window = MIGRATION_SCAN_CAP_PER_NEW_PEER;
-        let start = self
-            .bridge
-            .op_manager
-            .ring
-            .connection_manager
-            .next_migration_scan_offset(window)
-            % total;
-        if total > window {
-            tracing::debug!(
-                cap = window,
-                total,
-                start,
-                %peer_addr,
-                "Capping migration scan for new peer; rotating window covers the rest on later events"
-            );
-        }
-        for i in 0..window.min(total) {
-            let key = keys[(start + i) % total];
-            // Optimization: if we know both locations and the new peer isn't
-            // strictly closer to this contract than we are, it can't become
-            // the migration target this contract gained from the new peer, so
-            // skip the full selection join.
-            if let (Some(new_loc), Some(my_loc)) = (new_peer_loc, my_loc) {
-                let contract_loc = Location::from(&key);
-                if contract_loc.distance(new_loc) >= contract_loc.distance(my_loc) {
-                    continue;
-                }
-            }
-            self.consider_contract_migration(key);
-        }
-    }
-
     pub(in crate::node) fn listening_port(&self) -> u16 {
         self.listening_port
     }
@@ -1672,15 +1547,53 @@ impl P2pConnManager {
                                     let is_gw = gateways
                                         .iter()
                                         .any(|gw| gw.socket_addr() == Some(target_addr));
-                                    ctx.bridge
-                                        .ev_listener_tx
-                                        .send(P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer {
+
+                                    // Non-blocking enqueue to avoid self-deadlocking the
+                                    // event loop (#4145). ev_listener_tx is drained by THIS
+                                    // task's own select loop, so a `.send().await` here that
+                                    // back-pressures would stall the very loop that drains it
+                                    // — a true self-deadlock cycle. Under the SubscribeHint
+                                    // placement migration's load this is the ConnectPeer arm
+                                    // the nudge drives, so a full channel is the load signal
+                                    // we must shed cleanly rather than wedge on.
+                                    //
+                                    // On Full/Closed we drop THIS outbound attempt: the
+                                    // message is not sent, the op driver's retry loop / op
+                                    // TTL re-routes it (same recovery as the congested-peer
+                                    // 500ms-timeout drop above). We must NOT spawn the
+                                    // resend-waiter in that case — its `callback` would never
+                                    // be registered with any connect op, so dropping the
+                                    // callback here closes `result` and the waiter would
+                                    // observe `Ok(None)` immediately rather than hang the
+                                    // full 20s timeout on a connection that was never
+                                    // requested.
+                                    if let Err(err) = ctx.bridge.ev_listener_tx.try_send(
+                                        P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer {
                                             peer: target_peer.clone(),
                                             tx,
                                             callback,
                                             is_gw,
-                                        }))
-                                        .await?;
+                                        }),
+                                    ) {
+                                        // `err` owns the ConnectPeer event (and thus the
+                                        // callback Sender); dropping it here is what
+                                        // short-circuits the would-be waiter.
+                                        let reason = match err {
+                                            mpsc::error::TrySendError::Full(_) => "full",
+                                            mpsc::error::TrySendError::Closed(_) => "closed",
+                                        };
+                                        tracing::warn!(
+                                            tx = %tx,
+                                            peer_addr = %target_addr,
+                                            reason,
+                                            phase = "backpressure",
+                                            "Event-loop bridge channel {reason} while dispatching \
+                                             ConnectPeer; dropping outbound message (op will retry). \
+                                             Sustained occurrences indicate fan-out / migration load \
+                                             overwhelming the event loop."
+                                        );
+                                        continue;
+                                    }
 
                                     tracing::debug!(
                                         tx = %tx,
@@ -1995,18 +1908,29 @@ impl P2pConnManager {
                                             ctx.addr_by_pub_key.remove(&pub_key);
                                         }
 
-                                        // Notify handshake handler to clean up
-                                        if let Err(error) = handshake_cmd_sender
-                                            .send(HandshakeCommand::DropConnection {
-                                                peer: peer.clone(),
-                                            })
-                                            .await
-                                        {
+                                        // Notify handshake handler to clean up.
+                                        // Non-blocking (#4145): runs on the event-loop task,
+                                        // so a `.send().await` that back-pressures on the
+                                        // handshake command channel (cap 128) would stall the
+                                        // loop. Drop on full — the DropConnection is redundant
+                                        // cleanup: the connection has already been removed from
+                                        // ctx.connections / addr_by_pub_key and pruned from the
+                                        // ring above. The only residue is the handshake driver's
+                                        // ExpectedInboundTracker entry (if any). That tracker is
+                                        // a per-SocketAddr HashMap with no TTL sweep, but the
+                                        // entry is benign and bounded: it is overwritten on the
+                                        // next register() for the same addr and consumed when a
+                                        // matching inbound arrives, so a missed DropConnection
+                                        // leaves at most one stale per-addr expectation, not an
+                                        // unbounded leak.
+                                        if !handshake_cmd_sender.try_send(
+                                            HandshakeCommand::DropConnection { peer: peer.clone() },
+                                        ) {
                                             tracing::warn!(
                                                 peer = %peer,
-                                                error = ?error,
                                                 phase = "cleanup",
-                                                "Failed to send drop connection command during cleanup"
+                                                "Handshake command channel full/closed during \
+                                                 cleanup; skipping redundant drop notification"
                                             );
                                         }
                                     }
@@ -2128,19 +2052,30 @@ impl P2pConnManager {
                                         .clone(),
                                     addr,
                                 );
-                                if let Err(error) = handshake_cmd_sender
-                                    .send(HandshakeCommand::ExpectInbound {
-                                        peer: peer_placeholder,
-                                        transaction: None,
-                                        transient: false,
-                                    })
-                                    .await
-                                {
+                                // Non-blocking (#4145): this ExpectPeerConnection
+                                // handler runs on the event-loop task, so a
+                                // `.send().await` that back-pressures on the
+                                // handshake command channel (cap 128) would stall the
+                                // loop. Dropping the ExpectInbound registration is
+                                // recoverable: when the inbound connection actually
+                                // arrives without a matching expectation it is still
+                                // accepted provisionally (see handle_handshake_action,
+                                // "accepting provisionally"), and the originating
+                                // connect op retries if its handshake does not
+                                // complete. We `warn!` because a dropped expectation
+                                // makes admission less reliable under load.
+                                if !handshake_cmd_sender.try_send(HandshakeCommand::ExpectInbound {
+                                    peer: peer_placeholder,
+                                    transaction: None,
+                                    transient: false,
+                                }) {
                                     tracing::warn!(
                                         peer_addr = %addr,
-                                        error = ?error,
                                         phase = "connect",
-                                        "Failed to enqueue expect inbound command - connection may be rejected"
+                                        "Handshake command channel full/closed; dropped \
+                                         ExpectInbound registration. Inbound connection will \
+                                         be accepted provisionally; connect op retries if the \
+                                         handshake does not complete."
                                     );
                                 }
                             }
@@ -2205,23 +2140,12 @@ impl P2pConnManager {
                                     })
                                     .collect();
 
-                                // Get application subscriptions from contract executor
-                                // For now, we'll send a query to the contract handler
-                                let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-
-                                op_manager
-                                    .notify_contract_handler(
-                                        ContractHandlerEvent::QuerySubscriptions { callback: tx },
-                                    )
-                                    .await?;
-
+                                // Get application subscriptions from the contract handler.
+                                // #4549: bounded + non-fatal (see
+                                // `query_app_subscriptions_bounded`) — a saturated handler
+                                // must never stall or kill the network event listener.
                                 let app_subscriptions =
-                                    match timeout(Duration::from_secs(1), rx.recv()).await {
-                                        Ok(Some(QueryResult::NetworkDebug(info))) => {
-                                            info.application_subscriptions
-                                        }
-                                        _ => Vec::new(),
-                                    };
+                                    query_app_subscriptions_bounded(&op_manager.ch_outbound).await;
 
                                 // Log network subscription details for debugging
                                 for (contract_key, peers) in &network_subs {
@@ -2342,30 +2266,14 @@ impl P2pConnManager {
                                     // Get network subscriptions from OpManager
                                     let _network_subs = op_manager.get_network_subscriptions();
 
-                                    // Get application subscriptions from contract executor
-                                    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-                                    if op_manager
-                                        .notify_contract_handler(
-                                            ContractHandlerEvent::QuerySubscriptions {
-                                                callback: tx,
-                                            },
-                                        )
-                                        .await
-                                        .is_ok()
-                                    {
-                                        let app_subscriptions = match timeout(
-                                            Duration::from_secs(1),
-                                            rx.recv(),
-                                        )
-                                        .await
-                                        {
-                                            Ok(Some(QueryResult::NetworkDebug(info))) => {
-                                                info.application_subscriptions
-                                            }
-                                            _ => Vec::new(),
-                                        };
-
-                                        response.subscriptions = app_subscriptions
+                                    // Get application subscriptions from the contract handler.
+                                    // #4549: bounded + non-fatal (see
+                                    // `query_app_subscriptions_bounded`). On any failure this
+                                    // serves an empty list rather than stalling or killing the
+                                    // network event listener.
+                                    response.subscriptions =
+                                        query_app_subscriptions_bounded(&op_manager.ch_outbound)
+                                            .await
                                             .into_iter()
                                             .map(|sub| {
                                                 freenet_stdlib::client_api::SubscriptionInfo {
@@ -2374,7 +2282,6 @@ impl P2pConnManager {
                                                 }
                                             })
                                             .collect();
-                                    }
                                 }
 
                                 // Collect contract states.
@@ -2694,2760 +2601,6 @@ impl P2pConnManager {
             Err(EventLoopExitReason::UnexpectedStreamEnd.into())
         }
     }
-
-    /// Drop a single connection by socket address: notifies the handshake handler,
-    /// prunes topology, handles orphaned transactions, cleans up subscriptions,
-    /// and forwards a DropConnection event to the per-peer listener.
-    ///
-    /// Returns `true` if the connection existed and was dropped.
-    async fn drop_connection_by_addr(
-        &mut self,
-        peer_addr: SocketAddr,
-        handshake_cmd_sender: &HandshakeCommandSender,
-    ) -> bool {
-        let Some(entry) = self.connections.get(&peer_addr) else {
-            return false;
-        };
-
-        let peer = if let Some(ref pub_key) = entry.pub_key {
-            PeerKeyLocation::new(pub_key.clone(), peer_addr)
-        } else {
-            PeerKeyLocation::new(
-                (*self.bridge.op_manager.ring.connection_manager.pub_key).clone(),
-                peer_addr,
-            )
-        };
-        let pub_key_to_remove = entry.pub_key.clone();
-
-        tracing::trace!(
-            peer_addr = %peer_addr,
-            conn_map_size = self.connections.len(),
-            reason = "drop_requested",
-            "Removing connection from tracking map"
-        );
-
-        if let Err(error) = handshake_cmd_sender
-            .send(HandshakeCommand::DropConnection { peer: peer.clone() })
-            .await
-        {
-            tracing::warn!(
-                peer = %peer,
-                error = ?error,
-                phase = "disconnect",
-                "Failed to enqueue drop connection command"
-            );
-        }
-
-        // Immediately prune topology counters so we don't leak open connection slots.
-        let prune_result = self
-            .bridge
-            .op_manager
-            .ring
-            .prune_connection(PeerId::new(peer.pub_key().clone(), peer_addr))
-            .await;
-
-        // Handle orphaned transactions immediately (retry via alternate routes).
-        self.bridge
-            .handle_orphaned_transactions(prune_result.orphaned_transactions, peer_addr)
-            .await;
-
-        // Broadcast unready if we dropped below the readiness threshold
-        if prune_result.became_unready {
-            self.handle_broadcast_ready_state(false).await;
-        }
-
-        // Forget this peer's subscriptions and cached contract state
-        self.bridge
-            .op_manager
-            .on_ring_connection_lost(peer.pub_key());
-
-        if let Some(conn) = self.connections.remove(&peer_addr) {
-            if let Some(pub_key) = pub_key_to_remove {
-                self.addr_by_pub_key.remove(&pub_key);
-            }
-            // TODO: review: this could potentially leave garbage tasks in the background with peer listener
-            match timeout(
-                Duration::from_secs(1),
-                conn.sender
-                    .send(Right(ConnEvent::NodeAction(NodeEvent::DropConnection(
-                        peer_addr,
-                    )))),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(send_error)) => {
-                    tracing::error!(
-                        peer_addr = %peer_addr,
-                        error = ?send_error,
-                        phase = "error",
-                        "Failed to send drop connection message to peer"
-                    );
-                }
-                Err(elapsed) => {
-                    tracing::error!(
-                        peer_addr = %peer_addr,
-                        error = ?elapsed,
-                        phase = "timeout",
-                        "Timeout while sending drop connection message"
-                    );
-                }
-            }
-        }
-
-        true
-    }
-
-    /// Drop a zombie transport connection using non-blocking sends to the handshake
-    /// driver. This prevents a deadlock where the event loop blocks sending
-    /// DropConnection commands while the handshake driver blocks sending
-    /// InboundConnection events back to the event loop (#3519).
-    ///
-    /// Unlike `drop_connection_by_addr`, this method:
-    /// - Uses `try_send` for the handshake command (skips if channel full)
-    /// - Uses a shorter timeout for the per-connection drop notification
-    async fn drop_zombie_connection(
-        &mut self,
-        peer_addr: SocketAddr,
-        handshake_cmd_sender: &HandshakeCommandSender,
-    ) {
-        let Some(entry) = self.connections.get(&peer_addr) else {
-            return;
-        };
-
-        let peer = if let Some(ref pub_key) = entry.pub_key {
-            PeerKeyLocation::new(pub_key.clone(), peer_addr)
-        } else {
-            PeerKeyLocation::new(
-                (*self.bridge.op_manager.ring.connection_manager.pub_key).clone(),
-                peer_addr,
-            )
-        };
-        let pub_key_to_remove = entry.pub_key.clone();
-
-        // Non-blocking send to handshake driver to avoid deadlock (#3519).
-        // For zombie transports (already established connections), the expected_inbound
-        // entry was already consumed when the inbound connection arrived, so the
-        // DropConnection command is effectively a no-op.
-        if !handshake_cmd_sender.try_send(HandshakeCommand::DropConnection { peer: peer.clone() }) {
-            tracing::debug!(
-                peer = %peer,
-                "Handshake channel full during zombie cleanup, skipping handshake notification"
-            );
-        }
-
-        // Prune from ring topology (non-blocking — only takes write locks, no cross-task channels)
-        let prune_result = self
-            .bridge
-            .op_manager
-            .ring
-            .prune_connection(PeerId::new(peer.pub_key().clone(), peer_addr))
-            .await;
-
-        // Handle orphaned transactions
-        self.bridge
-            .handle_orphaned_transactions(prune_result.orphaned_transactions, peer_addr)
-            .await;
-
-        if prune_result.became_unready {
-            self.handle_broadcast_ready_state(false).await;
-        }
-
-        // Forget subscriptions and cached contract state
-        self.bridge
-            .op_manager
-            .on_ring_connection_lost(peer.pub_key());
-
-        // Remove from transport tracking and notify the per-connection task
-        if let Some(conn) = self.connections.remove(&peer_addr) {
-            if let Some(pub_key) = pub_key_to_remove {
-                self.addr_by_pub_key.remove(&pub_key);
-            }
-            // Short timeout — zombie connections may already be dead
-            match timeout(
-                Duration::from_millis(100),
-                conn.sender
-                    .send(Right(ConnEvent::NodeAction(NodeEvent::DropConnection(
-                        peer_addr,
-                    )))),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) | Err(_) => {
-                    // Expected for zombie connections — the peer task may already be gone
-                }
-            }
-        }
-    }
-
-    /// Process a SelectResult from the priority select stream
-    async fn process_select_result(
-        &mut self,
-        result: priority_select::SelectResult,
-        state: &mut EventListenerState,
-        handshake_commands: &HandshakeCommandSender,
-    ) -> anyhow::Result<EventResult> {
-        let peer_id = &self.bridge.op_manager.ring.connection_manager.pub_key;
-
-        use priority_select::SelectResult;
-        match result {
-            SelectResult::Notification(msg) => {
-                tracing::debug!(
-                    peer = %peer_id,
-                    msg_present = msg.is_some(),
-                    "PrioritySelect: notifications_receiver READY"
-                );
-                Ok(self.handle_notification_msg(msg))
-            }
-            SelectResult::OpExecution(msg) => {
-                tracing::debug!(
-                    peer = %peer_id,
-                    "PrioritySelect: op_execution_receiver READY"
-                );
-                Ok(self.handle_op_execution(msg, state))
-            }
-            SelectResult::PeerConnection(msg) => {
-                tracing::debug!(
-                    peer = %peer_id,
-                    "PrioritySelect: connection events READY"
-                );
-                self.handle_transport_event(msg, state, handshake_commands)
-                    .await
-            }
-            SelectResult::ConnBridge(msg) => {
-                tracing::debug!(
-                    peer = %peer_id,
-                    "PrioritySelect: conn_bridge_rx READY"
-                );
-                Ok(self.handle_bridge_msg(msg))
-            }
-            SelectResult::Handshake(result) => {
-                tracing::debug!(
-                    peer = %peer_id,
-                        "PrioritySelect: handshake event READY"
-                );
-                match result {
-                    Some(event) => {
-                        self.handle_handshake_action(event, state, handshake_commands)
-                            .await?;
-                        Ok(EventResult::Continue)
-                    }
-                    None => {
-                        tracing::warn!(
-                            "Handshake handler stream closed; notifying pending callbacks"
-                        );
-                        self.handle_handshake_stream_closed(state).await?;
-                        Ok(EventResult::Continue)
-                    }
-                }
-            }
-            SelectResult::NodeController(msg) => {
-                tracing::debug!(
-                    peer = %peer_id,
-                    "PrioritySelect: node_controller READY"
-                );
-                Ok(self.handle_node_controller_msg(msg))
-            }
-            SelectResult::ClientTransaction(event_id) => {
-                tracing::debug!(
-                    peer = %peer_id,
-                    "PrioritySelect: client_wait_for_transaction READY"
-                );
-                Ok(self.handle_client_transaction_subscription(event_id, state))
-            }
-            SelectResult::ExecutorTransaction(id) => {
-                tracing::debug!(
-                    peer = %peer_id,
-                    "PrioritySelect: executor_listener READY"
-                );
-                Ok(self.handle_executor_transaction(id, state))
-            }
-        }
-    }
-
-    async fn handle_inbound_message(
-        &self,
-        msg: NetMessage,
-        source_addr: Option<SocketAddr>,
-        op_manager: &Arc<OpManager>,
-        state: &mut EventListenerState,
-    ) -> anyhow::Result<()> {
-        let tx = *msg.id();
-        tracing::debug!(
-            %tx,
-            tx_type = ?tx.transaction_type(),
-            ?source_addr,
-            "Handling inbound NetMessage at event loop"
-        );
-        match msg {
-            NetMessage::V1(NetMessageV1::Aborted(tx)) => {
-                tracing::debug!(
-                    %tx,
-                    tx_type = ?tx.transaction_type(),
-                    "Received Aborted wire message — driver owns cancellation, ignoring"
-                );
-            }
-            msg => {
-                self.process_message(msg, source_addr, op_manager, state)
-                    .await;
-            }
-        }
-        Ok(())
-    }
-
-    async fn process_message(
-        &self,
-        msg: NetMessage,
-        source_addr: Option<SocketAddr>,
-        op_manager: &Arc<OpManager>,
-        state: &mut EventListenerState,
-    ) {
-        tracing::debug!(
-            tx = %msg.id(),
-            tx_type = ?msg.id().transaction_type(),
-            msg_type = %msg,
-            ?source_addr,
-            peer = ?op_manager.ring.connection_manager.get_own_addr(),
-            "process_message called - processing network message"
-        );
-
-        let span = tracing::info_span!(
-            "process_network_message",
-            transaction = %msg.id(),
-            tx_type = %msg.id().transaction_type()
-        );
-
-        let pending_op_result = state.pending_op_results.get(msg.id()).cloned();
-
-        GlobalExecutor::spawn(
-            process_message_decoupled(
-                msg,
-                source_addr,
-                op_manager.clone(),
-                self.bridge.clone(),
-                self.event_listener.trait_clone(),
-                pending_op_result,
-            )
-            .instrument(span),
-        );
-    }
-
-    /// Looks up a connection by public key using the reverse lookup map.
-    /// Returns the socket address and connection entry if found.
-    fn connection_entry_by_pub_key(
-        &self,
-        pub_key: &TransportPublicKey,
-    ) -> Option<(SocketAddr, &ConnectionEntry)> {
-        self.addr_by_pub_key
-            .get(pub_key)
-            .and_then(|addr| self.connections.get(addr).map(|entry| (*addr, entry)))
-    }
-
-    async fn handle_connect_peer(
-        &mut self,
-        peer: PeerKeyLocation,
-        mut callback: Box<dyn ConnectResultSender>,
-        tx: Transaction,
-        handshake_commands: &HandshakeCommandSender,
-        state: &mut EventListenerState,
-        transient: bool,
-    ) -> anyhow::Result<()> {
-        // Periodic cleanup of expired backoff entries (every 60 seconds)
-        const BACKOFF_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
-        if state.last_backoff_cleanup.elapsed() > BACKOFF_CLEANUP_INTERVAL {
-            state.peer_backoff.cleanup_expired();
-            state.last_backoff_cleanup = Instant::now();
-        }
-
-        let mut peer = peer;
-        let mut peer_addr = peer
-            .socket_addr()
-            .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
-
-        // IMPORTANT: Always try pub_key lookup first, not just for unspecified addresses.
-        // The peer's advertised address (from PeerKeyLocation) may differ from the actual
-        // TCP connection's remote address stored in self.connections. For example:
-        // - PeerKeyLocation may have the peer's listening port (e.g., 37791)
-        // - self.connections is keyed by the actual TCP source port (ephemeral port)
-        // By looking up via pub_key (populated when we receive the first message from this
-        // peer), we can find the correct connection entry regardless of address mismatch.
-        if let Some((existing_addr, _)) = self.connection_entry_by_pub_key(peer.pub_key()) {
-            if existing_addr != peer_addr {
-                tracing::debug!(
-                    tx = %tx,
-                    peer = %peer,
-                    advertised_addr = %peer_addr,
-                    actual_addr = %existing_addr,
-                    transient,
-                    phase = "connect",
-                    "Using existing connection (advertised address differs from actual)"
-                );
-            }
-            peer_addr = existing_addr;
-            peer = PeerKeyLocation::new(peer.pub_key().clone(), existing_addr);
-        } else if peer_addr.ip().is_unspecified() {
-            tracing::debug!(
-                tx = %tx,
-                transient,
-                "ConnectPeer received unspecified address without existing connection reference"
-            );
-        }
-
-        tracing::debug!(
-            tx = %tx,
-            peer = %peer,
-            peer_addr = %peer_addr,
-            transient,
-            phase = "connect",
-            "Initiating connection to peer"
-        );
-        if let Some(blocked_addrs) = &self.blocked_addresses {
-            if blocked_addrs.contains(&peer_addr) {
-                tracing::info!(
-                    tx = %tx,
-                    remote = %peer_addr,
-                    "Outgoing connection to peer blocked by local policy"
-                );
-                callback
-                    .send_result(Err(()))
-                    .await
-                    .inspect_err(|error| {
-                        tracing::debug!(
-                            remote = %peer_addr,
-                            ?error,
-                            "Failed to notify caller about blocked connection"
-                        );
-                    })
-                    .ok();
-                return Ok(());
-            }
-            tracing::debug!(
-                tx = %tx,
-                "Blocked addresses: {:?}, peer addr: {}",
-                blocked_addrs,
-                peer_addr
-            );
-        }
-
-        // If a transient transport already exists, promote it without dialing anew.
-        if self.connections.contains_key(&peer_addr) {
-            tracing::info!(
-                tx = %tx,
-                remote = %peer,
-                transient,
-                "connect_peer: reusing existing transport / promoting transient if present"
-            );
-            let connection_manager = &self.bridge.op_manager.ring.connection_manager;
-            let was_transient = connection_manager.drop_transient(peer_addr);
-
-            // Promote if: (a) was tracked as transient, OR (b) not already in ring.
-            // Case (b) handles expired transient TTL — transport preserved per 76058cf4
-            // but tracking entry gone. Without this, CONNECT succeeds but peer is never
-            // added to ring topology (#3113).
-            let needs_promotion =
-                was_transient.is_some() || !connection_manager.is_in_ring(peer_addr);
-            let transient_expired = was_transient.is_none() && needs_promotion;
-
-            if needs_promotion {
-                let loc = was_transient
-                    .and_then(|e| e.location)
-                    .unwrap_or_else(|| Location::from_address(&peer_addr));
-                // Don't re-run should_accept() here — the connection was already
-                // accepted at the protocol level (the CONNECT terminus handler in connect.rs) and NAT traversal
-                // already succeeded. Re-evaluating the probabilistic Kleinberg filter
-                // would discard hard-won connections for no capacity reason (#3545).
-                // Only enforce the hard max_connections cap as a resource safety limit.
-                let current = connection_manager.connection_count();
-                if current >= connection_manager.max_connections {
-                    tracing::warn!(
-                        tx = %tx,
-                        %peer,
-                        current_connections = current,
-                        max_connections = connection_manager.max_connections,
-                        %loc,
-                        transient_expired,
-                        "connect_peer: rejecting transient promotion to enforce cap"
-                    );
-                    callback
-                        .send_result(Err(()))
-                        .await
-                        .inspect_err(|err| {
-                            tracing::debug!(
-                                tx = %tx,
-                                remote = %peer,
-                                ?err,
-                                "connect_peer: failed to notify cap-rejection callback"
-                            );
-                        })
-                        .ok();
-                    return Ok(());
-                }
-                let just_became_ready = self
-                    .bridge
-                    .op_manager
-                    .ring
-                    .add_connection(loc, PeerId::new(peer.pub_key().clone(), peer_addr), true)
-                    .await;
-                tracing::info!(
-                    tx = %tx,
-                    remote = %peer,
-                    transient_expired,
-                    "connect_peer: promoted to ring"
-                );
-
-                // Update the dashboard/network_status with the peer's location.
-                // Without this, peers promoted via this path show "—" on the
-                // dashboard because the initial record_peer_connected(addr, None, None)
-                // from handle_successful_connection is never updated.
-                let pkl = crate::ring::PeerKeyLocation::new(peer.pub_key().clone(), peer_addr);
-                crate::node::network_status::record_peer_connected(
-                    peer_addr,
-                    Some(loc.as_f64()),
-                    Some(pkl),
-                );
-
-                // tell the promoted peer about our subscriptions and cache
-                for (target, msg) in self
-                    .bridge
-                    .op_manager
-                    .on_ring_connection_established(peer_addr, peer.pub_key())
-                {
-                    if let Err(e) = self.bridge.send(target, msg).await {
-                        tracing::warn!(
-                            %peer_addr,
-                            error = %e,
-                            "Failed to send interest/cache data on transient promotion"
-                        );
-                    }
-                }
-
-                // Directed-subscribe placement (#4404): the new neighbor may be
-                // the closest non-hosting peer for some contracts we host.
-                self.consider_migration_for_new_peer(peer_addr);
-
-                // Broadcast readiness if we just crossed the threshold
-                if just_became_ready {
-                    self.handle_broadcast_ready_state(true).await;
-                }
-            }
-
-            // Now that we know the peer's identity (from ConnectRequest), update the
-            // transport-level tracking so QueryConnections returns this peer.
-            if let Some(entry) = self.connections.get_mut(&peer_addr) {
-                if entry.pub_key.is_none() {
-                    entry.pub_key = Some(peer.pub_key().clone());
-                    self.addr_by_pub_key
-                        .insert(peer.pub_key().clone(), peer_addr);
-                    tracing::info!(
-                        tx = %tx,
-                        %peer_addr,
-                        pub_key = %peer.pub_key(),
-                        "connect_peer: updated transport entry with peer identity"
-                    );
-                } else {
-                    tracing::info!(
-                        tx = %tx,
-                        %peer_addr,
-                        existing_pub_key = ?entry.pub_key,
-                        "connect_peer: transport entry already has pub_key"
-                    );
-                }
-            } else {
-                tracing::warn!(
-                    tx = %tx,
-                    %peer_addr,
-                    "connect_peer: no transport entry found for peer_addr"
-                );
-            }
-
-            // Return the remote peer's address we are connected to.
-            let resolved_addr = peer
-                .socket_addr()
-                .expect("connected peer should have socket address");
-            callback
-                .send_result(Ok((resolved_addr, None)))
-                .await
-                .inspect_err(|err| {
-                    tracing::debug!(
-                        tx = %tx,
-                        remote = %peer,
-                        ?err,
-                        "connect_peer: failed to notify existing-connection callback"
-                    );
-                })
-                .ok();
-            return Ok(());
-        }
-
-        // Check if this peer is in backoff due to previous connection failures.
-        // This check is done AFTER the existing connection check above, so that:
-        // 1. If we already have a connection (possibly from inbound), we reuse it
-        // 2. Backoff only blocks NEW outbound connection attempts
-        // NOTE: Backoff runs before the max_connections pre-flight check
-        // to avoid unnecessary work when the peer is in backoff.
-        if !peer_addr.ip().is_unspecified() && state.peer_backoff.is_in_backoff(peer_addr) {
-            let remaining = state
-                .peer_backoff
-                .remaining_backoff(peer_addr)
-                .unwrap_or(Duration::ZERO);
-            tracing::debug!(
-                tx = %tx,
-                peer = %peer,
-                peer_addr = %peer_addr,
-                remaining_secs = remaining.as_secs(),
-                transient,
-                phase = "connect",
-                "Skipping connection attempt - peer in backoff"
-            );
-            callback
-                .send_result(Err(()))
-                .await
-                .inspect_err(|error| {
-                    tracing::debug!(
-                        remote = %peer_addr,
-                        ?error,
-                        "Failed to notify caller about backoff-delayed connection"
-                    );
-                })
-                .ok();
-            return Ok(());
-        }
-
-        // Pre-flight max_connections check: avoid expensive NAT hole-punching when
-        // we're already at capacity. We don't re-run should_accept() here because
-        // the connection was already accepted at the protocol level (the CONNECT terminus handler in connect.rs)
-        // and re-rolling the probabilistic Kleinberg filter would discard connections
-        // after costly NAT traversal for no capacity reason (#3545).
-        if !transient && !peer_addr.ip().is_unspecified() {
-            let connection_manager = &self.bridge.op_manager.ring.connection_manager;
-            let current = connection_manager.connection_count();
-            if current >= connection_manager.max_connections {
-                tracing::info!(
-                    tx = %tx,
-                    remote = %peer_addr,
-                    current_connections = current,
-                    max_connections = connection_manager.max_connections,
-                    "connect_peer: skipping connection — at max_connections"
-                );
-                callback
-                    .send_result(Err(()))
-                    .await
-                    .inspect_err(|err| {
-                        tracing::debug!(
-                            tx = %tx,
-                            remote = %peer_addr,
-                            ?err,
-                            "connect_peer: failed to notify max-connections-rejection callback"
-                        );
-                    })
-                    .ok();
-                return Ok(());
-            }
-        }
-
-        match state.awaiting_connection.entry(peer_addr) {
-            std::collections::hash_map::Entry::Occupied(mut callbacks) => {
-                let txs_entry = state.awaiting_connection_txs.entry(peer_addr).or_default();
-                if !txs_entry.contains(&tx) {
-                    txs_entry.push(tx);
-                }
-                tracing::debug!(
-                    tx = %tx,
-                    remote = %peer_addr,
-                    pending = callbacks.get().len(),
-                    transient,
-                    "Connection already pending, queuing additional requester"
-                );
-                callbacks.get_mut().push(callback);
-                tracing::info!(
-                    tx = %tx,
-                    remote = %peer_addr,
-                    pending = callbacks.get().len(),
-                    pending_txs = ?txs_entry,
-                    transient,
-                    "connect_peer: connection already pending, queued callback"
-                );
-                return Ok(());
-            }
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                let txs_entry = state.awaiting_connection_txs.entry(peer_addr).or_default();
-                txs_entry.push(tx);
-                tracing::debug!(
-                        tx = %tx,
-                    remote = %peer_addr,
-                    transient,
-                    "connect_peer: registering new pending connection"
-                );
-                entry.insert(vec![callback]);
-                tracing::info!(
-                tx = %tx,
-                remote = %peer_addr,
-                pending = 1,
-                    pending_txs = ?txs_entry,
-                    transient,
-                    "connect_peer: registered new pending connection"
-                );
-                state.expected_inbound.expect_incoming(peer_addr);
-            }
-        }
-
-        if let Err(error) = handshake_commands
-            .send(HandshakeCommand::Connect {
-                peer: peer.clone(),
-                transaction: tx,
-                transient,
-            })
-            .await
-        {
-            tracing::warn!(
-                tx = %tx,
-                remote = %peer_addr,
-                transient,
-                ?error,
-                "Failed to enqueue connect command"
-            );
-            self.bridge
-                .op_manager
-                .ring
-                .connection_manager
-                .prune_in_transit_connection(peer_addr);
-
-            // Note: We intentionally do NOT record backoff here. This failure is a LOCAL
-            // channel issue (handshake command queue full), not a failure to connect to the
-            // REMOTE peer. Backoff should only apply to actual connection failures
-            // (OutboundFailed), not local resource contention.
-
-            let pending_txs = state.awaiting_connection_txs.remove(&peer_addr);
-            if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
-                tracing::debug!(
-                    tx = %tx,
-                    remote = %peer_addr,
-                    callbacks = callbacks.len(),
-                    transient,
-                    "Cleaning up callbacks after connect command failure"
-                );
-                for mut cb in callbacks {
-                    cb.send_result(Err(()))
-                        .await
-                        .inspect_err(|send_err| {
-                            tracing::debug!(
-                                remote = %peer_addr,
-                                ?send_err,
-                                "Failed to deliver connect command failure to awaiting callback"
-                            );
-                        })
-                        .ok();
-                }
-            }
-            if let Some(pending_txs) = pending_txs {
-                tracing::debug!(
-                    remote = %peer_addr,
-                    pending_txs = ?pending_txs,
-                    "Removed pending transactions after connect command failure"
-                );
-            }
-        } else {
-            tracing::debug!(
-                tx = %tx,
-                remote = %peer_addr,
-                transient,
-                "connect_peer: handshake command dispatched"
-            );
-        }
-
-        Ok(())
-    }
-
-    async fn handle_handshake_action(
-        &mut self,
-        event: HandshakeEvent,
-        state: &mut EventListenerState,
-        handshake_commands: &HandshakeCommandSender,
-    ) -> anyhow::Result<()> {
-        tracing::info!(?event, "handle_handshake_action: received handshake event");
-        match event {
-            HandshakeEvent::InboundConnection {
-                transaction,
-                peer,
-                connection,
-                transient,
-            } => {
-                tracing::info!(provided = ?peer, transient, tx = ?transaction, "InboundConnection event");
-                let _conn_manager = &self.bridge.op_manager.ring.connection_manager;
-                let remote_addr = connection.remote_addr();
-
-                if let Some(blocked_addrs) = &self.blocked_addresses {
-                    if blocked_addrs.contains(&remote_addr) {
-                        tracing::info!(
-                            remote = %remote_addr,
-                            transient,
-                            transaction = ?transaction,
-                            "Inbound connection blocked by local policy"
-                        );
-                        return Ok(());
-                    }
-                }
-
-                // For transient inbound connections, peer may be None - we don't know the
-                // peer's identity yet. The identity will be learned when the peer sends
-                // its first message (e.g., ConnectRequest).
-                if peer.is_none() {
-                    tracing::info!(
-                        remote = %remote_addr,
-                        transient,
-                        transaction = ?transaction,
-                        "Inbound connection arrived without matching expectation; accepting provisionally"
-                    );
-                }
-
-                tracing::info!(
-                    remote = %remote_addr,
-                    peer_known = peer.is_some(),
-                    transient,
-                    transaction = ?transaction,
-                    "Inbound connection established"
-                );
-
-                // Clear backoff on inbound connection: the peer is demonstrably alive (#3252).
-                if !remote_addr.ip().is_unspecified() {
-                    state.peer_backoff.record_success(remote_addr);
-                }
-
-                // Treat only transient connections as transient. Normal inbound dials (including
-                // gateway bootstrap from peers) should be promoted into the ring once established.
-                let is_transient = transient;
-
-                // Pass peer directly - it may be None for transient connections
-                self.handle_successful_connection(
-                    peer,
-                    connection,
-                    state,
-                    None,
-                    is_transient,
-                    handshake_commands,
-                )
-                .await?;
-            }
-            HandshakeEvent::OutboundEstablished {
-                transaction,
-                peer,
-                connection,
-                transient,
-            } => {
-                // Outbound peers must have known addresses - use type-safe conversion
-                // If conversion fails, log error but continue since connection is established
-                let peer_addr = match KnownPeerKeyLocation::try_from(&peer) {
-                    Ok(k) => k.socket_addr(),
-                    Err(e) => {
-                        tracing::error!(
-                            transaction = %transaction,
-                            pub_key = %e.pub_key,
-                            "INTERNAL ERROR: outbound connection established but peer has unknown address"
-                        );
-                        // Use peer's pub_key in log, but we need an address for downstream logging
-                        // This should never happen, so use unspecified as last resort
-                        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
-                    }
-                };
-                tracing::info!(
-                    remote = %peer_addr,
-                    transient,
-                    transaction = %transaction,
-                    "Outbound connection established"
-                );
-
-                // Clear backoff and failed-addr tracking on successful connection
-                if !peer_addr.ip().is_unspecified() {
-                    state.peer_backoff.record_success(peer_addr);
-                    self.bridge
-                        .op_manager
-                        .ring
-                        .connection_manager
-                        .clear_failed_addr(peer_addr);
-                }
-
-                // For outbound connections, respect the transient flag from the handshake.
-                // Gateway connections should remain transient until CONNECT acceptance.
-                self.handle_successful_connection(
-                    Some(peer),
-                    connection,
-                    state,
-                    None,
-                    transient,
-                    handshake_commands,
-                )
-                .await?;
-            }
-            HandshakeEvent::OutboundFailed {
-                transaction,
-                peer,
-                error,
-                transient,
-            } => {
-                // Outbound peers must have known addresses - extract once for reuse
-                let peer_addr = match KnownPeerKeyLocation::try_from(&peer) {
-                    Ok(k) => k.socket_addr(),
-                    Err(e) => {
-                        // This is an internal consistency error - we initiated this connection,
-                        // so we should always know the target address
-                        tracing::error!(
-                            transaction = %transaction,
-                            pub_key = %e.pub_key,
-                            "INTERNAL ERROR: outbound connection failed but peer has unknown address"
-                        );
-                        return Ok(());
-                    }
-                };
-
-                tracing::info!(
-                    remote = %peer_addr,
-                    transient,
-                    transaction = %transaction,
-                    ?error,
-                    "Outbound connection failed"
-                );
-
-                self.bridge
-                    .op_manager
-                    .ring
-                    .connection_manager
-                    .prune_in_transit_connection(peer_addr);
-
-                // Only record transport-level failures (NAT traversal, timeout, I/O)
-                // so future CONNECT requests avoid routing to this peer. Protocol
-                // errors or rejections don't indicate the peer is unreachable.
-                if matches!(
-                    error,
-                    ConnectionError::TransportError(_)
-                        | ConnectionError::Timeout
-                        | ConnectionError::IOError(_)
-                ) {
-                    self.bridge
-                        .op_manager
-                        .ring
-                        .connection_manager
-                        .record_failed_addr(peer_addr);
-                }
-
-                // Record failure for the connecting page diagnostics
-                let failure_reason = match &error {
-                    ConnectionError::TransportError(msg) => {
-                        crate::node::network_status::classify_transport_error(msg)
-                    }
-                    ConnectionError::Timeout => crate::node::network_status::FailureReason::Timeout,
-                    ConnectionError::IOError(msg) => {
-                        crate::node::network_status::FailureReason::Other(msg.clone())
-                    }
-                    other @ ConnectionError::LocationUnknown
-                    | other @ ConnectionError::SendNotCompleted(_)
-                    | other @ ConnectionError::UnexpectedReq
-                    | other @ ConnectionError::Serialization(_)
-                    | other @ ConnectionError::FailedConnectOp
-                    | other @ ConnectionError::UnwantedConnection
-                    | other @ ConnectionError::AddressBlocked(_) => {
-                        crate::node::network_status::FailureReason::Other(other.to_string())
-                    }
-                };
-                crate::node::network_status::record_gateway_failure(peer_addr, failure_reason);
-
-                // Record failure for exponential backoff to prevent rapid retries
-                if !peer_addr.ip().is_unspecified() {
-                    state.peer_backoff.record_failure(peer_addr);
-                }
-
-                let pending_txs = state
-                    .awaiting_connection_txs
-                    .remove(&peer_addr)
-                    .unwrap_or_default();
-
-                if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
-                    tracing::debug!(
-                        remote = %peer_addr,
-                        callbacks = callbacks.len(),
-                        pending_txs = ?pending_txs,
-                        transient,
-                        "Notifying callbacks after outbound failure"
-                    );
-
-                    let mut callbacks = callbacks.into_iter();
-                    if let Some(mut cb) = callbacks.next() {
-                        cb.send_result(Err(()))
-                            .await
-                            .inspect_err(|err| {
-                                tracing::debug!(
-                                    remote = %peer_addr,
-                                    ?err,
-                                    "Failed to deliver outbound failure notification"
-                                );
-                            })
-                            .ok();
-                    }
-                    for mut cb in callbacks {
-                        cb.send_result(Err(()))
-                            .await
-                            .inspect_err(|err| {
-                                tracing::debug!(
-                                    remote = %peer_addr,
-                                    ?err,
-                                    "Failed to deliver secondary outbound failure notification"
-                                );
-                            })
-                            .ok();
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn handle_handshake_stream_closed(
-        &mut self,
-        state: &mut EventListenerState,
-    ) -> anyhow::Result<()> {
-        if state.awaiting_connection.is_empty() {
-            return Ok(());
-        }
-
-        tracing::warn!(
-            awaiting = state.awaiting_connection.len(),
-            "Handshake driver closed; notifying pending callbacks"
-        );
-
-        let awaiting = std::mem::take(&mut state.awaiting_connection);
-        let awaiting_txs = std::mem::take(&mut state.awaiting_connection_txs);
-
-        for (addr, callbacks) in awaiting {
-            let pending_txs = awaiting_txs.get(&addr).cloned().unwrap_or_default();
-            tracing::debug!(
-                remote = %addr,
-                callbacks = callbacks.len(),
-                pending_txs = ?pending_txs,
-                "Delivering handshake driver shutdown notification"
-            );
-            for mut cb in callbacks {
-                cb.send_result(Err(()))
-                    .await
-                    .inspect_err(|err| {
-                        tracing::debug!(
-                            remote = %addr,
-                            ?err,
-                            "Failed to deliver handshake driver shutdown notification"
-                        );
-                    })
-                    .ok();
-            }
-        }
-
-        Ok(())
-    }
-
-    async fn handle_successful_connection(
-        &mut self,
-        peer_id: Option<PeerKeyLocation>,
-        connection: Box<dyn PeerConnectionApi>,
-        state: &mut EventListenerState,
-        remaining_checks: Option<usize>,
-        is_transient: bool,
-        handshake_commands: &HandshakeCommandSender,
-    ) -> anyhow::Result<()> {
-        let mut broadcast_ready: Option<bool> = None;
-        let connection_manager = &self.bridge.op_manager.ring.connection_manager;
-        // For transient connections, we may not know the peer's identity yet - use connection's remote_addr
-        let peer_addr = peer_id
-            .as_ref()
-            .and_then(|p| p.socket_addr())
-            .unwrap_or_else(|| connection.remote_addr());
-
-        if is_transient && !connection_manager.try_register_transient(peer_addr, None) {
-            tracing::warn!(
-                remote = %peer_addr,
-                budget = connection_manager.transient_budget(),
-                current = connection_manager.transient_count(),
-                "Transient connection budget exhausted; dropping inbound connection"
-            );
-            if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
-                for mut cb in callbacks {
-                    // Best effort - caller will handle the connection failure
-                    #[allow(clippy::let_underscore_must_use)]
-                    let _ = cb.send_result(Err(())).await;
-                }
-            }
-            state.awaiting_connection_txs.remove(&peer_addr);
-            return Ok(());
-        }
-
-        // IMPORTANT: Insert into self.connections BEFORE removing from awaiting_connection.
-        // This prevents a race condition where another connect() call could slip through
-        // during the window when neither structure has the entry, causing the transport
-        // layer to tear down the connection we just established.
-        // See: handle_connect_peer checks self.connections first, then awaiting_connection.
-        // If the peer already has a connection (e.g., reconnected with new identity after
-        // suspend/resume), replace it. Dropping the old sender causes its
-        // peer_connection_listener to fire TransportClosed; the connection_id mechanism
-        // ensures that stale event won't remove the new entry.
-        if let Some(old) = self.connections.remove(&peer_addr) {
-            if let Some(ref old_pub_key) = old.pub_key {
-                self.addr_by_pub_key.remove(old_pub_key);
-            }
-
-            // Full cleanup: handle both transient and ring-promoted connections.
-            // If transient, drop_transient releases the budget slot.
-            // If ring-promoted, prune_connection cleans up topology, orphaned txs,
-            // subscriptions, and notifies the handshake driver.
-            let was_transient = self
-                .bridge
-                .op_manager
-                .ring
-                .connection_manager
-                .drop_transient(peer_addr)
-                .is_some();
-
-            if !was_transient {
-                // Old connection was ring-promoted — mirror TransportClosed cleanup
-                let old_peer = if let Some(ref pub_key) = old.pub_key {
-                    PeerKeyLocation::new(pub_key.clone(), peer_addr)
-                } else {
-                    PeerKeyLocation::new(
-                        (*self.bridge.op_manager.ring.connection_manager.pub_key).clone(),
-                        peer_addr,
-                    )
-                };
-                let prune_result = self
-                    .bridge
-                    .op_manager
-                    .ring
-                    .prune_connection(PeerId::new(old_peer.pub_key().clone(), peer_addr))
-                    .await;
-                self.bridge
-                    .handle_orphaned_transactions(prune_result.orphaned_transactions, peer_addr)
-                    .await;
-                if prune_result.became_unready {
-                    // Deferred: broadcast after connection_manager borrow ends
-                    broadcast_ready = Some(false);
-                }
-                self.bridge
-                    .op_manager
-                    .on_ring_connection_lost(old_peer.pub_key());
-                if let Err(error) = handshake_commands
-                    .send(HandshakeCommand::DropConnection {
-                        peer: old_peer.clone(),
-                    })
-                    .await
-                {
-                    tracing::warn!(
-                        remote = %peer_addr,
-                        ?error,
-                        "Failed to notify handshake driver about replaced connection"
-                    );
-                }
-            }
-
-            tracing::info!(
-                %peer_addr,
-                old_connection_id = old.connection_id,
-                was_transient,
-                "Replacing stale connection entry (peer reconnected with new identity)"
-            );
-        }
-
-        if is_transient {
-            let cm = &self.bridge.op_manager.ring.connection_manager;
-            let current = cm.transient_count();
-            if current >= cm.transient_budget() {
-                tracing::warn!(
-                    remote = %peer_addr,
-                    budget = cm.transient_budget(),
-                    current,
-                    "Transient connection budget exhausted; dropping inbound connection before insert"
-                );
-                return Ok(());
-            }
-        }
-        let conn_id = next_connection_id();
-        // Capture the remote's negotiated protocol version BEFORE the connection
-        // is moved into the spawned listener task below. Used to gate
-        // version-dependent message types (e.g. SubscribeHint).
-        let remote_version = connection.remote_version();
-        let (tx, rx) = mpsc::channel(10);
-        tracing::debug!(
-            self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key,
-            peer_id = ?peer_id,
-            %peer_addr,
-            connection_id = conn_id,
-            conn_map_size = self.connections.len(),
-            "[CONN_TRACK] INSERT: adding connection to HashMap"
-        );
-        self.connections.insert(
-            peer_addr,
-            ConnectionEntry {
-                sender: tx,
-                // For transient connections, we don't know the pub_key yet - it will be learned
-                // when the peer sends its first message (e.g., ConnectRequest)
-                pub_key: peer_id.as_ref().map(|p| p.pub_key().clone()),
-                connection_id: conn_id,
-                created_at: Instant::now(),
-                remote_version,
-            },
-        );
-        // Only add to reverse lookup if we know the pub_key
-        // For transient connections, this will be populated when identity is learned
-        if let Some(ref peer) = peer_id {
-            self.addr_by_pub_key
-                .insert(peer.pub_key().clone(), peer_addr);
-        }
-        let Some(conn_events) = self.conn_event_tx.as_ref().cloned() else {
-            anyhow::bail!("Connection event channel not initialized");
-        };
-
-        // Phase 4: Set orphan stream registry on connection for handling race conditions
-        // between stream fragments and metadata messages (RequestStreaming/ResponseStreaming).
-        let mut connection = connection;
-        connection
-            .set_orphan_stream_registry(self.bridge.op_manager.orphan_stream_registry().clone());
-
-        // Use tokio::spawn directly instead of GlobalExecutor::spawn.
-        // GlobalExecutor::spawn uses Handle::try_current().spawn() which doesn't
-        // reliably poll tasks in certain test contexts (see issue #2709).
-        tokio::spawn(async move {
-            peer_connection_listener(rx, connection, peer_addr, conn_events, conn_id).await;
-        });
-        // Yield to allow the spawned peer_connection_listener task to start.
-        // This is important because on some runtimes (especially in tests with boxed_local
-        // futures), spawned tasks may not be scheduled immediately, causing messages
-        // sent to the channel to pile up without being processed.
-        tokio::task::yield_now().await;
-        let newly_inserted = true;
-
-        // Now safe to remove from awaiting_connection and notify callbacks.
-        // self.connections already has the entry, so concurrent connect() calls
-        // will see it and reuse the existing connection instead of tearing it down.
-        let pending_txs = state
-            .awaiting_connection_txs
-            .remove(&peer_addr)
-            .unwrap_or_default();
-        if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
-            // The callback expects the remote peer's address (not our own)
-            let resolved_addr = peer_addr;
-            tracing::debug!(
-                remote = %peer_addr,
-                callbacks = callbacks.len(),
-                "handle_successful_connection: notifying waiting callbacks"
-            );
-            tracing::info!(
-                remote = %peer_addr,
-                callbacks = callbacks.len(),
-                pending_txs = ?pending_txs,
-                remaining_checks = ?remaining_checks,
-                "handle_successful_connection: connection established"
-            );
-            for mut cb in callbacks {
-                match timeout(
-                    Duration::from_secs(60),
-                    cb.send_result(Ok((resolved_addr, remaining_checks))),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(())) => {
-                        tracing::debug!(
-                            remote = %peer_addr,
-                            "Callback dropped before receiving connection result"
-                        );
-                    }
-                    Err(error) => {
-                        tracing::error!(
-                            remote = %peer_addr,
-                            ?error,
-                            "Failed to deliver connection result"
-                        );
-                    }
-                }
-            }
-        } else {
-            tracing::debug!(
-                peer_id = ?peer_id,
-                %peer_addr,
-                pending_txs = ?pending_txs,
-                "No callback for connection established"
-            );
-        }
-
-        // Only promote to ring if we know the peer's identity.
-        // For transient connections without known identity, we keep them as transport-only
-        // until the peer identifies itself (e.g., via ConnectRequest).
-        let promote_to_ring =
-            peer_id.is_some() && (!is_transient || connection_manager.is_gateway());
-
-        if newly_inserted {
-            tracing::info!(peer_id = ?peer_id, %peer_addr, is_transient, "handle_successful_connection: inserted new connection entry");
-            crate::node::network_status::record_peer_connected(peer_addr, None, None);
-            if promote_to_ring {
-                // Only prune reservation when promoting to ring - transient connections
-                // don't go through should_accept() so they have no reservation to prune
-                let pending_loc = connection_manager.prune_in_transit_connection(peer_addr);
-                // Safe to unwrap: promote_to_ring is only true when peer_id.is_some()
-                let peer = peer_id
-                    .as_ref()
-                    .expect("promote_to_ring requires known peer_id");
-                let loc = pending_loc.unwrap_or_else(|| Location::from_address(&peer_addr));
-                tracing::info!(
-                    %peer_addr,
-                    %loc,
-                    pending_loc_known = pending_loc.is_some(),
-                    "handle_successful_connection: evaluating promotion to ring"
-                );
-                // Don't re-run should_accept() here — the connection was already
-                // accepted at the protocol level (the CONNECT terminus handler in connect.rs) and transport
-                // establishment (NAT traversal) already succeeded. Re-evaluating
-                // the probabilistic Kleinberg filter would discard hard-won
-                // connections for no capacity reason (#3545).
-                // Only enforce the hard max_connections cap below.
-                let current = connection_manager.connection_count();
-                if current >= connection_manager.max_connections {
-                    tracing::warn!(
-                        %peer_addr,
-                        current_connections = current,
-                        max_connections = connection_manager.max_connections,
-                        %loc,
-                        "handle_successful_connection: rejecting new connection to enforce cap"
-                    );
-                    // Drop the connection immediately instead of letting it linger
-                    // as a zombie for up to 5 minutes confusing the dashboard.
-                    crate::node::network_status::record_peer_disconnected(peer_addr);
-                    self.drop_connection_by_addr(peer_addr, handshake_commands)
-                        .await;
-                    return Ok(());
-                }
-                tracing::info!(%peer_addr, %loc, "handle_successful_connection: promoting connection into ring");
-                let just_became_ready = self
-                    .bridge
-                    .op_manager
-                    .ring
-                    .add_connection(loc, PeerId::new(peer.pub_key().clone(), peer_addr), true)
-                    .await;
-                let pkl = crate::ring::PeerKeyLocation::new(peer.pub_key().clone(), peer_addr);
-                crate::node::network_status::record_peer_connected(
-                    peer_addr,
-                    Some(loc.as_f64()),
-                    Some(pkl),
-                );
-                // Only count as NAT success for non-gateway peers (gateway connections are direct)
-                if !crate::node::network_status::is_known_gateway(&peer_addr) {
-                    crate::node::network_status::record_nat_attempt(true);
-                }
-
-                // tell the new peer about our subscriptions and cache
-                for (target, msg) in self
-                    .bridge
-                    .op_manager
-                    .on_ring_connection_established(peer_addr, peer.pub_key())
-                {
-                    if let Err(e) = self.bridge.send(target, msg).await {
-                        tracing::warn!(
-                            %peer_addr,
-                            error = %e,
-                            "Failed to send interest/cache data to new peer"
-                        );
-                    }
-                }
-
-                // Directed-subscribe placement (#4404): the new neighbor may be
-                // the closest non-hosting peer for some contracts we host.
-                self.consider_migration_for_new_peer(peer_addr);
-
-                // Broadcast readiness if we just crossed the threshold (deferred)
-                if just_became_ready {
-                    broadcast_ready = Some(true);
-                }
-
-                // Note: In the simplified 2026-01 architecture, subscriptions are lease-based
-                // and renewed periodically by the subscription renewal background task.
-                // We no longer attempt to establish subscriptions opportunistically on peer connect.
-
-                if is_transient {
-                    connection_manager.drop_transient(peer_addr);
-                }
-            } else {
-                // Not promoting to ring - either unknown identity or transient on non-gateway.
-                //
-                // IMPORTANT: Before registering as transient, check if the connection was already
-                // promoted to ring by another code path (e.g., handle_connect_peer running during
-                // our yield_now().await or callback sends). This prevents a race condition where:
-                // 1. We start with peer_id=None, so promote_to_ring=false
-                // 2. We yield at yield_now().await or cb.send_result().await
-                // 3. Message arrives, handle_connect_peer promotes connection to ring
-                // 4. We resume and would register as transient (re-inserting a dropped entry)
-                // 5. TTL timer fires and removes the connection from ring!
-                //
-                // By checking has_connection_or_pending, we skip transient registration if the
-                // connection was already promoted to ring during our await points.
-                if connection_manager.has_connection_or_pending(peer_addr) {
-                    tracing::debug!(
-                        %peer_addr,
-                        "Skipping transient registration - connection already in ring topology"
-                    );
-                } else {
-                    // These connections don't go through should_accept() so there's no pending
-                    // reservation. Compute location from address directly.
-                    let loc = Location::from_address(&peer_addr);
-                    connection_manager.try_register_transient(peer_addr, Some(loc));
-                    tracing::info!(
-                        peer_id = ?peer_id,
-                        %peer_addr,
-                        "Registered transient connection (not added to ring topology)"
-                    );
-                    let ttl = connection_manager.transient_ttl();
-                    let cm = connection_manager.clone();
-                    GlobalExecutor::spawn(async move {
-                        sleep(ttl).await;
-                        if cm.drop_transient(peer_addr).is_some() {
-                            // Only remove the transient tracking entry. Do NOT
-                            // dispatch DropConnection — that tears down the
-                            // underlying transport, killing any in-progress
-                            // CONNECT handshake. If the CONNECT succeeds later,
-                            // handle_connect_peer() will detect the missing
-                            // transient entry via is_in_ring() and still promote
-                            // the peer to ring topology (see #3113 fix). If it
-                            // never succeeds, the transport idle timeout handles
-                            // cleanup.
-                            tracing::info!(
-                                %peer_addr,
-                                "Transient connection expired; removed tracking entry \
-                                 (transport preserved, handle_connect_peer will promote via fallback)"
-                            );
-                        }
-                    });
-                }
-            }
-        } else if is_transient {
-            // We reserved budget earlier, but didn't take ownership of the connection.
-            connection_manager.drop_transient(peer_addr);
-        }
-        // Deferred broadcast: connection_manager borrow is now dropped
-        if let Some(ready) = broadcast_ready {
-            self.handle_broadcast_ready_state(ready).await;
-        }
-        Ok(())
-    }
-
-    async fn handle_transport_event(
-        &mut self,
-        event: Option<ConnEvent>,
-        state: &mut EventListenerState,
-        handshake_commands: &HandshakeCommandSender,
-    ) -> anyhow::Result<EventResult> {
-        match event {
-            Some(ConnEvent::InboundMessage(mut inbound)) => {
-                let tx = *inbound.msg.id();
-
-                if let Some(remote_addr) = inbound.remote_addr {
-                    if let Some(sender_peer) = extract_sender_from_message(&inbound.msg) {
-                        // Try to get known address, fall back to remote_addr if unknown
-                        let sender_addr = KnownPeerKeyLocation::try_from(&sender_peer)
-                            .ok()
-                            .map(|k| k.socket_addr());
-                        if sender_addr.map(|a| a == remote_addr).unwrap_or(false)
-                            || sender_addr.map(|a| a.ip().is_unspecified()).unwrap_or(true)
-                        {
-                            let resolved_addr = {
-                                let raw_addr = sender_addr.unwrap_or(remote_addr);
-                                if raw_addr.ip().is_unspecified() {
-                                    if let Some(sender_mut) =
-                                        extract_sender_from_message_mut(&mut inbound.msg)
-                                    {
-                                        if sender_mut
-                                            .socket_addr()
-                                            .map(|a| a.ip().is_unspecified())
-                                            .unwrap_or(true)
-                                        {
-                                            sender_mut.set_addr(remote_addr);
-                                        }
-                                    }
-                                    remote_addr
-                                } else {
-                                    raw_addr
-                                }
-                            };
-                            let new_peer_id =
-                                PeerId::new(sender_peer.pub_key().clone(), resolved_addr);
-                            // Check if we have a connection but with a different pub_key
-                            if let Some(entry) = self.connections.get(&remote_addr) {
-                                // If we don't have the pub_key stored yet or it differs from the new one, update it
-                                let should_update = match &entry.pub_key {
-                                    None => true,
-                                    Some(old_pub_key) => old_pub_key != new_peer_id.pub_key(),
-                                };
-                                if should_update {
-                                    let old_pub_key = entry.pub_key.clone();
-                                    let is_first_identity = old_pub_key.is_none();
-                                    tracing::info!(
-                                        remote = %remote_addr,
-                                        old_pub_key = ?old_pub_key,
-                                        new_pub_key = %new_peer_id.pub_key(),
-                                        is_first_identity,
-                                        "Updating peer identity after inbound message"
-                                    );
-                                    // Remove old reverse lookup if it exists
-                                    if let Some(old_key) = old_pub_key {
-                                        self.addr_by_pub_key.remove(&old_key);
-                                        // Update ring with old PeerId -> new PeerId
-                                        let old_peer_id = PeerId::new(old_key, remote_addr);
-                                        self.bridge.op_manager.ring.update_connection_identity(
-                                            &old_peer_id,
-                                            new_peer_id.clone(),
-                                        );
-                                    }
-                                    // Update the entry's pub_key
-                                    if let Some(entry) = self.connections.get_mut(&remote_addr) {
-                                        entry.pub_key = Some(new_peer_id.pub_key().clone());
-                                    }
-                                    // Add new reverse lookup
-                                    self.addr_by_pub_key
-                                        .insert(new_peer_id.pub_key().clone(), remote_addr);
-                                    // Note: We do NOT automatically promote to ring here.
-                                    // Transient connections are promoted only when the Connect
-                                    // operation explicitly accepts via NodeEvent::ConnectPeer,
-                                    // which is handled by handle_connect_peer().
-                                }
-                            }
-                        }
-                    }
-                }
-
-                tracing::debug!(
-                    peer_addr = ?inbound.remote_addr,
-                    %tx,
-                    tx_type = ?tx.transaction_type(),
-                    "Queueing inbound NetMessage from peer connection"
-                );
-                Ok(EventResult::Event(
-                    ConnEvent::InboundMessage(inbound).into(),
-                ))
-            }
-            Some(ConnEvent::TransportClosed {
-                remote_addr,
-                error,
-                connection_id,
-            }) => {
-                tracing::debug!(
-                    remote = %remote_addr,
-                    ?error,
-                    connection_id,
-                    "peer_connection_listener reported transport closure"
-                );
-                // Ignore stale TransportClosed from replaced connections: the old
-                // listener's channel was dropped, but we must not remove the new entry.
-                if let Some(current) = self.connections.get(&remote_addr) {
-                    if current.connection_id != connection_id {
-                        tracing::info!(
-                            remote = %remote_addr,
-                            stale_id = connection_id,
-                            current_id = current.connection_id,
-                            "Ignoring stale TransportClosed from replaced connection"
-                        );
-                        return Ok(EventResult::Continue);
-                    }
-                }
-                // Look up the connection directly by address
-                if let Some(entry) = self.connections.remove(&remote_addr) {
-                    // Construct PeerKeyLocation for prune_connection and DropConnection
-                    let peer = if let Some(ref pub_key) = entry.pub_key {
-                        PeerKeyLocation::new(pub_key.clone(), remote_addr)
-                    } else {
-                        PeerKeyLocation::new(
-                            (*self.bridge.op_manager.ring.connection_manager.pub_key).clone(),
-                            remote_addr,
-                        )
-                    };
-                    // Remove from reverse lookup
-                    if let Some(pub_key) = entry.pub_key {
-                        self.addr_by_pub_key.remove(&pub_key);
-                    }
-                    tracing::debug!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, %peer, socket_addr = %remote_addr, conn_map_size = self.connections.len(), "[CONN_TRACK] REMOVE: TransportClosed - removing from connections HashMap");
-                    let prune_result = self
-                        .bridge
-                        .op_manager
-                        .ring
-                        .prune_connection(PeerId::new(peer.pub_key().clone(), remote_addr))
-                        .await;
-
-                    // Handle orphaned transactions immediately (retry via alternate routes)
-                    self.bridge
-                        .handle_orphaned_transactions(
-                            prune_result.orphaned_transactions,
-                            remote_addr,
-                        )
-                        .await;
-
-                    if prune_result.became_unready {
-                        self.handle_broadcast_ready_state(false).await;
-                    }
-
-                    // forget this peer's subscriptions and cached contract state
-                    self.bridge
-                        .op_manager
-                        .on_ring_connection_lost(peer.pub_key());
-
-                    // Backoff prevents reconnect-timeout-reconnect cycles to dead peers (#3252).
-                    if !remote_addr.ip().is_unspecified() {
-                        state.peer_backoff.record_failure(remote_addr);
-                        tracing::debug!(remote = %remote_addr, "Recorded peer backoff after transport closure");
-                    }
-
-                    if let Err(error) = handshake_commands
-                        .send(HandshakeCommand::DropConnection { peer: peer.clone() })
-                        .await
-                    {
-                        tracing::warn!(
-                            remote = %remote_addr,
-                            ?error,
-                            "Failed to notify handshake driver about dropped connection"
-                        );
-                    }
-                }
-                Ok(EventResult::Continue)
-            }
-            Some(other) => {
-                tracing::warn!(?other, "Unexpected event from peer connection listener");
-                Ok(EventResult::Continue)
-            }
-            None => {
-                tracing::error!("All peer connection event channels closed");
-                Ok(EventResult::Continue)
-            }
-        }
-    }
-
-    fn handle_notification_msg(&self, msg: Option<Either<NetMessage, NodeEvent>>) -> EventResult {
-        match msg {
-            Some(Left(msg)) => {
-                // With hop-by-hop routing, messages no longer embed target.
-                // For initial requests (GET, PUT, Subscribe, Connect), extract next hop from operation state.
-                // For other messages, process locally (they'll be routed through network_bridge.send()).
-                let tx = *msg.id();
-
-                // Try to get next hop from operation state for initial outbound requests
-                // Uses peek methods to avoid pop/push overhead
-                if let Some(next_hop_addr) = self.bridge.op_manager.peek_next_hop_addr(&tx) {
-                    tracing::debug!(
-                        tx = %msg.id(),
-                        msg_type = %msg,
-                        next_hop = %next_hop_addr,
-                        "handle_notification_msg: Found next hop in operation state, routing as OutboundMessage"
-                    );
-                    // Fire-and-forget ops (Update, Unsubscribe) are completed after routing.
-                    // Other ops expect responses and stay in the state map.
-                    let is_fire_and_forget = tx.transaction_type() == TransactionType::Update
-                        || matches!(
-                            &msg,
-                            NetMessage::V1(NetMessageV1::Subscribe(
-                                crate::operations::subscribe::SubscribeMsg::Unsubscribe { .. }
-                            ))
-                        );
-                    if is_fire_and_forget {
-                        self.bridge.op_manager.completed(tx);
-                    }
-                    return EventResult::Event(
-                        ConnEvent::OutboundMessageWithTarget {
-                            target_addr: next_hop_addr,
-                            msg,
-                        }
-                        .into(),
-                    );
-                }
-
-                // Message has no next hop or couldn't get from op state - process locally
-                tracing::debug!(
-                    tx = %msg.id(),
-                    msg_type = %msg,
-                    "handle_notification_msg: No next hop found, processing locally"
-                );
-                EventResult::Event(ConnEvent::InboundMessage(msg.into()).into())
-            }
-            Some(Right(action)) => {
-                tracing::debug!(
-                    event = %action,
-                    "handle_notification_msg: Received NodeEvent notification"
-                );
-                EventResult::Event(ConnEvent::NodeAction(action).into())
-            }
-            None => EventResult::Event(
-                ConnEvent::ClosedChannel(ChannelCloseReason::Notification).into(),
-            ),
-        }
-    }
-
-    fn handle_op_execution(
-        &self,
-        msg: Option<super::OpExecutionPayload>,
-        state: &mut EventListenerState,
-    ) -> EventResult {
-        match msg {
-            Some((callback, msg, target_addr)) => {
-                // The driver task may have been cancelled between
-                // `op_execution_sender.send()` and our processing of the
-                // event — e.g. simulation teardown drops driver futures.
-                // When the response receiver is dropped before we reach
-                // here, the callback sender is closed; inserting it
-                // would leak `pending_op_results` until the 60s sweep,
-                // detectable as imbalance in #3100's regression guard
-                // `test_pending_op_results_bounded`. Skipping the
-                // insert keeps the HashMap bounded; the outbound
-                // request below still dispatches because the receiving
-                // peer's view of the operation is independent of the
-                // local driver's lifecycle.
-                if callback.is_closed() {
-                    tracing::debug!(
-                        tx = %msg.id(),
-                        "handle_op_execution: callback already closed (driver cancelled before insert); skipping"
-                    );
-                } else {
-                    state.pending_op_results.insert(*msg.id(), callback);
-                    crate::config::GlobalTestMetrics::record_pending_op_insert();
-                    crate::config::GlobalTestMetrics::record_pending_op_size(
-                        state.pending_op_results.len() as u64,
-                    );
-                }
-                // When the driver supplied an explicit target, dispatch the
-                // message to that peer over the network instead of looping it
-                // back as a local InboundMessage. The reply still flows back
-                // through the `pending_op_results` callback we just inserted.
-                //
-                // This is the load-bearing branch for issue #3838:
-                // client-initiated SUBSCRIBE with the contract cached locally
-                // would otherwise short-circuit in `process_message` and never
-                // register as a downstream subscriber on the home node.
-                match target_addr {
-                    Some(target_addr) => {
-                        // Track `tx → target_addr` so disconnect-cancellation in
-                        // `prune_connection` / `handle_orphaned_transactions` can
-                        // wake the parked driver (#4154). Two cases register here:
-                        //   - `send_to_and_await`: this branch just installed a
-                        //     waiter into `pending_op_results` above.
-                        //   - `send_fire_and_forget` from a relay driver running
-                        //     on the originator: the callback is closed (no insert
-                        //     above) but the originator's client driver has an
-                        //     earlier `pending_op_results[tx]` waiter that needs
-                        //     waking.
-                        // Skip when no waiter is present (e.g. cancelled-driver
-                        // teardown races) — registering with nothing to wake would
-                        // leak a live_tx_tracker entry until the peer disconnects.
-                        // Same-peer duplicates (e.g. CONNECT's parallel
-                        // `Ring::initiate_connect` registration) are tolerated by
-                        // `remove_finished_transaction`'s per-peer `retain`. Cross-
-                        // peer rebinds (same tx forwarded to two peers in turn) leave
-                        // a stale entry on the earlier peer until that peer
-                        // disconnects — a known limitation documented in
-                        // `LiveTransactionTracker::add_transaction`'s rustdoc.
-                        let tx = *msg.id();
-                        if state.pending_op_results.contains_key(&tx) {
-                            self.bridge
-                                .op_manager
-                                .ring
-                                .live_tx_tracker
-                                .add_transaction(target_addr, tx);
-                        }
-                        EventResult::Event(
-                            ConnEvent::OutboundMessageWithTarget { target_addr, msg }.into(),
-                        )
-                    }
-                    None => EventResult::Event(ConnEvent::InboundMessage(msg.into()).into()),
-                }
-            }
-            None => {
-                EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::OpExecution).into())
-            }
-        }
-    }
-
-    fn handle_bridge_msg(&self, msg: Option<P2pBridgeEvent>) -> EventResult {
-        match msg {
-            Some(P2pBridgeEvent::Message(target, msg)) => {
-                // Use OutboundMessageWithTarget to preserve the target address from
-                // P2pBridge::send(). This is critical for NAT scenarios where
-                // the address in the message differs from the actual transport address.
-                // The target.socket_addr() contains the address that was used to look up
-                // the peer in P2pBridge::send(), which is the correct transport address.
-                if let Some(target_addr) = target.socket_addr() {
-                    EventResult::Event(
-                        ConnEvent::OutboundMessageWithTarget {
-                            target_addr,
-                            msg: *msg,
-                        }
-                        .into(),
-                    )
-                } else {
-                    // Fall back to OutboundMessage if no explicit address
-                    // (shouldn't happen in normal operation)
-                    tracing::warn!(
-                        tx = %msg.id(),
-                        target_pub_key = %target.pub_key(),
-                        "handle_bridge_msg: target has no socket address, falling back to msg.target()"
-                    );
-                    EventResult::Event(ConnEvent::OutboundMessage(*msg).into())
-                }
-            }
-            Some(P2pBridgeEvent::NodeAction(action)) => {
-                EventResult::Event(ConnEvent::NodeAction(action).into())
-            }
-            Some(P2pBridgeEvent::StreamSend {
-                target_addr,
-                stream_id,
-                data,
-                metadata,
-                completion_tx,
-            }) => EventResult::Event(
-                ConnEvent::StreamSend {
-                    target_addr,
-                    stream_id,
-                    data,
-                    metadata,
-                    completion_tx,
-                }
-                .into(),
-            ),
-            Some(P2pBridgeEvent::PipeStream {
-                target_addr,
-                outbound_stream_id,
-                inbound_handle,
-                metadata,
-            }) => EventResult::Event(
-                ConnEvent::PipeStream {
-                    target_addr,
-                    outbound_stream_id,
-                    inbound_handle,
-                    metadata,
-                }
-                .into(),
-            ),
-            None => EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Bridge).into()),
-        }
-    }
-
-    fn handle_node_controller_msg(&self, msg: Option<NodeEvent>) -> EventResult {
-        match msg {
-            Some(msg) => EventResult::Event(ConnEvent::NodeAction(msg).into()),
-            None => {
-                EventResult::Event(ConnEvent::ClosedChannel(ChannelCloseReason::Controller).into())
-            }
-        }
-    }
-
-    // Removed handle_handshake_msg as it's integrated into wait_for_event
-
-    fn handle_client_transaction_subscription(
-        &self,
-        event_id: Result<(ClientId, WaitingTransaction), anyhow::Error>,
-        state: &mut EventListenerState,
-    ) -> EventResult {
-        let Ok((client_id, transaction)) = event_id.inspect_err(|e| {
-            tracing::error!("Error while receiving client transaction result: {:?}", e);
-        }) else {
-            return EventResult::Continue;
-        };
-        match transaction {
-            WaitingTransaction::Transaction(tx) => {
-                tracing::debug!(%tx, %client_id, "Subscribing client to transaction results");
-                let entry = state.tx_to_client.entry(tx).or_default();
-                let inserted = entry.insert(client_id);
-                tracing::debug!(
-                    "tx_to_client: tx={} client={} inserted={} total_waiting_clients={}",
-                    tx,
-                    client_id,
-                    inserted,
-                    entry.len()
-                );
-            }
-            WaitingTransaction::Subscription { contract_key } => {
-                tracing::debug!(%client_id, %contract_key, "Client waiting for subscription");
-                if let Some(clients) =
-                    state
-                        .client_waiting_transaction
-                        .iter_mut()
-                        .find_map(|(tx, clients)| {
-                            if let WaitingTransaction::Subscription { contract_key: key } = tx {
-                                return (key == &contract_key).then_some(clients);
-                            }
-                            None
-                        })
-                {
-                    clients.insert(client_id);
-                } else {
-                    state.client_waiting_transaction.push((
-                        WaitingTransaction::Subscription { contract_key },
-                        HashSet::from_iter([client_id]),
-                    ));
-                }
-            }
-        }
-        EventResult::Continue
-    }
-
-    fn handle_executor_transaction(
-        &self,
-        id: Result<Transaction, anyhow::Error>,
-        state: &mut EventListenerState,
-    ) -> EventResult {
-        let Ok(id) = id.map_err(|err| {
-            tracing::error!("Error while receiving transaction from executor: {:?}", err);
-        }) else {
-            return EventResult::Continue;
-        };
-        state.pending_from_executor.insert(id);
-        EventResult::Continue
-    }
-
-    /// Broadcast a message to a list of peers off the event loop.
-    ///
-    /// In production, the sends are spawned via `tokio::spawn` to prevent
-    /// self-deadlock: the bridge channel is drained by the event loop, so
-    /// inline fan-out of >capacity sends would block forever.
-    /// In simulation tests, sends run inline for determinism.
-    async fn broadcast_to_peers(
-        bridge: &P2pBridge,
-        peers: Vec<SocketAddr>,
-        msg: crate::message::NetMessage,
-    ) {
-        let bridge = bridge.clone();
-
-        let send_all = async move {
-            for peer_addr in peers {
-                if let Err(e) = bridge.send(peer_addr, msg.clone()).await {
-                    tracing::warn!(
-                        peer_addr = %peer_addr,
-                        error = %e,
-                        "Failed to send broadcast message to peer"
-                    );
-                }
-            }
-        };
-
-        #[cfg(not(feature = "simulation_tests"))]
-        tokio::spawn(send_all);
-
-        #[cfg(feature = "simulation_tests")]
-        send_all.await;
-    }
-
-    /// Broadcast a hosting update message to all connected peers.
-    async fn handle_hosting_broadcast(&mut self, message: crate::message::NeighborHostingMessage) {
-        tracing::debug!(
-            message = ?message,
-            peer_count = self.connections.len(),
-            phase = "broadcast",
-            "Broadcasting hosting update to connected peers"
-        );
-
-        let msg = crate::message::NetMessage::V1(crate::message::NetMessageV1::NeighborHosting {
-            message: message.clone(),
-        });
-        let peers: Vec<SocketAddr> = self.connections.keys().copied().collect();
-        Self::broadcast_to_peers(&self.bridge, peers, msg).await;
-    }
-
-    /// Broadcast ChangeInterests message to all connected peers.
-    async fn handle_broadcast_change_interests(&mut self, added: Vec<u32>, removed: Vec<u32>) {
-        tracing::debug!(
-            added_count = added.len(),
-            removed_count = removed.len(),
-            peer_count = self.connections.len(),
-            "Broadcasting ChangeInterests to connected peers"
-        );
-
-        let msg = crate::message::NetMessage::V1(crate::message::NetMessageV1::InterestSync {
-            message: crate::message::InterestMessage::ChangeInterests { added, removed },
-        });
-        let peers: Vec<SocketAddr> = self.connections.keys().copied().collect();
-        Self::broadcast_to_peers(&self.bridge, peers, msg).await;
-    }
-
-    /// Send an interest message to a specific peer.
-    async fn handle_send_interest_message(
-        &mut self,
-        target: SocketAddr,
-        message: crate::message::InterestMessage,
-    ) {
-        tracing::debug!(
-            target = %target,
-            "Sending interest message to peer"
-        );
-
-        let msg =
-            crate::message::NetMessage::V1(crate::message::NetMessageV1::InterestSync { message });
-
-        if let Err(e) = self.bridge.send(target, msg).await {
-            tracing::warn!(
-                peer_addr = %target,
-                error = %e,
-                "Failed to send interest message to peer"
-            );
-        }
-    }
-
-    /// Send an arbitrary `NetMessage` to a target peer without registering
-    /// a `pending_op_results` callback for the message's transaction.
-    ///
-    /// Mirrors `handle_send_interest_message` but accepts a
-    /// fully-formed `NetMessage`. Used by the CONNECT joiner to
-    /// emit `ConnectFailed` upstream without disturbing its own
-    /// multi-reply receiver slot.
-    async fn handle_send_net_message(
-        &mut self,
-        target: SocketAddr,
-        msg: crate::message::NetMessage,
-    ) {
-        tracing::debug!(
-            target = %target,
-            tx = %msg.id(),
-            "Sending net message to peer"
-        );
-
-        if let Err(e) = self.bridge.send(target, msg).await {
-            tracing::warn!(
-                peer_addr = %target,
-                error = %e,
-                "Failed to send net message to peer"
-            );
-        }
-    }
-
-    /// Broadcast ReadyState to all connected ring peers.
-    async fn handle_broadcast_ready_state(&mut self, ready: bool) {
-        let msg =
-            crate::message::NetMessage::V1(crate::message::NetMessageV1::ReadyState { ready });
-
-        tracing::info!(
-            ready,
-            peer_count = self.connections.len(),
-            "Broadcasting ReadyState to connected peers"
-        );
-
-        let peers: Vec<SocketAddr> = self.connections.keys().copied().collect();
-        Self::broadcast_to_peers(&self.bridge, peers, msg).await;
-    }
-
-    /// Maximum retry attempts when a broadcast finds no targets.
-    const MAX_BROADCAST_RETRIES: u8 = 3;
-
-    /// Base delay between broadcast retries (scaled by attempt number for linear backoff).
-    const BROADCAST_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
-
-    /// Maximum entries in the no-target streak tracker. Prevents unbounded growth
-    /// from network-influenced contract keys.
-    const MAX_BROADCAST_STREAK_ENTRIES: usize = 256;
-
-    /// Notify interested network peers about a state change.
-    ///
-    /// Echo-back is prevented by summary comparison: we skip peers whose cached
-    /// summary matches ours (they already have our state).
-    ///
-    /// When no targets are found (race between contract updates and subscription
-    /// establishment), the broadcast is retried with linear backoff up to
-    /// [`Self::MAX_BROADCAST_RETRIES`] times.
-    async fn handle_broadcast_state_change(
-        &mut self,
-        op_manager: &Arc<OpManager>,
-        key: freenet_stdlib::prelude::ContractKey,
-        new_state: freenet_stdlib::prelude::WrappedState,
-        // `false` for a fresh executor-emitted broadcast, `true` for a
-        // no-target retry re-emission this handler scheduled. Used only to
-        // count fresh logical broadcasts once for the #4281 summary.
-        is_retry: bool,
-        // `true` when this is a deferred re-emission of a stashed fresh-contract
-        // broadcast (issue #4359). Suppresses re-recording a `no_targets`
-        // propagation-summary event on give-up (the originating PUT already
-        // counted one when it first gave up) so a flush per interested peer
-        // does not inflate the #4281 stats.
-        is_reemit: bool,
-    ) {
-        tracing::debug!(
-            contract = %key,
-            state_size = new_state.size(),
-            "BroadcastStateChange event received"
-        );
-
-        // Phase 7 egress self-block (#4300). A locally-applied UPDATE
-        // (e.g. delegate-driven) drives this fan-out to subscribers who
-        // don't know about our ban. If we have banned the contract, skip
-        // the fan-out entirely — and the no-target retry re-emission with
-        // it — rather than push state for a contract we have decided is
-        // harmful. There is no client to notify here (this is the
-        // fire-and-forget broadcast path), so we skip with a debug log
-        // instead of returning a typed error. Complements the
-        // client-originated UPDATE gate in `start_client_update` and the
-        // receive-side `UpdateMsg::*` drop in node.rs (PR #4299).
-        if op_manager.ring.contract_ban_list.is_banned(key.id()) {
-            tracing::debug!(
-                contract = %key,
-                phase = "broadcast_state_change_banned_skip",
-                "skipping state-change broadcast for banned contract"
-            );
-            // Drop any in-flight retry/streak bookkeeping for this
-            // contract: if it was banned mid-retry-cycle, a previously
-            // scheduled re-emission would otherwise leave a stale entry
-            // here that nothing clears until the contract is unbanned and
-            // broadcast again. Mirrors the cleanup the targets-found and
-            // retries-exhausted paths perform.
-            self.broadcast_retries.remove(&key);
-            self.broadcast_no_target_streak.remove(&key);
-            return;
-        }
-
-        let self_addr = op_manager.ring.connection_manager.get_own_addr();
-        let Some(self_addr) = self_addr else {
-            tracing::warn!(
-                contract = %key,
-                "Cannot broadcast state change - no own address"
-            );
-            return;
-        };
-
-        let target_result = op_manager.get_broadcast_targets_update(&key, &self_addr);
-        tracing::debug!(
-            contract = %key,
-            target_count = target_result.targets.len(),
-            self_addr = %self_addr,
-            "BroadcastStateChange: found targets"
-        );
-
-        if target_result.targets.is_empty() {
-            // Record the NO_TARGETS outcome once per *fresh* no-target broadcast
-            // for the #4281 summary, but NOT for retry re-emissions. Gating on
-            // `is_retry` (carried on the event) rather than the per-contract
-            // `broadcast_retries` counter is what makes the count accurate:
-            // retries and fresh broadcasts share that counter, so a fresh
-            // broadcast arriving mid-retry-cycle would otherwise be absorbed
-            // and uncounted (Codex P2). With the explicit flag, every fresh
-            // no-target broadcast is counted exactly once and retries never
-            // double-count. If a later retry heals (finds targets), the
-            // targets-found path below additionally records that success — both
-            // the initial miss and the eventual propagation are surfaced.
-            //
-            // `is_reemit` (issue #4359) is also excluded: a deferred re-emission
-            // of a stashed fresh-contract broadcast that STILL finds no targets
-            // must not re-record a `no_targets` event — the originating PUT
-            // already counted one when it first gave up, and counting again per
-            // interested-peer flush would inflate the #4281 no_targets/targets_avg
-            // stats.
-            if !is_retry && !is_reemit {
-                op_manager.update_propagation_stats.record_broadcast(
-                    *key.id(),
-                    0,
-                    target_result.interest_resolve_failed,
-                );
-            }
-
-            let retry_count = self.broadcast_retries.entry(key).or_insert(0);
-            if *retry_count < Self::MAX_BROADCAST_RETRIES {
-                *retry_count += 1;
-                let attempt = *retry_count;
-                tracing::info!(
-                    contract = %key,
-                    self_addr = %self_addr,
-                    attempt,
-                    max_retries = Self::MAX_BROADCAST_RETRIES,
-                    "BROADCAST_NO_TARGETS: scheduling retry - subscriptions may still be in-flight"
-                );
-                // Schedule a delayed re-emission of BroadcastStateChange.
-                // DELIBERATELY blocking — this whole block runs inside a
-                // `tokio::spawn`, so the blocking await cannot wedge the
-                // event loop, only its own detached task. Switching to
-                // `try_notify_node_event` here would silently drop the
-                // retry in the exact recovery path the executor-side
-                // try_notify sites depend on for healing.
-                //
-                // Spawn-task accumulation is bounded per-contract by
-                // `MAX_BROADCAST_RETRIES = 3` and
-                // `BROADCAST_RETRY_BASE_DELAY = 1s`. Worst-case under
-                // simultaneous wedges is
-                // `MAX_BROADCAST_RETRIES × concurrent_contracts_in_flight`
-                // spawn tasks blocked up to 30 s each on the same
-                // saturated channel — bounded by the small per-tick
-                // contract-touch count, so soft memory pressure only.
-                // (Per PR #4231 re-review.)
-                let op_mgr = op_manager.clone();
-                let delay = Self::BROADCAST_RETRY_BASE_DELAY * u32::from(attempt);
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    if let Err(e) = op_mgr
-                        .notify_node_event(crate::message::NodeEvent::BroadcastStateChange {
-                            key,
-                            new_state,
-                            is_retry: true,
-                            is_reemit: false,
-                        })
-                        .await
-                    {
-                        tracing::warn!(
-                            contract = %key,
-                            error = %e,
-                            "Failed to re-emit BroadcastStateChange for retry"
-                        );
-                    }
-                });
-            } else {
-                // Retries exhausted. Track consecutive no-target cycles to
-                // suppress repetitive WARN logging after the first occurrence.
-                self.broadcast_retries.remove(&key);
-
-                // Issue #4359: a fresh contract id loses the race between this
-                // broadcast give-up (~6 s) and the much slower interest/
-                // subscription resolve for a never-before-seen key. Instead of
-                // permanently abandoning the state — which silently leaves it
-                // locally-hosted only while every other node GETs NotFound —
-                // stash it. When the first interested peer/subscriber for this
-                // contract appears later, the interest path drains the stash
-                // and re-emits a single BroadcastStateChange, which then finds
-                // the freshly-registered target and propagates. The store is
-                // bounded by size and TTL so a churn of fresh ids that never
-                // gain a subscriber cannot pin memory.
-                op_manager
-                    .pending_broadcasts
-                    .stash(*key.id(), new_state.clone());
-
-                // Lost-wakeup guard (#4359 re-review): stash() runs here on the
-                // event-loop task while the interest-resolve flush runs on the
-                // subscribe/op driver task — they are concurrent with no
-                // happens-before. An interested peer could have registered (and
-                // already flushed → found nothing to take) in the window between
-                // `get_broadcast_targets_update` above and this stash. That would
-                // leave the state stashed with the only interested peer already
-                // past its flush, draining nothing until the NEXT subscriber or
-                // the TTL. Re-resolve targets now that the stash is in place: if a
-                // target has appeared, take the stash back and re-emit
-                // immediately rather than waiting on a future flush.
-                let recheck = op_manager.get_broadcast_targets_update(&key, &self_addr);
-                if !recheck.targets.is_empty() {
-                    if let Some(stashed) = op_manager.pending_broadcasts.take(key.id()) {
-                        tracing::debug!(
-                            contract = %key,
-                            target_count = recheck.targets.len(),
-                            phase = "pending_broadcast_stash_recheck",
-                            "A target appeared while giving up; re-emitting the deferred \
-                             fresh-contract broadcast immediately instead of leaving it \
-                             stashed for a future flush (#4359)"
-                        );
-                        if let Err(e) = op_manager.try_notify_node_event(
-                            crate::message::NodeEvent::BroadcastStateChange {
-                                key,
-                                new_state: stashed.clone(),
-                                is_retry: false,
-                                is_reemit: true,
-                            },
-                        ) {
-                            // Channel full/closed: re-stash so the next interest
-                            // flush still recovers it. Losing it would re-open the
-                            // locally-hosted-only failure this fix closes.
-                            op_manager.pending_broadcasts.stash(*key.id(), stashed);
-                            tracing::debug!(
-                                contract = %key,
-                                error = %e,
-                                "pending_broadcast_stash_recheck: immediate re-emit dropped; \
-                                 re-stashed for the next interest signal"
-                            );
-                        }
-                    }
-                }
-
-                // Evict oldest entry if at capacity to prevent unbounded growth.
-                if !self.broadcast_no_target_streak.contains_key(&key)
-                    && self.broadcast_no_target_streak.len() >= Self::MAX_BROADCAST_STREAK_ENTRIES
-                {
-                    if let Some(evict_key) = self.broadcast_no_target_streak.keys().next().cloned()
-                    {
-                        self.broadcast_no_target_streak.remove(&evict_key);
-                    }
-                }
-                let streak = self.broadcast_no_target_streak.entry(key).or_insert(0);
-                *streak = streak.saturating_add(1);
-                let current_streak = *streak;
-
-                if current_streak <= 1 {
-                    tracing::warn!(
-                        contract = %key,
-                        self_addr = %self_addr,
-                        "BROADCAST_NO_TARGETS: no targets found after {} retries, giving up",
-                        Self::MAX_BROADCAST_RETRIES
-                    );
-                } else {
-                    tracing::debug!(
-                        contract = %key,
-                        self_addr = %self_addr,
-                        consecutive_misses = current_streak,
-                        "BROADCAST_NO_TARGETS: still no targets (suppressing repeated warns)"
-                    );
-                }
-
-                // Emit delivery summary for diagnostics (only on first miss per streak)
-                if current_streak <= 1 {
-                    let update_tx =
-                        crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
-                    if let Some(log) = NetEventLog::broadcast_delivery_summary(
-                        &update_tx,
-                        &op_manager.ring,
-                        key,
-                        &target_result,
-                        0,
-                        0,
-                        0,
-                    ) {
-                        self.bridge
-                            .log_register
-                            .register_events(Either::Left(log))
-                            .await;
-                    }
-                }
-                // The NO_TARGETS outcome was already recorded for the #4281
-                // summary at the start of this retry cycle (retry_count == 0
-                // above); retry exhaustion does not record again, so a stuck
-                // contract counts as one no_targets per fresh broadcast, not
-                // once per retry.
-            }
-            return;
-        }
-
-        // Targets found - clear any pending retry and streak state for this contract
-        self.broadcast_retries.remove(&key);
-        self.broadcast_no_target_streak.remove(&key);
-        // Also drop any deferred re-broadcast stash (#4359): this fan-out is
-        // reaching targets now, so a previously-abandoned state for this
-        // contract is superseded and must not be re-emitted later as stale.
-        let _ = op_manager.pending_broadcasts.take(key.id());
-
-        // Record a successful fan-out for the #4281 propagation summary. Fires
-        // whether targets were found on the initial attempt or on a healing
-        // retry, so a recovered in-flight-subscription race is surfaced as a
-        // propagated update (with its real target count). A fresh broadcast
-        // that found targets on the first try has no `broadcast_retries` entry,
-        // so it is recorded exactly once here.
-        op_manager.update_propagation_stats.record_broadcast(
-            *key.id(),
-            target_result.targets.len(),
-            target_result.interest_resolve_failed,
-        );
-
-        // In production, enqueue each target into the broadcast queue.
-        // The queue worker handles delta computation and streaming with bounded
-        // concurrency (default: 2 concurrent streams) to prevent uplink saturation.
-        //
-        // In simulation tests, call inline to preserve deterministic message
-        // ordering — tokio::spawn in start_paused(true) changes broadcast
-        // delivery order and breaks convergence.
-        #[cfg(not(feature = "simulation_tests"))]
-        {
-            for target in &target_result.targets {
-                self.broadcast_queue
-                    .enqueue(key, target.clone(), new_state.clone())
-                    .await;
-            }
-            // Emit broadcast emitted telemetry (issue #3622)
-            //
-            // Production path limitations:
-            // - Transaction ID is synthetic (not from the original update operation).
-            //   BroadcastQueue creates its own TX per target, so this ID cannot be
-            //   correlated with downstream BroadcastReceived/BroadcastApplied events.
-            // - `broadcasted_to` = number of targets enqueued, not actual delivery
-            //   count. Actual sends are async via BroadcastQueue.
-            // - `broadcast_to` is empty to avoid cloning up to 512 PeerKeyLocations
-            //   purely for telemetry. The peer list can be reconstructed from
-            //   BroadcastReceived events on the receiving end.
-            let update_tx =
-                crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
-            let enqueued_count = target_result.targets.len();
-            if let Some(log) = NetEventLog::update_broadcast_emitted(
-                &update_tx,
-                &op_manager.ring,
-                key,
-                Vec::new(),
-                enqueued_count,
-                new_state,
-            ) {
-                self.bridge
-                    .log_register
-                    .register_events(Either::Left(log))
-                    .await;
-            }
-        }
-        #[cfg(feature = "simulation_tests")]
-        {
-            Self::broadcast_state_to_peers(
-                self.bridge.clone(),
-                op_manager,
-                key,
-                new_state,
-                target_result,
-            )
-            .await;
-        }
-    }
-
-    /// Send state to a specific peer that reported a stale summary.
-    ///
-    /// Unlike `handle_broadcast_state_change` which fans out to ALL subscribers,
-    /// this targets only the peer that needs catching up. Used by the interest
-    /// sync summary-mismatch handler to avoid O(peers^2) broadcast storms.
-    async fn handle_sync_state_to_peer(
-        &mut self,
-        op_manager: &Arc<OpManager>,
-        key: freenet_stdlib::prelude::ContractKey,
-        new_state: freenet_stdlib::prelude::WrappedState,
-        target_addr: std::net::SocketAddr,
-    ) {
-        let target = op_manager
-            .ring
-            .connection_manager
-            .get_peer_by_addr(target_addr);
-        let Some(target) = target else {
-            tracing::debug!(
-                contract = %key,
-                peer = %target_addr,
-                "SyncStateToPeer: peer not found in connection manager, skipping"
-            );
-            return;
-        };
-
-        tracing::debug!(
-            contract = %key,
-            peer = %target_addr,
-            "SyncStateToPeer: sending state to stale peer"
-        );
-
-        #[cfg(not(feature = "simulation_tests"))]
-        {
-            self.broadcast_queue.enqueue(key, target, new_state).await;
-        }
-        #[cfg(feature = "simulation_tests")]
-        {
-            super::broadcast_queue::broadcast_to_single_peer(
-                &self.bridge,
-                op_manager,
-                key,
-                new_state,
-                target,
-            )
-            .await;
-        }
-    }
-
-    /// Send state change broadcasts to interested peers.
-    ///
-    /// Used only in simulation tests for inline (deterministic) broadcast ordering.
-    /// In production, the `BroadcastQueue` handles per-target sends with bounded
-    /// concurrency.
-    #[cfg(feature = "simulation_tests")]
-    async fn broadcast_state_to_peers(
-        bridge: P2pBridge,
-        op_manager: &Arc<OpManager>,
-        key: freenet_stdlib::prelude::ContractKey,
-        new_state: freenet_stdlib::prelude::WrappedState,
-        target_result: crate::operations::update::BroadcastTargetResult,
-    ) {
-        // Skip the whole fan-out when we hold no local state for `key`: there is
-        // nothing to broadcast, and the per-target `get_contract_summary` calls
-        // below are the residual #4473 summarize storm on this path. Mirrors the
-        // production `broadcast_to_single_peer` gate. See
-        // `broadcast_queue::should_broadcast_contract`.
-        if !super::broadcast_queue::should_broadcast_contract(op_manager, &key) {
-            tracing::trace!(
-                contract = %key,
-                "Skipping broadcast fan-out - contract not hosted or in use"
-            );
-            return;
-        }
-
-        // Get our summary once for all targets
-        let our_summary = op_manager
-            .interest_manager
-            .get_contract_summary(op_manager, &key)
-            .await;
-
-        let update_tx = crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
-
-        tracing::debug!(
-            tx = %update_tx,
-            contract = %key,
-            target_count = target_result.targets.len(),
-            "Broadcasting state change to network peers"
-        );
-
-        let mut skipped_summary_match: usize = 0;
-        let mut send_success: usize = 0;
-        let mut send_failed: usize = 0;
-
-        for target in &target_result.targets {
-            let Some(peer_addr) = target.socket_addr() else {
-                continue;
-            };
-
-            let peer_key = PeerKey::from(target.pub_key().clone());
-
-            // Get peer's cached summary
-            let their_summary = op_manager
-                .interest_manager
-                .get_peer_summary(&key, &peer_key);
-
-            // Skip if summaries are equal (no change to send)
-            if let (Some(ours), Some(theirs)) = (&our_summary, &their_summary) {
-                if ours.as_ref() == theirs.as_ref() {
-                    tracing::trace!(
-                        contract = %key,
-                        peer = %peer_addr,
-                        "Skipping broadcast - peer already has our state"
-                    );
-                    skipped_summary_match += 1;
-                    continue;
-                }
-            }
-
-            // Compute delta if we have their summary (uses memoization cache)
-            // Track whether we successfully computed a delta vs sent full state
-            let (payload, sent_delta) = match (&our_summary, &their_summary) {
-                (Some(ours), Some(theirs)) => {
-                    match op_manager
-                        .interest_manager
-                        .compute_delta(op_manager, &key, theirs, ours, new_state.size())
-                        .await
-                    {
-                        Ok(Some(delta)) => (
-                            crate::message::DeltaOrFullState::Delta(delta.as_ref().to_vec()),
-                            true,
-                        ),
-                        Ok(None) => {
-                            tracing::debug!(
-                                contract = %key,
-                                "Delta computation returned no change, sending full state"
-                            );
-                            (
-                                crate::message::DeltaOrFullState::FullState(
-                                    new_state.as_ref().to_vec(),
-                                ),
-                                false,
-                            )
-                        }
-                        Err(err) => {
-                            tracing::debug!(
-                                contract = %key,
-                                error = %err,
-                                "Delta computation failed, falling back to full state"
-                            );
-                            (
-                                crate::message::DeltaOrFullState::FullState(
-                                    new_state.as_ref().to_vec(),
-                                ),
-                                false,
-                            )
-                        }
-                    }
-                }
-                _ => (
-                    crate::message::DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
-                    false,
-                ),
-            };
-
-            // Save payload size before moving it into the message
-            let payload_size = payload.size();
-
-            // Check if we should use streaming for full state broadcasts
-            let use_streaming = matches!(&payload, crate::message::DeltaOrFullState::FullState(_))
-                && crate::operations::should_use_streaming(
-                    op_manager.streaming_threshold,
-                    payload_size,
-                );
-
-            let send_result = if use_streaming {
-                let sender_summary_bytes = our_summary
-                    .as_ref()
-                    .map(|s| s.as_ref().to_vec())
-                    .unwrap_or_default();
-                let state_bytes = match payload {
-                    crate::message::DeltaOrFullState::FullState(data) => data,
-                    _ => unreachable!("checked above"),
-                };
-                let streaming_payload = crate::operations::update::BroadcastStreamingPayload {
-                    state_bytes,
-                    sender_summary_bytes,
-                };
-                let payload_bytes = match bincode::serialize(&streaming_payload) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!(
-                            tx = %update_tx,
-                            error = %e,
-                            "Failed to serialize BroadcastStreamingPayload, skipping"
-                        );
-                        continue;
-                    }
-                };
-                let sid = StreamId::next_operations();
-                tracing::debug!(
-                    tx = %update_tx,
-                    contract = %key,
-                    peer = %peer_addr,
-                    stream_id = %sid,
-                    payload_size,
-                    "Using streaming for BroadcastTo"
-                );
-                let msg = crate::operations::update::UpdateMsg::BroadcastToStreaming {
-                    id: update_tx,
-                    stream_id: sid,
-                    key,
-                    total_size: payload_bytes.len() as u64,
-                };
-                let net_msg: NetMessage = msg.into();
-                // Serialize metadata for embedding in fragment #1 (fix #2757)
-                let metadata = match bincode::serialize(&net_msg) {
-                    Ok(bytes) => Some(bytes::Bytes::from(bytes)),
-                    Err(e) => {
-                        tracing::warn!(
-                            ?peer_addr,
-                            error = %e,
-                            "Failed to serialize BroadcastTo metadata for embedding"
-                        );
-                        None
-                    }
-                };
-                let send_res = bridge.send(peer_addr, net_msg).await;
-                match send_res {
-                    Ok(()) => {
-                        // The metadata message went out; the streamed full state is
-                        // the actual payload. The success arm below caches
-                        // `our_summary` for this peer (FIX 1 of #4145), which is only
-                        // correct if the STATE was sent — so this branch's result must
-                        // reflect the stream send, not just the metadata send. If
-                        // `send_stream` fails, a streamed full state that never landed
-                        // would otherwise be marked as delivered, recreating the
-                        // #2763/#4235 divergence hazard (a wrongly-cached summary makes
-                        // the next delta unappliable). Propagate the stream-send error.
-                        bridge
-                            .send_stream(
-                                peer_addr,
-                                sid,
-                                bytes::Bytes::from(payload_bytes),
-                                metadata,
-                            )
-                            .await
-                            .inspect_err(|err| {
-                                tracing::warn!(
-                                    tx = %update_tx,
-                                    peer = %peer_addr,
-                                    error = %err,
-                                    "Failed to send broadcast stream data"
-                                );
-                            })
-                    }
-                    // Metadata send failed; nothing was streamed. Propagate the error.
-                    Err(err) => Err(err),
-                }
-            } else {
-                let msg = crate::operations::update::UpdateMsg::BroadcastTo {
-                    id: update_tx,
-                    key,
-                    payload,
-                    // Include our summary so peer doesn't echo back
-                    sender_summary_bytes: our_summary
-                        .as_ref()
-                        .map(|s| s.as_ref().to_vec())
-                        .unwrap_or_default(),
-                };
-                bridge.send(peer_addr, msg.into()).await
-            };
-
-            if let Err(err) = send_result {
-                send_failed += 1;
-                tracing::warn!(
-                    tx = %update_tx,
-                    peer = %peer_addr,
-                    error = %err,
-                    "Failed to send state change broadcast"
-                );
-            } else {
-                send_success += 1;
-                // Track delta vs full state sends for testing (PR #2763)
-                if sent_delta {
-                    op_manager
-                        .interest_manager
-                        .record_delta_send(new_state.size(), payload_size);
-                    crate::config::GlobalTestMetrics::record_delta_send();
-                } else {
-                    op_manager.interest_manager.record_full_state_send();
-                    crate::config::GlobalTestMetrics::record_full_state_send();
-                }
-
-                // Issue #3046: Refresh the peer's interest TTL on every successful
-                // broadcast send. Without this, interest entries for peers who only
-                // receive full-state broadcasts (no delta → no update_peer_summary
-                // call) expire after INTEREST_TTL, even though broadcasts
-                // are being successfully delivered. This caused ~49% of River room
-                // subscribers to miss updates.
-                op_manager
-                    .interest_manager
-                    .refresh_peer_interest(&key, &peer_key);
-
-                // Issue #4145: Cache the peer summary on ANY successful broadcast
-                // send — delta OR full state — not just deltas. Separate from the
-                // TTL refresh above: update_peer_summary sets the cached summary
-                // (used for delta computation), refresh_peer_interest only extends
-                // the TTL.
-                //
-                // PR #2763 originally gated this on `sent_delta`, which created a
-                // chicken-and-egg: a delta needs the peer's cached summary, but the
-                // summary was only cached after a delta — so every NEW subscriber
-                // (or a peer whose summary was cleared) starts on full state and is
-                // trapped sending full state forever. Under sustained fan-out that
-                // is the #4233 full-state broadcast storm.
-                //
-                // Safe now because this runs only inside the send-success (`else`)
-                // arm. This is the inline non-streaming `BroadcastTo` path: a
-                // successful `bridge.send` is the terminal state we can observe
-                // (the same assumption the delta path already made). Caching on a
-                // delivered broadcast is safe even when the cache is momentarily
-                // wrong: a wrongly-cached summary is corrected by the periodic
-                // InterestSync summary exchange (~5 min, node.rs) and by the
-                // delta-apply-failure → ResyncRequest path that clears the
-                // sender's cached summary (node.rs ~2119). Caching here lets the
-                // NEXT broadcast to this peer be a small delta. The streaming
-                // (full-state) path is gated more strictly on a `Delivered`
-                // completion (#4235) in `broadcast_queue.rs` — note that signal is
-                // sender-side completion, not a receiver ack, so a lost stream
-                // tail is covered by the same two backstops.
-                // (Telemetry above still records delta-vs-full-state separately.)
-                if let Some(summary) = &our_summary {
-                    op_manager.interest_manager.update_peer_summary(
-                        &key,
-                        &peer_key,
-                        Some(summary.clone()),
-                    );
-                }
-            }
-        }
-
-        // Emit broadcast emitted telemetry (issue #3622)
-        if let Some(log) = NetEventLog::update_broadcast_emitted(
-            &update_tx,
-            &op_manager.ring,
-            key,
-            target_result.targets.clone(),
-            send_success,
-            new_state,
-        ) {
-            bridge.log_register.register_events(Either::Left(log)).await;
-        }
-
-        // Emit broadcast delivery summary telemetry (issue #3046)
-        if let Some(log) = NetEventLog::broadcast_delivery_summary(
-            &update_tx,
-            &op_manager.ring,
-            key,
-            &target_result,
-            skipped_summary_match,
-            send_success,
-            send_failed,
-        ) {
-            bridge.log_register.register_events(Either::Left(log)).await;
-        }
-    }
 }
 
 trait ConnectResultSender: Send {
@@ -5464,6 +2617,68 @@ impl ConnectResultSender for mpsc::Sender<Result<(SocketAddr, Option<usize>), ()
     ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>> {
         async move { self.send(result).await.map_err(|_| ()) }.boxed()
     }
+}
+
+/// Fail every callback awaiting a connection to `peer_addr` after a connect
+/// attempt was abandoned (e.g. its `HandshakeCommand::Connect` enqueue was
+/// dropped on a full/closed handshake command channel, #4145).
+///
+/// Extracted as a free function so its callback/state invariants are
+/// unit-testable without standing up a full `P2pConnManager`:
+///
+/// 1. Every awaiting callback for `peer_addr` is resolved with `Err(())` — never
+///    left parked — so callers (including the SubscribeHint resend-waiter) fail
+///    fast and the op can retry.
+/// 2. `awaiting_connection` AND `awaiting_connection_txs` are both drained for
+///    `peer_addr` (kept in lock-step; a stranded tx entry would mislead later
+///    diagnostics).
+/// 3. NO peer backoff is recorded: a full LOCAL channel is resource contention,
+///    not a remote connection failure, so backing the peer off would wrongly
+///    delay a legitimate retry. (This function simply never touches
+///    `state.peer_backoff`; the test asserts it stays clear.)
+///
+/// The caller is responsible for the connection-manager side effect
+/// (`prune_in_transit_connection`), which is the one piece that needs the live
+/// ring — see the call site in `connect_peer`.
+async fn fail_awaiting_connection(
+    state: &mut EventListenerState,
+    peer_addr: SocketAddr,
+    tx: Transaction,
+    transient: bool,
+) {
+    // (2) drain both maps in lock-step.
+    let pending_txs = state.awaiting_connection_txs.remove(&peer_addr);
+
+    // (1) fail every awaiting callback — never leave one parked.
+    if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
+        tracing::debug!(
+            tx = %tx,
+            remote = %peer_addr,
+            callbacks = callbacks.len(),
+            transient,
+            "Cleaning up callbacks after connect command failure"
+        );
+        for mut cb in callbacks {
+            cb.send_result(Err(()))
+                .await
+                .inspect_err(|send_err| {
+                    tracing::debug!(
+                        remote = %peer_addr,
+                        ?send_err,
+                        "Failed to deliver connect command failure to awaiting callback"
+                    );
+                })
+                .ok();
+        }
+    }
+    if let Some(pending_txs) = pending_txs {
+        tracing::debug!(
+            remote = %peer_addr,
+            pending_txs = ?pending_txs,
+            "Removed pending transactions after connect command failure"
+        );
+    }
+    // (3) Deliberately NO state.peer_backoff.record_failure() here.
 }
 
 struct EventListenerState {
@@ -6201,13 +3416,12 @@ mod tests {
             assert!(!version_supports_subscribe_hint(None, (0, 0, 0)));
         }
 
-        /// Pin the PRODUCTION constant (not the local `FLOOR`): with
-        /// `SUBSCRIBE_HINT_MIN_VERSION` parked at `(0, 3, 0)` the placement
-        /// migration is dormant for EVERY shipped 0.2.x peer — both the lowest
-        /// shipped patch and any conceivable future 0.2.x — and stays fail-closed
-        /// on an unknown version. If someone lowers the floor to a 0.2.x release
-        /// (silently re-enabling the migration disabled in v0.2.74), this test
-        /// fails. See docs/RELEASING.md and issue #4145.
+        // Superseded: the placement migration was RE-ENABLED at `(0, 2, 80)` by
+        // PR #4511 (#4145 fixed in #4499). This test pinned the v0.2.74
+        // deactivation (dormant for every 0.2.x peer) and now documents that
+        // prior behavior; its asserts no longer hold against the lowered floor.
+        // Replaced by `placement_migration_active_at_reenable_floor` below.
+        #[ignore]
         #[test]
         fn placement_migration_deactivated_for_all_0_2_x() {
             assert!(!version_supports_subscribe_hint(
@@ -6218,6 +3432,43 @@ mod tests {
                 Some((0, 2, 255)),
                 SUBSCRIBE_HINT_MIN_VERSION
             ));
+            assert!(!version_supports_subscribe_hint(
+                None,
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+        }
+
+        /// Pin the PRODUCTION constant (not the local `FLOOR`): the placement
+        /// migration is RE-ENABLED at `(0, 2, 80)` (#4499 made it load-safe), so
+        /// peers at or above that floor participate while pre-floor 0.2.x peers
+        /// and unknown versions stay gated off (wire-compat with the staggered
+        /// rollout). An accidental change to the floor moves the activation set
+        /// and trips the pinned value below. See docs/RELEASING.md and issues
+        /// #4145 / #4499.
+        #[test]
+        fn placement_migration_active_at_reenable_floor() {
+            // The `supported(0,2,80)` + `!supported(0,2,79)` pair below pins the
+            // floor to exactly `(0, 2, 80)`: an accidental change moves the
+            // activation set and trips these asserts.
+            // At or above the floor: active.
+            assert!(version_supports_subscribe_hint(
+                Some((0, 2, 80)),
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+            assert!(version_supports_subscribe_hint(
+                Some((0, 2, 255)),
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+            // Below the floor: still gated off.
+            assert!(!version_supports_subscribe_hint(
+                Some((0, 2, 79)),
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+            assert!(!version_supports_subscribe_hint(
+                Some((0, 2, 73)),
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+            // Unknown version fails closed.
             assert!(!version_supports_subscribe_hint(
                 None,
                 SUBSCRIBE_HINT_MIN_VERSION
@@ -7042,6 +4293,96 @@ mod tests {
         );
     }
 
+    /// Source-scrape regression guard for #4549. The inline diagnostics
+    /// `QuerySubscriptions` queries on the network event loop must be BOUNDED by
+    /// `QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT` and must NOT propagate the contract
+    /// handler's result with `?`. The original bug was a bare
+    /// `notify_contract_handler(QuerySubscriptions ...).await?`: under
+    /// contract-executor saturation it returned `NoEvHandlerResponse` after the
+    /// 300s handler timeout, which killed the entire network event listener
+    /// ("Network event listener exited: no response received from handler") and
+    /// took the gateway network-dead with no self-recovery.
+    #[test]
+    fn query_subscriptions_diagnostics_bounded_and_non_fatal() {
+        let src = include_str!("p2p_protoc.rs");
+        // Built at runtime so this test's own source can't self-match the needle.
+        let needle = concat!("ContractHandlerEvent::", "QuerySubscriptions {");
+        let sites: Vec<usize> = src.match_indices(needle).map(|(i, _)| i).collect();
+        // The handler query now lives in exactly ONE place — the bounded helper
+        // `query_app_subscriptions_bounded`. Re-inlining it into an event-loop arm
+        // (the #4549 regression shape) would add a site and fail this assert.
+        assert_eq!(
+            sites.len(),
+            1,
+            "the QuerySubscriptions handler query must live only in \
+             query_app_subscriptions_bounded, found {} sites",
+            sites.len()
+        );
+        let idx = sites[0];
+        // Non-fatal: no `?`-propagation on the handler result (char-based window so
+        // a multi-byte char in nearby comments can't panic the slice).
+        let forward: String = src[idx..].chars().take(220).collect();
+        assert!(
+            !forward.contains(".await?"),
+            "the QuerySubscriptions handler query must not use the fatal `.await?` — a per-op \
+             handler timeout must never kill the network event listener (#4549). Near:\n{forward}"
+        );
+        // Bounded: wrapped in `timeout(QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT, ..)`.
+        let before = &src[..idx];
+        let bounded = before
+            .rfind("timeout(")
+            .is_some_and(|tp| src[tp..idx].contains("QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT"));
+        assert!(
+            bounded,
+            "the QuerySubscriptions handler query must be wrapped in \
+             timeout(QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT, ..) so a saturated contract handler \
+             can neither stall nor kill the network event loop (#4549)."
+        );
+        // Both diagnostics arms (and the helper definition) must reference the helper.
+        assert!(
+            src.matches("query_app_subscriptions_bounded(").count() >= 3,
+            "both diagnostics arms must delegate to query_app_subscriptions_bounded (#4549)"
+        );
+        // Keep the bound small so a future bump can't reopen the event-loop stall window.
+        assert!(
+            super::QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT <= Duration::from_secs(30),
+            "QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT must stay small to bound the loop stall (#4549)"
+        );
+    }
+
+    /// Behavioral pin for #4549: a stalled contract handler must make the bounded
+    /// diagnostics query return an EMPTY list within the timeout — never error (the
+    /// old fatal `.await?`) and never stall for the handler's 300s response timeout.
+    /// This exercises the production `query_app_subscriptions_bounded` directly, so
+    /// it fails if the stall-survival behavior regresses by ANY route, not just the
+    /// one syntactic revert the source-scrape pin catches.
+    #[tokio::test(start_paused = true)]
+    async fn query_app_subscriptions_bounded_yields_empty_when_handler_stalls() {
+        // Keep the handler (receiver) half alive but NEVER respond — the saturation
+        // condition that killed the listener pre-#4549. The unbounded send succeeds;
+        // the response oneshot never resolves, so the outer bound must fire.
+        let (sender, _handler_half, _waiting) = crate::contract::contract_handler_channel();
+        let bound = super::QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT;
+        let start = Instant::now();
+        let subs = super::query_app_subscriptions_bounded(&sender).await;
+        let elapsed = start.elapsed();
+        assert!(
+            subs.is_empty(),
+            "a stalled handler must yield empty app subscriptions, got {} entries",
+            subs.len()
+        );
+        // start_paused advances the clock deterministically: we wait the bound but
+        // NOT the handler's full 300s CH_EV_RESPONSE_TIME_OUT.
+        assert!(
+            elapsed >= bound,
+            "must wait the bounded timeout ({elapsed:?} < {bound:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(60),
+            "must not stall for the 300s handler timeout ({elapsed:?})"
+        );
+    }
+
     /// Pin: the `TransactionOrphaned` handler must deliver the cause
     /// THROUGH the waiter channel (`try_send(WaiterReply::PeerDisconnected ...)`)
     /// before dropping the sender via `pending_op_results.remove`. A future
@@ -7084,19 +4425,25 @@ mod tests {
     /// behavioral broadcast simulation tests can't silently regress the storm.
     #[test]
     fn broadcast_state_to_peers_gates_summarize_on_hosted_or_in_use() {
-        const SOURCE: &str = include_str!("p2p_protoc.rs");
+        // Lives in the `broadcast` submodule after the p2p_protoc.rs split.
+        const SOURCE: &str = include_str!("p2p_protoc/broadcast.rs");
 
         let fn_anchor = "async fn broadcast_state_to_peers(";
         let fn_start = SOURCE
             .find(fn_anchor)
             .expect("broadcast_state_to_peers renamed or removed");
-        // Bound the slice at the next `async fn ` so the assertion can't match a
-        // later function's body.
+        // Bound the slice at the next method (tolerating a `pub(super)` prefix)
+        // so the assertion can't match a later function's body.
         let after_header = &SOURCE[fn_start + fn_anchor.len()..];
-        let body_end = after_header
-            .find("\n    async fn ")
-            .map(|p| fn_start + fn_anchor.len() + p)
-            .unwrap_or(SOURCE.len());
+        let body_end = [
+            after_header.find("\n    async fn "),
+            after_header.find("\n    pub(super) async fn "),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|p| fn_start + fn_anchor.len() + p)
+        .unwrap_or(SOURCE.len());
         let body = &SOURCE[fn_start..body_end];
 
         let gate_pos = body.find("should_broadcast_contract(op_manager").expect(
@@ -7126,19 +4473,26 @@ mod tests {
     /// pins in the `start_client_*` entry points.
     #[test]
     fn handle_broadcast_state_change_gates_banned_egress() {
-        const SOURCE: &str = include_str!("p2p_protoc.rs");
+        // Lives in the `broadcast` submodule after the p2p_protoc.rs split.
+        const SOURCE: &str = include_str!("p2p_protoc/broadcast.rs");
 
         let fn_anchor = "async fn handle_broadcast_state_change(";
         let fn_start = SOURCE
             .find(fn_anchor)
             .expect("handle_broadcast_state_change renamed or removed");
-        // Bound the slice at the next `async fn ` so the assertion can't
+        // Bound the slice at the next method (tolerating the `pub(super)` prefix
+        // the sibling methods carry in the submodule) so the assertion can't
         // accidentally match a later function's body.
         let after_header = &SOURCE[fn_start + fn_anchor.len()..];
-        let body_end = after_header
-            .find("\n    async fn ")
-            .map(|p| fn_start + fn_anchor.len() + p)
-            .unwrap_or(SOURCE.len());
+        let body_end = [
+            after_header.find("\n    async fn "),
+            after_header.find("\n    pub(super) async fn "),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|p| fn_start + fn_anchor.len() + p)
+        .unwrap_or(SOURCE.len());
         let body = &SOURCE[fn_start..body_end];
 
         let gate_pos = body.find("contract_ban_list.is_banned").expect(
@@ -7195,17 +4549,25 @@ mod tests {
     /// OpManager + contract handler, hence the grep floor.
     #[test]
     fn handle_broadcast_state_change_stashes_on_giveup_and_takes_on_targets() {
-        const SOURCE: &str = include_str!("p2p_protoc.rs");
+        // Lives in the `broadcast` submodule after the p2p_protoc.rs split.
+        const SOURCE: &str = include_str!("p2p_protoc/broadcast.rs");
 
         let fn_anchor = "async fn handle_broadcast_state_change(";
         let fn_start = SOURCE
             .find(fn_anchor)
             .expect("handle_broadcast_state_change renamed or removed (#4359 wiring pin)");
+        // Bound at the next method, tolerating the `pub(super)` prefix the
+        // sibling methods carry in the submodule.
         let after_header = &SOURCE[fn_start + fn_anchor.len()..];
-        let body_end = after_header
-            .find("\n    async fn ")
-            .map(|p| fn_start + fn_anchor.len() + p)
-            .unwrap_or(SOURCE.len());
+        let body_end = [
+            after_header.find("\n    async fn "),
+            after_header.find("\n    pub(super) async fn "),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+        .map(|p| fn_start + fn_anchor.len() + p)
+        .unwrap_or(SOURCE.len());
         let body = &SOURCE[fn_start..body_end];
 
         // The targets-empty branch (`if target_result.targets.is_empty() {`)
@@ -7481,6 +4843,301 @@ mod tests {
             "#4359 MUST-FIX 1: the NeighborHosting proximity overlap path in node.rs must flush \
              the deferred broadcast (Source 1 first-viable-target signal), or a cold-id PUT whose \
              first target arrives via proximity announcement never drains."
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // #4145: blocking .send().await on event-loop-reachable channels.
+    //
+    // The behavioral tests below pin the two properties the SITE 1 fix
+    // depends on. The source-scrape pins guard against a future revert of
+    // any of the eight converted sites.
+    // ----------------------------------------------------------------------
+
+    /// SITE 1 liveness: when the event-loop bridge channel is full, the
+    /// ConnectPeer enqueue must NOT block the event loop. `try_send` on a
+    /// full bounded channel returns `Full` immediately rather than parking,
+    /// which is what lets the loop `continue` and drop the outbound attempt.
+    #[tokio::test]
+    async fn full_bridge_channel_try_send_does_not_block() {
+        // Cap 1, then fill it so the next send would block a `.send().await`.
+        let (tx, _rx) = mpsc::channel::<u32>(1);
+        tx.try_send(1).expect("first send fills the single slot");
+
+        // A blocking send would hang here forever (receiver is parked, never
+        // draining). try_send must return immediately with Full.
+        let res = timeout(Duration::from_millis(500), async { tx.try_send(2) })
+            .await
+            .expect("try_send must return immediately, never block the event loop");
+
+        match res {
+            Err(mpsc::error::TrySendError::Full(v)) => assert_eq!(v, 2),
+            other => panic!("expected TrySendError::Full, got {other:?}"),
+        }
+    }
+
+    /// SITE 1 resend-waiter safety: the waiter does `timeout(20s,
+    /// result.recv())`. If the ConnectPeer enqueue is dropped on a full
+    /// channel, the `callback` Sender (carried inside the dropped event) is
+    /// dropped too, so the waiter's `result.recv()` must observe `None`
+    /// IMMEDIATELY — never hang the full 20s on a connection that was never
+    /// requested. This reproduces the drop path: build the callback/result
+    /// pair exactly as the production code does, then drop the callback (as
+    /// dropping the TrySendError::Full(event) does) without registering it.
+    #[tokio::test]
+    async fn dropped_connect_peer_does_not_hang_resend_waiter() {
+        // Mirror the production pair: `let (callback, mut result) = mpsc::channel(10);`
+        let (callback, mut result) = mpsc::channel::<u32>(10);
+
+        // Simulate the Full path: the event (and thus `callback`) is dropped
+        // without ever being delivered to a connect op.
+        drop(callback);
+
+        // The real waiter awaits up to 20s. Bound the test well under that:
+        // if the callback drop did NOT close `result`, this recv would hang
+        // and the timeout would fire. A correct drop closes the channel so
+        // recv() resolves to None immediately.
+        let recv = timeout(Duration::from_secs(1), result.recv())
+            .await
+            .expect("result.recv() must resolve immediately when callback dropped, not hang");
+        assert!(
+            recv.is_none(),
+            "dropping the callback must close the result channel (recv -> None), \
+             so the resend-waiter short-circuits instead of waiting 20s"
+        );
+    }
+
+    /// Production source ONLY (everything before the `mod tests` block).
+    /// We deliberately do not use `strip_cfg_test_regions` here: these pins
+    /// reference the very `.send(...)` substrings they forbid, inside their
+    /// own assertion strings, so scanning the test module (whose brace-based
+    /// strip can be thrown off by `{`/`}` in earlier test string literals)
+    /// would self-trip. Slicing at the single top-level `mod tests {` is
+    /// robust and unambiguous.
+    fn production_src() -> String {
+        // The `P2pConnManager` impl is split across this module root and its
+        // `p2p_protoc/` submodules, so the source-scrape pins below must see
+        // ALL of them concatenated — otherwise a `try_send` / `send` site that
+        // moved into a submodule would silently drop out of the scan.
+        let full = include_str!("p2p_protoc.rs");
+        let cut = full
+            .find("\nmod tests {")
+            .expect("p2p_protoc.rs must have a `mod tests {` block");
+        [
+            &full[..cut],
+            include_str!("p2p_protoc/migration.rs"),
+            include_str!("p2p_protoc/broadcast.rs"),
+            include_str!("p2p_protoc/dispatch.rs"),
+            include_str!("p2p_protoc/connection_lifecycle.rs"),
+        ]
+        .join("\n")
+    }
+
+    /// Source-scrape pin: SITE 1. The ConnectPeer enqueue in the
+    /// OutboundMessageWithTarget no-connection branch must use the
+    /// non-blocking `ev_listener_tx.try_send(` — never a blocking
+    /// `.send(...).await` — or the event loop can self-deadlock (#4145).
+    #[test]
+    fn connect_peer_enqueue_is_non_blocking() {
+        let src = production_src();
+        // Anchor on the SITE-1 ConnectPeer enqueue specifically. The broader
+        // "no blocking send on a watched channel" guarantee is enforced by the
+        // CI linter (.github/scripts/check_blocking_sends.py); here we pin the
+        // SITE-1 shape and the resend-waiter ordering it depends on.
+        let try_send_at = src.find("ev_listener_tx.try_send(").expect(
+            "#4145 SITE 1: the ConnectPeer enqueue must use ev_listener_tx.try_send(), \
+             not a blocking .send().await (self-deadlock on the channel the loop drains).",
+        );
+
+        // Spawn-ordering invariant (review item 10): the resend-waiter must be
+        // spawned STRICTLY AFTER the try_send. The waiter does
+        // `timeout(20s, result.recv())`; it is sound only because on a Full
+        // enqueue we `continue` BEFORE spawning, so a dropped callback closes
+        // `result` and the waiter would short-circuit. If a future refactor
+        // spawned the waiter before (or unconditionally regardless of) the
+        // try_send, a dropped ConnectPeer would leave the waiter parked the full
+        // 20s on a connection that was never requested. We anchor on the waiter's
+        // 20s timeout, which is unique to this site.
+        let waiter_at = src[try_send_at..]
+            .find("Duration::from_secs(20)")
+            .map(|rel| try_send_at + rel)
+            .expect(
+                "#4145 SITE 1: the resend-waiter (timeout 20s) must appear AFTER the \
+                 ev_listener_tx.try_send — found it before, which risks a 20s hang on a \
+                 dropped ConnectPeer.",
+            );
+        // And the `continue` that short-circuits the Full path must sit between
+        // the try_send and the waiter spawn.
+        let between = &src[try_send_at..waiter_at];
+        assert!(
+            between.contains("continue"),
+            "#4145 SITE 1: the Full-path `continue` must short-circuit BEFORE the \
+             resend-waiter spawn, so a dropped ConnectPeer never spawns a waiter."
+        );
+    }
+
+    /// Source-scrape pin (review item 2): the four inline-on-event-loop
+    /// `P2pBridge::send` callers — both connection-establishment interest/cache
+    /// fan-out loops, plus the two unicast NodeEvent handlers — must use the
+    /// non-blocking `bridge.try_send(`, never `bridge.send(...).await`. A
+    /// blocking send there awaits the cap-512 ev_listener_tx the event loop
+    /// itself drains (#4145). The off-loop callers (`broadcast_to_peers`'
+    /// spawned task, the sim-only `broadcast_state_to_peers`) and the
+    /// op-driver/contract-task callers stay blocking and are NOT matched here.
+    #[test]
+    fn inline_bridge_sends_are_non_blocking() {
+        let src = production_src();
+        // The four converted call sites all read `self.bridge.try_send(`.
+        let converted = src.matches("self.bridge.try_send(").count();
+        assert!(
+            converted >= 4,
+            "#4145 item 2: expected at least four inline-on-loop self.bridge.try_send(...) \
+             call sites (2 fan-out loops + 2 unicast handlers), found {converted}."
+        );
+        // The blocking `self.bridge.send(...).await` form must be GONE from
+        // production (the remaining blocking bridge.send callers use the bare
+        // `bridge.send(` receiver — broadcast_to_peers' spawned task and the
+        // sim-only broadcast_state_to_peers — not `self.bridge.send(`).
+        assert!(
+            !src.contains("self.bridge.send("),
+            "#4145 item 2: a blocking self.bridge.send(...).await remains on an \
+             inline-on-event-loop path — must be self.bridge.try_send()."
+        );
+    }
+
+    /// Source-scrape pin: SITES 2-7. Every HandshakeCommand send from the
+    /// event-loop task must go through `try_send` (the bare blocking
+    /// `.send(HandshakeCommand::` shape stalls the loop, #4145). The blocking
+    /// `CommandSender::send` method was removed so it cannot be reintroduced.
+    #[test]
+    fn handshake_commands_are_non_blocking() {
+        let src = production_src();
+        assert!(
+            !src.contains(".send(HandshakeCommand::"),
+            "#4145 SITES 2-7: a blocking .send(HandshakeCommand::...).await remains — \
+             every handshake command from the event loop must use try_send()."
+        );
+        // Sanity: every place that constructs a HandshakeCommand for sending
+        // goes through try_send. The conversions plus the original zombie
+        // precedent give seven handshake try_send sites; some use the
+        // same-line `try_send(HandshakeCommand::` form and one uses the
+        // multi-line `try_send(\n    HandshakeCommand::` form, so we count
+        // both rather than pin a brittle single-form number.
+        let same_line = src.matches("try_send(HandshakeCommand::").count();
+        let multi_line = src.matches("try_send(").count().saturating_sub(same_line);
+        assert!(
+            same_line >= 6,
+            "#4145 SITES 2-7: expected at least six same-line \
+             try_send(HandshakeCommand::...) call sites, found {same_line}."
+        );
+        // The multi-line try_send( count includes the ev_listener_tx site too,
+        // so we only assert it is non-zero as a smoke check that the
+        // multi-line conversion (SITE 2 cleanup) survives.
+        assert!(
+            multi_line >= 1,
+            "#4145: expected at least one multi-line try_send( call site."
+        );
+    }
+
+    /// Behavioral test (review item 8) for the SITE 6 connect-command-drop
+    /// cleanup. When the handshake command channel is full/closed and the
+    /// `HandshakeCommand::Connect` enqueue is dropped, `connect_peer` must:
+    ///   (a) prune the in-transit connection slot — covered by the source pin
+    ///       `connect_peer_full_handshake_channel_prunes_in_transit` below,
+    ///       since the prune touches the live ring;
+    ///   (b) resolve EVERY awaiting callback with Err(()) — never park it;
+    ///   (c) drain BOTH awaiting_connection and awaiting_connection_txs;
+    ///   (d) NOT record peer backoff (local channel contention, not a remote
+    ///       failure).
+    /// This drives the extracted `fail_awaiting_connection` helper directly,
+    /// which owns (b)-(d).
+    #[tokio::test]
+    async fn connect_command_drop_fails_callbacks_without_backoff() {
+        use crate::dev_tool::Transaction;
+        use crate::transport::ExpectedInboundTracker;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let mut state = super::EventListenerState::new(ExpectedInboundTracker::empty_for_test());
+        let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 45678);
+        let tx = Transaction::new::<crate::operations::connect::ConnectMsg>();
+
+        // Two callers queued on this peer (mirrors the Occupied-entry append).
+        let (cb1, mut rx1) = mpsc::channel::<Result<(SocketAddr, Option<usize>), ()>>(1);
+        let (cb2, mut rx2) = mpsc::channel::<Result<(SocketAddr, Option<usize>), ()>>(1);
+        state.awaiting_connection.insert(
+            peer_addr,
+            vec![
+                Box::new(cb1) as Box<dyn super::ConnectResultSender>,
+                Box::new(cb2) as Box<dyn super::ConnectResultSender>,
+            ],
+        );
+        state.awaiting_connection_txs.insert(peer_addr, vec![tx]);
+
+        // Precondition: peer is NOT in backoff.
+        assert!(
+            !state.peer_backoff.is_in_backoff(peer_addr),
+            "precondition: peer must not be in backoff before the drop"
+        );
+
+        super::fail_awaiting_connection(&mut state, peer_addr, tx, false).await;
+
+        // (b) every callback resolved with Err(()), immediately (not parked).
+        let r1 = timeout(Duration::from_secs(1), rx1.recv())
+            .await
+            .expect("callback 1 must resolve immediately, not park");
+        let r2 = timeout(Duration::from_secs(1), rx2.recv())
+            .await
+            .expect("callback 2 must resolve immediately, not park");
+        assert_eq!(r1, Some(Err(())), "callback 1 must receive Err(())");
+        assert_eq!(r2, Some(Err(())), "callback 2 must receive Err(())");
+
+        // (c) both maps drained for this peer.
+        assert!(
+            !state.awaiting_connection.contains_key(&peer_addr),
+            "awaiting_connection must be drained for the peer"
+        );
+        assert!(
+            !state.awaiting_connection_txs.contains_key(&peer_addr),
+            "awaiting_connection_txs must be drained for the peer (lock-step with callbacks)"
+        );
+
+        // (d) no peer backoff recorded.
+        assert!(
+            !state.peer_backoff.is_in_backoff(peer_addr),
+            "#4145 SITE 6: a LOCAL handshake-channel-full drop must NOT record peer \
+             backoff — that would wrongly delay a legitimate retry."
+        );
+    }
+
+    /// Source pin (review item 8, invariant a): the connect-command-drop branch
+    /// in `connect_peer` must prune the in-transit connection slot, and must NOT
+    /// record peer backoff on this path. (The prune touches the live ring, so it
+    /// is verified by source-scrape rather than the behavioral test above.)
+    #[test]
+    fn connect_peer_full_handshake_channel_prunes_in_transit() {
+        let src = production_src();
+        // Locate the Connect-command try_send and bound a window over its
+        // failure branch (the `fail_awaiting_connection` call is the tail).
+        let from = src
+            .find("try_send(HandshakeCommand::Connect {")
+            .expect("connect_peer must enqueue HandshakeCommand::Connect via try_send");
+        let end = (from + 1200).min(src.len());
+        let branch = &src[from..end];
+        assert!(
+            branch.contains("prune_in_transit_connection(peer_addr)"),
+            "#4145 SITE 6: the connect-command-drop branch must prune the in-transit \
+             connection slot so the dropped attempt does not leak a reservation."
+        );
+        assert!(
+            branch.contains("fail_awaiting_connection("),
+            "#4145 SITE 6: the connect-command-drop branch must fail awaiting callbacks \
+             via fail_awaiting_connection()."
+        );
+        // Must NOT record backoff on this local-contention path.
+        assert!(
+            !branch.contains("record_failure"),
+            "#4145 SITE 6: the connect-command-drop branch must NOT record peer backoff \
+             (local channel contention is not a remote connection failure)."
         );
     }
 }

@@ -46,6 +46,55 @@ fn sandbox_csp_for_origin(origin: &str) -> String {
     )
 }
 
+/// Derive the browser-facing origin to interpolate into the sandbox CSP from
+/// the request headers, honoring a TLS-terminating reverse proxy's forwarded
+/// scheme and host.
+///
+/// The CSP origin MUST match the origin the *browser* actually used, or the
+/// CSP blocks the webapp's own assets. Behind a TLS proxy (the supported
+/// hosted-mode deployment) the browser's origin is `https://<public-host>`,
+/// while the node itself is reached over loopback `http`. We therefore:
+///
+/// - use `https` when `X-Forwarded-Proto: https` is present (set by the
+///   trusted proxy — same forwarded-header trust model as the hosted-mode
+///   token gate, which already requires the operator's proxy to set/strip
+///   `X-Forwarded-*`); otherwise `http`.
+/// - prefer `X-Forwarded-Host` over `Host` for the host:port, since a proxy
+///   may rewrite the upstream `Host` to its loopback target (nginx does this
+///   by default) while preserving the original in `X-Forwarded-Host`.
+///
+/// A direct connection carries neither forwarded header and falls back to the
+/// previous behavior: `http://<Host>`. `'self'` only as a last resort when no
+/// host is available at all.
+///
+/// Note: the forwarded headers are client-spoofable through a careless proxy,
+/// but the CSP is defence-in-depth, not a trust boundary — a mismatched origin
+/// only *breaks* the sandboxed app (too-strict CSP), it cannot widen what the
+/// opaque-origin iframe may reach. So honoring them here is safe.
+fn sandbox_origin_from_headers(headers: &axum::http::HeaderMap) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').next().unwrap_or(v).trim())
+        .filter(|v| v.eq_ignore_ascii_case("https"))
+        .map(|_| "https")
+        .unwrap_or("http");
+    headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(axum::http::header::HOST))
+        .and_then(|h| h.to_str().ok())
+        // `X-Forwarded-Host`, like `X-Forwarded-Proto`, may be a comma-separated
+        // list when the request traverses multiple proxies (or a proxy appends
+        // rather than overwrites). The first entry is the original client-facing
+        // host; using the whole list would yield an invalid CSP origin like
+        // `https://public.example, proxy.internal` and re-break the app.
+        .map(|host| host.split(',').next().unwrap_or(host).trim())
+        .filter(|host| !host.is_empty())
+        .map(|host| format!("{scheme}://{host}"))
+        .unwrap_or_else(|| "'self'".to_string())
+}
+
+pub(crate) mod hosted_export;
 mod permission_prompts;
 mod v1;
 mod v2;
@@ -100,6 +149,10 @@ pub struct HttpClientApi {
     pub(crate) origin_contracts: OriginContractMap,
     proxy_server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
+    /// Per-node route to the executor for the hosted-mode export endpoint
+    /// (P3-live of #4381). Shared (same `Arc`) with the router's `Extension`;
+    /// the node fills it at startup via `set_op_manager`.
+    export_op_manager: hosted_export::ExportOpManagerHandle,
 }
 
 impl HttpClientApi {
@@ -142,6 +195,12 @@ impl HttpClientApi {
 
         let config = Config { localhost };
 
+        // Per-node route to the executor for the hosted-mode export endpoint.
+        // The SAME handle is injected as a request `Extension` (read by the
+        // export handler) and stored in the returned `HttpClientApi` (filled by
+        // the node via `set_op_manager`).
+        let export_op_manager = hosted_export::ExportOpManagerHandle::default();
+
         let router = Router::new()
             .route("/", axum::routing::get(home_page::homepage))
             .route(
@@ -150,9 +209,16 @@ impl HttpClientApi {
             )
             .merge(v1::routes(config.clone()))
             .merge(v2::routes(config))
+            // Hosted-mode "export my data" endpoint (P3-live of #4381). Gated
+            // by the same refuse-plaintext-token check as the WS userToken; see
+            // `hosted_export`. Reaches the node via the per-node
+            // `ExportOpManagerHandle` Extension below.
+            .merge(hosted_export::routes(ApiVersion::V1))
+            .merge(hosted_export::routes(ApiVersion::V2))
             .merge(permission_prompts::routes())
             .layer(Extension(origin_contracts.clone()))
             .layer(Extension(pending_prompts))
+            .layer(Extension(export_op_manager.clone()))
             .layer(Extension(HttpClientApiRequest(proxy_request_sender)));
 
         (
@@ -160,6 +226,7 @@ impl HttpClientApi {
                 proxy_server_request: request_to_server,
                 origin_contracts,
                 response_channels: HashMap::new(),
+                export_op_manager,
             },
             router,
         )
@@ -189,6 +256,7 @@ async fn web_home(
     req_headers: axum::http::HeaderMap,
     api_version: ApiVersion,
     query_string: Option<String>,
+    hosted_mode: bool,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     // Check if this is the sandboxed iframe requesting its content
     let is_sandbox = query_string
@@ -201,7 +269,16 @@ async fn web_home(
     }
 
     // Root document load: render the shell that wraps the contract root.
-    render_shell_response(key, &config, api_version, query_string, None, rs).await
+    render_shell_response(
+        key,
+        &config,
+        api_version,
+        query_string,
+        None,
+        rs,
+        hosted_mode,
+    )
+    .await
 }
 
 /// Generates a shell page response: a fresh auth token + secure cookie,
@@ -222,6 +299,7 @@ async fn render_shell_response(
     query_string: Option<String>,
     sub_path: Option<&str>,
     rs: HttpClientApiRequest,
+    hosted_mode: bool,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     use headers::{Header, HeaderMapExt};
 
@@ -241,9 +319,16 @@ async fn render_shell_response(
         .build();
 
     let token_header = headers::Authorization::bearer(token.as_str()).unwrap();
-    let contract_response =
-        path_handlers::contract_home(key, rs, token.clone(), api_version, query_string, sub_path)
-            .await?;
+    let contract_response = path_handlers::contract_home(
+        key,
+        rs,
+        token.clone(),
+        api_version,
+        query_string,
+        sub_path,
+        hosted_mode,
+    )
+    .await?;
 
     let mut response = contract_response.into_response();
     response.headers_mut().typed_insert(token_header);
@@ -277,6 +362,26 @@ async fn render_shell_response(
     Ok(response)
 }
 
+/// Reads the `HostedMode` flag for the contract-web (shell) route, TOLERANTLY.
+///
+/// The shell route is the per-user-token *minting/UX* point, not the security
+/// gate. Unlike the WebSocket `connection_info` middleware — where a missing
+/// `Extension<HostedMode>` MUST fail loud (a dropped flag there could silently
+/// put public users on a shared Local namespace) — this route must fail SAFE to
+/// off: absent extension ⇒ `HostedMode(false)` ⇒ the shell mints no userToken ⇒
+/// unchanged (non-hosted) behavior.
+///
+/// Why tolerant: only `serve_client_api_in_impl` installs the `Extension`. The
+/// public `HttpClientApi::as_router` composition path returns a router WITHOUT
+/// it, so a required extractor here would make `/v{1,2}/contract/web/...` reject
+/// with a missing-extension 500 even for plain sandbox requests — a regression
+/// for that supported standalone composition mode. The production serve path
+/// still installs the real `Extension`, so hosted mode works there.
+fn hosted_mode_or_default(ext: Option<Extension<crate::server::HostedMode>>) -> bool {
+    ext.map(|Extension(hm)| hm.0).unwrap_or(false)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn web_subpages(
     key: String,
     last_path: String,
@@ -285,6 +390,7 @@ async fn web_subpages(
     req_headers: axum::http::HeaderMap,
     config: &Config,
     request_sender: HttpClientApiRequest,
+    hosted_mode: bool,
 ) -> Result<axum::response::Response, WebSocketApiError> {
     let is_sandbox = query_string
         .as_ref()
@@ -337,6 +443,7 @@ async fn web_subpages(
             query_string,
             Some(&last_path),
             request_sender,
+            hosted_mode,
         )
         .await;
     }
@@ -503,12 +610,10 @@ async fn serve_sandbox_response(
     let mut response = contract_response.into_response();
     add_sandbox_cors_headers(&mut response);
     // See `sandbox_csp_for_origin` for why we interpolate a concrete origin
-    // rather than using `'self'`.
-    let local_api_origin = req_headers
-        .get(axum::http::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .map(|host| format!("http://{host}"))
-        .unwrap_or_else(|| "'self'".to_string());
+    // rather than using `'self'`, and `sandbox_origin_from_headers` for why we
+    // honor the proxy's forwarded scheme/host (so the CSP matches the browser's
+    // real `https://` origin behind a TLS-terminating reverse proxy).
+    let local_api_origin = sandbox_origin_from_headers(req_headers);
     let csp = sandbox_csp_for_origin(&local_api_origin);
     if let Ok(csp_value) = axum::http::HeaderValue::from_str(&csp) {
         response
@@ -565,11 +670,13 @@ impl ClientEventsProxy for HttpClientApi {
                         req,
                         auth_token,
                         origin_contract,
+                        user_context,
                         ..
                     } => {
                         return Ok(OpenRequest::new(client_id, req)
                             .with_token(auth_token)
-                            .with_origin_contract(origin_contract));
+                            .with_origin_contract(origin_contract)
+                            .with_user_context(user_context));
                     }
                 }
             }
@@ -605,6 +712,21 @@ impl ClientEventsProxy for HttpClientApi {
         }
         .boxed()
     }
+
+    fn set_op_manager(&self, op_manager: &dyn std::any::Any) {
+        // Wire the export endpoint's per-node handle (shared with the router
+        // Extension) to the live node. See `hosted_export`. The caller passes an
+        // `Arc<OpManager>` behind `&dyn Any` to keep the `pub(crate)` `OpManager`
+        // out of the public `ClientEventsProxy` signature; downcast it here.
+        if let Some(op_manager) = op_manager.downcast_ref::<Arc<crate::node::OpManager>>() {
+            self.export_op_manager.set(op_manager);
+        } else {
+            tracing::error!(
+                "HttpClientApi::set_op_manager called with a non-OpManager argument; \
+                 hosted export will be unavailable on this node"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -628,6 +750,87 @@ mod tests {
         assert!(is_html_page("page.HTML"));
         assert!(is_html_page("page.htm"));
         assert!(is_html_page("dir/page.html"));
+    }
+
+    /// The shell-route HostedMode read must fail SAFE to off: an absent
+    /// extension maps to `false` (no userToken minted), a present one to its
+    /// real value. This is the inverse of the WS gate, which fails loud.
+    #[test]
+    fn hosted_mode_or_default_absent_is_off() {
+        assert!(
+            !hosted_mode_or_default(None),
+            "absent HostedMode extension must map to hosted-off"
+        );
+        assert!(
+            !hosted_mode_or_default(Some(Extension(crate::server::HostedMode(false)))),
+            "present HostedMode(false) must stay off"
+        );
+        assert!(
+            hosted_mode_or_default(Some(Extension(crate::server::HostedMode(true)))),
+            "present HostedMode(true) must be honored"
+        );
+    }
+
+    /// Regression (Codex re-review of #4513): the contract-web shell route must
+    /// NOT require an `Extension<HostedMode>`. Only `serve_client_api_in_impl`
+    /// installs that layer; the public `HttpClientApi::as_router` composition
+    /// path does not. A required extractor here made `/v{1,2}/contract/web/...`
+    /// reject with axum's missing-extension 500 even for plain requests — a
+    /// regression for that supported standalone composition mode.
+    ///
+    /// We drive the REAL `as_router` router (the one lacking the layer). The
+    /// returned `HttpClientApi` owns the proxy receiver; we drop it so the
+    /// shell render's `NewConnection` send fails fast (closed channel) instead
+    /// of blocking. The point is only that the request reaches the handler body
+    /// — proving the extractor tolerated the absent extension — so we assert the
+    /// response body is NOT axum's "Missing request extension" rejection.
+    #[tokio::test]
+    async fn contract_web_route_does_not_require_hosted_mode_extension() {
+        use axum::body::to_bytes;
+        use tower::ServiceExt;
+
+        // A syntactically valid contract key so routing + key parsing succeed
+        // and execution reaches the shell-render body.
+        let key = "EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr";
+
+        for uri in [
+            format!("/v1/contract/web/{key}/"),
+            format!("/v2/contract/web/{key}/"),
+        ] {
+            // `as_router` is the standalone composition path with NO HostedMode
+            // layer. EXPLICITLY drop the returned `HttpClientApi` (it owns the
+            // proxy receiver) so the handler's `NewConnection` send hits a
+            // closed channel and fails fast — otherwise the shell render would
+            // block awaiting a `NewId` reply that nothing services. A bare
+            // `_api` binding would keep the receiver alive to end-of-scope, so
+            // we `drop` it by name.
+            let (api, router) = HttpClientApi::as_router(&"127.0.0.1:0".parse().unwrap());
+            drop(api);
+
+            let req = axum::http::Request::builder()
+                .uri(&uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            // Timeout guard: if a future change makes this route block (e.g. the
+            // send no longer fails fast), surface it as a clear assertion rather
+            // than a CI hang.
+            let resp =
+                tokio::time::timeout(std::time::Duration::from_secs(10), router.oneshot(req))
+                    .await
+                    .unwrap_or_else(|_| panic!("{uri} shell route hung instead of returning"))
+                    .unwrap();
+
+            // Whatever the handler does downstream (here: a fast NodeError from
+            // the closed channel), it must NOT be axum's extractor rejection.
+            let status = resp.status();
+            let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert!(
+                !body.contains("Missing request extension"),
+                "{uri} must tolerate an absent HostedMode extension, not 500 on \
+                 the missing extractor; got status {status}, body: {body}"
+            );
+        }
     }
 
     #[test]
@@ -933,6 +1136,7 @@ mod tests {
                     headers,
                     &localhost_config(),
                     sender,
+                    false,
                 )
                 .await
                 .map(|_| ())
@@ -966,6 +1170,7 @@ mod tests {
             headers,
             &localhost_config(),
             dead_request_sender(),
+            false,
         )
         .await
         .expect("sandbox document load must redirect, not error");
@@ -985,6 +1190,7 @@ mod tests {
             axum::http::HeaderMap::new(),
             &localhost_config(),
             dead_request_sender(),
+            false,
         )
         .await;
         match res {
@@ -1045,5 +1251,83 @@ mod tests {
         let csp = sandbox_csp_for_origin("http://192.168.1.42:7509");
         assert!(csp.contains("http://192.168.1.42:7509"));
         assert!(!csp.contains("127.0.0.1"));
+    }
+
+    fn hdrs(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    /// Regression for the live-deploy bug: behind a TLS-terminating reverse
+    /// proxy the browser's origin is `https://<public-host>`, but the sandbox
+    /// CSP origin was hardcoded to `http://<Host>` — so the CSP blocked the
+    /// webapp's own `https://` assets and the app never loaded. The origin must
+    /// honor `X-Forwarded-Proto: https`.
+    #[test]
+    fn sandbox_origin_honors_forwarded_https_scheme() {
+        let origin = sandbox_origin_from_headers(&hdrs(&[
+            ("host", "127.0.0.1:7509"),
+            ("x-forwarded-proto", "https"),
+            ("x-forwarded-host", "localhost:8443"),
+        ]));
+        // https scheme + the public host the browser actually used.
+        assert_eq!(origin, "https://localhost:8443");
+        // And the resulting CSP allows that exact (https) origin.
+        let csp = sandbox_csp_for_origin(&origin);
+        assert!(csp.contains("https://localhost:8443"));
+        assert!(!csp.contains("http://localhost:8443"));
+    }
+
+    /// A proxy that preserves Host (e.g. Caddy) needs no `X-Forwarded-Host`:
+    /// the scheme still upgrades from `X-Forwarded-Proto`.
+    #[test]
+    fn sandbox_origin_forwarded_proto_without_forwarded_host_uses_host() {
+        let origin = sandbox_origin_from_headers(&hdrs(&[
+            ("host", "try.example.org"),
+            ("x-forwarded-proto", "https"),
+        ]));
+        assert_eq!(origin, "https://try.example.org");
+    }
+
+    /// A direct (no-proxy) connection is unchanged: `http://<Host>`.
+    #[test]
+    fn sandbox_origin_direct_connection_is_http_host() {
+        assert_eq!(
+            sandbox_origin_from_headers(&hdrs(&[("host", "127.0.0.1:7509")])),
+            "http://127.0.0.1:7509"
+        );
+        // Explicit `X-Forwarded-Proto: http` must NOT upgrade to https.
+        assert_eq!(
+            sandbox_origin_from_headers(&hdrs(&[
+                ("host", "127.0.0.1:7509"),
+                ("x-forwarded-proto", "http"),
+            ])),
+            "http://127.0.0.1:7509"
+        );
+    }
+
+    /// No host at all → `'self'` fallback (unchanged).
+    #[test]
+    fn sandbox_origin_no_host_falls_back_to_self() {
+        assert_eq!(sandbox_origin_from_headers(&hdrs(&[])), "'self'");
+    }
+
+    /// Multi-proxy: comma-separated `X-Forwarded-Host`/`-Proto` must use the
+    /// first (client-facing) entry, not the whole list (which is an invalid
+    /// CSP origin that would re-break the app).
+    #[test]
+    fn sandbox_origin_uses_first_of_comma_separated_forwarded_values() {
+        let origin = sandbox_origin_from_headers(&hdrs(&[
+            ("host", "127.0.0.1:7509"),
+            ("x-forwarded-proto", "https, http"),
+            ("x-forwarded-host", "public.example, proxy.internal"),
+        ]));
+        assert_eq!(origin, "https://public.example");
     }
 }

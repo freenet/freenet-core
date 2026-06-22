@@ -333,11 +333,14 @@ pub(crate) fn reclaim_evicted_contract(
             .pending_reclamation_add(key, expected_generation);
         return;
     }
-    op_manager.notify_contract_handler_fire_and_forget(
+    // Disk reclamation after hosting-cache eviction is best-effort GC —
+    // background-tier so it yields the contract loop to client/relay work (#4534).
+    op_manager.notify_contract_handler_fire_and_forget_prioritized(
         crate::contract::ContractHandlerEvent::EvictContract {
             key,
             expected_generation,
         },
+        crate::contract::Priority::Background,
     );
 }
 
@@ -512,6 +515,8 @@ pub(crate) async fn has_contract(
         } => Ok(key),
         crate::contract::ContractHandlerEvent::DelegateRequest { .. }
         | crate::contract::ContractHandlerEvent::DelegateResponse(_)
+        | crate::contract::ContractHandlerEvent::ExportUserSecrets { .. }
+        | crate::contract::ContractHandlerEvent::ExportUserSecretsResponse(_)
         | crate::contract::ContractHandlerEvent::PutQuery { .. }
         | crate::contract::ContractHandlerEvent::PutResponse { .. }
         | crate::contract::ContractHandlerEvent::GetQuery { .. }

@@ -92,7 +92,9 @@ pub(crate) mod running_average;
 pub(crate) mod small_world_rand;
 
 use crate::ring::{Connection, PeerKeyLocation};
-use crate::topology::meter::{AttributionSource, ResourceType};
+use crate::topology::meter::{
+    ATTRIBUTION_SOURCE_TTL, AttributionSource, MAX_ATTRIBUTION_SOURCES, ResourceType,
+};
 use crate::topology::rate::{Rate, RateProportion};
 use constants::*;
 use request_density_tracker::DensityMapError;
@@ -250,10 +252,14 @@ impl TopologyManager {
     ///
     /// Drops `source_creation_times` and meter entries for every
     /// `AttributionSource::Peer` whose `PeerKeyLocation` is not in `live`.
-    /// Contract/Delegate sources are untouched. Called once per maintenance
-    /// tick by the bandwidth bridge so neither `source_creation_times` (which
-    /// `extrapolated_usage` iterates every tick) nor the meter grows without
-    /// bound as peers churn (#3453 review).
+    /// Contract/Delegate sources are untouched HERE because their lifecycle
+    /// is not tied to the live-connection set; instead they (and any peer
+    /// entries that outlive a missed prune) are bounded at insertion time by
+    /// [`Self::bound_source_creation_times`], mirroring the meter's own
+    /// TTL + cap eviction. Called once per maintenance tick by the bandwidth
+    /// bridge so `source_creation_times` (which `extrapolated_usage`
+    /// iterates every tick) does not grow without bound as peers churn
+    /// (#3453 review).
     pub(crate) fn retain_peer_sources(
         &mut self,
         live: &std::collections::HashSet<PeerKeyLocation>,
@@ -262,9 +268,53 @@ impl TopologyManager {
             AttributionSource::Peer(peer) => live.contains(peer),
             // Enumerated explicitly (not `_`) so a future AttributionSource
             // variant must consciously decide its retention policy here.
+            // Non-peer sources are bounded by `bound_source_creation_times`,
+            // not by this live-set prune.
             AttributionSource::Delegate(_) | AttributionSource::Contract(_) => true,
         });
         self.meter.retain_peer_sources(live);
+    }
+
+    /// Size-bound `source_creation_times` before inserting a brand-new source.
+    ///
+    /// `source_creation_times` is keyed by `AttributionSource` — the same
+    /// externally-influenced keyspace as the meter's `attribution_meters` —
+    /// and `retain_peer_sources` only ever prunes `Peer` entries, so
+    /// Contract/Delegate sources would otherwise accumulate one entry per
+    /// distinct source ever reported (and `extrapolated_usage` iterates the
+    /// whole map every maintenance tick). Per `.claude/rules/code-style.md`
+    /// it must be size-bounded at insertion time, and per the AGENTS.md GC
+    /// rule the exemption from the live-peer prune must be time-bounded.
+    ///
+    /// Two phases, both bounded by an absolute-age threshold so no entry is
+    /// exempt from eviction indefinitely, sharing the meter's constants
+    /// since the two maps share a keyspace and lifecycle:
+    ///
+    /// 1. Drop every entry whose creation time is older than
+    ///    [`ATTRIBUTION_SOURCE_TTL`]. (`creation_time` only ever moves
+    ///    *earlier*, so age here is a strict lower bound on the entry's true
+    ///    age — never under-evicting.)
+    /// 2. If still at [`MAX_ATTRIBUTION_SOURCES`], evict the single oldest
+    ///    (lowest creation time) entry so the new source can be inserted.
+    fn bound_source_creation_times(&mut self, now: Instant) {
+        // Phase 1: TTL prune.
+        self.source_creation_times.retain(|_, creation_time| {
+            now.saturating_duration_since(*creation_time) < ATTRIBUTION_SOURCE_TTL
+        });
+
+        if self.source_creation_times.len() < MAX_ATTRIBUTION_SOURCES {
+            return;
+        }
+
+        // Phase 2: age-based eviction of the single oldest entry.
+        if let Some(oldest) = self
+            .source_creation_times
+            .iter()
+            .min_by_key(|(_, creation_time)| **creation_time)
+            .map(|(source, _)| source.clone())
+        {
+            self.source_creation_times.remove(&oldest);
+        }
     }
 
     pub(crate) fn report_resource_usage(
@@ -280,6 +330,11 @@ impl TopologyManager {
                     .insert(attribution.clone(), at_time);
             }
         } else {
+            // Bound the map BEFORE inserting a brand-new source so the cap is
+            // enforced at insertion time. Reporting against an existing
+            // source never grows the map, so this scan is skipped on the hot
+            // path (matching `Meter::report`).
+            self.bound_source_creation_times(at_time);
             self.source_creation_times
                 .insert(attribution.clone(), at_time);
         }
@@ -1149,6 +1204,77 @@ mod tests {
                 .per_second(),
             100.0
         );
+    }
+
+    fn test_limits() -> Limits {
+        Limits {
+            max_upstream_bandwidth: Rate::new_per_second(1000.0),
+            max_downstream_bandwidth: Rate::new_per_second(1000.0),
+            max_connections: 200,
+            min_connections: 5,
+        }
+    }
+
+    /// Encode a u32 into a distinct `ContractInstanceId` so we can mint more
+    /// than 256 distinct sources (a single `[byte; 32]` only yields 256).
+    fn contract_source_n(i: u32) -> AttributionSource {
+        use freenet_stdlib::prelude::ContractInstanceId;
+        let mut bytes = [0u8; 32];
+        bytes[0..4].copy_from_slice(&i.to_le_bytes());
+        AttributionSource::Contract(ContractInstanceId::new(bytes))
+    }
+
+    /// MAJOR #1 regression: `source_creation_times` must be size-bounded.
+    /// `retain_peer_sources` only prunes `Peer` entries, so without an
+    /// insertion-time bound Contract sources accumulate forever (and
+    /// `extrapolated_usage` iterates the whole map every tick). Filling past
+    /// the cap with fresh sources (TTL never fires) must hold the map at the
+    /// cap, evicting the oldest entry rather than growing.
+    #[test_log::test]
+    fn source_creation_times_bounded_by_cap() {
+        let mut topo = TopologyManager::new(test_limits());
+        let base = Instant::now();
+
+        for i in 0..MAX_ATTRIBUTION_SOURCES {
+            let at = base + Duration::from_millis(i as u64);
+            topo.report_resource_usage(
+                &contract_source_n(i as u32),
+                ResourceType::StateBytesWritten,
+                1.0,
+                at,
+            );
+        }
+        assert_eq!(topo.source_creation_times.len(), MAX_ATTRIBUTION_SOURCES);
+
+        // One more fresh source: oldest (i == 0) must be evicted, not grow.
+        let oldest = contract_source_n(0);
+        let newcomer = contract_source_n(MAX_ATTRIBUTION_SOURCES as u32);
+        let at = base + Duration::from_millis(MAX_ATTRIBUTION_SOURCES as u64);
+        topo.report_resource_usage(&newcomer, ResourceType::StateBytesWritten, 1.0, at);
+
+        assert_eq!(topo.source_creation_times.len(), MAX_ATTRIBUTION_SOURCES);
+        assert!(!topo.source_creation_times.contains_key(&oldest));
+        assert!(topo.source_creation_times.contains_key(&newcomer));
+    }
+
+    /// MAJOR #1 / combined-phase: an entry in `source_creation_times` older
+    /// than the TTL is dropped the next time a NEW source is inserted, even
+    /// when the map is nowhere near the cap.
+    #[test_log::test]
+    fn source_creation_times_ttl_evicts_stale_entry() {
+        let mut topo = TopologyManager::new(test_limits());
+        let t0 = Instant::now();
+        let stale = contract_source_n(1);
+        topo.report_resource_usage(&stale, ResourceType::StateBytesWritten, 1.0, t0);
+        assert_eq!(topo.source_creation_times.len(), 1);
+
+        let later = t0 + ATTRIBUTION_SOURCE_TTL + Duration::from_secs(1);
+        let fresh = contract_source_n(2);
+        topo.report_resource_usage(&fresh, ResourceType::StateBytesWritten, 1.0, later);
+
+        assert!(!topo.source_creation_times.contains_key(&stale));
+        assert!(topo.source_creation_times.contains_key(&fresh));
+        assert_eq!(topo.source_creation_times.len(), 1);
     }
 
     /// Regression test for the contract-hardening review (PR #4260):

@@ -46,7 +46,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Run bundle-swap E2E test
         run: bash scripts/macos-bundle-swap-e2e.sh

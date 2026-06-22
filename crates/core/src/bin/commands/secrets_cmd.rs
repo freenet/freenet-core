@@ -27,9 +27,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use chacha20poly1305::aead::{OsRng, rand_core::RngCore};
 use chrono::{DateTime, Utc};
 use freenet::dev_tool::{
-    KEK_SIZE, KekBackendKind, RestoreError, RetentionPolicy, build_backend_for, list_snapshots,
-    load_from_backend, read_backend_marker, replace_backend_marker, restore_snapshot_file,
-    snapshot_dir_for_encoded, thin_snapshots, write_backend_marker,
+    BundleKeyMaterial, ExportError, KEK_SIZE, KekBackendKind, RestoreError, RetentionPolicy,
+    SecretScope, Secrets, SecretsStore, Storage, TargetScope, UserSecretContext, build_backend_for,
+    export_bundle, import_bundle, list_snapshots, load_from_backend, read_backend_marker,
+    replace_backend_marker, restore_snapshot_file, snapshot_dir_for_encoded, thin_snapshots,
+    write_backend_marker, write_bundle_file,
 };
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -67,6 +69,21 @@ pub enum SecretsCommand {
     /// value is itself snapshotted first, so the restore is reversible.
     /// The node MUST be stopped.
     SnapshotRestore(SnapshotRestoreArgs),
+    /// Export a scope's delegate secrets into a single encrypted, portable
+    /// bundle file (P3 of #4381). Primary use: a hosted user downloading
+    /// their per-user secrets to re-import into their own peer; also backs
+    /// up a normal node's Local secrets. The node MUST be stopped.
+    ///
+    /// SECURITY: the bundle is ALWAYS encrypted at rest (passphrase- or
+    /// token-derived key). Building it requires the node to decrypt each
+    /// secret in memory, so an operator running this command observes the
+    /// plaintext during the export — inherent to the hosted model.
+    Export(ExportArgs),
+    /// Import a secrets bundle produced by `secrets export` (P3 of #4381),
+    /// re-placing each secret under its original delegate. Default target is
+    /// the single-user (Local) scope — the path a user takes when moving to
+    /// their own peer. The node MUST be stopped.
+    Import(ImportArgs),
 }
 
 #[derive(clap::Parser, Clone, Debug)]
@@ -160,6 +177,100 @@ pub struct SnapshotRestoreArgs {
     pub yes: bool,
 }
 
+#[derive(clap::Parser, Clone, Debug)]
+pub struct ExportArgs {
+    /// Path to the node's secrets directory (the on-disk secret blobs).
+    #[clap(long, value_parser)]
+    pub secrets_dir: PathBuf,
+    /// Path to the node's data directory (the ReDb `db` file with the
+    /// secrets index). This is the node's `--db-dir` (or the data dir under
+    /// which the runtime created `db`), NOT the secrets dir. Required because
+    /// the export walks the secrets index to enumerate what to gather.
+    #[clap(long, value_parser)]
+    pub db_dir: PathBuf,
+    /// Export ALL single-user (Local) secrets — the normal-node backup case.
+    /// Mutually exclusive with `--user-token`.
+    #[clap(long, conflicts_with = "user_token")]
+    pub local: bool,
+    /// Export every per-user secret for the user identified by this opaque
+    /// token (the hosted → self-host migration case). Mutually exclusive with
+    /// `--local`. Pass `--user-token` ALONE to select the user scope and source
+    /// the token safely (from `FREENET_USER_TOKEN`, else an interactive prompt),
+    /// or `--user-token <tok>` to provide it inline. WARNING: an inline value is
+    /// exposed via the process listing and shell history — prefer the env var or
+    /// the prompt.
+    #[clap(long, num_args = 0..=1, default_missing_value = "")]
+    pub user_token: Option<String>,
+    /// Encrypt the bundle under a key derived from a passphrase (Argon2id). This
+    /// is the DEFAULT key method. The passphrase is read from
+    /// `FREENET_SECRET_PASSPHRASE`, else this flag's inline value, else an
+    /// interactive hidden prompt (pass `--passphrase` alone to force the
+    /// prompt). WARNING: an inline value is exposed via the process listing and
+    /// shell history — prefer the env var or the prompt.
+    #[clap(long, num_args = 0..=1, default_missing_value = "", conflicts_with = "use_token_key")]
+    pub passphrase: Option<String>,
+    /// Encrypt the bundle under a key derived from the `--user-token` (HKDF),
+    /// so a hosted user who only has their token needs no separate passphrase.
+    /// Requires `--user-token`. Mutually exclusive with `--passphrase`.
+    #[clap(long, requires = "user_token")]
+    pub use_token_key: bool,
+    /// Output file for the encrypted bundle. Refuses to overwrite an existing
+    /// file. Written owner-only (0o600 on Unix).
+    #[clap(long, value_parser)]
+    pub out: PathBuf,
+}
+
+#[derive(clap::Parser, Clone, Debug)]
+pub struct ImportArgs {
+    /// The encrypted bundle file produced by `secrets export`.
+    #[clap(value_parser)]
+    pub bundle: PathBuf,
+    /// Path to the target node's secrets directory.
+    #[clap(long, value_parser)]
+    pub secrets_dir: PathBuf,
+    /// Path to the target node's data directory (the ReDb `db`). See the
+    /// matching `--db-dir` note on `export`.
+    #[clap(long, value_parser)]
+    pub db_dir: PathBuf,
+    /// Decrypt the bundle with a passphrase (Argon2id-keyed bundle). This is the
+    /// DEFAULT decrypt method. The passphrase is read from
+    /// `FREENET_SECRET_PASSPHRASE`, else this flag's inline value, else an
+    /// interactive hidden prompt (pass `--passphrase` alone to force the
+    /// prompt). WARNING: an inline value is exposed via the process listing and
+    /// shell history — prefer the env var or the prompt.
+    #[clap(long, num_args = 0..=1, default_missing_value = "", conflicts_with = "use_token_key")]
+    pub passphrase: Option<String>,
+    /// Decrypt the bundle with the user token instead of a passphrase (a bundle
+    /// exported with `--use-token-key`). Selects the token-decrypt method; the
+    /// token value is resolved like `--token`. Mutually exclusive with
+    /// `--passphrase`.
+    #[clap(long)]
+    pub use_token_key: bool,
+    /// The user token value for token-decrypt (used with `--use-token-key`).
+    /// Resolved from `FREENET_USER_TOKEN`, else this flag's inline value, else an
+    /// interactive prompt. WARNING: an inline value is exposed via the process
+    /// listing and shell history — prefer the env var or the prompt.
+    #[clap(long, num_args = 0..=1, default_missing_value = "", conflicts_with = "passphrase")]
+    pub token: Option<String>,
+    /// Place imported secrets at the single-user (Local) scope. This is the
+    /// DEFAULT when neither `--local` nor `--into-user` is given — it is the
+    /// path a user takes when migrating to their own peer. Mutually exclusive
+    /// with `--into-user`.
+    #[clap(long, conflicts_with = "into_user")]
+    pub local: bool,
+    /// Place imported secrets under a per-user scope keyed by this token
+    /// (round-trip / re-hosting). Mutually exclusive with `--local`. Pass
+    /// `--into-user` alone to be prompted for the token, or `--into-user <tok>`
+    /// to provide it inline (exposed via the process listing — prefer the
+    /// prompt).
+    #[clap(long, num_args = 0..=1, default_missing_value = "")]
+    pub into_user: Option<String>,
+    /// Overwrite an existing secret at the same delegate+id. Without this an
+    /// existing value is left untouched and reported as skipped.
+    #[clap(long)]
+    pub overwrite: bool,
+}
+
 pub async fn run(config: SecretsCliConfig) -> Result<()> {
     match config.command {
         SecretsCommand::KekStatus(args) => kek_status(args).await,
@@ -168,6 +279,8 @@ pub async fn run(config: SecretsCliConfig) -> Result<()> {
         SecretsCommand::KekMigrate(args) => kek_migrate(args).await,
         SecretsCommand::SnapshotList(args) => snapshot_list(args).await,
         SecretsCommand::SnapshotRestore(args) => snapshot_restore(args).await,
+        SecretsCommand::Export(args) => secrets_export(args).await,
+        SecretsCommand::Import(args) => secrets_import(args).await,
     }
 }
 
@@ -662,6 +775,315 @@ async fn snapshot_restore(args: SnapshotRestoreArgs) -> Result<()> {
         ),
         Err(RestoreError::Io(e)) => Err(anyhow::Error::new(e).context("snapshot restore failed")),
     }
+}
+
+/// Open the target node's `SecretsStore` for an export/import operation.
+///
+/// The store needs both the on-disk secrets dir (the blobs) and the ReDb
+/// `Storage` under the data dir (the index). Both are required because the
+/// export enumerates the index; the snapshot CLIs above only touch the
+/// filesystem, which is why they don't need the db dir.
+async fn open_store(
+    secrets_dir: &std::path::Path,
+    db_dir: &std::path::Path,
+) -> Result<SecretsStore> {
+    if !secrets_dir.exists() {
+        bail!("secrets dir {} does not exist", secrets_dir.display());
+    }
+    let db = Storage::new(db_dir)
+        .await
+        .with_context(|| format!("failed to open secrets index db under {}", db_dir.display()))?;
+    // Load the node's persisted `Secrets` (delegate cipher / legacy nonce) so
+    // the Local-scope legacy-decrypt fallback chain matches the running node.
+    // User-scope secrets don't use this (they derive purely from the token),
+    // and post-#4140 Local secrets derive from the node KEK; this only matters
+    // for pre-#4140 Local blobs written under the auto-persisted cipher.
+    let secrets = Secrets::load_for_secrets_dir(secrets_dir)
+        .with_context(|| format!("failed to load node secrets from {}", secrets_dir.display()))?;
+    SecretsStore::new(secrets_dir.to_path_buf(), secrets, db)
+        .map_err(|e| anyhow!("failed to open secrets store: {e}"))
+}
+
+/// Map an [`ExportError`] to an `anyhow::Error`, keeping the auth-failure case
+/// as a clear, actionable message and passing every other variant through with
+/// its own `Display`.
+fn map_export_err(e: ExportError) -> anyhow::Error {
+    if matches!(e, ExportError::AuthFailed) {
+        return anyhow!(
+            "bundle authentication failed: wrong passphrase/token, mismatched key method \
+             (passphrase vs token), or a corrupt bundle. No secrets were written."
+        );
+    }
+    anyhow::Error::new(e)
+}
+
+/// Resolve a secret input (passphrase / user token) from the safest available
+/// source, so secrets don't have to be passed on argv (where they leak via the
+/// process table and shell history).
+///
+/// Priority:
+///   1. Environment variable `env_var` (when `Some`), if set and non-empty.
+///   2. The CLI `flag` value, if provided (last-resort convenience; the caller's
+///      `--help` warns it is exposed via process listing).
+///   3. An interactive prompt, when stdin is a TTY (hidden/no-echo for
+///      passphrases). Non-interactive + no env + no flag is an error.
+///
+/// The result is `Zeroizing<String>` so it is wiped on drop. `label` names the
+/// secret in the prompt and in the not-provided error. `env_var` is `None` for
+/// inputs that have no dedicated env var (e.g. the `--into-user` target token,
+/// which would be ambiguous with the decrypt token's env var).
+///
+/// Note on ordering: env beats flag deliberately — a script that sets the env
+/// var should win over a stale flag, and it lets the unit test assert the
+/// preference without a TTY. (Both are non-interactive sources; a human at a
+/// terminal who passes neither gets the prompt.)
+fn resolve_secret(
+    flag: Option<&str>,
+    env_var: Option<&str>,
+    label: &str,
+    hidden: bool,
+) -> Result<Zeroizing<String>> {
+    use std::io::IsTerminal;
+
+    if let Some(env_var) = env_var
+        && let Some(v) = std::env::var_os(env_var)
+        && !v.is_empty()
+    {
+        let s = v
+            .into_string()
+            .map_err(|_| anyhow!("{env_var} is not valid UTF-8"))?;
+        return Ok(Zeroizing::new(s));
+    }
+
+    // A non-empty flag value is the last-resort source. An EMPTY flag value
+    // (e.g. bare `--user-token` via default_missing_value) means "flag present
+    // to select the scope, but source the value safely" — fall through to the
+    // prompt rather than using "".
+    if let Some(flag) = flag
+        && !flag.is_empty()
+    {
+        return Ok(Zeroizing::new(flag.to_string()));
+    }
+
+    if std::io::stdin().is_terminal() {
+        let prompt = format!("Enter {label}: ");
+        let value = if hidden {
+            // No-echo prompt for passphrases.
+            rpassword::prompt_password(&prompt)
+                .with_context(|| format!("failed to read {label} from the terminal"))?
+        } else {
+            use std::io::Write as _;
+            eprint!("{prompt}");
+            std::io::stderr().flush().ok();
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .with_context(|| format!("failed to read {label} from the terminal"))?;
+            line.trim_end_matches(['\r', '\n']).to_string()
+        };
+        if value.is_empty() {
+            bail!("empty {label}; aborting");
+        }
+        return Ok(Zeroizing::new(value));
+    }
+
+    let env_hint = match env_var {
+        Some(e) => format!("set {e}, "),
+        None => String::new(),
+    };
+    bail!(
+        "no {label} provided: {env_hint}pass the corresponding flag, or run interactively \
+         (stdin is not a TTY, so there is nothing to prompt)"
+    )
+}
+
+/// Environment variable names for the safe secret sources. Documented in the
+/// CLI `--help` for each flag so operators know the preferred input path.
+const ENV_PASSPHRASE: &str = "FREENET_SECRET_PASSPHRASE";
+const ENV_USER_TOKEN: &str = "FREENET_USER_TOKEN";
+
+async fn secrets_export(args: ExportArgs) -> Result<()> {
+    // Exactly one of --local / --user-token selects the source scope.
+    if !args.local && args.user_token.is_none() {
+        bail!("specify the source scope: --local (all single-user secrets) or --user-token <tok>");
+    }
+
+    // Key method: `--use-token-key` derives the bundle key from the user token
+    // (requires --user-token, enforced by clap). Otherwise the default is a
+    // passphrase, resolved below from env / flag / interactive prompt — so the
+    // operator does NOT have to pass it on argv. No "neither specified" error:
+    // absent --use-token-key we resolve a passphrase (prompting if interactive).
+
+    // Refuse to export against a non-existent node database. `Storage::new`
+    // CREATES `<db_dir>/db` if absent, so a wrong/empty --db-dir would silently
+    // open a brand-new empty index and emit a valid-looking but EMPTY bundle —
+    // the operator would think they had a backup but captured nothing. Require
+    // the db file to already exist for export (import may legitimately create a
+    // fresh db on a new peer). The "db" filename mirrors `Storage::new`.
+    let db_file = args.db_dir.join("db");
+    if !db_file.exists() {
+        bail!(
+            "no node database found at {} — is --db-dir correct and is the node initialized? \
+             (export refuses to run against a missing/empty database to avoid emitting an empty bundle)",
+            db_file.display()
+        );
+    }
+
+    let store = open_store(&args.secrets_dir, &args.db_dir).await?;
+
+    // Resolve the user token (scope selector, and bundle key when
+    // --use-token-key) from a safe source. Only needed for the user scope.
+    // `args.local` and `--user-token` are mutually exclusive (clap), so the
+    // token is resolved exactly when a user-scope export was requested.
+    let user_token: Option<Zeroizing<String>> = if args.local {
+        None
+    } else {
+        Some(resolve_secret(
+            args.user_token.as_deref(),
+            Some(ENV_USER_TOKEN),
+            "user token",
+            false,
+        )?)
+    };
+
+    // Build the source scope. For the user scope we derive a UserSecretContext
+    // from the resolved token; its `.scope()` borrows the context, so the
+    // context must outlive the export call.
+    let user_ctx = user_token
+        .as_ref()
+        .map(|t| UserSecretContext::from_token(t.as_bytes()));
+    let scope = if args.local {
+        SecretScope::Local
+    } else {
+        user_ctx
+            .as_ref()
+            .expect("user scope selected => context built")
+            .scope()
+    };
+
+    // Resolve the passphrase (only on the passphrase-key path) from a safe
+    // source, hidden-prompted if interactive. The owned buffers must outlive
+    // `export_bundle` since `BundleKeyMaterial` borrows them.
+    let passphrase: Option<Zeroizing<String>> = if args.use_token_key {
+        None
+    } else {
+        Some(resolve_secret(
+            args.passphrase.as_deref(),
+            Some(ENV_PASSPHRASE),
+            "passphrase",
+            true,
+        )?)
+    };
+    let material = if let Some(pass) = passphrase.as_ref() {
+        BundleKeyMaterial::Passphrase(pass.as_bytes())
+    } else {
+        // --use-token-key: derive the bundle key from the resolved user token.
+        BundleKeyMaterial::Token(
+            user_token
+                .as_ref()
+                .expect("--use-token-key requires --user-token")
+                .as_bytes(),
+        )
+    };
+
+    eprintln!(
+        "Note: building the bundle decrypts every secret in this node's memory. \
+         If this node is operated by someone other than you (hosted mode), they \
+         can observe the plaintext during this export. The bundle FILE is always \
+         encrypted at rest."
+    );
+
+    let bundle = export_bundle(&store, scope, &material).map_err(map_export_err)?;
+    write_bundle_file(&args.out, &bundle).map_err(|e| {
+        // Special-case the refuse-to-clobber path with a clearer message;
+        // everything else passes through with its own Display.
+        if let ExportError::Io(io) = &e
+            && io.kind() == std::io::ErrorKind::AlreadyExists
+        {
+            return anyhow!(
+                "refusing to overwrite existing file {}: choose a fresh --out path",
+                args.out.display()
+            );
+        }
+        anyhow::Error::new(e).context("failed to write bundle file")
+    })?;
+
+    println!(
+        "Wrote encrypted secrets bundle to {} ({} bytes).",
+        args.out.display(),
+        bundle.len()
+    );
+    Ok(())
+}
+
+async fn secrets_import(args: ImportArgs) -> Result<()> {
+    let bundle = fs::read(&args.bundle)
+        .with_context(|| format!("failed to read bundle file {}", args.bundle.display()))?;
+
+    let mut store = open_store(&args.secrets_dir, &args.db_dir).await?;
+
+    // Decrypt method: token-decrypt when --use-token-key, else passphrase
+    // (the default). The secret VALUE for the chosen method is resolved from a
+    // safe source (env / flag / prompt) so it need not appear on argv. The
+    // owned buffer must outlive `import_bundle` (BundleKeyMaterial borrows it).
+    let secret = if args.use_token_key {
+        resolve_secret(
+            args.token.as_deref(),
+            Some(ENV_USER_TOKEN),
+            "user token",
+            false,
+        )?
+    } else {
+        resolve_secret(
+            args.passphrase.as_deref(),
+            Some(ENV_PASSPHRASE),
+            "passphrase",
+            true,
+        )?
+    };
+    let material = if args.use_token_key {
+        BundleKeyMaterial::Token(secret.as_bytes())
+    } else {
+        BundleKeyMaterial::Passphrase(secret.as_bytes())
+    };
+
+    // Target scope: Local by default (the self-host migration path), or a
+    // per-user scope when --into-user is given. The token for the target scope
+    // is also resolved from a safe source. The owned TargetScope holds any
+    // UserSecretContext for the duration of the import.
+    let into_user_token: Option<Zeroizing<String>> = if args.into_user.is_some() {
+        // A dedicated env var would be ambiguous with the decrypt token's env
+        // var, so the target-scope token resolves from its flag or an
+        // interactive prompt only (env_var = None). Most imports use --local and
+        // skip this entirely.
+        Some(resolve_secret(
+            args.into_user.as_deref(),
+            None,
+            "target user token (--into-user)",
+            false,
+        )?)
+    } else {
+        None
+    };
+    let target = match into_user_token.as_ref() {
+        Some(tok) => TargetScope::user_from_token(tok.as_bytes()),
+        None => TargetScope::Local,
+    };
+
+    let report = import_bundle(&mut store, &bundle, &material, &target, args.overwrite)
+        .map_err(map_export_err)?;
+
+    println!("Imported {} secret(s).", report.imported);
+    if !report.skipped.is_empty() {
+        println!(
+            "Skipped {} secret(s) that already existed (re-run with --overwrite to replace):",
+            report.skipped.len()
+        );
+        for (delegate, secret) in &report.skipped {
+            println!("  delegate {delegate} secret {secret}");
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1184,6 +1606,281 @@ mod tests {
         assert_eq!(
             std::fs::read(secrets_dir.join("D").join("S")).unwrap(),
             b"suffix-one"
+        );
+    }
+
+    // ----- export / import CLI handlers -----
+
+    use freenet::dev_tool::SecretsStore as TestStore;
+    use freenet_stdlib::prelude::{Delegate, SecretsId};
+    use zeroize::Zeroizing as Zng;
+
+    /// Seed a Local-scope secret into a fresh node layout and return the
+    /// `(secrets_dir, db_dir)` paths. The seeding store (and its exclusive
+    /// ReDb lock) is dropped before returning so the CLI handler can re-open.
+    async fn seed_local_secret(
+        root: &std::path::Path,
+        delegate_code: u8,
+        secret_id: &[u8],
+        plaintext: &[u8],
+    ) -> (PathBuf, PathBuf) {
+        let secrets_dir = root.join("secrets");
+        let db_dir = root.join("data");
+        std::fs::create_dir_all(&secrets_dir).unwrap();
+        std::fs::create_dir_all(&db_dir).unwrap();
+        {
+            let db = Storage::new(&db_dir).await.unwrap();
+            let secrets = Secrets::load_for_secrets_dir(&secrets_dir).unwrap();
+            let mut store = TestStore::new(secrets_dir.clone(), secrets, db).unwrap();
+            let d = Delegate::from((&vec![delegate_code].into(), &vec![].into()));
+            let s = SecretsId::new(secret_id.to_vec());
+            store
+                .store_secret(
+                    d.key(),
+                    &s,
+                    SecretScope::Local,
+                    Zng::new(plaintext.to_vec()),
+                )
+                .unwrap();
+        }
+        (secrets_dir, db_dir)
+    }
+
+    fn export_args(
+        secrets_dir: &std::path::Path,
+        db_dir: &std::path::Path,
+        out: &std::path::Path,
+        passphrase: &str,
+    ) -> ExportArgs {
+        ExportArgs {
+            secrets_dir: secrets_dir.to_path_buf(),
+            db_dir: db_dir.to_path_buf(),
+            local: true,
+            user_token: None,
+            passphrase: Some(passphrase.to_string()),
+            use_token_key: false,
+            out: out.to_path_buf(),
+        }
+    }
+
+    fn import_args(
+        bundle: &std::path::Path,
+        secrets_dir: &std::path::Path,
+        db_dir: &std::path::Path,
+        passphrase: &str,
+    ) -> ImportArgs {
+        ImportArgs {
+            bundle: bundle.to_path_buf(),
+            secrets_dir: secrets_dir.to_path_buf(),
+            db_dir: db_dir.to_path_buf(),
+            passphrase: Some(passphrase.to_string()),
+            use_token_key: false,
+            token: None,
+            local: true,
+            into_user: None,
+            overwrite: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_export_then_import_round_trip() {
+        let src = tempfile::tempdir().unwrap();
+        let (secrets_dir, db_dir) =
+            seed_local_secret(src.path(), 1, b"cli-secret", b"cli-plaintext").await;
+        let bundle_path = src.path().join("bundle.bin");
+
+        secrets_export(export_args(&secrets_dir, &db_dir, &bundle_path, "pw"))
+            .await
+            .expect("export must succeed");
+        assert!(bundle_path.exists(), "bundle file written");
+        // Encrypted at rest: the file bytes don't contain the known plaintext.
+        let bytes = std::fs::read(&bundle_path).unwrap();
+        assert!(
+            !bytes
+                .windows(b"cli-plaintext".len())
+                .any(|w| w == b"cli-plaintext"),
+            "bundle must not contain plaintext at rest"
+        );
+
+        // Import into a fresh node.
+        let dst = tempfile::tempdir().unwrap();
+        let dst_secrets = dst.path().join("secrets");
+        let dst_db = dst.path().join("data");
+        std::fs::create_dir_all(&dst_secrets).unwrap();
+        std::fs::create_dir_all(&dst_db).unwrap();
+        secrets_import(import_args(&bundle_path, &dst_secrets, &dst_db, "pw"))
+            .await
+            .expect("import must succeed");
+
+        // Verify by reopening the destination store and reading the secret.
+        let db = Storage::new(&dst_db).await.unwrap();
+        let secrets = Secrets::load_for_secrets_dir(&dst_secrets).unwrap();
+        let store = TestStore::new(dst_secrets.clone(), secrets, db).unwrap();
+        let d = Delegate::from((&vec![1u8].into(), &vec![].into()));
+        let s = SecretsId::new(b"cli-secret".to_vec());
+        let got = store
+            .get_secret(d.key(), &s, SecretScope::Local)
+            .expect("imported secret present");
+        assert_eq!(got.to_vec(), b"cli-plaintext");
+    }
+
+    #[tokio::test]
+    async fn cli_export_refuses_to_overwrite_out() {
+        let src = tempfile::tempdir().unwrap();
+        let (secrets_dir, db_dir) = seed_local_secret(src.path(), 2, b"s", b"p").await;
+        let out = src.path().join("exists.bin");
+        std::fs::write(&out, b"prior").unwrap();
+        let err = secrets_export(export_args(&secrets_dir, &db_dir, &out, "pw"))
+            .await
+            .expect_err("must refuse to overwrite an existing --out");
+        assert!(
+            err.to_string().contains("refusing to overwrite"),
+            "got: {err}"
+        );
+        // Prior file untouched.
+        assert_eq!(std::fs::read(&out).unwrap(), b"prior");
+    }
+
+    #[tokio::test]
+    async fn cli_import_wrong_passphrase_fails_no_write() {
+        let src = tempfile::tempdir().unwrap();
+        let (secrets_dir, db_dir) = seed_local_secret(src.path(), 3, b"s", b"p").await;
+        let bundle_path = src.path().join("b.bin");
+        secrets_export(export_args(&secrets_dir, &db_dir, &bundle_path, "right"))
+            .await
+            .expect("export");
+
+        let dst = tempfile::tempdir().unwrap();
+        let dst_secrets = dst.path().join("secrets");
+        let dst_db = dst.path().join("data");
+        std::fs::create_dir_all(&dst_secrets).unwrap();
+        std::fs::create_dir_all(&dst_db).unwrap();
+        let err = secrets_import(import_args(&bundle_path, &dst_secrets, &dst_db, "wrong"))
+            .await
+            .expect_err("wrong passphrase must fail");
+        assert!(
+            err.to_string().contains("authentication failed"),
+            "got: {err}"
+        );
+
+        // Destination store has no secrets.
+        let db = Storage::new(&dst_db).await.unwrap();
+        let secrets = Secrets::load_for_secrets_dir(&dst_secrets).unwrap();
+        let store = TestStore::new(dst_secrets.clone(), secrets, db).unwrap();
+        assert!(
+            store
+                .export_scope_entries(SecretScope::Local)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_export_requires_scope_and_key() {
+        let src = tempfile::tempdir().unwrap();
+        let (secrets_dir, db_dir) = seed_local_secret(src.path(), 4, b"s", b"p").await;
+        let out = src.path().join("o.bin");
+        // No scope selected.
+        let mut a = export_args(&secrets_dir, &db_dir, &out, "pw");
+        a.local = false;
+        let err = secrets_export(a).await.expect_err("no scope must error");
+        assert!(err.to_string().contains("source scope"), "got: {err}");
+
+        // No passphrase source: the flag is None, FREENET_SECRET_PASSPHRASE is
+        // unset, and the test runner's stdin is not a TTY — so passphrase
+        // resolution must error clearly (the default key method now resolves
+        // from env/flag/prompt rather than requiring the flag).
+        // SAFETY: test-scoped env mutation; nextest per-process isolation.
+        unsafe {
+            std::env::remove_var(ENV_PASSPHRASE);
+        }
+        let mut a = export_args(&secrets_dir, &db_dir, &out, "pw");
+        a.passphrase = None;
+        let err = secrets_export(a)
+            .await
+            .expect_err("no passphrase source must error");
+        assert!(
+            err.to_string().contains("no passphrase provided"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_export_refuses_missing_db() {
+        // A --db-dir that exists but lacks the node's `db` file must NOT be
+        // silently opened as a fresh empty index (which would emit an empty
+        // bundle). Export must error clearly instead.
+        let src = tempfile::tempdir().unwrap();
+        let secrets_dir = src.path().join("secrets");
+        let db_dir = src.path().join("data"); // exists, but no `db` file inside
+        std::fs::create_dir_all(&secrets_dir).unwrap();
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let out = src.path().join("o.bin");
+
+        let err = secrets_export(export_args(&secrets_dir, &db_dir, &out, "pw"))
+            .await
+            .expect_err("missing db must error");
+        assert!(
+            err.to_string().contains("no node database found"),
+            "got: {err}"
+        );
+        // No bundle file was written.
+        assert!(
+            !out.exists(),
+            "no bundle should be written on the error path"
+        );
+    }
+
+    // ----- resolve_secret -----
+
+    #[test]
+    fn resolve_secret_prefers_env_over_flag() {
+        // Use a unique env var name so this test can't race other tests that
+        // read the production FREENET_* vars.
+        let env_name = "FREENET_TEST_RESOLVE_PREF";
+        // SAFETY: a test-private env var name not read elsewhere; set then
+        // removed within this test. nextest runs each test in its own process.
+        unsafe {
+            std::env::set_var(env_name, "from-env");
+        }
+        let got = resolve_secret(Some("from-flag"), Some(env_name), "thing", false)
+            .expect("env source must resolve");
+        assert_eq!(&*got, "from-env", "env must win over the flag");
+        // SAFETY: test-private env var name removed within this test; nextest
+        // runs each test in its own process.
+        unsafe {
+            std::env::remove_var(env_name);
+        }
+    }
+
+    #[test]
+    fn resolve_secret_falls_back_to_flag() {
+        // Env var unset (and unique to this test) → the flag value is used.
+        let env_name = "FREENET_TEST_RESOLVE_FLAG";
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var(env_name);
+        }
+        let got = resolve_secret(Some("flag-value"), Some(env_name), "thing", false)
+            .expect("flag source must resolve");
+        assert_eq!(&*got, "flag-value");
+    }
+
+    #[test]
+    fn resolve_secret_errors_when_no_source_in_non_interactive() {
+        // No env, no flag. Under `cargo test`/nextest stdin is not a TTY, so the
+        // prompt branch is skipped and this must error clearly (not hang).
+        let env_name = "FREENET_TEST_RESOLVE_MISSING";
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var(env_name);
+        }
+        let err = resolve_secret(None, Some(env_name), "passphrase", true)
+            .expect_err("no source in non-interactive mode must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no passphrase provided") && msg.contains(env_name),
+            "error should name the secret and the env var, got: {msg}"
         );
     }
 }

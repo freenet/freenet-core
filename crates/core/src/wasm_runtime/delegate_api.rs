@@ -395,6 +395,7 @@ mod tests {
                     &mut self.delegate_store,
                     depth,
                     vec![],
+                    None,
                 )
             }
         }
@@ -421,6 +422,7 @@ mod tests {
                     &mut self.delegate_store,
                     0,
                     vec![],
+                    None,
                 )
             }
         }
@@ -447,6 +449,7 @@ mod tests {
                     &mut self.delegate_store,
                     0,
                     attestations,
+                    None,
                 )
             }
         }
@@ -540,6 +543,7 @@ mod tests {
                 &mut env_holder.delegate_store,
                 0,
                 vec![],
+                None,
             )
         };
 
@@ -621,6 +625,7 @@ mod tests {
                 &mut env_holder.delegate_store,
                 0,
                 vec![],
+                None,
             )
         };
 
@@ -648,6 +653,7 @@ mod tests {
                 &mut env_holder.delegate_store,
                 0,
                 vec![],
+                None,
             )
         };
 

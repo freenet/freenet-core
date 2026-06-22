@@ -3,122 +3,36 @@
 //! Supports:
 //! - Linux: systemd user service (default) or system-wide service (--system)
 //! - macOS: launchd user agent
+//!
+//! # Module layout
+//!
+//! This module is split into focused submodules:
+//!
+//! - `log_utils` – log file rotation helpers
+//! - `single_instance` – macOS wrapper single-instance lock (flock-based)
+//! - `launch_at_login` – macOS Launch at Login, plist helpers, legacy migration
+//! - `wrapper` – process wrapper loop, state machine, log events
+//! - `purge` – data purge, doctor, process-reaping
+//! - `linux` – Linux/systemd service management
+//! - `macos` – macOS/launchd service management
+//! - `windows` – Windows registry/task service management
 
-use anyhow::{Context, Result};
+mod launch_at_login;
+mod linux;
+mod log_utils;
+mod macos;
+mod purge;
+mod single_instance;
+mod windows;
+pub mod wrapper;
+
+use anyhow::Result;
 use clap::Subcommand;
-use directories::ProjectDirs;
 use freenet::config::ConfigPaths;
-use freenet::tracing::tracer::get_log_dir;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::report::ReportCommand;
-
-/// Tail log files with automatic rotation detection.
-///
-/// Spawns `tail -f` on the latest log file, then periodically checks (every 5s)
-/// whether a newer log file has appeared. When rotation occurs (e.g., hourly
-/// tracing-appender rotation), kills the old `tail` and starts a new one on
-/// the new file.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn tail_with_rotation(log_dir: &Path, base_name: &str) -> Result<()> {
-    use std::time::Duration;
-
-    let mut current_log = find_latest_log_file(log_dir, base_name).ok_or_else(|| {
-        anyhow::anyhow!(
-            "No log files found in: {}\nMake sure the service has been installed and started.",
-            log_dir.display()
-        )
-    })?;
-
-    println!("Following logs from: {}", current_log.display());
-    println!("Press Ctrl+C to stop.\n");
-
-    loop {
-        let mut child = std::process::Command::new("tail")
-            .arg("-f")
-            .arg(&current_log)
-            .spawn()
-            .context("Failed to spawn tail")?;
-
-        // Poll for newer log files every 5 seconds
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    // tail exited (user Ctrl+C or error)
-                    std::process::exit(status.code().unwrap_or(1));
-                }
-                Ok(None) => {
-                    // tail still running, check for rotation
-                }
-                Err(e) => {
-                    drop(child.kill());
-                    drop(child.wait());
-                    anyhow::bail!("Error waiting on tail process: {e}");
-                }
-            }
-
-            std::thread::sleep(Duration::from_secs(5));
-
-            if let Some(newer_log) = find_latest_log_file(log_dir, base_name) {
-                if newer_log != current_log {
-                    println!("\n--- Log rotated to: {} ---\n", newer_log.display());
-                    drop(child.kill());
-                    drop(child.wait());
-                    current_log = newer_log;
-                    break; // break inner loop to spawn new tail
-                }
-            }
-        }
-    }
-}
-
-/// Find the latest log file in the given directory.
-/// Handles both static files (e.g., "freenet.log" from systemd) and
-/// rotated files (e.g., "freenet.2025-12-27.log" from tracing-appender).
-/// Returns the most recently modified file.
-pub(super) fn find_latest_log_file(log_dir: &Path, base_name: &str) -> Option<std::path::PathBuf> {
-    use std::fs;
-
-    let mut candidates: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
-
-    // Check for the static file (used by systemd StandardOutput)
-    let static_file = log_dir.join(format!("{base_name}.log"));
-    if static_file.exists() {
-        if let Ok(metadata) = fs::metadata(&static_file) {
-            if metadata.len() > 0 {
-                if let Ok(modified) = metadata.modified() {
-                    candidates.push((static_file, modified));
-                }
-            }
-        }
-    }
-
-    // Look for rotated files (pattern: {base_name}.YYYY-MM-DD.log)
-    if let Ok(entries) = fs::read_dir(log_dir) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            // Match pattern: {base_name}.YYYY-MM-DD.log
-            if name_str.starts_with(&format!("{base_name}."))
-                && name_str.ends_with(".log")
-                && name_str.len() > format!("{base_name}..log").len()
-            {
-                if let Ok(metadata) = entry.metadata() {
-                    if let Ok(modified) = metadata.modified() {
-                        candidates.push((entry.path(), modified));
-                    }
-                }
-            }
-        }
-    }
-
-    // Return the most recently modified file
-    candidates
-        .into_iter()
-        .max_by_key(|(_, modified)| *modified)
-        .map(|(path, _)| path)
-}
 
 #[derive(Subcommand, Debug, Clone)]
 pub enum ServiceCommand {
@@ -273,17 +187,17 @@ fn open_url_in_browser(url: &str) {
 
 /// Path of the first-run marker file, if we can determine a data directory.
 #[allow(dead_code)] // Used by the tray wrapper on Windows/macOS only
-fn first_run_marker_path() -> Option<PathBuf> {
+pub(super) fn first_run_marker_path() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join("freenet").join(".first-run-complete"))
 }
 
 #[allow(dead_code)]
-fn is_first_run_at(marker: &Path) -> bool {
+pub(super) fn is_first_run_at(marker: &Path) -> bool {
     !marker.exists()
 }
 
 #[allow(dead_code)]
-fn mark_first_run_complete_at(marker: &Path) -> std::io::Result<()> {
+pub(super) fn mark_first_run_complete_at(marker: &Path) -> std::io::Result<()> {
     if let Some(parent) = marker.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -297,12 +211,12 @@ fn mark_first_run_complete_at(marker: &Path) -> std::io::Result<()> {
 /// onboarding state. The migration is its own one-shot, tracked by its own
 /// marker, so it runs once for existing DMG users too.
 #[allow(dead_code)]
-fn legacy_migration_marker_path() -> Option<PathBuf> {
+pub(super) fn legacy_migration_marker_path() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join("freenet").join(".legacy-migration-complete"))
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn dashboard_port_is_listening() -> bool {
+pub(super) fn dashboard_port_is_listening() -> bool {
     use std::net::TcpStream;
     use std::time::Duration;
     let Ok(addr) = DASHBOARD_ADDR.parse::<std::net::SocketAddr>() else {
@@ -311,4280 +225,148 @@ fn dashboard_port_is_listening() -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(500)).is_ok()
 }
 
-// ── macOS wrapper single-instance lock ──
+// ── Platform dispatch functions ──────────────────────────────────────────────
 //
-// Problem: launchd's LAL agent fires RunAtLoad while the user's
-// open-launched wrapper is still alive, and spawns a second wrapper.
-// The backend-level single-instance guard
-// (EXIT_CODE_ALREADY_RUNNING = 43) catches the second wrapper's
-// DAEMON CHILD but by the time that exit propagates, the second
-// wrapper's tao event loop is already running on the main thread and
-// owns an NSStatusItem. Two rabbits.
-//
-// Port-based detection of "another wrapper is running" is fragile:
-//   - wrapper A's backend may be mid-crash or mid-backoff, in which
-//     case port 7509 is briefly free but wrapper A's tray is still up
-//   - `kill_stale_freenet_processes` runs early in wrapper startup
-//     and happily pkills the OTHER wrapper's live backend child,
-//     widening the race window it was meant to close
-//   - a non-Freenet squatter on port 7509 triggers a false positive
-//     with no diagnosable UX
-//
-// Solution: an advisory `flock` on a wrapper-scoped lockfile at
-// `~/Library/Caches/Freenet/wrapper.lock`, acquired in `run_wrapper`
-// BEFORE `kill_stale_freenet_processes` and BEFORE any user-visible
-// state change. Held for the wrapper's lifetime; released on process
-// exit by the kernel. If a second wrapper can't acquire, it exits
-// silently. Robust to backend state, to pkill interference, and to
-// third-party port squatters.
+// These thin wrappers dispatch to the platform-specific submodule (linux,
+// macos, windows) or the purge/wrapper submodule. They live at this module
+// level so `ServiceCommand::run` can call them without qualification, and
+// so `use super::*` in the tests block pulls them all into scope.
 
-/// Advisory single-instance guard for the macOS wrapper process. Held
-/// for the wrapper's lifetime and released automatically by the
-/// kernel on process exit.
+#[cfg(target_os = "linux")]
+fn install_service(system: bool) -> Result<()> {
+    linux::install_service(system)
+}
 #[cfg(target_os = "macos")]
-#[derive(Debug)]
-#[allow(dead_code)]
-pub(super) struct WrapperSingleInstanceLock {
-    // The File keeps the fd alive; dropping it releases the flock.
-    _file: std::fs::File,
+fn install_service(system: bool) -> Result<()> {
+    macos::install_service(system)
+}
+#[cfg(target_os = "windows")]
+fn install_service(system: bool) -> Result<()> {
+    windows::install_service(system)
 }
 
-/// Path of the wrapper lockfile if we can determine a cache directory.
-#[allow(dead_code)]
-pub(super) fn wrapper_lock_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("Freenet").join("wrapper.lock"))
+#[cfg(target_os = "linux")]
+fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> Result<()> {
+    linux::uninstall_service(system, purge, keep_data)
 }
-
-/// Outcome of attempting to acquire the wrapper single-instance lock.
-/// Extracted as a pure type so the orchestration in `run_wrapper` stays
-/// readable and the unit test can exercise every arm.
-#[derive(Debug)]
-#[allow(dead_code)]
-pub(super) enum AcquireWrapperLockOutcome {
-    /// We hold the lock; proceed with normal wrapper startup. The
-    /// caller must hold the guard for the duration of the wrapper.
-    Acquired(WrapperSingleInstanceLock),
-    /// Another wrapper already holds the lock. Exit silently.
-    AnotherWrapperRunning,
-    /// We couldn't even try (no cache dir, can't create parent, etc.).
-    /// Treat as "proceed without a lock" rather than silently exiting
-    /// the user's only way to run Freenet. On platforms where the
-    /// cache dir is always present, this is unreachable.
-    UnavailableSoProceed,
-}
-
-/// Acquire the wrapper lockfile via `flock(LOCK_EX | LOCK_NB)`.
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
-pub(super) fn acquire_wrapper_single_instance_lock() -> AcquireWrapperLockOutcome {
-    use std::os::unix::io::AsRawFd;
-    let Some(lock_path) = wrapper_lock_path() else {
-        tracing::warn!("Wrapper lock: cache directory unresolvable; proceeding without lock");
-        return AcquireWrapperLockOutcome::UnavailableSoProceed;
-    };
-    if let Some(parent) = lock_path.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
-            tracing::warn!(
-                "Wrapper lock: failed to create {}: {}; proceeding without lock",
-                parent.display(),
-                e
-            );
-            return AcquireWrapperLockOutcome::UnavailableSoProceed;
-        }
-    }
-    let file = match std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-    {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(
-                "Wrapper lock: failed to open {}: {}; proceeding without lock",
-                lock_path.display(),
-                e
-            );
-            return AcquireWrapperLockOutcome::UnavailableSoProceed;
-        }
-    };
-    // SAFETY: `file.as_raw_fd()` returns a valid fd owned by `file`,
-    // and `libc::flock` only operates on that fd. LOCK_EX | LOCK_NB
-    // is an exclusive non-blocking lock that fails fast if held by
-    // another process. The lock is released automatically when the
-    // fd closes on process exit (kernel-managed); we never need to
-    // unlock explicitly.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        AcquireWrapperLockOutcome::AnotherWrapperRunning
-    } else {
-        AcquireWrapperLockOutcome::Acquired(WrapperSingleInstanceLock { _file: file })
-    }
+fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> Result<()> {
+    macos::uninstall_service(system, purge, keep_data)
+}
+#[cfg(target_os = "windows")]
+fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> Result<()> {
+    windows::uninstall_service(system, purge, keep_data)
 }
 
-/// Non-macOS stub so `run_wrapper` compiles without cfg gates around
-/// every mention. On Linux the backend-level port guard is sufficient
-/// (no tray); on Windows the install-time wrapper detection is the
-/// analogous mechanism.
-#[cfg(not(target_os = "macos"))]
-#[allow(dead_code)]
-pub(super) fn acquire_wrapper_single_instance_lock() -> AcquireWrapperLockOutcome {
-    AcquireWrapperLockOutcome::UnavailableSoProceed
+#[cfg(target_os = "linux")]
+fn service_status(system: bool) -> Result<()> {
+    linux::service_status(system)
 }
-
-#[cfg(not(target_os = "macos"))]
-#[derive(Debug)]
-#[allow(dead_code)]
-pub(super) struct WrapperSingleInstanceLock;
-
-/// At-most-once guard for spawning the first-run dashboard opener within a
-/// single wrapper process. Without it, a wrapper that restarts its daemon
-/// child several times before the HTTP server binds (e.g. during a crash
-/// loop on initial startup) would accumulate one 30-second opener thread
-/// per relaunch, each racing to open a browser tab and write the marker.
-/// Checking a real wall-clock Instant plus polling a TCP port means we
-/// also can't reuse the per-launch marker file itself as a latch.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-static FIRST_RUN_OPENER_SPAWNED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-// ── Launch at Login (macOS) ──
-//
-// On macOS, the DMG-installed Freenet.app does not auto-start on login by
-// itself: the .app bundle is just a folder in /Applications. To match
-// the Windows-installer experience (service registers with the OS and
-// starts on boot) we write a user LaunchAgent plist that points at the
-// .app bundle's CFBundleExecutable shell wrapper and sets RunAtLoad=true.
-//
-// The presence/absence of the plist file is the single source of truth
-// for the user's preference: plist exists means launch at login enabled.
-// The tray menu's Launch at Login check item reads this state.
-//
-// Implementation uses `launchctl bootstrap gui/$UID <plist>`, which loads
-// the agent into the current GUI session and honours RunAtLoad on future
-// logins. launchctl exit status is logged via tracing::warn for diagnosis
-// but not propagated to callers; the plist is the authoritative preference.
-
-/// Identifier that also serves as the plist filename and launchd label.
-#[allow(dead_code)]
-const LAUNCH_AT_LOGIN_LABEL: &str = "org.freenet.Freenet";
-
-/// Legacy plist label written by the old `install.sh` / `freenet service
-/// install` path. We log a warning when we detect it so users know to
-/// clean up the duplicate before it races for port 7509.
-#[allow(dead_code)]
-const LEGACY_SERVICE_LAUNCHD_LABEL: &str = "org.freenet.node";
-
-/// Absolute path of the user LaunchAgent plist, if `$HOME` is resolvable.
-#[allow(dead_code)]
-fn launch_agent_plist_path() -> Option<PathBuf> {
-    launch_agent_plist_path_for(LAUNCH_AT_LOGIN_LABEL)
-}
-
-#[allow(dead_code)]
-fn launch_agent_plist_path_for(label: &str) -> Option<PathBuf> {
-    dirs::home_dir().map(|h| {
-        h.join("Library")
-            .join("LaunchAgents")
-            .join(format!("{label}.plist"))
-    })
-}
-
-#[allow(dead_code)]
-fn is_launch_at_login_enabled_at(plist: &Path) -> bool {
-    plist.exists()
-}
-
-/// If `exe` lives inside a macOS `.app` bundle, return that bundle's
-/// absolute path. Walks up the parent directories until a path segment
-/// ending in `.app` is found, or the filesystem root is reached.
-///
-/// Exposed at `pub(super)` so `update.rs` can detect bundle context for
-/// its DMG-swap auto-update path.
-#[allow(dead_code)]
-pub(super) fn macos_app_bundle_path(exe: &Path) -> Option<PathBuf> {
-    for ancestor in exe.ancestors() {
-        if ancestor
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.ends_with(".app"))
-        {
-            return Some(ancestor.to_path_buf());
-        }
-    }
-    None
-}
-
-/// The path to a `.app` bundle's CFBundleExecutable shell wrapper, by our
-/// packaging convention. See `scripts/package-macos.sh` for how this
-/// wrapper is produced: it execs the inner `freenet-bin` with the
-/// `service run-wrapper` subcommand.
-#[allow(dead_code)]
-fn macos_app_bundle_wrapper(bundle: &Path) -> PathBuf {
-    bundle.join("Contents").join("MacOS").join("Freenet")
-}
-
-/// Compute the ProgramArguments array for the user LaunchAgent. If we're
-/// running from inside an `.app` bundle, launchd should relaunch the
-/// bundle's CFBundleExecutable shell wrapper (which in turn execs
-/// `freenet-bin service run-wrapper`, entering the tray path). Otherwise
-/// (cargo-run, raw binary install, dev build) launchd needs to invoke
-/// the binary with the explicit `service run-wrapper` subcommand or it
-/// would default to `Network` mode and skip the tray entirely.
-#[allow(dead_code)]
-fn launch_agent_program_arguments(exe: &Path) -> Vec<String> {
-    match macos_app_bundle_path(exe) {
-        Some(bundle) => vec![
-            macos_app_bundle_wrapper(&bundle)
-                .to_string_lossy()
-                .into_owned(),
-        ],
-        None => vec![
-            exe.to_string_lossy().into_owned(),
-            "service".to_string(),
-            "run-wrapper".to_string(),
-        ],
-    }
-}
-
-fn xml_escape(s: &str) -> String {
-    // XML 1.0 predefined entities. Filesystem paths very rarely contain
-    // these, but launchd silently fails to load a malformed plist, so
-    // defensive escaping avoids a hard-to-diagnose "Launch at Login
-    // silently does nothing" for pathological paths.
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-/// Build the plist XML for the user LaunchAgent given explicit
-/// ProgramArguments. Pure function so the output format is unit-testable
-/// without touching the filesystem or launchctl.
-#[allow(dead_code)]
-fn launch_agent_plist_contents(program_arguments: &[String]) -> String {
-    let mut args_xml = String::new();
-    for arg in program_arguments {
-        args_xml.push_str("        <string>");
-        args_xml.push_str(&xml_escape(arg));
-        args_xml.push_str("</string>\n");
-    }
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{LAUNCH_AT_LOGIN_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-{args_xml}    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <false/>
-    <key>ProcessType</key>
-    <string>Interactive</string>
-</dict>
-</plist>
-"#
-    )
-}
-
-/// Write the plist to disk, creating `~/Library/LaunchAgents` if needed.
-/// Does NOT activate the agent with launchctl: that's the caller's job
-/// (separated so the filesystem half is unit-testable on Linux).
-#[allow(dead_code)]
-fn write_launch_agent_plist_at(plist: &Path, program_arguments: &[String]) -> std::io::Result<()> {
-    if let Some(parent) = plist.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(plist, launch_agent_plist_contents(program_arguments))
-}
-
-/// Remove the plist. Idempotent: returns Ok if the file was already gone.
-#[allow(dead_code)]
-fn remove_launch_agent_plist_at(plist: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(plist) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e),
-    }
-}
-
-/// Returns true if the on-disk plist already contains the expected
-/// leading ProgramArguments path, false otherwise (including on read
-/// error). Used for the self-heal check at wrapper startup so the
-/// plist gets rewritten after the user moves or replaces the .app.
-#[allow(dead_code)]
-fn launch_agent_plist_has_expected_leader(plist: &Path, expected_leader: &str) -> bool {
-    let escaped = format!("<string>{}</string>", xml_escape(expected_leader));
-    match std::fs::read_to_string(plist) {
-        Ok(contents) => contents.contains(&escaped),
-        Err(_) => false,
-    }
-}
-
-/// Call `launchctl bootstrap gui/$UID <plist>`. Logs non-zero exit
-/// (with stderr) via tracing::warn so silent "plist written but launchd
-/// never loaded it" breakages are diagnosable after the fact.
 #[cfg(target_os = "macos")]
-fn launchctl_bootstrap(plist: &Path) {
-    // SAFETY: libc::getuid is always safe; it returns the current user
-    // ID without touching user-provided pointers.
-    let uid = unsafe { libc::getuid() };
-    let target = format!("gui/{uid}");
-    match std::process::Command::new("launchctl")
-        .args(["bootstrap", &target])
-        .arg(plist)
-        .output()
-    {
-        Ok(o) if !o.status.success() => {
-            tracing::warn!(
-                "launchctl bootstrap {} returned {}: {}",
-                plist.display(),
-                o.status,
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                "launchctl bootstrap {} failed to spawn: {}",
-                plist.display(),
-                e
-            );
-        }
-        _ => {}
-    }
+fn service_status(system: bool) -> Result<()> {
+    macos::service_status(system)
+}
+#[cfg(target_os = "windows")]
+fn service_status(system: bool) -> Result<()> {
+    windows::service_status(system)
 }
 
+#[cfg(target_os = "linux")]
+fn start_service(system: bool) -> Result<()> {
+    linux::start_service(system)
+}
 #[cfg(target_os = "macos")]
-fn launchctl_bootout(plist: &Path) {
-    // SAFETY: libc::getuid is always safe; it returns the current user
-    // ID without touching user-provided pointers.
-    let uid = unsafe { libc::getuid() };
-    let target = format!("gui/{uid}");
-    match std::process::Command::new("launchctl")
-        .args(["bootout", &target])
-        .arg(plist)
-        .output()
-    {
-        Ok(o) if !o.status.success() => {
-            // bootout returns non-zero when the agent isn't currently
-            // loaded, which is expected when we're disabling after a
-            // previous session already exited. Log at debug, not warn.
-            tracing::debug!(
-                "launchctl bootout {} returned {}: {}",
-                plist.display(),
-                o.status,
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-        }
-        Err(e) => {
-            tracing::warn!(
-                "launchctl bootout {} failed to spawn: {}",
-                plist.display(),
-                e
-            );
-        }
-        _ => {}
-    }
+fn start_service(system: bool) -> Result<()> {
+    macos::start_service(system)
+}
+#[cfg(target_os = "windows")]
+fn start_service(system: bool) -> Result<()> {
+    windows::start_service(system)
 }
 
-#[cfg(not(target_os = "macos"))]
-#[allow(dead_code)]
-fn launchctl_bootstrap(_plist: &Path) {}
-
-#[cfg(not(target_os = "macos"))]
-#[allow(dead_code)]
-fn launchctl_bootout(_plist: &Path) {}
-
-/// Enable launch-at-login: write the plist and ask launchd to load it.
-#[allow(dead_code)]
-pub(super) fn enable_launch_at_login(executable: &Path) -> std::io::Result<()> {
-    let Some(plist) = launch_agent_plist_path() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "could not resolve home directory for launch agent path",
-        ));
-    };
-    let args = launch_agent_program_arguments(executable);
-    // If an older plist is already loaded, bootout first so bootstrap
-    // picks up any change to the executable path (e.g. user moved the
-    // .app from /Applications to ~/Applications between launches).
-    if plist.exists() {
-        launchctl_bootout(&plist);
-    }
-    write_launch_agent_plist_at(&plist, &args)?;
-    launchctl_bootstrap(&plist);
-    Ok(())
+#[cfg(target_os = "linux")]
+fn stop_service(system: bool) -> Result<()> {
+    linux::stop_service(system)
 }
-
-#[allow(dead_code)]
-pub(super) fn disable_launch_at_login() -> std::io::Result<()> {
-    let Some(plist) = launch_agent_plist_path() else {
-        return Ok(());
-    };
-    launchctl_bootout(&plist);
-    remove_launch_agent_plist_at(&plist)
-}
-
-/// User-facing query: is launch-at-login currently on?
-#[allow(dead_code)]
-pub(super) fn is_launch_at_login_enabled() -> bool {
-    launch_agent_plist_path()
-        .map(|p| is_launch_at_login_enabled_at(&p))
-        .unwrap_or(false)
-}
-
-/// Decision outcome for first-run Launch at Login registration. Pure so
-/// the decision logic can be unit-tested independently of filesystem or
-/// launchctl side-effects, per the deployment-rule pattern established
-/// earlier in this PR.
-#[derive(Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(super) enum FirstRunLaunchAtLoginAction {
-    /// User hasn't launched before and Launch at Login is disabled: enable it.
-    Register,
-    /// User hasn't launched before but Launch at Login is already enabled
-    /// (e.g. from the legacy install.sh path). Leave as-is.
-    AlreadyEnabled,
-    /// Not a first-run invocation.
-    NotFirstRun,
-}
-
-#[allow(dead_code)]
-pub(super) fn first_run_launch_at_login_action(
-    is_first_run: bool,
-    already_enabled: bool,
-) -> FirstRunLaunchAtLoginAction {
-    if !is_first_run {
-        FirstRunLaunchAtLoginAction::NotFirstRun
-    } else if already_enabled {
-        FirstRunLaunchAtLoginAction::AlreadyEnabled
-    } else {
-        FirstRunLaunchAtLoginAction::Register
-    }
-}
-
-/// Decision outcome for a user-initiated Launch at Login toggle (click
-/// on the tray menu check item). Pure function, same testability
-/// rationale as `first_run_launch_at_login_action`.
-#[derive(Debug, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(super) enum ToggleLaunchAtLoginOutcome {
-    Enable,
-    Disable,
-}
-
-#[allow(dead_code)]
-pub(super) fn toggle_launch_at_login_outcome(
-    currently_enabled: bool,
-) -> ToggleLaunchAtLoginOutcome {
-    if currently_enabled {
-        ToggleLaunchAtLoginOutcome::Disable
-    } else {
-        ToggleLaunchAtLoginOutcome::Enable
-    }
-}
-
-/// Startup self-heal: if Launch at Login is enabled but the plist points
-/// somewhere other than where we'd write it now (user moved the .app,
-/// upgraded via a new DMG install location, etc.), rewrite it. Idempotent:
-/// no-op when the plist is already current, or when Launch at Login is
-/// disabled, or when we can't figure out the expected location.
-#[allow(dead_code)]
-pub(super) fn refresh_launch_at_login_plist_if_stale() {
-    if !is_launch_at_login_enabled() {
-        return;
-    }
-    let Some(plist) = launch_agent_plist_path() else {
-        return;
-    };
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    let args = launch_agent_program_arguments(&exe);
-    let Some(leader) = args.first() else {
-        return;
-    };
-    if launch_agent_plist_has_expected_leader(&plist, leader) {
-        return;
-    }
-    tracing::info!(
-        "Refreshing stale Launch at Login plist (was pointing elsewhere, now {})",
-        leader
-    );
-    if let Err(e) = enable_launch_at_login(&exe) {
-        tracing::warn!("Failed to refresh Launch at Login plist: {}", e);
-    }
-}
-
-/// Returns true if the legacy `org.freenet.node` LaunchAgent plist
-/// exists. Used to warn users migrating from `install.sh` that they
-/// have two auto-starts racing for the same ports.
-#[allow(dead_code)]
-pub(super) fn legacy_launchd_agent_present() -> bool {
-    launch_agent_plist_path_for(LEGACY_SERVICE_LAUNCHD_LABEL)
-        .map(|p| p.exists())
-        .unwrap_or(false)
-}
-
-// ── Legacy install.sh → DMG migration (issue #3943) ──
-//
-// Users who installed Freenet via the old `install.sh` path on macOS have a
-// legacy launchd agent (`~/Library/LaunchAgents/org.freenet.node.plist`) that
-// auto-starts a legacy CLI binary on login, plus that binary somewhere on
-// disk (`~/.local/bin/freenet` by default, `/usr/local/bin/freenet`, etc.).
-//
-// When such a user installs the signed DMG, both auto-starts race for port
-// 7509 on every login: launchd respawns the legacy backend, the DMG wrapper's
-// `kill_stale_freenet_processes` pkills it, launchd respawns it again, and the
-// new wrapper's backend loses the port race and exits 43.
-//
-// On first DMG launch we migrate by removing the legacy plist (after booting
-// out its launchd agent) and the legacy CLI binaries, then letting the normal
-// first-run flow register the new `org.freenet.Freenet` agent.
-//
-// The DECISION (what to remove) is a pure function so it is unit-testable on
-// Linux CI with a mock `$HOME`; the EXECUTION (launchctl bootout, fs::remove)
-// is the macOS-only side-effecting wrapper. This split follows the
-// deployment-rule pattern (`first_run_marker_*`, `compute_menu_state`).
-
-/// A side effect the legacy-install migration should perform, in the order
-/// listed by [`legacy_install_migration_plan`]. Each variant names exactly
-/// one filesystem object so the executor can attempt them independently and
-/// fall back to a manual-cleanup warning per object (e.g. a root-owned
-/// binary the user can't `rm` without `sudo`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(super) enum LegacyMigrationStep {
-    /// Boot out the legacy launchd agent for this plist, then remove the
-    /// plist file. Bootout must precede removal so launchd stops respawning
-    /// the legacy backend before we delete its definition.
-    BootOutAndRemovePlist(PathBuf),
-    /// Remove the legacy auto-update wrapper script the plist invoked
-    /// (`freenet-service-wrapper.sh`).
-    RemoveLegacyWrapperScript(PathBuf),
-    /// Remove a legacy CLI binary that THIS legacy install owned (derived
-    /// from the legacy install's own artifacts, never a guessed location —
-    /// see [`legacy_install_migration_plan`]).
-    RemoveLegacyBinary(PathBuf),
-}
-
-/// What to do about a detected legacy install. Pure value computed by
-/// [`legacy_install_migration_plan`]; the executor turns it into side
-/// effects. `NoMigration` is its own variant (rather than an empty step
-/// list) so the caller can log "nothing to migrate" distinctly from a
-/// plan that ended up empty by accident.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(super) enum LegacyMigrationPlan {
-    /// No legacy plist present, or not a first-run invocation: do nothing.
-    NoMigration,
-    /// A legacy install was detected; perform these steps in order.
-    Migrate(Vec<LegacyMigrationStep>),
-}
-
-/// The legacy install's own artifacts, resolved from its plist and wrapper
-/// script (NOT guessed from hard-coded locations). The caller resolves these
-/// by reading the legacy plist's `ProgramArguments` and the wrapper script it
-/// points at, so the plan only ever touches files THIS legacy install owned.
-///
-/// This is the input that lets [`legacy_install_migration_plan`] stay pure:
-/// the caller does the file I/O and existence checks, the planner just decides.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(super) struct ResolvedLegacyInstall {
-    /// The wrapper script path from the plist's `ProgramArguments`, if it was
-    /// parseable AND the file exists. Removed by the migration.
-    pub wrapper_script: Option<PathBuf>,
-    /// Legacy CLI binaries that exist AND were referenced by the legacy
-    /// install (the binary embedded in the wrapper script, plus its sibling
-    /// `fdev`). Empty when the wrapper couldn't be read/parsed.
-    pub binaries: Vec<PathBuf>,
-}
-
-/// Decide how to migrate a pre-existing `install.sh` legacy install. PURE:
-/// takes the relevant filesystem state as inputs and returns a plan, with no
-/// side effects, so it can be unit-tested on any platform with a mock `$HOME`.
-///
-/// Arguments:
-/// - `migration_already_done`: whether the dedicated legacy-migration marker
-///   is present (we already migrated on a previous launch). This is NOT the
-///   onboarding first-run marker: a user who already launched a DMG before
-///   this migration shipped has the first-run marker set but may still have
-///   the racing legacy agent, so gating on first-run would skip exactly the
-///   users who need the migration (Codex P1 on PR #4448). The migration is
-///   its own one-shot tracked by its own marker.
-/// - `legacy_plist`: the legacy plist path and whether it currently exists.
-///   `None` means `$HOME` was unresolvable (no migration possible).
-/// - `resolved`: the legacy install's OWN artifacts (wrapper script + the
-///   binaries it referenced), already resolved and existence-filtered by the
-///   caller. We deliberately do NOT remove binaries from guessed locations:
-///   a user may have an unrelated `freenet`/`fdev` (Homebrew, cargo, manual)
-///   in `/usr/local/bin` or `~/bin` while the legacy service used
-///   `~/.local/bin`, and deleting that unrelated binary would be a
-///   destructive side effect beyond fixing the launchd race (Codex P2 on
-///   PR #4448). Targeting only the legacy install's own artifacts avoids that.
-///
-/// Returns `NoMigration` unless the migration hasn't been done yet AND the
-/// legacy plist exists. We anchor migration on the plist (not on a stray
-/// binary) because the plist is the thing that actively races for the port on
-/// login; a lone legacy binary with no auto-start agent is harmless and left
-/// alone.
-#[allow(dead_code)]
-pub(super) fn legacy_install_migration_plan(
-    migration_already_done: bool,
-    legacy_plist: Option<(PathBuf, bool)>,
-    resolved: &ResolvedLegacyInstall,
-) -> LegacyMigrationPlan {
-    if migration_already_done {
-        return LegacyMigrationPlan::NoMigration;
-    }
-    let Some((plist_path, plist_exists)) = legacy_plist else {
-        return LegacyMigrationPlan::NoMigration;
-    };
-    if !plist_exists {
-        return LegacyMigrationPlan::NoMigration;
-    }
-
-    let mut steps = Vec::with_capacity(2 + resolved.binaries.len());
-    // Bootout + plist removal first: stop launchd respawning the legacy
-    // backend before anything else.
-    steps.push(LegacyMigrationStep::BootOutAndRemovePlist(plist_path));
-    if let Some(wrapper) = &resolved.wrapper_script {
-        steps.push(LegacyMigrationStep::RemoveLegacyWrapperScript(
-            wrapper.clone(),
-        ));
-    }
-    for bin in &resolved.binaries {
-        steps.push(LegacyMigrationStep::RemoveLegacyBinary(bin.clone()));
-    }
-    LegacyMigrationPlan::Migrate(steps)
-}
-
-/// Extract the first `ProgramArguments` entry from a launchd plist's XML.
-/// For the legacy `org.freenet.node` plist this is the auto-update wrapper
-/// script path (`~/.local/bin/freenet-service-wrapper.sh`); see
-/// [`generate_plist`]. Pure string parsing so it is unit-testable: the legacy
-/// plist's exact shape is asserted in the tests against [`generate_plist`]'s
-/// own output, so a format drift trips CI.
-///
-/// Returns `None` if the plist has no `ProgramArguments` array or no
-/// `<string>` inside it (a hand-edited or unexpected plist) — in which case
-/// the caller falls back to removing only the plist itself.
-#[allow(dead_code)]
-pub(super) fn legacy_program_path_from_plist(plist_xml: &str) -> Option<PathBuf> {
-    // Find the ProgramArguments array, then the first <string>…</string>.
-    let after_key = plist_xml.split("<key>ProgramArguments</key>").nth(1)?;
-    let array = after_key.split("<array>").nth(1)?;
-    let array = array.split("</array>").next()?;
-    let start = array.find("<string>")? + "<string>".len();
-    let end = array[start..].find("</string>")? + start;
-    let raw = array[start..end].trim();
-    if raw.is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(xml_unescape(raw)))
-}
-
-/// Extract the freenet binary path embedded in a legacy auto-update wrapper
-/// script. [`generate_wrapper_script`] writes the binary as `"{binary}" network`
-/// / `"{binary}" update` lines; we recover it from the `network` invocation.
-/// Pure string parsing, unit-tested against [`generate_wrapper_script`]'s own
-/// output so a format drift trips CI.
-///
-/// Returns `None` if the expected invocation line isn't found (e.g. a
-/// hand-written wrapper), in which case the caller removes only the wrapper
-/// script and plist, not a guessed binary.
-#[allow(dead_code)]
-pub(super) fn legacy_binary_path_from_wrapper(wrapper_sh: &str) -> Option<PathBuf> {
-    // Match the `"<binary>" network …` launch line. The path is quoted so an
-    // install path containing spaces survives.
-    for line in wrapper_sh.lines() {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with('"') {
-            continue;
-        }
-        let rest = &trimmed[1..];
-        let Some(close) = rest.find('"') else {
-            continue;
-        };
-        let path = &rest[..close];
-        let after = rest[close + 1..].trim_start();
-        if after.starts_with("network") && !path.is_empty() {
-            return Some(PathBuf::from(path));
-        }
-    }
-    None
-}
-
-/// Basename of the auto-update wrapper script `freenet service install`
-/// writes (see [`wrapper_script_path`]). The migration only treats a plist's
-/// `ProgramArguments` target as a removable Freenet wrapper if it has this
-/// exact filename.
-const LEGACY_WRAPPER_SCRIPT_NAME: &str = "freenet-service-wrapper.sh";
-
-/// Distinctive header line [`generate_wrapper_script`] writes at the top of
-/// every wrapper. Used as a content signature so we never delete a
-/// hand-written or repurposed script that merely happens to be referenced by
-/// an `org.freenet.node` plist.
-const LEGACY_WRAPPER_SIGNATURE: &str = "# Freenet service wrapper for auto-update support.";
-
-/// Returns true if `(basename, contents)` look like a Freenet-generated
-/// auto-update wrapper script — i.e. it is safe for the migration to delete.
-/// PURE so the guard is unit-testable. We require BOTH the canonical filename
-/// AND the generated header signature, so a user who repurposed the legacy
-/// `org.freenet.node` label to launch an unrelated script does NOT have that
-/// script deleted (Codex P2, round 4 on PR #4448).
-#[allow(dead_code)]
-pub(super) fn is_legacy_freenet_wrapper(basename: Option<&str>, contents: &str) -> bool {
-    basename == Some(LEGACY_WRAPPER_SCRIPT_NAME) && contents.contains(LEGACY_WRAPPER_SIGNATURE)
-}
-
-/// Reverse of [`xml_escape`] for the entity set that function emits. Used to
-/// recover a real filesystem path from a plist `<string>` (e.g. a path with
-/// `&amp;` in it).
-#[allow(dead_code)]
-fn xml_unescape(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        // &amp; must be last so we don't double-decode the others.
-        .replace("&amp;", "&")
-}
-
-/// Execute a [`LegacyMigrationPlan`] on macOS. Best-effort and idempotent:
-/// each step is attempted independently and a failure (e.g. a root-owned
-/// binary the user can't `rm` without `sudo`) logs a manual-cleanup hint
-/// rather than aborting the whole migration or failing wrapper startup.
-///
-/// Returns `true` if a migration was attempted (so the caller knows the
-/// legacy plist is gone and the normal first-run agent registration should
-/// proceed), `false` if there was nothing to migrate.
 #[cfg(target_os = "macos")]
-fn run_legacy_install_migration(log_dir: &Path, plan: &LegacyMigrationPlan) -> bool {
-    let LegacyMigrationPlan::Migrate(steps) = plan else {
-        return false;
-    };
-    log_wrapper_event(
-        log_dir,
-        "Legacy install.sh install detected on first DMG launch; migrating to \
-         the DMG-managed launch agent (issue #3943).",
-    );
-    for step in steps {
-        match step {
-            LegacyMigrationStep::BootOutAndRemovePlist(plist) => {
-                // Bootout first so launchd stops auto-respawning the legacy
-                // backend; bootout is a no-op/non-fatal if not loaded.
-                launchctl_bootout(plist);
-                match remove_launch_agent_plist_at(plist) {
-                    Ok(()) => log_wrapper_event(
-                        log_dir,
-                        &format!("Migration: removed legacy launch agent {}", plist.display()),
-                    ),
-                    Err(e) => log_wrapper_event(
-                        log_dir,
-                        &format!(
-                            "Migration: could not remove legacy launch agent {} ({e}). \
-                             Please remove it manually: rm {}",
-                            plist.display(),
-                            plist.display()
-                        ),
-                    ),
-                }
-            }
-            LegacyMigrationStep::RemoveLegacyWrapperScript(wrapper) => {
-                remove_legacy_file(log_dir, "legacy wrapper script", wrapper);
-            }
-            LegacyMigrationStep::RemoveLegacyBinary(bin) => {
-                remove_legacy_file(log_dir, "legacy CLI binary", bin);
-            }
-        }
-    }
-    true
+fn stop_service(system: bool) -> Result<()> {
+    macos::stop_service(system)
+}
+#[cfg(target_os = "windows")]
+fn stop_service(system: bool) -> Result<()> {
+    windows::stop_service(system)
 }
 
-/// Remove a single legacy file as part of the migration, logging the outcome.
-/// Idempotent: a missing file is a no-op (it raced away between the caller's
-/// existence check and now). A permission failure (e.g. a root-owned binary
-/// the user can't `rm` without `sudo`) logs a manual-cleanup hint rather than
-/// failing the migration.
+#[cfg(target_os = "linux")]
+fn restart_service(system: bool) -> Result<()> {
+    linux::restart_service(system)
+}
 #[cfg(target_os = "macos")]
-fn remove_legacy_file(log_dir: &Path, kind: &str, path: &Path) {
-    match std::fs::remove_file(path) {
-        Ok(()) => log_wrapper_event(
-            log_dir,
-            &format!("Migration: removed {kind} {}", path.display()),
-        ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Raced away between the existence check and now; fine.
-        }
-        Err(e) => log_wrapper_event(
-            log_dir,
-            &format!(
-                "Migration: could not remove {kind} {} ({e}). \
-                 If it persists, remove it manually: sudo rm {}",
-                path.display(),
-                path.display()
-            ),
-        ),
-    }
+fn restart_service(system: bool) -> Result<()> {
+    macos::restart_service(system)
+}
+#[cfg(target_os = "windows")]
+fn restart_service(system: bool) -> Result<()> {
+    windows::restart_service(system)
 }
 
-/// Resolve a legacy install's own artifacts by reading its plist and the
-/// wrapper script the plist invokes. Side-effecting (file I/O) but does NOT
-/// mutate anything; the pure decision still lives in
-/// [`legacy_install_migration_plan`]. Only artifacts that exist on disk are
-/// returned, so the planner's output matches what is actually present.
-///
-/// We deliberately derive the binary from the wrapper script rather than
-/// guessing install locations, so we never remove an unrelated user-installed
-/// `freenet`/`fdev` (Codex P2, round 1 on PR #4448). We also VALIDATE that the
-/// referenced script is actually a Freenet-generated wrapper (canonical
-/// filename + header signature) before scheduling it — or its binary — for
-/// removal, so a hand-edited or repurposed `org.freenet.node` plist pointing
-/// at an unrelated script cannot cause that script/binary to be deleted
-/// (Codex P2, round 4).
+#[cfg(target_os = "linux")]
+fn service_logs(error_only: bool) -> Result<()> {
+    linux::service_logs(error_only)
+}
 #[cfg(target_os = "macos")]
-fn resolve_legacy_install(legacy_plist: &Path) -> ResolvedLegacyInstall {
-    let Ok(plist_xml) = std::fs::read_to_string(legacy_plist) else {
-        return ResolvedLegacyInstall::default();
-    };
-    let Some(wrapper_path) = legacy_program_path_from_plist(&plist_xml) else {
-        return ResolvedLegacyInstall::default();
-    };
-
-    // Only act on the wrapper if it is genuinely a Freenet-generated script.
-    // If we can't read it, or it doesn't look like ours, remove nothing here
-    // (the caller still removes the plist itself, which is the race cause).
-    let Ok(wrapper_sh) = std::fs::read_to_string(&wrapper_path) else {
-        return ResolvedLegacyInstall::default();
-    };
-    let basename = wrapper_path.file_name().and_then(|n| n.to_str());
-    if !is_legacy_freenet_wrapper(basename, &wrapper_sh) {
-        return ResolvedLegacyInstall::default();
-    }
-
-    // The plist's ProgramArguments points at the auto-update wrapper script,
-    // not the binary directly (see `generate_plist`). Recover the binary from
-    // the wrapper, then offer its sibling `fdev` too (install.sh ships both).
-    // Constrain to the canonical `freenet`/`fdev` basenames as a second guard.
-    let mut binaries = Vec::new();
-    if let Some(bin) = legacy_binary_path_from_wrapper(&wrapper_sh) {
-        if bin.file_name().and_then(|n| n.to_str()) == Some("freenet") && bin.exists() {
-            if let Some(dir) = bin.parent() {
-                let fdev = dir.join("fdev");
-                if fdev.exists() {
-                    binaries.push(fdev);
-                }
-            }
-            binaries.push(bin);
-        }
-    }
-
-    ResolvedLegacyInstall {
-        wrapper_script: wrapper_path.exists().then_some(wrapper_path),
-        binaries,
-    }
+fn service_logs(error_only: bool) -> Result<()> {
+    macos::service_logs(error_only)
+}
+#[cfg(target_os = "windows")]
+fn service_logs(error_only: bool) -> Result<()> {
+    windows::service_logs(error_only)
 }
 
-/// Run all the macOS-only Launch-at-Login housekeeping that must happen
-/// before the tray is built. Specifically:
-///
-/// - On first wrapper launch, register a user LaunchAgent so Freenet
-///   auto-starts on future logins (Windows-parity auto-start).
-/// - On every subsequent launch, if the user had previously enabled
-///   Launch at Login but the plist's embedded executable path no longer
-///   matches the current one (user moved the .app, upgraded via a new
-///   DMG installed elsewhere, etc.), rewrite it.
-/// - If a legacy `org.freenet.node` LaunchAgent from the install.sh era is
-///   present, migrate away from it (issue #3943): boot it out, remove its
-///   plist + wrapper + the binaries that install owned, then register our own
-///   agent. If migration can't remove the legacy plist (rare), fall back to
-///   logging a prominent manual-cleanup warning so the user knows the two
-///   agents race for port 7509.
-///
-/// Called synchronously (not from the wrapper thread) so the tray's
-/// Launch-at-Login check item reads the final filesystem state when
-/// `TrayState::new` consults it. Previously the first-run registration
-/// lived inside `run_wrapper_loop`, which ran on a background thread
-/// AFTER the tray was built, so the menu item shipped stale-unchecked
-/// on first launch even though Launch at Login had been enabled.
-#[cfg(target_os = "macos")]
-pub(super) fn macos_launch_at_login_startup(log_dir: &Path) {
-    // Resolve the onboarding first-run marker up front: the auto-register
-    // decision below uses it. (The legacy migration is gated on its OWN marker,
-    // not this one — see below.)
-    let Some(marker) = first_run_marker_path() else {
-        return;
-    };
-    let is_first_run = is_first_run_at(&marker);
-
-    // Legacy-install migration (issue #3943). If a pre-existing install.sh
-    // launch agent is present, boot it out, remove its plist + auto-update
-    // wrapper script, and remove the CLI binaries THAT legacy install owned,
-    // so the two installs stop racing for port 7509. We resolve the legacy
-    // install's own artifacts from its plist and wrapper (never guessed
-    // locations) so we don't delete an unrelated `freenet`/`fdev` a user
-    // installed separately. The decision is computed by the pure
-    // `legacy_install_migration_plan` so it is unit-testable on Linux.
-    //
-    // Gated on a DEDICATED migration marker, NOT the onboarding first-run
-    // marker: existing DMG users have the first-run marker set but may still
-    // have the racing legacy agent, and must still get migrated (Codex P1).
-    let migration_done = legacy_migration_marker_path()
-        .map(|m| m.exists())
-        .unwrap_or(false);
-    let legacy_plist_path = launch_agent_plist_path_for(LEGACY_SERVICE_LAUNCHD_LABEL);
-    let legacy_present = legacy_plist_path
-        .as_ref()
-        .map(|p| p.exists())
-        .unwrap_or(false);
-    let resolved = legacy_plist_path
-        .as_ref()
-        .filter(|_| !migration_done && legacy_present)
-        .map(|p| resolve_legacy_install(p))
-        .unwrap_or_default();
-    let legacy_plist = legacy_plist_path.map(|p| (p, legacy_present));
-    let plan = legacy_install_migration_plan(migration_done, legacy_plist, &resolved);
-    let migrated = run_legacy_install_migration(log_dir, &plan);
-
-    // Re-evaluate legacy presence after migration: a successful migration
-    // removed the legacy plist.
-    let legacy_present = if migrated {
-        legacy_launchd_agent_present()
-    } else {
-        legacy_present
-    };
-
-    // If we migrated an existing user who had no DMG agent of their own (the
-    // pre-migration code treated the legacy plist as already-enabled, so an
-    // already-onboarded user never got ours), register the replacement NOW —
-    // in the same launch as the migration — so they aren't left with Launch
-    // at Login silently off (Codex P2, round 2).
-    //
-    // This is intentionally a ONE-SHOT tied to the migrating launch, NOT a
-    // durable "re-register whenever our plist is absent" rule: once the
-    // migration marker is written (below), a migrated user who later DISABLES
-    // Launch at Login via the tray must keep it disabled — we must not
-    // recreate the plist against their explicit choice (Codex P2, round 5).
-    let migrated_off_legacy = migrated && !legacy_present;
-    if migrated_off_legacy && !is_launch_at_login_enabled() {
-        match std::env::current_exe() {
-            Ok(exe) => match enable_launch_at_login(&exe) {
-                Ok(()) => log_wrapper_event(
-                    log_dir,
-                    "Migration: registered replacement Launch at Login agent",
-                ),
-                Err(e) => log_wrapper_event(
-                    log_dir,
-                    &format!(
-                        "Migration: replacement Launch at Login registration failed ({e}). \
-                         Enable it from the Freenet tray menu if you want auto-start on login."
-                    ),
-                ),
-            },
-            Err(e) => log_wrapper_event(
-                log_dir,
-                &format!("Migration: could not resolve current exe for replacement agent: {e}"),
-            ),
-        }
-    }
-
-    // Mark the migration done ONLY once the legacy plist is actually gone, so
-    // a launch where plist removal was denied (rare; the plist is user-owned)
-    // retries next time rather than giving up permanently. The marker means
-    // "the legacy race is resolved": once written we never auto-manage Launch
-    // at Login off the migration path again, so a later user disable sticks
-    // (Codex P2, round 5).
-    if migrated && !legacy_present {
-        if let Some(m) = legacy_migration_marker_path() {
-            if let Err(e) = mark_first_run_complete_at(&m) {
-                log_wrapper_event(
-                    log_dir,
-                    &format!(
-                        "Migration: failed to write migration marker {}: {e}",
-                        m.display()
-                    ),
-                );
-            }
-        }
-    }
-
-    // Legacy-agent warning: if the legacy plist is STILL present (we either
-    // didn't migrate this launch, or removal was denied), warn the user.
-    // Treating the legacy plist's presence as "already enabled" below avoids
-    // layering a second auto-start on top of one we couldn't remove.
-    if legacy_present {
-        log_wrapper_event(
-            log_dir,
-            "Legacy launchd agent ~/Library/LaunchAgents/org.freenet.node.plist \
-             detected. Freenet is already configured to auto-start via that \
-             agent; the new DMG install will NOT create a duplicate agent. \
-             To clean up the legacy one when convenient: launchctl bootout \
-             gui/$UID ~/Library/LaunchAgents/org.freenet.node.plist && rm \
-             ~/Library/LaunchAgents/org.freenet.node.plist",
-        );
-    }
-
-    // First-run onboarding auto-register: register unless something already
-    // auto-starts Freenet (our own plist, or a legacy plist we couldn't
-    // remove). The post-migration replacement registration is handled above;
-    // here we only handle genuine first-run and the stale-plist self-heal.
-    let already_enabled = is_launch_at_login_enabled() || legacy_present;
-    match first_run_launch_at_login_action(is_first_run, already_enabled) {
-        FirstRunLaunchAtLoginAction::Register => match std::env::current_exe() {
-            Ok(exe) => match enable_launch_at_login(&exe) {
-                Ok(()) => log_wrapper_event(log_dir, "First-run: registered Launch at Login agent"),
-                Err(e) => log_wrapper_event(
-                    log_dir,
-                    &format!("First-run Launch at Login registration failed: {e}"),
-                ),
-            },
-            Err(e) => log_wrapper_event(
-                log_dir,
-                &format!("First-run Launch at Login: could not resolve current exe: {e}"),
-            ),
-        },
-        FirstRunLaunchAtLoginAction::AlreadyEnabled | FirstRunLaunchAtLoginAction::NotFirstRun => {
-            // Nothing to register; if our OWN plist is present it may be stale
-            // (user moved the .app, new DMG location). Refresh it. Don't
-            // resurrect a rewrite cycle on a legacy-only install (own plist
-            // absent), and don't fight a user who deliberately disabled it.
-            if is_launch_at_login_enabled() {
-                refresh_launch_at_login_plist_if_stale();
-            }
-        }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-#[allow(dead_code)]
-pub(super) fn macos_launch_at_login_startup(_log_dir: &Path) {}
-
-/// Spawn a short-lived thread that waits for the dashboard HTTP server to
-/// come up, then opens it in the browser and writes the first-run marker.
-/// The thread gives up after a generous timeout. If the daemon is crashing
-/// repeatedly we'd rather skip first-run and retry next launch than open
-/// a "connection refused" page in the user's browser.
-///
-/// Caller is responsible for gating on `FIRST_RUN_OPENER_SPAWNED` so we
-/// don't start more than one opener per process lifetime.
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-fn spawn_first_run_dashboard_opener(log_dir: &Path) {
-    // Import locally so we use the unqualified `Instant::now()` form. Wall-
-    // clock time is correct here: this is tray/CLI onboarding, not sim-
-    // reachable core code, and the deadline is about what the user's
-    // patience will tolerate. See `crates/core/src/bin/freenet.rs` for
-    // similar bin-side wall-clock usage.
-    use std::time::{Duration, Instant};
-
-    let log_dir = log_dir.to_path_buf();
-    std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while Instant::now() < deadline {
-            if dashboard_port_is_listening() {
-                open_url_in_browser(DASHBOARD_URL);
-                if let Some(marker) = first_run_marker_path() {
-                    match mark_first_run_complete_at(&marker) {
-                        Ok(()) => {
-                            log_wrapper_event(&log_dir, "First-run onboarding: dashboard opened")
-                        }
-                        Err(e) => log_wrapper_event(
-                            &log_dir,
-                            &format!("Failed to write first-run marker: {e}"),
-                        ),
-                    }
-                }
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        log_wrapper_event(
-            &log_dir,
-            "First-run dashboard open skipped: dashboard never became reachable",
-        );
-    });
-}
-
-/// State for the wrapper backoff state machine.
-#[derive(Debug, Clone)]
-struct WrapperState {
-    backoff_secs: u64,
-    consecutive_failures: u32,
-    port_conflict_kills: u32,
-}
-
-impl WrapperState {
-    fn new() -> Self {
-        Self {
-            backoff_secs: WRAPPER_INITIAL_BACKOFF_SECS,
-            consecutive_failures: 0,
-            port_conflict_kills: 0,
-        }
-    }
-}
-
-/// Action the wrapper should take after the child process exits.
-#[derive(Debug, PartialEq)]
-enum WrapperAction {
-    /// Run update, then relaunch.
-    Update,
-    /// Exit the wrapper cleanly.
-    Exit,
-    /// Kill stale processes and retry immediately.
-    KillAndRetry,
-    /// Wait (with jitter) then relaunch.
-    BackoffAndRelaunch { secs: u64 },
-}
-
-/// Pure function: given current state and exit info, determine the next action
-/// and update the state. Testable without spawning processes.
-fn next_wrapper_action(
-    state: &mut WrapperState,
-    exit_code: i32,
-    is_port_conflict: bool,
-    update_succeeded: Option<bool>, // None if not an update exit code
-) -> WrapperAction {
-    match exit_code {
-        code if code == WRAPPER_EXIT_UPDATE_NEEDED => {
-            match update_succeeded {
-                Some(true) => {
-                    state.consecutive_failures = 0;
-                    state.port_conflict_kills = 0;
-                    state.backoff_secs = WRAPPER_INITIAL_BACKOFF_SECS;
-                    WrapperAction::Update
-                }
-                Some(false) => {
-                    state.consecutive_failures += 1;
-                    let secs = state.backoff_secs;
-                    state.backoff_secs = (state.backoff_secs * 2).min(WRAPPER_MAX_BACKOFF_SECS);
-                    WrapperAction::BackoffAndRelaunch { secs }
-                }
-                None => WrapperAction::Update, // Will be called again with result
-            }
-        }
-        code if code == WRAPPER_EXIT_ALREADY_RUNNING => WrapperAction::Exit,
-        0 => WrapperAction::Exit,
-        _ => {
-            if is_port_conflict {
-                state.port_conflict_kills += 1;
-                if state.port_conflict_kills <= WRAPPER_MAX_PORT_CONFLICT_KILLS {
-                    state.backoff_secs = WRAPPER_INITIAL_BACKOFF_SECS;
-                    return WrapperAction::KillAndRetry;
-                }
-                // Fall through to normal crash backoff
-            }
-            state.consecutive_failures += 1;
-            state.port_conflict_kills = 0;
-            let secs = state.backoff_secs;
-            state.backoff_secs = (state.backoff_secs * 2).min(WRAPPER_MAX_BACKOFF_SECS);
-            WrapperAction::BackoffAndRelaunch { secs }
-        }
-    }
-}
-
-/// Compute a jittered duration: `secs` ±20%.
-fn jitter_secs(secs: u64) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    std::time::SystemTime::now().hash(&mut hasher);
-    let hash = hasher.finish();
-    let factor = 0.8 + (hash % 1000) as f64 / 2500.0;
-    (secs as f64 * factor) as u64
-}
-
-/// Result of a backoff sleep that was interrupted by a tray action.
-#[allow(dead_code)] // Variants are constructed only on platforms with tray support
-enum BackoffInterrupt {
-    /// Sleep completed without interruption.
-    Completed,
-    /// User requested quit.
-    Quit,
-    /// User requested start/restart — break out of backoff and relaunch.
-    Relaunch,
-    /// User requested a check for updates.
-    CheckUpdate,
-}
-
-/// Sleep for `secs` with ±20% jitter, interruptible via an optional action
-/// channel. Handles `ViewLogs` and `OpenDashboard` inline. Returns the
-/// action that interrupted the sleep so the caller can handle it.
-/// Sleeps in 1-second chunks to remain responsive to tray actions.
-fn sleep_with_jitter_interruptible(
-    secs: u64,
-    #[cfg(any(target_os = "windows", target_os = "macos"))] action_rx: Option<
-        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
-    >,
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))] _action_rx: Option<
-        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
-    >,
-) -> BackoffInterrupt {
-    let jittered = jitter_secs(secs).max(1);
-    for _ in 0..jittered {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        if let Some(rx) = action_rx {
-            if let Ok(action) = rx.try_recv() {
-                match action {
-                    super::tray::TrayAction::Quit => return BackoffInterrupt::Quit,
-                    super::tray::TrayAction::ViewLogs => super::tray::open_log_file(),
-                    super::tray::TrayAction::OpenDashboard => {
-                        open_url_in_browser(DASHBOARD_URL);
-                    }
-                    super::tray::TrayAction::Start | super::tray::TrayAction::Restart => {
-                        return BackoffInterrupt::Relaunch;
-                    }
-                    super::tray::TrayAction::CheckUpdate => {
-                        return BackoffInterrupt::CheckUpdate;
-                    }
-                    super::tray::TrayAction::Stop => {} // already stopped/backing off
-                }
-            }
-        }
-    }
-    BackoffInterrupt::Completed
-}
-
-/// Run the wrapper loop that manages a `freenet network` child process.
-/// On Windows and macOS, shows a system tray / menu bar icon.
-/// On Linux, runs the wrapper loop directly (no tray).
-fn run_wrapper(version: &str) -> Result<()> {
-    // On Windows, detach from the console so no terminal window is visible.
-    // The wrapper runs as a background service — all output goes to log files.
-    //
-    // CRITICAL: after `FreeConsole()` (and in particular when this process
-    // was launched by Windows autostart and never had a console at all),
-    // the inherited standard handles are invalid. ANY `Command::spawn()`
-    // reachable from this function MUST explicitly set
-    // `.stdin/.stdout/.stderr(Stdio::null())` — otherwise `spawn()` fails
-    // with "The handle is invalid" (os error 6) and the child silently
-    // never starts. Known spawn sites downstream of here:
-    //   - `spawn_update_command`                   (this file)
-    //   - network child in `run_wrapper_loop`      (this file, ~line 1452)
-    //   - `spawn_new_wrapper`                      (this file)
-    //   - `open_log_file` notepad/open/xdg-open    (tray.rs)
-    //   - `taskkill_pid` (nulls all three) and `list_freenet_processes`
-    //     (`.output()` — fresh pipes, no stdin inherit), reached directly via
-    //     `kill_stale_freenet_processes` (called below) and via
-    //     `kill_freenet_service_processes` (the `update.rs` restart path)
-    // Add any new child spawn in this module with null stdio by default.
-    // See #3933 / #3934 and `.claude/rules/bug-prevention-patterns.md`
-    // at the repo root for the rule + audit grep.
-    #[cfg(target_os = "windows")]
-    unsafe {
-        winapi::um::wincon::FreeConsole();
-    }
-
-    use freenet::tracing::tracer::get_log_dir;
-    use std::sync::mpsc;
-
-    let log_dir = get_log_dir().unwrap_or_else(|| {
-        let fallback = dirs::data_local_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join("freenet")
-            .join("logs");
-        eprintln!(
-            "Warning: could not determine log directory, using {}",
-            fallback.display()
-        );
-        fallback
-    });
-    std::fs::create_dir_all(&log_dir)
-        .with_context(|| format!("Failed to create log directory: {}", log_dir.display()))?;
-
-    // macOS wrapper single-instance guard. MUST run before
-    // `kill_stale_freenet_processes` and before anything user-visible.
-    // The kill helper uses `pkill -f "freenet network"` which matches
-    // the CURRENTLY-RUNNING backend child of a live wrapper, not just
-    // stale orphans; if we were to kill_stale before the single-
-    // instance check, a second wrapper would happily murder the first
-    // wrapper's backend, then see a free port, then proceed to build a
-    // duplicate tray. The flock-based guard is immune to that race
-    // because it inspects wrapper-level state (the lockfile held by
-    // the first wrapper process) not backend state.
-    //
-    // Phase-1 smoke test on 2026-04-22 reproduced the duplicate tray
-    // whenever launchd's RunAtLoad fired while the user's open-
-    // launched wrapper was still alive; this guard prevents that
-    // overlap without changing the LAL agent's `RunAtLoad=true`
-    // semantics (login-time auto-start still works; only the in-
-    // session overlap is suppressed).
-    //
-    // Linux has no tray and Windows has install-time guards; the
-    // overlap race only manifests on macOS where launchd can spawn a
-    // concurrent wrapper via RunAtLoad.
-    #[cfg(target_os = "macos")]
-    let _wrapper_lock = match acquire_wrapper_single_instance_lock() {
-        AcquireWrapperLockOutcome::Acquired(guard) => Some(guard),
-        AcquireWrapperLockOutcome::AnotherWrapperRunning => {
-            log_wrapper_event(
-                &log_dir,
-                &format!(
-                    "Wrapper pid={} exiting: another Freenet wrapper is already \
-                     running (lockfile at ~/Library/Caches/Freenet/wrapper.lock is \
-                     held). Expected if launchd fired RunAtLoad while an existing \
-                     wrapper is alive, or if Freenet.app was double-launched. \
-                     If Freenet's menu bar icon is not visible, another process may \
-                     be holding the lock; try `lsof ~/Library/Caches/Freenet/wrapper.lock`.",
-                    std::process::id()
-                ),
-            );
-            return Ok(());
-        }
-        AcquireWrapperLockOutcome::UnavailableSoProceed => {
-            log_wrapper_event(
-                &log_dir,
-                "Wrapper single-instance lock unavailable; proceeding without guard. \
-                 Dup-tray risk if RunAtLoad fires while another wrapper is alive.",
-            );
-            None
-        }
-    };
-
-    // Kill stale freenet network processes from a previous wrapper instance.
-    // Runs AFTER the single-instance lock so we only ever kill orphans:
-    // any live peer wrapper holds the lock and would have blocked us
-    // above. Concurrent overlap cases exit silently before reaching here.
-    kill_stale_freenet_processes(&log_dir);
-
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    {
-        use super::tray::{TrayAction, WrapperStatus};
-
-        let (action_tx, action_rx) = mpsc::channel::<TrayAction>();
-        let (status_tx, status_rx) = mpsc::channel::<WrapperStatus>();
-        // Wrapper → tray cleanup-done signal. On macOS, `tao::EventLoop::run`
-        // diverges (calls `process::exit` on `ControlFlow::Exit`), so the tray
-        // must block long enough for the wrapper thread to kill its child
-        // daemon before the process exits. The signal fires in the wrapper's
-        // spawn thunk regardless of which code path returned, so every exit
-        // route (Quit, auto-update restart, network-wait abort) is covered.
-        let (cleanup_tx, cleanup_rx) = mpsc::channel::<()>();
-        let version_owned = version.to_string();
-        let log_dir_clone = log_dir.clone();
-
-        // macOS: handle Launch at Login state BEFORE building the tray so
-        // the menu item's check state reads the final filesystem truth.
-        // Previously this ran on the wrapper thread, after the tray was
-        // already built, so first-run users saw a stale-unchecked box
-        // despite the agent being registered. Also rewrites a stale plist
-        // when the user moved the .app, and warns if the legacy install.sh
-        // launchd agent is still present.
-        #[cfg(target_os = "macos")]
-        macos_launch_at_login_startup(&log_dir);
-
-        // Wrapper loop runs on a background thread
-        let loop_handle = std::thread::spawn(move || {
-            let result = run_wrapper_loop(&log_dir_clone, Some((&action_rx, &status_tx)));
-            cleanup_tx.send(()).ok();
-            result
-        });
-
-        // Tray icon runs on the main thread (platform message pump)
-        super::tray::run_tray_event_loop(action_tx, status_rx, cleanup_rx, &version_owned);
-
-        // Tray loop exited (user clicked Quit) — join the wrapper thread
-        match loop_handle.join() {
-            Ok(result) => result,
-            Err(_) => anyhow::bail!("Wrapper loop thread panicked"),
-        }
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        let _ = version;
-        run_wrapper_loop(
-            &log_dir,
-            None::<(
-                &mpsc::Receiver<super::tray::TrayAction>,
-                &mpsc::Sender<super::tray::WrapperStatus>,
-            )>,
-        )
-    }
-}
-
-/// Spawn `freenet update --quiet` and wait for it to complete.
-/// On Windows, uses `CREATE_NO_WINDOW` to avoid flashing a console window
-/// (the wrapper has already detached from the console via `FreeConsole`).
-///
-/// stdin/stdout/stderr are nulled on every platform. On Windows this is
-/// load-bearing: the wrapper has already called `FreeConsole()` (and may
-/// never have had a console at all when launched by autostart), so
-/// inheriting the parent's invalid standard handles makes `spawn()` fail
-/// with "The handle is invalid" (os error 6). Without these nulls, the
-/// update subprocess silently fails to start and the wrapper falls into
-/// the exit-42 / update-failed / backoff-relaunch loop documented in
-/// #3934 (which was also the root cause of "Check for Updates" being
-/// broken in #3933). Null stdio is harmless on macOS/Linux because
-/// `--quiet` already suppresses all output.
-fn spawn_update_command(exe_path: &Path) -> std::io::Result<std::process::ExitStatus> {
-    let mut cmd = std::process::Command::new(exe_path);
-    cmd.args(["update", "--quiet"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    cmd.status()
-}
-
-/// Spawn a new wrapper process from the (possibly updated) binary on disk.
-/// Used after a successful tray-initiated update to re-exec the wrapper
-/// so the tray displays the correct new version.
-///
-/// Returns `true` if the new wrapper was spawned successfully (caller should
-/// exit to avoid two wrappers). Returns `false` on failure (caller should
-/// fall through to relaunch the child with the current wrapper instead of
-/// leaving the user with no running node).
-fn spawn_new_wrapper(exe_path: &Path, log_dir: &Path) -> bool {
-    let mut cmd = std::process::Command::new(exe_path);
-    cmd.args(["service", "run-wrapper"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x00000008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
-    }
-
-    match cmd.spawn() {
-        Ok(_) => {
-            log_wrapper_event(log_dir, "New wrapper process spawned");
-            true
-        }
-        Err(e) => {
-            log_wrapper_event(
-                log_dir,
-                &format!("Failed to spawn new wrapper: {e}. Continuing with current wrapper."),
-            );
-            false
-        }
-    }
-}
-
-/// Maximum time to wait for network readiness at startup (seconds).
-const NETWORK_READINESS_TIMEOUT_SECS: u64 = 60;
-/// Interval between network readiness checks (seconds).
-const NETWORK_READINESS_CHECK_INTERVAL_SECS: u64 = 2;
-/// DNS probe target for network readiness checks.
-const NETWORK_PROBE_ADDR: &str = "freenet.org:443";
-
-/// Wait for network connectivity before spawning the node.
-///
-/// On Windows, the registry Run key fires at user logon, which can be before
-/// the network stack is fully operational. Without this check, the node starts
-/// with no connectivity — gateway fetches fail, CONNECT handshakes timeout,
-/// and the node gets stuck with zombie transient connections. See #3716.
-///
-/// Returns `true` if network is ready or timed out (we start the node
-/// either way). Returns `false` if the user requested Quit via the tray
-/// during the wait.
-///
-/// We probe our own domain because if it's unreachable, the gateway fetch
-/// will also fail — there's no point starting the node before we can reach
-/// the gateway index.
-///
-/// Note: On platforms with tray support, Quit actions are handled during
-/// the wait. Other tray actions (Start, ViewLogs, etc.) are deferred until
-/// the wrapper loop starts.
-fn wait_for_network_ready(
-    log_dir: &Path,
-    #[cfg(any(target_os = "windows", target_os = "macos"))] action_rx: Option<
-        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
-    >,
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))] _action_rx: Option<
-        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
-    >,
-) -> bool {
-    wait_for_network_ready_inner(
-        log_dir,
-        NETWORK_PROBE_ADDR,
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        action_rx,
-        #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-        _action_rx,
-    )
-}
-
-/// Inner implementation with configurable probe address for testing.
-fn wait_for_network_ready_inner(
-    log_dir: &Path,
-    probe_addr: &str,
-    #[cfg(any(target_os = "windows", target_os = "macos"))] action_rx: Option<
-        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
-    >,
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))] _action_rx: Option<
-        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
-    >,
-) -> bool {
-    use std::net::ToSocketAddrs;
-
-    // Note: `to_socket_addrs()` is a blocking OS resolver call that can take
-    // 15-30s on Windows when the network is down. The iteration count between
-    // calls means the total wait may exceed NETWORK_READINESS_TIMEOUT_SECS
-    // in pathological cases. This is acceptable for a pre-startup wait.
-
-    // Quick check — if DNS works immediately, skip the wait
-    if probe_addr.to_socket_addrs().is_ok() {
-        return true;
-    }
-
-    log_wrapper_event(
-        log_dir,
-        "Network not ready yet, waiting for connectivity...",
-    );
-
-    let max_checks = NETWORK_READINESS_TIMEOUT_SECS / NETWORK_READINESS_CHECK_INTERVAL_SECS;
-
-    for _ in 0..max_checks {
-        let jittered = jitter_secs(NETWORK_READINESS_CHECK_INTERVAL_SECS);
-        std::thread::sleep(std::time::Duration::from_secs(jittered.max(1)));
-
-        // Allow the user to quit via the tray during the network wait
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        if let Some(rx) = action_rx {
-            if let Ok(super::tray::TrayAction::Quit) = rx.try_recv() {
-                return false;
-            }
-        }
-
-        if probe_addr.to_socket_addrs().is_ok() {
-            log_wrapper_event(log_dir, "Network is ready");
-            return true;
-        }
-    }
-
-    log_wrapper_event(
-        log_dir,
-        "Network readiness timeout — starting node anyway (it will retry internally)",
-    );
-    true
-}
-
-/// The core wrapper loop. Spawns `freenet network`, handles exit codes,
-/// and communicates with the tray icon (if present).
-fn run_wrapper_loop(
-    log_dir: &Path,
-    #[cfg(any(target_os = "windows", target_os = "macos"))] tray: Option<(
-        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
-        &std::sync::mpsc::Sender<super::tray::WrapperStatus>,
-    )>,
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))] _tray: Option<(
-        &std::sync::mpsc::Receiver<super::tray::TrayAction>,
-        &std::sync::mpsc::Sender<super::tray::WrapperStatus>,
-    )>,
-) -> Result<()> {
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    use super::tray::WrapperStatus;
-
-    let exe_path = std::env::current_exe().context("Failed to get current executable")?;
-
-    let mut state = WrapperState::new();
-
-    // On first launch, wait for network connectivity before spawning the node.
-    // This prevents the node from starting in a degraded state when the wrapper
-    // is auto-started at login before the network stack is ready (see #3716).
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    if !wait_for_network_ready(log_dir, tray.map(|(rx, _)| rx)) {
-        return Ok(()); // User requested Quit during network wait
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    wait_for_network_ready(log_dir, None);
-
-    // First-run onboarding: if this user has never launched the tray wrapper
-    // before, open the dashboard in their browser once the HTTP server comes
-    // up, and (on macOS) register the app for launch-at-login so Freenet
-    // behaves like the Windows-installed service: always on, starts at
-    // boot, no extra action required from the user. Runs the dashboard
-    // opener in a background thread so it doesn't delay the main loop.
-    // `FIRST_RUN_OPENER_SPAWNED` ensures at most one opener thread per
-    // wrapper process lifetime so a crash-looping daemon doesn't accumulate
-    // pending openers that would all race to open tabs when the port
-    // eventually binds.
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    if let Some(marker) = first_run_marker_path() {
-        if is_first_run_at(&marker)
-            && !FIRST_RUN_OPENER_SPAWNED.swap(true, std::sync::atomic::Ordering::SeqCst)
-        {
-            spawn_first_run_dashboard_opener(log_dir);
-        }
-    }
-
-    loop {
-        // Notify tray that we're starting
-        #[cfg(any(target_os = "windows", target_os = "macos"))]
-        if let Some((_, status_tx)) = tray {
-            status_tx.send(WrapperStatus::Running).ok();
-        }
-
-        let stderr_path = log_dir.join("freenet.error.log.last");
-        let stderr_file = std::fs::File::create(&stderr_path).ok();
-
-        let mut cmd = std::process::Command::new(&exe_path);
-        cmd.arg("network");
-
-        // On Windows, prevent a console window from appearing for the child process.
-        // The wrapper has already detached from the console via FreeConsole(),
-        // which invalidates the standard handles. We must explicitly set
-        // stdin/stdout to null to avoid inheriting the invalid handles
-        // (otherwise spawn fails with "The handle is invalid" os error 6).
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-            cmd.stdin(std::process::Stdio::null());
-            cmd.stdout(std::process::Stdio::null());
-        }
-
-        // Redirect stderr to a file for port-conflict detection.
-        // On Windows, stderr must also be explicitly set to avoid
-        // inheriting the invalid handle after FreeConsole().
-        if let Some(stderr_file) = stderr_file {
-            cmd.stderr(stderr_file);
-        } else {
-            #[cfg(target_os = "windows")]
-            cmd.stderr(std::process::Stdio::null());
-        }
-
-        // Use spawn + polling so we can handle tray actions while child runs
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                log_wrapper_event(log_dir, &format!("Failed to spawn freenet network: {e}"));
-                return Err(e).context("Failed to spawn freenet network");
-            }
-        };
-
-        // Poll child + tray actions until child exits or a tray action kills it
-        let exit_code = loop {
-            // Check if child has exited
-            match child.try_wait() {
-                Ok(Some(status)) => break status.code().unwrap_or(1),
-                Ok(None) => {} // still running
-                Err(e) => {
-                    log_wrapper_event(log_dir, &format!("Error waiting for child: {e}"));
-                    break 1;
-                }
-            }
-
-            // Process tray actions while child is running
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            if let Some((action_rx, status_tx)) = tray {
-                if let Ok(action) = action_rx.try_recv() {
-                    match action {
-                        super::tray::TrayAction::Quit => {
-                            drop(child.kill());
-                            drop(child.wait());
-                            return Ok(());
-                        }
-                        super::tray::TrayAction::Restart => {
-                            log_wrapper_event(log_dir, "Restart requested via tray");
-                            drop(child.kill());
-                            drop(child.wait());
-                            break SENTINEL_RESTART;
-                        }
-                        super::tray::TrayAction::Stop => {
-                            log_wrapper_event(log_dir, "Stop requested via tray");
-                            drop(child.kill());
-                            drop(child.wait());
-                            break SENTINEL_STOP;
-                        }
-                        super::tray::TrayAction::Start => {
-                            // Ignored while child is running — Start is only
-                            // meaningful from the stopped state (handled below).
-                        }
-                        super::tray::TrayAction::ViewLogs => super::tray::open_log_file(),
-                        super::tray::TrayAction::CheckUpdate => {
-                            // Run the actual update (not just --check). If it
-                            // succeeds (exit 0), kill the child and re-exec the
-                            // wrapper so the tray shows the correct new version.
-                            // Exit 2 means already up to date — no restart needed.
-                            status_tx.send(WrapperStatus::Updating).ok();
-                            let result = spawn_update_command(&exe_path);
-                            match result {
-                                Ok(s) if s.success() => {
-                                    log_wrapper_event(
-                                        log_dir,
-                                        "Update installed via tray, restarting wrapper...",
-                                    );
-                                    status_tx.send(WrapperStatus::UpdatedRestarting).ok();
-                                    drop(child.kill());
-                                    drop(child.wait());
-                                    if spawn_new_wrapper(&exe_path, log_dir) {
-                                        return Ok(());
-                                    }
-                                    // Spawn failed. Fall through to relaunch child
-                                    // with the current (old) wrapper rather than
-                                    // leaving no node running.
-                                    break SENTINEL_RESTART;
-                                }
-                                Ok(s)
-                                    if s.code()
-                                        == Some(super::update::EXIT_CODE_BUNDLE_UPDATE_STAGED) =>
-                                {
-                                    // macOS DMG-swap: the detached updater
-                                    // will swap /Applications/Freenet.app
-                                    // after this process exits and relaunch
-                                    // the new bundle. Do NOT re-exec.
-                                    log_wrapper_event(
-                                        log_dir,
-                                        "Bundle update staged; exiting for updater to take over",
-                                    );
-                                    status_tx.send(WrapperStatus::UpdatedRestarting).ok();
-                                    drop(child.kill());
-                                    drop(child.wait());
-                                    return Ok(());
-                                }
-                                Ok(_) => {
-                                    // Exit code 2 = already up to date, or other
-                                    // non-zero = update failed. Either way, no restart.
-                                    log_wrapper_event(log_dir, "No update available");
-                                    status_tx.send(WrapperStatus::UpToDate).ok();
-                                }
-                                Err(e) => {
-                                    log_wrapper_event(
-                                        log_dir,
-                                        &format!("Update check failed: {e}"),
-                                    );
-                                    status_tx.send(WrapperStatus::Running).ok();
-                                }
-                            }
-                        }
-                        super::tray::TrayAction::OpenDashboard => {
-                            open_url_in_browser(DASHBOARD_URL);
-                        }
-                    }
-                }
-            }
-
-            // Sleep briefly before polling again
-            std::thread::sleep(std::time::Duration::from_millis(250));
-        };
-
-        // Restart sentinel from tray Restart action — skip exit code handling
-        if exit_code == SENTINEL_RESTART {
-            continue;
-        }
-
-        // Stop sentinel — enter stopped state, wait for Start/Quit/Restart
-        if exit_code == SENTINEL_STOP {
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            if let Some((action_rx, status_tx)) = tray {
-                status_tx.send(WrapperStatus::Stopped).ok();
-                loop {
-                    if let Ok(action) = action_rx.try_recv() {
-                        match action {
-                            super::tray::TrayAction::Start | super::tray::TrayAction::Restart => {
-                                log_wrapper_event(log_dir, "Start requested via tray");
-                                break; // exit stopped loop, outer loop will relaunch
-                            }
-                            super::tray::TrayAction::Quit => {
-                                return Ok(());
-                            }
-                            super::tray::TrayAction::ViewLogs => {
-                                super::tray::open_log_file();
-                            }
-                            super::tray::TrayAction::CheckUpdate => {
-                                // Allow checking for updates even while stopped
-                                status_tx.send(WrapperStatus::Updating).ok();
-                                let result = spawn_update_command(&exe_path);
-                                match result {
-                                    Ok(s) if s.success() => {
-                                        log_wrapper_event(
-                                            log_dir,
-                                            "Update installed while stopped, restarting wrapper...",
-                                        );
-                                        status_tx.send(WrapperStatus::UpdatedRestarting).ok();
-                                        if spawn_new_wrapper(&exe_path, log_dir) {
-                                            return Ok(());
-                                        }
-                                        // Spawn failed. Exit stopped state and
-                                        // relaunch child with the current wrapper.
-                                        break;
-                                    }
-                                    Ok(s)
-                                        if s.code()
-                                            == Some(
-                                                super::update::EXIT_CODE_BUNDLE_UPDATE_STAGED,
-                                            ) =>
-                                    {
-                                        log_wrapper_event(
-                                            log_dir,
-                                            "Bundle update staged while stopped; exiting for updater",
-                                        );
-                                        status_tx.send(WrapperStatus::UpdatedRestarting).ok();
-                                        return Ok(());
-                                    }
-                                    Ok(_) => {
-                                        log_wrapper_event(log_dir, "No update available");
-                                        status_tx.send(WrapperStatus::UpToDate).ok();
-                                    }
-                                    Err(e) => {
-                                        log_wrapper_event(
-                                            log_dir,
-                                            &format!("Update check failed: {e}"),
-                                        );
-                                    }
-                                }
-                            }
-                            // These actions are no-ops while the node is stopped.
-                            super::tray::TrayAction::OpenDashboard
-                            | super::tray::TrayAction::Stop => {}
-                        }
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                }
-            }
-            continue;
-        }
-
-        // Determine if this is a port conflict (for the state machine)
-        let is_port_conflict = stderr_path
-            .exists()
-            .then(|| std::fs::read_to_string(&stderr_path).unwrap_or_default())
-            .map(|s| s.contains("already in use"))
-            .unwrap_or(false);
-
-        // For exit code 42, run the update first and pass result to state machine.
-        // On Windows, this works because replace_binary() renames the running exe
-        // (freenet.exe → freenet.exe.old) rather than deleting it. Windows allows
-        // renaming a running executable. The new binary is placed at the original
-        // path, so the next child launch uses it. The .old file is cleaned up on
-        // the subsequent update.
-        let update_succeeded = if exit_code == WRAPPER_EXIT_UPDATE_NEEDED {
-            log_wrapper_event(log_dir, "Update needed, running freenet update...");
-
-            #[cfg(any(target_os = "windows", target_os = "macos"))]
-            if let Some((_, status_tx)) = tray {
-                status_tx.send(WrapperStatus::Updating).ok();
-            }
-
-            let result = spawn_update_command(&exe_path);
-            let outcome = super::update::classify_update_subprocess(&result);
-
-            // Drive the persistent auto-update failure counter used by
-            // `check_if_update_available` to break the exit-42 restart loop
-            // (#3934). The split between `SpawnFailed` (records) and
-            // `OtherFailure` (no change) is deliberate: transient GitHub/
-            // network errors must NOT accumulate toward the lockout
-            // (Codex P1 review on PR #3941), only environmental failures
-            // (exe missing/locked) should. Install-stage failures (AV
-            // holding freenet.exe) are recorded inside the subprocess
-            // itself at `update.rs` on `replace_binary` error, so those
-            // still lock out after MAX_UPDATE_FAILURES.
-            match super::update::update_counter_action(outcome) {
-                super::update::UpdateCounterAction::Clear => {
-                    super::auto_update::clear_update_failures();
-                }
-                super::update::UpdateCounterAction::Record => {
-                    super::auto_update::record_update_failure();
-                }
-                super::update::UpdateCounterAction::NoChange => {}
-            }
-
-            // macOS DMG-swap: if the update subprocess exits with the
-            // bundle-staged code, the detached updater takes over after
-            // this process exits. We must not re-exec or retry; just
-            // return Ok so the wrapper exits cleanly and the updater can
-            // swap /Applications/Freenet.app.
-            if outcome == super::update::UpdateSubprocessOutcome::BundleUpdateStaged {
-                log_wrapper_event(
-                    log_dir,
-                    "Bundle update staged during auto-update; exiting for updater",
-                );
-                #[cfg(any(target_os = "windows", target_os = "macos"))]
-                if let Some((_, status_tx)) = tray {
-                    status_tx.send(WrapperStatus::UpdatedRestarting).ok();
-                }
-                return Ok(());
-            }
-
-            let ok = outcome == super::update::UpdateSubprocessOutcome::BinaryReplaced;
-            if ok {
-                log_wrapper_event(log_dir, "Update successful, restarting...");
-            } else {
-                log_wrapper_event(log_dir, "Update failed");
-            }
-            Some(ok)
-        } else {
-            None
-        };
-
-        // Use the tested state machine to determine next action
-        let action = next_wrapper_action(&mut state, exit_code, is_port_conflict, update_succeeded);
-
-        match action {
-            WrapperAction::Update => {
-                // Update succeeded — re-exec the wrapper so the tray shows
-                // the correct new version (compiled-in to the new binary).
-                #[cfg(any(target_os = "windows", target_os = "macos"))]
-                if let Some((_, status_tx)) = tray {
-                    status_tx.send(WrapperStatus::UpdatedRestarting).ok();
-                    // Brief pause so the tray can display the message
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-                }
-                if spawn_new_wrapper(&exe_path, log_dir) {
-                    return Ok(());
-                }
-                // Spawn failed — fall through to relaunch child with current wrapper.
-            }
-            WrapperAction::Exit => {
-                let reason = if exit_code == WRAPPER_EXIT_ALREADY_RUNNING {
-                    "Another instance is already running, exiting cleanly"
-                } else if exit_code == 0 {
-                    "Normal shutdown"
-                } else {
-                    "Exiting"
-                };
-                log_wrapper_event(log_dir, reason);
-                return Ok(());
-            }
-            WrapperAction::KillAndRetry => {
-                log_wrapper_event(
-                    log_dir,
-                    &format!(
-                        "Port conflict detected (attempt {}/{WRAPPER_MAX_PORT_CONFLICT_KILLS}) — killing stale process and retrying...",
-                        state.port_conflict_kills,
-                    ),
-                );
-                kill_stale_freenet_processes(log_dir);
-                std::thread::sleep(std::time::Duration::from_secs(2));
-            }
-            WrapperAction::BackoffAndRelaunch { secs } => {
-                if state.consecutive_failures >= WRAPPER_MAX_CONSECUTIVE_FAILURES {
-                    log_wrapper_event(
-                        log_dir,
-                        &format!(
-                            "Giving up after {} consecutive failures. \
-                             Run 'freenet network' manually to diagnose.",
-                            state.consecutive_failures,
-                        ),
-                    );
-                    return Ok(());
-                }
-
-                #[cfg(any(target_os = "windows", target_os = "macos"))]
-                if let Some((_, status_tx)) = tray {
-                    status_tx.send(WrapperStatus::Stopped).ok();
-                }
-
-                log_wrapper_event(
-                    log_dir,
-                    &format!("Exited with code {exit_code}, restarting after {secs}s backoff..."),
-                );
-                // Loop: CheckUpdate resumes backoff; Relaunch/Quit/Completed break out.
-                loop {
-                    #[cfg(any(target_os = "windows", target_os = "macos"))]
-                    let interrupt = sleep_with_jitter_interruptible(secs, tray.map(|(rx, _)| rx));
-                    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-                    let interrupt = sleep_with_jitter_interruptible(secs, None);
-                    match interrupt {
-                        BackoffInterrupt::Quit => return Ok(()),
-                        BackoffInterrupt::Relaunch => {
-                            log_wrapper_event(log_dir, "Relaunch requested during backoff");
-                            state.consecutive_failures = 0;
-                            break; // relaunch
-                        }
-                        BackoffInterrupt::CheckUpdate => {
-                            // Run the update check. Only relaunch if an update
-                            // was actually installed; otherwise resume backoff.
-                            // This prevents users from defeating the crash
-                            // backoff by repeatedly clicking "Check for Updates".
-                            log_wrapper_event(log_dir, "Update check requested during backoff");
-                            #[cfg(any(target_os = "windows", target_os = "macos"))]
-                            if let Some((_, status_tx)) = tray {
-                                status_tx.send(WrapperStatus::Updating).ok();
-                                let result = spawn_update_command(&exe_path);
-                                let outcome = super::update::classify_update_subprocess(&result);
-
-                                // Drive the persistent failure counter for
-                                // the user-initiated check path identically
-                                // to the auto-update path above — see the
-                                // long comment there for the SpawnFailed vs.
-                                // OtherFailure rationale (#3934 / Codex P1).
-                                match super::update::update_counter_action(outcome) {
-                                    super::update::UpdateCounterAction::Clear => {
-                                        super::auto_update::clear_update_failures();
-                                    }
-                                    super::update::UpdateCounterAction::Record => {
-                                        super::auto_update::record_update_failure();
-                                    }
-                                    super::update::UpdateCounterAction::NoChange => {}
-                                }
-
-                                match outcome {
-                                    super::update::UpdateSubprocessOutcome::BinaryReplaced => {
-                                        log_wrapper_event(
-                                            log_dir,
-                                            "Update installed during backoff, restarting wrapper...",
-                                        );
-                                        status_tx.send(WrapperStatus::UpdatedRestarting).ok();
-                                        if spawn_new_wrapper(&exe_path, log_dir) {
-                                            return Ok(());
-                                        }
-                                        // Spawn failed. Relaunch with current wrapper.
-                                        state.consecutive_failures = 0;
-                                        break;
-                                    }
-                                    super::update::UpdateSubprocessOutcome::BundleUpdateStaged => {
-                                        log_wrapper_event(
-                                            log_dir,
-                                            "Bundle update staged during backoff; exiting for updater",
-                                        );
-                                        status_tx.send(WrapperStatus::UpdatedRestarting).ok();
-                                        return Ok(());
-                                    }
-                                    super::update::UpdateSubprocessOutcome::AlreadyUpToDate => {
-                                        log_wrapper_event(log_dir, "No update available");
-                                        status_tx.send(WrapperStatus::UpToDate).ok();
-                                    }
-                                    super::update::UpdateSubprocessOutcome::SpawnFailed => {
-                                        let msg = match &result {
-                                            Err(e) => {
-                                                format!("Update subprocess failed to spawn: {e}")
-                                            }
-                                            Ok(_) => {
-                                                // Unreachable: classify only returns
-                                                // SpawnFailed for Err results.
-                                                "Update subprocess failed to spawn".to_string()
-                                            }
-                                        };
-                                        log_wrapper_event(log_dir, &msg);
-                                        status_tx.send(WrapperStatus::Stopped).ok();
-                                    }
-                                    super::update::UpdateSubprocessOutcome::OtherFailure => {
-                                        let msg = if let Ok(s) = &result {
-                                            format!(
-                                                "Update check failed with exit code {:?}",
-                                                s.code()
-                                            )
-                                        } else {
-                                            // Unreachable: classify returns
-                                            // SpawnFailed for Err results.
-                                            "Update check failed".to_string()
-                                        };
-                                        log_wrapper_event(log_dir, &msg);
-                                        status_tx.send(WrapperStatus::Stopped).ok();
-                                    }
-                                }
-                            }
-                            // No update installed — resume backoff
-                            continue;
-                        }
-                        BackoffInterrupt::Completed => break, // normal backoff done
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Maximum number of wrapper log files to keep (one per day).
-const WRAPPER_LOG_RETENTION_DAYS: usize = 7;
-
-/// Append a timestamped message to a date-based wrapper log file.
-/// Files are named `freenet-wrapper.YYYY-MM-DD.log` with automatic rotation.
-/// Old files beyond `WRAPPER_LOG_RETENTION_DAYS` are deleted.
-fn log_wrapper_event(log_dir: &Path, message: &str) {
-    use std::io::Write;
-
-    let now = chrono::Local::now();
-    let date_str = now.format("%Y-%m-%d");
-    let log_path = log_dir.join(format!("freenet-wrapper.{date_str}.log"));
-
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-    {
-        let timestamp = now.format("%H:%M:%S");
-        drop(writeln!(file, "{timestamp}: {message}"));
-    }
-    // Also print to stderr for debugging when run manually
-    eprintln!("{message}");
-
-    // Clean up old log files (best-effort, don't let cleanup failure block anything)
-    cleanup_old_wrapper_logs(log_dir);
-}
-
-/// Delete wrapper log files older than the retention period.
-fn cleanup_old_wrapper_logs(log_dir: &Path) {
-    let entries = match std::fs::read_dir(log_dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    let mut wrapper_logs: Vec<std::path::PathBuf> = entries
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("freenet-wrapper.") && n.ends_with(".log"))
-                .unwrap_or(false)
-        })
-        .collect();
-
-    if wrapper_logs.len() <= WRAPPER_LOG_RETENTION_DAYS {
-        return;
-    }
-
-    // Sort by name (date is embedded, so lexicographic = chronological)
-    wrapper_logs.sort();
-
-    // Remove oldest files beyond retention
-    let to_remove = wrapper_logs.len() - WRAPPER_LOG_RETENTION_DAYS;
-    for path in &wrapper_logs[..to_remove] {
-        drop(std::fs::remove_file(path));
-    }
-}
-
-/// Kill stale `freenet network` processes from a previous wrapper instance.
-fn kill_stale_freenet_processes(log_dir: &Path) {
-    #[cfg(unix)]
-    {
-        // Scope to current user to avoid killing other users' processes on shared machines.
-        // Mirrors the macOS wrapper script: pkill -f -u "$(id -u)" "freenet network"
-        let uid = std::process::Command::new("id")
-            .arg("-u")
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .unwrap_or_default();
-        let uid = uid.trim();
-        let status = std::process::Command::new("pkill")
-            .args(["-f", "-u", uid, "freenet network"])
-            .status();
-        if let Ok(s) = status {
-            if s.success() {
-                log_wrapper_event(
-                    log_dir,
-                    "Killed stale freenet network process(es) on startup",
-                );
-                std::thread::sleep(std::time::Duration::from_secs(2));
-            }
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        // Reap orphaned `network` node children left by a previous wrapper
-        // instance. Only nodes are targeted — never a wrapper or another
-        // `freenet` subcommand. A single pass suffices here (unlike the loop
-        // in `kill_freenet_service_processes`): this runs at wrapper startup
-        // and on the port-conflict retry, when the only live wrapper is this
-        // process, so no other wrapper exists to respawn a reaped node.
-        // Shares the PowerShell-based enumeration used by
-        // `kill_freenet_service_processes`; `wmic` (used here previously) is
-        // deprecated and absent by default on recent Windows releases.
-        if kill_freenet_processes_matching(FreenetServiceProcess::Node) > 0 {
-            log_wrapper_event(
-                log_dir,
-                "Killed stale freenet network process(es) on startup",
-            );
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        }
-    }
-}
-
-/// Per-platform directory the wrapper writes its lifecycle log to. Mirrors the
-/// path `service_logs` tails, so `doctor`'s reap events land in the same place a
-/// user would already be looking.
-fn doctor_log_dir() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    #[cfg(target_os = "macos")]
-    {
-        home.join("Library/Logs/freenet")
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        home.join(".local/state/freenet")
-    }
-}
-
-/// Reap stale `freenet network` processes, escalating to SIGKILL for any that
-/// ignore the initial SIGTERM.
-///
-/// `kill_stale_freenet_processes` (the wrapper-startup reaper) sends a single
-/// `pkill` (SIGTERM) and returns. That is right for the startup path — the
-/// wrapper is about to relaunch and a lingering drainer will exit on its own —
-/// but `doctor` is invoked precisely because a node is WEDGED, and the original
-/// incident's orphan ignored SIGTERM for >11s (see `heal_stale_orphan_or_defer`
-/// in `generate_wrapper_script`). So here we SIGTERM, wait, then SIGKILL the
-/// holdouts. Returns the number of processes that were still matching after the
-/// SIGTERM pass (i.e. needed escalation), for the summary output.
-#[cfg(unix)]
-fn reap_stale_freenet_processes_escalating(log_dir: &Path) -> usize {
-    let uid = std::process::Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
-    let escalated = kill_pattern_escalating(uid.trim(), "freenet network", 12);
-    if escalated > 0 {
-        log_wrapper_event(
-            log_dir,
-            "doctor: stale freenet network process(es) ignored SIGTERM, sent SIGKILL",
-        );
-    } else {
-        log_wrapper_event(log_dir, "doctor: reaped stale freenet network process(es)");
-    }
-    escalated
-}
-
-/// SIGTERM a user-scoped process set matched by `pattern` (a `pgrep -f`
-/// substring), wait up to `grace_secs` for graceful exit polling once a second,
-/// then SIGKILL any survivor. Returns the count of survivors that needed the
-/// SIGKILL escalation.
-///
-/// Parameterized on `pattern` (not hardcoded to "freenet network") purely so the
-/// escalation timing/decision is unit-testable against a controllable child;
-/// production callers always pass "freenet network".
-#[cfg(unix)]
-fn kill_pattern_escalating(uid: &str, pattern: &str, grace_secs: usize) -> usize {
-    use std::time::Duration;
-
-    // SIGTERM pass. Ignore the result: a non-match (nothing to kill) is the
-    // common, healthy case, and we re-check liveness via pgrep below regardless.
-    std::process::Command::new("pkill")
-        .args(["-f", "-u", uid, pattern])
-        .status()
-        .ok();
-
-    // Wait for graceful exit, escalating as soon as the survivors are quiet.
-    for _ in 0..grace_secs {
-        std::thread::sleep(Duration::from_secs(1));
-        if pids_matching(uid, pattern).is_empty() {
-            return 0;
-        }
-    }
-
-    // SIGKILL any survivor.
-    let survivors = pids_matching(uid, pattern).len();
-    if survivors > 0 {
-        std::process::Command::new("pkill")
-            .args(["-9", "-f", "-u", uid, pattern])
-            .status()
-            .ok();
-        std::thread::sleep(Duration::from_secs(1));
-    }
-    survivors
-}
-
-/// PIDs of user-scoped processes whose command line matches `pattern`
-/// (`pgrep -f`). Empty on any error.
-#[cfg(unix)]
-fn pids_matching(uid: &str, pattern: &str) -> Vec<u32> {
-    std::process::Command::new("pgrep")
-        .args(["-f", "-u", uid, pattern])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| {
-            s.split_whitespace()
-                .filter_map(|p| p.parse().ok())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Recover a wedged service install (issue #3967). Orchestrates the manual
-/// recovery that `restart` cannot do:
-///
-///   1. Re-template the wrapper/unit to the CURRENT binary via the install
-///      path. This closes the bootstrap gap: the self-heal wrapper (#4408) can
-///      only reach disk through `freenet update`, which a node wedged on a
-///      stale orphan never runs — so an already-wedged install never adopts the
-///      fix on its own. Idempotent on a healthy install.
-///   2. Stop the managed service so launchd/systemd releases its child cleanly.
-///   3. Reap stale orphaned `freenet network` processes (PPID=1, holding the
-///      port on an old binary), escalating SIGTERM -> SIGKILL for holdouts.
-///   4. Start the service so the freshly-templated wrapper launches on a clean
-///      port.
-///
-/// Cross-platform: it calls the cfg-gated install/stop/start helpers and the
-/// unix reaper, so it compiles on every target.
 fn service_doctor(system: bool) -> Result<()> {
-    println!("freenet service doctor: recovering service install...");
-
-    // 1. Re-template wrapper/unit to the current binary.
-    println!("  - Re-templating service wrapper/unit to the current binary...");
-    install_service(system)?;
-
-    // 2. Stop the managed service (best-effort: a wedged install may show the
-    //    agent as not-running, in which case stop is a no-op we don't want to
-    //    abort on).
-    println!("  - Stopping the managed service...");
-    if let Err(e) = stop_service(system) {
-        println!("    (stop reported: {e} — continuing; the service may already be down)");
-    }
-
-    // 3. Reap stale orphans (the step `restart` lacks).
-    #[cfg(unix)]
-    {
-        let log_dir = doctor_log_dir();
-        println!("  - Reaping stale 'freenet network' processes...");
-        let escalated = reap_stale_freenet_processes_escalating(&log_dir);
-        if escalated > 0 {
-            println!("    ({escalated} process(es) ignored SIGTERM and were force-killed)");
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        println!("  - Reaping stale 'freenet network' processes...");
-        kill_stale_freenet_processes(&doctor_log_dir());
-    }
-
-    // 4. Start fresh so the new wrapper text loads on a clean port.
-    println!("  - Starting the service...");
-    start_service(system)?;
-
-    println!("freenet service doctor: done. The service has been re-templated and restarted.");
-    println!(
-        "If the dashboard still shows an old version, hard-refresh the page to clear cached assets."
-    );
-    Ok(())
+    purge::service_doctor(system)
 }
-
-/// Determine whether the user wants to purge data directories.
-///
-/// - `--purge` → true
-/// - `--keep-data` → false
-/// - Neither → prompt interactively (defaults to false if stdin is not a TTY)
-pub fn should_purge(purge: bool, keep_data: bool) -> Result<bool> {
-    if purge {
-        return Ok(true);
-    }
-    if keep_data {
-        return Ok(false);
-    }
-
-    use std::io::{self, BufRead, IsTerminal, Write};
-
-    // Check if stdin is a TTY for interactive prompting
-    if io::stdin().is_terminal() {
-        print!("Also remove all Freenet data, config, and logs? [y/N] ");
-        io::stdout().flush()?;
-        let mut line = String::new();
-        io::stdin().lock().read_line(&mut line)?;
-        let answer = line.trim().to_ascii_lowercase();
-        Ok(answer == "y" || answer == "yes")
-    } else {
-        println!(
-            "Non-interactive mode: keeping data. Use --purge to also remove data, config, and logs."
-        );
-        Ok(false)
-    }
-}
-
-/// Remove a directory if it exists, printing what is being removed.
-fn remove_if_exists(label: &str, path: &Path) -> Result<()> {
-    if path.exists() {
-        println!("Removing {label}: {}", path.display());
-        std::fs::remove_dir_all(path)
-            .with_context(|| format!("Failed to remove {label} directory: {}", path.display()))?;
-    }
-    Ok(())
-}
-
-/// Re-export for callers outside this module (e.g. `uninstall::run`) that
-/// also need to collapse empty parent folders after their own cleanup
-/// passes. Runtime use is Windows-only (see `uninstall::collapse_windows_bin_tree`)
-/// but the function is exposed on every platform so that tests for the
-/// caller-side helper can run under Linux CI too.
-pub(super) fn remove_dir_if_empty_pub(path: &Path) {
-    remove_dir_if_empty(path)
-}
-
-/// Remove a directory only if it is empty. Unlike `remove_if_exists`, this
-/// never recursively deletes — it is intended for cleaning up empty parent
-/// folders after their children have been removed (e.g. collapsing an empty
-/// `%APPDATA%\The Freenet Project Inc\Freenet\` once its `config` subfolder
-/// is gone). Any error other than "not empty" is swallowed; the parent is
-/// expendable and we should not fail the uninstall over it.
-fn remove_dir_if_empty(path: &Path) {
-    if !path.is_dir() {
-        return;
-    }
-    let Ok(mut entries) = std::fs::read_dir(path) else {
-        return;
-    };
-    if entries.next().is_some() {
-        return;
-    }
-    match std::fs::remove_dir(path) {
-        Ok(()) => println!("Removing empty dir: {}", path.display()),
-        Err(err) => {
-            // Best-effort: the parent may have been re-populated by a
-            // concurrent process, or the user lacks permission. Either
-            // way, don't abort the uninstall.
-            eprintln!("Note: could not remove empty dir {}: {err}", path.display());
-        }
-    }
+fn run_wrapper(version: &str) -> Result<()> {
+    wrapper::run_wrapper(version)
 }
 
 /// Public wrapper for use by the `uninstall` command.
 pub fn purge_data(system_mode: bool) -> Result<()> {
-    purge_data_dirs(system_mode)
+    purge::purge_data(system_mode)
 }
 
-/// Remove Freenet data, config, cache, and log directories.
-///
-/// When `system_mode` is true on Linux, resolves directories for the service
-/// user (via SUDO_USER) rather than root's home directory.
-fn purge_data_dirs(#[allow(unused_variables)] system_mode: bool) -> Result<()> {
-    // On Linux with --system, the service runs as the SUDO_USER, not root.
-    // We need to resolve that user's directories, not root's.
-    #[cfg(target_os = "linux")]
-    let home_override: Option<std::path::PathBuf> = if system_mode {
-        std::env::var("SUDO_USER")
-            .ok()
-            .map(|u| home_dir_for_user(&u))
-    } else {
-        None
-    };
-    #[cfg(not(target_os = "linux"))]
-    let home_override: Option<std::path::PathBuf> = None;
-
-    // If we have a home override (system mode on Linux), purge the service
-    // user's XDG dirs via the manually-constructed paths. Otherwise use
-    // ProjectDirs, which resolves from the current user.
-    if let Some(ref home) = home_override {
-        for (label, dir) in linux_system_purge_dirs(home) {
-            remove_if_exists(label, &dir)?;
-        }
-    } else {
-        let leaves = DataLeaves::from_project_dirs();
-        purge_leaves_and_collapse(&leaves)?;
-    }
-
-    Ok(())
-}
-
-/// XDG leaf directories that `--system` mode must purge for the service user.
-///
-/// These MUST match the paths the running node actually creates. On Linux the
-/// `directories` crate lowercases the application name when building
-/// `ProjectDirs` (`ProjectDirs::from("", "The Freenet Project Inc", "Freenet")`
-/// yields `~/.local/share/freenet`, not `~/.local/share/Freenet`), and
-/// `get_log_dir` uses `~/.local/state/freenet`. The previous hardcoded
-/// uppercase `Freenet` paths matched nothing on disk, so
-/// `sudo freenet uninstall --purge --system` reported success while silently
-/// leaving all of the user's contracts, delegates, and database behind (#3907).
-///
-/// Extracted as a pure function (parameterised on `home`) so the path logic is
-/// unit-testable without mutating process-level `SUDO_USER`/home state. This is
-/// only reached in `--system` mode, which only resolves a `home_override` on
-/// Linux; the `cfg_attr` suppresses the dead-code lint on macOS/Windows, where
-/// `home_override` is always `None` so the function is never called.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn linux_system_purge_dirs(home: &Path) -> [(&'static str, PathBuf); 4] {
-    [
-        ("data", home.join(".local/share/freenet")),
-        ("config", home.join(".config/freenet")),
-        ("cache", home.join(".cache/freenet")),
-        ("logs", home.join(".local/state/freenet")),
-    ]
-}
-
-/// The full set of leaf directories `purge_data_dirs` needs to touch in
-/// non-system mode. Grouping these into a value type makes the purge logic
-/// testable without mocking `ProjectDirs` (a tricky proposition given it
-/// reads process-level env vars).
-#[derive(Debug, Default, Clone)]
-struct DataLeaves {
-    /// `data_local_dir` — on Windows this is `%LOCALAPPDATA%\...\data`.
-    data_local: Option<PathBuf>,
-    /// Pre-#3739 Roaming data path, only populated on Windows where it
-    /// differs from `data_local`.
-    data_roaming: Option<PathBuf>,
-    /// `config_dir` (Roaming on Windows, e.g.
-    /// `%APPDATA%\...\Freenet\config`). Only populated when it differs
-    /// from both data paths (matches the macOS case where
-    /// `config_dir == data_dir`). On Windows the running node does
-    /// not write here — it writes to `config_local` — but several
-    /// other call sites (`config.rs:1661` id-set fallback, `report.rs`
-    /// config-file scan) still resolve through `config_dir()`, and an
-    /// older install may have written to it before the live node
-    /// switched to Local AppData. Cleaning both is correct.
-    config: Option<PathBuf>,
-    /// `config_local_dir` (Local on Windows, e.g.
-    /// `%LOCALAPPDATA%\...\Freenet\config`). This is what the running
-    /// node actually writes to (`Config::build` in config.rs uses
-    /// `defaults.config_local_dir()`), which is *not* the same as
-    /// `config_dir` on Windows. Without this, `freenet uninstall
-    /// --purge` left the live config folder behind. Only populated
-    /// when distinct from `data_local`, `data_roaming`, and `config`
-    /// to avoid double removal — on Linux/macOS the `directories`
-    /// crate aliases `config_local_dir` to `config_dir`, so this
-    /// stays `None` and the existing leaves cover those platforms.
-    config_local: Option<PathBuf>,
-    /// `cache_dir` for the uppercase project bundle.
-    cache: Option<PathBuf>,
-    /// Lowercase-variant cache used by the webapp cache on case-sensitive
-    /// filesystems.
-    cache_lowercase: Option<PathBuf>,
-    /// Log dir (as returned by `tracing::get_log_dir`).
-    log: Option<PathBuf>,
-    /// Whether the parents of our leaves are Freenet-owned and therefore
-    /// safe to collapse if empty.
-    ///
-    /// True on Windows — `ProjectDirs` there builds
-    /// `%LOCALAPPDATA%\The Freenet Project Inc\Freenet\{data,config,cache}`
-    /// and `get_log_dir` returns `%LOCALAPPDATA%\freenet\logs`; the
-    /// immediate parents (`...\Freenet`, `...\freenet`) exist only for us.
-    ///
-    /// False on Linux/macOS. On Linux the `directories` crate lowercases the
-    /// application name, so `ProjectDirs` builds `~/.local/share/freenet`,
-    /// `~/.config/freenet`, `~/.cache/freenet` (note the lowercase `freenet`,
-    /// not `Freenet`); macOS uses its own `~/Library/...` scheme. The parents
-    /// of those leaves are shared XDG/OS hierarchies used by every other app
-    /// on the system — collapsing them would at best no-op (by luck) and at
-    /// worst delete an otherwise-empty shared root on a fresh account. The
-    /// safety must be enforced at the type level, not left to
-    /// `remove_dir_if_empty`'s runtime check.
-    collapse_parents: bool,
-}
-
-impl DataLeaves {
-    fn from_project_dirs() -> Self {
-        let mut leaves = DataLeaves::default();
-
-        if let Some(dirs) = ProjectDirs::from("", "The Freenet Project Inc", "Freenet") {
-            let data_dir = dirs.data_local_dir().to_path_buf();
-            leaves.data_local = Some(data_dir.clone());
-
-            let roaming = dirs.data_dir().to_path_buf();
-            if roaming != data_dir {
-                leaves.data_roaming = Some(roaming.clone());
-            }
-
-            let config_dir = dirs.config_dir().to_path_buf();
-            if config_dir != data_dir && Some(&config_dir) != leaves.data_roaming.as_ref() {
-                leaves.config = Some(config_dir);
-            }
-
-            let config_local_dir = dirs.config_local_dir().to_path_buf();
-            if config_local_dir != data_dir
-                && Some(&config_local_dir) != leaves.data_roaming.as_ref()
-                && Some(&config_local_dir) != leaves.config.as_ref()
-            {
-                leaves.config_local = Some(config_local_dir);
-            }
-
-            leaves.cache = Some(dirs.cache_dir().to_path_buf());
-        } else {
-            eprintln!(
-                "Warning: Could not determine Freenet directories. Data and config may not have been removed."
-            );
-        }
-
-        if let Some(dirs) = ProjectDirs::from("", "The Freenet Project Inc", "freenet") {
-            let cache_lower = dirs.cache_dir().to_path_buf();
-            if cache_lower.exists() {
-                leaves.cache_lowercase = Some(cache_lower);
-            }
-        }
-
-        leaves.log = get_log_dir();
-        leaves.collapse_parents = cfg!(target_os = "windows");
-
-        leaves
-    }
-}
-
-/// Remove every populated leaf directory and then collapse any Freenet-owned
-/// parent folder that the removal left empty. This is the #3904 fix: on
-/// Windows the per-leaf calls removed `...\Freenet\config` but not its now-
-/// empty `...\Freenet\` parent. By collecting parents, deduping, and visiting
-/// them deepest-first, we tidy up without ever attempting to remove a parent
-/// that still holds a sibling app's data.
-fn purge_leaves_and_collapse(leaves: &DataLeaves) -> Result<()> {
-    let mut parents: Vec<PathBuf> = Vec::new();
-    let collect = |leaf: &Path, acc: &mut Vec<PathBuf>| {
-        if leaves.collapse_parents {
-            push_parent(leaf, acc);
-        }
-    };
-
-    if let Some(ref data_local) = leaves.data_local {
-        remove_if_exists("data", data_local)?;
-        collect(data_local, &mut parents);
-    }
-    if let Some(ref roaming) = leaves.data_roaming {
-        remove_if_exists("data (legacy roaming)", roaming)?;
-        collect(roaming, &mut parents);
-    }
-    if let Some(ref config) = leaves.config {
-        remove_if_exists("config (legacy roaming)", config)?;
-        collect(config, &mut parents);
-    }
-    if let Some(ref config_local) = leaves.config_local {
-        remove_if_exists("config", config_local)?;
-        collect(config_local, &mut parents);
-    }
-    if let Some(ref cache) = leaves.cache {
-        remove_if_exists("cache", cache)?;
-        collect(cache, &mut parents);
-    }
-    if let Some(ref cache_lower) = leaves.cache_lowercase {
-        remove_if_exists("cache", cache_lower)?;
-        collect(cache_lower, &mut parents);
-    }
-    if let Some(ref log) = leaves.log {
-        remove_if_exists("logs", log)?;
-        collect(log, &mut parents);
-    }
-
-    // Sort ascending, dedup consecutive duplicates, then reverse so that
-    // deepest paths are processed first. If a hypothetical future caller
-    // ever adds a grandparent alongside its parent, this ordering ensures
-    // the grandparent is only evaluated after its child has been collapsed.
-    parents.sort();
-    parents.dedup();
-    for parent in parents.into_iter().rev() {
-        remove_dir_if_empty(&parent);
-    }
-
-    Ok(())
-}
-
-fn push_parent(leaf: &Path, acc: &mut Vec<PathBuf>) {
-    if let Some(parent) = leaf.parent() {
-        acc.push(parent.to_path_buf());
-    }
-}
-
-/// Path to the system-wide systemd service file.
-#[cfg(target_os = "linux")]
-const SYSTEM_SERVICE_PATH: &str = "/etc/systemd/system/freenet.service";
-
-/// Check if a system-wide Freenet service is installed.
-#[cfg(target_os = "linux")]
-fn has_system_service() -> bool {
-    Path::new(SYSTEM_SERVICE_PATH).exists()
-}
-
-/// Check if a user-level Freenet service is installed.
-#[cfg(target_os = "linux")]
-fn has_user_service() -> bool {
-    dirs::home_dir()
-        .map(|h| h.join(".config/systemd/user/freenet.service").exists())
-        .unwrap_or(false)
-}
-
-/// Recursively chown a directory to the given user (best-effort).
-/// Used after creating directories with sudo so the service user can write to them.
-#[cfg(target_os = "linux")]
-fn chown_to_user(path: &Path, username: &str) {
-    let _status = std::process::Command::new("chown")
-        .args(["-R", username, &path.display().to_string()])
-        .status();
-}
-
-/// Look up a user's home directory from /etc/passwd via `getent passwd`.
-/// Falls back to `/home/{username}` if getent is unavailable.
-#[cfg(target_os = "linux")]
-fn home_dir_for_user(username: &str) -> std::path::PathBuf {
-    // Try getent passwd which works with NSS (LDAP, NIS, etc.)
-    if let Ok(output) = std::process::Command::new("getent")
-        .args(["passwd", username])
-        .output()
-    {
-        if output.status.success() {
-            let line = String::from_utf8_lossy(&output.stdout);
-            // Format: username:x:uid:gid:gecos:home:shell
-            if let Some(home) = line.split(':').nth(5) {
-                let home = home.trim();
-                if !home.is_empty() {
-                    return std::path::PathBuf::from(home);
-                }
-            }
-        }
-    }
-    std::path::PathBuf::from(format!("/home/{username}"))
-}
-
-/// Resolve whether to use system or user mode.
-/// If `--system` is passed, use system mode. Otherwise auto-detect based on
-/// which service file exists, defaulting to user mode.
-#[cfg(target_os = "linux")]
-fn use_system_mode(system_flag: bool) -> bool {
-    // Auto-detect: if only system service exists, use system mode
-    system_flag || (has_system_service() && !has_user_service())
-}
-
-/// Run a systemctl command, using --user or not based on system mode.
-#[cfg(target_os = "linux")]
-fn systemctl(system_mode: bool, args: &[&str]) -> Result<std::process::ExitStatus> {
-    let mut cmd = std::process::Command::new("systemctl");
-    if !system_mode {
-        cmd.arg("--user");
-    }
-    cmd.args(args);
-    let status = cmd.status().context("Failed to run systemctl")?;
-    Ok(status)
-}
-
-/// Run a systemctl command with helpful error on user-session failures.
-#[cfg(target_os = "linux")]
-fn systemctl_with_hint(system_mode: bool, args: &[&str], action: &str) -> Result<()> {
-    let status = systemctl(system_mode, args)?;
-    if status.success() {
-        return Ok(());
-    }
-
-    if system_mode {
-        anyhow::bail!("Failed to {action}");
-    }
-
-    // Check if this looks like a user session bus issue
-    let hint = std::process::Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .ok()
-        .and_then(|out| {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            if stderr.contains("bus")
-                || stderr.contains("XDG_RUNTIME_DIR")
-                || stderr.contains("Failed to connect")
-            {
-                Some(
-                    "\n\nHint: User systemd session not available (common in containers/LXC).\n\
-                     Try: sudo freenet service install --system",
-                )
-            } else {
-                None
-            }
-        })
-        .unwrap_or("");
-
-    anyhow::bail!("Failed to {action}{hint}");
-}
+// Re-exports for the `update` command and other callers outside this module.
+pub(crate) use log_utils::find_latest_log_file;
+pub use purge::remove_dir_if_empty_pub;
+pub use purge::should_purge;
 
 #[cfg(target_os = "linux")]
-fn install_service(system: bool) -> Result<()> {
-    if system {
-        install_system_service()
-    } else {
-        install_user_service()
-    }
-}
-
+pub use linux::generate_system_service_file;
 #[cfg(target_os = "linux")]
-fn install_user_service() -> Result<()> {
-    use std::fs;
-
-    let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
-    let home_dir = dirs::home_dir().context("Failed to get home directory")?;
-
-    let service_dir = home_dir.join(".config/systemd/user");
-    fs::create_dir_all(&service_dir).context("Failed to create systemd user directory")?;
-
-    // Create log directory - use ~/.local/state/freenet for XDG compliance
-    let log_dir = home_dir.join(".local/state/freenet");
-    fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
-
-    let service_content = generate_user_service_file(&exe_path, &log_dir);
-    let service_path = service_dir.join("freenet.service");
-
-    fs::write(&service_path, &service_content).context("Failed to write service file")?;
-
-    // Sidecar records the unit's SHA-256 so a later `freenet update` can
-    // distinguish "Freenet's unit" from a hand-edited one before
-    // overwriting (#4287). A failed sidecar write only weakens future
-    // user-modification protection — warn and continue.
-    let hash_path = service_path.with_extension("service.hash");
-    let unit_hash = super::update::wrapper_content_hash(&service_content);
-    if let Err(e) = super::update::write_wrapper_hash_sidecar(&hash_path, &unit_hash) {
-        eprintln!(
-            "Warning: failed to write service hash sidecar at {}: {}.",
-            hash_path.display(),
-            e
-        );
-    }
-
-    // Reload systemd user daemon
-    systemctl_with_hint(false, &["daemon-reload"], "reload systemd daemon")?;
-
-    // Enable the service
-    systemctl_with_hint(false, &["enable", "freenet"], "enable service")?;
-
-    println!("Freenet user service installed successfully.");
-    println!();
-    println!("To start the service now:");
-    println!("  freenet service start");
-    println!();
-    println!("The service will start automatically on login.");
-    println!("Logs will be written to: {}", log_dir.display());
-
-    Ok(())
-}
-
+pub use linux::generate_user_service_file;
 #[cfg(target_os = "linux")]
-fn install_system_service() -> Result<()> {
-    use std::fs;
-
-    let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
-
-    // Get the user to run the service as.
-    // When running with sudo, SUDO_USER has the original (non-root) user.
-    let username = std::env::var("SUDO_USER")
-        .or_else(|_| std::env::var("USER"))
-        .or_else(|_| std::env::var("LOGNAME"))
-        .context(
-            "Could not determine username. Set the USER environment variable \
-             or run with sudo (which sets SUDO_USER).",
-        )?;
-
-    if username == "root" {
-        anyhow::bail!(
-            "Refusing to install system service running as root.\n\
-             Run with sudo from a non-root user account so SUDO_USER is set,\n\
-             or set the USER environment variable to the desired service user."
-        );
-    }
-
-    // Look up the user's home directory from /etc/passwd.
-    // When running with sudo, dirs::home_dir() returns /root which is wrong.
-    let home_dir = home_dir_for_user(&username);
-
-    // Create log directory and fix ownership (we're running as root via sudo,
-    // but the service will run as the target user).
-    let log_dir = home_dir.join(".local/state/freenet");
-    fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
-    chown_to_user(&log_dir, &username);
-
-    let service_content = generate_system_service_file(&exe_path, &log_dir, &username, &home_dir);
-
-    fs::write(SYSTEM_SERVICE_PATH, &service_content).with_context(|| {
-        format!(
-            "Failed to write service file to {SYSTEM_SERVICE_PATH}. \
-             Are you running as root? Try: sudo freenet service install --system"
-        )
-    })?;
-
-    // Sidecar records the unit's SHA-256 so a later `freenet update` can
-    // distinguish "Freenet's unit" from a hand-edited one before
-    // overwriting (#4287). Lives next to the root-owned unit and is
-    // written by the same root process, so root owns it too. A failed
-    // sidecar write only weakens future user-modification protection —
-    // warn and continue.
-    let system_hash_path = Path::new(SYSTEM_SERVICE_PATH).with_extension("service.hash");
-    let unit_hash = super::update::wrapper_content_hash(&service_content);
-    if let Err(e) = super::update::write_wrapper_hash_sidecar(&system_hash_path, &unit_hash) {
-        eprintln!(
-            "Warning: failed to write service hash sidecar at {}: {}.",
-            system_hash_path.display(),
-            e
-        );
-    }
-
-    // Reload systemd daemon (system-level, no --user)
-    let status = systemctl(true, &["daemon-reload"])?;
-    if !status.success() {
-        anyhow::bail!("Failed to reload systemd daemon");
-    }
-
-    // Enable the service
-    let status = systemctl(true, &["enable", "freenet"])?;
-    if !status.success() {
-        anyhow::bail!("Failed to enable service");
-    }
-
-    println!("Freenet system service installed successfully.");
-    println!("  Service runs as user: {username}");
-    println!();
-    println!("To start the service now:");
-    println!("  sudo freenet service start --system");
-    println!();
-    println!("The service will start automatically on boot.");
-    println!("Logs will be written to: {}", log_dir.display());
-
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-pub fn generate_user_service_file(binary_path: &Path, log_dir: &Path) -> String {
-    format!(
-        r#"[Unit]
-Description=Freenet Node
-Documentation=https://freenet.org
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-# Stale-orphan self-heal (issue #3967): RestartPreventExitStatus=43 below
-# means an exit 43 ("another instance already running") never restarts the
-# unit. That is correct for a legitimate second instance, but if the port
-# holder is an ORPHANED `freenet network` (PPID=1) still running an OLD
-# binary, the unit would stand down and the orphan would serve stale assets
-# forever. This pre-flight runs before every start: it finds the port
-# holder, and kills it ONLY when it is an init-adopted orphan (PPID==1) whose
-# `Freenet version:` line differs from the binary this unit would launch (or
-# whose version can't be read). A user-run `freenet network` (parented by a
-# shell, PPID!=1) is always left alone, as is a current-version orphan.
-#
-# systemd performs its own $VAR/${{VAR}} expansion on Exec* lines BEFORE handing
-# the string to /bin/sh, so every dollar the SHELL must see is written as $$
-# here (systemd collapses $$ -> a single $ for sh). Self-match guards: the
-# pre-flight sh's OWN argv contains the literal "freenet network" (it is the
-# substring `pgrep -f` matches), so the pre-flight excludes its own PID ($$$$ ->
-# the sh's $$) and PID 1 from the holder loop. We deliberately do NOT anchor on
-# the holder's exe equalling THIS unit's on-disk binary: a #3967 orphan is, by
-# definition, running an OLD/DIFFERENT binary, so an `exe == on-disk binary`
-# guard would skip exactly the orphan we must kill. The PPID==1 + version-line
-# checks below are what distinguish a stale orphan from a legitimate holder.
-# PPID is read after the final ')' in /proc/PID/stat (comm is parenthesized) so
-# a comm containing whitespace can't shift the field. The '-' prefix means a
-# failure here never blocks the start.
-ExecStartPre=-/bin/sh -c 'self=$$$$; ondisk=$$(timeout 5 {binary} --version 2>/dev/null | grep "^Freenet version:"); for pid in $$(pgrep -f -u "$$(id -u)" "freenet network" 2>/dev/null); do [ "$$pid" = "$$self" ] && continue; [ "$$pid" = "1" ] && continue; exe=$$(readlink -f /proc/$$pid/exe 2>/dev/null); hv=""; [ -x "$$exe" ] && hv=$$(timeout 5 "$$exe" --version 2>/dev/null | grep "^Freenet version:"); ppid=$$(sed "s/.*) //" /proc/$$pid/stat 2>/dev/null | awk "{{print \$$2}}"); mismatch=1; [ -n "$$ondisk" ] && [ -n "$$hv" ] && [ "$$hv" != "$$ondisk" ] && mismatch=0; if [ "$$ppid" = "1" ] && {{ [ "$$mismatch" = "0" ] || [ -z "$$hv" ]; }}; then kill -TERM "$$pid" 2>/dev/null || true; w=0; while kill -0 "$$pid" 2>/dev/null && [ $$w -lt 12 ]; do sleep 1; w=$$((w+1)); done; kill -0 "$$pid" 2>/dev/null && kill -KILL "$$pid" 2>/dev/null || true; fi; done'
-ExecStart={binary} network
-Restart=always
-# Wait 10 seconds before restart to avoid rapid restart loops
-RestartSec=10
-# Stop restart loop after 5 failures in 2 minutes (e.g., port conflict with
-# a stale process). Without this, systemd restarts indefinitely.
-# SuccessExitStatus=42 ensures auto-update exits don't count as failures.
-StartLimitBurst=5
-StartLimitIntervalSec=120
-# Allow 45 seconds for graceful shutdown before SIGKILL.
-# The node handles SIGTERM by (1) waiting up to `shutdown-drain-secs`
-# (default 30s) for in-flight client PUT/GET/UPDATE/SUBSCRIBE drivers
-# to finish, then (2) closing peer connections. The 15s headroom over
-# the default drain covers peer-connection teardown + spawn-task
-# cleanup. If you raise `shutdown-drain-secs`, raise this in lockstep.
-TimeoutStopSec=45
-
-# Auto-update: if peer exits with code 42 (version mismatch with gateway),
-# run update before systemd restarts the service. The '-' prefix means
-# ExecStopPost failure won't affect service restart. $$EXIT_STATUS is doubled
-# so systemd passes a literal $EXIT_STATUS through to sh (which systemd itself
-# sets in the ExecStopPost environment).
-ExecStopPost=-/bin/sh -c '[ "$$EXIT_STATUS" = "42" ] && {binary} update --quiet || true'
-# Treat exit code 42 as success so it doesn't count against StartLimitBurst.
-# Without this, rapid update cycles (exit 42 → ExecStopPost → restart) can
-# exhaust the burst limit and permanently kill the service.
-SuccessExitStatus=42 43
-# Exit code 43 = another instance is already running on the port.
-# Do NOT restart — the existing instance is healthy.
-RestartPreventExitStatus=43
-
-# Logging
-# - The node's tracing layer writes its own size-capped, hourly-rotated
-#   logs to {log_dir}/freenet.YYYY-MM-DD-HH.log (LOG_RETENTION_HOURS +
-#   LOG_DIR_MAX_BYTES; see crates/core/src/tracing.rs).
-# - systemd's StandardOutput/StandardError previously appended to a fixed
-#   freenet.log / freenet.error.log that the time-based cleanup never
-#   pruned (mtime stayed fresh while the file was being written), so they
-#   grew without bound on long-running nodes (issue #4251).
-# - Routing both to the journal lets journald handle rotation, and panics
-#   or pre-tracing-init output remain queryable via
-#   `journalctl --user-unit freenet`.
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=freenet
-
-# Resource limits to prevent runaway resource consumption
-# File descriptors needed for network connections
-LimitNOFILE=65536
-# Memory limit (2GB soft limit for user service)
-MemoryMax=2G
-# CPU quota (200% = 2 cores max)
-CPUQuota=200%
-
-[Install]
-WantedBy=default.target
-"#,
-        binary = binary_path.display(),
-        log_dir = log_dir.display()
-    )
-}
-
-#[cfg(target_os = "linux")]
-pub fn generate_system_service_file(
-    binary_path: &Path,
-    log_dir: &Path,
-    username: &str,
-    home_dir: &Path,
-) -> String {
-    format!(
-        r#"[Unit]
-Description=Freenet Node
-Documentation=https://freenet.org
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User={username}
-Environment=HOME={home}
-# Stale-orphan self-heal (issue #3967): see the matching comment in the user
-# unit (including the systemd $$-escaping, the PPID-after-final-')' parse, and
-# why we do NOT anchor on the holder's exe equalling this unit's on-disk binary
-# — a #3967 orphan runs an OLD/DIFFERENT binary, so that anchor would skip the
-# very process we must kill). The self-PID and PID-1 skips exclude the
-# pre-flight's own sh (whose argv contains the literal "freenet network").
-# RestartPreventExitStatus=43 means an exit 43 never restarts the unit, so an
-# init-adopted orphan (PPID==1) running an OLD binary would hold the port
-# forever. This pre-flight kills the holder ONLY when it is such an orphan whose
-# `Freenet version:` differs from (or can't be read against) the binary this
-# unit launches; a user-run instance (PPID!=1) is always left alone. The '-'
-# prefix means a failure here never blocks the start.
-ExecStartPre=-/bin/sh -c 'self=$$$$; ondisk=$$(timeout 5 {binary} --version 2>/dev/null | grep "^Freenet version:"); for pid in $$(pgrep -f -u "$$(id -u)" "freenet network" 2>/dev/null); do [ "$$pid" = "$$self" ] && continue; [ "$$pid" = "1" ] && continue; exe=$$(readlink -f /proc/$$pid/exe 2>/dev/null); hv=""; [ -x "$$exe" ] && hv=$$(timeout 5 "$$exe" --version 2>/dev/null | grep "^Freenet version:"); ppid=$$(sed "s/.*) //" /proc/$$pid/stat 2>/dev/null | awk "{{print \$$2}}"); mismatch=1; [ -n "$$ondisk" ] && [ -n "$$hv" ] && [ "$$hv" != "$$ondisk" ] && mismatch=0; if [ "$$ppid" = "1" ] && {{ [ "$$mismatch" = "0" ] || [ -z "$$hv" ]; }}; then kill -TERM "$$pid" 2>/dev/null || true; w=0; while kill -0 "$$pid" 2>/dev/null && [ $$w -lt 12 ]; do sleep 1; w=$$((w+1)); done; kill -0 "$$pid" 2>/dev/null && kill -KILL "$$pid" 2>/dev/null || true; fi; done'
-ExecStart={binary} network
-Restart=always
-# Wait 10 seconds before restart to avoid rapid restart loops
-RestartSec=10
-# Stop restart loop after 5 failures in 2 minutes (e.g., port conflict with
-# a stale process). Without this, systemd restarts indefinitely.
-# SuccessExitStatus=42 ensures auto-update exits don't count as failures.
-StartLimitBurst=5
-StartLimitIntervalSec=120
-# Allow 45 seconds for graceful shutdown before SIGKILL.
-# The node handles SIGTERM by (1) waiting up to `shutdown-drain-secs`
-# (default 30s) for in-flight client PUT/GET/UPDATE/SUBSCRIBE drivers
-# to finish, then (2) closing peer connections. The 15s headroom over
-# the default drain covers peer-connection teardown + spawn-task
-# cleanup. If you raise `shutdown-drain-secs`, raise this in lockstep.
-TimeoutStopSec=45
-
-# Auto-update: if peer exits with code 42 (version mismatch with gateway),
-# run update before systemd restarts the service. The '-' prefix means
-# ExecStopPost failure won't affect service restart. $$EXIT_STATUS is doubled
-# so systemd passes a literal $EXIT_STATUS through to sh (which systemd itself
-# sets in the ExecStopPost environment).
-ExecStopPost=-/bin/sh -c '[ "$$EXIT_STATUS" = "42" ] && {binary} update --quiet || true'
-# Treat exit code 42 as success so it doesn't count against StartLimitBurst.
-# Without this, rapid update cycles (exit 42 → ExecStopPost → restart) can
-# exhaust the burst limit and permanently kill the service.
-SuccessExitStatus=42 43
-# Exit code 43 = another instance is already running on the port.
-# Do NOT restart — the existing instance is healthy.
-RestartPreventExitStatus=43
-
-# Logging
-# - The node's tracing layer writes its own size-capped, hourly-rotated
-#   logs to {log_dir}/freenet.YYYY-MM-DD-HH.log (LOG_RETENTION_HOURS +
-#   LOG_DIR_MAX_BYTES; see crates/core/src/tracing.rs).
-# - systemd's StandardOutput/StandardError previously appended to a fixed
-#   freenet.log / freenet.error.log that the time-based cleanup never
-#   pruned (mtime stayed fresh while the file was being written), so they
-#   grew without bound on long-running nodes (issue #4251).
-# - Routing both to the journal lets journald handle rotation, and panics
-#   or pre-tracing-init output remain queryable via
-#   `journalctl -u freenet`.
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=freenet
-
-# Resource limits to prevent runaway resource consumption
-# File descriptors needed for network connections
-LimitNOFILE=65536
-# Memory limit (2GB soft limit)
-MemoryMax=2G
-# CPU quota (200% = 2 cores max)
-CPUQuota=200%
-
-[Install]
-WantedBy=multi-user.target
-"#,
-        binary = binary_path.display(),
-        log_dir = log_dir.display(),
-        username = username,
-        home = home_dir.display()
-    )
-}
-
-/// Stop, disable, and remove the Freenet service file. Does not purge data.
-/// Returns true if a service was found and removed.
-#[cfg(target_os = "linux")]
-pub fn stop_and_remove_service(system: bool) -> Result<bool> {
-    use std::fs;
-
-    let system_mode = use_system_mode(system);
-
-    let service_path = if system_mode {
-        std::path::PathBuf::from(SYSTEM_SERVICE_PATH)
-    } else {
-        dirs::home_dir()
-            .context("Failed to get home directory")?
-            .join(".config/systemd/user/freenet.service")
-    };
-
-    if !service_path.exists() {
-        return Ok(false);
-    }
-
-    // Stop the service if running (best-effort, may already be stopped)
-    let _stop = systemctl(system_mode, &["stop", "freenet"]);
-
-    // Disable the service (best-effort, may already be disabled)
-    let _disable = systemctl(system_mode, &["disable", "freenet"]);
-
-    fs::remove_file(&service_path).context("Failed to remove service file")?;
-
-    // Reload systemd (best-effort, failure is non-fatal during uninstall)
-    drop(systemctl(system_mode, &["daemon-reload"]));
-
-    Ok(true)
-}
-
-#[cfg(target_os = "linux")]
-fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> Result<()> {
-    stop_and_remove_service(system)?;
-
-    println!("Freenet service uninstalled.");
-
-    if should_purge(purge, keep_data)? {
-        let system_mode = use_system_mode(system);
-        purge_data_dirs(system_mode)?;
-        println!("All Freenet data, config, and logs removed.");
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn service_status(system: bool) -> Result<()> {
-    let system_mode = use_system_mode(system);
-    let status = systemctl(system_mode, &["status", "freenet"])?;
-    std::process::exit(status.code().unwrap_or(1));
-}
-
-#[cfg(target_os = "linux")]
-fn start_service(system: bool) -> Result<()> {
-    let system_mode = use_system_mode(system);
-    systemctl_with_hint(system_mode, &["start", "freenet"], "start service")?;
-    println!("Freenet service started.");
-    println!("Open http://127.0.0.1:7509/ in your browser to view your Freenet dashboard.");
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn stop_service(system: bool) -> Result<()> {
-    let system_mode = use_system_mode(system);
-    systemctl_with_hint(system_mode, &["stop", "freenet"], "stop service")?;
-    println!("Freenet service stopped.");
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn restart_service(system: bool) -> Result<()> {
-    let system_mode = use_system_mode(system);
-    systemctl_with_hint(system_mode, &["restart", "freenet"], "restart service")?;
-    println!("Freenet service restarted.");
-    println!("Open http://127.0.0.1:7509/ in your browser to view your Freenet dashboard.");
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn service_logs(error_only: bool) -> Result<()> {
-    let log_dir = dirs::home_dir()
-        .context("Failed to get home directory")?
-        .join(".local/state/freenet");
-
-    let base_name = if error_only {
-        "freenet.error"
-    } else {
-        "freenet"
-    };
-
-    tail_with_rotation(&log_dir, base_name)
-}
-
-// macOS implementation using launchd
-// --system flag is not supported on macOS (launchd daemons need different setup)
-#[cfg(target_os = "macos")]
-fn install_service(system: bool) -> Result<()> {
-    if system {
-        anyhow::bail!(
-            "The --system flag is only supported on Linux.\n\
-             On macOS, use the default user agent: freenet service install"
-        );
-    }
-    install_macos_service()
-}
-
-/// Derive the path of the macOS auto-update wrapper script from a home
-/// directory. Single source of truth shared by the install path (which
-/// writes the script), the update path, and the uninstall path (which
-/// removes it). Keep this in sync with `update.rs`'s wrapper derivation.
-#[cfg(target_os = "macos")]
-fn wrapper_script_path(home_dir: &Path) -> PathBuf {
-    home_dir.join(".local/bin/freenet-service-wrapper.sh")
-}
-
-/// Remove the wrapper script and its sidecar/backup files written by the
-/// install (`*.sh`, `*.sh.hash`) and update (`*.sh.bak`) paths.
-///
-/// Idempotent: a missing file is not an error, so uninstalling twice (or
-/// uninstalling an install that never ran an update) succeeds cleanly.
-/// Returns an error only if a present file cannot be removed.
-///
-/// Regression target for #4290: install wrote three files, uninstall
-/// removed zero, leaving stale wrapper artifacts in `~/.local/bin`.
-#[cfg(target_os = "macos")]
-fn remove_wrapper_files(wrapper_path: &Path) -> Result<()> {
-    use std::fs;
-
-    // `.sh` itself, plus the `.sh.hash` sidecar (#4286) and any `.sh.bak`
-    // backup left by `freenet update`. Derived via `with_extension` so they
-    // track the wrapper path rather than being independently hardcoded.
-    let targets = [
-        wrapper_path.to_path_buf(),
-        wrapper_path.with_extension("sh.hash"),
-        wrapper_path.with_extension("sh.bak"),
-    ];
-
-    for target in &targets {
-        match fs::remove_file(target) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                return Err(e).with_context(|| {
-                    format!("Failed to remove wrapper file {}", target.display())
-                });
-            }
-        }
-    }
-
-    Ok(())
-}
+pub use linux::stop_and_remove_service;
 
 #[cfg(target_os = "macos")]
-fn install_macos_service() -> Result<()> {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
-    let home_dir = dirs::home_dir().context("Failed to get home directory")?;
-
-    let launch_agents_dir = home_dir.join("Library/LaunchAgents");
-    fs::create_dir_all(&launch_agents_dir).context("Failed to create LaunchAgents directory")?;
-
-    // Create log directory in proper macOS location
-    let log_dir = home_dir.join("Library/Logs/freenet");
-    fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
-
-    // Create wrapper script for auto-update support.
-    // launchd doesn't have ExecStopPost like systemd, so we use a wrapper
-    // that checks exit code 42 (update needed) and runs update before restart.
-    let wrapper_path = wrapper_script_path(&home_dir);
-    let wrapper_dir = wrapper_path
-        .parent()
-        .context("wrapper path has no parent directory")?;
-    fs::create_dir_all(wrapper_dir).context("Failed to create wrapper directory")?;
-    let wrapper_content = generate_wrapper_script(&exe_path);
-    fs::write(&wrapper_path, &wrapper_content).context("Failed to write wrapper script")?;
-    fs::set_permissions(&wrapper_path, fs::Permissions::from_mode(0o755))
-        .context("Failed to make wrapper script executable")?;
-
-    // Sidecar records the wrapper's SHA-256 so a later `freenet update`
-    // can distinguish "Freenet's wrapper" from a hand-edited one before
-    // overwriting (#3967). A failed sidecar write only weakens future
-    // user-modification protection — warn and continue.
-    let wrapper_hash_path = wrapper_path.with_extension("sh.hash");
-    let wrapper_hash = super::update::wrapper_content_hash(&wrapper_content);
-    if let Err(e) = super::update::write_wrapper_hash_sidecar(&wrapper_hash_path, &wrapper_hash) {
-        eprintln!(
-            "Warning: failed to write wrapper hash sidecar at {}: {}.",
-            wrapper_hash_path.display(),
-            e
-        );
-    }
-
-    let plist_content = generate_plist(&wrapper_path, &log_dir);
-    let plist_path = launch_agents_dir.join("org.freenet.node.plist");
-
-    fs::write(&plist_path, plist_content).context("Failed to write plist file")?;
-
-    println!("Freenet service installed successfully.");
-    println!();
-    println!("To start the service now:");
-    println!("  freenet service start");
-    println!();
-    println!("The service will start automatically on login.");
-    println!("Logs will be written to: {}", log_dir.display());
-
-    Ok(())
-}
-
+pub use macos::generate_wrapper_script;
 #[cfg(target_os = "macos")]
-pub fn generate_wrapper_script(binary_path: &Path) -> String {
-    format!(
-        r#"#!/bin/bash
-# Freenet service wrapper for auto-update support.
-# This wrapper monitors exit code 42 (update needed) and runs update before restart.
-# Includes exponential backoff to prevent rapid restart loops on repeated failures.
-# On startup, kills any stale 'freenet network' processes to avoid port conflicts.
+pub use macos::stop_and_remove_service;
 
-BACKOFF=10       # Initial backoff in seconds
-MAX_BACKOFF=300  # Maximum backoff (5 minutes)
-CONSECUTIVE_FAILURES=0
-PORT_CONFLICT_KILLS=0
-MAX_PORT_CONFLICT_KILLS=3  # Give up after this many kill attempts
-
-# Lifecycle messages route through `logger`, which writes to macOS unified
-# logging (auto-rotated, queryable via `log show --predicate 'process ==
-# "logger"' --info`). Previously these were appended to a fixed
-# ~/Library/Logs/freenet/freenet.log that the cleanup pass never touched
-# (its mtime stayed fresh while being written), so the file grew without
-# bound on long-running nodes (issue #4251). The transient
-# freenet.error.log.last scratch file below is overwritten on every launch
-# and so does not accumulate.
-log_event() {{
-    logger -t freenet "$1"
-}}
-
-# Print a binary's full version identity line, e.g.
-#   Freenet version: 0.2.71 (abc1234)
-# Bounded by a 5s timeout so a wedged binary can't stall the whole self-heal
-# before ExecStart. `timeout` may be absent on a bare macOS box, so fall back
-# to invoking the binary directly when it isn't on PATH.
-version_line() {{
-    if command -v timeout >/dev/null 2>&1; then
-        timeout 5 "$1" --version 2>/dev/null | grep '^Freenet version:'
-    else
-        "$1" --version 2>/dev/null | grep '^Freenet version:'
-    fi
-}}
-
-# Print the on-disk binary's full version identity line. Used on the exit-43
-# self-heal path to tell a stale orphan apart from a legitimate second
-# instance running the SAME binary we would launch.
-ondisk_version() {{
-    version_line "{binary}"
-}}
-
-# Enumerate PIDs of `freenet network` processes owned by the current user.
-holder_pids() {{
-    pgrep -f -u "$(id -u)" "freenet network" 2>/dev/null
-}}
-
-# Resolve a PID's executable path on macOS. `ps -o command=` yields the full
-# argv. The wrapper launches the node as `<binary> network`, so the image path
-# is everything up to the trailing ` network` argument. We strip that suffix
-# rather than `awk '{{print $1}}'`-splitting on whitespace, because an install
-# path that contains a space (e.g. `/Users/Some User/bin/freenet`) would be
-# re-truncated by whitespace splitting — the exact regression that switching
-# from `ps -o comm=` to `-o command=` was meant to avoid. Empty if the process
-# is gone. (If the holder's argv ever stops ending in ` network` this yields the
-# full command line, which still drives the version comparison correctly.)
-holder_exe() {{
-    ps -o command= -p "$1" 2>/dev/null | sed 's/ network$//'
-}}
-
-# Stale-orphan self-heal for exit 43.
-#
-# WHY this exists: the binary returns exit 43 ("another instance is already
-# running") whenever it cleanly detects something already holding the
-# service port. launchd's plist sets KeepAlive.SuccessfulExit=false, so if
-# this wrapper responds with `exit 0`, launchd treats it as an intentional
-# stop and NEVER respawns us. (systemd has the same trap via
-# RestartPreventExitStatus=43.) That is correct for a real second instance,
-# but catastrophic when the port holder is an ORPHANED `freenet network`
-# (PPID=1, detached from any wrapper) still running a STALE OLD binary: every
-# new spawn detects it, exits 43, we stand down, and the orphan serves stale
-# assets forever (issue #3967).
-#
-# So before deferring, decide per holder. We ONLY kill a process that is an
-# ORPHAN (PPID==1, adopted by launchd/init and not this wrapper's own child) —
-# a deliberately hand-run `freenet network` is parented by a user shell, so its
-# PPID != 1 and we always defer to it (never SIGKILL a developer's instance or
-# truncate a supervised upgrade's drain). Among orphans we kill when EITHER:
-#   * its version line differs from the binary we would launch (stale binary),
-#     but only when we can actually read our own on-disk version (a non-empty
-#     ondisk); if ondisk is unreadable mid-update we must NOT treat "differs"
-#     as a kill signal, or we'd cull a healthy current node, OR
-#   * we cannot read the holder's own version at all (binary gone/unreadable),
-#     in which case an init-adopted orphan is presumed stale.
-# Kill is SIGTERM, then SIGKILL (the original incident's orphan ignored SIGTERM
-# for >11s). Returns 0 = killed a stale orphan, relaunch; 1 = defer.
-heal_stale_orphan_or_defer() {{
-    local ondisk pid exe holder_ver ppid version_mismatch killed=1
-    ondisk="$(ondisk_version)"
-    for pid in $(holder_pids); do
-        # Never touch our own child (the instance we just ran in this loop).
-        [ "$pid" = "$WRAPPER_CHILD_PID" ] && continue
-        ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
-        exe="$(holder_exe "$pid")"
-        holder_ver=""
-        if [ -n "$exe" ] && [ -x "$exe" ]; then
-            holder_ver="$(version_line "$exe")"
-        fi
-        # Orphan-only: a non-init-adopted holder is a real second instance (or a
-        # user-run node) and is always deferred to, regardless of version.
-        version_mismatch=1
-        if [ -n "$ondisk" ] && [ -n "$holder_ver" ] && [ "$holder_ver" != "$ondisk" ]; then
-            version_mismatch=0
-        fi
-        if [ "$ppid" = "1" ] && {{ [ "$version_mismatch" = "0" ] || [ -z "$holder_ver" ]; }}; then
-            log_event "Exit 43: port holder PID $pid is a STALE orphan (holder='$holder_ver' ondisk='$ondisk' ppid=$ppid). Killing and relaunching."
-            kill -TERM "$pid" 2>/dev/null || true
-            # Wait up to ~12s for graceful exit, then escalate to SIGKILL.
-            local waited=0
-            while kill -0 "$pid" 2>/dev/null && [ $waited -lt 12 ]; do
-                sleep 1
-                waited=$((waited + 1))
-            done
-            if kill -0 "$pid" 2>/dev/null; then
-                log_event "Exit 43: stale orphan PID $pid ignored SIGTERM after ${{waited}}s, sending SIGKILL"
-                kill -KILL "$pid" 2>/dev/null || true
-                sleep 1
-            fi
-            killed=0
-        else
-            log_event "Exit 43: deferring to port holder PID $pid (holder='$holder_ver' ondisk='$ondisk' ppid=$ppid) — current version, user-supervised, or version undeterminable"
-        fi
-    done
-    return $killed
-}}
-
-# Kill any stale freenet network processes before starting.
-# This handles the case where a previous launch daemon restart left a child
-# process still holding the port (e.g. port 7509).
-# Scoped to the current user to avoid killing processes owned by other users.
-if pkill -f -u "$(id -u)" "freenet network" 2>/dev/null; then
-    log_event "Killed stale freenet network process(es) on startup"
-    sleep 2
-fi
-
-# Forward a SIGTERM (sent by launchd on stop / restart) to the node so it can
-# run its graceful drain, rather than relying solely on launchd group-signaling
-# the whole process group. The node handles SIGTERM by draining in-flight
-# client drivers before closing peer connections. Harmless if launchd already
-# group-signals — the child just receives a (deduplicated) TERM either way.
-forward_term() {{
-    [ -n "$WRAPPER_CHILD_PID" ] && kill -TERM "$WRAPPER_CHILD_PID" 2>/dev/null || true
-}}
-trap forward_term TERM
-
-while true; do
-    # Launch in the background so we know our own child's PID. This lets the
-    # exit-43 self-heal path avoid mistaking our just-exited child for a
-    # stale orphan still holding the port, and lets the TERM trap above forward
-    # launchd's stop signal to the node for a graceful drain.
-    "{binary}" network 2>"$HOME/Library/Logs/freenet/freenet.error.log.last" &
-    WRAPPER_CHILD_PID=$!
-    # `wait` is interrupted by the trapped TERM; re-wait so we collect the
-    # child's real exit status after it finishes draining.
-    wait $WRAPPER_CHILD_PID
-    EXIT_CODE=$?
-    while kill -0 "$WRAPPER_CHILD_PID" 2>/dev/null; do
-        wait $WRAPPER_CHILD_PID
-        EXIT_CODE=$?
-    done
-
-    if [ $EXIT_CODE -eq 42 ]; then
-        log_event "Update needed, running freenet update..."
-        if "{binary}" update --quiet; then
-            log_event "Update successful, restarting..."
-            CONSECUTIVE_FAILURES=0
-            PORT_CONFLICT_KILLS=0
-            BACKOFF=10
-            sleep 2
-        else
-            CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
-            log_event "Update failed (attempt $CONSECUTIVE_FAILURES), backing off $BACKOFF seconds..."
-            sleep $BACKOFF
-            BACKOFF=$((BACKOFF * 2))
-            [ $BACKOFF -gt $MAX_BACKOFF ] && BACKOFF=$MAX_BACKOFF
-        fi
-        continue
-    elif [ $EXIT_CODE -eq 43 ]; then
-        # Another instance holds the port. Before standing down (which under
-        # launchd SuccessfulExit=false would stop us forever), check whether
-        # the holder is a stale orphan running an old binary and, if so, kill
-        # it and relaunch instead of deferring. See heal_stale_orphan_or_defer.
-        if heal_stale_orphan_or_defer; then
-            log_event "Killed stale orphan holding the port on exit 43, relaunching"
-            CONSECUTIVE_FAILURES=0
-            PORT_CONFLICT_KILLS=0
-            BACKOFF=10
-            sleep 2
-            continue
-        fi
-        log_event "Another instance (current version) is already running, exiting cleanly"
-        exit 0
-    elif [ $EXIT_CODE -eq 0 ]; then
-        log_event "Normal shutdown"
-        exit 0
-    else
-        # Check if this looks like a port-already-in-use failure.
-        if grep -q "already in use" "$HOME/Library/Logs/freenet/freenet.error.log.last" 2>/dev/null; then
-            PORT_CONFLICT_KILLS=$((PORT_CONFLICT_KILLS + 1))
-            if [ $PORT_CONFLICT_KILLS -le $MAX_PORT_CONFLICT_KILLS ]; then
-                log_event "Port conflict detected (attempt $PORT_CONFLICT_KILLS/$MAX_PORT_CONFLICT_KILLS) — killing stale freenet process and retrying..."
-                pkill -f -u "$(id -u)" "freenet network" 2>/dev/null || true
-                sleep 2
-                BACKOFF=10
-                continue
-            else
-                log_event "Port conflict persists after $MAX_PORT_CONFLICT_KILLS kill attempts. Manual intervention may be required ('pkill freenet'). Backing off..."
-            fi
-        fi
-        CONSECUTIVE_FAILURES=$((CONSECUTIVE_FAILURES + 1))
-        PORT_CONFLICT_KILLS=0
-        log_event "Exited with code $EXIT_CODE, restarting after backoff..."
-        sleep $BACKOFF
-        BACKOFF=$((BACKOFF * 2))
-        [ $BACKOFF -gt $MAX_BACKOFF ] && BACKOFF=$MAX_BACKOFF
-    fi
-done
-"#,
-        binary = binary_path.display()
-    )
-}
-
+// Re-exports for tray.rs (Launch at Login toggle and state query).
 #[cfg(target_os = "macos")]
-pub(super) fn generate_plist(wrapper_path: &Path, log_dir: &Path) -> String {
-    // Note: wrapper_path is the auto-update wrapper script, not the freenet binary directly.
-    // The wrapper handles the loop: run freenet, check exit code, update if needed.
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>org.freenet.node</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{wrapper}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <false/>
-    </dict>
-    <!--
-        Logging
-        - The node's tracing layer writes its own size-capped, hourly-
-          rotated logs to {log_dir}/freenet.YYYY-MM-DD-HH.log
-          (LOG_RETENTION_HOURS + LOG_DIR_MAX_BYTES; see
-          crates/core/src/tracing.rs).
-        - launchd previously appended to fixed freenet.log / freenet.error.log
-          that the time-based cleanup never pruned, so they grew without
-          bound (issue #4251). macOS does not offer a journal target for
-          launchd, so the cleanest option is /dev/null — diagnostics
-          remain available via `freenet service report`, which collects
-          the rotated tracing logs.
-    -->
-    <key>StandardOutPath</key>
-    <string>/dev/null</string>
-    <key>StandardErrorPath</key>
-    <string>/dev/null</string>
-    <key>SoftResourceLimits</key>
-    <dict>
-        <key>NumberOfFiles</key>
-        <integer>65536</integer>
-    </dict>
-    <key>HardResourceLimits</key>
-    <dict>
-        <key>NumberOfFiles</key>
-        <integer>65536</integer>
-    </dict>
-</dict>
-</plist>
-"#,
-        wrapper = wrapper_path.display(),
-        log_dir = log_dir.display()
-    )
-}
+pub(crate) use launch_at_login::{
+    ToggleLaunchAtLoginOutcome, disable_launch_at_login, enable_launch_at_login,
+    is_launch_at_login_enabled, macos_app_bundle_path, toggle_launch_at_login_outcome,
+};
 
-/// Bail with "--system not supported on macOS" for commands that don't apply.
+// Re-exports for update.rs (macOS plist generation).
 #[cfg(target_os = "macos")]
-fn check_no_system_flag(system: bool) -> Result<()> {
-    if system {
-        anyhow::bail!(
-            "The --system flag is only supported on Linux.\n\
-             On macOS, use the default user agent commands without --system."
-        );
-    }
-    Ok(())
-}
-
-/// Stop and remove the Freenet launchd agent. Does not purge data.
-/// Returns true if a service was found and removed.
-#[cfg(target_os = "macos")]
-pub fn stop_and_remove_service(_system: bool) -> Result<bool> {
-    let home_dir = dirs::home_dir().context("Failed to get home directory")?;
-    stop_and_remove_service_at(&home_dir)
-}
-
-/// Core of macOS uninstall, parametrized on the home directory so the
-/// cleanup-ordering invariant is unit-testable without touching the real
-/// `$HOME` or shelling out to `launchctl` (which only runs when the plist is
-/// present).
-#[cfg(target_os = "macos")]
-fn stop_and_remove_service_at(home_dir: &Path) -> Result<bool> {
-    use std::fs;
-
-    let plist_path = home_dir.join("Library/LaunchAgents/org.freenet.node.plist");
-
-    // Remove the auto-update wrapper script and its sidecar/backup files
-    // (#4290). install writes `*.sh` + `*.sh.hash`; `freenet update` may
-    // leave a `*.sh.bak`. Missing files are not an error (idempotent), so we
-    // run this BEFORE the plist early-return: a partial or repeated uninstall
-    // can leave the plist already gone while the wrapper artifacts remain, and
-    // those must still be cleaned up.
-    remove_wrapper_files(&wrapper_script_path(home_dir))?;
-
-    if !plist_path.exists() {
-        return Ok(false);
-    }
-
-    if let Some(plist_path_str) = plist_path.to_str() {
-        // Unload the service if loaded (ignore errors as it may not be loaded)
-        let unload_status = std::process::Command::new("launchctl")
-            .args(["unload", plist_path_str])
-            .status();
-        if let Err(e) = unload_status {
-            eprintln!("Warning: Failed to unload service: {}", e);
-        }
-    }
-
-    // Remove the plist file
-    fs::remove_file(&plist_path).context("Failed to remove plist file")?;
-
-    Ok(true)
-}
-
-#[cfg(target_os = "macos")]
-fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> Result<()> {
-    check_no_system_flag(system)?;
-
-    stop_and_remove_service(system)?;
-
-    println!("Freenet service uninstalled.");
-
-    if should_purge(purge, keep_data)? {
-        purge_data_dirs(false)?;
-        println!("All Freenet data, config, and logs removed.");
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn service_status(system: bool) -> Result<()> {
-    check_no_system_flag(system)?;
-
-    let output = std::process::Command::new("launchctl")
-        .args(["list", "org.freenet.node"])
-        .output()
-        .context("Failed to check service status")?;
-
-    if output.status.success() {
-        println!("Freenet service is running.");
-        if !output.stdout.is_empty() {
-            println!("{}", String::from_utf8_lossy(&output.stdout));
-        }
-    } else {
-        println!("Freenet service is not running.");
-        std::process::exit(3); // Standard exit code for "not running"
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn start_service(system: bool) -> Result<()> {
-    check_no_system_flag(system)?;
-
-    let plist_path = dirs::home_dir()
-        .context("Failed to get home directory")?
-        .join("Library/LaunchAgents/org.freenet.node.plist");
-
-    if !plist_path.exists() {
-        anyhow::bail!("Service not installed. Run 'freenet service install' first.");
-    }
-
-    let plist_path_str = plist_path
-        .to_str()
-        .context("Plist path contains invalid UTF-8")?;
-
-    let status = std::process::Command::new("launchctl")
-        .args(["load", plist_path_str])
-        .status()
-        .context("Failed to start service")?;
-
-    if status.success() {
-        println!("Freenet service started.");
-        println!("Open http://127.0.0.1:7509/ in your browser to view your Freenet dashboard.");
-    } else {
-        anyhow::bail!("Failed to start service");
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn stop_service(system: bool) -> Result<()> {
-    check_no_system_flag(system)?;
-
-    let plist_path = dirs::home_dir()
-        .context("Failed to get home directory")?
-        .join("Library/LaunchAgents/org.freenet.node.plist");
-
-    let plist_path_str = plist_path
-        .to_str()
-        .context("Plist path contains invalid UTF-8")?;
-
-    let status = std::process::Command::new("launchctl")
-        .args(["unload", plist_path_str])
-        .status()
-        .context("Failed to stop service")?;
-
-    if status.success() {
-        println!("Freenet service stopped.");
-    } else {
-        anyhow::bail!("Failed to stop service");
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn restart_service(system: bool) -> Result<()> {
-    check_no_system_flag(system)?;
-    stop_service(false)?;
-    start_service(false)
-}
-
-#[cfg(target_os = "macos")]
-fn service_logs(error_only: bool) -> Result<()> {
-    let log_dir = dirs::home_dir()
-        .context("Failed to get home directory")?
-        .join("Library/Logs/freenet");
-
-    let base_name = if error_only {
-        "freenet.error"
-    } else {
-        "freenet"
-    };
-
-    tail_with_rotation(&log_dir, base_name)
-}
-
-// Windows implementation
-// Note: Windows service management requires either:
-// 1. Running as a Windows Service (requires service registration)
-// 2. Using Task Scheduler for user-level autostart
-// For now, we provide Task Scheduler-based autostart
+pub(crate) use macos::generate_plist;
 
 #[cfg(target_os = "windows")]
-fn install_service(system: bool) -> Result<()> {
-    if system {
-        anyhow::bail!(
-            "The --system flag is only supported on Linux.\n\
-             On Windows, use the default scheduled task: freenet service install"
-        );
-    }
-
-    let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
-    let exe_path_str = exe_path
-        .to_str()
-        .context("Executable path contains invalid UTF-8")?;
-
-    // Register Freenet to start at logon via the registry Run key.
-    // This requires no admin privileges — HKCU is user-writable.
-    // The wrapper manages the freenet network child process, handles
-    // auto-update (exit code 42), crash backoff, log capture, and
-    // shows a system tray icon.
-    let run_command = format!("\"{}\" service run-wrapper", exe_path_str);
-    let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
-    let (run_key, _) = hkcu
-        .create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
-        .context("Failed to open registry Run key")?;
-    run_key
-        .set_value("Freenet", &run_command)
-        .context("Failed to write Freenet registry entry")?;
-
-    // Also clean up any legacy scheduled task from older installs
-    drop(
-        std::process::Command::new("schtasks")
-            .args(["/delete", "/tn", "Freenet", "/f"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status(),
-    );
-
-    println!("Freenet autostart registered successfully.");
-    println!();
-    println!("To start Freenet now:");
-    println!("  freenet service start");
-    println!();
-    println!("Freenet will start automatically when you log in.");
-    println!("A system tray icon will appear with status and controls.");
-
-    Ok(())
-}
-
+pub(crate) use windows::kill_freenet_service_processes;
 #[cfg(target_os = "windows")]
-fn check_no_system_flag_windows(system: bool) -> Result<()> {
-    if system {
-        anyhow::bail!(
-            "The --system flag is only supported on Linux.\n\
-             On Windows, use the default service commands without --system."
-        );
-    }
-    Ok(())
-}
-
-/// Stop and remove Freenet autostart. Kills running process, removes registry
-/// Run key, and cleans up any legacy scheduled task. Does not purge data.
-/// Returns true if Freenet was registered.
-#[cfg(target_os = "windows")]
-pub fn stop_and_remove_service(_system: bool) -> Result<bool> {
-    let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
-    let run_key = hkcu
-        .open_subkey_with_flags(
-            r"Software\Microsoft\Windows\CurrentVersion\Run",
-            winreg::enums::KEY_READ | winreg::enums::KEY_WRITE,
-        )
-        .context("Failed to open registry Run key")?;
-
-    let had_registry = run_key.delete_value("Freenet").is_ok();
-
-    // Kill the running Freenet service processes (wrapper + node child).
-    // Targets only the service's own processes by command line so an
-    // unrelated freenet.exe — e.g. the GUI installer — is never killed
-    // (issue #4205).
-    kill_freenet_service_processes();
-
-    // Also clean up any legacy scheduled task from older installs
-    let had_task = std::process::Command::new("schtasks")
-        .args(["/query", "/tn", "Freenet"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if had_task {
-        drop(
-            std::process::Command::new("schtasks")
-                .args(["/delete", "/tn", "Freenet", "/f"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status(),
-        );
-    }
-
-    Ok(had_registry || had_task)
-}
-
-#[cfg(target_os = "windows")]
-fn uninstall_service(system: bool, purge: bool, keep_data: bool) -> Result<()> {
-    check_no_system_flag_windows(system)?;
-
-    stop_and_remove_service(system)?;
-
-    println!("Freenet autostart uninstalled.");
-
-    if should_purge(purge, keep_data)? {
-        purge_data_dirs(false)?;
-        println!("All Freenet data, config, and logs removed.");
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn service_status(system: bool) -> Result<()> {
-    check_no_system_flag_windows(system)?;
-
-    let hkcu = winreg::RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
-    let registered = hkcu
-        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run")
-        .ok()
-        .and_then(|k| k.get_value::<String, _>("Freenet").ok())
-        .is_some();
-
-    if registered {
-        println!("Freenet autostart is registered.");
-        // Check if actually running
-        let running = std::process::Command::new("tasklist")
-            .args(["/fi", "imagename eq freenet.exe", "/fo", "csv", "/nh"])
-            .output()
-            .map(|o| {
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                stdout.contains("freenet.exe")
-            })
-            .unwrap_or(false);
-        if running {
-            println!("Freenet is currently running.");
-        } else {
-            println!("Freenet is not currently running.");
-        }
-    } else {
-        println!("Freenet autostart is not registered.");
-        std::process::exit(3);
-    }
-
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn start_service(system: bool) -> Result<()> {
-    check_no_system_flag_windows(system)?;
-
-    let exe_path = std::env::current_exe().context("Failed to get current executable path")?;
-
-    // Spawn the wrapper as a detached process that survives parent exit.
-    // CREATE_NEW_PROCESS_GROUP (0x200) + DETACHED_PROCESS (0x08) ensures
-    // the child is not killed when the parent's console or job object closes.
-    use std::os::windows::process::CommandExt;
-    const DETACHED_PROCESS: u32 = 0x00000008;
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-    std::process::Command::new(&exe_path)
-        .args(["service", "run-wrapper"])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
-        .spawn()
-        .context("Failed to start Freenet")?;
-
-    println!("Freenet started.");
-    println!("Open http://127.0.0.1:7509/ in your browser to view your Freenet dashboard.");
-
-    Ok(())
-}
-
-/// Strip the leading executable path from a Windows process command line,
-/// returning just the argument portion (everything after the program name).
-///
-/// The program path is normally quoted — both Rust's `Command` and the
-/// registry `Run` key quote it — in which case it can be stripped exactly.
-/// For an unquoted path we fall back to splitting on the first whitespace;
-/// that is only ambiguous for unquoted paths containing spaces, which
-/// Windows avoids for the processes Freenet itself spawns.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn command_line_args(cmdline: &str) -> &str {
-    let trimmed = cmdline.trim_start();
-    if let Some(after_open_quote) = trimmed.strip_prefix('"') {
-        after_open_quote
-            .find('"')
-            .map_or("", |close| after_open_quote[close + 1..].trim_start())
-    } else {
-        trimmed
-            .find(char::is_whitespace)
-            .map_or("", |space| trimmed[space..].trim_start())
-    }
-}
-
-/// Which Freenet service process a `freenet.exe` command line represents.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FreenetServiceProcess {
-    /// The `service run-wrapper` supervisor (also the Windows tray process).
-    Wrapper,
-    /// The `network` node child the wrapper supervises.
-    Node,
-}
-
-/// Classify a `freenet.exe` process from its full command line.
-///
-/// Matching is by the **subcommand prefix** — the first argument token after
-/// the executable path — not by scanning every token. A blanket token scan
-/// would misfire on a command line where `network` or `run-wrapper` appears
-/// as an option value or path component rather than the subcommand, e.g.
-/// `freenet local --config-dir network`.
-///
-/// Returns `None` for every other `freenet.exe` invocation, which must never
-/// be killed: the GUI installer (launched with no subcommand — issue #4205),
-/// `service stop`, `update`, or any directly-run `freenet` CLI command. Note
-/// that a node started manually via the top-level `freenet network`
-/// subcommand IS classified as `Node` — `service stop` is meant to stop a
-/// running node regardless of how it was launched.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn classify_freenet_process(cmdline: &str) -> Option<FreenetServiceProcess> {
-    let mut args = command_line_args(cmdline).split_whitespace();
-    match args.next()? {
-        "network" => Some(FreenetServiceProcess::Node),
-        "service" if args.next() == Some("run-wrapper") => Some(FreenetServiceProcess::Wrapper),
-        _ => None,
-    }
-}
-
-/// Parse the `<pid>\t<command line>` lines produced by the PowerShell process
-/// listing in `list_freenet_processes` into `(pid, command_line)` pairs.
-/// Lines that do not begin with a numeric PID are ignored.
-#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn parse_freenet_process_listing(stdout: &str) -> Vec<(u32, String)> {
-    stdout
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim_end_matches('\r');
-            let (pid, cmdline) = line.split_once('\t').unwrap_or((line, ""));
-            Some((pid.trim().parse::<u32>().ok()?, cmdline.to_string()))
-        })
-        .collect()
-}
-
-/// Enumerate `freenet.exe` processes and their command lines via PowerShell.
-///
-/// Uses `Get-CimInstance` rather than `wmic`, which is deprecated and no
-/// longer installed by default on recent Windows releases. Returns `None` if
-/// the process listing could not be obtained.
-///
-/// A process whose `CommandLine` cannot be read (owned by another user) is
-/// listed with an empty command line and so is never classified as a service
-/// process. The wrapper, node, and installer all run as the same user, so
-/// this never hides one of our own processes.
-///
-/// `.output()` captures stdout/stderr through fresh pipes and does not inherit
-/// stdin, so this spawn is safe even after `FreeConsole()` (see the spawn-site
-/// audit note on `run_wrapper`).
-#[cfg(target_os = "windows")]
-fn list_freenet_processes() -> Option<Vec<(u32, String)>> {
-    let output = std::process::Command::new("powershell")
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "Get-CimInstance Win32_Process -Filter \"Name='freenet.exe'\" | \
-             ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(parse_freenet_process_listing(&String::from_utf8_lossy(
-        &output.stdout,
-    )))
-}
-
-/// Force-terminate a process by PID via `taskkill`. Returns whether `taskkill`
-/// reported success.
-///
-/// All three standard handles are nulled so the spawn succeeds even when the
-/// caller has detached from its console via `FreeConsole()` — the auto-update
-/// restart path reaches here from the wrapper. See
-/// `.claude/rules/bug-prevention-patterns.md`.
-#[cfg(target_os = "windows")]
-fn taskkill_pid(pid: u32) -> bool {
-    std::process::Command::new("taskkill")
-        .args(["/f", "/pid", &pid.to_string()])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-/// Enumerate `freenet.exe` processes and `taskkill` every one classified as
-/// `kind`, excluding the current process. Returns the number terminated.
-#[cfg(target_os = "windows")]
-fn kill_freenet_processes_matching(kind: FreenetServiceProcess) -> usize {
-    let our_pid = std::process::id();
-    let Some(processes) = list_freenet_processes() else {
-        return 0;
-    };
-    let mut killed = 0;
-    for (pid, cmdline) in processes {
-        if pid != our_pid && classify_freenet_process(&cmdline) == Some(kind) && taskkill_pid(pid) {
-            killed += 1;
-        }
-    }
-    killed
-}
-
-/// Stop the running Freenet service — the `service run-wrapper` supervisor and
-/// the `network` node child it manages.
-///
-/// Unlike a blanket `taskkill /im freenet.exe`, this targets only the
-/// service's own processes (classified by command line), so it never kills an
-/// unrelated `freenet.exe` that merely shares the image name: the GUI
-/// installer (issue #4205), a concurrent `freenet` CLI command, or the caller
-/// itself.
-///
-/// Wrappers are killed first, then nodes in a short re-enumerating loop. Only
-/// a live wrapper spawns `network` children, and `taskkill /f` merely
-/// *requests* termination (`TerminateProcess` is asynchronous), so a wrapper
-/// can briefly outlive the wrapper pass — long enough to spawn a node the
-/// first node enumeration missed. Each loop pass re-enumerates; once no
-/// wrapper this sweep terminated is still alive, the node set is stable. The
-/// loop stops as soon as a pass kills nothing — everything is gone, or the
-/// remainder is unkillable and retrying will not help — and is bounded to 3
-/// passes (200ms apart, comfortably over normal `TerminateProcess` latency)
-/// so an unkillable process cannot hang the caller.
-///
-/// Known limitation: a wrapper mid-self-update can `spawn_new_wrapper` inside
-/// its own async-termination window; that successor is not re-enumerated and
-/// may survive. This matches the previous blanket `taskkill`'s exposure and
-/// requires a self-update to coincide with a stop to the millisecond.
-///
-/// Returns the count of successful `taskkill` requests — which counts a node
-/// re-killed across passes more than once, so callers only test `> 0`. A `0`
-/// result means nothing was running, the process listing was unavailable, or
-/// every `taskkill` failed; callers treat all three as "nothing was stopped".
-#[cfg(target_os = "windows")]
-pub(crate) fn kill_freenet_service_processes() -> usize {
-    let mut killed = kill_freenet_processes_matching(FreenetServiceProcess::Wrapper);
-    for _ in 0..3 {
-        let nodes = kill_freenet_processes_matching(FreenetServiceProcess::Node);
-        killed += nodes;
-        if nodes == 0 {
-            break;
-        }
-        // Give a still-dying wrapper time to finish so a node it respawns is
-        // visible to the next enumeration.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-    killed
-}
-
-#[cfg(target_os = "windows")]
-fn stop_service(system: bool) -> Result<()> {
-    check_no_system_flag_windows(system)?;
-
-    if kill_freenet_service_processes() > 0 {
-        println!("Freenet stopped.");
-        Ok(())
-    } else {
-        anyhow::bail!("Failed to stop Freenet. It may not be running.")
-    }
-}
-
-#[cfg(target_os = "windows")]
-fn restart_service(system: bool) -> Result<()> {
-    check_no_system_flag_windows(system)?;
-    drop(stop_service(false));
-    // Give it a moment to stop
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    start_service(false)
-}
-
-#[cfg(target_os = "windows")]
-fn service_logs(error_only: bool) -> Result<()> {
-    use freenet::tracing::tracer::get_log_dir;
-    use std::time::Duration;
-
-    let log_dir = get_log_dir().context(
-        "Could not determine log directory. \
-         Ensure Freenet has been run at least once via 'freenet service run-wrapper'.",
-    )?;
-
-    let base_name = if error_only {
-        "freenet.error"
-    } else {
-        "freenet"
-    };
-
-    // Also check the wrapper log (now date-rotated: freenet-wrapper.YYYY-MM-DD.log)
-    let wrapper_log = find_latest_log_file(&log_dir, "freenet-wrapper");
-
-    let mut current_log = match find_latest_log_file(&log_dir, base_name) {
-        Some(log_path) => {
-            println!("Log file: {}", log_path.display());
-            if let Some(ref wl) = wrapper_log {
-                println!("Wrapper log: {}", wl.display());
-            }
-            log_path
-        }
-        None => {
-            if let Some(ref wl) = wrapper_log {
-                println!("No node logs found, showing wrapper log:");
-                let status = std::process::Command::new("powershell")
-                    .args([
-                        "-Command",
-                        &format!("Get-Content -Path '{}' -Tail 50 -Wait", wl.display()),
-                    ])
-                    .status()
-                    .context("Failed to open wrapper log")?;
-                std::process::exit(status.code().unwrap_or(1));
-            } else {
-                anyhow::bail!(
-                    "No log files found in {}.\n\
-                     Ensure Freenet has been run at least once.",
-                    log_dir.display()
-                );
-            }
-        }
-    };
-
-    println!("Press Ctrl+C to stop.\n");
-
-    loop {
-        let mut child = std::process::Command::new("powershell")
-            .args([
-                "-Command",
-                &format!(
-                    "Get-Content -Path '{}' -Tail 50 -Wait",
-                    current_log.display()
-                ),
-            ])
-            .spawn()
-            .context("Failed to spawn PowerShell for log tailing")?;
-
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    if !status.success() {
-                        // Fallback: open in notepad
-                        drop(
-                            std::process::Command::new("notepad")
-                                .arg(&current_log)
-                                .spawn(),
-                        );
-                    }
-                    std::process::exit(status.code().unwrap_or(1));
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    drop(child.kill());
-                    drop(child.wait());
-                    anyhow::bail!("Error waiting on PowerShell process: {e}");
-                }
-            }
-
-            std::thread::sleep(Duration::from_secs(5));
-
-            if let Some(newer_log) = find_latest_log_file(&log_dir, base_name) {
-                if newer_log != current_log {
-                    println!("\n--- Log rotated to: {} ---\n", newer_log.display());
-                    drop(child.kill());
-                    drop(child.wait());
-                    current_log = newer_log;
-                    break;
-                }
-            }
-        }
-    }
-}
+pub use windows::stop_and_remove_service;
 
 // Fallback for unsupported platforms
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -4630,6 +412,52 @@ fn service_logs(_error_only: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression guard for the service.rs submodule split: it dropped
+    /// `spawn_first_run_dashboard_opener` entirely (only the call site
+    /// survived) and left several Windows-only items unimported, breaking the
+    /// Windows build. Linux CI compiles none of those `#[cfg(windows)]` paths,
+    /// so the breakage shipped to `main` silently. These source-scrape pins run
+    /// on every platform and fail fast if the Windows-critical wiring is
+    /// dropped again.
+    #[test]
+    fn windows_first_run_wiring_is_present() {
+        let wrapper = include_str!("service/wrapper.rs");
+        assert!(
+            wrapper.contains("fn spawn_first_run_dashboard_opener("),
+            "wrapper.rs must define spawn_first_run_dashboard_opener — the split \
+             dropped it, breaking the Windows build."
+        );
+        assert!(
+            wrapper.contains("use super::single_instance::FIRST_RUN_OPENER_SPAWNED;"),
+            "wrapper.rs must import FIRST_RUN_OPENER_SPAWNED from single_instance."
+        );
+        let windows = include_str!("service/windows.rs");
+        assert!(
+            windows.contains("use super::log_utils::find_latest_log_file;"),
+            "windows.rs must import find_latest_log_file from log_utils."
+        );
+    }
+
+    // Pull test-helper functions from submodules that are not re-exported at the
+    // service.rs level (they are pub(super) in their submodule, making them
+    // visible here via explicit `use`).
+    #[allow(unused_imports)]
+    use super::launch_at_login::*;
+    #[allow(unused_imports)]
+    use super::linux::*;
+    #[allow(unused_imports)]
+    use super::log_utils::*;
+    #[allow(unused_imports)]
+    use super::macos::*;
+    #[allow(unused_imports)]
+    use super::purge::*;
+    #[allow(unused_imports)]
+    use super::single_instance::*;
+    #[allow(unused_imports)]
+    use super::windows::*;
+    #[allow(unused_imports)]
+    use super::wrapper::*;
     use std::path::PathBuf;
 
     #[test]
@@ -6768,6 +2596,331 @@ echo "RC=$?"
         assert_eq!(state.backoff_secs, WRAPPER_INITIAL_BACKOFF_SECS);
     }
 
+    // ── Stuck-wrapper detection tests (#4382) ──
+
+    #[test]
+    fn test_stuck_fires_once_at_threshold_on_repeated_identical_failure() {
+        let mut state = WrapperState::new();
+        // First two identical crashes: below threshold, no stuck signal.
+        for expected_streak in 1..WRAPPER_STUCK_NOTIFY_THRESHOLD {
+            next_wrapper_action(&mut state, 1, false, None);
+            assert!(
+                !state.stuck_just_crossed,
+                "should not fire at streak {expected_streak}"
+            );
+            assert_eq!(state.identical_failure_streak, expected_streak);
+        }
+        // The Nth identical crash crosses the threshold exactly once.
+        next_wrapper_action(&mut state, 1, false, None);
+        assert!(state.stuck_just_crossed, "must fire at threshold");
+        assert_eq!(
+            state.identical_failure_streak,
+            WRAPPER_STUCK_NOTIFY_THRESHOLD
+        );
+        // Subsequent identical crashes must NOT re-fire (once per episode).
+        next_wrapper_action(&mut state, 1, false, None);
+        assert!(!state.stuck_just_crossed, "must not re-fire after crossing");
+        assert_eq!(
+            state.identical_failure_streak,
+            WRAPPER_STUCK_NOTIFY_THRESHOLD + 1
+        );
+    }
+
+    #[test]
+    fn test_stuck_streak_resets_when_failure_cause_changes() {
+        let mut state = WrapperState::new();
+        // Two crashes with code 1, then a different code resets the streak.
+        next_wrapper_action(&mut state, 1, false, None);
+        next_wrapper_action(&mut state, 1, false, None);
+        assert_eq!(state.identical_failure_streak, 2);
+        next_wrapper_action(&mut state, 7, false, None);
+        assert_eq!(state.identical_failure_streak, 1, "new cause resets streak");
+        assert!(!state.stuck_just_crossed);
+    }
+
+    #[test]
+    fn test_stuck_signature_distinguishes_port_conflict() {
+        let mut state = WrapperState::new();
+        // Same exit code but different port-conflict flag = different signature.
+        next_wrapper_action(&mut state, 1, true, None);
+        next_wrapper_action(&mut state, 1, true, None);
+        assert_eq!(state.identical_failure_streak, 2);
+        next_wrapper_action(&mut state, 1, false, None);
+        assert_eq!(
+            state.identical_failure_streak, 1,
+            "port-conflict flag is part of the signature"
+        );
+    }
+
+    #[test]
+    fn test_stuck_port_conflict_loop_fires_at_threshold() {
+        // Repeated exit-43-style port conflicts (the #3967 stale-orphan
+        // signature) must trip the detector even though the early KillAndRetry
+        // path returns before the generic backoff arm.
+        let mut state = WrapperState::new();
+        let mut fired = 0;
+        for _ in 0..WRAPPER_STUCK_NOTIFY_THRESHOLD {
+            next_wrapper_action(&mut state, 1, true, None);
+            if state.stuck_just_crossed {
+                fired += 1;
+            }
+        }
+        assert_eq!(fired, 1, "stuck signal fires exactly once for port loop");
+    }
+
+    #[test]
+    fn test_stuck_streak_cleared_by_clean_exit() {
+        let mut state = WrapperState::new();
+        next_wrapper_action(&mut state, 1, false, None);
+        next_wrapper_action(&mut state, 1, false, None);
+        assert_eq!(state.identical_failure_streak, 2);
+        // Clean exit (code 0) resets the streak so a later failure starts fresh.
+        next_wrapper_action(&mut state, 0, false, None);
+        assert_eq!(state.identical_failure_streak, 0);
+        assert!(state.last_failure_signature.is_none());
+    }
+
+    #[test]
+    fn test_stuck_streak_cleared_by_successful_update() {
+        let mut state = WrapperState::new();
+        next_wrapper_action(&mut state, 1, false, None);
+        next_wrapper_action(&mut state, 1, false, None);
+        next_wrapper_action(&mut state, 42, false, Some(true));
+        assert_eq!(state.identical_failure_streak, 0);
+        assert!(state.last_failure_signature.is_none());
+    }
+
+    #[test]
+    fn test_stuck_status_file_roundtrip_and_clear() {
+        let tmp = tempfile::tempdir().unwrap();
+        let status = StuckWrapperStatus::new(43, true, WRAPPER_STUCK_NOTIFY_THRESHOLD);
+        write_stuck_status_file(tmp.path(), &status);
+
+        let path = tmp.path().join(STUCK_STATUS_FILE_NAME);
+        assert!(path.exists(), "status file must be written");
+        let json = std::fs::read_to_string(&path).unwrap();
+        let parsed: StuckWrapperStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, status);
+        assert_eq!(parsed.failure_count, WRAPPER_STUCK_NOTIFY_THRESHOLD);
+        assert!(parsed.is_port_conflict);
+        assert!(
+            parsed.recovery_hint.contains("freenet service stop"),
+            "hint must give the recovery command"
+        );
+
+        // Clearing removes the file; clearing again (missing file) is a no-op.
+        clear_stuck_status_file(tmp.path());
+        assert!(!path.exists(), "status file must be cleared on recovery");
+        clear_stuck_status_file(tmp.path());
+    }
+
+    #[test]
+    fn test_stuck_status_messages_differ_by_cause() {
+        let port = StuckWrapperStatus::new(43, true, 3);
+        assert!(port.last_error.contains("port"));
+        assert!(port.recovery_hint.contains("port"));
+
+        let crash = StuckWrapperStatus::new(101, false, 3);
+        assert!(!crash.is_port_conflict);
+        assert!(crash.last_error.contains("exit 101"));
+        assert!(crash.recovery_hint.contains("crashing"));
+    }
+
+    #[test]
+    fn test_applescript_escape_quotes_and_backslashes() {
+        assert_eq!(applescript_escape("plain"), "plain");
+        assert_eq!(applescript_escape("a\"b"), "a\\\"b");
+        assert_eq!(applescript_escape("a\\b"), "a\\\\b");
+        // Backslash escaped before quote so an injected `\"` can't break out.
+        assert_eq!(applescript_escape("\\\""), "\\\\\\\"");
+    }
+
+    // ── Exit-43 / cross-process persistence tests (#4382 review BLOCKING) ──
+
+    #[test]
+    fn test_exit_43_records_port_conflict_signature() {
+        // The DOMINANT #3967 manifestation: the child sees a stale orphan on the
+        // port and exits 43. Pre-fix this arm recorded NO signature; now it must
+        // record a port-conflict signature so the detector can see it. Even
+        // though the child stderr lacks "already in use" (is_port_conflict=false
+        // from the caller), the recorded signature must force the port-conflict
+        // flag for honest messaging.
+        let mut state = WrapperState::new();
+        let action = next_wrapper_action(&mut state, 43, false, None);
+        assert_eq!(action, WrapperAction::Exit);
+        assert_eq!(
+            state.last_failure_signature,
+            Some(FailureSignature {
+                exit_code: 43,
+                is_port_conflict: true,
+            }),
+            "exit 43 must record a forced port-conflict signature"
+        );
+        assert_eq!(state.identical_failure_streak, 1);
+    }
+
+    #[test]
+    fn test_persistent_streak_accumulates_and_fires_once_at_threshold() {
+        // Simulate N consecutive exit-43 *relaunches*, each a fresh process
+        // (prior loaded from disk, in-memory state irrelevant). Only the
+        // relaunch whose count reaches the threshold fires.
+        let mut prior: Option<PersistentStuckStreak> = None;
+        let mut fired = 0;
+        for expected in 1..=(WRAPPER_STUCK_NOTIFY_THRESHOLD + 2) {
+            let (record, just_crossed) =
+                persistent_streak_action(prior.as_ref(), 43, true, "1.2.3", 1000 + expected as u64);
+            assert_eq!(record.count, expected);
+            if just_crossed {
+                fired += 1;
+                assert_eq!(expected, WRAPPER_STUCK_NOTIFY_THRESHOLD);
+            }
+            prior = Some(record);
+        }
+        assert_eq!(fired, 1, "fires exactly once across relaunches");
+    }
+
+    #[test]
+    fn test_persistent_streak_resets_on_cause_change() {
+        let prior = PersistentStuckStreak {
+            exit_code: 43,
+            is_port_conflict: true,
+            version: "1.2.3".to_string(),
+            count: 2,
+            updated_unix_secs: 1000,
+        };
+        // Different exit code = different cause = fresh episode.
+        let (record, just_crossed) =
+            persistent_streak_action(Some(&prior), 101, false, "1.2.3", 1001);
+        assert_eq!(record.count, 1, "cause change resets streak");
+        assert!(!just_crossed);
+    }
+
+    #[test]
+    fn test_persistent_streak_resets_on_version_change() {
+        let prior = PersistentStuckStreak {
+            exit_code: 43,
+            is_port_conflict: true,
+            version: "1.2.3".to_string(),
+            count: WRAPPER_STUCK_NOTIFY_THRESHOLD - 1,
+            updated_unix_secs: 1000,
+        };
+        // New binary version = different binary = fresh episode (must NOT cross
+        // the threshold off a stale prior version's count).
+        let (record, just_crossed) =
+            persistent_streak_action(Some(&prior), 43, true, "1.2.4", 1001);
+        assert_eq!(record.count, 1, "version change resets streak");
+        assert!(!just_crossed);
+    }
+
+    #[test]
+    fn test_persistent_streak_resets_on_ttl_expiry() {
+        let prior = PersistentStuckStreak {
+            exit_code: 43,
+            is_port_conflict: true,
+            version: "1.2.3".to_string(),
+            count: WRAPPER_STUCK_NOTIFY_THRESHOLD - 1,
+            updated_unix_secs: 1000,
+        };
+        // Same cause + version but the prior record is older than the TTL: a
+        // stale file must NOT count toward the threshold (GC/TTL discipline).
+        let now = 1000 + STUCK_STREAK_TTL_SECS + 1;
+        let (record, just_crossed) = persistent_streak_action(Some(&prior), 43, true, "1.2.3", now);
+        assert_eq!(record.count, 1, "stale streak (past TTL) resets");
+        assert!(!just_crossed);
+
+        // Exactly at the TTL boundary still counts as continuing.
+        let at_boundary = 1000 + STUCK_STREAK_TTL_SECS;
+        let (record, _) = persistent_streak_action(Some(&prior), 43, true, "1.2.3", at_boundary);
+        assert_eq!(
+            record.count, WRAPPER_STUCK_NOTIFY_THRESHOLD,
+            "boundary continues"
+        );
+    }
+
+    #[test]
+    fn test_persistent_streak_file_roundtrip_and_clear() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            read_stuck_streak_file(tmp.path()).is_none(),
+            "missing file reads as no prior streak"
+        );
+        let record = PersistentStuckStreak {
+            exit_code: 43,
+            is_port_conflict: true,
+            version: "1.2.3".to_string(),
+            count: 2,
+            updated_unix_secs: 1234,
+        };
+        write_stuck_streak_file(tmp.path(), &record);
+        let read = read_stuck_streak_file(tmp.path()).expect("must read back");
+        assert_eq!(read, record);
+
+        clear_stuck_streak_file(tmp.path());
+        assert!(
+            read_stuck_streak_file(tmp.path()).is_none(),
+            "cleared file reads as none"
+        );
+        // Clearing a missing file is a no-op.
+        clear_stuck_streak_file(tmp.path());
+    }
+
+    #[test]
+    fn test_read_stuck_streak_file_tolerates_malformed_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(STUCK_STREAK_FILE_NAME), "{not json").unwrap();
+        assert!(
+            read_stuck_streak_file(tmp.path()).is_none(),
+            "malformed file must read as no prior streak, not panic"
+        );
+    }
+
+    // ── stuck_loop_action pure-decision tests (#4382 review NIT) ──
+
+    #[test]
+    fn test_stuck_loop_action_writes_on_threshold_cross() {
+        // Write takes precedence regardless of the other flags.
+        assert_eq!(
+            stuck_loop_action(true, false, WRAPPER_STUCK_NOTIFY_THRESHOLD),
+            StuckLoopAction::Write
+        );
+        assert_eq!(stuck_loop_action(true, true, 0), StuckLoopAction::Write);
+    }
+
+    #[test]
+    fn test_stuck_loop_action_clears_on_recovery() {
+        // streak reset to 0 (clean exit / successful update) → clear.
+        assert_eq!(stuck_loop_action(false, false, 0), StuckLoopAction::Clear);
+    }
+
+    #[test]
+    fn test_stuck_loop_action_clears_on_cause_change_midloop() {
+        // The #4382 review MINOR: cause changes mid-episode, streak==1, not a
+        // recovery — the stale file for the prior cause must still be cleared.
+        assert_eq!(stuck_loop_action(false, true, 1), StuckLoopAction::Clear);
+    }
+
+    #[test]
+    fn test_stuck_loop_action_none_when_progressing_same_cause() {
+        // Below threshold, same cause, no change: leave the file alone.
+        assert_eq!(stuck_loop_action(false, false, 1), StuckLoopAction::None);
+        assert_eq!(stuck_loop_action(false, false, 2), StuckLoopAction::None);
+    }
+
+    #[test]
+    fn test_signature_change_flag_set_only_on_change_not_first_failure() {
+        let mut state = WrapperState::new();
+        // First failure: None -> Some, no stale file to clear.
+        next_wrapper_action(&mut state, 1, false, None);
+        assert!(!state.signature_changed, "first failure is not a change");
+        // Same cause again: still no change.
+        next_wrapper_action(&mut state, 1, false, None);
+        assert!(!state.signature_changed);
+        // Different cause: change flagged.
+        next_wrapper_action(&mut state, 7, false, None);
+        assert!(state.signature_changed, "cause change must flag");
+        assert_eq!(state.identical_failure_streak, 1);
+    }
+
     /// Regression test for #3716: tray actions were silently dropped during
     /// backoff sleep. Verify the sleep function maps each action correctly.
     #[test]
@@ -6961,7 +3114,7 @@ echo "RC=$?"
     /// than silently shipping the regression to Windows users.
     #[test]
     fn spawn_update_command_must_null_all_three_standard_handles() {
-        let src = include_str!("service.rs");
+        let src = include_str!("service/wrapper.rs");
         let (_, after_fn_start) = src
             .split_once("fn spawn_update_command(")
             .expect("spawn_update_command definition not found");
@@ -7000,12 +3153,19 @@ echo "RC=$?"
     /// failure to Windows.
     #[test]
     fn taskkill_pid_must_null_all_three_standard_handles() {
-        let src = include_str!("service.rs");
+        let src = include_str!("service/windows.rs");
         let (_, after_fn_start) = src
             .split_once("fn taskkill_pid(")
             .expect("taskkill_pid definition not found");
-        let (body, _) = after_fn_start
-            .split_once("\nfn ")
+        // Locate the end of taskkill_pid by finding the next top-level
+        // function. In the submodule file the next fn may carry a pub
+        // visibility modifier, so try all common patterns in order.
+        let body = after_fn_start
+            .split_once("\npub(super) fn ")
+            .or_else(|| after_fn_start.split_once("\npub(crate) fn "))
+            .or_else(|| after_fn_start.split_once("\npub fn "))
+            .or_else(|| after_fn_start.split_once("\nfn "))
+            .map(|(b, _)| b)
             .expect("could not locate end of taskkill_pid");
         let code_only: String = body
             .lines()
@@ -7047,7 +3207,7 @@ echo "RC=$?"
         let plist_path = home.join("org.freenet.node.plist");
 
         for path in [&wrapper_path, &hash_path, &bak_path, &plist_path] {
-            fs::write(path, b"x").expect("write fixture file");
+            fs::write(path, b"x" as &[u8]).expect("write fixture file");
             assert!(path.exists(), "fixture {} should exist", path.display());
         }
 

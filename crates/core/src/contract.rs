@@ -9,6 +9,7 @@ use freenet_stdlib::prelude::*;
 
 mod executor;
 mod fair_queue;
+pub(crate) use fair_queue::Priority;
 pub(crate) mod governance;
 mod handler;
 pub mod storages;
@@ -24,9 +25,9 @@ pub(crate) use executor::{
 pub use executor::mock_runtime::{clear_crdt_contracts, is_crdt_contract, register_crdt_contract};
 pub(crate) use handler::{
     ClientResponsesReceiver, ClientResponsesSender, ContractHandler, ContractHandlerChannel,
-    ContractHandlerEvent, NetworkContractHandler, SenderHalve, SessionMessage, StashedResponder,
-    StoreResponse, WaitingResolution, WaitingTransaction, client_responses_channel,
-    contract_handler_channel,
+    ContractHandlerEvent, NetworkContractHandler, RedactedToken, SenderHalve, SessionMessage,
+    StashedResponder, StoreResponse, WaitingResolution, WaitingTransaction,
+    client_responses_channel, contract_handler_channel,
     in_memory::{
         MemoryContractHandler, MockWasmContractHandler, MockWasmHandlerBuilder,
         SimulationContractHandler, SimulationHandlerBuilder,
@@ -42,6 +43,7 @@ use tracing::Instrument;
 use self::executor::DelegateNotificationReceiver;
 use self::user_input::{CallerIdentity, UserInputPrompter};
 use crate::config::GlobalExecutor;
+use crate::wasm_runtime::UserSecretContext;
 
 /// Maximum iterations when handling contract requests to prevent infinite loops
 const MAX_CONTRACT_REQUEST_ITERATIONS: usize = 100;
@@ -405,6 +407,7 @@ async fn handle_delegate_with_contract_requests<CH, P>(
     contract_handler: &mut CH,
     initial_req: DelegateRequest<'static>,
     origin_contract: Option<&ContractInstanceId>,
+    user_context: Option<&UserSecretContext>,
     delegate_key: &DelegateKey,
     prompter: &P,
 ) -> Vec<OutboundDelegateMsg>
@@ -441,7 +444,7 @@ where
         // Execute the delegate request
         let values = match contract_handler
             .executor()
-            .execute_delegate_request(current_req, origin_contract, None)
+            .execute_delegate_request(current_req, origin_contract, None, user_context)
             .await
         {
             Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse { key: _, values }) => {
@@ -822,7 +825,15 @@ where
                 };
                 match contract_handler
                     .executor()
-                    .execute_delegate_request(target_req, None, Some(delegate_key))
+                    // Inter-delegate hop: `user_context = None`. A
+                    // delegate-to-delegate message does NOT carry the
+                    // originating connection's per-user secret namespace — the
+                    // target delegate's secrets are its own, scoped to whatever
+                    // (if any) user context its own connections present. This
+                    // keeps the per-user namespace bound to the connection
+                    // boundary, not propagated transitively through delegate
+                    // messages (part of the #4381 unforgeability invariant).
+                    .execute_delegate_request(target_req, None, Some(delegate_key), None)
                     .await
                 {
                     Ok(freenet_stdlib::client_api::HostResponse::DelegateResponse {
@@ -1038,7 +1049,7 @@ where
         // single-digit microseconds even at peak load.
         for _ in 0..fair_queue::MAX_DRAIN_BATCH {
             match contract_handler.channel().try_recv_from_sender()? {
-                Some((id, event)) => {
+                Some((id, event, priority)) => {
                     // Process ClientDisconnect inline — it's a lightweight cleanup
                     // operation that should never be delayed or compete with
                     // DelegateRequest events for the default queue's limited capacity.
@@ -1048,10 +1059,14 @@ where
                         contract_handler.channel().drop_waiting_response(id);
                         continue;
                     }
-                    if let Err(rejected) = fair_queue.try_push(id, event) {
-                        track_pending_reclamation_if_evict(&mut contract_handler, &rejected);
-                        send_queue_full_response(contract_handler.channel(), rejected).await;
-                    }
+                    push_with_background_eviction(
+                        &mut contract_handler,
+                        &mut fair_queue,
+                        id,
+                        event,
+                        priority,
+                    )
+                    .await;
                 }
                 None => break,
             }
@@ -1094,11 +1109,15 @@ where
         // or a delegate notification.
         tokio::select! {
             result = contract_handler.channel().recv_from_sender() => {
-                let (id, event) = result?;
-                if let Err(rejected) = fair_queue.try_push(id, event) {
-                    track_pending_reclamation_if_evict(&mut contract_handler, &rejected);
-                    send_queue_full_response(contract_handler.channel(), rejected).await;
-                }
+                let (id, event, priority) = result?;
+                push_with_background_eviction(
+                    &mut contract_handler,
+                    &mut fair_queue,
+                    id,
+                    event,
+                    priority,
+                )
+                .await;
             }
             Some(resume) = resume_rx.recv() => {
                 handle_deferred_resume(&mut contract_handler, &mut deferral_ctx, resume).await?;
@@ -1514,6 +1533,63 @@ where
     })
 }
 
+/// Push an event into the fair queue, shedding queued `Background` work to make
+/// room when a higher-priority (foreground) event is rejected *for lack of
+/// global capacity* (#4534).
+///
+/// Eviction is attempted ONLY when ALL of:
+/// - the rejected event is foreground (`> Background`), and
+/// - the rejection reason is [`RejectReason::GlobalCapacity`] — a
+///   [`RejectReason::PerContract`] rejection cannot be helped by evicting
+///   Background (a different tier/contract), so we skip the wasted shed and the
+///   identical-failure retry (review of #4534), and
+/// - there is queued `Background` to shed.
+///
+/// The evicted background events get best-effort queue-full responses (they
+/// re-emit on their next cycle), then the foreground event is retried once. If
+/// it still cannot be admitted (or eviction did not apply), it gets the normal
+/// queue-full response.
+async fn push_with_background_eviction<CH>(
+    contract_handler: &mut CH,
+    fair_queue: &mut fair_queue::FairEventQueue,
+    id: handler::EventId,
+    event: ContractHandlerEvent,
+    priority: fair_queue::Priority,
+) where
+    CH: ContractHandler + Send + 'static,
+{
+    let rejected = match fair_queue.try_push(id, event, priority) {
+        Ok(()) => return,
+        Err(rejected) => rejected,
+    };
+
+    let eviction_can_help = priority > fair_queue::Priority::Background
+        && rejected.reason == fair_queue::RejectReason::GlobalCapacity
+        && fair_queue.background_queued() > 0;
+
+    if eviction_can_help {
+        // Reclaim at most the reserve's worth of slots in one shot — enough to
+        // admit a burst of client work without unbounded eviction churn.
+        let evicted = fair_queue.evict_background(fair_queue::CLIENT_LOCAL_RESERVE);
+        for shed in evicted {
+            track_pending_reclamation_if_evict(contract_handler, &shed);
+            send_queue_full_response(contract_handler.channel(), Box::new(shed)).await;
+        }
+        // Retry the foreground push now that space was freed.
+        match fair_queue.try_push(rejected.id, rejected.event, rejected.priority) {
+            Ok(()) => return,
+            Err(still_rejected) => {
+                track_pending_reclamation_if_evict(contract_handler, &still_rejected);
+                send_queue_full_response(contract_handler.channel(), still_rejected).await;
+                return;
+            }
+        }
+    }
+
+    track_pending_reclamation_if_evict(contract_handler, &rejected);
+    send_queue_full_response(contract_handler.channel(), rejected).await;
+}
+
 /// When the fair queue rejects an `EvictContract` event (queue-full),
 /// the hosting-cache entry is already gone — no later sweep would
 /// re-emit on its own. Record the key in the pending-reclamation retry
@@ -1582,12 +1658,19 @@ async fn send_queue_full_response(
             key: *key,
             delta: Err(make_err()),
         },
+        // Export has a typed response variant, so deliver the queue-full error
+        // through it (the HTTP export handler awaits this exact variant) rather
+        // than dropping the sender and surfacing a generic NoEvHandlerResponse.
+        ContractHandlerEvent::ExportUserSecrets { .. } => {
+            ContractHandlerEvent::ExportUserSecretsResponse(Err(make_err()))
+        }
         // Events without error response variants: drop the oneshot sender to
         // unblock the caller. The caller's receiver will get a RecvError, which
         // maps to ContractError::NoEvHandlerResponse. This prevents leaking
         // entries in the waiting_response map.
         ContractHandlerEvent::DelegateRequest { .. }
         | ContractHandlerEvent::DelegateResponse(_)
+        | ContractHandlerEvent::ExportUserSecretsResponse(_)
         | ContractHandlerEvent::PutResponse { .. }
         | ContractHandlerEvent::GetResponse { .. }
         | ContractHandlerEvent::UpdateResponse { .. }
@@ -1653,6 +1736,10 @@ async fn handle_delegate_notification<CH, P>(
     let outbound = handle_delegate_with_contract_requests(
         contract_handler,
         req,
+        None,
+        // Contract-state-change notification: not driven by a client
+        // connection, so there is no user token and no per-user secret
+        // namespace. Secrets stay `SecretScope::Local`.
         None,
         &delegate_key,
         prompter,
@@ -2023,11 +2110,16 @@ where
         ContractHandlerEvent::DelegateRequest {
             req,
             origin_contract,
+            user_context,
         } => {
             let delegate_key = req.key().clone();
             tracing::debug!(
                 delegate_key = %delegate_key,
                 ?origin_contract,
+                // `user_context`'s Debug redacts the dek_secret; logging the
+                // (non-secret) user_id here is safe and useful for tracing
+                // which namespace a hosted-mode request touched.
+                ?user_context,
                 "Processing delegate request"
             );
 
@@ -2036,6 +2128,7 @@ where
                 contract_handler,
                 req,
                 origin_contract.as_ref(),
+                user_context.as_ref(),
                 &delegate_key,
                 prompter,
             )
@@ -2052,6 +2145,34 @@ where
                     error = %error,
                     delegate_key = %delegate_key,
                     "Failed to send DELEGATE response (client may have disconnected)"
+                );
+            }
+        }
+        ContractHandlerEvent::ExportUserSecrets {
+            user_context,
+            token,
+        } => {
+            // Hosted-mode export (P3-live of #4381). Runs on the executor (which
+            // owns the SecretsStore) and returns the encrypted bundle bytes.
+            // `user_context` is the forge-proof per-user namespace derived at the
+            // connection boundary; the export reads ONLY that user's scope. Log
+            // only the non-secret user_id — never the token or bundle bytes.
+            tracing::debug!(
+                user_id = ?user_context.user_id(),
+                "Processing hosted-mode secret export request"
+            );
+            let result = contract_handler
+                .executor()
+                .export_user_secrets(&user_context, token.expose())
+                .await;
+            if let Err(error) = contract_handler
+                .channel()
+                .send_to_sender(id, ContractHandlerEvent::ExportUserSecretsResponse(result))
+                .await
+            {
+                tracing::debug!(
+                    error = %error,
+                    "Failed to send EXPORT response (client may have disconnected)"
                 );
             }
         }
@@ -2195,6 +2316,7 @@ where
             contract_handler.channel().drop_waiting_response(id);
         }
         ContractHandlerEvent::DelegateResponse(_)
+        | ContractHandlerEvent::ExportUserSecretsResponse(_)
         | ContractHandlerEvent::PutResponse { .. }
         | ContractHandlerEvent::GetResponse { .. }
         | ContractHandlerEvent::UpdateResponse { .. }
@@ -2517,7 +2639,7 @@ mod tests {
         });
 
         // Receive on the handler side (populates waiting_response)
-        let (id, received_event) =
+        let (id, received_event, priority) =
             tokio::time::timeout(Duration::from_millis(200), rcv_halve.recv_from_sender())
                 .await
                 .expect("timeout waiting for event")
@@ -2526,6 +2648,8 @@ mod tests {
         let rejected = Box::new(fair_queue::RejectedEvent {
             id,
             event: received_event,
+            priority,
+            reason: fair_queue::RejectReason::GlobalCapacity,
         });
 
         (rejected, handle)
@@ -2838,7 +2962,7 @@ mod tests {
         // so the two futures make progress cooperatively to completion.
         let send_fut = send_halve.send_to_handler(event);
         let recv_fut = async {
-            let (id, received) = handler
+            let (id, received, _priority) = handler
                 .channel()
                 .recv_from_sender()
                 .await
@@ -2875,7 +2999,7 @@ mod tests {
         };
         let send_fut = send_halve.send_to_handler(event);
         let recv_fut = async {
-            let (id, received) = handler
+            let (id, received, _priority) = handler
                 .channel()
                 .recv_from_sender()
                 .await

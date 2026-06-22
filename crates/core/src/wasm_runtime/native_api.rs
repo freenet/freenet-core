@@ -1,7 +1,9 @@
 //! Implementation of native API's exported and available in the WASM modules.
 
 use dashmap::DashMap;
-use freenet_stdlib::prelude::{ContractInstanceId, ContractKey, DelegateKey, SecretsId};
+use freenet_stdlib::prelude::{
+    ContractInstanceId, ContractKey, DelegateKey, SecretsId, encode_secret_key_list,
+};
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -11,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use super::contract_store::ContractStore;
 use super::delegate_store::DelegateStore;
 use super::runtime::InstanceInfo;
-use super::secrets_store::SecretsStore;
+use super::secrets_store::{SecretScope, SecretsStore, UserSecretContext};
 use crate::contract::storages::Storage;
 
 /// This is a map of starting addresses of the instance memory space.
@@ -367,6 +369,19 @@ pub(super) struct DelegateCallEnv {
     secret_store: std::cell::UnsafeCell<*mut SecretsStore>,
     /// The delegate key, needed to scope secret access.
     pub delegate_key: DelegateKey,
+    /// Optional per-user secret namespace for this call, derived ONCE at the
+    /// WS connection boundary from the connection's user token (hosted mode,
+    /// P2 of #4381). When `Some`, the secret host functions
+    /// (`get_secret`/`set_secret`/`remove_secret`/`get_secret_len`) operate on
+    /// [`SecretScope::User`] keyed by this context; when `None` they use
+    /// [`SecretScope::Local`] — byte-for-byte the single-user behavior.
+    ///
+    /// This is OWNED (not a borrow) so the `dek_secret` it holds outlives every
+    /// secret call made during this `process()` invocation. It is supplied by
+    /// the runtime from the connection context and is NEVER settable from
+    /// inside the WASM sandbox, a delegate message, or any request body — that
+    /// is the unforgeability invariant of the per-user namespace.
+    user_context: Option<UserSecretContext>,
     /// Read-only pointer to the ContractStore for index lookups
     /// (ContractInstanceId → CodeHash). Valid only during synchronous process().
     contract_store: *const ContractStore,
@@ -455,11 +470,13 @@ impl DelegateCallEnv {
         delegate_store: &mut DelegateStore,
         creation_depth: u32,
         origin_contracts: Vec<ContractInstanceId>,
+        user_context: Option<UserSecretContext>,
     ) -> Self {
         Self {
             context,
             secret_store: std::cell::UnsafeCell::new(secret_store as *mut SecretsStore),
             delegate_key,
+            user_context,
             contract_store: contract_store as *const ContractStore,
             state_store_db,
             state_write_callback,
@@ -467,6 +484,19 @@ impl DelegateCallEnv {
             creation_depth,
             creations_this_call: std::cell::Cell::new(0),
             origin_contracts,
+        }
+    }
+
+    /// The [`SecretScope`] for this call's secret operations.
+    ///
+    /// Returns [`SecretScope::User`] (borrowing the connection's
+    /// [`UserSecretContext`]) when this call runs under a hosted-mode user
+    /// token, else [`SecretScope::Local`]. The borrow is tied to `&self`, so
+    /// the `dek_secret` is never copied out of the owned context.
+    fn secret_scope(&self) -> SecretScope<'_> {
+        match &self.user_context {
+            Some(ctx) => ctx.scope(),
+            None => SecretScope::Local,
         }
     }
 
@@ -1105,8 +1135,14 @@ pub(super) mod delegate_secrets {
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
-        // Look up the secret
-        match env.secret_store().get_secret(&env.delegate_key, &secret_id) {
+        // Look up the secret. The scope is `Local` for single-user nodes and
+        // `User` when this call runs under a hosted-mode user token (P2 of
+        // #4381). The scope comes solely from the connection-derived
+        // `user_context`, never from anything the delegate can influence.
+        match env
+            .secret_store()
+            .get_secret(&env.delegate_key, &secret_id, env.secret_scope())
+        {
             Ok(plaintext) => {
                 let len = plaintext.len();
                 if len > i32::MAX as usize {
@@ -1173,8 +1209,12 @@ pub(super) mod delegate_secrets {
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
-        // Look up the secret
-        match env.secret_store().get_secret(&env.delegate_key, &secret_id) {
+        // Look up the secret (scope per the connection's user_context; see
+        // get_secret_len).
+        match env
+            .secret_store()
+            .get_secret(&env.delegate_key, &secret_id, env.secret_scope())
+        {
             Ok(plaintext) => {
                 let secret_len = plaintext.len();
                 let out_len_usize = out_len as usize;
@@ -1289,9 +1329,10 @@ pub(super) mod delegate_secrets {
             unsafe { std::slice::from_raw_parts(val_src, val_len as usize) }.to_vec(),
         );
 
+        let scope = env.secret_scope();
         match env
             .secret_store_mut()
-            .store_secret(&env.delegate_key, &secret_id, value)
+            .store_secret(&env.delegate_key, &secret_id, scope, value)
         {
             Ok(()) => error_codes::SUCCESS,
             Err(e) => {
@@ -1341,7 +1382,10 @@ pub(super) mod delegate_secrets {
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
-        match env.secret_store().get_secret(&env.delegate_key, &secret_id) {
+        match env
+            .secret_store()
+            .get_secret(&env.delegate_key, &secret_id, env.secret_scope())
+        {
             Ok(_) => 1,
             Err(e) => {
                 tracing::debug!(
@@ -1396,9 +1440,10 @@ pub(super) mod delegate_secrets {
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
+        let scope = env.secret_scope();
         match env
             .secret_store_mut()
-            .remove_secret(&env.delegate_key, &secret_id)
+            .remove_secret(&env.delegate_key, &secret_id, scope)
         {
             Ok(()) => error_codes::SUCCESS,
             Err(e) => {
@@ -1411,6 +1456,131 @@ pub(super) mod delegate_secrets {
                 error_codes::ERR_SECRET_NOT_FOUND
             }
         }
+    }
+
+    /// Read the `prefix` argument from WASM memory and return the serialized
+    /// (length-prefixed) byte form of the matching stored keys for this
+    /// delegate+scope. Shared by `list_secrets_len` and `list_secrets` so the
+    /// length the guest allocates exactly matches the bytes it later receives.
+    ///
+    /// Returns `Err(error_code)` on any precondition failure; `Ok(bytes)`
+    /// otherwise (an empty `bytes` means "no matching keys").
+    fn collect_list_secrets(prefix_ptr: i64, prefix_len: i32) -> Result<Vec<u8>, i32> {
+        let id = current_instance_id();
+        if id == -1 {
+            tracing::warn!("delegate list_secrets called outside process()");
+            return Err(error_codes::ERR_NOT_IN_PROCESS);
+        }
+        if prefix_len < 0 {
+            tracing::warn!("delegate list_secrets called with negative prefix_len: {prefix_len}");
+            return Err(error_codes::ERR_INVALID_PARAM);
+        }
+        let Some(info) = MEM_ADDR.get(&id) else {
+            tracing::warn!("instance mem space not recorded for {id}");
+            return Err(error_codes::ERR_NOT_IN_PROCESS);
+        };
+        let Some(env) = DELEGATE_ENV.get(&id) else {
+            tracing::warn!("delegate call env not set for instance {id}");
+            return Err(error_codes::ERR_NOT_IN_PROCESS);
+        };
+
+        // A zero-length prefix is the "list all" case and needs no memory read.
+        let prefix: Vec<u8> = if prefix_len == 0 {
+            Vec::new()
+        } else {
+            let Some(prefix_src) = validate_and_compute_ptr::<u8>(
+                prefix_ptr,
+                info.start_ptr,
+                prefix_len as usize,
+                info.mem_size,
+            ) else {
+                tracing::error!("Memory bounds violation in delegate list_secrets (prefix)");
+                return Err(error_codes::ERR_MEMORY_BOUNDS);
+            };
+            // SAFETY: `prefix_src` was validated by `validate_and_compute_ptr`
+            // to point to `prefix_len` bytes within the WASM linear memory.
+            unsafe { std::slice::from_raw_parts(prefix_src, prefix_len as usize) }.to_vec()
+        };
+
+        let keys =
+            env.secret_store()
+                .list_secret_keys(&env.delegate_key, env.secret_scope(), &prefix);
+        Ok(encode_secret_key_list(keys.iter().map(|k| k.as_slice())))
+    }
+
+    /// Return the byte length of the serialized key list (see
+    /// `collect_list_secrets`) so the delegate can size its output buffer.
+    ///
+    /// ## Returns
+    /// - Non-negative: serialized length in bytes (0 = no matching keys)
+    /// - `ERR_NOT_IN_PROCESS`: called outside process()
+    /// - `ERR_INVALID_PARAM`: negative prefix length
+    pub(crate) fn list_secrets_len(prefix_ptr: i64, prefix_len: i32) -> i32 {
+        match collect_list_secrets(prefix_ptr, prefix_len) {
+            Ok(bytes) => {
+                if bytes.len() > i32::MAX as usize {
+                    i32::MAX
+                } else {
+                    bytes.len() as i32
+                }
+            }
+            Err(code) => code,
+        }
+    }
+
+    /// Write the serialized key list to WASM memory at `out_ptr` (max
+    /// `out_len` bytes).
+    ///
+    /// ## Returns
+    /// - Non-negative: number of bytes written
+    /// - `ERR_NOT_IN_PROCESS`: called outside process()
+    /// - `ERR_INVALID_PARAM`: negative length
+    /// - `ERR_BUFFER_TOO_SMALL`: output buffer is too small (use
+    ///   `list_secrets_len` first)
+    pub(crate) fn list_secrets(
+        prefix_ptr: i64,
+        prefix_len: i32,
+        out_ptr: i64,
+        out_len: i32,
+    ) -> i32 {
+        if out_len < 0 {
+            tracing::warn!("delegate list_secrets called with negative out_len: {out_len}");
+            return error_codes::ERR_INVALID_PARAM;
+        }
+        let bytes = match collect_list_secrets(prefix_ptr, prefix_len) {
+            Ok(b) => b,
+            Err(code) => return code,
+        };
+        if bytes.is_empty() {
+            return 0;
+        }
+        if bytes.len() > out_len as usize {
+            tracing::debug!(
+                "delegate list_secrets buffer too small: need {}, have {}",
+                bytes.len(),
+                out_len
+            );
+            return error_codes::ERR_BUFFER_TOO_SMALL;
+        }
+
+        let id = current_instance_id();
+        let Some(info) = MEM_ADDR.get(&id) else {
+            tracing::warn!("instance mem space not recorded for {id}");
+            return error_codes::ERR_NOT_IN_PROCESS;
+        };
+        let Some(dst) =
+            validate_and_compute_ptr::<u8>(out_ptr, info.start_ptr, bytes.len(), info.mem_size)
+        else {
+            tracing::error!("Memory bounds violation in delegate list_secrets (output)");
+            return error_codes::ERR_MEMORY_BOUNDS;
+        };
+        // SAFETY: `dst` was validated by `validate_and_compute_ptr` to point to
+        // `bytes.len()` bytes within WASM linear memory, and `bytes` is a valid
+        // slice of that length.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst, bytes.len());
+        }
+        bytes.len() as i32
     }
 }
 
@@ -2005,5 +2175,96 @@ pub(super) mod delegate_management {
                 delegate_mgmt_error_codes::ERR_STORE_FAILED
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod list_secrets_abi_tests {
+    //! Host-side ABI validation tests for the `list_secrets` hostcall path
+    //! (#4355 / #4523). These exercise ONLY the parameter-validation branches
+    //! that short-circuit before any WASM linear-memory access or
+    //! `DelegateCallEnv` lookup, so no real delegate WASM module is needed.
+    //!
+    //! The success / prefix-filter / buffer-too-small / len-vs-fill-agreement
+    //! arms genuinely require a registered `MEM_ADDR` + `DELEGATE_ENV` (i.e. a
+    //! live delegate instance), so they are covered at the store layer by
+    //! `secrets_store::list_secret_keys_*` and left to end-to-end-through-WASM
+    //! coverage (legitimately deferred: the test-delegate fixture pins the
+    //! published stdlib and cannot drive the new ABI yet).
+
+    use super::CURRENT_DELEGATE_INSTANCE;
+    use super::delegate_secrets::{list_secrets, list_secrets_len};
+    use super::error_codes;
+
+    /// Set the thread-local instance id for the body of `f`, restoring -1
+    /// (the "not in process" sentinel) afterwards so tests don't leak state.
+    fn with_instance_id<R>(id: i64, f: impl FnOnce() -> R) -> R {
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(id));
+        let r = f();
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(-1));
+        r
+    }
+
+    #[test]
+    fn list_secrets_negative_out_len_is_invalid_param() {
+        // `out_len < 0` is rejected by `list_secrets` itself, before any
+        // instance-id / memory lookup, so this holds regardless of context.
+        assert_eq!(
+            list_secrets(0, 0, 0, -1),
+            error_codes::ERR_INVALID_PARAM,
+            "negative out_len must be rejected as ERR_INVALID_PARAM"
+        );
+    }
+
+    #[test]
+    fn list_secrets_outside_process_is_not_in_process() {
+        // Default thread-local id is -1 ("not in process"). A non-negative
+        // out_len passes the first guard, then `collect_list_secrets` rejects
+        // on the id == -1 check.
+        with_instance_id(-1, || {
+            assert_eq!(
+                list_secrets(0, 0, 0, 64),
+                error_codes::ERR_NOT_IN_PROCESS,
+                "calling list_secrets outside process() must be ERR_NOT_IN_PROCESS"
+            );
+        });
+    }
+
+    #[test]
+    fn list_secrets_len_outside_process_is_not_in_process() {
+        with_instance_id(-1, || {
+            assert_eq!(
+                list_secrets_len(0, 0),
+                error_codes::ERR_NOT_IN_PROCESS,
+                "list_secrets_len outside process() must be ERR_NOT_IN_PROCESS"
+            );
+        });
+    }
+
+    #[test]
+    fn list_secrets_len_negative_prefix_is_invalid_param() {
+        // With a non-sentinel instance id the id==-1 guard passes, and the
+        // negative prefix_len is rejected BEFORE the MEM_ADDR lookup, so no
+        // registered instance memory is required to reach ERR_INVALID_PARAM.
+        with_instance_id(0xABCD, || {
+            assert_eq!(
+                list_secrets_len(0, -1),
+                error_codes::ERR_INVALID_PARAM,
+                "negative prefix_len must be rejected as ERR_INVALID_PARAM"
+            );
+        });
+    }
+
+    #[test]
+    fn list_secrets_negative_prefix_is_invalid_param() {
+        // Same negative-prefix guard reached via `list_secrets` (out_len valid,
+        // id non-sentinel) — `collect_list_secrets` rejects prefix_len < 0.
+        with_instance_id(0xABCD, || {
+            assert_eq!(
+                list_secrets(0, -1, 0, 64),
+                error_codes::ERR_INVALID_PARAM,
+                "negative prefix_len via list_secrets must be ERR_INVALID_PARAM"
+            );
+        });
     }
 }

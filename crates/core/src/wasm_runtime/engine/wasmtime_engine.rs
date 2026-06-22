@@ -998,6 +998,31 @@ impl WasmtimeEngine {
         // Memory benefits come from pooling and proper cleanup, not optimizations
         wasmtime_config.cranelift_opt_level(OptLevel::None);
 
+        // Disable native (DWARF) unwind-info registration (#4549).
+        //
+        // Wasmtime registers per-module FDE (frame description entry) unwind info
+        // with the *system* libunwind so a host stack-capture / OS unwinder can
+        // walk THROUGH JIT'd wasm frames. libunwind's FDE cache invalidation
+        // (`DwarfFDECache::removeAllIn`) is O(n) in the number of registered
+        // ranges, so under heavy module load/unload churn (cache eviction +
+        // recompilation under contract-executor backpressure) registration becomes
+        // quadratic. A production gateway death-spiralled at ~100% CPU entirely
+        // inside `DwarfFDECache::removeAllIn`. Wasmtime's own docs explicitly
+        // recommend disabling this on "systems loading many modules".
+        //
+        // Safety: this does NOT affect wasmtime's own Wasm-trap backtraces (those
+        // are governed by `wasm_backtrace*` and are independent), so contract
+        // trap / out-of-fuel error reporting is unchanged. The only thing lost is
+        // a third-party unwinder's ability to walk through wasm frames — which
+        // Freenet never does: contract WASM runs via `spawn_blocking` on a
+        // dedicated thread and panics are caught as `BlockingResult::Panic`, never
+        // unwound across the wasm boundary.
+        //
+        // Windows forbids disabling native unwind info (wasmtime returns an error
+        // from `Engine::new`), so leave it at its default there.
+        #[cfg(not(target_os = "windows"))]
+        wasmtime_config.native_unwind_info(false);
+
         // Enable disk-based compilation cache (#3456). Wasmtime caches compiled
         // modules keyed by (engine config + WASM bytes hash). On cache hit,
         // Module::new() skips compilation entirely and deserializes — ~100x faster.
@@ -1252,6 +1277,36 @@ impl WasmtimeEngine {
                     let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
                     refresh_mem_addr_from_caller(&mut caller, id);
                     native_api::delegate_secrets::remove_secret(key_ptr, key_len)
+                },
+            )
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
+
+        linker
+            .func_wrap(
+                "freenet_delegate_secrets",
+                "__frnt__delegate__list_secrets_len",
+                |mut caller: Caller<'_, HostState>, prefix_ptr: i64, prefix_len: i32| {
+                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+                    refresh_mem_addr_from_caller(&mut caller, id);
+                    native_api::delegate_secrets::list_secrets_len(prefix_ptr, prefix_len)
+                },
+            )
+            .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
+
+        linker
+            .func_wrap(
+                "freenet_delegate_secrets",
+                "__frnt__delegate__list_secrets",
+                |mut caller: Caller<'_, HostState>,
+                 prefix_ptr: i64,
+                 prefix_len: i32,
+                 out_ptr: i64,
+                 out_len: i32| {
+                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+                    refresh_mem_addr_from_caller(&mut caller, id);
+                    native_api::delegate_secrets::list_secrets(
+                        prefix_ptr, prefix_len, out_ptr, out_len,
+                    )
                 },
             )
             .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;

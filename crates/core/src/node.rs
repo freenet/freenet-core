@@ -51,6 +51,12 @@ use serde::{Deserialize, Serialize};
 pub(crate) use network_bridge::{
     ConnectionError, EventLoopNotificationsSender, NetworkBridge, OpExecutionPayload, WaiterReply,
 };
+// Re-export the UPDATE-broadcast stream-assembly telemetry global (#4440) so the
+// `Ring` snapshot task can read it (the broadcast queue lives behind the private
+// `network_bridge` module). Mirrors `crate::transport::metrics::TRANSPORT_METRICS`.
+// (The module-cache metrics were a sibling process-global until #4488 made them
+// a per-node `Arc`.)
+pub(crate) use network_bridge::broadcast_queue::BROADCAST_STREAM_METRICS;
 #[cfg(test)]
 pub(crate) use network_bridge::{EventLoopNotificationsReceiver, event_loop_notification_channel};
 // Re-export types for dev_tool and testing
@@ -74,6 +80,7 @@ mod p2p_impl;
 mod request_router;
 pub(crate) mod testing_impl;
 
+pub use p2p_impl::enable_abort_on_fatal_listener_exit;
 pub use request_router::{DeduplicatedRequest, RequestRouter};
 
 /// Handle to trigger graceful shutdown of the node.
@@ -1751,23 +1758,19 @@ where
             return Ok(());
         }
         NetMessageV1::SubscribeHint(hint) => {
-            // Placement-migration deactivation gate (v0.2.74 hotfix). The
-            // placement migration was disabled after the v0.2.73 UPDATE-broadcast
-            // degradation by parking the SubscribeHint version floor at
-            // `(0, 3, 0)`, above every shipped 0.2.x release. The SEND side
-            // (`p2p_protoc::peer_supports_subscribe_hint`) already respects this
-            // floor, but the floor bump alone only stops US from emitting hints —
-            // a 0.2.74 node receiving a hint from a not-yet-upgraded 0.2.73 peer
-            // would still ACT on it and keep the migration load alive throughout
-            // the multi-hour staggered rollout.
+            // Placement-migration version gate. The migration is re-enabled at
+            // floor `(0, 2, 80)` (#4499 made it load-safe). The SEND side
+            // (`p2p_protoc::peer_supports_subscribe_hint`) gates emission on the
+            // remote peer's version; the RECEIVE path must gate too, so a node on
+            // an older release does not ACT on a hint from an upgraded peer and
+            // keep migration load alive on a peer that predates the load-safe fix.
             //
-            // So gate the RECEIVE path too. The symmetric (sender-version) gate is
-            // not cleanly reachable here — the per-connection remote version lives
-            // in `P2pConnManager.connections` and is not exposed through the
-            // `NetworkBridge` trait — so use this node's OWN version against the
-            // SAME floor the send side uses. With the floor parked at `(0, 3, 0)`
-            // and our own version on the 0.2.x line this evaluates to "migration
-            // off → ignore"; lowering the floor re-activates both sides together.
+            // The symmetric (sender-version) gate is not cleanly reachable here:
+            // the per-connection remote version lives in `P2pConnManager.connections`
+            // and is not exposed through the `NetworkBridge` trait, so use this
+            // node's OWN version against the SAME floor the send side uses. A node
+            // on `>= 0.2.80` acts on inbound hints; a pre-floor node ignores them.
+            // Lowering the floor (sim override) re-activates both sides together.
             //
             // Read the floor via `subscribe_hint_floor_override().unwrap_or(...)`,
             // identical to the send side, so a simulation that opts into the
@@ -1788,8 +1791,8 @@ where
                     ?own_version,
                     ?floor,
                     ?source_addr,
-                    "Ignoring inbound SubscribeHint — placement migration deactivated \
-                     (own version below the SubscribeHint floor)"
+                    "Ignoring inbound SubscribeHint: own version is below the \
+                     SubscribeHint re-enable floor (pre-floor peer, wire-compat)"
                 );
                 return Ok(());
             }
@@ -1824,6 +1827,35 @@ where
                     holder = ?hint.holder.socket_addr(),
                     ?source_addr,
                     "Received SubscribeHint whose holder is not the sender — ignoring"
+                );
+                return Ok(());
+            }
+            // Backpressure-aware migration admission (#4534): refuse to take on
+            // a NEW migrated contract when the contract module cache is already
+            // at/above its occupancy ceiling. Accepting more would push the
+            // hosted working set past cache capacity, forcing recompile-on-
+            // access thrash that fills the fair queue ("contract queue full")
+            // and OOMs memory-bound gateways. This gates ONLY the directed-
+            // subscribe placement nudge; the node's own local client
+            // subscribes/GETs are never gated here. The hint is dropped silently
+            // and the holder re-proposes it on its next migration trigger once
+            // headroom returns.
+            // Read the per-node module-cache occupancy off the same `Ring` the
+            // caches publish into (a process-global until #4488).
+            let contract_cache_occupancy = crate::wasm_runtime::contract_cache_occupancy_pct(
+                &op_manager.ring.module_cache_metrics(),
+            );
+            if !migration_admission_allowed(contract_cache_occupancy) {
+                tracing::debug!(
+                    key = %hint.key,
+                    holder = %hint.holder,
+                    ?source_addr,
+                    occupancy_pct = ?contract_cache_occupancy,
+                    ceiling_pct = MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT,
+                    "Refusing inbound SubscribeHint: contract module cache at/above \
+                     the migration-admission occupancy ceiling — deferring placement \
+                     migration to bound the hosted working set and avoid cache thrash \
+                     (#4534)"
                 );
                 return Ok(());
             }
@@ -1895,6 +1927,80 @@ const MAX_STALE_SYNCS_PER_SUMMARIES: usize = 32;
 /// [`MAX_STALE_SYNCS_PER_SUMMARIES`] regardless of `stale_contracts_len`.
 fn stale_sync_emit_budget(stale_contracts_len: usize) -> usize {
     stale_contracts_len.min(MAX_STALE_SYNCS_PER_SUMMARIES)
+}
+
+/// Maximum contract-module-cache occupancy (percent of budget) at which this
+/// node still accepts an inbound placement-migration `SubscribeHint` (#4534).
+///
+/// Above this ceiling, inbound hints are refused so the hosted working set
+/// cannot grow past cache capacity and thrash (module recompile-on-access),
+/// which had filled the contract fair queue and produced client-facing
+/// "contract queue full" outages and gateway OOMs on 0.2.80. The ~10% headroom
+/// below 100% is reserved for the node's own locally-requested contracts, whose
+/// directed subscribes are NOT gated here. Refusal is silent and best-effort:
+/// the holder re-proposes the migration on its next trigger, so placement
+/// migration resumes automatically once occupancy falls back below the ceiling.
+///
+/// Recovery is real but NOT guaranteed: occupancy only drops when cold modules
+/// age out of the LRU faster than new ones compile (the recent distinct-module
+/// byte-sum falls below the ceiling). On a node whose hosted working set
+/// genuinely exceeds the cache budget — the exact #4534 scenario — occupancy
+/// stays pinned near 100% and migration is refused INDEFINITELY by design. That
+/// is the correct conservative behavior (it stops the thrash), but it means this
+/// gate is a stopgap, not a complete fix: on such a node the operator must raise
+/// `FREENET_MODULE_CACHE_BUDGET_BYTES` to actually re-enable placement. #4534
+/// stays open for the cache-sizing / offload-compilation / interest-weighted-
+/// retention directions; this constant implements only the "couple migration
+/// acceptance to cache headroom" one.
+const MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT: u64 = 90;
+
+/// Whether to accept an inbound placement-migration hint given the current
+/// contract-module-cache occupancy. `None` (budget gauge not yet published — no
+/// runtime pool built) admits, since there is no pressure signal to act on.
+///
+/// Split out as a pure function so the threshold logic is unit-testable without
+/// constructing an `OpManager` or touching the global cache gauges (#4534).
+fn migration_admission_allowed(contract_cache_occupancy_pct: Option<u64>) -> bool {
+    match contract_cache_occupancy_pct {
+        Some(pct) => pct < MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT,
+        None => true,
+    }
+}
+
+#[cfg(test)]
+mod migration_admission_tests {
+    use super::{
+        MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT, migration_admission_allowed,
+    };
+
+    /// No runtime pool / budget gauge yet → no pressure signal → admit.
+    #[test]
+    fn admits_when_cache_budget_uninitialized() {
+        assert!(migration_admission_allowed(None));
+    }
+
+    /// Below the ceiling the node keeps accepting migration (the #4404 feature
+    /// is not crippled on healthy nodes).
+    #[test]
+    fn admits_below_occupancy_ceiling() {
+        assert!(migration_admission_allowed(Some(0)));
+        assert!(migration_admission_allowed(Some(
+            MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT - 1
+        )));
+    }
+
+    /// At or above the ceiling the node sheds inbound migration — this is the
+    /// #4534 fix. The over-budget transient (> 100%) is refused too.
+    #[test]
+    fn refuses_at_or_above_occupancy_ceiling() {
+        assert!(!migration_admission_allowed(Some(
+            MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT
+        )));
+        assert!(!migration_admission_allowed(Some(
+            MIGRATION_ADMISSION_MAX_CONTRACT_CACHE_OCCUPANCY_PCT + 5
+        )));
+        assert!(!migration_admission_allowed(Some(150)));
+    }
 }
 
 /// Per-contract disposition in the stale-sync emission loop, used to model the
@@ -2376,8 +2482,10 @@ async fn handle_interest_sync_message(
                 return None;
             };
 
-            // Fetch our summary
-            let summary = get_contract_summary(op_manager, &key).await;
+            // Fetch our summary (serving a peer's ResyncRequest — relay-tier).
+            let summary =
+                get_contract_summary(op_manager, &key, crate::contract::Priority::NetworkRelay)
+                    .await;
             let Some(summary) = summary else {
                 tracing::warn!(
                     contract = %key,
@@ -2555,14 +2663,23 @@ async fn get_contract_state_by_id(
 }
 
 /// Get the contract state summary using the contract's summarize_state method.
+///
+/// `priority` lets the periodic interest-sync path issue the summarize at
+/// [`Priority::Background`](crate::contract::Priority::Background) so the
+/// post-#4473 residual summarize load never starves client work (#4534), while
+/// relay/resync callers keep the default `NetworkRelay` precedence.
 async fn get_contract_summary(
     op_manager: &Arc<OpManager>,
     key: &freenet_stdlib::prelude::ContractKey,
+    priority: crate::contract::Priority,
 ) -> Option<freenet_stdlib::prelude::StateSummary<'static>> {
     use crate::contract::ContractHandlerEvent;
 
     match op_manager
-        .notify_contract_handler(ContractHandlerEvent::GetSummaryQuery { key: *key })
+        .notify_contract_handler_prioritized(
+            ContractHandlerEvent::GetSummaryQuery { key: *key },
+            priority,
+        )
         .await
     {
         Ok(ContractHandlerEvent::GetSummaryResponse {
@@ -2620,7 +2737,9 @@ async fn summary_if_hosted_or_in_use(
     key: &freenet_stdlib::prelude::ContractKey,
 ) -> Option<freenet_stdlib::prelude::StateSummary<'static>> {
     if op_manager.ring.is_hosting_contract(key) || op_manager.ring.contract_in_use(key) {
-        get_contract_summary(op_manager, key).await
+        // Periodic interest-sync summarize: best-effort background work, so it
+        // yields the contract loop to client/relay traffic (#4534 / #4473).
+        get_contract_summary(op_manager, key, crate::contract::Priority::Background).await
     } else {
         None
     }
@@ -2757,6 +2876,7 @@ pub async fn run_local_node(
             notification_channel,
             token,
             origin_contract,
+            user_context,
             ..
         } = req;
         tracing::debug!(client_id = %id, ?token, "Received OpenRequest -> {request}");
@@ -2782,7 +2902,9 @@ pub async fn run_local_node(
                     ?origin_contract,
                     "Handling ClientRequest::DelegateOp"
                 );
-                executor.delegate_request(op, origin_contract.as_ref(), None)
+                // `user_context` is `Some` only in hosted mode with a user token;
+                // `None` keeps secrets on the single-user `SecretScope::Local`.
+                executor.delegate_request(op, origin_contract.as_ref(), None, user_context.as_ref())
             }
             ClientRequest::Disconnect { cause } => {
                 if let Some(cause) = cause {
@@ -3323,27 +3445,28 @@ mod tests {
         assert_eq!(init_peer.location, location);
     }
 
-    // Tests for the INBOUND `SubscribeHint` receive gate (v0.2.74 hotfix).
+    // Tests for the INBOUND `SubscribeHint` receive gate.
     //
-    // FIX 1: the floor bump to `(0, 3, 0)` only gates the SEND side; the
-    // receive handler must ALSO ignore inbound hints while the placement
-    // migration is deactivated, so a 0.2.74 node does not act on hints sent
-    // by a not-yet-upgraded 0.2.73 peer during the staggered rollout.
+    // The placement migration is RE-ENABLED at floor `(0, 2, 80)` (#4499 made it
+    // load-safe). The receive handler shares this floor with the send side, so a
+    // node acts on an inbound hint only when both it and the producing peer are at
+    // or above the floor; it still ignores hints from pre-floor peers, which
+    // preserves wire-compat during the staggered rollout.
     mod inbound_subscribe_hint_gate {
         use crate::node::network_bridge::p2p_protoc::{
             SUBSCRIBE_HINT_MIN_VERSION, own_crate_version, version_supports_subscribe_hint,
         };
 
-        /// The gate predicate ignores an inbound hint while the migration is
-        /// deactivated: for THIS node's own (0.2.x) version against the parked
-        /// production floor, `version_supports_subscribe_hint` returns `false`,
-        /// which is the "ignore the hint" branch in the receive handler.
+        // Superseded: the placement migration was RE-ENABLED at `(0, 2, 80)` by
+        // PR #4511 (#4145 fixed in #4499). This test pinned the v0.2.74
+        // deactivation (own version below the parked floor, so all inbound hints
+        // ignored) and now documents that prior behavior; its `own < floor`
+        // assert no longer holds once the crate reaches the floor. Replaced by
+        // `receive_gate_active_at_reenable_floor` below.
+        #[ignore]
         #[test]
         fn receive_gate_ignores_hint_while_deactivated() {
             let own = own_crate_version();
-            // Sanity: this hotfix ships on the 0.2.x line, strictly below the
-            // parked floor. If the crate ever crosses the floor this guard
-            // (and the deactivation it pins) must be revisited.
             assert!(
                 own < SUBSCRIBE_HINT_MIN_VERSION,
                 "own version {own:?} must be below the parked floor \
@@ -3354,9 +3477,44 @@ mod tests {
                 "while deactivated, the receive gate must IGNORE inbound hints \
                  (own version below the floor)"
             );
-            // A concrete 0.2.73 sender's own-version analogue is likewise ignored.
             assert!(!version_supports_subscribe_hint(
                 Some((0, 2, 73)),
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+        }
+
+        /// At the re-enable floor the receive gate ACTS on hints from peers at or
+        /// above the floor and IGNORES hints from pre-floor peers (wire-compat).
+        /// Uses explicit versions rather than `own_crate_version` so the assertion
+        /// is stable across the 0.2.79 -> 0.2.80 boundary (the crate is still
+        /// 0.2.79 until the re-enable release bumps it to the floor version).
+        #[test]
+        fn receive_gate_active_at_reenable_floor() {
+            // The `supported(0,2,80)` + `!supported(0,2,79)` pair pins the floor
+            // to exactly `(0, 2, 80)`; an accidental change trips these asserts.
+            // Peers at or above the floor are acted on.
+            assert!(version_supports_subscribe_hint(
+                Some((0, 2, 80)),
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+            assert!(version_supports_subscribe_hint(
+                Some((0, 3, 0)),
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+            // Pre-floor peers are still ignored: older 0.2.x peers, and the
+            // original 0.2.73 sender from the staggered rollout.
+            assert!(!version_supports_subscribe_hint(
+                Some((0, 2, 79)),
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+            assert!(!version_supports_subscribe_hint(
+                Some((0, 2, 73)),
+                SUBSCRIBE_HINT_MIN_VERSION
+            ));
+            // Unknown remote version fails closed (the migration's send/receive
+            // gate must never act on a peer whose version we could not determine).
+            assert!(!version_supports_subscribe_hint(
+                None,
                 SUBSCRIBE_HINT_MIN_VERSION
             ));
         }
@@ -3402,7 +3560,7 @@ mod tests {
                 .expect("receive arm must still call start_directed_subscribe");
             assert!(
                 gate_idx < directed_idx,
-                "the deactivation gate must run BEFORE start_directed_subscribe"
+                "the version gate must run BEFORE start_directed_subscribe"
             );
             assert!(
                 arm.contains("subscribe_hint_floor_override()"),

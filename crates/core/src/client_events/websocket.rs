@@ -130,6 +130,7 @@ use crate::{
 
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
 use crate::server::client_api::OriginContractMap;
+use crate::wasm_runtime::UserSecretContext;
 
 /// Checks if a WebSocket Origin header value refers to localhost.
 ///
@@ -528,6 +529,7 @@ impl WebSocketProxy {
     /// Returns `None` if the client has already disconnected (response channel
     /// closed or missing). Returning `None` instead of an error prevents
     /// transient disconnects from killing `client_fn` (#3479).
+    #[allow(clippy::too_many_arguments)]
     fn setup_subscription(
         &self,
         client_id: ClientId,
@@ -535,6 +537,7 @@ impl WebSocketProxy {
         req: Box<ClientRequest<'static>>,
         auth_token: Option<AuthToken>,
         origin_contract: Option<ContractInstanceId>,
+        user_context: Option<UserSecretContext>,
     ) -> Option<OpenRequest<'static>> {
         let (tx, rx) =
             tokio::sync::mpsc::channel(crate::contract::SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE);
@@ -554,7 +557,8 @@ impl WebSocketProxy {
             OpenRequest::new(client_id, req)
                 .with_notification(tx)
                 .with_token(auth_token)
-                .with_origin_contract(origin_contract),
+                .with_origin_contract(origin_contract)
+                .with_user_context(user_context),
         )
     }
 
@@ -584,6 +588,7 @@ impl WebSocketProxy {
                 req,
                 auth_token,
                 origin_contract,
+                user_context,
                 ..
             } => {
                 // Extract the subscription key if this request needs a notification channel.
@@ -610,8 +615,14 @@ impl WebSocketProxy {
 
                 let open_req = if let Some(key) = sub_key {
                     tracing::debug!(%client_id, contract = %key, "setting up subscription channel");
-                    match self.setup_subscription(client_id, key, req, auth_token, origin_contract)
-                    {
+                    match self.setup_subscription(
+                        client_id,
+                        key,
+                        req,
+                        auth_token,
+                        origin_contract,
+                        user_context,
+                    ) {
                         Some(r) => r,
                         None => return Ok(None),
                     }
@@ -619,6 +630,7 @@ impl WebSocketProxy {
                     OpenRequest::new(client_id, req)
                         .with_token(auth_token)
                         .with_origin_contract(origin_contract)
+                        .with_user_context(user_context)
                 };
                 Ok(Some(open_req))
             }
@@ -666,6 +678,169 @@ struct ConnectionInfo {
     /// Accepted for backward compatibility but ignored — streaming is always enabled.
     #[allow(dead_code)]
     streaming: Option<bool>,
+    /// Durable per-user token for hosted mode (P2 of #4381). This is a SEPARATE
+    /// credential from `auth_token` (the per-app session token minted by the
+    /// HTTP attestation flow): `auth_token` identifies which app-contract a
+    /// connection is acting for, whereas `user_token` identifies WHICH USER's
+    /// secret namespace the connection's delegate secret operations bind to.
+    /// The browser shell page supplies it as the `userToken` query parameter on
+    /// the WS upgrade URL (the P2-frontend follow-up mints/stores/presents it).
+    /// It is honored ONLY when the node runs in hosted mode; otherwise it is
+    /// ignored entirely and every connection stays single-user.
+    user_token: Option<String>,
+}
+
+/// Decide a connection's per-user secret namespace from the hosted-mode flag
+/// and the presented user token (P2 of #4381).
+///
+/// This is the security-critical gate, factored out of the `connection_info`
+/// middleware so it can be unit-tested in isolation:
+///
+/// - hosted mode OFF => always `None` (token ignored entirely; single-user).
+/// - hosted mode ON, non-empty token => `Some` context derived solely from the
+///   token bytes.
+/// - hosted mode ON, no token or empty token => `None` (this connection is
+///   single-user, just like a non-hosted node).
+///
+/// `None` everywhere means [`crate::wasm_runtime::SecretScope::Local`]
+/// downstream — byte-for-byte the pre-#4381 behavior — so the flag-off path is
+/// provably inert.
+pub(crate) fn derive_user_context(
+    hosted_mode: bool,
+    user_token: Option<&str>,
+) -> Option<UserSecretContext> {
+    match (hosted_mode, user_token) {
+        (true, Some(token)) if !token.is_empty() => {
+            Some(UserSecretContext::from_token(token.as_bytes()))
+        }
+        // hosted on but no/empty token, or hosted off (token ignored): Local.
+        (true, _) | (false, _) => None,
+    }
+}
+
+/// Outcome of the "should this connection's user token be honored?" gate.
+///
+/// Pure decision over `(hosted_mode, has_token, source_ip, xfp_https)`, factored
+/// out of the `connection_info` middleware so the security property is provable
+/// without standing up a WS stack (refuse-plaintext-token invariant of #4381).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UserTokenDecision {
+    /// Honor the token: derive the per-user secret context from it.
+    Honor,
+    /// Hosted mode + a token were present, but the connection is not
+    /// demonstrably secure (not a loopback source carrying
+    /// `X-Forwarded-Proto: https`). Reject the upgrade rather than silently
+    /// dropping the token — silently falling back to `Local` would put the user
+    /// on the WRONG (shared) namespace under a public plaintext deployment.
+    RejectInsecure,
+    /// No per-user scoping: treat as single-user (`SecretScope::Local`). Reached
+    /// for the flag-off path and the no-token path (`has_token == false`) — both
+    /// byte-for-byte the pre-#4381 behavior, so no rejection fires.
+    ///
+    /// NOTE: an EMPTY token (`?userToken=` with no value) is mapped to `Local`
+    /// too, but that happens at the CALL SITE, which passes `has_token = false`
+    /// for an empty token (matching `derive_user_context`'s empty-is-absent
+    /// rule). This pure fn keys only on the `has_token` bool and never inspects
+    /// token contents — so an empty token must NOT reach here as `has_token ==
+    /// true`, or it would be wrongly rejected as insecure.
+    Local,
+}
+
+/// Whether a source IP is loopback (`127.0.0.0/8`, `::1`), after normalizing an
+/// IPv4-mapped IPv6 source (`::ffff:127.0.0.1`) from a dual-stack socket.
+///
+/// Loopback is the trust anchor for honoring a durable per-user token: a direct
+/// local browser, or a TLS-terminating reverse proxy colocated on the same host,
+/// both connect from loopback. Anything off-host cannot forge a loopback source
+/// (the kernel sets it from the accepted socket — see `ConnectInfo<SocketAddr>`
+/// in `private_network_filter`), so it is a sound, non-spoofable signal that the
+/// plaintext HTTP port was NOT exposed to the network for this connection.
+pub(crate) fn is_loopback_source(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.is_loopback(),
+            None => v6.is_loopback(),
+        },
+    }
+}
+
+/// The security-critical gate: decide whether to honor a per-user `userToken`.
+///
+/// HONOR only when the connection is demonstrably secure, so an operator who
+/// accidentally exposes a plaintext HTTP port to the internet — directly OR
+/// through a reverse proxy — cannot leak the durable, node-independent token.
+///
+/// A loopback source proves only the proxy→node hop is local; the node
+/// REQUIRES `X-Forwarded-Proto: https` (set by the TLS-terminating proxy) as
+/// positive evidence the browser→proxy hop used TLS. Host is NOT used — it is
+/// proxy-rewritable (e.g. nginx's default config rewrites `Host` to the
+/// upstream `127.0.0.1:7509`), so it cannot grant trust.
+///
+/// 1. **source loopback + `X-Forwarded-Proto: https`** ⇒ `Honor`. Either a
+///    same-host TLS-terminating reverse proxy (the intended hosted deployment,
+///    e.g. Caddy — which sets XFP by default) attesting the browser→proxy hop
+///    was TLS, or a local process forging the header — but a local process
+///    already has full node access, so loopback is the trust boundary.
+/// 2. **source loopback + NO `X-Forwarded-Proto: https`** (header missing or
+///    `http`) ⇒ `RejectInsecure`. A direct plaintext connection — even
+///    loopback — or a plaintext reverse proxy (nginx default, no XFP). Without
+///    positive HTTPS evidence the token may have crossed the network in
+///    cleartext, so it is refused: secure by default.
+/// 3. **source non-loopback** (any XFP) ⇒ `RejectInsecure`. The token crossed
+///    the network to reach the node directly; never honor it.
+///
+/// `X-Forwarded-Proto` is trusted **only** from a loopback source (branch 1
+/// requires loopback). From an off-host source it is client-spoofable
+/// (`curl -H 'X-Forwarded-Proto: https'`) and is never consulted (branch 3).
+///
+/// Decision table (only reached when hosted mode is on and a non-empty token is
+/// present — see the call site's `has_token` non-empty check):
+///
+/// | source     | xfp_https | outcome          |
+/// |------------|-----------|------------------|
+/// | loopback   | true      | `Honor`          |
+/// | loopback   | false     | `RejectInsecure` |
+/// | non-loop   | any       | `RejectInsecure` |
+/// | `None`     | any       | `RejectInsecure` |
+///
+/// A missing source IP (`None`) is treated as insecure (fail closed): we cannot
+/// prove loopback, so we must not honor the token. In production `ConnectInfo`
+/// always yields the peer address; `None` only arises in unit tests that omit it.
+pub(crate) fn decide_user_token(
+    hosted_mode: bool,
+    has_token: bool,
+    source_ip: Option<std::net::IpAddr>,
+    xfp_https: bool,
+) -> UserTokenDecision {
+    // Flag off, or no token presented: single-user, no rejection. This is the
+    // ONLY path when hosted mode is off, so the whole invariant is hosted-gated
+    // and the flag-off behavior is byte-for-byte unchanged.
+    if !hosted_mode || !has_token {
+        return UserTokenDecision::Local;
+    }
+
+    // Hosted mode + a token: the source MUST be loopback. A non-loopback source
+    // means the token reached the node directly over the network — never honor.
+    let Some(ip) = source_ip else {
+        // No source IP: cannot prove loopback ⇒ fail closed.
+        return UserTokenDecision::RejectInsecure;
+    };
+    if !is_loopback_source(ip) {
+        return UserTokenDecision::RejectInsecure;
+    }
+
+    // Source is loopback. The proxy→node hop is local, but that says nothing
+    // about the browser→proxy hop. Require positive HTTPS evidence
+    // (`X-Forwarded-Proto: https`, set by the TLS-terminating proxy) before
+    // honoring the token; otherwise the token may have crossed the network in
+    // cleartext (direct plaintext, or a plaintext proxy). `xfp_https` is
+    // trusted here ONLY because we've already proven the source is loopback.
+    if xfp_https {
+        UserTokenDecision::Honor
+    } else {
+        UserTokenDecision::RejectInsecure
+    }
 }
 
 async fn connection_info(
@@ -673,9 +848,11 @@ async fn connection_info(
         auth_token: auth_token_q,
         encoding_protocol,
         streaming: _,
+        user_token: user_token_q,
     }): Query<ConnectionInfo>,
     Extension(allowed_hosts): Extension<crate::server::AllowedHosts>,
     Extension(allowed_source_cidrs): Extension<crate::server::AllowedSourceCidrs>,
+    Extension(hosted_mode): Extension<crate::server::HostedMode>,
     mut req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
@@ -769,11 +946,122 @@ async fn connection_info(
         }
     }
 
+    // Derive the per-connection user secret context (hosted mode, P2 of #4381),
+    // gated by the refuse-plaintext-token secure-connection check below.
+    //
+    // SECURITY-CRITICAL boundary: this is the ONE place a `UserSecretContext` is
+    // constructed. It happens here, at connection establishment, from the user
+    // token presented on the upgrade request — never from a `ClientRequest`, a
+    // delegate message, or anything reachable from WASM. Downstream the context
+    // is immutable and travels with the connection.
+    //
+    // Token source: the `userToken` query parameter (canonical, supplied by the
+    // browser shell page on the WS URL), OR an `X-Freenet-User-Token` header
+    // which, if present, takes precedence (mirrors how a Bearer `auth_token`
+    // header overrides its query form). The token is sensitive: we derive the
+    // context and then drop the raw bytes — they are never stored or logged.
+    // `hosted_mode` is a REQUIRED `Extension<HostedMode>` extractor (above), not
+    // read tolerantly: it is a security-isolation flag, so a missing injection
+    // must fail loud (500) rather than silently default to hosted-off. The single
+    // bring-up choke point `server::serve_client_api_in_impl` injects it on both
+    // router branches (loopback and LAN), so production always has it; a 500 here
+    // means a misconfiguration to surface, not to paper over. A silent
+    // default-to-false in a real hosted deployment that lost the injection would
+    // disable per-user isolation (all users -> Local shared namespace ->
+    // cross-user clobber) — for a security flag, fail-loud beats fail-silent.
+    let user_token = req
+        .headers()
+        .get("x-freenet-user-token")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_owned())
+        .or(user_token_q);
+
+    // REFUSE-PLAINTEXT-TOKEN invariant (#4381): a `userToken` is a durable,
+    // node-independent, high-value credential that names a per-user secret
+    // namespace. Honor it ONLY over a demonstrably secure connection, so an
+    // operator who accidentally exposes a plaintext HTTP port to the internet —
+    // directly OR through a reverse proxy — cannot leak it. "Secure" requires a
+    // loopback source carrying `X-Forwarded-Proto: https` (positive evidence the
+    // browser→proxy hop used TLS, set by the TLS-terminating proxy). See
+    // `decide_user_token` for the full rationale and truth table.
+    //
+    // Source IP: read from the `ConnectInfo<SocketAddr>` request extension that
+    // `axum::serve(..).into_make_service_with_connect_info::<SocketAddr>()` injects
+    // for every connection (the same plumbing `private_network_filter` extracts).
+    // We read it from `req.extensions()` rather than as a typed extractor so a
+    // missing ConnectInfo (only possible in unit tests that omit it) yields
+    // `None` and fails CLOSED in the gate below, instead of 500-ing the request.
+    //
+    // Host is NOT consulted: a loopback source proves only the proxy→node hop is
+    // local, and `Host` is proxy-rewritable (nginx's default rewrites it to the
+    // upstream `127.0.0.1:7509`), so it cannot grant trust. The node requires
+    // positive HTTPS evidence instead.
+    //
+    // `X-Forwarded-Proto` is trusted ONLY when the source is loopback; from any
+    // off-host source it is client-spoofable, so `decide_user_token` consults it
+    // only after the source is already proven loopback.
+    let source_ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+    let xfp_https = req
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("https"));
+
+    // `has_token` is a NON-EMPTY check, matching `derive_user_context`'s
+    // empty-is-absent semantics. The browser shell sends `?userToken=` (empty)
+    // for a brand-new user who has no token yet; that connection must fall
+    // through to Local (single-user) so the client can connect and GET a token,
+    // NOT be locked out with a 403. Both helpers must agree on "empty": an empty
+    // token is treated as no token, so it is never gated.
+    let user_context = match decide_user_token(
+        hosted_mode.0,
+        user_token.as_deref().is_some_and(|t| !t.is_empty()),
+        source_ip,
+        xfp_https,
+    ) {
+        UserTokenDecision::Honor => derive_user_context(hosted_mode.0, user_token.as_deref()),
+        UserTokenDecision::Local => None,
+        UserTokenDecision::RejectInsecure => {
+            // Fail LOUD, not silent. Dropping the token and falling back to Local
+            // would silently put the user on the WRONG (shared) namespace under a
+            // public plaintext deployment; rejecting surfaces the misconfiguration
+            // to the operator/user instead. Do not log the token (high-value
+            // credential); log only the non-secret source IP and path.
+            tracing::warn!(
+                source_ip = ?source_ip,
+                xfp_https,
+                request_path = req.uri().path(),
+                "Rejected hosted user token over an insecure connection \
+                 (need a loopback source carrying X-Forwarded-Proto: https)"
+            );
+            return (
+                StatusCode::FORBIDDEN,
+                "hosted user token requires a secure (TLS/loopback) connection",
+            )
+                .into_response();
+        }
+    };
+
+    // Do NOT log credentials. The auth token, the user token, and the full
+    // request URI are all sensitive: the URI query string carries
+    // `?auth_token=<raw>` and `?userToken=<raw>` verbatim, and the user token
+    // is an especially high-value credential (durable, node-independent, names
+    // a per-user secret namespace). Log only the URI PATH and non-secret
+    // presence/derived flags. `?user_context` is safe — its `Debug` redacts the
+    // dek_secret and prints only the non-secret user_id (or `None`).
     tracing::debug!(
-        ?auth_token_q, ?auth_token, request_uri = ?req.uri(), "connection_info middleware extracting auth token and encoding protocol",
+        auth_token_present = auth_token.is_some(),
+        hosted_mode = hosted_mode.0,
+        ?user_context,
+        request_path = req.uri().path(),
+        "connection_info middleware: resolved auth token, hosted-mode context, and encoding protocol",
     );
     req.extensions_mut().insert(encoding_protoc);
     req.extensions_mut().insert(auth_token);
+    req.extensions_mut().insert(user_context);
     // `streaming` query parameter is accepted but ignored — streaming is now
     // always enabled for payloads exceeding CHUNK_THRESHOLD (512 KiB).
 
@@ -787,6 +1075,10 @@ async fn websocket_commands(
     Extension(rs): Extension<WebSocketRequest>,
     Extension(origin_contracts): Extension<OriginContractMap>,
     Extension(api_version): Extension<ApiVersion>,
+    // The per-connection user secret context derived in `connection_info`
+    // (hosted mode). `None` outside hosted mode or when no user token was
+    // presented. Owned and moved into the connection task below.
+    Extension(user_context): Extension<Option<UserSecretContext>>,
 ) -> Response {
     let on_upgrade = move |ws: WebSocket| async move {
         // Get the data we need from the DashMap
@@ -844,6 +1136,7 @@ async fn websocket_commands(
         if let Err(error) = websocket_interface(
             rs.clone(),
             auth_and_instance,
+            user_context,
             token_is_invalid,
             encoding_protoc,
             api_version,
@@ -883,6 +1176,8 @@ async fn notify_disconnect(
             req: Box::new(ClientRequest::Disconnect { cause: None }),
             auth_token: auth_token.as_ref().map(|t| t.0.clone()),
             origin_contract: auth_token.as_ref().map(|t| t.1),
+            // Synthetic disconnect: no secret operations, so no user context.
+            user_context: None,
             api_version,
         })
         .await
@@ -894,6 +1189,11 @@ async fn notify_disconnect(
 async fn websocket_interface(
     request_sender: WebSocketRequest,
     mut auth_token: Option<(AuthToken, ContractInstanceId)>,
+    // Per-connection user secret context (hosted mode). Derived once at upgrade
+    // and immutable for the life of this connection; cloned into each
+    // `ClientConnection::Request` so every request from this connection (and
+    // only this connection) binds to the same user namespace.
+    user_context: Option<UserSecretContext>,
     token_is_invalid: bool,
     encoding_protoc: EncodingProtocol,
     api_version: ApiVersion,
@@ -1016,6 +1316,7 @@ async fn websocket_interface(
                     &request_sender,
                     &mut auth_token.as_mut().map(|t| t.0.clone()),
                     auth_token.as_mut().map(|t| t.1),
+                    user_context.as_ref(),
                     api_version,
                     &mut delegate_rate_limiter,
                     &mut conn_state,
@@ -1280,6 +1581,7 @@ async fn process_client_request(
     request_sender: &mpsc::Sender<ClientConnection>,
     auth_token: &mut Option<AuthToken>,
     origin_contract: Option<ContractInstanceId>,
+    user_context: Option<&UserSecretContext>,
     api_version: ApiVersion,
     rate_limiter: &mut DelegateRateLimiter,
     conn_state: &mut ConnectionState,
@@ -1454,6 +1756,10 @@ async fn process_client_request(
             req: Box::new(req),
             auth_token: auth_token.clone(),
             origin_contract,
+            // Clone the connection's user context into this request. Every
+            // request from this connection carries the SAME context, derived
+            // once at upgrade; a client cannot vary it per-request.
+            user_context: user_context.cloned(),
             api_version,
         })
         .await
@@ -1802,6 +2108,365 @@ mod tests {
     use freenet_stdlib::client_api::streaming::{
         CHUNK_SIZE, CHUNK_THRESHOLD, ReassemblyBuffer, chunk_request,
     };
+
+    /// The hosted-mode flag is the gate: with it OFF, a presented user token is
+    /// ignored entirely and no per-user context is derived (single-user).
+    #[test]
+    fn hosted_mode_off_ignores_user_token() {
+        assert!(
+            derive_user_context(false, Some("some-user-token")).is_none(),
+            "flag off must ignore the token entirely"
+        );
+        assert!(derive_user_context(false, None).is_none());
+        assert!(derive_user_context(false, Some("")).is_none());
+    }
+
+    /// With hosted mode ON, a non-empty token yields a context; absent/empty
+    /// token still means single-user (no context).
+    #[test]
+    fn hosted_mode_on_honors_only_a_nonempty_token() {
+        assert!(
+            derive_user_context(true, Some("alice")).is_some(),
+            "flag on + token must derive a context"
+        );
+        assert!(
+            derive_user_context(true, None).is_none(),
+            "flag on + no token => single-user"
+        );
+        assert!(
+            derive_user_context(true, Some("")).is_none(),
+            "flag on + empty token => single-user (not an empty-token namespace)"
+        );
+    }
+
+    /// The derived namespace depends only on the token bytes: same token =>
+    /// same UserId; different tokens => different UserId. This pins that the
+    /// flag-gated boundary feeds the token straight into the (deterministic)
+    /// derivation with no other inputs.
+    #[test]
+    fn derived_context_namespace_tracks_only_the_token() {
+        let a = derive_user_context(true, Some("alice")).unwrap();
+        let a_again = derive_user_context(true, Some("alice")).unwrap();
+        let b = derive_user_context(true, Some("bob")).unwrap();
+        assert_eq!(a.user_id(), a_again.user_id());
+        assert_ne!(a.user_id(), b.user_id());
+    }
+
+    // ---- refuse-plaintext-token secure-connection gate (#4381) ----
+
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    const LOOPBACK_V4: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST); // 127.0.0.1
+    const LOOPBACK_V4_ALT: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 5)); // 127/8
+    const LOOPBACK_V6: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST); // ::1
+    const PUBLIC_V4: IpAddr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)); // TEST-NET-3
+    const LAN_V4: IpAddr = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50)); // private but NOT loopback
+
+    /// `is_loopback_source` accepts loopback v4/v6 and v4-mapped-v6 loopback,
+    /// and rejects everything else — including a private-but-not-loopback LAN IP
+    /// (loopback, not "private", is the trust anchor for the token gate).
+    #[test]
+    fn loopback_source_detection() {
+        assert!(is_loopback_source(LOOPBACK_V4));
+        assert!(is_loopback_source(LOOPBACK_V4_ALT));
+        assert!(is_loopback_source(LOOPBACK_V6));
+        // ::ffff:127.0.0.1 (IPv4-mapped loopback from a dual-stack socket).
+        assert!(is_loopback_source(
+            "::ffff:127.0.0.1".parse::<IpAddr>().unwrap()
+        ));
+        assert!(!is_loopback_source(PUBLIC_V4));
+        assert!(!is_loopback_source(LAN_V4));
+        // ::ffff:8.8.8.8 (mapped public) must not be treated as loopback.
+        assert!(!is_loopback_source(
+            "::ffff:8.8.8.8".parse::<IpAddr>().unwrap()
+        ));
+    }
+
+    /// Flag OFF: the gate is inert. A presented token over ANY source/XFP
+    /// (even a remote, plaintext one) is `Local` — no rejection path fires. This
+    /// proves the whole invariant is hosted-mode-gated and flag-off is unchanged.
+    #[test]
+    fn gate_flag_off_is_always_local_never_rejects() {
+        for source in [Some(PUBLIC_V4), Some(LAN_V4), Some(LOOPBACK_V4), None] {
+            for xfp in [false, true] {
+                assert_eq!(
+                    decide_user_token(false, true, source, xfp),
+                    UserTokenDecision::Local,
+                    "flag off must be Local for source={source:?} xfp={xfp}"
+                );
+            }
+        }
+    }
+
+    /// No token (any mode/source/XFP): `Local`, never rejected. Token-less
+    /// connections are unaffected by the gate in all modes.
+    #[test]
+    fn gate_no_token_is_always_local() {
+        for hosted in [false, true] {
+            for source in [Some(PUBLIC_V4), Some(LOOPBACK_V4), None] {
+                for xfp in [false, true] {
+                    assert_eq!(
+                        decide_user_token(hosted, false, source, xfp),
+                        UserTokenDecision::Local,
+                        "no token must be Local for hosted={hosted} source={source:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Hosted ON + token + loopback source + `X-Forwarded-Proto: https` => Honor.
+    /// The intended hosted deployment: a same-host TLS-terminating reverse proxy
+    /// attesting the browser→proxy hop was TLS (e.g. Caddy, which sets XFP by
+    /// default).
+    #[test]
+    fn gate_loopback_with_https_is_honored() {
+        for source in [LOOPBACK_V4, LOOPBACK_V4_ALT, LOOPBACK_V6] {
+            assert_eq!(
+                decide_user_token(true, true, Some(source), true),
+                UserTokenDecision::Honor,
+                "loopback {source:?} + XFP=https (intended TLS proxy) must be honored"
+            );
+        }
+    }
+
+    /// Hosted ON + token + loopback source + NO `X-Forwarded-Proto: https` =>
+    /// REJECT. This single case now covers BOTH the direct plaintext loopback
+    /// connection AND the nginx-default plaintext-proxy gap: nginx's default
+    /// rewrites `Host` to the upstream `127.0.0.1:7509` and (without explicit
+    /// config) forwards no XFP, so a same-host proxy serving public PLAINTEXT
+    /// http presents a loopback source, a local-looking Host, and no XFP — yet
+    /// the browser→proxy hop crossed the network in cleartext. Without positive
+    /// HTTPS evidence the token is refused: Host is NOT consulted, so it cannot
+    /// be used to bypass the gate.
+    #[test]
+    fn gate_loopback_no_https_is_rejected() {
+        for source in [LOOPBACK_V4, LOOPBACK_V4_ALT, LOOPBACK_V6] {
+            assert_eq!(
+                decide_user_token(true, true, Some(source), false),
+                UserTokenDecision::RejectInsecure,
+                "loopback {source:?} + NO XFP (direct plaintext or plaintext proxy) \
+                 must be rejected — Host must NOT grant trust"
+            );
+        }
+    }
+
+    /// Hosted ON + token + non-loopback source => REJECT for ANY XFP. The token
+    /// reached the node directly over the network. XFP is client-spoofable from
+    /// off-host and is never consulted here. Covers the directly-exposed
+    /// plaintext port and the LAN-exposed port (trust anchor is loopback, NOT
+    /// "is_private_ip").
+    #[test]
+    fn gate_non_loopback_source_is_always_rejected() {
+        for source in [PUBLIC_V4, LAN_V4] {
+            for xfp in [false, true] {
+                assert_eq!(
+                    decide_user_token(true, true, Some(source), xfp),
+                    UserTokenDecision::RejectInsecure,
+                    "non-loopback {source:?} must be rejected (xfp={xfp}) \
+                     — spoofable XFP must NOT widen a remote source"
+                );
+            }
+        }
+    }
+
+    /// Hosted ON + token + unknown source (`None`) => REJECT (fail closed) for any
+    /// XFP. We cannot prove loopback, so we must not honor. In production
+    /// ConnectInfo is always present; `None` only arises if the plumbing is missing.
+    #[test]
+    fn gate_missing_source_fails_closed() {
+        for xfp in [false, true] {
+            assert_eq!(
+                decide_user_token(true, true, None, xfp),
+                UserTokenDecision::RejectInsecure,
+            );
+        }
+    }
+
+    /// Regression: an EMPTY `userToken` (`?userToken=` => `Some("")`) must be
+    /// treated as no token (Local), NOT rejected as insecure. The call site
+    /// computes `has_token` as a NON-EMPTY check, so an empty token over a
+    /// remote/non-loopback hosted connection falls through to Local — a
+    /// brand-new remote user whose client sends an empty `userToken=` connects
+    /// as single-user to GET a token, instead of being locked out with a 403.
+    /// This mirrors `derive_user_context`'s empty-is-absent semantics so the two
+    /// helpers agree on "empty".
+    #[test]
+    fn gate_empty_token_is_local_not_rejected() {
+        // Replicate the call-site computation of `has_token`.
+        let has_token = |t: Option<&str>| t.is_some_and(|t| !t.is_empty());
+
+        // Empty token + hosted on + remote source => Local (the regression).
+        assert_eq!(
+            decide_user_token(true, has_token(Some("")), Some(PUBLIC_V4), false),
+            UserTokenDecision::Local,
+            "empty userToken over a remote hosted connection must be Local, not rejected"
+        );
+        // Empty token + hosted on + loopback + no XFP => Local (no spurious
+        // Honor and no rejection either — empty is absent before the gate runs).
+        assert_eq!(
+            decide_user_token(true, has_token(Some("")), Some(LOOPBACK_V4), false),
+            UserTokenDecision::Local,
+        );
+        // Sanity: a NON-empty token over the same remote source IS rejected, so
+        // the empty-token allowance is specifically about emptiness.
+        assert_eq!(
+            decide_user_token(true, has_token(Some("alice")), Some(PUBLIC_V4), false),
+            UserTokenDecision::RejectInsecure,
+        );
+        // Whitespace is intentionally a real (non-empty) token, consistent with
+        // derive_user_context — so it IS gated (rejected over a remote source).
+        assert_eq!(
+            decide_user_token(true, has_token(Some(" ")), Some(PUBLIC_V4), false),
+            UserTokenDecision::RejectInsecure,
+            "whitespace token is non-empty => treated as a real token"
+        );
+    }
+
+    /// Integration-level check that the `connection_info` middleware actually
+    /// enforces the gate end-to-end (not just the pure helper): it reads the
+    /// `ConnectInfo<SocketAddr>` source, the `X-Forwarded-Proto` header, and the
+    /// `userToken`, and returns 403 for an insecure hosted token while passing
+    /// everything else through. Builds a minimal router that layers
+    /// `connection_info` over a trivial 200 handler, mirroring the production
+    /// extension stack (`HostedMode`, `AllowedHosts`, `AllowedSourceCidrs`).
+    ///
+    /// These requests are NOT WebSocket upgrades (no `Upgrade: websocket`), so
+    /// the Origin/Host CSWSH check is skipped — this isolates the user-token gate.
+    #[tokio::test]
+    async fn middleware_rejects_insecure_hosted_token_and_passes_rest() {
+        use axum::{Extension, Router, body::Body, http::Request, http::StatusCode, routing::get};
+        use std::net::SocketAddr;
+        use tower::ServiceExt;
+
+        async fn handler() -> &'static str {
+            "ok"
+        }
+
+        // `connection_info` inserts `Extension<Option<UserSecretContext>>`,
+        // `Extension<Option<AuthToken>>`, and `Extension<EncodingProtocol>` and
+        // then calls the next service; the trivial handler ignores them. The
+        // three extractor Extensions it READS must be present or it 500s.
+        fn router(hosted: bool) -> Router {
+            Router::new()
+                .route("/", get(handler))
+                .layer(axum::middleware::from_fn(connection_info))
+                .layer(Extension(crate::server::HostedMode(hosted)))
+                .layer(Extension(crate::server::AllowedHosts::default()))
+                .layer(Extension(crate::server::AllowedSourceCidrs::default()))
+        }
+
+        // The gate reads only the `X-Forwarded-Proto` header and the
+        // `ConnectInfo<SocketAddr>` source — `Host` is NOT consulted (it is
+        // proxy-rewritable and cannot grant trust), so the helper does not set
+        // it. `xfp_https` sets `X-Forwarded-Proto: https` when true.
+        fn req(
+            hosted_uri_token: Option<&str>,
+            source: Option<SocketAddr>,
+            xfp_https: bool,
+        ) -> Request<Body> {
+            let uri = match hosted_uri_token {
+                Some(t) => format!("/?userToken={t}"),
+                None => "/".to_string(),
+            };
+            let mut builder = Request::builder().uri(uri);
+            if xfp_https {
+                builder = builder.header("x-forwarded-proto", "https");
+            }
+            if let Some(addr) = source {
+                builder = builder.extension(axum::extract::ConnectInfo(addr));
+            }
+            builder.body(Body::empty()).unwrap()
+        }
+
+        let loopback: SocketAddr = ([127, 0, 0, 1], 12345).into();
+        let public: SocketAddr = ([203, 0, 113, 7], 443).into();
+
+        // Hosted ON + token + remote plaintext => 403 (the leak-prevention case).
+        let resp = router(true)
+            .oneshot(req(Some("alice"), Some(public), false))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "insecure hosted token must be rejected at the middleware"
+        );
+
+        // Hosted ON + token + remote + spoofed XFP https => still 403.
+        let resp = router(true)
+            .oneshot(req(Some("alice"), Some(public), true))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "XFP from a remote source must not bypass the gate"
+        );
+
+        // Hosted ON + token + loopback + XFP https => 200 (intended same-host TLS
+        // proxy; e.g. Caddy, which sets X-Forwarded-Proto: https by default).
+        let resp = router(true)
+            .oneshot(req(Some("alice"), Some(loopback), true))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "loopback + XFP=https (TLS proxy) hosted token must be honored"
+        );
+
+        // Hosted ON + token + loopback + NO XFP => 403. Covers BOTH a direct
+        // plaintext loopback connection AND the nginx-default plaintext-proxy
+        // gap (loopback source, local-looking rewritten Host, no XFP): without
+        // positive HTTPS evidence the token is refused. Host is NOT consulted,
+        // so it cannot be used to bypass the gate.
+        let resp = router(true)
+            .oneshot(req(Some("alice"), Some(loopback), false))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "loopback + no XFP (direct plaintext or plaintext proxy) must be rejected"
+        );
+
+        // Hosted OFF + token + remote => 200 (gate inert; token ignored, Local).
+        let resp = router(false)
+            .oneshot(req(Some("alice"), Some(public), false))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "flag off must not reject; token is ignored, not gated"
+        );
+
+        // No token + remote (any mode) => 200 (unaffected by the gate).
+        let resp = router(true)
+            .oneshot(req(None, Some(public), false))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = router(false)
+            .oneshot(req(None, Some(public), false))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Hosted ON + EMPTY token (`/?userToken=`) + remote => 200, NOT 403.
+        // A brand-new remote user whose client sends an empty userToken must be
+        // able to connect (as Local) to GET a real token, not be locked out.
+        let resp = router(true)
+            .oneshot(req(Some(""), Some(public), false))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "empty userToken over a remote hosted connection must be Local (200), not rejected"
+        );
+    }
 
     fn test_conn_state(encoding: EncodingProtocol) -> ConnectionState {
         ConnectionState {

@@ -9,6 +9,7 @@ pub(crate) mod mock_state_storage;
 mod module_cache;
 mod native_api;
 mod runtime;
+pub mod secret_export;
 pub mod secret_snapshots;
 mod secrets_store;
 pub(crate) mod simulation_runtime;
@@ -25,7 +26,8 @@ pub(crate) use error::{ContractError, RuntimeInnerError, RuntimeResult};
 pub use mock_state_storage::MockStateStorage;
 pub use module_cache::default_module_cache_budget_bytes;
 pub(crate) use module_cache::{
-    DELEGATE_MODULE_CACHE_BUDGET_DIVISOR, MODULE_CACHE_METRICS, ModuleCache,
+    DELEGATE_MODULE_CACHE_BUDGET_DIVISOR, ModuleCache, ModuleCacheMetrics,
+    contract_cache_occupancy_pct,
 };
 // Clamp bounds are referenced only by the config-default round-trip test, which
 // asserts the resolved default lands within [MIN, MAX] without hardcoding the
@@ -46,7 +48,9 @@ pub(crate) use native_api::{
 pub(crate) use native_api::InheritedOriginsEntry;
 pub use runtime::{ContractExecError, Runtime};
 pub(crate) use runtime::{RuntimeConfig, SharedModuleCache};
-pub use secrets_store::{SecretStoreError, SecretsStore};
+pub use secrets_store::{
+    ExportSecretEntry, SecretScope, SecretStoreError, SecretsStore, UserSecretContext,
+};
 // NOTE: InMemoryContractStore and SimulationStores are available but currently unused
 // They provide infrastructure for more sophisticated simulation scenarios
 #[allow(unused_imports)]

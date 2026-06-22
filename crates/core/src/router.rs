@@ -10,7 +10,9 @@ use serde::{Deserialize, Serialize};
 use crate::config::GlobalRng;
 use crate::node::network_status::OpType;
 use crate::ring::{Distance, Location, PeerKeyLocation};
-pub(crate) use isotonic_estimator::{EstimatorType, IsotonicEstimator, IsotonicEvent};
+pub(crate) use isotonic_estimator::{
+    AdjustmentMode, EstimatorType, IsotonicEstimator, IsotonicEvent,
+};
 use util::{Mean, TransferSpeed};
 
 /// Default size of the candidate window the prediction-based router considers.
@@ -176,7 +178,8 @@ pub(crate) struct RouterSnapshotInfo {
     /// `None` on non-unix. Populated by `Ring`; see [`open_fds`](Self::open_fds).
     pub fd_soft_limit: Option<u64>,
     /// Compiled-WASM module-cache gauges (#4440), populated by `Ring` from the
-    /// process-global `MODULE_CACHE_METRICS`. `None` until the WASM runtime has
+    /// per-node `ModuleCacheMetrics` `Arc` the caches publish into (a
+    /// process-global until #4488). `None` until the WASM runtime has
     /// touched the cache. The contract-cache thrash (eviction → recompile) that
     /// drove the #4441 incident was invisible to central telemetry; these make
     /// occupancy and eviction pressure observable on the snapshot cadence. The
@@ -190,6 +193,31 @@ pub(crate) struct RouterSnapshotInfo {
     pub delegate_module_cache_total_bytes: Option<u64>,
     pub delegate_module_cache_budget_bytes: Option<u64>,
     pub delegate_module_cache_evictions_total: Option<u64>,
+    /// UPDATE-broadcast stream-assembly gauges (#4440), populated by `Ring` from
+    /// the process-global `BROADCAST_STREAM_METRICS` the broadcast queue
+    /// publishes into. A streaming broadcast that fails to reach `Delivered`
+    /// (dropped, oneshot dropped, or completion timeout) is a stream-assembly /
+    /// transfer failure — the exact signal that flagged the v0.2.73 incident
+    /// (nova/vega ~1500-2300 failures/hr vs ~0 baseline) and the one that would
+    /// catch a re-enable going wrong. `None` until the first streaming broadcast.
+    ///
+    /// `*_total` are monotonic lifetime counters (the collector differences them
+    /// across the cadence to derive a rate); `*_failures_last_snapshot` is the
+    /// per-snapshot delta `Ring` samples directly, so the incident signal is
+    /// legible without a stateful collector.
+    pub broadcast_stream_attempts_total: Option<u64>,
+    pub broadcast_stream_failures_total: Option<u64>,
+    pub broadcast_stream_failures_last_snapshot: Option<u64>,
+    /// Background-task health gauges (#4440), populated by `Ring` from the
+    /// process-global `BACKGROUND_TASK_HEALTH` the monitored tasks publish into.
+    /// `refresh_router`'s transient `get_router_events` errors were made
+    /// non-fatal by the v0.2.74 #4438 hotfix, so a persistently-failing refresh
+    /// is now silent; these make it observable (partially addresses #4440 (a)).
+    /// `last_success_age_secs` is seconds since the last successful run (`None`
+    /// until the first success); `consecutive_failures` is the current run of
+    /// failures since the last success.
+    pub refresh_router_last_success_age_secs: Option<u64>,
+    pub refresh_router_consecutive_failures: Option<u64>,
     /// Per-operation-type estimator curves, keyed by op type name (e.g., "GET").
     pub per_op_curves: HashMap<String, PerOpCurves>,
     /// Renegade predictor diagnostics. These (and `renegade_accuracy_pairs`) are
@@ -445,14 +473,21 @@ impl Router {
         }
 
         Router {
-            // Positive because we expect time to increase as distance increases
-            response_start_time_estimator: IsotonicEstimator::new(
+            // Positive because we expect time to increase as distance increases.
+            // Multiplicative per-peer adjustment: a peer's response time deviates
+            // from the global fit by a near-constant ratio, not a constant offset
+            // (validated on production telemetry). See `AdjustmentMode`.
+            response_start_time_estimator: IsotonicEstimator::new_with_mode(
                 success_durations,
                 EstimatorType::Positive,
+                AdjustmentMode::Multiplicative,
             ),
             // Positive because we expect failure probability to increase as distance increase
             failure_estimator: IsotonicEstimator::new(failure_outcomes, EstimatorType::Positive),
-            // Negative because we expect transfer rate to decrease as distance increases
+            // Negative because we expect transfer rate to decrease as distance increases.
+            // Additive for now: transfer rate is the same unbounded multiplicative-scale
+            // quantity as response time and is a strong candidate for multiplicative too,
+            // but current telemetry lacks the per-distance payload data to validate it.
             transfer_rate_estimator: IsotonicEstimator::new(
                 transfer_rates,
                 EstimatorType::Negative,
@@ -465,7 +500,16 @@ impl Router {
                 .collect(),
             per_op_response_time: per_op_response_time
                 .into_iter()
-                .map(|(k, v)| (k, IsotonicEstimator::new(v, EstimatorType::Positive)))
+                .map(|(k, v)| {
+                    (
+                        k,
+                        IsotonicEstimator::new_with_mode(
+                            v,
+                            EstimatorType::Positive,
+                            AdjustmentMode::Multiplicative,
+                        ),
+                    )
+                })
                 .collect(),
             per_op_transfer_rate: per_op_transfer_rate
                 .into_iter()
@@ -524,7 +568,12 @@ impl Router {
                     self.per_op_response_time
                         .entry(ot)
                         .or_insert_with(|| {
-                            IsotonicEstimator::new(std::iter::empty(), EstimatorType::Positive)
+                            // Multiplicative to match the global response-time estimator.
+                            IsotonicEstimator::new_with_mode(
+                                std::iter::empty(),
+                                EstimatorType::Positive,
+                                AdjustmentMode::Multiplicative,
+                            )
                         })
                         .add_event(IsotonicEvent {
                             peer: event.peer.clone(),
@@ -971,6 +1020,13 @@ impl Router {
             delegate_module_cache_total_bytes: None,
             delegate_module_cache_budget_bytes: None,
             delegate_module_cache_evictions_total: None,
+            // Broadcast stream-assembly + background-task health gauges,
+            // populated by Ring on the snapshot cadence (#4440).
+            broadcast_stream_attempts_total: None,
+            broadcast_stream_failures_total: None,
+            broadcast_stream_failures_last_snapshot: None,
+            refresh_router_last_success_age_secs: None,
+            refresh_router_consecutive_failures: None,
             // Renegade predictor diagnostics
             renegade_failure_events: self.renegade_predictor.len(),
             renegade_response_time_events: self.renegade_predictor.stage_sizes().1,
@@ -1106,6 +1162,72 @@ mod tests {
     use crate::ring::Distance;
 
     use super::*;
+
+    #[test]
+    fn estimators_use_intended_adjustment_modes() {
+        // Pin the per-estimator adjustment modes so a future change can't silently
+        // make failure probability multiplicative (wrong for a bounded [0,1] target)
+        // or response time additive. Response time is multiplicative (validated on
+        // telemetry, #4547); failure and transfer rate stay additive for now.
+        let mut router = Router::new(&[]);
+        // Global estimators.
+        assert_eq!(
+            router.response_start_time_estimator.adjustment_mode(),
+            AdjustmentMode::Multiplicative,
+            "response time must be multiplicative"
+        );
+        assert_eq!(
+            router.failure_estimator.adjustment_mode(),
+            AdjustmentMode::Additive,
+            "failure probability must stay additive (bounded [0,1])"
+        );
+        assert_eq!(
+            router.transfer_rate_estimator.adjustment_mode(),
+            AdjustmentMode::Additive,
+            "transfer rate stays additive pending instrumentation (#4547)"
+        );
+
+        // Per-op estimators are created lazily on the first matching event and must
+        // match their global counterpart's mode. A timed GET success populates all
+        // three (response time + failure + transfer rate) for OpType::Get.
+        router.add_event(RouteEvent {
+            peer: PeerKeyLocation::random(),
+            contract_location: Location::random(),
+            outcome: RouteOutcome::Success {
+                time_to_response_start: Duration::from_millis(100),
+                payload_size: 5000,
+                payload_transfer_time: Duration::from_millis(50),
+            },
+            op_type: Some(OpType::Get),
+        });
+        assert_eq!(
+            router
+                .per_op_response_time
+                .get(&OpType::Get)
+                .unwrap()
+                .adjustment_mode(),
+            AdjustmentMode::Multiplicative,
+            "per-op response time must match the global estimator (multiplicative)"
+        );
+        assert_eq!(
+            router
+                .per_op_failure
+                .get(&OpType::Get)
+                .unwrap()
+                .adjustment_mode(),
+            AdjustmentMode::Additive,
+            "per-op failure must stay additive"
+        );
+        assert_eq!(
+            router
+                .per_op_transfer_rate
+                .get(&OpType::Get)
+                .unwrap()
+                .adjustment_mode(),
+            AdjustmentMode::Additive,
+            "per-op transfer rate must stay additive"
+        );
+    }
 
     #[test]
     fn before_data_select_closest() {

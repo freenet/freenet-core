@@ -179,6 +179,7 @@ impl Default for ConfigArgs {
                 token_cleanup_interval_seconds: None,
                 allowed_host: None,
                 allowed_source_cidrs: None,
+                hosted_mode: None,
             },
             secrets: Default::default(),
             log_level: Some(tracing::log::LevelFilter::Info),
@@ -284,9 +285,6 @@ impl ConfigArgs {
     /// URL so the remote-fetch path is exercised deterministically without
     /// reaching out to `freenet.org` (which would be slow and flaky in CI).
     async fn build_with_gateways_index(mut self, gateways_index: &str) -> anyhow::Result<Config> {
-        // Validate gateway configuration
-        self.network_api.validate()?;
-
         let cfg = if let Some(path) = self.config_paths.config_dir.as_ref() {
             if !path.exists() {
                 return Err(anyhow::Error::new(std::io::Error::new(
@@ -323,8 +321,6 @@ impl ConfigArgs {
             }
         };
 
-        let should_persist = cfg.is_none();
-
         // merge the configuration from the file with the command line arguments
         if let Some(cfg) = cfg {
             self.secrets.merge(cfg.secrets);
@@ -351,6 +347,9 @@ impl ConfigArgs {
                         .collect(),
                 );
             }
+            self.ws_api
+                .hosted_mode
+                .get_or_insert(cfg.ws_api.hosted_mode);
             self.network_api
                 .address
                 .get_or_insert(cfg.network_api.address);
@@ -403,6 +402,33 @@ impl ConfigArgs {
             if self.network_api.bbr_startup_rate.is_none() {
                 self.network_api.bbr_startup_rate = cfg.network_api.bbr_startup_rate;
             }
+            if let Some(limit) = cfg.network_api.total_bandwidth_limit {
+                self.network_api.total_bandwidth_limit.get_or_insert(limit);
+            }
+            if let Some(min_bw) = cfg.network_api.min_bandwidth_per_connection {
+                self.network_api
+                    .min_bandwidth_per_connection
+                    .get_or_insert(min_bw);
+            }
+            self.network_api
+                .event_loop_channel_capacity
+                .get_or_insert(cfg.network_api.event_loop_channel_capacity);
+            // `--is-gateway` is a plain on/off flag: when absent we can't tell
+            // "not a gateway" from "flag not passed", so only let the file turn
+            // it ON. A saved gateway then stays a gateway on a bare restart (the
+            // telemetry flags below have the same limitation).
+            if cfg.is_gateway {
+                self.network_api.is_gateway = true;
+            }
+            // Same on/off-flag limitation: only let the file turn this ON, so a
+            // node set up to run isolated stays isolated on a bare restart
+            // instead of going back to fetching the public gateway list.
+            if cfg.network_api.skip_load_from_network {
+                self.network_api.skip_load_from_network = true;
+            }
+            if let Some(loc) = cfg.location {
+                self.network_api.location.get_or_insert(loc);
+            }
             self.log_level.get_or_insert(cfg.log_level);
             self.max_hosting_storage
                 .get_or_insert(cfg.max_hosting_storage);
@@ -410,6 +436,8 @@ impl ConfigArgs {
                 .get_or_insert(cfg.module_cache_budget_bytes);
             self.shutdown_drain_secs
                 .get_or_insert(cfg.shutdown_drain_secs);
+            self.max_blocking_threads
+                .get_or_insert(cfg.max_blocking_threads);
             self.config_paths.merge(cfg.config_paths.as_ref().clone());
             // Merge telemetry config - CLI args override file config
             // Note: enabled defaults to true via clap, so we only override
@@ -422,6 +450,9 @@ impl ConfigArgs {
                     .endpoint
                     .get_or_insert(cfg.telemetry.endpoint);
             }
+            self.telemetry
+                .transport_snapshot_interval_secs
+                .get_or_insert(cfg.telemetry.transport_snapshot_interval_secs);
             // reference-ping-enabled defaults to false via clap; override
             // if the config file sets it to true. The inverse direction
             // doesn't need handling — the clap default is already false.
@@ -434,6 +465,11 @@ impl ConfigArgs {
                 self.telemetry.iface_tx_enabled = true;
             }
         }
+
+        // Validate the effective config (CLI + values merged from config.toml).
+        // After the merge so a gateway role restored from the file is still
+        // checked for its public address/port, not silently armed (#4275).
+        self.network_api.validate()?;
 
         let mode = self.mode.unwrap_or(OperationMode::Network);
         let config_paths = self.config_paths.build(self.id.as_deref())?;
@@ -505,6 +541,31 @@ impl ConfigArgs {
             // When we successfully fetch gateways from the network, replace local ones entirely
             // This ensures users always use the current active gateways
             // TODO: This behavior will likely change once we release a stable version
+
+            // #4275: warn about locally-cached gateways the remote index no
+            // longer lists (e.g. a peer pinned via --gateway) before discarding
+            // them. The remote index still wins; --skip-load-from-network keeps
+            // a custom peer set.
+            if let Ok(content) = fs::read_to_string(&gateways_file) {
+                if let Ok(local_cache) = toml::from_str::<Gateways>(&content) {
+                    let dropped = gateways_dropped_by_remote_replace(
+                        &local_cache.gateways,
+                        &remotely_loaded_gateways.gateways,
+                    );
+                    if !dropped.is_empty() {
+                        tracing::warn!(
+                            dropped = ?dropped,
+                            file = ?gateways_file,
+                            "Remote gateway index does not list {} locally-cached \
+                             gateway(s); they will be discarded. If you pinned them \
+                             manually, run with --skip-load-from-network to keep a \
+                             custom peer set.",
+                            dropped.len()
+                        );
+                    }
+                }
+            }
+
             tracing::info!(
                 gateway_count = remotely_loaded_gateways.gateways.len(),
                 "Replacing local gateways with gateways from remote index"
@@ -796,6 +857,7 @@ impl ConfigArgs {
                     })
                     .transpose()?
                     .unwrap_or_default(),
+                hosted_mode: self.ws_api.hosted_mode.unwrap_or(false),
             },
             secrets,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
@@ -842,15 +904,19 @@ impl ConfigArgs {
             gateways.save_to_file(&gateways_file)?;
         }
 
-        if should_persist {
-            let path = this.config_dir().join("config.toml");
-            tracing::info!(path = ?path, "Persisting configuration");
-            let mut file = File::create(path)?;
-            file.write_all(
-                toml::to_string(&this)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
-                    .as_bytes(),
-            )?;
+        // Persist on first run (no file yet) or when the effective config
+        // changed — e.g. the operator passed a new CLI flag — so config.toml
+        // stays the source of truth (#4275). Comparing against the file's
+        // current contents (written by the same serializer) keeps an unchanged
+        // restart a no-op, so operator hand-edits survive.
+        let config_path = this.config_dir().join("config.toml");
+        let new_config_toml = toml::to_string(&this)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let current = std::fs::read_to_string(&config_path).ok();
+        if current.as_deref() != Some(new_config_toml.as_str()) {
+            tracing::info!(path = ?config_path, "Persisting configuration");
+            let mut file = File::create(&config_path)?;
+            file.write_all(new_config_toml.as_bytes())?;
         }
 
         Ok(this)
@@ -1277,14 +1343,19 @@ fn parse_gateway(input: &str, secrets_dir: &Path) -> anyhow::Result<GatewayConfi
 impl NetworkArgs {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         if self.is_gateway {
-            // For gateways, require both public address and port
+            // A gateway advertises its own identity (peer_id) from its public
+            // address + port and, unlike a NAT'd peer, can never learn or
+            // correct it later. Require both explicitly; otherwise peer_id is
+            // None and the gateway boots with no ring location. See #4324.
             if self.public_address.is_none() {
                 return Err(anyhow::anyhow!(
-                    "Gateway nodes must specify a public network address"
+                    "Gateway nodes must specify a public network address (--public-network-address)"
                 ));
             }
-            if self.public_port.is_none() && self.network_port.is_none() {
-                return Err(anyhow::anyhow!("Gateway nodes must specify a network port"));
+            if self.public_port.is_none() {
+                return Err(anyhow::anyhow!(
+                    "Gateway nodes must specify a public network port (--public-network-port)"
+                ));
             }
         }
         Ok(())
@@ -1573,6 +1644,69 @@ pub struct WebsocketApiArgs {
         skip_serializing_if = "Option::is_none"
     )]
     pub allowed_source_cidrs: Option<Vec<String>>,
+
+    /// Opt-in hosted mode (P2 of #4381): honor a per-connection durable user
+    /// token (the `userToken` query parameter on the WebSocket upgrade) and
+    /// give that connection its own per-user delegate-secret namespace.
+    ///
+    /// OFF by default. When off, `userToken` is ignored and every connection is
+    /// single-user, byte-for-byte today's behavior. Enable only on a node you
+    /// intend to operate as a shared public proxy for untrusted users.
+    ///
+    /// SECURE-CONNECTION REQUIREMENT (refuse-plaintext-token, #4381): even with
+    /// hosted mode on, the durable `userToken` is honored ONLY over a **loopback**
+    /// connection carrying `X-Forwarded-Proto: https` — i.e. behind a
+    /// TLS-terminating reverse proxy colocated on the same host. The loopback
+    /// source proves the proxy→node hop is local; the `https` XFP is positive
+    /// evidence (set by the TLS terminator) that the browser→proxy hop used TLS.
+    ///
+    /// Everything else is **rejected** with `403` (fail-closed): a non-loopback
+    /// source, OR a loopback source without `X-Forwarded-Proto: https` (header
+    /// missing or `http`). A direct plaintext connection — even loopback — is
+    /// refused. `Host` is deliberately NOT consulted: it is proxy-rewritable
+    /// (nginx's default rewrites it to the upstream `127.0.0.1:7509`), so it
+    /// cannot grant trust; only the `https` XFP can.
+    ///
+    /// OPERATOR NOTE (REQUIRED proxy config): front the node with a
+    /// TLS-terminating reverse proxy on the SAME host that connects over
+    /// loopback. The proxy MUST (a) SET / OVERWRITE `X-Forwarded-Proto` itself to
+    /// the real browser→proxy scheme, AND (b) STRIP any client-supplied
+    /// `X-Forwarded-*` headers, so a client cannot forge the TLS attestation.
+    /// Caddy does both by default. nginx requires
+    /// `proxy_set_header X-Forwarded-Proto $scheme;` (a literal `https` is fine
+    /// for an HTTPS-only server block) and must NOT pass through a client-supplied
+    /// `X-Forwarded-Proto` — nginx forwards unknown client headers by default, so
+    /// the explicit `proxy_set_header` overwrite is what stops pass-through.
+    ///
+    /// SECURITY NOTE (known limitation): the node trusts `X-Forwarded-Proto` from
+    /// a loopback source and cannot tell a header the proxy SET from one it merely
+    /// PASSED THROUGH from the client. If the proxy is misconfigured to forward a
+    /// client-supplied `X-Forwarded-Proto: https` over a plaintext listener, a
+    /// client could spoof it and the token would be honored over cleartext. The
+    /// node cannot detect this pass-through misconfiguration; correct proxy
+    /// configuration is the operator's responsibility.
+    ///
+    /// A developer testing hosted mode locally must likewise front it with a TLS
+    /// proxy or send the header (`curl -H 'X-Forwarded-Proto: https'` from
+    /// loopback) — a plain plaintext loopback request is refused. A TLS terminator
+    /// on a **different** host (remote load balancer) is not supported today (its
+    /// source is not loopback) and would need future explicit trusted-proxy-IP
+    /// config.
+    ///
+    /// `--hosted-mode` is THE operator switch, so it works as a BARE flag:
+    /// `--hosted-mode` => `Some(true)`; `--hosted-mode=false` (or
+    /// `--hosted-mode false`) => `Some(false)`; absent => `None`. Kept as
+    /// `Option<bool>` (not a plain `bool` with `default_value`) so config-file /
+    /// env layering can still leave it unset (`None`) and the CLI only overrides
+    /// when actually present — `None` is then resolved to `false` in `build`.
+    #[arg(
+        long = "hosted-mode",
+        env = "FREENET_HOSTED_MODE",
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    #[serde(rename = "hosted-mode", skip_serializing_if = "Option::is_none")]
+    pub hosted_mode: Option<bool>,
 }
 
 /// Default telemetry endpoint (nova.locut.us OTLP collector).
@@ -1758,6 +1892,18 @@ pub struct WebsocketApiConfig {
     /// Empty means only loopback + RFC1918 / IPv6 ULA are accepted.
     #[serde(default, rename = "allowed-source-cidrs")]
     pub allowed_source_cidrs: Vec<ipnet::IpNet>,
+
+    /// Opt-in hosted mode (P2 of #4381). When `true`, a WebSocket connection
+    /// that presents a durable per-user token (the `userToken` query parameter)
+    /// gets a per-user delegate-secret namespace derived from that token; when
+    /// `false` (the default), the `userToken` parameter is ignored entirely and
+    /// every connection is single-user — byte-for-byte the pre-#4381 behavior.
+    ///
+    /// This flag ONLY governs whether the WS boundary derives a per-user
+    /// context; everything downstream is driven by whether a context was
+    /// derived, so with the flag off the entire feature is inert.
+    #[serde(default, rename = "hosted-mode")]
+    pub hosted_mode: bool,
 }
 
 #[inline]
@@ -1779,6 +1925,7 @@ impl From<SocketAddr> for WebsocketApiConfig {
             token_cleanup_interval_seconds: default_token_cleanup_interval_seconds(),
             allowed_hosts: Vec::new(),
             allowed_source_cidrs: Vec::new(),
+            hosted_mode: false,
         }
     }
 }
@@ -1793,6 +1940,7 @@ impl Default for WebsocketApiConfig {
             token_cleanup_interval_seconds: default_token_cleanup_interval_seconds(),
             allowed_hosts: Vec::new(),
             allowed_source_cidrs: Vec::new(),
+            hosted_mode: false,
         }
     }
 }
@@ -2172,6 +2320,22 @@ impl Gateways {
         fs::write(path, content)?;
         Ok(())
     }
+}
+
+/// Gateway addresses in `local` (the on-disk `gateways.toml` cache) absent
+/// from `remote` (the freshly fetched index) — the entries the remote-index
+/// replacement is about to drop. Surfaced as a warning so an operator-pinned
+/// `--gateway` peer is never discarded silently (#4275).
+fn gateways_dropped_by_remote_replace(
+    local: &[GatewayConfig],
+    remote: &[GatewayConfig],
+) -> Vec<Address> {
+    let remote_addrs: HashSet<&Address> = remote.iter().map(|g| &g.address).collect();
+    local
+        .iter()
+        .filter(|g| !remote_addrs.contains(&g.address))
+        .map(|g| g.address.clone())
+        .collect()
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -3113,6 +3277,127 @@ mod tests {
         );
     }
 
+    /// Hosted mode (P2 of #4381) is OFF unless explicitly enabled. This is the
+    /// inert-by-default guarantee: a node built with no hosted-mode flag never
+    /// honors a user token and stays single-user.
+    #[tokio::test]
+    async fn hosted_mode_defaults_to_off() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            ..Default::default()
+        };
+        let cfg = args.build().await.unwrap();
+        assert!(
+            !cfg.ws_api.hosted_mode,
+            "hosted_mode must default to false (inert unless explicitly enabled)"
+        );
+    }
+
+    /// When explicitly enabled, hosted mode resolves to `true` and survives a
+    /// TOML round-trip (so it works from a config file, not just the CLI flag).
+    #[tokio::test]
+    async fn hosted_mode_explicit_true_round_trips() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(temp_dir.path().to_path_buf()),
+                data_dir: Some(temp_dir.path().to_path_buf()),
+                log_dir: Some(temp_dir.path().to_path_buf()),
+            },
+            ws_api: WebsocketApiArgs {
+                hosted_mode: Some(true),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let cfg = args.build().await.unwrap();
+        assert!(
+            cfg.ws_api.hosted_mode,
+            "explicit --hosted-mode should resolve to true"
+        );
+
+        let serialized = toml::to_string(&cfg).unwrap();
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert!(
+            reparsed.ws_api.hosted_mode,
+            "hosted_mode=true must survive a TOML serialize/deserialize round-trip"
+        );
+    }
+
+    /// `--hosted-mode` is the operator switch for the feature, so it MUST work as
+    /// a BARE flag (clap optional-value form), while staying `Option<bool>` so
+    /// config-file/env layering can leave it unset. Asserts the three forms:
+    ///   bare `--hosted-mode`        => Some(true)
+    ///   `--hosted-mode=false`       => Some(false)
+    ///   absent                      => None
+    #[test]
+    fn hosted_mode_cli_accepts_bare_flag_and_explicit_value() {
+        use clap::Parser;
+
+        // The arg also reads FREENET_HOSTED_MODE via clap's `env`. Clear it for
+        // the duration of this test so the env of the test runner can't mask the
+        // CLI-form assertions, then restore it.
+        let saved = std::env::var_os("FREENET_HOSTED_MODE");
+        // SAFETY: this is the only test that touches FREENET_HOSTED_MODE, and it
+        // restores the prior value below; nextest per-process isolation means no
+        // other thread observes the transient unset.
+        unsafe {
+            std::env::remove_var("FREENET_HOSTED_MODE");
+        }
+
+        // Bare `--hosted-mode` => Some(true) (default_missing_value).
+        let bare = ConfigArgs::try_parse_from(["freenet", "--hosted-mode"])
+            .expect("bare --hosted-mode should parse");
+        assert_eq!(
+            bare.ws_api.hosted_mode,
+            Some(true),
+            "bare --hosted-mode must mean Some(true)"
+        );
+
+        // `--hosted-mode=false` => Some(false) (explicit override off).
+        let explicit_false = ConfigArgs::try_parse_from(["freenet", "--hosted-mode=false"])
+            .expect("--hosted-mode=false should parse");
+        assert_eq!(
+            explicit_false.ws_api.hosted_mode,
+            Some(false),
+            "--hosted-mode=false must mean Some(false)"
+        );
+
+        // `--hosted-mode true` (space-separated value) => Some(true).
+        let explicit_true = ConfigArgs::try_parse_from(["freenet", "--hosted-mode", "true"])
+            .expect("--hosted-mode true should parse");
+        assert_eq!(
+            explicit_true.ws_api.hosted_mode,
+            Some(true),
+            "--hosted-mode true must mean Some(true)"
+        );
+
+        // Absent => None (so config-file/env can still supply the value, and
+        // `build()` resolves None to false).
+        let absent =
+            ConfigArgs::try_parse_from(["freenet"]).expect("no hosted-mode flag should parse");
+        assert_eq!(
+            absent.ws_api.hosted_mode, None,
+            "absent --hosted-mode must leave it None for config/env layering"
+        );
+
+        // Restore the env var for any other test in this process.
+        // SAFETY: restores the value saved above; same single-test /
+        // nextest-isolation rationale as the unset.
+        unsafe {
+            if let Some(v) = saved {
+                std::env::set_var("FREENET_HOSTED_MODE", v);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn max_hosting_storage_explicit_value_round_trips() {
         let temp_dir = tempfile::tempdir().unwrap();
@@ -3345,6 +3630,474 @@ mod tests {
             cfg.ws_api.allowed_hosts,
             vec!["my-tailscale-host".to_string()],
             "allowed-host from config.toml must be present in built config"
+        );
+    }
+
+    /// A local-mode `ConfigArgs` pointing every path at `dir`. Used to seed a
+    /// `config.toml` (first `build()` persists it) and to read it back on a
+    /// later bare build — the real persistence round-trip.
+    fn local_args(dir: &Path) -> ConfigArgs {
+        ConfigArgs {
+            mode: Some(OperationMode::Local),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(dir.to_path_buf()),
+                data_dir: Some(dir.to_path_buf()),
+                log_dir: Some(dir.to_path_buf()),
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_role_and_total_bandwidth_round_trip_through_build() {
+        // Regression for #4275: is_gateway/location/total_bandwidth_limit are
+        // written to config.toml but build()'s merge never read them back, so a
+        // bare `freenet network` demoted the gateway and dropped its bandwidth
+        // cap. Exercises the real round-trip: first build persists, bare build
+        // reads back.
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let mut first = local_args(temp_dir.path());
+        first.network_api.is_gateway = true;
+        first.network_api.public_address = Some("1.2.3.4".parse().unwrap());
+        first.network_api.public_port = Some(31337);
+        first.network_api.location = Some(0.5);
+        first.network_api.total_bandwidth_limit = Some(100_000_000);
+        first.network_api.max_connections = Some(2000);
+        first.build().await.unwrap();
+        assert!(
+            temp_dir.path().join("config.toml").exists(),
+            "first build with flags must persist config.toml"
+        );
+
+        let cfg = local_args(temp_dir.path()).build().await.unwrap();
+
+        assert!(
+            cfg.is_gateway,
+            "is_gateway from config.toml must survive a bare build (node must stay a gateway)"
+        );
+        assert_eq!(
+            cfg.location,
+            Some(0.5),
+            "location from config.toml must survive a bare build"
+        );
+        assert_eq!(
+            cfg.network_api.total_bandwidth_limit,
+            Some(100_000_000),
+            "total_bandwidth_limit from config.toml must survive a bare build"
+        );
+        assert_eq!(
+            cfg.network_api.max_connections, 2000,
+            "max_connections from config.toml must survive a bare build"
+        );
+        assert!(
+            cfg.peer_id.is_some(),
+            "peer_id must be reconstructed from the restored public address/port"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_in_config_without_public_address_fails_validation() {
+        // A config.toml claiming is_gateway=true with no public address must be
+        // rejected, not silently armed — which only holds if validate() runs
+        // after the merge. The normal flow can't produce such a file (validate
+        // rejects it up front), so hand-craft it: seed a valid non-gateway
+        // config.toml, then flip is_gateway on with no public address.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut seeded = local_args(temp_dir.path()).build().await.unwrap();
+        seeded.is_gateway = true;
+        seeded.network_api.public_address = None;
+        seeded.network_api.public_port = None;
+        std::fs::write(
+            temp_dir.path().join("config.toml"),
+            toml::to_string(&seeded).unwrap(),
+        )
+        .unwrap();
+
+        let err = local_args(temp_dir.path()).build().await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("public network address"),
+            "an is_gateway=true config without a public address must fail validation: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_total_bandwidth_limit_overrides_file_config() {
+        // CLI args still take precedence over the file value: the new merge
+        // must use get_or_insert (fill-if-empty), not a blind overwrite.
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        let mut first = local_args(temp_dir.path());
+        first.network_api.total_bandwidth_limit = Some(100_000_000);
+        first.build().await.unwrap();
+
+        let mut second = local_args(temp_dir.path());
+        second.network_api.total_bandwidth_limit = Some(50_000_000);
+        let cfg = second.build().await.unwrap();
+
+        assert_eq!(
+            cfg.network_api.total_bandwidth_limit,
+            Some(50_000_000),
+            "CLI --total-bandwidth-limit must override the config.toml value"
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_flag_set_on_a_later_run_is_persisted_to_config() {
+        // #4275 (B2): config.toml was only written on the first run, so a value
+        // passed on the CLI when the file already existed applied for that run
+        // but was lost on the next bare restart. It must be persisted instead.
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // First run creates config.toml (no total_bandwidth_limit).
+        clap_bare_args(temp_dir.path()).build().await.unwrap();
+
+        // Later run passes a new value on the CLI.
+        let mut args = clap_bare_args(temp_dir.path());
+        args.network_api.total_bandwidth_limit = Some(50_000_000);
+        args.build().await.unwrap();
+
+        // A subsequent bare run must see the persisted value.
+        let cfg = clap_bare_args(temp_dir.path()).build().await.unwrap();
+        assert_eq!(
+            cfg.network_api.total_bandwidth_limit,
+            Some(50_000_000),
+            "a CLI flag set on a later run must be written back to config.toml"
+        );
+    }
+
+    #[tokio::test]
+    async fn bare_restart_does_not_rewrite_unchanged_config() {
+        // The re-persist must only fire when something changed: a no-op restart
+        // must leave config.toml byte-identical, so operator hand-edits survive.
+        // Uses clap_bare_args (all-None) so the rebuild reads every value back
+        // from the file; local_args would re-pick a random network port each
+        // build (ConfigArgs::default) and look like a spurious change.
+        let temp_dir = tempfile::tempdir().unwrap();
+        clap_bare_args(temp_dir.path()).build().await.unwrap();
+
+        let path = temp_dir.path().join("config.toml");
+        let before = std::fs::read_to_string(&path).unwrap();
+        clap_bare_args(temp_dir.path()).build().await.unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+
+        assert_eq!(
+            before, after,
+            "a no-op restart must not rewrite config.toml"
+        );
+    }
+
+    #[test]
+    fn warns_only_about_cached_gateways_absent_from_remote_index() {
+        // #4275 (A2): the remote-index replacement must surface — but only —
+        // the locally-cached gateways that the index no longer lists, so a
+        // manually pinned peer is not dropped silently.
+        fn gw(host: &str) -> GatewayConfig {
+            GatewayConfig {
+                address: Address::Host {
+                    host: host.to_string(),
+                    port: 31337,
+                },
+                public_key_path: PathBuf::from("/dev/null"),
+                location: None,
+            }
+        }
+
+        let local = vec![gw("a"), gw("b"), gw("c")];
+        let remote = vec![gw("b"), gw("c"), gw("d")];
+
+        // Only "a" is in the local cache but missing from the remote index.
+        assert_eq!(
+            gateways_dropped_by_remote_replace(&local, &remote),
+            vec![Address::Host {
+                host: "a".to_string(),
+                port: 31337
+            }],
+        );
+
+        // Remote is a superset / identical → nothing is dropped → no warning.
+        assert!(gateways_dropped_by_remote_replace(&local, &local).is_empty());
+        assert!(gateways_dropped_by_remote_replace(&[], &remote).is_empty());
+    }
+
+    /// A `ConfigArgs` mirroring a real bare `freenet network` parse: every
+    /// optional field unset (None), pointed at `dir` in Local mode. Avoids
+    /// `ConfigArgs::default()`, which pre-fills some fields with `Some(..)` that
+    /// would MASK the file value on merge and give the guard below a false pass.
+    fn clap_bare_args(dir: &Path) -> ConfigArgs {
+        ConfigArgs {
+            mode: Some(OperationMode::Local),
+            network_api: NetworkArgs::default(),
+            ws_api: WebsocketApiArgs::default(),
+            secrets: Default::default(),
+            log_level: None,
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(dir.to_path_buf()),
+                data_dir: Some(dir.to_path_buf()),
+                log_dir: Some(dir.to_path_buf()),
+            },
+            id: None,
+            version: false,
+            max_blocking_threads: None,
+            max_hosting_storage: None,
+            module_cache_budget_bytes: None,
+            shutdown_drain_secs: None,
+            telemetry: Default::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn all_persisted_config_fields_round_trip_through_build() {
+        // #4275 guard against the recurring bug class (#3890, #4275): build()'s
+        // field-by-field merge silently drops any persisted field it doesn't
+        // list. Seeds a non-default value for EVERY persisted field, writes it,
+        // rebuilds from a clap-bare ConfigArgs, and asserts each one survives.
+        //
+        // The destructuring below has NO `..`: adding a field to any of these
+        // structs fails to COMPILE until the author classifies it (round-trips
+        // -> merge + assert; skip-by-design -> bind to `_`). Keeps it honest.
+        let temp_dir = tempfile::tempdir().unwrap();
+
+        // Valid base build: creates the on-disk secret files (and gives us real
+        // secrets + resolved paths) that the rebuild will read back.
+        let base = clap_bare_args(temp_dir.path()).build().await.unwrap();
+
+        let seed = Config {
+            mode: OperationMode::Local,
+            network_api: NetworkApiConfig {
+                address: "10.1.2.3".parse().unwrap(),
+                port: 40001,
+                public_address: Some("1.2.3.4".parse().unwrap()),
+                public_port: Some(40002),
+                ignore_protocol_version: false, // #[serde(skip)] — not persisted
+                bandwidth_limit: Some(7_000_000),
+                total_bandwidth_limit: Some(123_000_000),
+                min_bandwidth_per_connection: Some(2_000_000),
+                blocked_addresses: Some(
+                    std::iter::once("9.9.9.9:1234".parse::<SocketAddr>().unwrap()).collect(),
+                ),
+                event_loop_channel_capacity: 4096,
+                transient_budget: 4097,
+                transient_ttl_secs: 61,
+                min_connections: 11,
+                max_connections: 222,
+                streaming_threshold: 131_072,
+                ledbat_min_ssthresh: Some(200_000),
+                congestion_control: "bbr".to_string(),
+                bbr_startup_rate: Some(5_000),
+                skip_load_from_network: true,
+            },
+            ws_api: WebsocketApiConfig {
+                address: "10.1.2.4".parse().unwrap(),
+                port: 8123,
+                token_ttl_seconds: 4321,
+                token_cleanup_interval_seconds: 321,
+                allowed_hosts: vec!["my-host".to_string()],
+                allowed_source_cidrs: vec!["10.0.0.0/8".parse().unwrap()],
+                hosted_mode: true,
+            },
+            secrets: base.secrets.clone(),
+            log_level: tracing::log::LevelFilter::Debug,
+            config_paths: base.config_paths.clone(),
+            peer_id: None,
+            gateways: vec![],
+            is_gateway: true,
+            location: Some(0.5),
+            max_blocking_threads: 7,
+            max_hosting_storage: 123_456_789,
+            module_cache_budget_bytes: 987_654_321,
+            telemetry: TelemetryConfig {
+                enabled: false,
+                endpoint: "http://example.invalid:4318".to_string(),
+                transport_snapshot_interval_secs: 45,
+                is_test_environment: false, // #[serde(skip)] — derived from --id
+                reference_ping_enabled: true,
+                iface_tx_enabled: true,
+            },
+            shutdown_drain_secs: 77,
+        };
+
+        std::fs::write(
+            temp_dir.path().join("config.toml"),
+            toml::to_string(&seed).unwrap(),
+        )
+        .unwrap();
+
+        let rebuilt = clap_bare_args(temp_dir.path()).build().await.unwrap();
+
+        // Exhaustive destructure — NO `..`. A new Config field must be handled here.
+        let Config {
+            mode,
+            network_api,
+            ws_api,
+            secrets: _, // key material, not config
+            log_level,
+            config_paths: _, // re-resolved per process (temp dir)
+            peer_id: _,      // derived from public addr/port
+            gateways: _,     // lives in gateways.toml
+            is_gateway,
+            location,
+            max_blocking_threads,
+            max_hosting_storage,
+            module_cache_budget_bytes,
+            telemetry,
+            shutdown_drain_secs,
+        } = rebuilt;
+
+        assert_eq!(mode, seed.mode, "mode");
+        assert_eq!(log_level, seed.log_level, "log_level");
+        assert_eq!(is_gateway, seed.is_gateway, "is_gateway");
+        assert_eq!(location, seed.location, "location");
+        assert_eq!(
+            max_blocking_threads, seed.max_blocking_threads,
+            "max_blocking_threads"
+        );
+        assert_eq!(
+            max_hosting_storage, seed.max_hosting_storage,
+            "max_hosting_storage"
+        );
+        assert_eq!(
+            module_cache_budget_bytes, seed.module_cache_budget_bytes,
+            "module_cache_budget_bytes"
+        );
+        assert_eq!(
+            shutdown_drain_secs, seed.shutdown_drain_secs,
+            "shutdown_drain_secs"
+        );
+
+        let NetworkApiConfig {
+            address,
+            port,
+            public_address,
+            public_port,
+            ignore_protocol_version: _, // serde-skip
+            bandwidth_limit,
+            total_bandwidth_limit,
+            min_bandwidth_per_connection,
+            blocked_addresses,
+            event_loop_channel_capacity,
+            transient_budget,
+            transient_ttl_secs,
+            min_connections,
+            max_connections,
+            streaming_threshold,
+            ledbat_min_ssthresh,
+            congestion_control,
+            bbr_startup_rate,
+            skip_load_from_network,
+        } = network_api;
+        assert_eq!(address, seed.network_api.address, "network_api.address");
+        assert_eq!(port, seed.network_api.port, "network_api.port");
+        assert_eq!(
+            public_address, seed.network_api.public_address,
+            "public_address"
+        );
+        assert_eq!(public_port, seed.network_api.public_port, "public_port");
+        assert_eq!(
+            bandwidth_limit, seed.network_api.bandwidth_limit,
+            "bandwidth_limit"
+        );
+        assert_eq!(
+            total_bandwidth_limit, seed.network_api.total_bandwidth_limit,
+            "total_bandwidth_limit"
+        );
+        assert_eq!(
+            min_bandwidth_per_connection, seed.network_api.min_bandwidth_per_connection,
+            "min_bandwidth_per_connection"
+        );
+        assert_eq!(
+            blocked_addresses, seed.network_api.blocked_addresses,
+            "blocked_addresses"
+        );
+        assert_eq!(
+            event_loop_channel_capacity, seed.network_api.event_loop_channel_capacity,
+            "event_loop_channel_capacity"
+        );
+        assert_eq!(
+            transient_budget, seed.network_api.transient_budget,
+            "transient_budget"
+        );
+        assert_eq!(
+            transient_ttl_secs, seed.network_api.transient_ttl_secs,
+            "transient_ttl_secs"
+        );
+        assert_eq!(
+            min_connections, seed.network_api.min_connections,
+            "min_connections"
+        );
+        assert_eq!(
+            max_connections, seed.network_api.max_connections,
+            "max_connections"
+        );
+        assert_eq!(
+            streaming_threshold, seed.network_api.streaming_threshold,
+            "streaming_threshold"
+        );
+        assert_eq!(
+            ledbat_min_ssthresh, seed.network_api.ledbat_min_ssthresh,
+            "ledbat_min_ssthresh"
+        );
+        assert_eq!(
+            congestion_control, seed.network_api.congestion_control,
+            "congestion_control"
+        );
+        assert_eq!(
+            bbr_startup_rate, seed.network_api.bbr_startup_rate,
+            "bbr_startup_rate"
+        );
+        assert_eq!(
+            skip_load_from_network, seed.network_api.skip_load_from_network,
+            "skip_load_from_network"
+        );
+
+        let WebsocketApiConfig {
+            address: ws_address,
+            port: ws_port,
+            token_ttl_seconds,
+            token_cleanup_interval_seconds,
+            allowed_hosts,
+            allowed_source_cidrs,
+            hosted_mode,
+        } = ws_api;
+        assert_eq!(ws_address, seed.ws_api.address, "ws_api.address");
+        assert_eq!(ws_port, seed.ws_api.port, "ws_api.port");
+        assert_eq!(
+            token_ttl_seconds, seed.ws_api.token_ttl_seconds,
+            "token_ttl_seconds"
+        );
+        assert_eq!(
+            token_cleanup_interval_seconds, seed.ws_api.token_cleanup_interval_seconds,
+            "token_cleanup_interval_seconds"
+        );
+        assert_eq!(allowed_hosts, seed.ws_api.allowed_hosts, "allowed_hosts");
+        assert_eq!(
+            allowed_source_cidrs, seed.ws_api.allowed_source_cidrs,
+            "allowed_source_cidrs"
+        );
+        assert_eq!(hosted_mode, seed.ws_api.hosted_mode, "ws_api.hosted_mode");
+
+        let TelemetryConfig {
+            enabled,
+            endpoint,
+            transport_snapshot_interval_secs,
+            is_test_environment: _, // serde-skip, derived from --id
+            reference_ping_enabled,
+            iface_tx_enabled,
+        } = telemetry;
+        assert_eq!(enabled, seed.telemetry.enabled, "telemetry.enabled");
+        assert_eq!(endpoint, seed.telemetry.endpoint, "telemetry.endpoint");
+        assert_eq!(
+            transport_snapshot_interval_secs, seed.telemetry.transport_snapshot_interval_secs,
+            "transport_snapshot_interval_secs"
+        );
+        assert_eq!(
+            reference_ping_enabled, seed.telemetry.reference_ping_enabled,
+            "reference_ping_enabled"
+        );
+        assert_eq!(
+            iface_tx_enabled, seed.telemetry.iface_tx_enabled,
+            "iface_tx_enabled"
         );
     }
 
@@ -4075,25 +4828,25 @@ mod tests {
         (server, url)
     }
 
-    /// Regression test for #4268: an isolated gateway started with
-    /// `--is-gateway --public-network-address X --network-port Y` (and no
-    /// `--public-network-port`) has a `None` `peer_id`, because `peer_id` is
-    /// derived from `public_address.zip(public_port)`. On first boot — remote
-    /// index unreachable/empty, no on-disk `gateways.toml`, and no
-    /// `--gateway`/`--gateways` — the file-load fallback branch must still
-    /// allow the gateway to start with an empty bootstrap list.
+    /// Regression test for #4268: an isolated gateway — remote index
+    /// unreachable/empty, no on-disk `gateways.toml`, and no
+    /// `--gateway`/`--gateways` — must still be allowed to start with an empty
+    /// bootstrap list. Before the #4268 fix, the file-load fallback branch
+    /// guarded on `peer_id.is_none()` and wrongly rejected such a gateway with
+    /// "Cannot initialize node without gateways". This is the file-load
+    /// analogue of the `--skip-load-from-network` guard fixed in PR #4264.
     ///
-    /// Before the fix, the branch guarded on `peer_id.is_none()`, so this
-    /// configuration was wrongly rejected with "Cannot initialize node without
-    /// gateways". This is the file-load analogue of the
-    /// `--skip-load-from-network` guard fixed in PR #4264.
+    /// The gateway is configured with both `--public-network-address` and
+    /// `--public-network-port` (required for gateways since #4324), so it has a
+    /// valid `peer_id`. This test pins the *bootstrap* behavior, independent of
+    /// identity derivation.
     ///
     /// Note: `skip_load_from_network` is intentionally NOT set here — that flag
     /// would route an `is_gateway` node through the earlier
     /// `skip_load && is_gateway` branch and never reach the file-load guard
     /// this test exercises.
     #[tokio::test]
-    async fn test_file_load_branch_isolated_gateway_without_public_port_succeeds() {
+    async fn test_file_load_branch_isolated_gateway_succeeds() {
         let temp_dir = tempfile::tempdir().unwrap();
         let config_dir = temp_dir.path();
         // No gateways.toml is written: the config_dir is empty, so File::open
@@ -4111,11 +4864,9 @@ mod tests {
             },
             network_api: NetworkArgs {
                 is_gateway: true,
-                // public_address + network_port (NOT public_port) is the valid
-                // isolated-gateway configuration that yields peer_id == None.
                 public_address: Some("203.0.113.10".parse().unwrap()),
+                public_port: Some(31337),
                 network_port: Some(31337),
-                public_port: None,
                 ..Default::default()
             },
             ..Default::default()
@@ -4132,15 +4883,56 @@ mod tests {
             "isolated gateway should start with no bootstrap gateways, got {:?}",
             cfg.gateways
         );
-        // This PR intentionally does NOT change peer_id derivation: a gateway
-        // configured with --network-port but no --public-network-port still has
-        // peer_id == None (peer_id = public_address.zip(public_port)). That
-        // pre-existing behavior is out of scope here; whether such a gateway
-        // should derive peer_id from network_port is tracked separately. The
-        // fix only ensures build() no longer rejects this valid configuration.
         assert!(
-            cfg.peer_id.is_none(),
-            "expected peer_id to remain None for a gateway without --public-network-port"
+            cfg.peer_id.is_some(),
+            "expected peer_id to be derived from public address + port"
+        );
+    }
+
+    /// Regression test for #4324: a gateway started with
+    /// `--is-gateway --public-network-address X --network-port Y` but NO
+    /// `--public-network-port` must be rejected at config-build time.
+    ///
+    /// Such a gateway would otherwise derive `peer_id == None` (peer_id =
+    /// `public_address.zip(public_port)`) → `own_addr == None` → no ring
+    /// location. Unlike a NAT'd peer, a gateway has no upstream to learn or
+    /// correct its address later, so it would stay degraded permanently. The
+    /// agreed fix (maintainer consensus on the issue) is to fail fast and
+    /// require the public port explicitly, rather than silently falling back
+    /// to the local bind port.
+    #[tokio::test]
+    async fn test_gateway_without_public_port_is_rejected() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path();
+
+        let (_server, index_url) = empty_gateways_index_server();
+
+        let args = ConfigArgs {
+            mode: Some(OperationMode::Network),
+            config_paths: ConfigPathsArgs {
+                config_dir: Some(config_dir.to_path_buf()),
+                data_dir: Some(config_dir.to_path_buf()),
+                log_dir: Some(config_dir.to_path_buf()),
+            },
+            network_api: NetworkArgs {
+                is_gateway: true,
+                // network_port set but no public_port: it no longer substitutes
+                // for the public port, so this must be rejected.
+                public_address: Some("203.0.113.10".parse().unwrap()),
+                network_port: Some(31337),
+                public_port: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let err = args
+            .build_with_gateways_index(&index_url)
+            .await
+            .expect_err("gateway without --public-network-port must be rejected");
+        assert!(
+            err.to_string().contains("public network port"),
+            "expected error to mention the missing public network port, got: {err}"
         );
     }
 

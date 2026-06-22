@@ -124,7 +124,7 @@ jobs:
     steps:
       - name: Checkout repository
         if: github.event_name != 'merge_group'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           # Explicitly checkout the PR head so the trusted "Compute PR diff"
           # step sees the fork's changes. Safe: we only run git locally and
@@ -139,6 +139,15 @@ jobs:
           # .git/config under prompt injection. The trusted git steps here
           # need no credentials, so persisting them buys nothing.
           persist-credentials: false
+          # actions/checkout v7 refuses to check out a fork PR head from a
+          # pull_request_target workflow unless this is set (the "pwn request"
+          # guard). It is safe HERE specifically because, per the reasoning
+          # above, this job never executes the fork's code (no cargo/npm/bash,
+          # Claude has no Bash tool) and does not persist credentials — it only
+          # reads the fork diff to review it against base-repo-trusted rules.
+          # Without this, every fork PR fails the required "Claude Rule Review"
+          # check and cannot merge.
+          allow-unsafe-pr-checkout: true
 
       - name: Check review-override label
         id: override

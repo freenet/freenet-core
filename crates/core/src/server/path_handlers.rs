@@ -226,6 +226,8 @@ async fn is_locally_known(
             })),
             auth_token: None,
             origin_contract: None,
+            // Internal node-query request: no delegate secrets, no user context.
+            user_context: None,
             api_version: Default::default(),
         })
         .await
@@ -255,6 +257,8 @@ async fn is_locally_known(
             req: Box::new(ClientRequest::Disconnect { cause: None }),
             auth_token: None,
             origin_contract: None,
+            // Internal node-query request: no delegate secrets, no user context.
+            user_context: None,
             api_version: Default::default(),
         })
         .await
@@ -373,6 +377,7 @@ pub(super) async fn contract_home(
     api_version: ApiVersion,
     query_string: Option<String>,
     sub_path: Option<&str>,
+    hosted_mode: bool,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
     let instance_id = ContractInstanceId::from_bytes(&key).map_err(|err| {
         debug!("contract_home: Failed to parse contract key: {}", err);
@@ -398,7 +403,14 @@ pub(super) async fn contract_home(
     // Return the shell page instead of the contract HTML directly.
     // The shell page wraps the contract in a sandboxed iframe for
     // origin isolation (GHSA-824h-7x5x-wfmf).
-    match shell_page(&assigned_token, &key, api_version, query_string, sub_path) {
+    match shell_page(
+        &assigned_token,
+        &key,
+        api_version,
+        query_string,
+        sub_path,
+        hosted_mode,
+    ) {
         Ok(b) => Ok(b.into_response()),
         Err(err) => {
             tracing::error!("Failed to generate shell page: {err}");
@@ -461,6 +473,8 @@ async fn ensure_contract_cached(
             ),
             auth_token: None,
             origin_contract: None,
+            // Internal node-query request: no delegate secrets, no user context.
+            user_context: None,
             api_version: Default::default(),
         })
         .await
@@ -483,6 +497,8 @@ async fn ensure_contract_cached(
             req: Box::new(ClientRequest::Disconnect { cause: None }),
             auth_token: None,
             origin_contract: None,
+            // Internal node-query request: no delegate secrets, no user context.
+            user_context: None,
             api_version: Default::default(),
         })
         .await
@@ -788,6 +804,7 @@ fn shell_page(
     api_version: ApiVersion,
     query_string: Option<String>,
     sub_path: Option<&str>,
+    hosted_mode: bool,
 ) -> Result<impl IntoResponse, WebSocketApiError> {
     let version_prefix = api_version.prefix();
     // For a deep-link reload (#3841) the iframe must load the requested
@@ -846,24 +863,66 @@ fn shell_page(
          <path d='{}' fill='%23007FFF' fill-rule='evenodd'/></svg>",
         super::home_page::RABBIT_SVG_PATH,
     );
+    // Per-user durable token plumbing (P2-frontend of #4381). In hosted mode
+    // the shell page mints/loads a durable per-user bearer secret from
+    // `localStorage` and hands it to the bridge so the proxied WebSocket
+    // upgrade carries `?userToken=<token>`. The shell is same-origin with the
+    // node (so it CAN use localStorage); the sandboxed iframe is a different
+    // origin and cannot. One token in localStorage = ONE identity per visitor
+    // across every contract app on this node — the intended design.
+    //
+    // When hosted mode is OFF the shell is BEHAVIOURALLY identical to the
+    // pre-#4381 shell: no token snippet, and the same single-argument
+    // `freenetBridge(...)` call at the same site. Note this is behavioural, not
+    // literal byte-equality — the always-injected SHELL_BRIDGE_JS itself gained
+    // a `userToken` argument and an inert, undefined-guarded `if (userToken)`
+    // branch that never fires when the bridge is called with one argument. The
+    // token is generated client-side from `crypto.getRandomValues` and is NEVER
+    // derived from any request input, so there is no injection vector.
+    let (user_token_script, bridge_call) = if hosted_mode {
+        (
+            format!("<script>\n{SHELL_USER_TOKEN_JS}\n</script>\n"),
+            // Third arg `true` puts the bridge in hosted mode so it can fail
+            // closed when it has no per-user token (http, or storage failure) —
+            // see the hostedNoToken branch in SHELL_BRIDGE_JS.
+            format!("freenetBridge(\"{auth_token}\", __freenet_user_token, true);"),
+        )
+    } else {
+        // Non-hosted: the original 1-arg call. `hostedMode` is undefined, so the
+        // fail-closed branch never triggers and behavior is unchanged.
+        (String::new(), format!("freenetBridge(\"{auth_token}\");"))
+    };
+
+    // Hosted-mode "shell chrome": a thin, host-controlled bar rendered OUTSIDE
+    // the sandboxed app iframe. It is the only place a per-user-data action
+    // (export to your own peer) can live — the durable user token is held by
+    // the shell and must never reach the sandbox — and the only place the
+    // "this is a hosted proxy, not private" disclosure cannot be hidden or
+    // spoofed by the contract app. Empty (and the layout unchanged) when hosted
+    // mode is off. The export control is a placeholder until the node-side
+    // export endpoint lands (P3 `secrets export` over HTTP, scoped to the
+    // connection's user token).
+    let (hosted_styles, hosted_bar) = if hosted_mode {
+        (
+            format!("\n<style>{HOSTED_BAR_STYLES}</style>"),
+            format!("{HOSTED_BAR_HTML}\n<script>{HOSTED_BAR_JS}</script>"),
+        )
+    } else {
+        (String::new(), String::new())
+    };
+    // NOTE: every placeholder must be passed as an explicit `name = name`
+    // argument. `format!` cannot implicitly capture `{ident}` variables when the
+    // format string is produced by a macro (`include_str!`) rather than written
+    // as a string literal.
     let html = format!(
-        r##"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Freenet</title>
-<link rel="icon" type="image/svg+xml" href="{favicon}">
-<style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none;display:block}}</style>
-</head>
-<body>
-<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-modals" allow="clipboard-read; clipboard-write" data-src="{iframe_src}"></iframe>
-<script>
-{SHELL_BRIDGE_JS}
-</script>
-<script>freenetBridge("{auth_token}");</script>
-</body>
-</html>"##
+        include_str!("path_handlers/assets/shell.html"),
+        favicon = favicon,
+        hosted_styles = hosted_styles,
+        hosted_bar = hosted_bar,
+        iframe_src = iframe_src,
+        SHELL_BRIDGE_JS = SHELL_BRIDGE_JS,
+        user_token_script = user_token_script,
+        bridge_call = bridge_call,
     );
 
     Ok(Html(html))
@@ -997,6 +1056,44 @@ async fn sandbox_content_body(
     Ok(Html(body))
 }
 
+/// JavaScript that mints (or loads) the durable per-user token in hosted mode.
+///
+/// Injected into the shell page (P2-frontend of #4381) ONLY when the node runs
+/// in hosted mode. The shell is same-origin with the node, so it can persist a
+/// token in `localStorage`; the sandboxed iframe cannot. The token is a 32-byte
+/// secret minted from `crypto.getRandomValues` (never from request input), hex
+/// encoded, and reused across every visit and every contract app on this node —
+/// one durable identity per visitor. The bridge presents it on the proxied
+/// WebSocket upgrade as `?userToken=<token>`.
+///
+/// On a non-`https:` page the IIFE returns undefined BEFORE touching
+/// `localStorage`, so the durable token is never loaded, minted, or transmitted
+/// over a plaintext wire (client mirror of the backend REFUSE-PLAINTEXT-TOKEN
+/// invariant — see `decide_user_token`).
+///
+/// `localStorage` access is wrapped in try/catch so that a browser with storage
+/// disabled (private mode quirks, embedded webviews) degrades to an undefined
+/// token rather than throwing before the bridge starts; an undefined token means
+/// the bridge omits the `userToken` param and the backend treats the connection
+/// as a local/anonymous one (see `decide_user_token`).
+const SHELL_USER_TOKEN_JS: &str = include_str!("path_handlers/assets/shell_user_token.js");
+
+/// Styles for the hosted-mode "shell chrome" bar (see `shell_page`). Rendered
+/// only when hosted mode is on; the bar lives OUTSIDE the sandboxed app iframe.
+const HOSTED_BAR_STYLES: &str = include_str!("path_handlers/assets/hosted_bar.css");
+
+/// Markup for the hosted-mode bar: the always-visible "not private" disclosure
+/// plus an Account popover with the access-key backup/restore and the
+/// export-to-your-own-peer action. The access key is the per-user token, read
+/// from the shell-only `__freenet_user_token` global — it never enters the
+/// sandboxed iframe. The Export action is a placeholder until the node-side
+/// export endpoint lands.
+const HOSTED_BAR_HTML: &str = include_str!("path_handlers/assets/hosted_bar.html");
+
+/// Behavior for the hosted-mode bar (toggle popover, copy/restore the access
+/// key, export placeholder). Runs in the trusted shell context.
+const HOSTED_BAR_JS: &str = include_str!("path_handlers/assets/hosted_bar.js");
+
 /// JavaScript for the shell page's postMessage bridge.
 ///
 /// The bridge listens for WebSocket requests from the sandboxed iframe,
@@ -1004,883 +1101,13 @@ async fn sandbox_content_body(
 /// forwards messages in both directions. Only allows connections to the
 /// local API server itself (same origin) to prevent the contract from using the
 /// bridge as an open proxy to other localhost services.
-const SHELL_BRIDGE_JS: &str = r#"
-function freenetBridge(authToken) {
-  'use strict';
-  var LOCAL_API_ORIGIN = location.origin;
-  var MAX_CONNECTIONS = 32;
-  var iframe = document.getElementById('app');
-  var connections = new Map();
-  var lastClipboard = 0;
-  var lastDownload = 0;
-
-  // Build iframe src from data-src, appending any URL hash for deep
-  // linking. Using data-src (not src) in the HTML means the iframe
-  // doesn't start loading until we set .src here, so there is exactly
-  // one load -- with the hash already in the URL.
-  var iframeDataSrc = iframe.getAttribute('data-src');
-  // Cache the contract web prefix; used by nav/popstate path validation.
-  // Cross-contract navigation updates this when it accepts a new path
-  // so it always reflects the currently loaded contract (see navigate
-  // handler below).
-  var CONTRACT_PREFIX_RE = /^(\/v[12]\/contract\/web\/[^/]+\/)/;
-  var contractPrefixMatch = iframeDataSrc.match(CONTRACT_PREFIX_RE);
-  var contractPrefix = contractPrefixMatch ? contractPrefixMatch[1] : null;
-  var iframeSrc = iframeDataSrc;
-  if (location.hash) {
-    iframeSrc += location.hash.slice(0, 8192);
-  }
-  iframe.src = iframeSrc;
-  // Seed history state so that back-navigating to the initial entry still
-  // has an identifiable __freenet_nav__ record. Using replaceState avoids
-  // adding a new entry — we just tag the existing one.
-  if (contractPrefix) {
-    try {
-      history.replaceState(
-        { __freenet_nav__: true, iframePath: iframeSrc },
-        ''
-      );
-    } catch(e) {}
-  }
-
-  function sendToIframe(msg) {
-    iframe.contentWindow.postMessage(msg, '*');
-  }
-
-  window.addEventListener('message', function(event) {
-    if (event.source !== iframe.contentWindow) return;
-    var msg = event.data;
-    if (!msg) return;
-
-    // Handle shell-level messages (title, favicon) from iframe
-    if (msg.__freenet_shell__) {
-      if (msg.type === 'title' && typeof msg.title === 'string') {
-        // Truncate to prevent UI spoofing with excessively long titles
-        document.title = msg.title.slice(0, 128);
-      } else if (msg.type === 'favicon' && typeof msg.href === 'string') {
-        // Only allow https: and data: schemes to prevent exfiltration
-        try {
-          var scheme = msg.href.split(':')[0].toLowerCase();
-          if (scheme !== 'https' && scheme !== 'data') return;
-        } catch(e) { return; }
-        var link = document.querySelector('link[rel="icon"]');
-        if (link) link.href = msg.href;
-      } else if (msg.type === 'hash' && typeof msg.hash === 'string') {
-        // Only allow # fragments — reject anything that could modify path/query.
-        // Note: replaceState (not pushState) is intentional — avoids polluting
-        // browser history with every in-app route change. This also means
-        // replaceState does NOT fire popstate or hashchange, preventing loops.
-        var h = msg.hash.slice(0, 8192);
-        if (h.length > 0 && h.charAt(0) === '#') {
-          // Preserve the existing state object (which may carry our
-          // __freenet_nav__ marker) so popstate can still restore the iframe.
-          // If the current entry is tagged, also update its iframePath to
-          // include the new fragment — otherwise back/forward would restore
-          // the iframe without the user's current fragment position.
-          var curState = history.state;
-          if (curState && curState.__freenet_nav__ === true &&
-              typeof curState.iframePath === 'string') {
-            var basePath = curState.iframePath.split('#')[0];
-            history.replaceState(
-              { __freenet_nav__: true, iframePath: basePath + h },
-              '',
-              h
-            );
-          } else {
-            history.replaceState(history.state, '', h);
-          }
-        }
-      } else if (msg.type === 'clipboard' && typeof msg.text === 'string') {
-        // Sandboxed iframes can't use navigator.clipboard due to permissions
-        // policy. Proxy clipboard writes through the trusted shell instead.
-        // Write-only — no readText proxy to prevent exfiltration.
-        // Rate-limited to 1 write/sec to prevent clipboard spam from
-        // malicious contracts. Requires transient user activation (browser
-        // enforced) — works when the iframe sends this in a click handler.
-        var now = Date.now();
-        if (now - lastClipboard >= 1000) {
-          lastClipboard = now;
-          try { navigator.clipboard.writeText(msg.text.slice(0, 2048)); } catch(e) {}
-        }
-      } else if (msg.type === 'download' &&
-                 typeof msg.filename === 'string' &&
-                 typeof msg.base64 === 'string') {
-        // Download proxy: contracts inside the sandboxed (null-origin)
-        // iframe can't reliably trigger file downloads — `<a download>`
-        // either silently fails (Firefox) or saves to an inaccessible
-        // location (Chrome). The shell runs in the real origin and
-        // can do it normally.
-        //
-        // Validation:
-        //  - filename: stripped of path separators and leading dots,
-        //    capped at 128 chars, no nulls
-        //  - mimeType: only a small allowlist (data URLs from arbitrary
-        //    types could be exploited by malicious contracts)
-        //  - base64: capped at ~10 MiB raw bytes
-        //  - rate-limit: 1 download per 2s, same reasoning as clipboard
-        var now2 = Date.now();
-        if (now2 - lastDownload < 2000) {
-          console.warn('[freenet] download rate-limited (>1 per 2s)');
-          return;
-        }
-        // Charge the rate-limit budget for *every* attempt (even rejected
-        // ones) so a malicious iframe can't burn host CPU by spamming
-        // invalid payloads at high frequency.
-        lastDownload = now2;
-        var rawName = msg.filename;
-        if (rawName.indexOf('\0') !== -1) {
-          console.warn('[freenet] download rejected: null byte in filename');
-          return;
-        }
-        // Strip path components — keep only the basename. Normalise
-        // both `/` and `\` so a malicious contract can't smuggle in a
-        // backslash on POSIX.
-        var slash = rawName.lastIndexOf('/');
-        if (slash >= 0) rawName = rawName.slice(slash + 1);
-        var bslash = rawName.lastIndexOf('\\');
-        if (bslash >= 0) rawName = rawName.slice(bslash + 1);
-        // Strip leading dots so a contract can't write a dotfile.
-        while (rawName.charAt(0) === '.') rawName = rawName.slice(1);
-        rawName = rawName.slice(0, 128);
-        if (rawName.length === 0) {
-          console.warn('[freenet] download rejected: empty filename after sanitisation');
-          return;
-        }
-        var mime = typeof msg.mimeType === 'string' ? msg.mimeType : 'application/octet-stream';
-        var ALLOWED_MIME = {
-          'application/json': 1,
-          'application/octet-stream': 1,
-          'text/plain': 1,
-          'text/csv': 1
-        };
-        // Disallowed MIMEs are downgraded to octet-stream rather than
-        // rejected, so callers always get *some* download — but log it
-        // so the contract author can fix the mismatch.
-        if (!ALLOWED_MIME[mime]) {
-          console.warn('[freenet] download MIME ' + mime + ' downgraded to application/octet-stream');
-          mime = 'application/octet-stream';
-        }
-        // base64 max length ≈ 4/3 * raw size; 10 MiB raw → ~13.4 MiB b64.
-        // Round up to 14 MiB for a small safety margin.
-        if (msg.base64.length > 14 * 1024 * 1024) {
-          console.warn('[freenet] download rejected: payload exceeds 14 MiB base64 cap');
-          return;
-        }
-        var raw;
-        try {
-          raw = atob(msg.base64);
-        } catch (e) {
-          console.warn('[freenet] download rejected: base64 decode failed');
-          return;
-        }
-        var len = raw.length;
-        var bytes = new Uint8Array(len);
-        for (var i = 0; i < len; i++) bytes[i] = raw.charCodeAt(i) & 0xff;
-        var blob;
-        try { blob = new Blob([bytes], { type: mime }); } catch (e) {
-          console.warn('[freenet] download rejected: Blob construction failed');
-          return;
-        }
-        var url;
-        try { url = URL.createObjectURL(blob); } catch (e) {
-          console.warn('[freenet] download rejected: createObjectURL failed');
-          return;
-        }
-        var a = document.createElement('a');
-        a.href = url;
-        a.download = rawName;
-        a.style.display = 'none';
-        document.body.appendChild(a);
-        try { a.click(); } catch (e) {}
-        document.body.removeChild(a);
-        // Defer revoke so the browser has time to start the download.
-        setTimeout(function() { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
-      } else if (msg.type === 'navigate' && typeof msg.href === 'string') {
-        // Navigation from the sandboxed iframe. The iframe cannot navigate
-        // the top window itself, so it postMessages the shell, which does
-        // one of two things:
-        //
-        //   1. SAME-CONTRACT hop (subpage inside the current contract's
-        //      webapp): update iframe.src in place. This preserves the
-        //      running shell, auth token, and in-memory state — matching
-        //      what a multi-page webapp expects for client-side routing.
-        //
-        //   2. CROSS-CONTRACT hop (link to a different Freenet contract):
-        //      fall through to a top-level window.location.assign. The
-        //      gateway serves a fresh shell via `contract_home` for the
-        //      new contract, which generates a new auth token and origin
-        //      attribution. Reusing the current iframe for a different
-        //      contract would keep the old auth token bound to the
-        //      original contract, so the server would misattribute every
-        //      subsequent delegate/API request (see PR review: Codex P1).
-        //
-        // This is the fix for the "Delta cannot link to other Freenet
-        // contracts without forcing a new tab" report: cross-contract
-        // links now navigate in place via a full shell reload, instead of
-        // being silently dropped.
-        //
-        // Security posture:
-        // - Same-origin only (rejects cross-site). The sandbox still
-        //   blocks contract JS from reading gateway cookies or same-origin
-        //   state.
-        // - Target path must match the contract-webapp shape
-        //   /v[12]/contract/web/{key}/... . This rejects /v1/node/...,
-        //   /v1/delegate/..., or any other gateway endpoint as a
-        //   navigation target.
-        // - Sandbox iframe attributes are NOT widened. The shell remains
-        //   the sole code with top-level navigation authority.
-        // - Cross-contract navigation via window.location.assign is the
-        //   same privilege level as a user middle-clicking a link today
-        //   (target="_blank" + allow-popups already escapes the sandbox
-        //   and can reach any Freenet contract). The difference is that
-        //   the destination now loads in the same tab instead of a new
-        //   one.
-        //
-        // Cap href length to prevent a malicious contract from bloating
-        // history.state or the address bar with arbitrarily large URLs.
-        if (msg.href.length > 4096) return;
-        try {
-          var resolved = new URL(msg.href, iframe.src);
-          // Same-origin only.
-          if (resolved.origin !== location.origin) return;
-          var cleanPath = resolved.pathname;
-          // Contract-webapp shape check. This is the security boundary
-          // that prevents the handler from being used to navigate to
-          // gateway internals (/v1/node/..., /v1/delegate/...) or to
-          // non-contract paths in general. The contract-key segment is
-          // validated server-side in the freshly-loaded shell path via
-          // ContractInstanceId::from_bytes, so we only need a loose
-          // shape check here — a bogus key still produces a 4xx from the
-          // gateway, not a silent bypass.
-          var newPrefixMatch = cleanPath.match(CONTRACT_PREFIX_RE);
-          if (!newPrefixMatch) return;
-          var newContractPrefix = newPrefixMatch[1];
-          // Cap the hash component to match the 8192-byte cap used by
-          // the hash-forwarding path; the iframe path is stored in
-          // history.state so unbounded hashes would bloat the per-tab
-          // history record.
-          var cappedHash = resolved.hash ? resolved.hash.slice(0, 8192) : '';
-
-          if (newContractPrefix === contractPrefix) {
-            // SAME-CONTRACT: update iframe.src in place. This preserves
-            // the running shell, auth token, and client-side state.
-            //
-            // Close any open WebSocket connections from the previous
-            // page to prevent resource leaks. The old iframe document
-            // will be destroyed when src changes, orphaning any
-            // connection callbacks.
-            connections.forEach(function(ws) { try { ws.close(); } catch(e) {} });
-            connections.clear();
-            // Build new sandbox URL preserving __sandbox=1
-            resolved.searchParams.set('__sandbox', '1');
-            var newIframePath = resolved.pathname + resolved.search + cappedHash;
-            iframe.src = newIframePath;
-            // Push a history entry so back/forward navigate between
-            // visited subpages, and update the address bar to the
-            // non-sandbox URL. The sandbox flag is intentionally omitted
-            // from the outer URL; the shell always re-adds it when
-            // loading the iframe. See issue #3839.
-            try {
-              history.pushState(
-                { __freenet_nav__: true, iframePath: newIframePath },
-                '',
-                cleanPath + cappedHash
-              );
-            } catch(e) {}
-          } else {
-            // CROSS-CONTRACT: top-level navigation. The gateway's
-            // contract_home handler re-runs and generates a fresh auth
-            // token + origin attribution for the destination contract.
-            // The browser's normal back/forward history takes care of
-            // cross-contract restoration — no popstate handling needed.
-            //
-            // Include `resolved.search` so any query parameters the link
-            // carries (e.g. app-level routing args) survive the hop. The
-            // destination shell page strips the sensitive routing params
-            // (`__sandbox`, `authToken`) before forwarding the rest into
-            // the iframe's `location.search`. The gateway's subpage
-            // handler redirects non-root HTML loads to the shell route
-            // (see `web_subpages` `Sec-Fetch-Dest` handling), which
-            // preserves the filtered query string all the way through,
-            // so `/v1/contract/web/{key}/page2?invite=…` still lands on
-            // a shell that issues an auth token and forwards `invite`
-            // into the iframe.
-            try {
-              window.location.assign(cleanPath + resolved.search + cappedHash);
-            } catch(e) {}
-          }
-        } catch(e) {}
-      } else if (msg.type === 'open_url' && typeof msg.url === 'string') {
-        // Open external URLs in a new tab. Popups from the sandboxed iframe
-        // inherit the opaque origin, breaking CORS on target sites. The shell
-        // opens the URL instead, giving proper origin. See issue #1499.
-        //
-        // Security model: this scheme allow-list is the PRIMARY gate, not
-        // defence in depth. A malicious contract iframe can postMessage
-        // `open_url` directly without going through the upstream
-        // navigation interceptor, so the URL parser + scheme check below
-        // is what blocks `javascript:` / `data:` / `file:` etc.
-        //
-        // Both http and https are accepted because user-pasted markdown
-        // links commonly target plain-HTTP self-hosted services (e.g.
-        // nova.locut.us:3133, the Freenet network telemetry dashboard,
-        // no TLS configured). Auth tokens never travel through this path
-        // — the only operation is `window.open(url, '_blank',
-        // 'noopener,noreferrer')` — so HTTP doesn't expose credentials.
-        // See freenet/river#231.
-        //
-        // Private networks (RFC1918 192.168/16, 10/8, 172.16-31/12 and
-        // RFC4193 fc00::/7, link-local fe80::/10) are deliberately NOT
-        // blocked. A user who pastes a link to their home router or NAS
-        // expects the link to work; the threat model here is that a
-        // *malicious contract* might forge a markdown link to a LAN
-        // admin panel and trick the user into clicking, which is a
-        // social-engineering attack class we accept.
-        try {
-          var u = new URL(msg.url);
-          if (u.protocol !== 'https:' && u.protocol !== 'http:') return;
-          // URL.hostname strips brackets from IPv6 literals, so a URL
-          // `http://[::1]/` parses with hostname `::1`, NOT `[::1]`.
-          // Compare against the bracket-less form.
-          var h = u.hostname.toLowerCase();
-          if (h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '0.0.0.0') return;
-          // Honour shift-click by requesting a popup-style window feature
-          // (freenet/freenet-core#3853). Firefox honours this as "open in
-          // a new window"; other browsers may still open a tab, which is
-          // an acceptable fallback. ctrl / meta / middle-click cannot be
-          // preserved from a postMessage handler because browsers only
-          // honour background-tab placement when window.open is called
-          // from a direct user gesture, so we route those through the
-          // same default-tab path as plain left-click.
-          if (msg.shiftKey === true) {
-            window.open(u.href, '_blank', 'noopener,noreferrer,popup');
-          } else {
-            window.open(u.href, '_blank', 'noopener,noreferrer');
-          }
-        } catch(e) {}
-      }
-      return;
-    }
-
-    if (!msg.__freenet_ws__) return;
-
-    switch (msg.type) {
-      case 'open': {
-        // Limit concurrent connections to prevent resource exhaustion
-        if (connections.size >= MAX_CONNECTIONS) {
-          sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
-          return;
-        }
-        // Security: only allow WebSocket connections to the local API server itself.
-        // Validate protocol explicitly and compare origin.
-        try {
-          var u = new URL(msg.url);
-          if (u.protocol !== 'ws:' && u.protocol !== 'wss:') {
-            sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
-            return;
-          }
-          var httpProto = u.protocol === 'wss:' ? 'https:' : 'http:';
-          if (httpProto + '//' + u.host !== LOCAL_API_ORIGIN) {
-            sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
-            return;
-          }
-        } catch(e) {
-          sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
-          return;
-        }
-        // Inject auth token into the WebSocket URL
-        u.searchParams.set('authToken', authToken);
-        var ws = new WebSocket(u.toString(), msg.protocols || undefined);
-        ws.binaryType = 'arraybuffer';
-        connections.set(msg.id, ws);
-
-        ws.onopen = function() {
-          sendToIframe({ __freenet_ws__: true, type: 'open', id: msg.id });
-        };
-        ws.onmessage = function(e) {
-          var transfer = e.data instanceof ArrayBuffer ? [e.data] : [];
-          iframe.contentWindow.postMessage({
-            __freenet_ws__: true, type: 'message', id: msg.id, data: e.data
-          }, '*', transfer);
-        };
-        ws.onclose = function(e) {
-          sendToIframe({
-            __freenet_ws__: true, type: 'close', id: msg.id,
-            code: e.code, reason: e.reason
-          });
-          connections.delete(msg.id);
-        };
-        ws.onerror = function() {
-          sendToIframe({ __freenet_ws__: true, type: 'error', id: msg.id });
-          connections.delete(msg.id);
-        };
-        break;
-      }
-      case 'send': {
-        var ws = connections.get(msg.id);
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(msg.data);
-        }
-        break;
-      }
-      case 'close': {
-        var ws = connections.get(msg.id);
-        if (ws) {
-          ws.close(msg.code, msg.reason);
-          connections.delete(msg.id);
-        }
-        break;
-      }
-    }
-  });
-
-  // Forward runtime hash changes (browser back/forward, manual URL edits)
-  function forwardHash() {
-    if (location.hash) {
-      sendToIframe({ __freenet_shell__: true, type: 'hash', hash: location.hash.slice(0, 8192) });
-    }
-  }
-  // popstate fires when the user presses back/forward. If the popped entry
-  // carries our __freenet_nav__ marker, restore the iframe to the matching
-  // subpage. Otherwise, fall back to forwarding the hash. See issue #3839.
-  window.addEventListener('popstate', function(ev) {
-    var state = ev.state;
-    if (state && state.__freenet_nav__ === true && typeof state.iframePath === 'string') {
-      // Security: path must still live under this contract's web prefix.
-      // A stale state object from a different contract must not be able to
-      // redirect the iframe elsewhere.
-      if (contractPrefix && state.iframePath.indexOf(contractPrefix) === 0) {
-        // No-op if the iframe is already on the target path (e.g. popstate
-        // fired from a bfcache restore where iframe state was retained).
-        // This avoids a spurious reload that would tear down live WebSocket
-        // connections unnecessarily.
-        if (iframe.src.indexOf(state.iframePath) === -1) {
-          connections.forEach(function(ws) { try { ws.close(); } catch(e) {} });
-          connections.clear();
-          iframe.src = state.iframePath;
-        }
-        return;
-      }
-    }
-    forwardHash();
-  });
-  window.addEventListener('hashchange', forwardHash);
-
-  // Permission prompt overlay: render a modal in the shell page's DOM
-  // (outside the sandboxed iframe) whenever a delegate permission prompt
-  // is pending. The shell is trusted and same-origin with the gateway, so
-  // the sandboxed contract cannot reach into this DOM. See issue #3836.
-  //
-  // Every open Freenet tab subscribes to /permission/events (Server-Sent
-  // Events) and renders the overlay as soon as the gateway pushes an
-  // `prompt_added` event. When the user responds in one tab, the gateway
-  // emits `prompt_removed` and every tab dismisses its card. This was
-  // previously a 3-second polling loop with a visibility-skip optimisation
-  // that caused the originating tab to silently miss prompts whenever it
-  // wasn't foregrounded; SSE eliminates both the polling-floor latency and
-  // the visibility race.
-  var overlayRoot = null;
-  var overlayCards = {}; // nonce -> card element
-  var OVERLAY_CSS =
-    '#__freenet_perm_overlay{position:fixed;inset:0;z-index:2147483647;' +
-    'background:rgba(8,10,14,0.62);backdrop-filter:blur(4px);' +
-    '-webkit-backdrop-filter:blur(4px);display:none;align-items:center;' +
-    'justify-content:center;padding:20px;overflow:auto;' +
-    'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}' +
-    '#__freenet_perm_overlay .fn-card{--bg:#0f1419;--fg:#e6e8eb;--card:#1a2028;' +
-    '--accent:#3b82f6;--border:#2d3748;--warn:#f59e0b;--muted:#9ca3af;' +
-    'background:var(--card);color:var(--fg);border:1px solid var(--border);' +
-    'border-radius:14px;padding:28px;max-width:520px;width:100%;margin:12px 0;' +
-    'box-shadow:0 12px 40px rgba(0,0,0,0.5);box-sizing:border-box;}' +
-    '@media (prefers-color-scheme: light){#__freenet_perm_overlay .fn-card{' +
-    '--bg:#f5f5f5;--fg:#1a1a1a;--card:#ffffff;--accent:#2563eb;' +
-    '--border:#d1d5db;--warn:#d97706;--muted:#6b7280;' +
-    'box-shadow:0 12px 40px rgba(0,0,0,0.18);}}' +
-    '#__freenet_perm_overlay .fn-header{display:flex;align-items:center;gap:12px;' +
-    'margin-bottom:18px;}' +
-    '#__freenet_perm_overlay .fn-icon{font-size:28px;line-height:1;}' +
-    '#__freenet_perm_overlay .fn-title{font-size:18px;font-weight:600;margin:0;' +
-    'color:var(--fg);}' +
-    '#__freenet_perm_overlay .fn-msg-label{font-size:11px;color:var(--muted);' +
-    'text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;}' +
-    '#__freenet_perm_overlay .fn-msg{font-size:15px;line-height:1.5;margin:0 0 22px 0;' +
-    'padding:14px 16px;background:var(--bg);border-left:3px solid var(--warn);' +
-    'border-radius:4px;white-space:pre-wrap;word-wrap:break-word;color:var(--fg);}' +
-    '#__freenet_perm_overlay .fn-msg-pre{font-family:ui-monospace,SFMono-Regular,' +
-    'Menlo,Monaco,Consolas,monospace;font-size:12px;line-height:1.45;' +
-    'max-height:300px;overflow:auto;}' +
-    '#__freenet_perm_overlay .fn-btns{display:flex;gap:10px;flex-wrap:wrap;}' +
-    '#__freenet_perm_overlay .fn-btn{padding:10px 20px;border-radius:8px;' +
-    'font-size:14px;cursor:pointer;flex:1;min-width:100px;font-weight:500;' +
-    'border:1px solid var(--border);background:var(--card);color:var(--fg);' +
-    'transition:transform 0.12s, opacity 0.12s, filter 0.12s;font-family:inherit;}' +
-    '#__freenet_perm_overlay .fn-btn.primary{background:var(--accent);' +
-    'color:#fff;border-color:var(--accent);}' +
-    '#__freenet_perm_overlay .fn-btn:hover:not(:disabled){transform:translateY(-1px);' +
-    'filter:brightness(1.08);}' +
-    '#__freenet_perm_overlay .fn-btn:disabled{opacity:0.55;cursor:not-allowed;}' +
-    '#__freenet_perm_overlay .fn-delegate-line{font-size:12px;color:var(--muted);' +
-    'margin-top:10px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}' +
-    '#__freenet_perm_overlay .fn-delegate-line .hash{user-select:all;}' +
-    '#__freenet_perm_overlay .fn-tech{margin-top:10px;font-size:12px;color:var(--muted);}' +
-    '#__freenet_perm_overlay .fn-tech summary{cursor:pointer;user-select:none;}' +
-    '#__freenet_perm_overlay .fn-tech dl{margin:8px 0 0 16px;}' +
-    '#__freenet_perm_overlay .fn-tech dt{font-weight:600;color:var(--fg);margin-top:6px;}' +
-    '#__freenet_perm_overlay .fn-tech dd{margin:2px 0 0 0;font-family:ui-monospace,' +
-    'SFMono-Regular,Menlo,Consolas,monospace;word-break:break-all;user-select:all;}' +
-    '#__freenet_perm_overlay .fn-timer{margin-top:14px;font-size:12px;' +
-    'color:var(--muted);text-align:center;}';
-  // Auto-deny duration in seconds, mirroring the standalone /permission/{nonce}
-  // fallback page. Tracked client-side only; the server enforces the real
-  // timeout and will clear the nonce regardless.
-  var OVERLAY_AUTO_DENY_SECONDS = 60;
-  function ensureOverlayRoot() {
-    if (overlayRoot) return overlayRoot;
-    var style = document.createElement('style');
-    style.textContent = OVERLAY_CSS;
-    document.head.appendChild(style);
-    overlayRoot = document.createElement('div');
-    overlayRoot.id = '__freenet_perm_overlay';
-    overlayRoot.setAttribute('role', 'dialog');
-    overlayRoot.setAttribute('aria-modal', 'true');
-    overlayRoot.setAttribute('aria-label', 'Delegate permission request');
-    document.body.appendChild(overlayRoot);
-    // Escape-to-dismiss: routes to the last button in the most-recently-added
-    // card, which (by the standard delegate convention Allow Once / Always
-    // Allow / Deny) is the Deny button. If the delegate supplied a single
-    // label this is a no-op — Escape just does nothing.
-    document.addEventListener('keydown', function(e) {
-      if (e.key !== 'Escape') return;
-      if (!overlayRoot || overlayRoot.style.display === 'none') return;
-      var nonces = Object.keys(overlayCards);
-      if (nonces.length === 0) return;
-      var nonce = nonces[nonces.length - 1];
-      var card = overlayCards[nonce];
-      var btns = card.querySelectorAll('button');
-      if (btns.length < 2) return; // no non-primary option, ignore
-      btns[btns.length - 1].click();
-      e.preventDefault();
-    });
-    return overlayRoot;
-  }
-  function setText(el, text) {
-    // textContent avoids any HTML interpretation of delegate-controlled
-    // strings. Delegate-provided fields are never parsed as markup.
-    el.textContent = text == null ? '' : String(text);
-  }
-  // Truncate a hash for display: first8…last5. Mirrors truncate_hash() in
-  // crates/core/src/server/client_api/permission_prompts.rs so the overlay
-  // and the standalone /permission/{nonce} fallback page render identically.
-  // Handles multi-byte unicode by iterating Array.from(...) which gives
-  // codepoints, not UTF-16 code units.
-  function truncateHash(s) {
-    if (typeof s !== 'string' || s.length === 0) return '';
-    var chars = Array.from(s);
-    if (chars.length <= 14) return s;
-    return chars.slice(0, 8).join('') + '\u2026' + chars.slice(chars.length - 5).join('');
-  }
-  // Render the Caller row from the tagged caller object. Forward-compatible:
-  // an unknown `kind` (e.g. a future "delegate" variant from issue #3860)
-  // falls through to a neutral "Unknown caller" so the overlay does NOT
-  // pretend to render an identity it doesn't understand.
-  function formatCaller(caller) {
-    if (!caller || typeof caller !== 'object') {
-      return { display: 'No app caller', full: '' };
-    }
-    if (caller.kind === 'webapp' && typeof caller.hash === 'string') {
-      return {
-        display: 'Freenet app ' + truncateHash(caller.hash),
-        full: caller.hash,
-      };
-    }
-    if (caller.kind === 'none') {
-      return { display: 'No app caller', full: '' };
-    }
-    return { display: 'Unknown caller', full: '' };
-  }
-  function createCard(p) {
-    var card = document.createElement('div');
-    card.className = 'fn-card';
-    card.setAttribute('data-nonce', p.nonce);
-
-    var header = document.createElement('div');
-    header.className = 'fn-header';
-    var icon = document.createElement('span');
-    icon.className = 'fn-icon';
-    icon.textContent = '\u{1F512}';
-    var title = document.createElement('h1');
-    title.className = 'fn-title';
-    title.textContent = 'Permission Request';
-    header.appendChild(icon);
-    header.appendChild(title);
-    card.appendChild(header);
-
-    // "Delegate says:" authorship label is non-negotiable: a malicious
-    // delegate would otherwise be able to write text like "Freenet verified
-    // this request" with no way for the user to tell who authored it. The
-    // text below the label is delegate-controlled; the label tells the user
-    // that. See the trust-model rationale in permission_prompts.rs.
-    var msgLabel = document.createElement('div');
-    msgLabel.className = 'fn-msg-label';
-    msgLabel.textContent = 'Delegate says:';
-    card.appendChild(msgLabel);
-    // Try to render the delegate-supplied message as pretty-printed JSON
-    // when it parses as JSON. Falls back to a plain paragraph for plain
-    // text. The pretty form makes structured token requests legible
-    // (#190) — users routinely see one-line blobs like
-    //   {"token":{"max_age":"31536000 seconds","tier":"Min10"},...}
-    // and have to mentally parse them to make a security decision.
-    //
-    // Security: still rendered via textContent (setText), so no HTML
-    // interpretation. Long values are wrapped via CSS (white-space:
-    // pre-wrap on .fn-msg-pre). Render is best-effort: any parse error
-    // falls back to the original raw string in a <p>.
-    var rawMsg = p.message || 'A delegate is requesting permission.';
-    var pretty = null;
-    if (typeof rawMsg === 'string' && rawMsg.length > 0) {
-      var trimmed = rawMsg.trim();
-      if (trimmed.length <= 64 * 1024 &&
-          (trimmed.charAt(0) === '{' || trimmed.charAt(0) === '[')) {
-        try {
-          var parsed = JSON.parse(trimmed);
-          pretty = JSON.stringify(parsed, null, 2);
-          // Cap rendered output at 16 KiB after pretty-printing so a
-          // hostile delegate can't force a multi-MiB layout pass.
-          if (pretty.length > 16 * 1024) {
-            pretty = pretty.slice(0, 16 * 1024) + '\n…';
-          }
-        } catch (e) {
-          pretty = null;
-        }
-      }
-    }
-    if (pretty !== null) {
-      var msgPre = document.createElement('pre');
-      msgPre.className = 'fn-msg fn-msg-pre';
-      setText(msgPre, pretty);
-      card.appendChild(msgPre);
-    } else {
-      var msg = document.createElement('p');
-      msg.className = 'fn-msg';
-      setText(msg, rawMsg);
-      card.appendChild(msg);
-    }
-
-    var buttons = document.createElement('div');
-    buttons.className = 'fn-btns';
-    var labels = Array.isArray(p.labels) && p.labels.length > 0 ? p.labels : ['OK'];
-    labels.forEach(function(label, idx) {
-      var b = document.createElement('button');
-      b.className = 'fn-btn' + (idx === 0 ? ' primary' : '');
-      setText(b, label);
-      b.addEventListener('click', function() {
-        respondToPrompt(p.nonce, idx, card);
-      });
-      buttons.appendChild(b);
-    });
-    card.appendChild(buttons);
-
-    // Inline truncated delegate hash, always visible. Gives the user a
-    // passive anomaly signal: a returning user who recognises their
-    // delegate's fingerprint can spot an impostor without expanding the
-    // Technical details disclosure. Full hash is in the Technical details
-    // pane below and copyable via user-select: all on .hash.
-    var delegateLine = document.createElement('div');
-    delegateLine.className = 'fn-delegate-line';
-    var delegateLabel = document.createElement('span');
-    delegateLabel.textContent = 'Delegate: ';
-    delegateLine.appendChild(delegateLabel);
-    var delegateHashSpan = document.createElement('span');
-    delegateHashSpan.className = 'hash';
-    var delegateFull = typeof p.delegate_key === 'string' ? p.delegate_key : '';
-    setText(delegateHashSpan, truncateHash(delegateFull) || '(none)');
-    if (delegateFull) {
-      delegateHashSpan.setAttribute('title', delegateFull);
-    }
-    delegateLine.appendChild(delegateHashSpan);
-    card.appendChild(delegateLine);
-
-    // Technical details disclosure. Holds the full delegate hash and the
-    // Caller row. Closed by default — the user's decision is timing/intent
-    // ("did I just trigger this?"), not hash matching. Power users hover or
-    // copy via user-select: all to audit the unabbreviated value.
-    var details = document.createElement('details');
-    details.className = 'fn-tech';
-    var summary = document.createElement('summary');
-    summary.textContent = 'Technical details';
-    details.appendChild(summary);
-    var dl = document.createElement('dl');
-    var dtDelegate = document.createElement('dt');
-    dtDelegate.textContent = 'Delegate';
-    var ddDelegate = document.createElement('dd');
-    setText(ddDelegate, delegateFull || '(none)');
-    if (delegateFull) {
-      ddDelegate.setAttribute('title', delegateFull);
-    }
-    var dtCaller = document.createElement('dt');
-    dtCaller.textContent = 'Caller';
-    var ddCaller = document.createElement('dd');
-    var callerRendered = formatCaller(p.caller);
-    setText(ddCaller, callerRendered.display);
-    if (callerRendered.full) {
-      ddCaller.setAttribute('title', callerRendered.full);
-    }
-    dl.appendChild(dtDelegate);
-    dl.appendChild(ddDelegate);
-    dl.appendChild(dtCaller);
-    dl.appendChild(ddCaller);
-    details.appendChild(dl);
-    card.appendChild(details);
-
-    // Countdown mirroring the standalone permission page. The real timeout
-    // lives server-side; this is a hint for the user that the prompt won't
-    // wait forever. On expiry the next poll drops the card via the
-    // reconciliation path, so we don't need a local hide here.
-    var timer = document.createElement('div');
-    timer.className = 'fn-timer';
-    var remaining = OVERLAY_AUTO_DENY_SECONDS;
-    timer.textContent = 'Auto-deny in ' + remaining + 's';
-    card._fnTimerId = setInterval(function() {
-      remaining -= 1;
-      if (remaining <= 0) {
-        clearInterval(card._fnTimerId);
-        timer.textContent = 'Auto-denied';
-        return;
-      }
-      timer.textContent = 'Auto-deny in ' + remaining + 's';
-    }, 1000);
-    card.appendChild(timer);
-    return card;
-  }
-  function showCard(nonce, card) {
-    var root = ensureOverlayRoot();
-    root.appendChild(card);
-    root.style.display = 'flex';
-    overlayCards[nonce] = card;
-    // Move keyboard focus to the primary button so Enter/Space answer the
-    // prompt without requiring a mouse click.
-    var primary = card.querySelector('.fn-btn.primary');
-    if (primary && typeof primary.focus === 'function') {
-      try { primary.focus(); } catch (e) {}
-    }
-  }
-  function hideCard(nonce) {
-    var card = overlayCards[nonce];
-    if (!card) return;
-    if (card._fnTimerId) {
-      clearInterval(card._fnTimerId);
-      card._fnTimerId = null;
-    }
-    if (card.parentNode) card.parentNode.removeChild(card);
-    delete overlayCards[nonce];
-    if (overlayRoot && Object.keys(overlayCards).length === 0) {
-      overlayRoot.style.display = 'none';
-    }
-  }
-  function respondToPrompt(nonce, index, card) {
-    var btns = card.querySelectorAll('button');
-    btns.forEach(function(b) { b.disabled = true; b.style.opacity = '0.5'; });
-    fetch('/permission/' + encodeURIComponent(nonce) + '/respond', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ index: index })
-    }).then(function(r) {
-      // 404 means another tab already answered (or it auto-denied) — hide
-      // the overlay here as well so the user isn't staring at a dead button.
-      if (r.ok || r.status === 404) {
-        hideCard(nonce);
-      } else {
-        btns.forEach(function(b) { b.disabled = false; b.style.opacity = '1'; });
-      }
-    }).catch(function() {
-      btns.forEach(function(b) { b.disabled = false; b.style.opacity = '1'; });
-    });
-  }
-  // Snapshot the current pending list and reconcile against the open
-  // overlay cards. Used for initial bootstrap, on `resync` events when an
-  // SSE subscriber lagged, and as a fallback while the EventSource is
-  // reconnecting.
-  function reconcileFromPending() {
-    fetch('/permission/pending').then(function(r) { return r.json(); }).then(function(prompts) {
-      if (!Array.isArray(prompts)) return;
-      var seen = {};
-      prompts.forEach(function(p) {
-        if (!p || typeof p.nonce !== 'string') return;
-        seen[p.nonce] = true;
-        if (overlayCards[p.nonce]) return;
-        showCard(p.nonce, createCard(p));
-      });
-      Object.keys(overlayCards).forEach(function(nonce) {
-        if (!seen[nonce]) hideCard(nonce);
-      });
-    }).catch(function() {});
-  }
-
-  // Open a Server-Sent Events connection so prompts appear with no polling
-  // delay and on every open Freenet tab regardless of foreground/background
-  // state. The browser's EventSource auto-reconnects with exponential
-  // backoff if the connection drops; on each reconnect we re-bootstrap from
-  // /permission/pending so we don't miss anything during the gap.
-  //
-  // While the EventSource is in the disconnected state (its `error` event
-  // has fired and `readyState !== 1`), we run a 3-second polling fallback
-  // against /permission/pending so a tab whose stream fails (gateway
-  // restart, connection-cap rejection, transient network) still receives
-  // prompt updates. The fallback shuts off as soon as the stream re-opens.
-  var fallbackPollHandle = null;
-  function startFallbackPoll() {
-    if (fallbackPollHandle !== null) return;
-    fallbackPollHandle = setInterval(reconcileFromPending, 3000);
-    reconcileFromPending();
-  }
-  function stopFallbackPoll() {
-    if (fallbackPollHandle === null) return;
-    clearInterval(fallbackPollHandle);
-    fallbackPollHandle = null;
-  }
-  if (typeof EventSource !== 'undefined') {
-    var es = new EventSource('/permission/events');
-    es.addEventListener('prompt_added', function(e) {
-      try {
-        var p = JSON.parse(e.data);
-        if (!p || typeof p.nonce !== 'string') return;
-        if (overlayCards[p.nonce]) return;
-        showCard(p.nonce, createCard(p));
-      } catch (err) {}
-    });
-    es.addEventListener('prompt_removed', function(e) {
-      try {
-        var p = JSON.parse(e.data);
-        if (!p || typeof p.nonce !== 'string') return;
-        hideCard(p.nonce);
-      } catch (err) {}
-    });
-    // The server emits `resync` when its broadcast channel laps a slow
-    // subscriber. Reconcile from the polling endpoint instead of clearing
-    // first: the reconcile path's diff already adds new cards and hides
-    // ones that disappeared, with no flicker on cards that survive.
-    es.addEventListener('resync', reconcileFromPending);
-    // EventSource fires `open` on initial connect AND on every reconnect.
-    // Reconcile each time so a transient disconnect doesn't leave us out
-    // of date, and stop the fallback poll if it had taken over.
-    es.addEventListener('open', function() {
-      stopFallbackPoll();
-      reconcileFromPending();
-    });
-    // `error` fires on connect failure, transient drops, and when the
-    // server caps us out. Switch to polling until the EventSource
-    // re-opens; the browser auto-reconnects in the background.
-    es.addEventListener('error', startFallbackPoll);
-    // Initial bootstrap so we're populated before the SSE handshake
-    // completes (avoids a brief empty state on slow connections).
-    reconcileFromPending();
-  } else {
-    // EventSource missing in some embedded webviews -- fall back to the
-    // legacy 3-second poll so users on those clients still see prompts.
-    startFallbackPoll();
-  }
-}
-"#;
+///
+/// `userToken` is the durable per-user bearer secret minted by
+/// `SHELL_USER_TOKEN_JS` in hosted mode; it is `undefined` in non-hosted mode
+/// (the bridge is then called with a single argument) and, when present, is
+/// appended to the real WebSocket URL as `?userToken=<token>` so the node can
+/// scope a per-user delegate-secret namespace (P2 of #4381).
+const SHELL_BRIDGE_JS: &str = include_str!("path_handlers/assets/shell_bridge.js");
 
 /// JavaScript WebSocket shim injected into the sandboxed iframe content.
 ///
@@ -1888,97 +1115,7 @@ function freenetBridge(authToken) {
 /// compiles to `new WebSocket(url)` via wasm-bindgen, resolving from global
 /// scope at call time) is intercepted and routed through postMessage to the
 /// shell page's bridge.
-const WEBSOCKET_SHIM_JS: &str = r#"
-(function() {
-  'use strict';
-  var wsInstances = new Map();
-  var idCounter = 0;
-
-  function FreenetWebSocket(url, protocols) {
-    this._id = '__fws_' + (++idCounter);
-    this.url = url;
-    this.readyState = 0;
-    this.bufferedAmount = 0;
-    this.extensions = '';
-    this.protocol = '';
-    this.binaryType = 'blob';
-    this.onopen = null;
-    this.onmessage = null;
-    this.onclose = null;
-    this.onerror = null;
-    this._listeners = {};
-    wsInstances.set(this._id, this);
-    window.parent.postMessage({
-      __freenet_ws__: true, type: 'open', id: this._id,
-      url: url, protocols: protocols
-    }, '*');
-  }
-  FreenetWebSocket.CONNECTING = 0;
-  FreenetWebSocket.OPEN = 1;
-  FreenetWebSocket.CLOSING = 2;
-  FreenetWebSocket.CLOSED = 3;
-  FreenetWebSocket.prototype.send = function(data) {
-    if (this.readyState !== 1) throw new DOMException('WebSocket is not open', 'InvalidStateError');
-    var transfer = data instanceof ArrayBuffer ? [data] : [];
-    window.parent.postMessage({
-      __freenet_ws__: true, type: 'send', id: this._id, data: data
-    }, '*', transfer);
-  };
-  FreenetWebSocket.prototype.close = function(code, reason) {
-    if (this.readyState >= 2) return;
-    this.readyState = 2;
-    window.parent.postMessage({
-      __freenet_ws__: true, type: 'close', id: this._id, code: code, reason: reason
-    }, '*');
-  };
-  FreenetWebSocket.prototype.addEventListener = function(type, listener) {
-    if (!this._listeners[type]) this._listeners[type] = [];
-    this._listeners[type].push(listener);
-  };
-  FreenetWebSocket.prototype.removeEventListener = function(type, listener) {
-    if (!this._listeners[type]) return;
-    this._listeners[type] = this._listeners[type].filter(function(l) { return l !== listener; });
-  };
-  FreenetWebSocket.prototype.dispatchEvent = function(event) {
-    var handler = this['on' + event.type];
-    if (handler) handler.call(this, event);
-    var listeners = this._listeners[event.type];
-    if (listeners) for (var i = 0; i < listeners.length; i++) listeners[i].call(this, event);
-    return true;
-  };
-
-  window.addEventListener('message', function(event) {
-    // Only accept messages from the parent shell page
-    if (event.source !== window.parent) return;
-    var msg = event.data;
-    if (!msg || !msg.__freenet_ws__) return;
-    var ws = wsInstances.get(msg.id);
-    if (!ws) return;
-    switch (msg.type) {
-      case 'open':
-        ws.readyState = 1;
-        ws.dispatchEvent(new Event('open'));
-        break;
-      case 'message':
-        var data = msg.data;
-        if (ws.binaryType === 'blob' && data instanceof ArrayBuffer) data = new Blob([data]);
-        ws.dispatchEvent(new MessageEvent('message', { data: data }));
-        break;
-      case 'close':
-        ws.readyState = 3;
-        ws.dispatchEvent(new CloseEvent('close', { code: msg.code, reason: msg.reason, wasClean: true }));
-        wsInstances.delete(msg.id);
-        break;
-      case 'error':
-        ws.dispatchEvent(new Event('error'));
-        break;
-    }
-  });
-
-  window.WebSocket = FreenetWebSocket;
-  if (typeof globalThis !== 'undefined') globalThis.WebSocket = FreenetWebSocket;
-})();
-"#;
+const WEBSOCKET_SHIM_JS: &str = include_str!("path_handlers/assets/websocket_shim.js");
 
 /// JavaScript navigation interceptor injected into sandboxed iframe HTML pages.
 ///
@@ -2000,72 +1137,8 @@ const WEBSOCKET_SHIM_JS: &str = r#"
 /// Same-origin links with an explicit non-`_self` target are left to the
 /// browser so webapps that legitimately want multi-tab navigation within
 /// their own contract still work.
-const NAVIGATION_INTERCEPTOR_JS: &str = r#"
-(function() {
-  'use strict';
-  // Shared handler for both `click` (primary button) and `auxclick`
-  // (non-primary, i.e. middle-click). Middle-click is dispatched via
-  // `auxclick` in modern browsers and does NOT fire `click` at all, so
-  // without a separate `auxclick` listener middle-clicks on cross-origin
-  // <a target="_blank"> links bypass the interceptor entirely and the
-  // browser opens a null-origin sandboxed popup (freenet/freenet-core#3853
-  // follow-up from #3852).
-  function handleAnchorClick(e) {
-    var target = e.target;
-    // Walk up to find the nearest <a> element (handles clicks on child elements)
-    while (target && target.tagName !== 'A') target = target.parentElement;
-    if (!target || !target.href) return;
-    // Skip javascript: and mailto: links
-    var protocol = target.protocol;
-    if (protocol && protocol !== 'http:' && protocol !== 'https:') return;
-    // Skip links with download attribute
-    if (target.hasAttribute('download')) return;
-    // Skip links explicitly marked to bypass interception
-    if (target.dataset && target.dataset.freenetNoIntercept) return;
-    // Classify by origin. Cross-origin always goes through the open_url
-    // bridge, regardless of the `target` attribute, because a sandboxed
-    // popup would have a null origin and break CORS on the destination
-    // (freenet/river#208).
-    //
-    // Fail-safe default: if the origin comparison throws (pathological URLs
-    // that slipped past the protocol check above) we assume cross-origin,
-    // because the failure mode we are guarding against is a null-origin
-    // sandboxed popup, not an accidental in-contract navigation.
-    var isCrossOrigin = true;
-    try {
-      isCrossOrigin = target.origin !== location.origin;
-    } catch(err) {}
-    if (isCrossOrigin) {
-      e.preventDefault();
-      // Forward shift-key state so the shell can honour shift-click
-      // as a new-window request (freenet/freenet-core#3853). ctrl /
-      // meta / middle-click intent can't be meaningfully preserved
-      // from a postMessage handler: browsers only allow background-
-      // tab placement when window.open is called directly from a
-      // user gesture, and all three collapse to a plain new tab
-      // regardless of what we forward. Keep the contract minimal.
-      window.parent.postMessage({
-        __freenet_shell__: true,
-        type: 'open_url',
-        url: target.href,
-        shiftKey: !!e.shiftKey
-      }, '*');
-      return;
-    }
-    // Same-origin link. Respect explicit non-_self targets so webapps
-    // that open multiple tabs within their own contract still work.
-    if (target.target && target.target !== '_self') return;
-    // Same-origin in-contract link: request navigation via shell
-    e.preventDefault();
-    window.parent.postMessage({
-      __freenet_shell__: true, type: 'navigate', href: target.href
-    }, '*');
-  }
-  document.addEventListener('click', handleAnchorClick, true);
-  // Catch middle-click and other non-primary button activations.
-  document.addEventListener('auxclick', handleAnchorClick, true);
-})();
-"#;
+const NAVIGATION_INTERCEPTOR_JS: &str =
+    include_str!("path_handlers/assets/navigation_interceptor.js");
 
 /// Extracts the relative file path from a contract web URI.
 ///
@@ -3393,9 +2466,10 @@ mod tests {
         // and Safari because the iframe sandbox omitted `allow-downloads`.
         // Lock the token in so a future refactor does not regress the fix.
         let token = AuthToken::generate();
-        let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None, None).unwrap())
-                .await;
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, false).unwrap(),
+        )
+        .await;
         assert!(
             html.contains("allow-downloads"),
             "iframe sandbox missing `allow-downloads` — user-initiated \
@@ -3405,11 +2479,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_page_hosted_mode_renders_proxy_chrome_bar() {
+        // The hosted-mode "shell chrome" bar lives OUTSIDE the sandboxed iframe
+        // and carries the "not private" disclosure plus the Account popover
+        // (access-key backup/restore + export-to-your-own-peer). It must render
+        // in hosted mode and be ABSENT in non-hosted mode so a normal
+        // single-user node is unaffected.
+        let token = AuthToken::generate();
+        let hosted = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, true).unwrap(),
+        )
+        .await;
+        assert!(
+            hosted.contains(r#"id="fnbar""#),
+            "hosted bar missing: {hosted}"
+        );
+        assert!(
+            hosted.contains("not private"),
+            "always-visible disclosure missing"
+        );
+        assert!(
+            hosted.contains("Access key") && hosted.contains("Restore from key"),
+            "access-key backup/restore controls missing"
+        );
+        assert!(hosted.contains("Export data"), "export control missing");
+        // The access key is read from the shell-only token global; it is never
+        // injected into the sandboxed iframe.
+        assert!(
+            hosted.contains("__freenet_user_token"),
+            "access-key source global missing"
+        );
+
+        let plain = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, false).unwrap(),
+        )
+        .await;
+        assert!(
+            !plain.contains(r#"id="fnbar""#),
+            "non-hosted shell must not render the proxy chrome bar"
+        );
+        assert!(
+            !plain.contains("Export data"),
+            "non-hosted shell must not render the export control"
+        );
+    }
+
+    #[tokio::test]
     async fn shell_page_contains_iframe_and_bridge() {
         let token = AuthToken::generate();
-        let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None, None).unwrap())
-                .await;
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, false).unwrap(),
+        )
+        .await;
 
         // Shell page must contain sandboxed iframe
         assert!(
@@ -3482,9 +2603,10 @@ mod tests {
     #[tokio::test]
     async fn shell_page_permission_overlay_present_and_safe() {
         let token = AuthToken::generate();
-        let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None, None).unwrap())
-                .await;
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, false).unwrap(),
+        )
+        .await;
 
         // Overlay root and accessibility attributes
         assert!(
@@ -3656,9 +2778,10 @@ mod tests {
     #[tokio::test]
     async fn shell_page_iframe_uses_data_src_for_deep_linking() {
         let token = AuthToken::generate();
-        let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None, None).unwrap())
-                .await;
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, false).unwrap(),
+        )
+        .await;
 
         // The iframe must NOT have a src attribute (which would trigger an
         // immediate load before JS can append the hash fragment).
@@ -3679,9 +2802,10 @@ mod tests {
     async fn shell_page_forwards_query_params_to_iframe() {
         let token = AuthToken::generate();
         let qs = Some("invitation=abc123&room=test".to_string());
-        let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs, None).unwrap())
-                .await;
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, qs, None, false).unwrap(),
+        )
+        .await;
 
         // Query params should be forwarded to iframe src
         assert!(
@@ -3711,7 +2835,15 @@ mod tests {
 
         // Directory-style deep link.
         let html = response_body(
-            shell_page(&token, "testkey123", ApiVersion::V1, None, Some("news/")).unwrap(),
+            shell_page(
+                &token,
+                "testkey123",
+                ApiVersion::V1,
+                None,
+                Some("news/"),
+                false,
+            )
+            .unwrap(),
         )
         .await;
         assert!(
@@ -3727,6 +2859,7 @@ mod tests {
                 ApiVersion::V1,
                 None,
                 Some("about/team"),
+                false,
             )
             .unwrap(),
         )
@@ -3738,9 +2871,10 @@ mod tests {
 
         // `None` sub-path keeps the iframe pointed at the contract root —
         // pins that the new parameter does not change root-load behaviour.
-        let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, None, None).unwrap())
-                .await;
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, false).unwrap(),
+        )
+        .await;
         assert!(
             html.contains(r#"data-src="/v1/contract/web/testkey123/?__sandbox=1""#),
             "root load must still point the iframe at the contract root; got: {html}"
@@ -3834,9 +2968,17 @@ mod tests {
         let handler = {
             let key = key.clone();
             tokio::spawn(async move {
-                contract_home(key, sender, token, ApiVersion::V1, None, Some("news/"))
-                    .await
-                    .map(|resp| resp.into_response())
+                contract_home(
+                    key,
+                    sender,
+                    token,
+                    ApiVersion::V1,
+                    None,
+                    Some("news/"),
+                    false,
+                )
+                .await
+                .map(|resp| resp.into_response())
             })
         };
 
@@ -3951,9 +3093,10 @@ mod tests {
     async fn shell_page_strips_sandbox_prefixed_params() {
         let token = AuthToken::generate();
         let qs = Some("__sandbox_extra=evil&invitation=abc&__sandboxFoo=bar".to_string());
-        let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs, None).unwrap())
-                .await;
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, qs, None, false).unwrap(),
+        )
+        .await;
 
         // __sandbox-prefixed params must be stripped
         assert!(
@@ -3984,9 +3127,10 @@ mod tests {
     async fn shell_page_strips_auth_token_from_forwarded_query() {
         let token = AuthToken::generate();
         let qs = Some("authToken=attacker_value&invite=abc&authTokenExtra=x".to_string());
-        let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs, None).unwrap())
-                .await;
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, qs, None, false).unwrap(),
+        )
+        .await;
         assert!(
             !html.contains("attacker_value"),
             "attacker-supplied authToken value must not reach iframe src"
@@ -4012,9 +3156,10 @@ mod tests {
     async fn shell_page_escapes_html_in_query_params() {
         let token = AuthToken::generate();
         let qs = Some("foo=\"><script>alert(1)</script>".to_string());
-        let html =
-            response_body(shell_page(&token, "testkey123", ApiVersion::V1, qs, None).unwrap())
-                .await;
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, qs, None, false).unwrap(),
+        )
+        .await;
 
         // The double quote and angle brackets must be escaped
         assert!(
@@ -4024,6 +3169,296 @@ mod tests {
         assert!(
             html.contains("&quot;"),
             "double quote should be HTML-escaped"
+        );
+    }
+
+    /// Hosted mode (P2-frontend of #4381): the shell page must mint/load a
+    /// durable per-user token in `localStorage` and hand it to the bridge as a
+    /// second argument, so the proxied WebSocket upgrade carries
+    /// `?userToken=<token>`.
+    #[tokio::test]
+    async fn shell_page_hosted_mode_injects_user_token() {
+        let token = AuthToken::generate();
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, true).unwrap(),
+        )
+        .await;
+
+        // The localStorage token-minting snippet must be present.
+        assert!(
+            html.contains("__freenet_user_token__"),
+            "hosted-mode shell must include the durable localStorage token key; got: {html}"
+        );
+        assert!(
+            html.contains("crypto.getRandomValues"),
+            "hosted-mode token must be minted from crypto.getRandomValues, not request input"
+        );
+        assert!(
+            html.contains("localStorage.setItem"),
+            "hosted-mode token must be persisted to localStorage"
+        );
+        // The bridge must be called with the user-token argument AND the
+        // hosted-mode flag (so it can fail closed over http).
+        assert!(
+            html.contains(&format!(
+                "freenetBridge(\"{}\", __freenet_user_token, true);",
+                token.as_str()
+            )),
+            "hosted-mode shell must call freenetBridge with the user token and hosted flag; got: {html}"
+        );
+        // The bridge must NOT be called in the 1-arg form in hosted mode.
+        assert!(
+            !html.contains(&format!("freenetBridge(\"{}\");", token.as_str())),
+            "hosted-mode shell must not emit the 1-arg freenetBridge call"
+        );
+    }
+
+    /// Non-hosted mode must be byte-for-byte the pre-#4381 shell: no token
+    /// snippet, the original 1-arg `freenetBridge(...)` call, and no `userToken`
+    /// string anywhere. This is the no-regression guard for the default path.
+    #[tokio::test]
+    async fn shell_page_non_hosted_mode_omits_user_token() {
+        let token = AuthToken::generate();
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, false).unwrap(),
+        )
+        .await;
+
+        // The per-user-token MINTING machinery (the localStorage snippet and
+        // its `__freenet_user_token` variable) must be absent: a non-hosted
+        // visitor never gets a durable identity. Note the always-injected
+        // `SHELL_BRIDGE_JS` still *mentions* `userToken` as an inert, undefined
+        // closure argument guarded by `if (userToken)`, so we deliberately do
+        // not assert the substring `userToken` is wholly absent — we assert the
+        // minting snippet and the 2-arg call (the parts that actually activate
+        // the feature) are absent.
+        assert!(
+            !html.contains("__freenet_user_token"),
+            "non-hosted shell must not mint a per-user token; got: {html}"
+        );
+        assert!(
+            !html.contains("localStorage.setItem"),
+            "non-hosted shell must not persist a per-user token; got: {html}"
+        );
+        assert!(
+            !html.contains(", __freenet_user_token)"),
+            "non-hosted shell must not call freenetBridge with a user token"
+        );
+        // The original single-argument bridge call must be emitted unchanged
+        // (byte-for-byte the pre-#4381 output).
+        assert!(
+            html.contains(&format!("freenetBridge(\"{}\");", token.as_str())),
+            "non-hosted shell must emit the original 1-arg freenetBridge call; got: {html}"
+        );
+    }
+
+    /// Pins that the per-user-token machinery is wired through the bridge JS
+    /// itself (not just the page wrapper): the WS-open handler must append the
+    /// `userToken` query param to the real WebSocket URL when a token is set,
+    /// and `SHELL_USER_TOKEN_JS` must mint it from OS entropy.
+    #[test]
+    fn bridge_js_appends_user_token_param() {
+        assert!(
+            SHELL_BRIDGE_JS.contains("function freenetBridge(authToken, userToken, hostedMode)"),
+            "bridge function must accept the per-user token and hosted-mode arguments"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("u.searchParams.set('userToken', userToken)"),
+            "bridge must append userToken to the real WebSocket URL"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("if (userToken"),
+            "bridge must only append userToken when present (non-hosted = undefined)"
+        );
+        assert!(
+            SHELL_USER_TOKEN_JS.contains("crypto.getRandomValues"),
+            "user-token snippet must mint the token from OS entropy"
+        );
+        assert!(
+            SHELL_USER_TOKEN_JS.contains("__freenet_user_token__"),
+            "user-token snippet must persist under the durable localStorage key"
+        );
+    }
+
+    /// REFUSE-PLAINTEXT-TOKEN, client side (Codex review, #4513): the durable
+    /// per-user token is a high-value bearer secret and must never cross a
+    /// plaintext wire. Two INDEPENDENT guards enforce this so a refactor of
+    /// either can't reopen the leak:
+    ///   1. `SHELL_USER_TOKEN_JS` returns undefined on a non-https page BEFORE
+    ///      touching localStorage (never loads/mints/transmits the token), and
+    ///   2. the bridge WS-open handler gates the `userToken` append on
+    ///      `location.protocol === 'https:'`.
+    #[test]
+    fn user_token_never_transmitted_over_plaintext() {
+        // Guard 1: the https check must precede any localStorage access in the
+        // minting IIFE, so an http page returns undefined without reading the
+        // stored token.
+        let https_guard = SHELL_USER_TOKEN_JS
+            .find("location.protocol !== 'https:'")
+            .expect("user-token snippet must refuse to run on a non-https page");
+        // Anchor on the actual localStorage READ (`localStorage.getItem`), not
+        // the bare word "localStorage" which also appears in the rationale
+        // comment above the guard.
+        let first_storage_access = SHELL_USER_TOKEN_JS
+            .find("localStorage.getItem")
+            .expect("user-token snippet must read from localStorage");
+        assert!(
+            https_guard < first_storage_access,
+            "the https guard must run BEFORE any localStorage access so an http \
+             page never even reads a previously-minted token"
+        );
+        assert!(
+            SHELL_USER_TOKEN_JS.contains("return undefined"),
+            "the non-https branch must yield an undefined token"
+        );
+
+        // Guard 2: the bridge append is gated on https as a second barrier.
+        assert!(
+            SHELL_BRIDGE_JS.contains("location.protocol === 'https:'"),
+            "bridge must gate the userToken append on a secure connection"
+        );
+        let https_attach_guard = SHELL_BRIDGE_JS
+            .find("userToken && location.protocol === 'https:'")
+            .expect("bridge must only attach userToken over https");
+        let set_user = SHELL_BRIDGE_JS
+            .find("u.searchParams.set('userToken', userToken)")
+            .expect("bridge must have a userToken append site");
+        assert!(
+            https_attach_guard < set_user,
+            "the https guard must precede the userToken append"
+        );
+    }
+
+    /// FAIL CLOSED, not shared-Local (Codex review, #4381): a HOSTED browser
+    /// with no per-user token must REFUSE to operate, not silently connect onto
+    /// the shared Local delegate-secret namespace. The token is absent for two
+    /// reasons that BOTH must fail closed — plaintext http (token withheld by
+    /// the transmit guards) and https-but-storage/crypto-failure (mint throws,
+    /// catch returns undefined). The unified `hostedMode === true && !userToken`
+    /// condition covers both, so the test keys off the token-absent condition
+    /// rather than re-checking the protocol. The shell must (a) not load the
+    /// app, showing a message instead, and (b) refuse all WebSocket opens.
+    #[tokio::test]
+    async fn hosted_shell_fails_closed_when_no_user_token() {
+        // The hosted shell page must pass the hosted flag to the bridge so it
+        // CAN fail closed; without the third `true` arg the bridge can't tell
+        // it's hosted.
+        let token = AuthToken::generate();
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, true).unwrap(),
+        )
+        .await;
+        assert!(
+            html.contains(&format!(
+                "freenetBridge(\"{}\", __freenet_user_token, true);",
+                token.as_str()
+            )),
+            "hosted shell must pass the hosted flag (true) to the bridge; got: {html}"
+        );
+
+        // Unified guard: hosted AND no token (for ANY reason). Keying off
+        // `!userToken` covers both the http (token withheld) and the
+        // https-but-storage-failure (mint returned undefined) cases with one
+        // condition. Requires hostedMode === true so non-hosted (hostedMode
+        // undefined) is always inert, and a truthy token (hosted+https+minted)
+        // operates normally.
+        assert!(
+            SHELL_BRIDGE_JS.contains("hostedMode === true && !userToken"),
+            "fail-closed must require hosted mode AND an absent token (any cause)"
+        );
+        // The guard must NOT re-check the protocol — that would miss the
+        // https+storage-failure case (token undefined despite https).
+        assert!(
+            !SHELL_BRIDGE_JS.contains("hostedMode === true && location.protocol"),
+            "fail-closed must not key off the protocol (misses https+no-storage)"
+        );
+
+        // Effect 1 — the app is not loaded: the iframe is removed and a message
+        // is shown instead. Anchor on the removeChild of the iframe and the
+        // alert role.
+        assert!(
+            SHELL_BRIDGE_JS.contains("removeChild(iframe)"),
+            "fail-closed must not load the app iframe"
+        );
+        assert!(
+            SHELL_BRIDGE_JS.contains("role', 'alert'") || SHELL_BRIDGE_JS.contains("'alert'"),
+            "fail-closed must render a visible alert message"
+        );
+
+        // Effect 2 — the WS-open handler refuses while hostedNoToken, BEFORE it
+        // would otherwise open a socket on the shared Local namespace. Assert the
+        // refusal check precedes the real WebSocket construction.
+        let refuse = SHELL_BRIDGE_JS
+            .find("if (hostedNoToken)")
+            .expect("WS-open handler must refuse while hosted+no-token");
+        let open_socket = SHELL_BRIDGE_JS
+            .find("new WebSocket(u.toString()")
+            .expect("bridge must have a WebSocket open site");
+        assert!(
+            refuse < open_socket,
+            "the hostedNoToken refusal must precede opening the real socket"
+        );
+    }
+
+    /// Non-hosted mode must NEVER reach the fail-closed path: the bridge is
+    /// called with one argument, so `hostedMode` is undefined and the whole
+    /// hostedNoToken branch is inert — the app loads and connects over http
+    /// exactly as before #4381. (Single-user nodes commonly run over http.)
+    #[tokio::test]
+    async fn non_hosted_shell_never_fails_closed() {
+        let token = AuthToken::generate();
+        let html = response_body(
+            shell_page(&token, "testkey123", ApiVersion::V1, None, None, false).unwrap(),
+        )
+        .await;
+        // The 1-arg call leaves hostedMode undefined; `=== true` is then false.
+        assert!(
+            html.contains(&format!("freenetBridge(\"{}\");", token.as_str())),
+            "non-hosted shell must use the 1-arg freenetBridge call; got: {html}"
+        );
+        assert!(
+            !html.contains(", true);"),
+            "non-hosted shell must not pass the hosted-mode flag to the bridge"
+        );
+    }
+
+    /// Isolation-boundary regression (Codex review, #4513): the sandboxed app
+    /// must never be able to choose its own per-user (or auth) identity by
+    /// putting a `userToken` / `authToken` on the WebSocket URL it asks the
+    /// shell to open. The bridge must STRIP any caller-supplied credentials
+    /// before injecting its own, and the strip must run BEFORE the conditional
+    /// `set('userToken', ...)` — otherwise a caller token survives whenever the
+    /// shell's minted token is undefined (localStorage disabled / private mode),
+    /// letting the app pick its own secret namespace.
+    #[test]
+    fn bridge_js_strips_caller_supplied_user_token_before_injecting() {
+        let delete_user = SHELL_BRIDGE_JS
+            .find("u.searchParams.delete('userToken')")
+            .expect("bridge must delete any caller-supplied userToken");
+        let delete_auth = SHELL_BRIDGE_JS
+            .find("u.searchParams.delete('authToken')")
+            .expect("bridge must delete any caller-supplied authToken (defense-in-depth)");
+        let set_auth = SHELL_BRIDGE_JS
+            .find("u.searchParams.set('authToken', authToken)")
+            .expect("bridge must inject the shell's authToken");
+        // Anchor on the userToken append itself rather than the full
+        // conditional, whose guard expression is allowed to evolve (it now also
+        // carries the https barrier — see user_token_never_transmitted_over_plaintext).
+        let conditional_set_user = SHELL_BRIDGE_JS
+            .find("u.searchParams.set('userToken', userToken)")
+            .expect("bridge must conditionally inject the shell's minted userToken");
+
+        // The deletes must precede BOTH injection points, so a caller value can
+        // never survive — including the undefined-token path where the
+        // conditional set is skipped entirely.
+        assert!(
+            delete_user < conditional_set_user,
+            "delete('userToken') must run before the conditional set so a caller \
+             token cannot survive when the shell's token is undefined"
+        );
+        assert!(
+            delete_user < set_auth && delete_auth < set_auth,
+            "credential deletes must run before the authToken injection"
         );
     }
 
