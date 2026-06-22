@@ -644,5 +644,9 @@ mod opentelemetry_tracer {
     }
 }
 
+// `pub(crate)` (not `pub(super)`): `OTEventRegister` is re-exported again as
+// `pub(crate)` from `tracing.rs` and constructed in `node.rs` / `testing_impl`,
+// so it must be visible crate-wide. The narrower `pub(super)` broke the
+// `trace-ot` build after the tracing module split (see #4225).
 #[cfg(feature = "trace-ot")]
-pub(super) use opentelemetry_tracer::OTEventRegister;
+pub(crate) use opentelemetry_tracer::OTEventRegister;

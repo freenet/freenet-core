@@ -1553,8 +1553,14 @@ impl NetLogMessage {
     /// Signals whether this message closes a transaction span.
     ///
     /// In case of isolated events where the span is not being tracked it should return true.
+    // Terminal variants above complete a span; the wildcard is deliberate so
+    // non-span events (and any future variant) are treated as not-completing.
+    // `pub(crate)`: called from the sibling `metrics_client` module's
+    // OpenTelemetry span processing. Was private, which broke the `trace-ot`
+    // build after the tracing module split (see #4225).
     #[cfg(feature = "trace-ot")]
-    fn span_completed(&self) -> bool {
+    #[allow(clippy::wildcard_enum_match_arm)]
+    pub(crate) fn span_completed(&self) -> bool {
         match &self.kind {
             EventKind::Connect(ConnectEvent::Finished { .. }) => true,
             EventKind::Connect(_) => false,
@@ -1568,6 +1574,10 @@ impl NetLogMessage {
                 | SubscribeEvent::SubscribeTimeout { .. },
             ) => true,
             EventKind::Subscribe(_) => false,
+            EventKind::Update(
+                UpdateEvent::UpdateSuccess { .. } | UpdateEvent::UpdateFailure { .. },
+            ) => true,
+            EventKind::Update(_) => false,
             _ => false,
         }
     }
@@ -1586,6 +1596,9 @@ impl<'a> From<NetEventLog<'a>> for NetLogMessage {
 
 #[cfg(feature = "trace-ot")]
 impl<'a> From<&'a NetLogMessage> for Option<Vec<opentelemetry::KeyValue>> {
+    // Wildcard is deliberate: only the event kinds mapped above carry
+    // span attributes; every other event (and any new variant) maps to None.
+    #[allow(clippy::wildcard_enum_match_arm)]
     fn from(msg: &'a NetLogMessage) -> Self {
         use opentelemetry::KeyValue;
         let map: Option<Vec<KeyValue>> = match &msg.kind {
@@ -2054,5 +2067,81 @@ mod eventlog_backpressure_tests {
         )
         .await
         .expect("register_events must return promptly on a closed channel");
+    }
+}
+
+#[cfg(all(test, feature = "trace-ot"))]
+mod span_completed_tests {
+    use super::*;
+
+    fn msg(kind: EventKind) -> NetLogMessage {
+        NetLogMessage {
+            datetime: Utc::now(),
+            tx: *Transaction::NULL,
+            peer_id: PeerId::random(),
+            kind,
+        }
+    }
+
+    fn contract_key() -> ContractKey {
+        ContractKey::from_id_and_code(ContractInstanceId::new([1u8; 32]), CodeHash::new([2u8; 32]))
+    }
+
+    // Regression for #4225: UpdateSuccess / UpdateFailure are terminal UPDATE
+    // events that close their OpenTelemetry span. They previously fell through
+    // the `_ => false` arm of `span_completed`, so their spans were never
+    // marked complete and leaked under the `trace-ot` feature.
+    #[test]
+    fn update_terminal_events_complete_span() {
+        let tx = Transaction::new::<crate::operations::update::UpdateMsg>();
+        let key = contract_key();
+
+        let success = msg(EventKind::Update(UpdateEvent::UpdateSuccess {
+            id: tx,
+            requester: PeerKeyLocation::random(),
+            target: PeerKeyLocation::random(),
+            key,
+            timestamp: 0,
+            state_hash_before: None,
+            state_hash_after: None,
+            state_size: None,
+        }));
+        assert!(
+            success.span_completed(),
+            "UpdateSuccess must close its span"
+        );
+
+        let failure = msg(EventKind::Update(UpdateEvent::UpdateFailure {
+            id: tx,
+            requester: PeerKeyLocation::random(),
+            target: PeerKeyLocation::random(),
+            key,
+            reason: OperationFailure::Timeout,
+            elapsed_ms: 0,
+            timestamp: 0,
+        }));
+        assert!(
+            failure.span_completed(),
+            "UpdateFailure must close its span"
+        );
+    }
+
+    // A non-terminal UPDATE event must NOT close the span — guards against
+    // over-broadly classifying the whole `Update` group as span-completing.
+    #[test]
+    fn non_terminal_update_event_does_not_complete_span() {
+        let tx = Transaction::new::<crate::operations::update::UpdateMsg>();
+
+        let request = msg(EventKind::Update(UpdateEvent::Request {
+            id: tx,
+            requester: PeerKeyLocation::random(),
+            key: contract_key(),
+            target: PeerKeyLocation::random(),
+            timestamp: 0,
+        }));
+        assert!(
+            !request.span_completed(),
+            "UpdateEvent::Request is not terminal and must not close the span"
+        );
     }
 }
