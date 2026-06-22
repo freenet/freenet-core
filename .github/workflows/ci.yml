@@ -541,6 +541,46 @@ jobs:
         # Run separately since the main step uses --no-default-features.
         run: cargo nextest run -p freenet-ping-types --profile ci
 
+  macos_unit:
+    name: macOS Service Unit
+    runs-on: macos-latest
+    timeout-minutes: 30
+    needs: fmt_check
+    # Same skip conditions as test_unit (see test_unit comment for details).
+    if: |
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
+      !startsWith(github.head_ref, 'release/v')
+
+    env:
+      # RUST_LOG controls tracing output level (used by both test-log and production code)
+      RUST_LOG: error
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # Increase rustc stack size to prevent SIGSEGV during compilation
+      # 256MB required for LLVM optimization passes on large workspaces (rustc suggests this value)
+      RUST_MIN_STACK: 268435456
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        if: success() || steps.test.conclusion == 'failure'
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install nextest
+        run: curl -LsSf https://get.nexte.st/latest/mac | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
+      - name: Build freenet bin
+        run: cargo build --locked -p freenet --bin freenet
+
+      - name: Test service commands
+        run: cargo nextest run -p freenet --bin freenet --profile ci -E 'test(commands::service)'
+
   test_simulation:
     name: Simulation
     # Run on the heavy runner for PRs (validates the change) and for release
