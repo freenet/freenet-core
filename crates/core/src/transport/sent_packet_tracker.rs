@@ -7,8 +7,9 @@ use crate::simulation::TimeSource;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
-/// Entry for pending packet receipts: (payload, sent_time_nanos, delivery_token)
-type PendingReceiptEntry = (Box<[u8]>, u64, Option<DeliveryRateToken>);
+/// Entry for pending packet receipts:
+/// (encrypted_payload, sent_time_nanos, delivery_token, plaintext_packet_size)
+type PendingReceiptEntry = (Box<[u8]>, u64, Option<DeliveryRateToken>, usize);
 
 /// Identifies which outbound stream (if any) owns a sent packet's bytes.
 ///
@@ -150,8 +151,11 @@ const PACKET_LOSS_DECAY_FACTOR: f64 = 1.0 / 1000.0;
 /// }
 /// ```
 pub(super) struct SentPacketTracker<T: TimeSource> {
-    /// The list of packets that have been sent but not yet acknowledged
-    /// Stores (payload, sent_time_nanos, delivery_token) for RTT calculation and BBR
+    /// The list of packets that have been sent but not yet acknowledged.
+    ///
+    /// Stores the encrypted payload for resend, the send time for RTT
+    /// calculation, the delivery token for BBR, and the plaintext packet size
+    /// that was added to congestion-controller flight size.
     pending_receipts: HashMap<PacketId, PendingReceiptEntry>,
 
     resend_queue: VecDeque<ResendQueueEntry>,
@@ -242,10 +246,12 @@ impl<T: TimeSource> SentPacketTracker<T> {
 
 impl<T: TimeSource> SentPacketTracker<T> {
     pub(super) fn report_sent_packet(&mut self, packet_id: PacketId, payload: Box<[u8]>) {
-        self.report_sent_packet_with_token(packet_id, payload, None);
+        let packet_size = payload.len();
+        self.report_sent_packet_with_token_and_size(packet_id, payload, None, packet_size);
     }
 
-    /// Report a sent packet with an optional BBR delivery rate token.
+    /// Report a sent packet with an optional BBR delivery rate token and an
+    /// explicit plaintext flight-size byte count.
     ///
     /// The token is used by BBR for accurate delivery rate estimation. When an ACK
     /// arrives, the token is returned alongside the RTT sample so it can be passed
@@ -258,20 +264,21 @@ impl<T: TimeSource> SentPacketTracker<T> {
     /// stream fragment through this method keeps its original stream tag. A
     /// genuinely new packet (monotonic `packet_id`, never colliding with an old
     /// tag) has no entry yet and is correctly tagged `Control`. First sends of
-    /// stream fragments must use [`Self::report_sent_stream_packet`] instead so
-    /// they are tagged with their owning stream.
-    pub(super) fn report_sent_packet_with_token(
+    /// stream fragments must use [`Self::report_sent_stream_packet_with_size`]
+    /// instead so they are tagged with their owning stream.
+    pub(super) fn report_sent_packet_with_token_and_size(
         &mut self,
         packet_id: PacketId,
         payload: Box<[u8]>,
         token: Option<DeliveryRateToken>,
+        packet_size: usize,
     ) {
         let stream = self
             .packet_streams
             .get(&packet_id)
             .copied()
             .unwrap_or(PacketStream::Control);
-        self.report_sent_packet_inner(packet_id, payload, token, stream);
+        self.report_sent_packet_inner(packet_id, payload, token, stream, packet_size);
     }
 
     /// Report a sent packet that carries bytes owned by `stream`.
@@ -280,7 +287,8 @@ impl<T: TimeSource> SentPacketTracker<T> {
     /// its owning stream so that, when the stream aborts, [`Self::drop_stream`]
     /// can release the packet's flight-size bytes atomically (issue #4345).
     /// Resends of the same packet re-register through
-    /// [`Self::report_sent_packet_with_token`], which preserves this tag.
+    /// [`Self::refresh_sent_packet`], which preserves this tag.
+    #[cfg(test)]
     pub(super) fn report_sent_stream_packet(
         &mut self,
         packet_id: PacketId,
@@ -288,7 +296,27 @@ impl<T: TimeSource> SentPacketTracker<T> {
         token: Option<DeliveryRateToken>,
         stream_id: StreamId,
     ) {
-        self.report_sent_packet_inner(packet_id, payload, token, PacketStream::Stream(stream_id));
+        let packet_size = payload.len();
+        self.report_sent_stream_packet_with_size(packet_id, payload, token, stream_id, packet_size);
+    }
+
+    /// Report a sent stream packet with an explicit plaintext flight-size byte
+    /// count.
+    pub(super) fn report_sent_stream_packet_with_size(
+        &mut self,
+        packet_id: PacketId,
+        payload: Box<[u8]>,
+        token: Option<DeliveryRateToken>,
+        stream_id: StreamId,
+        packet_size: usize,
+    ) {
+        self.report_sent_packet_inner(
+            packet_id,
+            payload,
+            token,
+            PacketStream::Stream(stream_id),
+            packet_size,
+        );
     }
 
     /// Refresh an already-tracked packet's payload / send-time / token in place
@@ -327,8 +355,11 @@ impl<T: TimeSource> SentPacketTracker<T> {
                 // In-place refresh. The packet is still tracked, still queued for
                 // resend (get_resend re-queued it), and its stream tag in
                 // `packet_streams` is untouched — so it is preserved across the
-                // resend. `payload` is the same bytes the caller just sent.
-                *slot = (payload, sent_time_nanos, token);
+                // resend. `payload` is the same bytes the caller just sent; the
+                // plaintext byte count is preserved because no new flight-size
+                // bytes are added on resend.
+                let packet_size = slot.3;
+                *slot = (payload, sent_time_nanos, token, packet_size);
                 true
             }
             None => {
@@ -346,6 +377,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
         payload: Box<[u8]>,
         token: Option<DeliveryRateToken>,
         stream: PacketStream,
+        packet_size: usize,
     ) {
         let sent_time_nanos = self.time_source.now_nanos();
 
@@ -358,13 +390,16 @@ impl<T: TimeSource> SentPacketTracker<T> {
         // branch keeps an already-present re-register idempotent (no duplicate
         // resend-queue entry, no `total_packets_sent` bump, stream tag
         // preserved); the `stream` argument is ignored when the entry exists.
+        // Preserve the original plaintext byte count too, because flight size
+        // was added only on the first send.
         if let Some(slot) = self.pending_receipts.get_mut(&packet_id) {
-            *slot = (payload, sent_time_nanos, token);
+            let packet_size = slot.3;
+            *slot = (payload, sent_time_nanos, token, packet_size);
             return;
         }
 
         self.pending_receipts
-            .insert(packet_id, (payload, sent_time_nanos, token));
+            .insert(packet_id, (payload, sent_time_nanos, token, packet_size));
         self.packet_streams.insert(packet_id, stream);
         self.resend_queue.push_back(ResendQueueEntry { packet_id });
         self.total_packets_sent += 1;
@@ -398,33 +433,25 @@ impl<T: TimeSource> SentPacketTracker<T> {
     ///
     /// The byte count is therefore released exactly once: here.
     ///
-    /// # Why the returned count is the *encrypted* stored-payload length
+    /// # Why the returned count is the stored plaintext packet size
     ///
-    /// `drop_stream` sums `pending_receipts[id].0.len()` — the ENCRYPTED
-    /// on-wire payload that was stored when the packet was sent — NOT the
-    /// plaintext fragment size that `on_send`/`on_send_with_token` added to
-    /// flight size. This is INTENTIONAL and is the same byte count the other two
-    /// release paths use:
+    /// `pending_receipts` keeps both the encrypted on-wire payload (for resend)
+    /// and the plaintext packet size that `on_send`/`on_send_with_token` added
+    /// to flight size. `drop_stream` returns the stored plaintext size, not
+    /// `payload.len()`, so the release exactly matches the earlier add.
     ///
-    /// - ACK: `report_received_receipts` returns `payload.len()` (the stored
-    ///   encrypted length) and the recv loop passes it to `on_ack*`.
-    /// - Abandon: `ResendAction::Abandon { payload_len }` is `packet.len()` (the
-    ///   stored encrypted length) and the recv loop passes it to
-    ///   `release_flightsize`.
+    /// This is the same byte count the other two release paths use:
     ///
-    /// So `drop_stream` releases EXACTLY what an ACK or Abandon for those same
+    /// - ACK: `report_received_receipts` returns the stored plaintext size and
+    ///   the recv loop passes it to `on_ack*`.
+    /// - Abandon: `ResendAction::Abandon { payload_len }` is the stored
+    ///   plaintext size and the recv loop passes it to `release_flightsize`.
+    ///
+    /// So `drop_stream` releases exactly what an ACK or Abandon for those same
     /// packets would have released — it substitutes for the ACKs that will never
-    /// arrive. The plaintext-add / encrypted-release asymmetry is a pre-existing
-    /// convention across ALL three release paths (flight size is conservative —
-    /// it can read low because encrypted ≥ plaintext, and `release_flightsize`
-    /// saturates at 0); it is NOT introduced or worsened here.
-    ///
-    /// A future change MUST NOT "fix" one release path to plaintext bytes without
-    /// fixing `on_send` AND all three release paths together — switching only one
-    /// reintroduces an inconsistency. The plaintext-vs-encrypted accounting
-    /// convention is tracked separately in
-    /// <https://github.com/freenet/freenet-core/issues/4402> and is out of scope
-    /// for #4345.
+    /// arrive. All three release paths must remain on the same byte-count
+    /// convention as `on_send`, or flight-size accounting will drift
+    /// (issue #4402).
     ///
     /// Returns `0` for an unknown or already-drained stream, and never panics.
     ///
@@ -455,8 +482,8 @@ impl<T: TimeSource> SentPacketTracker<T> {
             // A packet whose tag is present but that is absent from
             // `pending_receipts` cannot occur: the tag is removed in lockstep on
             // ACK and abandon. The `if let` is a defensive no-panic guard.
-            if let Some((payload, _, _)) = self.pending_receipts.remove(pid) {
-                released_bytes = released_bytes.saturating_add(payload.len() as u64);
+            if let Some((_, _, _, packet_size)) = self.pending_receipts.remove(pid) {
+                released_bytes = released_bytes.saturating_add(packet_size as u64);
             }
             self.packet_streams.remove(pid);
             self.retransmit_counts.remove(pid);
@@ -508,8 +535,10 @@ impl<T: TimeSource> SentPacketTracker<T> {
             // Get packet info before removing
             let is_retransmitted = self.retransmitted_packets.contains(packet_id);
 
-            if let Some((payload, sent_time_nanos, token)) = self.pending_receipts.get(packet_id) {
-                let packet_size = payload.len();
+            if let Some((_, sent_time_nanos, token, packet_size)) =
+                self.pending_receipts.get(packet_id)
+            {
+                let packet_size = *packet_size;
                 let token = *token; // Copy the token before removing
 
                 if is_retransmitted {
@@ -714,7 +743,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
             let sent_time_nanos = self
                 .pending_receipts
                 .get(&entry.packet_id)
-                .map(|(_, ts, _)| *ts)
+                .map(|(_, ts, _, _)| *ts)
                 .unwrap_or(0);
 
             // Calculate RTO deadline from current sent_time (not stored value)
@@ -736,7 +765,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
             if let Some(tlp_at) = tlp_deadline {
                 if now_nanos >= tlp_at && now_nanos < rto_deadline {
                     // TLP fires! Clone packet data for the probe
-                    if let Some((packet, _, _)) = self.pending_receipts.get(&entry.packet_id) {
+                    if let Some((packet, _, _, _)) = self.pending_receipts.get(&entry.packet_id) {
                         let packet_clone = packet.clone();
                         let packet_id = entry.packet_id;
 
@@ -780,7 +809,7 @@ impl<T: TimeSource> SentPacketTracker<T> {
                     let payload_len = self
                         .pending_receipts
                         .remove(&entry.packet_id)
-                        .map(|(payload, _, _)| payload.len())
+                        .map(|(_, _, _, packet_size)| packet_size)
                         .unwrap_or(0);
                     self.retransmit_counts.remove(&entry.packet_id);
                     self.retransmitted_packets.remove(&entry.packet_id);
@@ -855,8 +884,8 @@ pub enum ResendAction {
     TlpProbe(u32, Box<[u8]>),
     /// The packet has been retransmitted `MAX_PACKET_RETRANSMITS` times without
     /// an ACK and is declared permanently lost (issue #4345). It has been
-    /// removed from tracking; the caller MUST release its `payload_len` bytes
-    /// from the congestion controller's flight size via
+    /// removed from tracking; the caller MUST release its `payload_len`
+    /// plaintext bytes from the congestion controller's flight size via
     /// `CongestionControl::release_flightsize(payload_len)` and MUST NOT
     /// re-register or re-send it.
     Abandon { packet_id: u32, payload_len: usize },
@@ -2041,7 +2070,10 @@ pub(in crate::transport) mod tests {
     /// packet that resends is re-registered too; if any other packet is
     /// abandoned first the helper panics, since callers rely on the target being
     /// the one that ages out.
-    fn drive_to_abandon(tracker: &mut SentPacketTracker<VirtualTime>, packet_id: PacketId) {
+    fn drive_to_abandon(
+        tracker: &mut SentPacketTracker<VirtualTime>,
+        packet_id: PacketId,
+    ) -> usize {
         for _ in 0..1000 {
             tracker.time_source.advance(Duration::from_secs(120));
             match tracker.get_resend() {
@@ -2050,17 +2082,137 @@ pub(in crate::transport) mod tests {
                     // Control-default path must preserve a stream packet's tag.
                     tracker.report_sent_packet(id, packet);
                 }
-                ResendAction::Abandon { packet_id: id, .. } => {
+                ResendAction::Abandon {
+                    packet_id: id,
+                    payload_len,
+                } => {
                     assert_eq!(
                         id, packet_id,
                         "an unexpected packet ({id}) abandoned before the target ({packet_id})"
                     );
-                    return;
+                    return payload_len;
                 }
                 ResendAction::TlpProbe(..) | ResendAction::WaitUntil(_) => {}
             }
         }
         panic!("packet {packet_id} was never abandoned");
+    }
+
+    fn report_sent_stream_packets_with_accounting(
+        tracker: &mut SentPacketTracker<VirtualTime>,
+        flight_size: &mut isize,
+        stream: StreamId,
+        packets: &[(PacketId, usize, usize)],
+    ) {
+        for &(packet_id, plaintext_size, encrypted_size) in packets {
+            assert!(
+                encrypted_size > plaintext_size,
+                "test must model encryption/framing overhead"
+            );
+            *flight_size += plaintext_size as isize;
+            tracker.report_sent_stream_packet_with_size(
+                packet_id,
+                vec![0u8; encrypted_size].into(),
+                None,
+                stream,
+                plaintext_size,
+            );
+        }
+    }
+
+    fn release_flight_size(flight_size: &mut isize, payload_len: usize) {
+        *flight_size -= payload_len as isize;
+    }
+
+    fn release_acks(
+        flight_size: &mut isize,
+        ack_info: Vec<(Option<Duration>, usize, Option<DeliveryRateToken>)>,
+    ) {
+        for (_, packet_size, _) in ack_info {
+            release_flight_size(flight_size, packet_size);
+        }
+    }
+
+    /// Issue #4402: every release path must return the same plaintext byte count
+    /// that `on_send` added to flight size, even though the tracker stores the
+    /// encrypted on-wire payload for resend.
+    #[test]
+    fn test_issue_4402_plaintext_flightsize_releases_balance_all_paths() {
+        // Fully ACKed stream.
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+        let mut flight_size = 0isize;
+        report_sent_stream_packets_with_accounting(
+            &mut tracker,
+            &mut flight_size,
+            stream,
+            &[(1, 10, 26), (2, 14, 30)],
+        );
+
+        let (ack_info, _) = tracker.report_received_receipts(&[1, 2]);
+        release_acks(&mut flight_size, ack_info);
+        assert_eq!(
+            flight_size, 0,
+            "ACK path must release the plaintext byte count that on_send added"
+        );
+
+        // Fully abandoned stream.
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+        let mut flight_size = 0isize;
+        report_sent_stream_packets_with_accounting(
+            &mut tracker,
+            &mut flight_size,
+            stream,
+            &[(10, 11, 27), (11, 13, 29)],
+        );
+
+        let released = drive_to_abandon(&mut tracker, 10);
+        release_flight_size(&mut flight_size, released);
+        let released = drive_to_abandon(&mut tracker, 11);
+        release_flight_size(&mut flight_size, released);
+        assert_eq!(
+            flight_size, 0,
+            "Abandon path must release the plaintext byte count that on_send added"
+        );
+
+        // Fully dropped stream.
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+        let mut flight_size = 0isize;
+        report_sent_stream_packets_with_accounting(
+            &mut tracker,
+            &mut flight_size,
+            stream,
+            &[(20, 17, 33), (21, 19, 35)],
+        );
+
+        let released = tracker.drop_stream(stream);
+        release_flight_size(&mut flight_size, released as usize);
+        assert_eq!(
+            flight_size, 0,
+            "drop_stream path must release the plaintext byte count that on_send added"
+        );
+
+        // Mixed stream: one packet ACKed, remainder dropped.
+        let mut tracker = mock_sent_packet_tracker();
+        let stream = StreamId::next();
+        let mut flight_size = 0isize;
+        report_sent_stream_packets_with_accounting(
+            &mut tracker,
+            &mut flight_size,
+            stream,
+            &[(30, 23, 39), (31, 25, 41), (32, 27, 43)],
+        );
+
+        let (ack_info, _) = tracker.report_received_receipts(&[30]);
+        release_acks(&mut flight_size, ack_info);
+        let released = tracker.drop_stream(stream);
+        release_flight_size(&mut flight_size, released as usize);
+        assert_eq!(
+            flight_size, 0,
+            "mixed ACK/drop paths must not over-release encrypted payload overhead"
+        );
     }
 
     /// drop_stream returns the EXACT byte total of the dropped stream's packets
