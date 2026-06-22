@@ -29,10 +29,21 @@ use super::{OpManager, background_task_monitor::BackgroundTaskMonitor};
 /// Exit code requested when the network event loop dies on a fatal (non-graceful)
 /// condition (#4549). `42` == `EXIT_CODE_UPDATE_NEEDED` (see
 /// `crates/core/src/bin/commands/auto_update.rs`) and is also hard-coded in the
-/// systemd unit templates (`[ "$EXIT_STATUS" = "42" ]`). It is listed in the unit's
-/// `SuccessExitStatus`, so a repeating wedge-restart cannot trip `StartLimitBurst`
-/// and brick the unit; its `ExecStopPost` hook runs `freenet update`, so a wedged
-/// old binary can auto-upgrade to a fixed version.
+/// GENERATED systemd unit template (`crates/core/src/bin/commands/service/linux.rs`,
+/// `[ "$EXIT_STATUS" = "42" ]`). Its `ExecStopPost` hook runs `freenet update`, so a
+/// wedged OLD binary auto-upgrades to a fixed version (the self-heal path that rolls
+/// this fix out), and `Restart=always` (`RestartSec=10`) restarts it.
+///
+/// The restart loop is bounded by `RestartSec` and is visible (a `CRITICAL` log per
+/// exit + climbing `NRestarts`) — strictly better than the #4549 dark wedge. NOTE:
+/// the unit's `StartLimitBurst`/`StartLimitIntervalSec` are currently emitted in the
+/// `[Service]` section, where systemd ignores them, so they do NOT rate-limit a
+/// repeating wedge today; moving them to `[Unit]` (and then a min-uptime exit-code
+/// guard) is tracked in #4551 and is out of scope for this hotfix.
+///
+/// Caveat (macOS): the macOS service wrapper treats a non-zero `freenet update`
+/// result (the no-op "already up to date" exit) as a failure and applies restart
+/// backoff. Production gateways are Linux, so this only slows restart on macOS.
 const FATAL_LISTENER_EXIT_CODE: i32 = 42;
 
 /// When `true`, a fatal (non-graceful) exit of the network event listener aborts
@@ -456,6 +467,7 @@ impl NodeP2P {
                    tracing::error!(
                        error = %e,
                        exit_code = FATAL_LISTENER_EXIT_CODE,
+                       uptime_secs = start_time.elapsed().as_secs(),
                        "Network event listener exited unexpectedly; forcing immediate process \
                         exit so the service manager restarts the node promptly and the \
                         auto-update hook can fire (avoids the wedged-but-alive dark window, #4549)"
@@ -809,14 +821,18 @@ mod tests {
             "UnexpectedStreamEnd must be treated as a fatal wedge"
         );
 
-        // Arbitrary listener errors (UDP-listener death, handler/transport errors,
-        // the #4549 'no response received from handler') are all fatal.
+        // Arbitrary listener errors (UDP-listener death, handler/transport errors)
+        // are all fatal.
         assert!(!listener_exit_is_graceful(&anyhow::anyhow!(
             "UDP listen task exited unexpectedly — transport layer is dead"
         )));
-        assert!(!listener_exit_is_graceful(&anyhow::anyhow!(
-            "no response received from handler"
-        )));
+
+        // The real #4549 production error is the TYPED
+        // `ContractError::NoEvHandlerResponse` (not a string stand-in) — it must
+        // also classify as fatal so the wedge triggers a restart.
+        assert!(!listener_exit_is_graceful(
+            &crate::contract::ContractError::NoEvHandlerResponse.into()
+        ));
     }
 
     /// The fast-exit flag must be OFF by default so simulation / integration tests
@@ -832,7 +848,8 @@ mod tests {
         );
         assert_eq!(
             FATAL_LISTENER_EXIT_CODE, 42,
-            "must match EXIT_CODE_UPDATE_NEEDED"
+            "must match EXIT_CODE_UPDATE_NEEDED so the systemd ExecStopPost auto-update \
+             hook fires on a wedge"
         );
     }
 
