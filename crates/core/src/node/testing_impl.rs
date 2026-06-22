@@ -754,6 +754,14 @@ pub(super) struct Builder<ER> {
     event_register: ER,
     contracts: Vec<(ContractContainer, WrappedState, bool)>,
     contract_subscribers: HashMap<ContractKey, Vec<PeerKeyLocation>>,
+    /// Pre-formed ring connections injected at node startup, bypassing the
+    /// organic CONNECT handshake. Each entry is a peer this node should already
+    /// hold a direct ring connection to when its event loop starts. Drained by
+    /// `run_node_with_{shared_storage,mock_wasm}` into
+    /// `apply_preseeded_connections` (see that helper for the rationale).
+    /// Populated by [`SimNetwork::preseed_direct_star`]; empty for every node by
+    /// default, so this is a zero-cost no-op for all existing simulations.
+    preseed_connections: Vec<PeerKeyLocation>,
     /// Seed for deterministic RNG in this node's transport layer
     pub rng_seed: u64,
     /// Network name for scoped fault injection
@@ -782,6 +790,7 @@ impl<ER: NetEventRegister> Builder<ER> {
             event_register,
             contracts: Vec::new(),
             contract_subscribers: HashMap::new(),
+            preseed_connections: Vec::new(),
             rng_seed,
             network_name,
             shared_cm: None,
@@ -1262,13 +1271,17 @@ impl SimNetwork {
     /// Enable the placement-migration (`SubscribeHint`) cascade for this
     /// simulation by lowering the version floor to `(0,0,0)` on every node.
     ///
-    /// The cascade is OFF by default in sim: its peers report the current build
-    /// version, which is below the production `SUBSCRIBE_HINT_MIN_VERSION`, so
-    /// the gate never fires. A test that specifically exercises migration calls
-    /// this; every other sim is left untouched (so an unrelated test cannot be
-    /// perturbed by hosting migrating mid-run). Like `with_governance_config`,
-    /// this patches the already-built node/gateway configs (config_* ran during
-    /// construction when the override was still `None`).
+    /// The cascade's default depends on the build version: peers report the
+    /// current build version, so the gate fires whenever that version is `>=`
+    /// the production `SUBSCRIBE_HINT_MIN_VERSION` (currently `(0,2,80)`). This
+    /// crate is already past that floor, so #4404 migration is ON by default in
+    /// sim now — call [`disable_placement_migration`](Self::disable_placement_migration)
+    /// to pin it OFF for a test whose premise assumes the contract stays put.
+    /// This method forces it ON regardless of build version (floor `(0,0,0)`),
+    /// for a test that specifically exercises migration; every other sim is left
+    /// untouched. Like `with_governance_config`, this patches the already-built
+    /// node/gateway configs (config_* ran during construction when the override
+    /// was still `None`).
     #[allow(dead_code)]
     pub fn enable_placement_migration(&mut self) -> &mut Self {
         const TEST_FLOOR: (u8, u8, u16) = (0, 0, 0);
@@ -1310,6 +1323,116 @@ impl SimNetwork {
             builder.config.subscribe_hint_floor_override = Some(UNREACHABLE_FLOOR);
         }
         self
+    }
+
+    /// Resolve a label to its full [`PeerKeyLocation`] (pub_key + address) from
+    /// the already-built node/gateway configs. Returns `None` if the label is
+    /// not found among this network's nodes. Must be called before the builders
+    /// are drained into the run loop (i.e. before `run_controlled_simulation`).
+    fn peer_key_location_for(&self, label: &NodeLabel) -> Option<PeerKeyLocation> {
+        let builder = self
+            .gateways
+            .iter()
+            .map(|(b, cfg)| (b, &cfg.label))
+            .chain(self.nodes.iter().map(|(b, l)| (b, l)))
+            .find(|(_, l)| *l == label)
+            .map(|(b, _)| b)?;
+        let addr = std::net::SocketAddr::new(
+            builder.config.network_listener_ip,
+            builder.config.network_listener_port,
+        );
+        Some(PeerKeyLocation::new(
+            builder.config.key_pair.public().clone(),
+            addr,
+        ))
+    }
+
+    /// Preseed a **direct star** topology: inject a pre-formed ring connection
+    /// between `host` and every label in `subscribers`, in BOTH directions, so
+    /// that when the simulation starts the host already holds direct connections
+    /// to all subscribers (and each subscriber to the host) — bypassing the
+    /// organic ring-routed CONNECT handshake entirely.
+    ///
+    /// ## Why this exists (#4233)
+    ///
+    /// A faithful 40-80-subscriber direct star (the production-incident
+    /// fan-out topology) cannot be bootstrapped organically in this Turmoil
+    /// harness: ring-routed CONNECT cannot form that many direct connections to
+    /// a single 1-gateway hub within the virtual-time budget — subscribers hit
+    /// "at terminus, no uphill peers available — rejecting" and the simulation
+    /// exhausts its whole schedule in topology formation before any UPDATE
+    /// fires (N=8/16 form; N>=24 never finish). This primitive is the
+    /// connection-side analogue of the `SeedHostedContract` contract preseed: it
+    /// writes the ring connection state directly so the star exists at t=0 and
+    /// the test can reach the sustained-fan-out broadcast phase it actually
+    /// targets.
+    ///
+    /// ## What it injects — and what it leaves to the organic path
+    ///
+    /// Only the ring `Connection`/`Location` state is injected (via
+    /// [`Ring::add_connection`](crate::ring::Ring::add_connection) at node
+    /// startup). The underlying transport connection is materialized lazily on
+    /// first send, and each subscriber's interest/subscription is registered
+    /// organically when it runs its real `Subscribe` op (which now routes
+    /// directly to the host over the injected connection). So the genuine
+    /// subscribe + interest + broadcast machinery is exercised unchanged; only
+    /// the CONNECT handshake is replaced. See
+    /// `apply_preseeded_connections` for the full mechanism.
+    ///
+    /// ## Caller responsibilities
+    ///
+    /// - The host's `max_connections` must be `>= subscribers.len()` (plus slack
+    ///   for its own gateway-mesh connections), or the [`ConnectionManager`] cap
+    ///   will reject the overflow connections at injection time (logged + skipped,
+    ///   surfacing as a connectivity shortfall in the test's assertions).
+    /// - Call this AFTER `SimNetwork::new*` and BEFORE
+    ///   `run_controlled_simulation` (it mutates the builders in place; once they
+    ///   are drained into the run loop the preseed list is consumed at startup).
+    ///
+    /// Panics if `host` or any subscriber label is not found in this network.
+    pub fn preseed_direct_star(&mut self, host: &NodeLabel, subscribers: &[NodeLabel]) {
+        let host_pkl = self
+            .peer_key_location_for(host)
+            .unwrap_or_else(|| panic!("preseed_direct_star: host {host:?} not found in network"));
+
+        // Resolve every subscriber up front so we fail fast on a bad label and
+        // do not partially mutate the builders.
+        let sub_pkls: Vec<(NodeLabel, PeerKeyLocation)> = subscribers
+            .iter()
+            .map(|label| {
+                let pkl = self.peer_key_location_for(label).unwrap_or_else(|| {
+                    panic!("preseed_direct_star: subscriber {label:?} not found in network")
+                });
+                (label.clone(), pkl)
+            })
+            .collect();
+
+        for (sub_label, sub_pkl) in sub_pkls {
+            // host -> subscriber
+            self.push_preseed_connection(host, sub_pkl);
+            // subscriber -> host
+            self.push_preseed_connection(&sub_label, host_pkl.clone());
+        }
+    }
+
+    /// Append a single pre-formed connection to `label`'s builder. Internal
+    /// helper for [`preseed_direct_star`](Self::preseed_direct_star).
+    fn push_preseed_connection(&mut self, label: &NodeLabel, peer: PeerKeyLocation) {
+        let builder = self
+            .gateways
+            .iter_mut()
+            .find(|(_, cfg)| cfg.label == *label)
+            .map(|(b, _)| b)
+            .or_else(|| {
+                self.nodes
+                    .iter_mut()
+                    .find(|(_, l)| *l == *label)
+                    .map(|(b, _)| b)
+            })
+            .unwrap_or_else(|| {
+                panic!("push_preseed_connection: label {label:?} not found in network")
+            });
+        builder.preseed_connections.push(peer);
     }
 
     /// Returns the VirtualTime instance for this simulation.
