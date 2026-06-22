@@ -80,6 +80,7 @@ mod p2p_impl;
 mod request_router;
 pub(crate) mod testing_impl;
 
+pub use p2p_impl::enable_abort_on_fatal_listener_exit;
 pub use request_router::{DeduplicatedRequest, RequestRouter};
 
 /// Handle to trigger graceful shutdown of the node.

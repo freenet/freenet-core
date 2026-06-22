@@ -7,8 +7,8 @@ use tracing::Instrument;
 use super::{
     NetEventRegister, PeerId,
     network_bridge::{
-        EventLoopNotificationsReceiver, event_loop_notification_channel_with_capacity,
-        p2p_protoc::P2pConnManager,
+        EventLoopExitReason, EventLoopNotificationsReceiver,
+        event_loop_notification_channel_with_capacity, p2p_protoc::P2pConnManager,
     },
 };
 use crate::{
@@ -25,6 +25,60 @@ use crate::{
 };
 
 use super::{OpManager, background_task_monitor::BackgroundTaskMonitor};
+
+/// Exit code requested when the network event loop dies on a fatal (non-graceful)
+/// condition (#4549). `42` == `EXIT_CODE_UPDATE_NEEDED` (see
+/// `crates/core/src/bin/commands/auto_update.rs`) and is also hard-coded in the
+/// GENERATED systemd unit template (`crates/core/src/bin/commands/service/linux.rs`,
+/// `[ "$EXIT_STATUS" = "42" ]`). Its `ExecStopPost` hook runs `freenet update`, so a
+/// wedged OLD binary auto-upgrades to a fixed version (the self-heal path that rolls
+/// this fix out), and `Restart=always` (`RestartSec=10`) restarts it.
+///
+/// The restart loop is bounded by `RestartSec` and is visible (a `CRITICAL` log per
+/// exit + climbing `NRestarts`) — strictly better than the #4549 dark wedge. NOTE:
+/// the unit's `StartLimitBurst`/`StartLimitIntervalSec` are currently emitted in the
+/// `[Service]` section, where systemd ignores them, so they do NOT rate-limit a
+/// repeating wedge today; moving them to `[Unit]` (and then a min-uptime exit-code
+/// guard) is tracked in #4551 and is out of scope for this hotfix.
+///
+/// Caveat (macOS): the macOS service wrapper treats a non-zero `freenet update`
+/// result (the no-op "already up to date" exit) as a failure and applies restart
+/// backoff. Production gateways are Linux, so this only slows restart on macOS.
+const FATAL_LISTENER_EXIT_CODE: i32 = 42;
+
+/// When `true`, a fatal (non-graceful) exit of the network event listener aborts
+/// the whole process with [`FATAL_LISTENER_EXIT_CODE`] instead of unwinding through
+/// the normal teardown/return path (#4549).
+///
+/// In production that unwind path could hang for tens of minutes while the node sat
+/// network-dead (the listener had already logged its exit), so systemd never
+/// restarted it and the auto-update hook never fired — the node just spun. A prompt
+/// `process::exit` converts that dark window into a quick restart.
+///
+/// **Off by default.** It is enabled only by the real `freenet` binary
+/// ([`enable_abort_on_fatal_listener_exit`]) so that simulation / integration tests
+/// and library embedders never have a fatal listener exit kill their host process.
+static ABORT_ON_FATAL_LISTENER_EXIT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enable the #4549 fast-exit behaviour: a fatal (non-graceful) network event
+/// listener exit will abort the process with [`FATAL_LISTENER_EXIT_CODE`] for a
+/// prompt service-manager restart, rather than risk hanging in teardown. Call once
+/// from the production node entry point. See [`ABORT_ON_FATAL_LISTENER_EXIT`].
+pub fn enable_abort_on_fatal_listener_exit() {
+    ABORT_ON_FATAL_LISTENER_EXIT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether a network-event-listener exit error is a *graceful* shutdown (a clean,
+/// intended exit) rather than a fatal wedge that warrants a process restart.
+///
+/// Graceful shutdown (`NodeEvent::Disconnect`, e.g. SIGTERM or auto-update) returns
+/// [`EventLoopExitReason::GracefulShutdown`]; every other listener-exit error
+/// (UDP-listener death, unexpected stream end, a handler/transport error) is fatal.
+fn listener_exit_is_graceful(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<EventLoopExitReason>()
+        .is_some_and(|reason| matches!(reason, EventLoopExitReason::GracefulShutdown))
+}
 
 pub(crate) struct NodeP2P {
     pub(crate) op_manager: Arc<OpManager>,
@@ -400,6 +454,26 @@ impl NodeP2P {
         let result = crate::deterministic_select! {
             r = f => {
                let Err(e) = r;
+               // #4549: on a fatal (non-graceful) listener exit, abort the process
+               // immediately rather than risk hanging in the teardown/return path
+               // below (in production the node sat network-dead and spun for ~37min
+               // before finally exiting, so systemd never restarted it). A graceful
+               // shutdown (Disconnect / SIGTERM / auto-update) must still fall through
+               // to the clean teardown. Gated so only the real binary force-exits.
+               if !listener_exit_is_graceful(&e)
+                   && ABORT_ON_FATAL_LISTENER_EXIT.load(std::sync::atomic::Ordering::Relaxed)
+               {
+                   eprintln!("CRITICAL: Network event listener exited (fatal): {e}");
+                   tracing::error!(
+                       error = %e,
+                       exit_code = FATAL_LISTENER_EXIT_CODE,
+                       uptime_secs = start_time.elapsed().as_secs(),
+                       "Network event listener exited unexpectedly; forcing immediate process \
+                        exit so the service manager restarts the node promptly and the \
+                        auto-update hook can fire (avoids the wedged-but-alive dark window, #4549)"
+                   );
+                   std::process::exit(FATAL_LISTENER_EXIT_CODE);
+               }
                eprintln!("CRITICAL: Network event listener exited: {e}");
                tracing::error!("Network event listener exited: {}", e);
                Err(e)
@@ -725,6 +799,59 @@ impl NodeP2P {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #4549: the fast-exit watchdog (`process::exit(42)` on a fatal listener exit)
+    /// is gated by `listener_exit_is_graceful`. A regression in this predicate is
+    /// dangerous in BOTH directions: classifying a graceful shutdown as fatal would
+    /// force-exit the process on every clean SIGTERM / auto-update (turning exit 0
+    /// into a spurious exit-42 + auto-update on every stop); classifying a real
+    /// wedge as graceful would leave the node spinning network-dead (the bug we are
+    /// fixing). Pin both directions.
+    #[test]
+    fn listener_exit_graceful_classification() {
+        // Graceful shutdown (NodeEvent::Disconnect via SIGTERM / auto-update).
+        assert!(
+            listener_exit_is_graceful(&EventLoopExitReason::GracefulShutdown.into()),
+            "GracefulShutdown must be treated as a clean exit (no force-exit)"
+        );
+
+        // Unexpected stream end is fatal — the node must fast-exit and restart.
+        assert!(
+            !listener_exit_is_graceful(&EventLoopExitReason::UnexpectedStreamEnd.into()),
+            "UnexpectedStreamEnd must be treated as a fatal wedge"
+        );
+
+        // Arbitrary listener errors (UDP-listener death, handler/transport errors)
+        // are all fatal.
+        assert!(!listener_exit_is_graceful(&anyhow::anyhow!(
+            "UDP listen task exited unexpectedly — transport layer is dead"
+        )));
+
+        // The real #4549 production error is the TYPED
+        // `ContractError::NoEvHandlerResponse` (not a string stand-in) — it must
+        // also classify as fatal so the wedge triggers a restart.
+        assert!(!listener_exit_is_graceful(
+            &crate::contract::ContractError::NoEvHandlerResponse.into()
+        ));
+    }
+
+    /// The fast-exit flag must be OFF by default so simulation / integration tests
+    /// and library embedders never have a fatal listener exit kill their process.
+    /// Only the real binary opts in via `enable_abort_on_fatal_listener_exit`.
+    #[test]
+    fn fatal_listener_fast_exit_is_opt_in() {
+        // NOTE: deliberately does NOT call `enable_abort_on_fatal_listener_exit()`
+        // (a process-global flip would affect other tests in the same binary).
+        assert!(
+            !ABORT_ON_FATAL_LISTENER_EXIT.load(std::sync::atomic::Ordering::Relaxed),
+            "fatal-listener fast-exit must be opt-in (off unless the binary enables it)"
+        );
+        assert_eq!(
+            FATAL_LISTENER_EXIT_CODE, 42,
+            "must match EXIT_CODE_UPDATE_NEEDED so the systemd ExecStopPost auto-update \
+             hook fires on a wedge"
+        );
+    }
 
     /// Verify that a spawned task that panics is detected via JoinHandle.
     #[tokio::test]

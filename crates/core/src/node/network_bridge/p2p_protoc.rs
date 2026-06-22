@@ -38,7 +38,7 @@ use crate::transport::{
 use crate::{
     client_events::ClientId,
     config::GlobalExecutor,
-    contract::{ContractHandlerChannel, ExecutorTransactionStream, WaitingResolution},
+    contract::{ContractHandlerChannel, ExecutorTransactionStream, SenderHalve, WaitingResolution},
     message::{MessageStats, NetMessage, NodeEvent, Transaction, TransactionType},
     node::{
         NetEventRegister, NodeConfig, OpManager, PeerId, WaiterReply, process_message_decoupled,
@@ -99,6 +99,63 @@ impl std::fmt::Display for EventLoopExitReason {
 }
 
 impl std::error::Error for EventLoopExitReason {}
+
+/// Upper bound on how long the network event listener will wait for the contract
+/// handler to answer a *diagnostics* `QuerySubscriptions` query (#4549).
+///
+/// These queries run inline on the event loop. The handler's own response timeout
+/// is `CH_EV_RESPONSE_TIME_OUT` (300s); without an outer bound a saturated handler
+/// would stall the entire network event loop for up to 5 minutes per diagnostics
+/// poll. A diagnostics query is best-effort, so cap the wait and serve an empty
+/// result on timeout rather than freezing (or, previously, killing) the listener.
+const QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Best-effort, bounded query to the contract handler for application-level
+/// subscriptions, used by the diagnostics arms of the network event loop (#4549).
+///
+/// This runs INLINE on the network event loop, so it must be both bounded and
+/// non-fatal: a saturated contract handler previously made the bare
+/// `notify_contract_handler(QuerySubscriptions ...).await?` return
+/// `NoEvHandlerResponse` only after the 300s handler timeout, which killed the
+/// whole network event listener ("Network event listener exited: no response
+/// received from handler") and took the gateway network-dead. Here the wait is
+/// capped at [`QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT`] and ANY failure (timeout,
+/// channel error, missing response) yields an empty list. A genuinely-dead
+/// contract handler causes the `contract_executor_task` to exit, which the
+/// `run_node` supervisor observes via its `deterministic_select!` and brings the
+/// node down — so de-fatalizing this diagnostics query does not mask a dead
+/// handler.
+async fn query_app_subscriptions_bounded(
+    ch_outbound: &ContractHandlerChannel<SenderHalve>,
+) -> Vec<crate::message::SubscriptionInfo> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    match timeout(
+        QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT,
+        ch_outbound.send_to_handler(ContractHandlerEvent::QuerySubscriptions { callback: tx }),
+    )
+    .await
+    {
+        Ok(Ok(_)) => match timeout(Duration::from_secs(1), rx.recv()).await {
+            Ok(Some(QueryResult::NetworkDebug(info))) => info.application_subscriptions,
+            _ => Vec::new(),
+        },
+        Ok(Err(err)) => {
+            tracing::warn!(
+                error = %err,
+                "QuerySubscriptions diagnostics: contract handler error; \
+                 serving empty app subscriptions"
+            );
+            Vec::new()
+        }
+        Err(_elapsed) => {
+            tracing::warn!(
+                "QuerySubscriptions diagnostics: contract handler did not respond within \
+                 timeout; serving empty app subscriptions"
+            );
+            Vec::new()
+        }
+    }
+}
 
 pub(crate) enum P2pBridgeEvent {
     Message(PeerKeyLocation, Box<NetMessage>),
@@ -2083,23 +2140,12 @@ impl P2pConnManager {
                                     })
                                     .collect();
 
-                                // Get application subscriptions from contract executor
-                                // For now, we'll send a query to the contract handler
-                                let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-
-                                op_manager
-                                    .notify_contract_handler(
-                                        ContractHandlerEvent::QuerySubscriptions { callback: tx },
-                                    )
-                                    .await?;
-
+                                // Get application subscriptions from the contract handler.
+                                // #4549: bounded + non-fatal (see
+                                // `query_app_subscriptions_bounded`) — a saturated handler
+                                // must never stall or kill the network event listener.
                                 let app_subscriptions =
-                                    match timeout(Duration::from_secs(1), rx.recv()).await {
-                                        Ok(Some(QueryResult::NetworkDebug(info))) => {
-                                            info.application_subscriptions
-                                        }
-                                        _ => Vec::new(),
-                                    };
+                                    query_app_subscriptions_bounded(&op_manager.ch_outbound).await;
 
                                 // Log network subscription details for debugging
                                 for (contract_key, peers) in &network_subs {
@@ -2220,30 +2266,14 @@ impl P2pConnManager {
                                     // Get network subscriptions from OpManager
                                     let _network_subs = op_manager.get_network_subscriptions();
 
-                                    // Get application subscriptions from contract executor
-                                    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-                                    if op_manager
-                                        .notify_contract_handler(
-                                            ContractHandlerEvent::QuerySubscriptions {
-                                                callback: tx,
-                                            },
-                                        )
-                                        .await
-                                        .is_ok()
-                                    {
-                                        let app_subscriptions = match timeout(
-                                            Duration::from_secs(1),
-                                            rx.recv(),
-                                        )
-                                        .await
-                                        {
-                                            Ok(Some(QueryResult::NetworkDebug(info))) => {
-                                                info.application_subscriptions
-                                            }
-                                            _ => Vec::new(),
-                                        };
-
-                                        response.subscriptions = app_subscriptions
+                                    // Get application subscriptions from the contract handler.
+                                    // #4549: bounded + non-fatal (see
+                                    // `query_app_subscriptions_bounded`). On any failure this
+                                    // serves an empty list rather than stalling or killing the
+                                    // network event listener.
+                                    response.subscriptions =
+                                        query_app_subscriptions_bounded(&op_manager.ch_outbound)
+                                            .await
                                             .into_iter()
                                             .map(|sub| {
                                                 freenet_stdlib::client_api::SubscriptionInfo {
@@ -2252,7 +2282,6 @@ impl P2pConnManager {
                                                 }
                                             })
                                             .collect();
-                                    }
                                 }
 
                                 // Collect contract states.
@@ -4261,6 +4290,96 @@ mod tests {
             body.contains(".reserve()"),
             "PipeStream dispatch must use `reserve()` instead of `send().await` — \
              see #4145. Body:\n{body}"
+        );
+    }
+
+    /// Source-scrape regression guard for #4549. The inline diagnostics
+    /// `QuerySubscriptions` queries on the network event loop must be BOUNDED by
+    /// `QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT` and must NOT propagate the contract
+    /// handler's result with `?`. The original bug was a bare
+    /// `notify_contract_handler(QuerySubscriptions ...).await?`: under
+    /// contract-executor saturation it returned `NoEvHandlerResponse` after the
+    /// 300s handler timeout, which killed the entire network event listener
+    /// ("Network event listener exited: no response received from handler") and
+    /// took the gateway network-dead with no self-recovery.
+    #[test]
+    fn query_subscriptions_diagnostics_bounded_and_non_fatal() {
+        let src = include_str!("p2p_protoc.rs");
+        // Built at runtime so this test's own source can't self-match the needle.
+        let needle = concat!("ContractHandlerEvent::", "QuerySubscriptions {");
+        let sites: Vec<usize> = src.match_indices(needle).map(|(i, _)| i).collect();
+        // The handler query now lives in exactly ONE place — the bounded helper
+        // `query_app_subscriptions_bounded`. Re-inlining it into an event-loop arm
+        // (the #4549 regression shape) would add a site and fail this assert.
+        assert_eq!(
+            sites.len(),
+            1,
+            "the QuerySubscriptions handler query must live only in \
+             query_app_subscriptions_bounded, found {} sites",
+            sites.len()
+        );
+        let idx = sites[0];
+        // Non-fatal: no `?`-propagation on the handler result (char-based window so
+        // a multi-byte char in nearby comments can't panic the slice).
+        let forward: String = src[idx..].chars().take(220).collect();
+        assert!(
+            !forward.contains(".await?"),
+            "the QuerySubscriptions handler query must not use the fatal `.await?` — a per-op \
+             handler timeout must never kill the network event listener (#4549). Near:\n{forward}"
+        );
+        // Bounded: wrapped in `timeout(QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT, ..)`.
+        let before = &src[..idx];
+        let bounded = before
+            .rfind("timeout(")
+            .is_some_and(|tp| src[tp..idx].contains("QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT"));
+        assert!(
+            bounded,
+            "the QuerySubscriptions handler query must be wrapped in \
+             timeout(QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT, ..) so a saturated contract handler \
+             can neither stall nor kill the network event loop (#4549)."
+        );
+        // Both diagnostics arms (and the helper definition) must reference the helper.
+        assert!(
+            src.matches("query_app_subscriptions_bounded(").count() >= 3,
+            "both diagnostics arms must delegate to query_app_subscriptions_bounded (#4549)"
+        );
+        // Keep the bound small so a future bump can't reopen the event-loop stall window.
+        assert!(
+            super::QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT <= Duration::from_secs(30),
+            "QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT must stay small to bound the loop stall (#4549)"
+        );
+    }
+
+    /// Behavioral pin for #4549: a stalled contract handler must make the bounded
+    /// diagnostics query return an EMPTY list within the timeout — never error (the
+    /// old fatal `.await?`) and never stall for the handler's 300s response timeout.
+    /// This exercises the production `query_app_subscriptions_bounded` directly, so
+    /// it fails if the stall-survival behavior regresses by ANY route, not just the
+    /// one syntactic revert the source-scrape pin catches.
+    #[tokio::test(start_paused = true)]
+    async fn query_app_subscriptions_bounded_yields_empty_when_handler_stalls() {
+        // Keep the handler (receiver) half alive but NEVER respond — the saturation
+        // condition that killed the listener pre-#4549. The unbounded send succeeds;
+        // the response oneshot never resolves, so the outer bound must fire.
+        let (sender, _handler_half, _waiting) = crate::contract::contract_handler_channel();
+        let bound = super::QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT;
+        let start = Instant::now();
+        let subs = super::query_app_subscriptions_bounded(&sender).await;
+        let elapsed = start.elapsed();
+        assert!(
+            subs.is_empty(),
+            "a stalled handler must yield empty app subscriptions, got {} entries",
+            subs.len()
+        );
+        // start_paused advances the clock deterministically: we wait the bound but
+        // NOT the handler's full 300s CH_EV_RESPONSE_TIME_OUT.
+        assert!(
+            elapsed >= bound,
+            "must wait the bounded timeout ({elapsed:?} < {bound:?})"
+        );
+        assert!(
+            elapsed < Duration::from_secs(60),
+            "must not stall for the 300s handler timeout ({elapsed:?})"
         );
     }
 
