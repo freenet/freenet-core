@@ -28,13 +28,15 @@ slow-timeout = { period = "300s", terminate-after = 2 }
 filter = "package(freenet-ping-app)"
 slow-timeout = { period = "300s", terminate-after = 3 }
 
-# #4233 wide-star UPDATE fan-out liveness tests (40/60/80 direct subscribers).
-# These drive a 1-gateway / N-subscriber star through 300s of virtual time in
-# the paused-time Turmoil runner, advanced in tiny quanta. Wall-clock cost
-# scales with N (each of the N subscriber event loops is stepped every quantum),
-# so the wide-star variants need far more than the default 240s cap. See
-# test_fanout_liveness_* / run_fanout_liveness_scenario in
-# tests/simulation_integration.rs (issue #4233).
+# #4233 wide-star UPDATE fan-out liveness tests. This filter matches the
+# always-on variants (N=8/16 organic, N=24 preseed) AND the #[ignore]'d
+# incident-scale ones (N=40/60/80). Each drives a 1-gateway / N-subscriber star
+# in the paused-time Turmoil runner, advanced in tiny quanta. The virtual-time
+# budget scales with N in the driver (run_fanout_liveness_scenario_inner), and
+# wall-clock cost scales with N too (each of the N subscriber event loops is
+# stepped every quantum), so these need far more than the default 240s cap; the
+# always-on N=24 runs ~250-300s wall-clock. See test_fanout_liveness_* /
+# run_fanout_liveness_scenario in tests/simulation_integration.rs (issue #4233).
 [[profile.ci.overrides]]
 filter = "test(test_fanout_liveness)"
 slow-timeout = { period = "600s", terminate-after = 2 }

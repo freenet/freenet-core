@@ -1271,13 +1271,17 @@ impl SimNetwork {
     /// Enable the placement-migration (`SubscribeHint`) cascade for this
     /// simulation by lowering the version floor to `(0,0,0)` on every node.
     ///
-    /// The cascade is OFF by default in sim: its peers report the current build
-    /// version, which is below the production `SUBSCRIBE_HINT_MIN_VERSION`, so
-    /// the gate never fires. A test that specifically exercises migration calls
-    /// this; every other sim is left untouched (so an unrelated test cannot be
-    /// perturbed by hosting migrating mid-run). Like `with_governance_config`,
-    /// this patches the already-built node/gateway configs (config_* ran during
-    /// construction when the override was still `None`).
+    /// The cascade's default depends on the build version: peers report the
+    /// current build version, so the gate fires whenever that version is `>=`
+    /// the production `SUBSCRIBE_HINT_MIN_VERSION` (currently `(0,2,80)`). This
+    /// crate is already past that floor, so #4404 migration is ON by default in
+    /// sim now — call [`disable_placement_migration`](Self::disable_placement_migration)
+    /// to pin it OFF for a test whose premise assumes the contract stays put.
+    /// This method forces it ON regardless of build version (floor `(0,0,0)`),
+    /// for a test that specifically exercises migration; every other sim is left
+    /// untouched. Like `with_governance_config`, this patches the already-built
+    /// node/gateway configs (config_* ran during construction when the override
+    /// was still `None`).
     #[allow(dead_code)]
     pub fn enable_placement_migration(&mut self) -> &mut Self {
         const TEST_FLOOR: (u8, u8, u16) = (0, 0, 0);

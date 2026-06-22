@@ -3809,19 +3809,29 @@ fn run_fanout_liveness_scenario_inner(
     // closes that gap by requiring the converged contract's replica set to be
     // exactly the host plus EVERY subscriber.
     //
-    // Scoped to the preseed path because exact participation is a structural
-    // invariant ONLY there: `preseed_direct_star` wires every subscriber
-    // directly to the host at t=0, so every subscriber's GET+subscribe must
-    // reach the host and join the broadcast set (a shortfall means a real loss —
-    // e.g. a `ConnectionManager` cap-rejected preseed connection, or a subscribe
-    // that never reached the host). The organic N=8/16 variants (preseed=false)
-    // form the star via ring-routed CONNECT, which is best-effort at this
-    // harness's bootstrap ceiling — a subscriber can legitimately fail to form
-    // its host connection ("at terminus … rejecting", the very limitation the
-    // preseed primitive exists to bypass), so requiring all N there would assert
-    // an invariant organic formation does not provide. Those variants are gated
-    // by (a)–(d) (no stale peers, bounded backlog, convergence), which hold.
-    if preseed {
+    // Scoped to `preseed && !enable_migration`, because exact participation is a
+    // structural invariant ONLY there: `preseed_direct_star` wires every
+    // subscriber directly to the host at t=0, so every subscriber's GET+subscribe
+    // must reach the host and join the broadcast set (a shortfall means a real
+    // loss — e.g. a `ConnectionManager` cap-rejected preseed connection, or a
+    // subscribe that never reached the host).
+    //
+    // Excluded from the migration-ON variant for the same reason the baseline
+    // pins the cascade OFF (see the `disable_placement_migration` rationale
+    // above): with the `SubscribeHint` cascade live, hosting migrates off the
+    // gateway and the converged replica set is no longer deterministically
+    // `host + all subscribers`, so this exact-count invariant cannot hold — a
+    // failure there would be benign migration churn, not a liveness loss. The
+    // migration-ON incident-scale test is gated by (a)–(d) instead.
+    //
+    // Excluded from the organic N=8/16 variants (preseed=false) because they form
+    // the star via ring-routed CONNECT, which is best-effort at this harness's
+    // bootstrap ceiling — a subscriber can legitimately fail to form its host
+    // connection ("at terminus … rejecting", the very limitation the preseed
+    // primitive exists to bypass), so requiring all N there would assert an
+    // invariant organic formation does not provide. Those variants are gated by
+    // (a)–(d) (no stale peers, bounded backlog, convergence), which hold.
+    if preseed && !enable_migration {
         let expected_replicas = subscribers + 1; // 1 gateway host + N subscribers
         assert!(
             !convergence.converged.is_empty(),
