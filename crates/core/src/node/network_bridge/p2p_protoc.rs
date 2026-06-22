@@ -100,6 +100,16 @@ impl std::fmt::Display for EventLoopExitReason {
 
 impl std::error::Error for EventLoopExitReason {}
 
+/// Upper bound on how long the network event listener will wait for the contract
+/// handler to answer a *diagnostics* `QuerySubscriptions` query (#4549).
+///
+/// These queries run inline on the event loop. The handler's own response timeout
+/// is `CH_EV_RESPONSE_TIME_OUT` (300s); without an outer bound a saturated handler
+/// would stall the entire network event loop for up to 5 minutes per diagnostics
+/// poll. A diagnostics query is best-effort, so cap the wait and serve an empty
+/// result on timeout rather than freezing (or, previously, killing) the listener.
+const QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub(crate) enum P2pBridgeEvent {
     Message(PeerKeyLocation, Box<NetMessage>),
     NodeAction(NodeEvent),
@@ -1391,7 +1401,7 @@ impl P2pConnManager {
                                     )
                                     .await
                                     {
-                                        Ok(Ok(())) => {
+                                        Ok(Ok(_)) => {
                                             tracing::trace!(
                                                 tx = %msg.id(),
                                                 peer_addr = %target_addr,
@@ -2048,7 +2058,7 @@ impl P2pConnManager {
                                 )
                                 .await
                                 {
-                                    Ok(Ok(())) => {}
+                                    Ok(Ok(_)) => {}
                                     Ok(Err(send_error)) => {
                                         tracing::error!(
                                             error = ?send_error,
@@ -2084,22 +2094,53 @@ impl P2pConnManager {
                                     .collect();
 
                                 // Get application subscriptions from contract executor
-                                // For now, we'll send a query to the contract handler
+                                // For now, we'll send a query to the contract handler.
+                                //
+                                // #4549: this is a best-effort diagnostics query. It must
+                                // NOT be fatal to the network event listener, and must not
+                                // stall it: a saturated contract handler previously made
+                                // this `.await?` return `NoEvHandlerResponse` after the
+                                // 300s handler timeout, which killed the whole listener
+                                // ("Network event listener exited: no response received
+                                // from handler") and took the gateway network-dead. Bound
+                                // the wait and serve an empty list on any failure. A
+                                // genuinely-dead contract handler is detected separately by
+                                // the `contract_executor_task` supervisor in `run_node`.
                                 let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
-                                op_manager
-                                    .notify_contract_handler(
+                                let app_subscriptions = match timeout(
+                                    QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT,
+                                    op_manager.notify_contract_handler(
                                         ContractHandlerEvent::QuerySubscriptions { callback: tx },
-                                    )
-                                    .await?;
-
-                                let app_subscriptions =
-                                    match timeout(Duration::from_secs(1), rx.recv()).await {
-                                        Ok(Some(QueryResult::NetworkDebug(info))) => {
-                                            info.application_subscriptions
+                                    ),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(_)) => {
+                                        match timeout(Duration::from_secs(1), rx.recv()).await {
+                                            Ok(Some(QueryResult::NetworkDebug(info))) => {
+                                                info.application_subscriptions
+                                            }
+                                            _ => Vec::new(),
                                         }
-                                        _ => Vec::new(),
-                                    };
+                                    }
+                                    Ok(Err(err)) => {
+                                        tracing::warn!(
+                                            error = %err,
+                                            "QuerySubscriptions diagnostics: contract handler \
+                                             error; serving empty app subscriptions"
+                                        );
+                                        Vec::new()
+                                    }
+                                    Err(_elapsed) => {
+                                        tracing::warn!(
+                                            "QuerySubscriptions diagnostics: contract handler did \
+                                             not respond within timeout; serving empty app \
+                                             subscriptions"
+                                        );
+                                        Vec::new()
+                                    }
+                                };
 
                                 // Log network subscription details for debugging
                                 for (contract_key, peers) in &network_subs {
@@ -2136,7 +2177,7 @@ impl P2pConnManager {
                                 )
                                 .await
                                 {
-                                    Ok(Ok(())) => {}
+                                    Ok(Ok(_)) => {}
                                     Ok(Err(send_error)) => {
                                         tracing::error!(
                                             error = ?send_error,
@@ -2220,17 +2261,23 @@ impl P2pConnManager {
                                     // Get network subscriptions from OpManager
                                     let _network_subs = op_manager.get_network_subscriptions();
 
-                                    // Get application subscriptions from contract executor
+                                    // Get application subscriptions from contract executor.
+                                    // #4549: bounded + best-effort, same rationale as the
+                                    // QuerySubscriptions arm above — a saturated handler must
+                                    // not stall (or kill) the network event listener.
                                     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-                                    if op_manager
-                                        .notify_contract_handler(
-                                            ContractHandlerEvent::QuerySubscriptions {
-                                                callback: tx,
-                                            },
+                                    if matches!(
+                                        timeout(
+                                            QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT,
+                                            op_manager.notify_contract_handler(
+                                                ContractHandlerEvent::QuerySubscriptions {
+                                                    callback: tx,
+                                                },
+                                            ),
                                         )
-                                        .await
-                                        .is_ok()
-                                    {
+                                        .await,
+                                        Ok(Ok(_))
+                                    ) {
                                         let app_subscriptions = match timeout(
                                             Duration::from_secs(1),
                                             rx.recv(),
@@ -2333,7 +2380,7 @@ impl P2pConnManager {
                                 )
                                 .await
                                 {
-                                    Ok(Ok(())) => {}
+                                    Ok(Ok(_)) => {}
                                     Ok(Err(send_error)) => {
                                         tracing::error!(
                                             error = ?send_error,
@@ -4262,6 +4309,53 @@ mod tests {
             "PipeStream dispatch must use `reserve()` instead of `send().await` — \
              see #4145. Body:\n{body}"
         );
+    }
+
+    /// Source-scrape regression guard for #4549. The inline diagnostics
+    /// `QuerySubscriptions` queries on the network event loop must be BOUNDED by
+    /// `QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT` and must NOT propagate the contract
+    /// handler's result with `?`. The original bug was a bare
+    /// `notify_contract_handler(QuerySubscriptions ...).await?`: under
+    /// contract-executor saturation it returned `NoEvHandlerResponse` after the
+    /// 300s handler timeout, which killed the entire network event listener
+    /// ("Network event listener exited: no response received from handler") and
+    /// took the gateway network-dead with no self-recovery.
+    #[test]
+    fn query_subscriptions_diagnostics_bounded_and_non_fatal() {
+        let src = include_str!("p2p_protoc.rs");
+        // Built at runtime so this test's own source can't self-match the needle.
+        let needle = concat!("ContractHandlerEvent::", "QuerySubscriptions {");
+        let sites: Vec<usize> = src.match_indices(needle).map(|(i, _)| i).collect();
+        // Two on-loop dispatch arms: NodeEvent::QuerySubscriptions and
+        // NodeEvent::QueryNodeDiagnostics both query the handler for app subs.
+        assert!(
+            sites.len() >= 2,
+            "expected >=2 on-loop QuerySubscriptions dispatch sites, found {}",
+            sites.len()
+        );
+        for idx in sites {
+            // Forward window (char-based, so a multi-byte char in nearby comments
+            // can't panic the slice): must not use the fatal `.await?`.
+            let forward: String = src[idx..].chars().take(220).collect();
+            assert!(
+                !forward.contains(".await?"),
+                "QuerySubscriptions diagnostics query must not use the fatal `.await?` — a \
+                 per-op handler timeout must never kill the network event listener (#4549). \
+                 Near:\n{forward}"
+            );
+            // Each call must be wrapped in `timeout(QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT, ..)`
+            // — confirm the nearest preceding `timeout(` carries the bound constant.
+            let before = &src[..idx];
+            let bounded = before
+                .rfind("timeout(")
+                .is_some_and(|tp| src[tp..idx].contains("QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT"));
+            assert!(
+                bounded,
+                "QuerySubscriptions diagnostics query must be wrapped in \
+                 timeout(QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT, ..) so a saturated contract handler \
+                 can neither stall nor kill the network event loop (#4549)."
+            );
+        }
     }
 
     /// Pin: the `TransactionOrphaned` handler must deliver the cause
