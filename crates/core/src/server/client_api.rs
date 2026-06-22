@@ -46,6 +46,55 @@ fn sandbox_csp_for_origin(origin: &str) -> String {
     )
 }
 
+/// Derive the browser-facing origin to interpolate into the sandbox CSP from
+/// the request headers, honoring a TLS-terminating reverse proxy's forwarded
+/// scheme and host.
+///
+/// The CSP origin MUST match the origin the *browser* actually used, or the
+/// CSP blocks the webapp's own assets. Behind a TLS proxy (the supported
+/// hosted-mode deployment) the browser's origin is `https://<public-host>`,
+/// while the node itself is reached over loopback `http`. We therefore:
+///
+/// - use `https` when `X-Forwarded-Proto: https` is present (set by the
+///   trusted proxy — same forwarded-header trust model as the hosted-mode
+///   token gate, which already requires the operator's proxy to set/strip
+///   `X-Forwarded-*`); otherwise `http`.
+/// - prefer `X-Forwarded-Host` over `Host` for the host:port, since a proxy
+///   may rewrite the upstream `Host` to its loopback target (nginx does this
+///   by default) while preserving the original in `X-Forwarded-Host`.
+///
+/// A direct connection carries neither forwarded header and falls back to the
+/// previous behavior: `http://<Host>`. `'self'` only as a last resort when no
+/// host is available at all.
+///
+/// Note: the forwarded headers are client-spoofable through a careless proxy,
+/// but the CSP is defence-in-depth, not a trust boundary — a mismatched origin
+/// only *breaks* the sandboxed app (too-strict CSP), it cannot widen what the
+/// opaque-origin iframe may reach. So honoring them here is safe.
+fn sandbox_origin_from_headers(headers: &axum::http::HeaderMap) -> String {
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(',').next().unwrap_or(v).trim())
+        .filter(|v| v.eq_ignore_ascii_case("https"))
+        .map(|_| "https")
+        .unwrap_or("http");
+    headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(axum::http::header::HOST))
+        .and_then(|h| h.to_str().ok())
+        // `X-Forwarded-Host`, like `X-Forwarded-Proto`, may be a comma-separated
+        // list when the request traverses multiple proxies (or a proxy appends
+        // rather than overwrites). The first entry is the original client-facing
+        // host; using the whole list would yield an invalid CSP origin like
+        // `https://public.example, proxy.internal` and re-break the app.
+        .map(|host| host.split(',').next().unwrap_or(host).trim())
+        .filter(|host| !host.is_empty())
+        .map(|host| format!("{scheme}://{host}"))
+        .unwrap_or_else(|| "'self'".to_string())
+}
+
+pub(crate) mod hosted_export;
 mod permission_prompts;
 mod v1;
 mod v2;
@@ -100,6 +149,10 @@ pub struct HttpClientApi {
     pub(crate) origin_contracts: OriginContractMap,
     proxy_server_request: mpsc::Receiver<ClientConnection>,
     response_channels: HashMap<ClientId, mpsc::UnboundedSender<HostCallbackResult>>,
+    /// Per-node route to the executor for the hosted-mode export endpoint
+    /// (P3-live of #4381). Shared (same `Arc`) with the router's `Extension`;
+    /// the node fills it at startup via `set_op_manager`.
+    export_op_manager: hosted_export::ExportOpManagerHandle,
 }
 
 impl HttpClientApi {
@@ -142,6 +195,12 @@ impl HttpClientApi {
 
         let config = Config { localhost };
 
+        // Per-node route to the executor for the hosted-mode export endpoint.
+        // The SAME handle is injected as a request `Extension` (read by the
+        // export handler) and stored in the returned `HttpClientApi` (filled by
+        // the node via `set_op_manager`).
+        let export_op_manager = hosted_export::ExportOpManagerHandle::default();
+
         let router = Router::new()
             .route("/", axum::routing::get(home_page::homepage))
             .route(
@@ -150,9 +209,16 @@ impl HttpClientApi {
             )
             .merge(v1::routes(config.clone()))
             .merge(v2::routes(config))
+            // Hosted-mode "export my data" endpoint (P3-live of #4381). Gated
+            // by the same refuse-plaintext-token check as the WS userToken; see
+            // `hosted_export`. Reaches the node via the per-node
+            // `ExportOpManagerHandle` Extension below.
+            .merge(hosted_export::routes(ApiVersion::V1))
+            .merge(hosted_export::routes(ApiVersion::V2))
             .merge(permission_prompts::routes())
             .layer(Extension(origin_contracts.clone()))
             .layer(Extension(pending_prompts))
+            .layer(Extension(export_op_manager.clone()))
             .layer(Extension(HttpClientApiRequest(proxy_request_sender)));
 
         (
@@ -160,6 +226,7 @@ impl HttpClientApi {
                 proxy_server_request: request_to_server,
                 origin_contracts,
                 response_channels: HashMap::new(),
+                export_op_manager,
             },
             router,
         )
@@ -543,12 +610,10 @@ async fn serve_sandbox_response(
     let mut response = contract_response.into_response();
     add_sandbox_cors_headers(&mut response);
     // See `sandbox_csp_for_origin` for why we interpolate a concrete origin
-    // rather than using `'self'`.
-    let local_api_origin = req_headers
-        .get(axum::http::header::HOST)
-        .and_then(|h| h.to_str().ok())
-        .map(|host| format!("http://{host}"))
-        .unwrap_or_else(|| "'self'".to_string());
+    // rather than using `'self'`, and `sandbox_origin_from_headers` for why we
+    // honor the proxy's forwarded scheme/host (so the CSP matches the browser's
+    // real `https://` origin behind a TLS-terminating reverse proxy).
+    let local_api_origin = sandbox_origin_from_headers(req_headers);
     let csp = sandbox_csp_for_origin(&local_api_origin);
     if let Ok(csp_value) = axum::http::HeaderValue::from_str(&csp) {
         response
@@ -646,6 +711,21 @@ impl ClientEventsProxy for HttpClientApi {
             Ok(())
         }
         .boxed()
+    }
+
+    fn set_op_manager(&self, op_manager: &dyn std::any::Any) {
+        // Wire the export endpoint's per-node handle (shared with the router
+        // Extension) to the live node. See `hosted_export`. The caller passes an
+        // `Arc<OpManager>` behind `&dyn Any` to keep the `pub(crate)` `OpManager`
+        // out of the public `ClientEventsProxy` signature; downcast it here.
+        if let Some(op_manager) = op_manager.downcast_ref::<Arc<crate::node::OpManager>>() {
+            self.export_op_manager.set(op_manager);
+        } else {
+            tracing::error!(
+                "HttpClientApi::set_op_manager called with a non-OpManager argument; \
+                 hosted export will be unavailable on this node"
+            );
+        }
     }
 }
 
@@ -1171,5 +1251,83 @@ mod tests {
         let csp = sandbox_csp_for_origin("http://192.168.1.42:7509");
         assert!(csp.contains("http://192.168.1.42:7509"));
         assert!(!csp.contains("127.0.0.1"));
+    }
+
+    fn hdrs(pairs: &[(&str, &str)]) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    /// Regression for the live-deploy bug: behind a TLS-terminating reverse
+    /// proxy the browser's origin is `https://<public-host>`, but the sandbox
+    /// CSP origin was hardcoded to `http://<Host>` — so the CSP blocked the
+    /// webapp's own `https://` assets and the app never loaded. The origin must
+    /// honor `X-Forwarded-Proto: https`.
+    #[test]
+    fn sandbox_origin_honors_forwarded_https_scheme() {
+        let origin = sandbox_origin_from_headers(&hdrs(&[
+            ("host", "127.0.0.1:7509"),
+            ("x-forwarded-proto", "https"),
+            ("x-forwarded-host", "localhost:8443"),
+        ]));
+        // https scheme + the public host the browser actually used.
+        assert_eq!(origin, "https://localhost:8443");
+        // And the resulting CSP allows that exact (https) origin.
+        let csp = sandbox_csp_for_origin(&origin);
+        assert!(csp.contains("https://localhost:8443"));
+        assert!(!csp.contains("http://localhost:8443"));
+    }
+
+    /// A proxy that preserves Host (e.g. Caddy) needs no `X-Forwarded-Host`:
+    /// the scheme still upgrades from `X-Forwarded-Proto`.
+    #[test]
+    fn sandbox_origin_forwarded_proto_without_forwarded_host_uses_host() {
+        let origin = sandbox_origin_from_headers(&hdrs(&[
+            ("host", "try.example.org"),
+            ("x-forwarded-proto", "https"),
+        ]));
+        assert_eq!(origin, "https://try.example.org");
+    }
+
+    /// A direct (no-proxy) connection is unchanged: `http://<Host>`.
+    #[test]
+    fn sandbox_origin_direct_connection_is_http_host() {
+        assert_eq!(
+            sandbox_origin_from_headers(&hdrs(&[("host", "127.0.0.1:7509")])),
+            "http://127.0.0.1:7509"
+        );
+        // Explicit `X-Forwarded-Proto: http` must NOT upgrade to https.
+        assert_eq!(
+            sandbox_origin_from_headers(&hdrs(&[
+                ("host", "127.0.0.1:7509"),
+                ("x-forwarded-proto", "http"),
+            ])),
+            "http://127.0.0.1:7509"
+        );
+    }
+
+    /// No host at all → `'self'` fallback (unchanged).
+    #[test]
+    fn sandbox_origin_no_host_falls_back_to_self() {
+        assert_eq!(sandbox_origin_from_headers(&hdrs(&[])), "'self'");
+    }
+
+    /// Multi-proxy: comma-separated `X-Forwarded-Host`/`-Proto` must use the
+    /// first (client-facing) entry, not the whole list (which is an invalid
+    /// CSP origin that would re-break the app).
+    #[test]
+    fn sandbox_origin_uses_first_of_comma_separated_forwarded_values() {
+        let origin = sandbox_origin_from_headers(&hdrs(&[
+            ("host", "127.0.0.1:7509"),
+            ("x-forwarded-proto", "https, http"),
+            ("x-forwarded-host", "public.example, proxy.internal"),
+        ]));
+        assert_eq!(origin, "https://public.example");
     }
 }

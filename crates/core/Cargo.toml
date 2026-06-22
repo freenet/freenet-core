@@ -1,6 +1,6 @@
 [package]
 name = "freenet"
-version = "0.2.80"
+version = "0.2.82"
 edition = "2024"
 rust-version = "1.85"
 publish = true
@@ -88,6 +88,7 @@ tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "signal", "sync", "process", "tracing", "time", "test-util"] }
 tokio-tungstenite = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 tower-http = { workspace = true }
 ulid = { workspace = true }
 zeroize = { workspace = true }

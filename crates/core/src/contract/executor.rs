@@ -595,6 +595,35 @@ pub(crate) trait ContractExecutor: Send + 'static {
         user_context: Option<&UserSecretContext>,
     ) -> impl Future<Output = Response> + Send;
 
+    /// Export the per-user delegate secrets named by `user_context` into an
+    /// encrypted bundle, sealed under the user's `token` (hosted-mode export,
+    /// P3-live of #4381). The bundle round-trips through
+    /// [`crate::wasm_runtime::secret_export::import_bundle`] with
+    /// `BundleKeyMaterial::Token(token)`, so the user re-imports on their own
+    /// peer with the same token they already hold.
+    ///
+    /// `user_context` MUST come from the connection boundary (the same
+    /// forge-proof channel that scopes delegate secrets), never from a request
+    /// body — see [`UserSecretContext`]'s security invariant. The export is
+    /// strictly per-user: it reads only `user_context.scope()`
+    /// ([`crate::wasm_runtime::SecretScope::User`]), never the node-local
+    /// (`Local`) namespace.
+    ///
+    /// The default implementation rejects: only the production
+    /// `RuntimePool` / `Executor<Runtime>` (which owns a real `SecretsStore`)
+    /// supports export. Mock executors keep no on-disk secrets.
+    fn export_user_secrets(
+        &mut self,
+        _user_context: &UserSecretContext,
+        _token: &[u8],
+    ) -> impl Future<Output = Result<Vec<u8>, ExecutorError>> + Send {
+        async {
+            Err(ExecutorError::other(anyhow::anyhow!(
+                "secret export is not supported by this executor"
+            )))
+        }
+    }
+
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo>;
 
     /// Remove all subscriptions for a disconnected client.

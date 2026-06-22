@@ -108,22 +108,31 @@ fn fixture_non_idempotent_override_produces_distinct_states() {
 /// match in CI before the gap reaches production.
 #[test]
 fn production_gate_sites_consult_is_contract_broken() {
-    // Read the full source file at compile time. `include_str!` is
+    // Read the full source files at compile time. `include_str!` is
     // resolved relative to the file containing this macro — these tests
     // live at `crates/core/src/contract/executor/pool_tests/` so we
-    // climb one level to reach the production file.
-    const RUNTIME_SRC: &str = include_str!("../runtime.rs");
+    // climb one level to reach the production files.
+    // `is_contract_broken` call sites live in runtime/executor_impl.rs after
+    // the split; both files are searched independently (not concatenated) so
+    // that `#[cfg(test)]` markers in runtime.rs don't accidentally truncate
+    // the executor_impl.rs search window.
+    const RUNTIME_RS: &str = include_str!("../runtime.rs");
+    const EXECUTOR_IMPL_RS: &str = include_str!("../runtime/executor_impl.rs");
 
-    // Truncate before the test module so we only grep production code.
-    // The runtime file currently has no `#[cfg(test)]` mod, so this is
-    // a no-op today, but future-proofs against a sibling test asserting
-    // the same substring.
-    let production = RUNTIME_SRC
+    // Strip test modules from each file independently, then concatenate the
+    // production-only slices. executor_impl.rs has no #[cfg(test)] today so
+    // its split_once is a no-op, but future-proofs against one being added.
+    let runtime_prod = RUNTIME_RS
         .split_once("#[cfg(test)]")
         .map(|(prod, _)| prod)
-        .unwrap_or(RUNTIME_SRC);
+        .unwrap_or(RUNTIME_RS);
+    let executor_impl_prod = EXECUTOR_IMPL_RS
+        .split_once("#[cfg(test)]")
+        .map(|(prod, _)| prod)
+        .unwrap_or(EXECUTOR_IMPL_RS);
 
-    let occurrences = production.matches("is_contract_broken").count();
+    let occurrences = runtime_prod.matches("is_contract_broken").count()
+        + executor_impl_prod.matches("is_contract_broken").count();
     assert!(
         occurrences >= 3,
         "expected at least 3 `is_contract_broken` checks in production \

@@ -1,0 +1,11 @@
+node_modules/
+
+# Format-template HTML files contain Rust `format!` placeholders (`{ident}`)
+# and escaped literal braces (`{{` / `}}`). Prettier would rewrite those and
+# break the templates, so they are intentionally excluded here. They are still
+# served byte-for-byte from the consuming Rust source via `include_str!`.
+**/assets/shell.html
+**/assets/home.html
+**/assets/peer.html
+**/assets/peer_not_found.html
+**/assets/permission_prompt.html

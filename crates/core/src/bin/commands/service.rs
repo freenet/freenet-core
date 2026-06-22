@@ -187,17 +187,17 @@ fn open_url_in_browser(url: &str) {
 
 /// Path of the first-run marker file, if we can determine a data directory.
 #[allow(dead_code)] // Used by the tray wrapper on Windows/macOS only
-fn first_run_marker_path() -> Option<PathBuf> {
+pub(super) fn first_run_marker_path() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join("freenet").join(".first-run-complete"))
 }
 
 #[allow(dead_code)]
-fn is_first_run_at(marker: &Path) -> bool {
+pub(super) fn is_first_run_at(marker: &Path) -> bool {
     !marker.exists()
 }
 
 #[allow(dead_code)]
-fn mark_first_run_complete_at(marker: &Path) -> std::io::Result<()> {
+pub(super) fn mark_first_run_complete_at(marker: &Path) -> std::io::Result<()> {
     if let Some(parent) = marker.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -211,12 +211,12 @@ fn mark_first_run_complete_at(marker: &Path) -> std::io::Result<()> {
 /// onboarding state. The migration is its own one-shot, tracked by its own
 /// marker, so it runs once for existing DMG users too.
 #[allow(dead_code)]
-fn legacy_migration_marker_path() -> Option<PathBuf> {
+pub(super) fn legacy_migration_marker_path() -> Option<PathBuf> {
     dirs::data_local_dir().map(|d| d.join("freenet").join(".legacy-migration-complete"))
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
-fn dashboard_port_is_listening() -> bool {
+pub(super) fn dashboard_port_is_listening() -> bool {
     use std::net::TcpStream;
     use std::time::Duration;
     let Ok(addr) = DASHBOARD_ADDR.parse::<std::net::SocketAddr>() else {
@@ -354,14 +354,14 @@ pub use macos::stop_and_remove_service;
 
 // Re-exports for tray.rs (Launch at Login toggle and state query).
 #[cfg(target_os = "macos")]
-pub use launch_at_login::{
+pub(crate) use launch_at_login::{
     ToggleLaunchAtLoginOutcome, disable_launch_at_login, enable_launch_at_login,
     is_launch_at_login_enabled, macos_app_bundle_path, toggle_launch_at_login_outcome,
 };
 
 // Re-exports for update.rs (macOS plist generation).
 #[cfg(target_os = "macos")]
-pub use macos::generate_plist;
+pub(crate) use macos::generate_plist;
 
 #[cfg(target_os = "windows")]
 pub(crate) use windows::kill_freenet_service_processes;
@@ -2596,6 +2596,331 @@ echo "RC=$?"
         assert_eq!(state.backoff_secs, WRAPPER_INITIAL_BACKOFF_SECS);
     }
 
+    // ── Stuck-wrapper detection tests (#4382) ──
+
+    #[test]
+    fn test_stuck_fires_once_at_threshold_on_repeated_identical_failure() {
+        let mut state = WrapperState::new();
+        // First two identical crashes: below threshold, no stuck signal.
+        for expected_streak in 1..WRAPPER_STUCK_NOTIFY_THRESHOLD {
+            next_wrapper_action(&mut state, 1, false, None);
+            assert!(
+                !state.stuck_just_crossed,
+                "should not fire at streak {expected_streak}"
+            );
+            assert_eq!(state.identical_failure_streak, expected_streak);
+        }
+        // The Nth identical crash crosses the threshold exactly once.
+        next_wrapper_action(&mut state, 1, false, None);
+        assert!(state.stuck_just_crossed, "must fire at threshold");
+        assert_eq!(
+            state.identical_failure_streak,
+            WRAPPER_STUCK_NOTIFY_THRESHOLD
+        );
+        // Subsequent identical crashes must NOT re-fire (once per episode).
+        next_wrapper_action(&mut state, 1, false, None);
+        assert!(!state.stuck_just_crossed, "must not re-fire after crossing");
+        assert_eq!(
+            state.identical_failure_streak,
+            WRAPPER_STUCK_NOTIFY_THRESHOLD + 1
+        );
+    }
+
+    #[test]
+    fn test_stuck_streak_resets_when_failure_cause_changes() {
+        let mut state = WrapperState::new();
+        // Two crashes with code 1, then a different code resets the streak.
+        next_wrapper_action(&mut state, 1, false, None);
+        next_wrapper_action(&mut state, 1, false, None);
+        assert_eq!(state.identical_failure_streak, 2);
+        next_wrapper_action(&mut state, 7, false, None);
+        assert_eq!(state.identical_failure_streak, 1, "new cause resets streak");
+        assert!(!state.stuck_just_crossed);
+    }
+
+    #[test]
+    fn test_stuck_signature_distinguishes_port_conflict() {
+        let mut state = WrapperState::new();
+        // Same exit code but different port-conflict flag = different signature.
+        next_wrapper_action(&mut state, 1, true, None);
+        next_wrapper_action(&mut state, 1, true, None);
+        assert_eq!(state.identical_failure_streak, 2);
+        next_wrapper_action(&mut state, 1, false, None);
+        assert_eq!(
+            state.identical_failure_streak, 1,
+            "port-conflict flag is part of the signature"
+        );
+    }
+
+    #[test]
+    fn test_stuck_port_conflict_loop_fires_at_threshold() {
+        // Repeated exit-43-style port conflicts (the #3967 stale-orphan
+        // signature) must trip the detector even though the early KillAndRetry
+        // path returns before the generic backoff arm.
+        let mut state = WrapperState::new();
+        let mut fired = 0;
+        for _ in 0..WRAPPER_STUCK_NOTIFY_THRESHOLD {
+            next_wrapper_action(&mut state, 1, true, None);
+            if state.stuck_just_crossed {
+                fired += 1;
+            }
+        }
+        assert_eq!(fired, 1, "stuck signal fires exactly once for port loop");
+    }
+
+    #[test]
+    fn test_stuck_streak_cleared_by_clean_exit() {
+        let mut state = WrapperState::new();
+        next_wrapper_action(&mut state, 1, false, None);
+        next_wrapper_action(&mut state, 1, false, None);
+        assert_eq!(state.identical_failure_streak, 2);
+        // Clean exit (code 0) resets the streak so a later failure starts fresh.
+        next_wrapper_action(&mut state, 0, false, None);
+        assert_eq!(state.identical_failure_streak, 0);
+        assert!(state.last_failure_signature.is_none());
+    }
+
+    #[test]
+    fn test_stuck_streak_cleared_by_successful_update() {
+        let mut state = WrapperState::new();
+        next_wrapper_action(&mut state, 1, false, None);
+        next_wrapper_action(&mut state, 1, false, None);
+        next_wrapper_action(&mut state, 42, false, Some(true));
+        assert_eq!(state.identical_failure_streak, 0);
+        assert!(state.last_failure_signature.is_none());
+    }
+
+    #[test]
+    fn test_stuck_status_file_roundtrip_and_clear() {
+        let tmp = tempfile::tempdir().unwrap();
+        let status = StuckWrapperStatus::new(43, true, WRAPPER_STUCK_NOTIFY_THRESHOLD);
+        write_stuck_status_file(tmp.path(), &status);
+
+        let path = tmp.path().join(STUCK_STATUS_FILE_NAME);
+        assert!(path.exists(), "status file must be written");
+        let json = std::fs::read_to_string(&path).unwrap();
+        let parsed: StuckWrapperStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, status);
+        assert_eq!(parsed.failure_count, WRAPPER_STUCK_NOTIFY_THRESHOLD);
+        assert!(parsed.is_port_conflict);
+        assert!(
+            parsed.recovery_hint.contains("freenet service stop"),
+            "hint must give the recovery command"
+        );
+
+        // Clearing removes the file; clearing again (missing file) is a no-op.
+        clear_stuck_status_file(tmp.path());
+        assert!(!path.exists(), "status file must be cleared on recovery");
+        clear_stuck_status_file(tmp.path());
+    }
+
+    #[test]
+    fn test_stuck_status_messages_differ_by_cause() {
+        let port = StuckWrapperStatus::new(43, true, 3);
+        assert!(port.last_error.contains("port"));
+        assert!(port.recovery_hint.contains("port"));
+
+        let crash = StuckWrapperStatus::new(101, false, 3);
+        assert!(!crash.is_port_conflict);
+        assert!(crash.last_error.contains("exit 101"));
+        assert!(crash.recovery_hint.contains("crashing"));
+    }
+
+    #[test]
+    fn test_applescript_escape_quotes_and_backslashes() {
+        assert_eq!(applescript_escape("plain"), "plain");
+        assert_eq!(applescript_escape("a\"b"), "a\\\"b");
+        assert_eq!(applescript_escape("a\\b"), "a\\\\b");
+        // Backslash escaped before quote so an injected `\"` can't break out.
+        assert_eq!(applescript_escape("\\\""), "\\\\\\\"");
+    }
+
+    // ── Exit-43 / cross-process persistence tests (#4382 review BLOCKING) ──
+
+    #[test]
+    fn test_exit_43_records_port_conflict_signature() {
+        // The DOMINANT #3967 manifestation: the child sees a stale orphan on the
+        // port and exits 43. Pre-fix this arm recorded NO signature; now it must
+        // record a port-conflict signature so the detector can see it. Even
+        // though the child stderr lacks "already in use" (is_port_conflict=false
+        // from the caller), the recorded signature must force the port-conflict
+        // flag for honest messaging.
+        let mut state = WrapperState::new();
+        let action = next_wrapper_action(&mut state, 43, false, None);
+        assert_eq!(action, WrapperAction::Exit);
+        assert_eq!(
+            state.last_failure_signature,
+            Some(FailureSignature {
+                exit_code: 43,
+                is_port_conflict: true,
+            }),
+            "exit 43 must record a forced port-conflict signature"
+        );
+        assert_eq!(state.identical_failure_streak, 1);
+    }
+
+    #[test]
+    fn test_persistent_streak_accumulates_and_fires_once_at_threshold() {
+        // Simulate N consecutive exit-43 *relaunches*, each a fresh process
+        // (prior loaded from disk, in-memory state irrelevant). Only the
+        // relaunch whose count reaches the threshold fires.
+        let mut prior: Option<PersistentStuckStreak> = None;
+        let mut fired = 0;
+        for expected in 1..=(WRAPPER_STUCK_NOTIFY_THRESHOLD + 2) {
+            let (record, just_crossed) =
+                persistent_streak_action(prior.as_ref(), 43, true, "1.2.3", 1000 + expected as u64);
+            assert_eq!(record.count, expected);
+            if just_crossed {
+                fired += 1;
+                assert_eq!(expected, WRAPPER_STUCK_NOTIFY_THRESHOLD);
+            }
+            prior = Some(record);
+        }
+        assert_eq!(fired, 1, "fires exactly once across relaunches");
+    }
+
+    #[test]
+    fn test_persistent_streak_resets_on_cause_change() {
+        let prior = PersistentStuckStreak {
+            exit_code: 43,
+            is_port_conflict: true,
+            version: "1.2.3".to_string(),
+            count: 2,
+            updated_unix_secs: 1000,
+        };
+        // Different exit code = different cause = fresh episode.
+        let (record, just_crossed) =
+            persistent_streak_action(Some(&prior), 101, false, "1.2.3", 1001);
+        assert_eq!(record.count, 1, "cause change resets streak");
+        assert!(!just_crossed);
+    }
+
+    #[test]
+    fn test_persistent_streak_resets_on_version_change() {
+        let prior = PersistentStuckStreak {
+            exit_code: 43,
+            is_port_conflict: true,
+            version: "1.2.3".to_string(),
+            count: WRAPPER_STUCK_NOTIFY_THRESHOLD - 1,
+            updated_unix_secs: 1000,
+        };
+        // New binary version = different binary = fresh episode (must NOT cross
+        // the threshold off a stale prior version's count).
+        let (record, just_crossed) =
+            persistent_streak_action(Some(&prior), 43, true, "1.2.4", 1001);
+        assert_eq!(record.count, 1, "version change resets streak");
+        assert!(!just_crossed);
+    }
+
+    #[test]
+    fn test_persistent_streak_resets_on_ttl_expiry() {
+        let prior = PersistentStuckStreak {
+            exit_code: 43,
+            is_port_conflict: true,
+            version: "1.2.3".to_string(),
+            count: WRAPPER_STUCK_NOTIFY_THRESHOLD - 1,
+            updated_unix_secs: 1000,
+        };
+        // Same cause + version but the prior record is older than the TTL: a
+        // stale file must NOT count toward the threshold (GC/TTL discipline).
+        let now = 1000 + STUCK_STREAK_TTL_SECS + 1;
+        let (record, just_crossed) = persistent_streak_action(Some(&prior), 43, true, "1.2.3", now);
+        assert_eq!(record.count, 1, "stale streak (past TTL) resets");
+        assert!(!just_crossed);
+
+        // Exactly at the TTL boundary still counts as continuing.
+        let at_boundary = 1000 + STUCK_STREAK_TTL_SECS;
+        let (record, _) = persistent_streak_action(Some(&prior), 43, true, "1.2.3", at_boundary);
+        assert_eq!(
+            record.count, WRAPPER_STUCK_NOTIFY_THRESHOLD,
+            "boundary continues"
+        );
+    }
+
+    #[test]
+    fn test_persistent_streak_file_roundtrip_and_clear() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            read_stuck_streak_file(tmp.path()).is_none(),
+            "missing file reads as no prior streak"
+        );
+        let record = PersistentStuckStreak {
+            exit_code: 43,
+            is_port_conflict: true,
+            version: "1.2.3".to_string(),
+            count: 2,
+            updated_unix_secs: 1234,
+        };
+        write_stuck_streak_file(tmp.path(), &record);
+        let read = read_stuck_streak_file(tmp.path()).expect("must read back");
+        assert_eq!(read, record);
+
+        clear_stuck_streak_file(tmp.path());
+        assert!(
+            read_stuck_streak_file(tmp.path()).is_none(),
+            "cleared file reads as none"
+        );
+        // Clearing a missing file is a no-op.
+        clear_stuck_streak_file(tmp.path());
+    }
+
+    #[test]
+    fn test_read_stuck_streak_file_tolerates_malformed_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(STUCK_STREAK_FILE_NAME), "{not json").unwrap();
+        assert!(
+            read_stuck_streak_file(tmp.path()).is_none(),
+            "malformed file must read as no prior streak, not panic"
+        );
+    }
+
+    // ── stuck_loop_action pure-decision tests (#4382 review NIT) ──
+
+    #[test]
+    fn test_stuck_loop_action_writes_on_threshold_cross() {
+        // Write takes precedence regardless of the other flags.
+        assert_eq!(
+            stuck_loop_action(true, false, WRAPPER_STUCK_NOTIFY_THRESHOLD),
+            StuckLoopAction::Write
+        );
+        assert_eq!(stuck_loop_action(true, true, 0), StuckLoopAction::Write);
+    }
+
+    #[test]
+    fn test_stuck_loop_action_clears_on_recovery() {
+        // streak reset to 0 (clean exit / successful update) → clear.
+        assert_eq!(stuck_loop_action(false, false, 0), StuckLoopAction::Clear);
+    }
+
+    #[test]
+    fn test_stuck_loop_action_clears_on_cause_change_midloop() {
+        // The #4382 review MINOR: cause changes mid-episode, streak==1, not a
+        // recovery — the stale file for the prior cause must still be cleared.
+        assert_eq!(stuck_loop_action(false, true, 1), StuckLoopAction::Clear);
+    }
+
+    #[test]
+    fn test_stuck_loop_action_none_when_progressing_same_cause() {
+        // Below threshold, same cause, no change: leave the file alone.
+        assert_eq!(stuck_loop_action(false, false, 1), StuckLoopAction::None);
+        assert_eq!(stuck_loop_action(false, false, 2), StuckLoopAction::None);
+    }
+
+    #[test]
+    fn test_signature_change_flag_set_only_on_change_not_first_failure() {
+        let mut state = WrapperState::new();
+        // First failure: None -> Some, no stale file to clear.
+        next_wrapper_action(&mut state, 1, false, None);
+        assert!(!state.signature_changed, "first failure is not a change");
+        // Same cause again: still no change.
+        next_wrapper_action(&mut state, 1, false, None);
+        assert!(!state.signature_changed);
+        // Different cause: change flagged.
+        next_wrapper_action(&mut state, 7, false, None);
+        assert!(state.signature_changed, "cause change must flag");
+        assert_eq!(state.identical_failure_streak, 1);
+    }
+
     /// Regression test for #3716: tray actions were silently dropped during
     /// backoff sleep. Verify the sleep function maps each action correctly.
     #[test]
@@ -2882,7 +3207,7 @@ echo "RC=$?"
         let plist_path = home.join("org.freenet.node.plist");
 
         for path in [&wrapper_path, &hash_path, &bak_path, &plist_path] {
-            fs::write(path, b"x").expect("write fixture file");
+            fs::write(path, b"x" as &[u8]).expect("write fixture file");
             assert!(path.exists(), "fixture {} should exist", path.display());
         }
 

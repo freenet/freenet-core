@@ -5,6 +5,7 @@ use super::estimator::{
     fmt_prediction_prob, fmt_prediction_speed, fmt_prediction_time,
 };
 use super::*;
+use crate::router::AdjustmentMode;
 
 // ─── Peer detail page ────────────────────────────────────────────────────────
 
@@ -19,29 +20,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
 
     let Some(peer) = peer else {
         return format!(
-            r##"<!DOCTYPE html>
-<html lang="en"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Peer Not Found — Freenet</title>
-<style>{CSS}{PEER_CSS}</style><script>{JS}</script>
-</head><body>
-<header>
-    <div class="header-left">
-        <a href="/" class="logo-link"><img src="https://freenet.org/freenet_logo.svg" alt="Freenet" class="logo"></a>
-        <a href="/" class="header-title">FREENET</a>
-        <span class="header-sep">/</span>
-        <span class="header-scope">Peer</span>
-    </div>
-    <div class="header-right">
-        <button class="theme-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle dark/light mode">
-            <span id="theme-icon">☀️</span>
-        </button>
-    </div>
-</header>
-<main>
-    <div class="card"><h2>Peer Not Found</h2><p class="empty">No connected peer with address <code>{addr}</code>. The peer may have disconnected.</p>
-    <p style="margin-top:0.75rem"><a href="/" style="color:var(--accent-light);font-family:var(--font-mono);font-size:0.85rem">&larr; Back to dashboard</a></p></div>
-</main></body></html>"##,
+            include_str!("assets/peer_not_found.html"),
             CSS = CSS,
             PEER_CSS = PEER_CSS,
             JS = JS,
@@ -277,12 +256,23 @@ pub fn peer_detail_html(address_str: &str) -> String {
                 let fail_y_max =
                     failure_chart_y_max(f_curve, if tab_name == "All" { fail_adj } else { None })
                         .to_string();
+                // The adjustment mode per chart MUST match the router's choice for
+                // that estimator (see `Router::new`): failure + transfer are
+                // additive, response time is multiplicative. The dashboard renders
+                // the peer-adjusted curve with this mode, so a wrong mode would draw
+                // a curve of the wrong SHAPE vs the router's prediction. (The curve
+                // is intentionally a *preview*: the dashboard draws it whenever an
+                // adjustment exists, while the router only applies it once the peer
+                // has `MIN_POINTS_FOR_REGRESSION` effective observations.) When
+                // #4547 flips transfer rate to multiplicative, update its mode here
+                // too — the mode is mirrored, not read from the snapshot.
                 panel_content.push_str(&build_estimator_chart_or_placeholder(
                     "Failure Probability",
                     f_curve,
                     f_points,
                     f_range,
                     if tab_name == "All" { fail_adj } else { None },
+                    AdjustmentMode::Additive,
                     ploc,
                     "0.0",
                     &fail_y_max,
@@ -294,6 +284,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                     rt_points,
                     rt_range,
                     if tab_name == "All" { rt_adj } else { None },
+                    AdjustmentMode::Multiplicative,
                     ploc,
                     "0",
                     "auto",
@@ -305,6 +296,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
                     xfer_points,
                     xfer_range,
                     if tab_name == "All" { xfer_adj } else { None },
+                    AdjustmentMode::Additive,
                     ploc,
                     // Transfer rate is a positive B/s value: floor at 0, auto-scale
                     // the top. (Was "auto"/"0", which clamped the max to 0 and gave a
@@ -332,8 +324,9 @@ pub fn peer_detail_html(address_str: &str) -> String {
                 <p style="font-size:0.8em;color:var(--text-muted);">
                     Actual observed outcomes (dots) against ring distance to the contract, with the
                     isotonic fit overlaid (the All tab is the aggregate the router uses; per-op tabs
-                    just break it down and are not consulted separately). "Peer-adjusted" adds this
-                    peer's running EWMA correction to that fit. How tightly the dots hug a monotonic
+                    just break it down and are not consulted separately). "Peer-adjusted" applies this
+                    peer's running EWMA correction to that fit — a multiplicative factor for response
+                    time, an additive offset for failure and transfer rate. How tightly the dots hug a monotonic
                     curve shows how well distance alone predicts the outcome. A separate Renegade
                     model is blended into the final estimate; its accuracy is in the Prediction
                     Accuracy panel below.
@@ -398,40 +391,7 @@ pub fn peer_detail_html(address_str: &str) -> String {
     let version = snap_ref.map(|s| s.version.as_str()).unwrap_or("?");
 
     format!(
-        r##"<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Peer {addr} — Freenet</title>
-    <style>{CSS}{PEER_CSS}</style>
-    <script>{JS}</script>
-</head>
-<body>
-    <header>
-        <div class="header-left">
-            <a href="/" class="logo-link"><img src="https://freenet.org/freenet_logo.svg" alt="Freenet" class="logo"></a>
-            <a href="/" class="header-title">FREENET</a>
-            <span class="header-sep">/</span>
-            <span class="header-scope">Peer</span>
-            <span class="header-addr">{addr}</span>
-            <span class="badge">v{version}</span>
-        </div>
-        <div class="header-right">
-            <button class="theme-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle dark/light mode">
-                <span id="theme-icon">☀️</span>
-            </button>
-        </div>
-    </header>
-    <main>
-        {info_card}
-        {model_card}
-        {charts}
-        {renegade_chart}
-        {prediction_card}
-    </main>
-</body>
-</html>"##,
+        include_str!("assets/peer.html"),
         addr = html_escape(&peer.address.to_string()),
         CSS = CSS,
         PEER_CSS = PEER_CSS,

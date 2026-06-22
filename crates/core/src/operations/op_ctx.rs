@@ -875,6 +875,249 @@ mod tests {
             .expect("executor task should complete without panicking");
     }
 
+    /// Regression for issue #4350. The renewal driver wraps each
+    /// `send_to_and_await` attempt in a per-attempt timeout, and
+    /// `recover_orphaned_subscriptions` wraps the whole renewal future in an
+    /// **outer** cancel deadline. Before the fix the per-attempt wait was the
+    /// global `OPERATION_TTL` (60 s) while the outer deadline was only 25 s, so
+    /// a peer that replied between 25 s and 60 s tripped the OUTER cancel first
+    /// — dropping the future (and its capacity-1 reply receiver) mid-`await`,
+    /// so the in-flight reply landed on a closed receiver.
+    ///
+    /// This pins the corrected nesting at the timeout layer where the bug
+    /// lives, in virtual time (`start_paused = true`): with a per-attempt
+    /// timeout strictly *below* the outer deadline, a slow peer makes the INNER
+    /// per-attempt timeout fire first, returning a clean `Elapsed` to the
+    /// renewal task while the outer deadline still has budget left — so the
+    /// task records its own failure instead of being cancelled mid-flight.
+    ///
+    /// It also asserts the inverse to prove the test actually discriminates:
+    /// the pre-fix shape (per-attempt wait > outer deadline) is killed by the
+    /// outer cancel, which is exactly the discarded-reply path #4350 removes.
+    #[tokio::test(start_paused = true)]
+    async fn renewal_per_attempt_timeout_fires_before_outer_cancel() {
+        use crate::ring::Ring;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        // Current production constants/relationship from #4350.
+        let per_attempt = Ring::RENEWAL_PER_ATTEMPT_TIMEOUT; // 20 s
+        let outer = Ring::renewal_outer_cancel(); // 55 s (budget + cleanup + margin)
+        assert!(
+            per_attempt < outer,
+            "test precondition: per-attempt ({per_attempt:?}) must be below the \
+             outer cancel deadline ({outer:?}) — the #4350 invariant"
+        );
+
+        let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 7)), 31337);
+
+        // --- Fixed shape: outer(per_attempt(send_to_and_await)) ---
+        // A slow peer that never replies within the 20 s per-attempt window.
+        // With the fix the inner per-attempt timeout fires first, well before
+        // the 55 s outer cancel; the task gets a clean Elapsed to classify.
+        {
+            let (receiver, sender) = event_loop_notification_channel();
+            let EventLoopNotificationsReceiver {
+                mut op_execution_receiver,
+                ..
+            } = receiver;
+            let tx = Transaction::new::<ConnectMsg>();
+            let mut ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+
+            // Slow peer holds the reply sender well past the per-attempt
+            // timeout (but `peer.abort()` removes the timer so it can't advance
+            // virtual time past the deadline).
+            let peer = tokio::spawn(async move {
+                let (reply_sender, _outbound, _target) = op_execution_receiver
+                    .recv()
+                    .await
+                    .expect("outbound msg should be delivered");
+                tokio::time::sleep(outer * 100).await;
+                drop(reply_sender);
+            });
+
+            let outbound = dummy_reply_with_tx(tx);
+            let outer_result = tokio::time::timeout(
+                outer,
+                tokio::time::timeout(per_attempt, ctx.send_to_and_await(target, outbound)),
+            )
+            .await;
+
+            // The OUTER deadline must NOT fire: the inner per-attempt timeout
+            // resolves first, so `tokio::time::timeout(outer, ..)` returns Ok.
+            let inner_result = outer_result.expect(
+                "outer cancel deadline must NOT fire — the per-attempt timeout \
+                 resolves first (issue #4350); an outer Err here means the \
+                 future was cancelled mid-await, discarding the in-flight reply",
+            );
+            // The inner per-attempt timeout DID fire (slow peer exceeded it),
+            // returning a clean Elapsed the renewal task can classify.
+            assert!(
+                inner_result.is_err(),
+                "the per-attempt timeout should elapse for a slow peer, yielding \
+                 a clean in-task failure rather than an outer-cancel drop"
+            );
+            peer.abort();
+        }
+
+        // --- Pre-fix shape (historical bug, literal values) ---
+        // Proves the test discriminates: the original bug was a 25 s outer
+        // deadline wrapping a 60 s `OPERATION_TTL` per-attempt wait. A peer
+        // replying between 25 s and 60 s tripped the outer cancel first,
+        // dropping the future (and its receiver) mid-await. Modelled with
+        // literal values so it stays a faithful record of the pre-fix shape
+        // even as the production constants evolve.
+        {
+            let old_outer = Duration::from_secs(25);
+            let old_per_attempt = OPERATION_TTL; // 60 s
+            let reply_delay = Duration::from_secs(40); // in (25 s, 60 s)
+            assert!(old_outer < reply_delay && reply_delay < old_per_attempt);
+
+            let (receiver, sender) = event_loop_notification_channel();
+            let EventLoopNotificationsReceiver {
+                mut op_execution_receiver,
+                ..
+            } = receiver;
+            let tx = Transaction::new::<ConnectMsg>();
+            let mut ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+
+            let peer = tokio::spawn(async move {
+                let (reply_sender, _outbound, _target) = op_execution_receiver
+                    .recv()
+                    .await
+                    .expect("outbound msg should be delivered");
+                tokio::time::sleep(reply_delay).await;
+                // Expected to fail: the receiver is dropped by the outer cancel
+                // in this buggy pre-fix shape. Swallow it deliberately.
+                drop(reply_sender.try_send(WaiterReply::Reply(dummy_reply_with_tx(tx))));
+            });
+
+            let outbound = dummy_reply_with_tx(tx);
+            let outer_result = tokio::time::timeout(
+                old_outer,
+                tokio::time::timeout(old_per_attempt, ctx.send_to_and_await(target, outbound)),
+            )
+            .await;
+
+            assert!(
+                outer_result.is_err(),
+                "pre-fix shape (per-attempt wait > outer deadline) MUST be \
+                 killed by the outer cancel — this is the discarded-reply path \
+                 #4350 removes; if this passes the test no longer discriminates"
+            );
+            peer.await.expect("peer task should not panic");
+        }
+    }
+
+    /// Regression for issue #4350, **multi-attempt** case (Codex review P2).
+    /// A single shorter per-attempt timeout is not enough on its own: when a
+    /// renewal advances to a second peer (e.g. after a fast NotFound from the
+    /// first), a fresh full-length per-attempt timeout on that second attempt
+    /// could still outlive the outer cancel, so its reply would be dropped
+    /// mid-await — the #4350 bug, just on the retry.
+    ///
+    /// The driver closes this by clamping EACH attempt to the budget remaining
+    /// until its task deadline (`Ring::RENEWAL_TASK_BUDGET`, kept below the
+    /// outer cancel). This pins that behaviour at the timeout layer in virtual
+    /// time: attempt 1 replies fast (consuming little budget) and attempt 2 is
+    /// a slow peer clamped to the *remaining* budget. Both resolve inside the
+    /// task deadline, so the outer cancel never fires even across the retry.
+    #[tokio::test(start_paused = true)]
+    async fn renewal_clamps_retry_attempt_to_remaining_budget() {
+        use crate::ring::Ring;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+        let outer = Ring::renewal_outer_cancel(); // 55 s
+        let budget = Ring::RENEWAL_TASK_BUDGET; // 20 s, < outer
+        let per_attempt_cap = Ring::RENEWAL_PER_ATTEMPT_TIMEOUT;
+        let min_attempt = Ring::RENEWAL_MIN_ATTEMPT_BUDGET;
+        assert!(budget < outer, "task budget must be below the outer cancel");
+
+        let target = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 9)), 31337);
+
+        // Model the driver's loop: a single task deadline, each attempt's
+        // timeout clamped to the remaining budget. Attempt 1's peer replies
+        // fast; attempt 2's peer never replies (slow peer) and must be cut by
+        // the clamped per-attempt timeout, NOT the outer cancel.
+        let deadline = tokio::time::Instant::now() + budget;
+
+        let sequence = async {
+            let mut rounds = 0u32;
+            let mut last_attempt_timed_out = false;
+            loop {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining < min_attempt {
+                    break (rounds, last_attempt_timed_out);
+                }
+                let attempt_timeout = remaining.min(per_attempt_cap);
+
+                let (receiver, sender) = event_loop_notification_channel();
+                let EventLoopNotificationsReceiver {
+                    mut op_execution_receiver,
+                    ..
+                } = receiver;
+                let tx = Transaction::new::<ConnectMsg>();
+                let mut ctx = OpCtx::new(tx, sender.op_execution_sender.clone());
+
+                // Round 0: peer replies fast (1 s). Later rounds: slow peer
+                // that never replies within the clamped window.
+                let fast = rounds == 0;
+                let peer = tokio::spawn(async move {
+                    let (reply_sender, _outbound, _target) = op_execution_receiver
+                        .recv()
+                        .await
+                        .expect("outbound msg should be delivered");
+                    if fast {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        drop(reply_sender.try_send(WaiterReply::Reply(dummy_reply_with_tx(tx))));
+                    } else {
+                        // Slow peer: hold the reply sender (so the driver's
+                        // recv() doesn't see a hang-up and actually waits) far
+                        // beyond any deadline. `peer.abort()` below removes this
+                        // timer so it can't advance virtual time. The clamped
+                        // per-attempt timeout must cut the driver's await first.
+                        tokio::time::sleep(outer * 100).await;
+                        drop(reply_sender);
+                    }
+                });
+
+                let outbound = dummy_reply_with_tx(tx);
+                let attempt =
+                    tokio::time::timeout(attempt_timeout, ctx.send_to_and_await(target, outbound))
+                        .await;
+                last_attempt_timed_out = attempt.is_err();
+                rounds += 1;
+                // Drop (don't await) the slow peer so its indefinite hold can't
+                // advance virtual time past the deadline. The fast peer has
+                // already replied by here.
+                peer.abort();
+
+                // After a fast reply, keep retrying (models advance_to_next_peer);
+                // after a slow-peer timeout we've demonstrated the clamp held.
+                if last_attempt_timed_out || rounds >= 10 {
+                    break (rounds, last_attempt_timed_out);
+                }
+            }
+        };
+
+        let outer_result = tokio::time::timeout(outer, sequence).await;
+        assert!(
+            outer_result.is_ok(),
+            "the outer cancel deadline must NOT fire — every clamped attempt \
+             completes within the task budget, so retries can't be killed \
+             mid-await (issue #4350, Codex P2)"
+        );
+        let (rounds, last_timed_out) = outer_result.unwrap();
+        assert!(
+            rounds >= 2,
+            "expected at least two attempts (fast reply then clamped slow retry), got {rounds}"
+        );
+        assert!(
+            last_timed_out,
+            "the slow second attempt must be cut by its own clamped timeout \
+             inside the task budget, not left awaiting the outer cancel"
+        );
+    }
+
     #[tokio::test]
     async fn send_and_await_errors_on_dropped_receiver() {
         let (receiver, sender) = event_loop_notification_channel();

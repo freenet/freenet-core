@@ -7,11 +7,14 @@ use super::launch_at_login::macos_launch_at_login_startup;
 use super::single_instance::{AcquireWrapperLockOutcome, acquire_wrapper_single_instance_lock};
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
+use super::single_instance::FIRST_RUN_OPENER_SPAWNED;
+
+#[cfg(any(target_os = "windows", target_os = "macos"))]
 use super::DASHBOARD_URL;
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 use super::open_url_in_browser;
-#[cfg(any(target_os = "windows", target_os = "macos"))]
-use super::single_instance::FIRST_RUN_OPENER_SPAWNED;
+// First-run marker helpers + dashboard reachability probe live in the parent
+// `service` module; the first-run onboarding opener below references them.
 use super::{
     SENTINEL_RESTART, SENTINEL_STOP, WRAPPER_EXIT_ALREADY_RUNNING, WRAPPER_EXIT_UPDATE_NEEDED,
     WRAPPER_INITIAL_BACKOFF_SECS, WRAPPER_MAX_BACKOFF_SECS, WRAPPER_MAX_CONSECUTIVE_FAILURES,
@@ -67,12 +70,89 @@ fn spawn_first_run_dashboard_opener(log_dir: &Path) {
     });
 }
 
+/// Number of consecutive *identical* failures (same exit code + same detected
+/// cause, e.g. repeated exit 43 against a held port) before the wrapper
+/// surfaces a "stuck" signal to the operator (#4382).
+///
+/// Rationale for N = 3: a single failure is noise (a transient port race, a
+/// one-off crash), and two could still be an unlucky double. By the third
+/// identical failure the wrapper is demonstrably looping on the *same* cause
+/// rather than making progress — the signature of the #3967 stale-orphan wedge,
+/// where the wrapper repeatedly loses the port to a detached old binary and
+/// exits 43 every cycle. Three is low enough to surface the problem within a
+/// couple of backoff intervals (tens of seconds, not the ~50-failure give-up
+/// horizon) yet high enough to avoid crying wolf on transient blips.
+pub(super) const WRAPPER_STUCK_NOTIFY_THRESHOLD: u32 = 3;
+
+/// File name (under the log directory) where the wrapper records a stuck-loop
+/// status (failure count + last error). This is groundwork: the homepage
+/// banner reader is not yet wired (tracked as a follow-up to #4382), so the
+/// operator-facing signals delivered today are the cross-platform log line and
+/// the macOS osascript notification. The file lets a future banner surface the
+/// stuck state even when the served node is a stale orphan (dovetails with the
+/// #4289 version-mismatch banner).
+pub(super) const STUCK_STATUS_FILE_NAME: &str = "wrapper-stuck-status.json";
+
+/// File name (under the log directory) where the wrapper persists a
+/// *cross-process* identical-failure streak (#4382). The dominant #3967
+/// manifestation — a stale orphan answering on the dashboard port — makes the
+/// child exit 43 (`WRAPPER_EXIT_ALREADY_RUNNING`); the wrapper then exits and
+/// (on macOS) launchd relaunches `service run-wrapper` fresh, resetting the
+/// in-memory streak to 0 every cycle. Without disk persistence the in-process
+/// `WRAPPER_STUCK_NOTIFY_THRESHOLD` is never reached across relaunches and the
+/// signal never fires. This file lets consecutive exit-43 relaunches accumulate.
+pub(super) const STUCK_STREAK_FILE_NAME: &str = "wrapper-stuck-streak.json";
+
+/// TTL for the persisted cross-process streak file (#4382). If the last update
+/// is older than this, the streak is considered stale and reset to a fresh
+/// episode rather than counting an ancient failure toward the threshold. This
+/// honours the GC/TTL discipline (AGENTS.md "WHEN writing cleanup/GC logic"):
+/// the persisted counter must not be able to trigger forever off a stale file.
+/// One hour comfortably spans the exit-43 relaunch cadence (launchd relaunches
+/// within seconds) while preventing a days-old file from instantly tripping the
+/// detector after an unrelated later failure.
+pub(super) const STUCK_STREAK_TTL_SECS: u64 = 3600;
+
+/// Distinguishing signature of a wrapper failure: the child exit code plus
+/// whether it was detected as a port conflict. Two failures with the same
+/// signature are "identical" for the purpose of the stuck-loop detector
+/// (#4382) — the wrapper is looping on the same cause rather than making
+/// progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct FailureSignature {
+    pub(super) exit_code: i32,
+    pub(super) is_port_conflict: bool,
+}
+
 /// State for the wrapper backoff state machine.
 #[derive(Debug, Clone)]
 pub(super) struct WrapperState {
     pub(super) backoff_secs: u64,
     pub(super) consecutive_failures: u32,
     pub(super) port_conflict_kills: u32,
+    /// Signature of the most recent failure, used to count *identical*
+    /// repeats (#4382). `None` before the first failure or after a success
+    /// resets the streak.
+    pub(super) last_failure_signature: Option<FailureSignature>,
+    /// How many times in a row the same `last_failure_signature` has
+    /// occurred (1 on first occurrence of a signature).
+    pub(super) identical_failure_streak: u32,
+    /// Set once the stuck notification has fired for the current streak so
+    /// the wrapper surfaces the problem once per stuck episode, not on every
+    /// subsequent identical failure.
+    pub(super) stuck_notified: bool,
+    /// Transient flag set by the most recent `next_wrapper_action` call when
+    /// that call's failure pushed the identical-failure streak across
+    /// `WRAPPER_STUCK_NOTIFY_THRESHOLD`. The loop reads it to fire the
+    /// stuck notification + status-file write exactly once per episode.
+    pub(super) stuck_just_crossed: bool,
+    /// Transient flag set by the most recent `next_wrapper_action` call when
+    /// that call's failure had a *different* signature than the previous one
+    /// (a fresh episode started). The loop reads it to clear a stale status
+    /// file written for the prior cause, so the homepage banner doesn't show
+    /// the wrong recovery hint when the failure cause changes mid-loop (#4382
+    /// review MINOR).
+    pub(super) signature_changed: bool,
 }
 
 impl WrapperState {
@@ -81,7 +161,50 @@ impl WrapperState {
             backoff_secs: WRAPPER_INITIAL_BACKOFF_SECS,
             consecutive_failures: 0,
             port_conflict_kills: 0,
+            last_failure_signature: None,
+            identical_failure_streak: 0,
+            stuck_notified: false,
+            stuck_just_crossed: false,
+            signature_changed: false,
         }
+    }
+
+    /// Record a failure with the given signature and update the
+    /// identical-failure streak. Returns `true` exactly once per stuck
+    /// episode: on the failure that first reaches
+    /// `WRAPPER_STUCK_NOTIFY_THRESHOLD` consecutive identical failures, so the
+    /// caller can surface the stuck signal a single time rather than on every
+    /// repeat.
+    pub(super) fn record_failure_signature(&mut self, sig: FailureSignature) -> bool {
+        if self.last_failure_signature == Some(sig) {
+            self.identical_failure_streak = self.identical_failure_streak.saturating_add(1);
+        } else {
+            // A different failure cause starts a fresh episode. Flag it so the
+            // loop clears any stale status file written for the prior cause
+            // (#4382 review MINOR); only flag a *change*, not the very first
+            // failure (None -> Some), where there is no stale file to clear.
+            if self.last_failure_signature.is_some() {
+                self.signature_changed = true;
+            }
+            self.last_failure_signature = Some(sig);
+            self.identical_failure_streak = 1;
+            self.stuck_notified = false;
+        }
+        if self.identical_failure_streak >= WRAPPER_STUCK_NOTIFY_THRESHOLD && !self.stuck_notified {
+            self.stuck_notified = true;
+            return true;
+        }
+        false
+    }
+
+    /// Reset the identical-failure streak after a clean run / successful
+    /// update so a later failure starts a fresh episode.
+    pub(super) fn reset_failure_streak(&mut self) {
+        self.last_failure_signature = None;
+        self.identical_failure_streak = 0;
+        self.stuck_notified = false;
+        self.stuck_just_crossed = false;
+        self.signature_changed = false;
     }
 }
 
@@ -106,6 +229,15 @@ pub(super) fn next_wrapper_action(
     is_port_conflict: bool,
     update_succeeded: Option<bool>, // None if not an update exit code
 ) -> WrapperAction {
+    // Reset the per-call transients before recording this outcome; only a
+    // failure that crosses the stuck threshold / changes signature sets them
+    // back to true.
+    state.stuck_just_crossed = false;
+    state.signature_changed = false;
+    let sig = FailureSignature {
+        exit_code,
+        is_port_conflict,
+    };
     match exit_code {
         code if code == WRAPPER_EXIT_UPDATE_NEEDED => {
             match update_succeeded {
@@ -113,10 +245,12 @@ pub(super) fn next_wrapper_action(
                     state.consecutive_failures = 0;
                     state.port_conflict_kills = 0;
                     state.backoff_secs = WRAPPER_INITIAL_BACKOFF_SECS;
+                    state.reset_failure_streak();
                     WrapperAction::Update
                 }
                 Some(false) => {
                     state.consecutive_failures += 1;
+                    state.stuck_just_crossed = state.record_failure_signature(sig);
                     let secs = state.backoff_secs;
                     state.backoff_secs = (state.backoff_secs * 2).min(WRAPPER_MAX_BACKOFF_SECS);
                     WrapperAction::BackoffAndRelaunch { secs }
@@ -124,9 +258,41 @@ pub(super) fn next_wrapper_action(
                 None => WrapperAction::Update, // Will be called again with result
             }
         }
-        code if code == WRAPPER_EXIT_ALREADY_RUNNING => WrapperAction::Exit,
-        0 => WrapperAction::Exit,
+        code if code == WRAPPER_EXIT_ALREADY_RUNNING => {
+            // The child's pre-flight check_for_existing_process() saw a live
+            // node already answering on the WS/dashboard port and exited 43
+            // (#3967 stale-orphan signature). The child returns AlreadyRunning
+            // *without* printing "already in use", so the stderr-derived
+            // `is_port_conflict` is false here — but conceptually this IS a
+            // port conflict (a stale orphan holding the port), so force the
+            // flag in the recorded signature for honest messaging.
+            //
+            // The in-process streak alone never reaches the threshold here:
+            // exit 43 returns Exit and the process terminates, so on macOS
+            // launchd relaunches a fresh wrapper with a reset in-memory streak.
+            // The loop therefore ALSO persists this signature to disk (see
+            // persistent_streak_action) so consecutive exit-43 *relaunches*
+            // across processes are what actually surface the signal. We still
+            // record in-process for the rare same-process repeat.
+            let sig = FailureSignature {
+                exit_code,
+                is_port_conflict: true,
+            };
+            state.stuck_just_crossed = state.record_failure_signature(sig);
+            WrapperAction::Exit
+        }
+        0 => {
+            // Clean exit — the wrapper is making progress, so a later failure
+            // starts a fresh stuck episode.
+            state.reset_failure_streak();
+            WrapperAction::Exit
+        }
         _ => {
+            // Record the failure signature on EVERY crash path (including the
+            // port-conflict kill-and-retry path): repeated identical port
+            // conflicts are precisely the #3967 stale-orphan signature, so the
+            // detector must see them even while we're still retrying.
+            state.stuck_just_crossed = state.record_failure_signature(sig);
             if is_port_conflict {
                 state.port_conflict_kills += 1;
                 if state.port_conflict_kills <= WRAPPER_MAX_PORT_CONFLICT_KILLS {
@@ -141,6 +307,45 @@ pub(super) fn next_wrapper_action(
             state.backoff_secs = (state.backoff_secs * 2).min(WRAPPER_MAX_BACKOFF_SECS);
             WrapperAction::BackoffAndRelaunch { secs }
         }
+    }
+}
+
+/// What the wrapper loop should do with the in-process stuck-status file after
+/// a `next_wrapper_action` call (#4382).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StuckLoopAction {
+    /// Threshold just crossed this iteration: write the status file + notify.
+    Write,
+    /// The wrapper recovered (clean exit / successful update) or the failure
+    /// cause changed mid-episode: clear any stale status file so the homepage
+    /// banner doesn't show the wrong recovery hint.
+    Clear,
+    /// Neither — leave the status file untouched.
+    None,
+}
+
+/// Pure decision for the in-process stuck-status file based on the transient
+/// flags `next_wrapper_action` set on the state (#4382). Extracted so the
+/// three branches are unit-testable without spawning processes or touching the
+/// filesystem (mirrors the pure-core + platform-binding pattern in this file).
+///
+/// - `stuck_just_crossed`: this iteration's failure first reached the
+///   threshold → write the file (takes precedence).
+/// - `streak` reset to 0: clean exit / successful update → clear.
+/// - `signature_changed`: a different cause started mid-loop → clear the stale
+///   file written for the prior cause (the #4382 review MINOR; without this the
+///   streak==1 case fell through both old branches and left the banner stale).
+pub(super) fn stuck_loop_action(
+    stuck_just_crossed: bool,
+    signature_changed: bool,
+    streak: u32,
+) -> StuckLoopAction {
+    if stuck_just_crossed {
+        StuckLoopAction::Write
+    } else if streak == 0 || signature_changed {
+        StuckLoopAction::Clear
+    } else {
+        StuckLoopAction::None
     }
 }
 
@@ -893,6 +1098,52 @@ fn run_wrapper_loop(
         // Use the tested state machine to determine next action
         let action = next_wrapper_action(&mut state, exit_code, is_port_conflict, update_succeeded);
 
+        // #4382 (cross-process): an exit-43 stale-orphan relaunch — the DOMINANT
+        // #3967 manifestation — terminates this process, so the in-memory streak
+        // never accumulates (launchd relaunches `service run-wrapper` fresh each
+        // cycle). Persist the streak to disk so consecutive exit-43 relaunches
+        // surface the signal. This is the *only* path that reaches the threshold
+        // for the stable-orphan-on-port case.
+        if exit_code == WRAPPER_EXIT_ALREADY_RUNNING {
+            handle_persistent_stuck_relaunch(log_dir, exit_code, /* is_port_conflict */ true);
+        }
+
+        // #4382 (in-process): when the same failure has repeated
+        // WRAPPER_STUCK_NOTIFY_THRESHOLD times in a row within a single wrapper
+        // process (repeated non-43 crashes, or the bind-conflict KillAndRetry
+        // window), surface it once. The pure `stuck_loop_action` decides Write
+        // (threshold crossed), Clear (recovered, or the cause changed mid-loop
+        // leaving a stale file), or None.
+        match stuck_loop_action(
+            state.stuck_just_crossed,
+            state.signature_changed,
+            state.identical_failure_streak,
+        ) {
+            StuckLoopAction::Write => {
+                let status = StuckWrapperStatus::new(
+                    exit_code,
+                    is_port_conflict,
+                    state.identical_failure_streak,
+                );
+                log_wrapper_event(log_dir, &status.log_line());
+                write_stuck_status_file(log_dir, &status);
+                notify_stuck_wrapper(&status);
+            }
+            StuckLoopAction::Clear => {
+                // The wrapper is making progress again (or switched cause), so
+                // clear any stale stuck-status file so the homepage banner
+                // doesn't linger / show the wrong recovery hint. On a clean
+                // exit / successful update also clear the persisted
+                // cross-process streak so a later unrelated failure starts from
+                // zero (GC discipline).
+                clear_stuck_status_file(log_dir);
+                if state.identical_failure_streak == 0 {
+                    clear_stuck_streak_file(log_dir);
+                }
+            }
+            StuckLoopAction::None => {}
+        }
+
         match action {
             WrapperAction::Update => {
                 // Update succeeded — re-exec the wrapper so the tray shows
@@ -1086,6 +1337,261 @@ pub(super) fn log_wrapper_event(log_dir: &Path, message: &str) {
 
     // Clean up old log files (best-effort, don't let cleanup failure block anything)
     cleanup_old_wrapper_logs(log_dir);
+}
+
+/// Status the wrapper writes to `STUCK_STATUS_FILE_NAME` once a repeated,
+/// identical failure has crossed `WRAPPER_STUCK_NOTIFY_THRESHOLD` (#4382).
+///
+/// Serialized as JSON so a future homepage reader can render an operator
+/// banner even when the served node is a stale orphan answering on the port.
+/// The reader is not yet wired (follow-up to #4382); today's delivered signals
+/// are the log line and the macOS osascript notification.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) struct StuckWrapperStatus {
+    /// Child exit code that keeps repeating.
+    pub(super) exit_code: i32,
+    /// Whether the repeated failure was detected as a port conflict.
+    pub(super) is_port_conflict: bool,
+    /// How many consecutive identical failures have occurred.
+    pub(super) failure_count: u32,
+    /// Human-readable last-error summary (exit code + cause).
+    pub(super) last_error: String,
+    /// One-line recovery hint for the operator.
+    pub(super) recovery_hint: String,
+}
+
+impl StuckWrapperStatus {
+    pub(super) fn new(exit_code: i32, is_port_conflict: bool, failure_count: u32) -> Self {
+        let cause = if is_port_conflict {
+            // exit 43 / "address already in use" against a held port is the
+            // #3967 stale-orphan signature.
+            format!("exit {exit_code} — the dashboard port is held by another process")
+        } else {
+            format!("exit {exit_code}")
+        };
+        let last_error =
+            format!("Node failed {failure_count} times in a row with the same cause: {cause}.");
+        let recovery_hint = if is_port_conflict {
+            "The background service looks stuck on an old process holding the port. \
+             Recover with: freenet service stop && freenet service start \
+             (or kill the stale 'freenet network' process holding the dashboard port)."
+                .to_string()
+        } else {
+            "The background service is repeatedly crashing on startup. \
+             Recover with: freenet service stop && freenet service start, \
+             then check the wrapper logs for the underlying error."
+                .to_string()
+        };
+        Self {
+            exit_code,
+            is_port_conflict,
+            failure_count,
+            last_error,
+            recovery_hint,
+        }
+    }
+
+    /// Single log line summarizing the stuck condition.
+    pub(super) fn log_line(&self) -> String {
+        format!(
+            "Wrapper appears stuck: {} {}",
+            self.last_error, self.recovery_hint
+        )
+    }
+}
+
+/// Write the stuck status to `STUCK_STATUS_FILE_NAME` under the log directory.
+/// Best-effort: a write failure must never block the wrapper loop.
+pub(super) fn write_stuck_status_file(log_dir: &Path, status: &StuckWrapperStatus) {
+    let path = log_dir.join(STUCK_STATUS_FILE_NAME);
+    match serde_json::to_string_pretty(status) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                eprintln!("Failed to write stuck-status file {}: {e}", path.display());
+            }
+        }
+        Err(e) => eprintln!("Failed to serialize stuck-status: {e}"),
+    }
+}
+
+/// Remove the stuck status file (best-effort) once the wrapper recovers, so a
+/// stale banner doesn't linger. A missing file is not an error.
+pub(super) fn clear_stuck_status_file(log_dir: &Path) {
+    let path = log_dir.join(STUCK_STATUS_FILE_NAME);
+    if path.exists() {
+        drop(std::fs::remove_file(&path));
+    }
+}
+
+/// Persisted, *cross-process* identical-failure streak (#4382).
+///
+/// The dominant #3967 wedge makes the child exit 43 against a stale orphan on
+/// the port; the wrapper then exits and launchd relaunches it fresh, so the
+/// in-memory streak resets every cycle and the in-process detector never fires.
+/// This record, written to `STUCK_STREAK_FILE_NAME` under the log dir, lets the
+/// count survive across relaunches.
+///
+/// GC/TTL discipline (AGENTS.md "WHEN writing cleanup/GC logic"): the streak is
+/// reset (not accumulated) whenever the cause changes, the binary `version`
+/// changes, or the record is older than `STUCK_STREAK_TTL_SECS`. A stale file
+/// can therefore never trip the detector forever.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) struct PersistentStuckStreak {
+    pub(super) exit_code: i32,
+    pub(super) is_port_conflict: bool,
+    /// Compiled binary version that observed this streak. A version change
+    /// means a different binary — a fresh episode, not a continuation.
+    pub(super) version: String,
+    /// Consecutive identical cross-process failures so far.
+    pub(super) count: u32,
+    /// Unix seconds of the last update, for TTL-based staleness reset.
+    pub(super) updated_unix_secs: u64,
+}
+
+/// Pure decision for the cross-process streak (#4382): given the previously
+/// persisted record (if any), the new failure signature, the current binary
+/// `version`, and the current time, compute the record to persist and whether
+/// this update crosses `WRAPPER_STUCK_NOTIFY_THRESHOLD` for the first time.
+///
+/// The streak resets to 1 (a fresh episode) when the signature differs, the
+/// version differs, or the prior record is older than `STUCK_STREAK_TTL_SECS`.
+/// It fires exactly once — on the relaunch whose `count` first reaches the
+/// threshold — so a long stale loop doesn't re-notify on every cycle.
+///
+/// Kept pure (no filesystem/clock access) so the three branches — accumulate,
+/// reset-on-cause/version-change, reset-on-TTL — are unit-testable.
+pub(super) fn persistent_streak_action(
+    prior: Option<&PersistentStuckStreak>,
+    exit_code: i32,
+    is_port_conflict: bool,
+    version: &str,
+    now_unix_secs: u64,
+) -> (PersistentStuckStreak, bool) {
+    let continues = prior.is_some_and(|p| {
+        p.exit_code == exit_code
+            && p.is_port_conflict == is_port_conflict
+            && p.version == version
+            && now_unix_secs.saturating_sub(p.updated_unix_secs) <= STUCK_STREAK_TTL_SECS
+    });
+    let count = if continues {
+        // Safe: `continues` implies `prior` is Some.
+        prior.map(|p| p.count).unwrap_or(0).saturating_add(1)
+    } else {
+        1
+    };
+    // Fire exactly on the transition into the threshold, not on every later
+    // identical relaunch.
+    let just_crossed = count == WRAPPER_STUCK_NOTIFY_THRESHOLD;
+    let record = PersistentStuckStreak {
+        exit_code,
+        is_port_conflict,
+        version: version.to_string(),
+        count,
+        updated_unix_secs: now_unix_secs,
+    };
+    (record, just_crossed)
+}
+
+/// Read the persisted cross-process streak record, if present and parseable.
+/// A missing or malformed file is treated as "no prior streak".
+pub(super) fn read_stuck_streak_file(log_dir: &Path) -> Option<PersistentStuckStreak> {
+    let path = log_dir.join(STUCK_STREAK_FILE_NAME);
+    let json = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&json).ok()
+}
+
+/// Write the persisted cross-process streak record (best-effort).
+pub(super) fn write_stuck_streak_file(log_dir: &Path, record: &PersistentStuckStreak) {
+    let path = log_dir.join(STUCK_STREAK_FILE_NAME);
+    match serde_json::to_string_pretty(record) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                eprintln!("Failed to write stuck-streak file {}: {e}", path.display());
+            }
+        }
+        Err(e) => eprintln!("Failed to serialize stuck-streak: {e}"),
+    }
+}
+
+/// Remove the persisted cross-process streak file (best-effort) once the
+/// wrapper makes progress, so a later unrelated failure starts from zero.
+pub(super) fn clear_stuck_streak_file(log_dir: &Path) {
+    let path = log_dir.join(STUCK_STREAK_FILE_NAME);
+    if path.exists() {
+        drop(std::fs::remove_file(&path));
+    }
+}
+
+/// Current wall-clock time in Unix seconds (real time is correct here: this is
+/// operator-facing staleness bookkeeping on disk across OS process restarts,
+/// not simulated node logic, and lives in the `src/bin` CLI rather than the
+/// `crates/core` library subject to the `TimeSource` rule).
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Record an exit-43-style relaunch (stale orphan on the port) against the
+/// persisted cross-process streak and, if it first crosses the threshold,
+/// surface the stuck signal. Called on the `WRAPPER_EXIT_ALREADY_RUNNING` path
+/// in the loop, since that path exits the process before the in-memory streak
+/// can ever accumulate.
+fn handle_persistent_stuck_relaunch(log_dir: &Path, exit_code: i32, is_port_conflict: bool) {
+    let prior = read_stuck_streak_file(log_dir);
+    let (record, just_crossed) = persistent_streak_action(
+        prior.as_ref(),
+        exit_code,
+        is_port_conflict,
+        env!("CARGO_PKG_VERSION"),
+        now_unix_secs(),
+    );
+    write_stuck_streak_file(log_dir, &record);
+    if just_crossed {
+        let status = StuckWrapperStatus::new(exit_code, is_port_conflict, record.count);
+        log_wrapper_event(log_dir, &status.log_line());
+        write_stuck_status_file(log_dir, &status);
+        notify_stuck_wrapper(&status);
+    }
+}
+
+/// Surface the stuck condition as a desktop notification. macOS uses
+/// `osascript display notification`; other platforms rely on the status file +
+/// log line (the banner half of #4382), so this is a no-op there.
+fn notify_stuck_wrapper(status: &StuckWrapperStatus) {
+    #[cfg(target_os = "macos")]
+    {
+        // AppleScript string-literal escaping: backslash and double-quote.
+        let body = applescript_escape(&status.last_error);
+        let title = applescript_escape("Freenet service may be stuck");
+        let script = format!("display notification \"{body}\" with title \"{title}\"");
+        // Best-effort: a notification failure must never block the wrapper.
+        if let Err(e) = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(&script)
+            // Null all three handles: the wrapper has detached from its
+            // console (see the FreeConsole cross-reference in run_wrapper).
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            eprintln!("Failed to post stuck-wrapper notification: {e}");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = status;
+    }
+}
+
+/// Escape a string for safe interpolation into an AppleScript string literal
+/// (backslash first, then double-quote). Kept as a pure function so it can be
+/// unit-tested on non-macOS CI.
+#[allow(dead_code)] // Only called on macOS, but tested everywhere.
+pub(super) fn applescript_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Delete wrapper log files older than the retention period.
