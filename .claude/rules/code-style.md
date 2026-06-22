@@ -344,6 +344,25 @@ Do not add new `OsRng` call sites outside of crypto key/nonce
 generation. Every other "I need randomness" urge in `crates/core/`
 should still go through `GlobalRng`.
 
+### WHEN adding a persisted config field
+
+A field serialized into `config.toml` MUST also be merged back from the
+file into `ConfigArgs` in `ConfigArgs::build()`. Forgetting this is a
+recurring, silent bug: the value is written but ignored on the next
+flag-less restart and reverts to its default. This caused #3890
+(allowed-host/CIDR) and #4275 (is_gateway, bandwidth limits, ...).
+
+The guard test
+`config::tests::all_persisted_config_fields_round_trip_through_build`
+destructures every persisted config struct with no `..`, so a new field
+fails to COMPILE there until you classify it:
+
+  - operator-configurable → add a `get_or_insert` merge line in
+    `build()`, plus a non-default seed value and an `assert_eq!` in the
+    guard (so the round-trip is actually exercised).
+  - not config (peer_id, gateways, secret key material, derived/runtime
+    fields) → bind it to `_` in the guard with a one-line reason.
+
 ### WHEN writing documentation
 
 ```
