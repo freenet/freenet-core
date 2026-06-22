@@ -250,6 +250,23 @@ pub trait ClientEventsProxy {
         id: ClientId,
         response: Result<HostResponse, ClientError>,
     ) -> BoxFuture<'_, Result<(), ClientError>>;
+
+    /// Wire this proxy's HTTP layer to the live node, so HTTP-only operations
+    /// that must reach the executor (the hosted-mode export endpoint, P3-live of
+    /// #4381) can route through the node's `OpManager`. Called ONCE at node
+    /// startup from `p2p_impl`, where the live `op_manager` first meets the
+    /// client proxies (before the combinator consumes them).
+    ///
+    /// The argument is `&dyn Any` carrying an `Arc<OpManager>` rather than a
+    /// concrete `&Arc<OpManager>` ON PURPOSE: `ClientEventsProxy` is a public
+    /// trait but `OpManager` is `pub(crate)`, so naming it in the signature
+    /// would leak a more-private type. Implementors that care
+    /// (`HttpClientApi`) downcast it; the default no-op ignores it, so external
+    /// implementors (e.g. fdev's `StdInput`) need not know about `OpManager` at
+    /// all. Stored as a `Weak` by the recipient so it does not extend the
+    /// node's lifetime, making this per-node (no process-global singleton that
+    /// concurrent in-process nodes would clobber).
+    fn set_op_manager(&self, _op_manager: &dyn std::any::Any) {}
 }
 
 /// Helper function to register a subscription listener for GET/PUT operations with auto-subscribe
@@ -267,12 +284,15 @@ async fn register_subscription_listener(
         "Registering subscription listener"
     );
     let register_listener = op_manager
-        .notify_contract_handler(ContractHandlerEvent::RegisterSubscriberListener {
-            key: instance_id,
-            client_id,
-            summary: None, // No summary for GET/PUT-based subscriptions
-            subscriber_listener: subscription_listener,
-        })
+        .notify_contract_handler_prioritized(
+            ContractHandlerEvent::RegisterSubscriberListener {
+                key: instance_id,
+                client_id,
+                summary: None, // No summary for GET/PUT-based subscriptions
+                subscriber_listener: subscription_listener,
+            },
+            crate::contract::Priority::ClientLocal,
+        )
         .await
         .inspect_err(|err| {
             tracing::error!(
@@ -1032,10 +1052,13 @@ async fn process_open_request(
                             Err(err) if !subscribe => {
                                 // Not joined yet — check if we can serve from local cache
                                 let local_result = op_manager
-                                    .notify_contract_handler(ContractHandlerEvent::GetQuery {
-                                        instance_id: key,
-                                        return_contract_code,
-                                    })
+                                    .notify_contract_handler_prioritized(
+                                        ContractHandlerEvent::GetQuery {
+                                            instance_id: key,
+                                            return_contract_code,
+                                        },
+                                        crate::contract::Priority::ClientLocal,
+                                    )
                                     .await;
                                 if let Ok(ContractHandlerEvent::GetResponse {
                                     key: Some(full_key),
@@ -1074,10 +1097,13 @@ async fn process_open_request(
                         // if subscribed (cache is fresh), otherwise fetch from network.
                         // See PR #2388 for why always-local-first was problematic.
                         let (full_key, state, contract) = match op_manager
-                            .notify_contract_handler(ContractHandlerEvent::GetQuery {
-                                instance_id: key,
-                                return_contract_code,
-                            })
+                            .notify_contract_handler_prioritized(
+                                ContractHandlerEvent::GetQuery {
+                                    instance_id: key,
+                                    return_contract_code,
+                                },
+                                crate::contract::Priority::ClientLocal,
+                            )
                             .await
                         {
                             Ok(ContractHandlerEvent::GetResponse {
@@ -1321,11 +1347,12 @@ async fn process_open_request(
                         // GET+subscribe=true and PUT+subscribe=true bypass this check
                         // because those operations inherently fetch/provide the WASM.
                         match op_manager
-                            .notify_contract_handler(
+                            .notify_contract_handler_prioritized(
                                 crate::contract::ContractHandlerEvent::GetQuery {
                                     instance_id: key,
                                     return_contract_code: true,
                                 },
+                                crate::contract::Priority::ClientLocal,
                             )
                             .await
                         {
@@ -1391,13 +1418,14 @@ async fn process_open_request(
                         };
 
                         let register_listener = op_manager
-                            .notify_contract_handler(
+                            .notify_contract_handler_prioritized(
                                 ContractHandlerEvent::RegisterSubscriberListener {
                                     key,
                                     client_id,
                                     summary,
                                     subscriber_listener,
                                 },
+                                crate::contract::Priority::ClientLocal,
                             )
                             .await
                             .inspect_err(|err| {
@@ -1646,11 +1674,14 @@ async fn process_open_request(
                 let user_context = request.user_context;
 
                 let res = match op_manager
-                    .notify_contract_handler(ContractHandlerEvent::DelegateRequest {
-                        req,
-                        origin_contract,
-                        user_context,
-                    })
+                    .notify_contract_handler_prioritized(
+                        ContractHandlerEvent::DelegateRequest {
+                            req,
+                            origin_contract,
+                            user_context,
+                        },
+                        crate::contract::Priority::ClientLocal,
+                    )
                     .await
                 {
                     Ok(ContractHandlerEvent::DelegateResponse(res)) => {

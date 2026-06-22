@@ -22,7 +22,7 @@ Driver entry points:
 | GET | `get/op_ctx_task.rs::start_client_get`, `start_relay_get`, `start_sub_op_get`, `start_targeted_sub_op_get` |
 | PUT | `put/op_ctx_task.rs::start_client_put`, `start_relay_put`, `start_relay_put_streaming` |
 | UPDATE | `update/op_ctx_task.rs::start_client_update`, `start_relay_request_update`, `start_relay_broadcast_to`, `start_relay_request_update_streaming`, `start_relay_broadcast_to_streaming` |
-| SUBSCRIBE | `subscribe/op_ctx_task.rs::start_client_subscribe`, `start_directed_subscribe` (SubscribeHint placement nudge, #4404), `run_executor_subscribe`, `run_renewal_subscribe`, `start_relay_subscribe`; `subscribe.rs::handle_unsubscribe_inbound` for `Unsubscribe` |
+| SUBSCRIBE | `subscribe/op_ctx_task.rs::start_client_subscribe`, `start_directed_subscribe` (SubscribeHint placement nudge, #4404 — the inbound-hint receive arm in `node.rs` now refuses it above the module-cache occupancy ceiling, `migration_admission_allowed`, #4534), `run_executor_subscribe`, `run_renewal_subscribe`, `start_relay_subscribe`; `subscribe.rs::handle_unsubscribe_inbound` for `Unsubscribe` |
 
 The shared retry-loop driver lives in `op_ctx.rs` (`RetryDriver` trait
 + `drive_retry_loop`). UPDATE is fire-and-forget (no retry loop, no
@@ -63,6 +63,51 @@ for every inbound wire message. Pattern per op:
 `ConnectOp` survives only as a `#[cfg(test)]` fixture wrapping
 `RelayState::handle_request`. Production CONNECT runs entirely on the
 drivers in `connect/op_ctx_task.rs`.
+
+## Critical Invariant: Tag Contract-Handler Events with the Right Priority (#4534)
+
+```
+Every event sent to the single-threaded contract_handling loop carries a
+`crate::contract::Priority` (ClientLocal > NetworkRelay > Background).
+The fair queue drains higher classes first, reserves admission capacity
+(CLIENT_LOCAL_RESERVE) for ClientLocal, and sheds Background to make room.
+A mis-tag silently degrades service: tag a client path Background and it
+gets starved/evicted; tag relay/background ClientLocal and it can exhaust
+the reserve meant to protect real client requests.
+
+Rules for choosing the class at a send site:
+
+  ClientLocal  → the event serves a WS/HTTP client connected to THIS node.
+                 Set it at the client-facing entry points:
+                 - client_events.rs request handlers (GET, RegisterSubscriberListener,
+                   DelegateRequest)
+                 - drive_client_update → update_contract(.., ClientLocal)
+                 - hosted_export.rs ExportUserSecrets
+                 - a client's own PUT reaches the relay driver via
+                   originator-loopback (upstream_addr == own_addr); compute it
+                   with put_store_priority() — DO NOT hardcode NetworkRelay on
+                   the relay PUT store path.
+
+  NetworkRelay → serving a remote peer's relayed op (the default). All
+                 drive_relay_* drivers, ResyncResponse apply, broadcast-path
+                 summaries/deltas that propagate a real UPDATE. This is also
+                 `Priority::DEFAULT`, so untagged callers fall here safely.
+
+  Background   → best-effort node-internal work that must yield to client/relay
+                 traffic: the periodic interest-sync summarize
+                 (summary_if_hosted_or_in_use), placement-migration caching,
+                 renewal, and EvictContract disk reclamation. NEVER tag a
+                 client- or peer-visible op Background.
+
+When a shared helper is reached from BOTH a client and a relay path (e.g.
+put_contract, update_contract), thread a `priority` param through rather
+than hardcoding — decide the class at the driver that knows the origin.
+
+The loop's pop() applies a bounded anti-starvation floor
+(RELAY_STARVATION_FLOOR) so sustained ClientLocal load cannot indefinitely
+starve NetworkRelay/Background — but that is a backstop, not a license to
+mis-tag.
+```
 
 ## Critical Invariant: Initialize-Before-Send
 

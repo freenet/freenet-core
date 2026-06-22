@@ -1,0 +1,17 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Freenet</title>
+<link rel="icon" type="image/svg+xml" href="{favicon}">
+<style>*{{margin:0;padding:0}}html,body{{width:100%;height:100%;overflow:hidden}}iframe{{width:100%;height:100%;border:none;display:block}}</style>{hosted_styles}
+</head>
+<body>
+{hosted_bar}<iframe id="app" sandbox="allow-scripts allow-forms allow-popups allow-downloads allow-modals" allow="clipboard-read; clipboard-write" data-src="{iframe_src}"></iframe>
+<script>
+{SHELL_BRIDGE_JS}
+</script>
+{user_token_script}<script>{bridge_call}</script>
+</body>
+</html>

@@ -705,7 +705,10 @@ struct ConnectionInfo {
 /// `None` everywhere means [`crate::wasm_runtime::SecretScope::Local`]
 /// downstream — byte-for-byte the pre-#4381 behavior — so the flag-off path is
 /// provably inert.
-fn derive_user_context(hosted_mode: bool, user_token: Option<&str>) -> Option<UserSecretContext> {
+pub(crate) fn derive_user_context(
+    hosted_mode: bool,
+    user_token: Option<&str>,
+) -> Option<UserSecretContext> {
     match (hosted_mode, user_token) {
         (true, Some(token)) if !token.is_empty() => {
             Some(UserSecretContext::from_token(token.as_bytes()))
@@ -721,7 +724,7 @@ fn derive_user_context(hosted_mode: bool, user_token: Option<&str>) -> Option<Us
 /// out of the `connection_info` middleware so the security property is provable
 /// without standing up a WS stack (refuse-plaintext-token invariant of #4381).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UserTokenDecision {
+pub(crate) enum UserTokenDecision {
     /// Honor the token: derive the per-user secret context from it.
     Honor,
     /// Hosted mode + a token were present, but the connection is not
@@ -752,7 +755,7 @@ enum UserTokenDecision {
 /// (the kernel sets it from the accepted socket — see `ConnectInfo<SocketAddr>`
 /// in `private_network_filter`), so it is a sound, non-spoofable signal that the
 /// plaintext HTTP port was NOT exposed to the network for this connection.
-fn is_loopback_source(ip: std::net::IpAddr) -> bool {
+pub(crate) fn is_loopback_source(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => v4.is_loopback(),
         std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
@@ -804,7 +807,7 @@ fn is_loopback_source(ip: std::net::IpAddr) -> bool {
 /// A missing source IP (`None`) is treated as insecure (fail closed): we cannot
 /// prove loopback, so we must not honor the token. In production `ConnectInfo`
 /// always yields the peer address; `None` only arises in unit tests that omit it.
-fn decide_user_token(
+pub(crate) fn decide_user_token(
     hosted_mode: bool,
     has_token: bool,
     source_ip: Option<std::net::IpAddr>,

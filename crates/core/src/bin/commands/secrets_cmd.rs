@@ -1846,6 +1846,8 @@ mod tests {
         let got = resolve_secret(Some("from-flag"), Some(env_name), "thing", false)
             .expect("env source must resolve");
         assert_eq!(&*got, "from-env", "env must win over the flag");
+        // SAFETY: test-private env var name removed within this test; nextest
+        // runs each test in its own process.
         unsafe {
             std::env::remove_var(env_name);
         }

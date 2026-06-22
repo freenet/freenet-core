@@ -24,21 +24,45 @@ pub(super) fn routes(config: Config) -> Router {
 async fn web_home_v2(
     key: Path<String>,
     rs: Extension<HttpClientApiRequest>,
+    // Tolerant: see `hosted_mode_or_default` — absent ⇒ hosted-off, so the
+    // standalone `as_router` composition (no HostedMode layer) doesn't 500.
+    hosted_mode: Option<Extension<crate::server::HostedMode>>,
     config: axum::extract::State<Config>,
     headers: axum::http::HeaderMap,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
 ) -> Result<axum::response::Response, WebSocketApiError> {
-    web_home(key, rs, config, headers, ApiVersion::V2, query).await
+    web_home(
+        key,
+        rs,
+        config,
+        headers,
+        ApiVersion::V2,
+        query,
+        hosted_mode_or_default(hosted_mode),
+    )
+    .await
 }
 
 async fn web_subpages_v2(
     Path((key, last_path)): Path<(String, String)>,
     axum::extract::RawQuery(query): axum::extract::RawQuery,
+    // Tolerant: see `hosted_mode_or_default`.
+    hosted_mode: Option<Extension<crate::server::HostedMode>>,
     headers: axum::http::HeaderMap,
     axum::extract::State(config): axum::extract::State<Config>,
     Extension(rs): Extension<HttpClientApiRequest>,
 ) -> Result<axum::response::Response, WebSocketApiError> {
-    web_subpages(key, last_path, ApiVersion::V2, query, headers, &config, rs).await
+    web_subpages(
+        key,
+        last_path,
+        ApiVersion::V2,
+        query,
+        headers,
+        &config,
+        rs,
+        hosted_mode_or_default(hosted_mode),
+    )
+    .await
 }
 
 /// Redirect `/v2/contract/web/{key}` (no trailing slash) to

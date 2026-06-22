@@ -352,123 +352,17 @@ async fn permission_page(
 
     (
         headers,
+        // Every placeholder is passed explicitly: `format!` cannot implicitly
+        // capture `{ident}` variables when the format string comes from a macro
+        // (`include_str!`) instead of a string literal.
         Html(format!(
-            r##"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Freenet - Permission Request</title>
-<style>
-  :root {{ --bg: #0f1419; --fg: #e6e8eb; --card: #1a2028; --accent: #3b82f6;
-          --border: #2d3748; --warn: #f59e0b; --muted: #6b7280; }}
-  @media (prefers-color-scheme: light) {{
-    :root {{ --bg: #f5f5f5; --fg: #1a1a1a; --card: #fff; --accent: #2563eb;
-            --border: #d1d5db; --warn: #d97706; --muted: #9ca3af; }}
-  }}
-  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-  body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-         background: var(--bg); color: var(--fg); display: flex; justify-content: center;
-         align-items: center; min-height: 100vh; padding: 20px; }}
-  .card {{ background: var(--card); border: 1px solid var(--border); border-radius: 12px;
-           padding: 32px; max-width: 520px; width: 100%; box-shadow: 0 4px 24px rgba(0,0,0,0.2); }}
-  .header {{ display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }}
-  .icon {{ font-size: 32px; }}
-  h1 {{ font-size: 18px; font-weight: 600; }}
-  .message-label {{ font-size: 12px; color: var(--muted); margin-bottom: 4px; text-transform: uppercase;
-                    letter-spacing: 0.5px; }}
-  .message {{ font-size: 15px; line-height: 1.5; margin-bottom: 24px; padding: 16px;
-              background: var(--bg); border-left: 3px solid var(--warn); border-radius: 4px; }}
-  .buttons {{ display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }}
-  .btn {{ padding: 10px 24px; border: 1px solid var(--border); border-radius: 8px;
-          background: var(--card); color: var(--fg); font-size: 14px; cursor: pointer;
-          transition: all 0.15s; flex: 1; min-width: 100px; font-weight: 500; }}
-  .btn.primary {{ background: var(--accent); color: white; border-color: var(--accent); }}
-  .btn:hover {{ opacity: 0.85; transform: translateY(-1px); }}
-  .btn:disabled {{ opacity: 0.5; cursor: not-allowed; transform: none; }}
-  .delegate-line {{ font-size: 12px; color: var(--muted); margin-top: 8px;
-                    font-family: monospace; }}
-  .delegate-line .hash {{ user-select: all; }}
-  details.tech {{ margin-top: 12px; font-size: 12px; color: var(--muted); }}
-  details.tech summary {{ cursor: pointer; user-select: none; }}
-  details.tech dl {{ margin-top: 8px; padding-left: 16px; }}
-  details.tech dt {{ font-weight: 600; color: var(--fg); margin-top: 6px; }}
-  details.tech dd {{ font-family: monospace; word-break: break-all; user-select: all; }}
-  .timer {{ margin-top: 16px; font-size: 13px; color: var(--muted); text-align: center; }}
-  .result {{ text-align: center; padding: 24px 0; }}
-  .result .icon {{ font-size: 48px; margin-bottom: 12px; }}
-</style>
-</head>
-<body>
-<div class="card" id="prompt">
-  <div class="header">
-    <span class="icon">&#x1f512;</span>
-    <h1>Permission Request</h1>
-  </div>
-  <div class="message-label">Delegate says:</div>
-  <p class="message">{message}</p>
-  <div class="buttons">
-    {buttons_html}
-  </div>
-  <div class="delegate-line">
-    Delegate: <span class="hash" title="{delegate_full_attr}">{delegate_trunc_html}</span>
-  </div>
-  <details class="tech">
-    <summary>Technical details</summary>
-    <dl>
-      <dt>Delegate</dt>
-      <dd title="{delegate_full_attr}">{delegate_full_attr}</dd>
-      <dt>Caller</dt>
-      <dd{caller_title_html}>{caller_display_html}</dd>
-    </dl>
-  </details>
-  <div class="timer">Auto-deny in <span id="countdown">60</span>s</div>
-</div>
-<div class="card result" id="done" style="display:none">
-  <span class="icon">&#x2705;</span>
-  <h1>Response sent</h1>
-  <p>You can close this tab.</p>
-</div>
-<div class="card result" id="expired" style="display:none">
-  <span class="icon">&#x23f0;</span>
-  <h1>Timed out</h1>
-  <p>The request was auto-denied. You can close this tab.</p>
-</div>
-<script>
-var seconds = 60;
-var timer = setInterval(function() {{
-  seconds--;
-  var el = document.getElementById('countdown');
-  if (el) el.textContent = seconds;
-  if (seconds <= 0) {{
-    clearInterval(timer);
-    document.getElementById('prompt').style.display = 'none';
-    document.getElementById('expired').style.display = 'block';
-  }}
-}}, 1000);
-
-function respond(nonce, index) {{
-  var buttons = document.querySelectorAll('.btn');
-  buttons.forEach(function(b) {{ b.disabled = true; }});
-  fetch('/permission/' + nonce + '/respond', {{
-    method: 'POST',
-    headers: {{ 'Content-Type': 'application/json' }},
-    body: JSON.stringify({{ index: index }})
-  }}).then(function(r) {{
-    if (r.ok) {{
-      document.getElementById('prompt').style.display = 'none';
-      document.getElementById('done').style.display = 'block';
-      clearInterval(timer);
-    }} else {{
-      buttons.forEach(function(b) {{ b.disabled = false; }});
-    }}
-  }}).catch(function() {{
-    buttons.forEach(function(b) {{ b.disabled = false; }});
-  }});
-}}
-</script>
-</body>
-</html>"##,
+            include_str!("permission_prompts/assets/permission_prompt.html"),
+            caller_title_html = caller_title_html,
+            caller_display_html = caller_display_html,
+            delegate_full_attr = delegate_full_attr,
+            delegate_trunc_html = delegate_trunc_html,
+            message = message,
+            buttons_html = buttons_html,
         )),
     )
 }
@@ -721,33 +615,7 @@ fn origin_authority(origin: &str) -> Option<&str> {
 
 /// HTML for when a permission request has expired or already been answered.
 fn expired_html() -> String {
-    r##"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Freenet</title>
-<style>
-  :root { --bg: #0f1419; --fg: #e6e8eb; --card: #1a2028; --border: #2d3748; }
-  @media (prefers-color-scheme: light) {
-    :root { --bg: #f5f5f5; --fg: #1a1a1a; --card: #fff; --border: #d1d5db; }
-  }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-         background: var(--bg); color: var(--fg); display: flex; justify-content: center;
-         align-items: center; min-height: 100vh; }
-  .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px;
-          padding: 40px; text-align: center; max-width: 400px; }
-  .icon { font-size: 48px; margin-bottom: 16px; }
-</style>
-</head>
-<body>
-<div class="card">
-  <div class="icon">&#x2139;</div>
-  <h1>Request expired</h1>
-  <p>This permission request has already been answered or timed out.</p>
-</div>
-</body>
-</html>"##
-        .to_string()
+    include_str!("permission_prompts/assets/expired.html").to_string()
 }
 
 /// Minimal HTML entity escaping for untrusted delegate content.

@@ -382,11 +382,25 @@ impl ContractHandlerChannel<SenderHalve> {
     const CH_EV_RESPONSE_TIME_OUT: Duration = Duration::from_secs(300);
 
     /// Send an event to the contract handler and receive a response event if successful.
+    ///
+    /// Defaults to [`Priority::DEFAULT`] (`NetworkRelay`). Callers on a
+    /// local-client path should use [`send_to_handler_prioritized`] with
+    /// [`Priority::ClientLocal`] (#4534).
     pub async fn send_to_handler(
         &self,
         ev: ContractHandlerEvent,
     ) -> Result<ContractHandlerEvent, ContractError> {
-        self.send_to_handler_with_timeout(ev, Self::CH_EV_RESPONSE_TIME_OUT)
+        self.send_to_handler_prioritized(ev, super::fair_queue::Priority::DEFAULT)
+            .await
+    }
+
+    /// Send an event at an explicit priority class and await its response.
+    pub async fn send_to_handler_prioritized(
+        &self,
+        ev: ContractHandlerEvent,
+        priority: super::fair_queue::Priority,
+    ) -> Result<ContractHandlerEvent, ContractError> {
+        self.send_to_handler_with_timeout(ev, Self::CH_EV_RESPONSE_TIME_OUT, priority)
             .await
     }
 
@@ -398,6 +412,7 @@ impl ContractHandlerChannel<SenderHalve> {
         &self,
         ev: ContractHandlerEvent,
         timeout: Duration,
+        priority: super::fair_queue::Priority,
     ) -> Result<ContractHandlerEvent, ContractError> {
         let id = EV_ID.with(|c| {
             let v = c.get();
@@ -407,7 +422,12 @@ impl ContractHandlerChannel<SenderHalve> {
         let (result, result_receiver) = tokio::sync::oneshot::channel();
         self.end
             .event_sender
-            .send(InternalCHEvent { ev, id, result })
+            .send(InternalCHEvent {
+                ev,
+                id,
+                priority,
+                result,
+            })
             .map_err(|err| ContractError::ChannelDropped(Box::new(err.0.ev)))?;
         match tokio::time::timeout(timeout, result_receiver).await {
             Ok(Ok((_, res))) => Ok(res),
@@ -418,10 +438,19 @@ impl ContractHandlerChannel<SenderHalve> {
     /// Send an event to the contract handler without waiting for a response.
     ///
     /// Used for fire-and-forget events like `ClientDisconnect` that don't
-    /// produce a response.
+    /// produce a response. Defaults to [`Priority::DEFAULT`].
     pub fn send_to_handler_fire_and_forget(
         &self,
         ev: ContractHandlerEvent,
+    ) -> Result<(), ContractError> {
+        self.send_to_handler_fire_and_forget_prioritized(ev, super::fair_queue::Priority::DEFAULT)
+    }
+
+    /// Fire-and-forget send at an explicit priority class.
+    pub fn send_to_handler_fire_and_forget_prioritized(
+        &self,
+        ev: ContractHandlerEvent,
+        priority: super::fair_queue::Priority,
     ) -> Result<(), ContractError> {
         let id = EV_ID.with(|c| {
             let v = c.get();
@@ -433,7 +462,12 @@ impl ContractHandlerChannel<SenderHalve> {
         let (result, _) = tokio::sync::oneshot::channel();
         self.end
             .event_sender
-            .send(InternalCHEvent { ev, id, result })
+            .send(InternalCHEvent {
+                ev,
+                id,
+                priority,
+                result,
+            })
             .map_err(|err| ContractError::ChannelDropped(Box::new(err.0.ev)))?;
         Ok(())
     }
@@ -618,10 +652,16 @@ impl ContractHandlerChannel<ContractHandlerHalve> {
 
     pub async fn recv_from_sender(
         &mut self,
-    ) -> Result<(EventId, ContractHandlerEvent), ContractError> {
-        if let Some(InternalCHEvent { ev, id, result }) = self.end.event_receiver.recv().await {
+    ) -> Result<(EventId, ContractHandlerEvent, super::fair_queue::Priority), ContractError> {
+        if let Some(InternalCHEvent {
+            ev,
+            id,
+            priority,
+            result,
+        }) = self.end.event_receiver.recv().await
+        {
             self.end.waiting_response.insert(id, result);
-            return Ok((EventId { id }, ev));
+            return Ok((EventId { id }, ev, priority));
         }
         Err(ContractError::NoEvHandlerResponse)
     }
@@ -630,13 +670,20 @@ impl ContractHandlerChannel<ContractHandlerHalve> {
     ///
     /// Returns `Ok(None)` if the channel is empty, `Err` if the channel is closed.
     /// Used by the fair-queue drain loop to batch-fill the fair queue before processing.
+    #[allow(clippy::type_complexity)]
     pub fn try_recv_from_sender(
         &mut self,
-    ) -> Result<Option<(EventId, ContractHandlerEvent)>, ContractError> {
+    ) -> Result<Option<(EventId, ContractHandlerEvent, super::fair_queue::Priority)>, ContractError>
+    {
         match self.end.event_receiver.try_recv() {
-            Ok(InternalCHEvent { ev, id, result }) => {
+            Ok(InternalCHEvent {
+                ev,
+                id,
+                priority,
+                result,
+            }) => {
                 self.end.waiting_response.insert(id, result);
-                Ok(Some((EventId { id }, ev)))
+                Ok(Some((EventId { id }, ev, priority)))
             }
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(None),
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
@@ -656,7 +703,33 @@ struct InternalCHEvent {
     ev: ContractHandlerEvent,
     id: u64,
     // client_id: Option<ClientId>,
+    /// Scheduling/admission priority class for the fair queue (#4534).
+    priority: super::fair_queue::Priority,
     result: tokio::sync::oneshot::Sender<(EventId, ContractHandlerEvent)>,
+}
+
+/// A user token carried on a [`ContractHandlerEvent::ExportUserSecrets`] event,
+/// held in `Zeroizing` so it is wiped on drop. Its `Debug` redacts the bytes:
+/// `ContractHandlerEvent` derives `Debug` and is logged, and the token is a
+/// high-value, durable credential that must NEVER reach a log line (mirrors how
+/// `UserSecretContext`'s `Debug` redacts its `dek_secret`).
+pub(crate) struct RedactedToken(zeroize::Zeroizing<Vec<u8>>);
+
+impl RedactedToken {
+    pub(crate) fn new(token: Vec<u8>) -> Self {
+        Self(zeroize::Zeroizing::new(token))
+    }
+
+    /// Borrow the raw token bytes (for deriving the bundle key only).
+    pub(crate) fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for RedactedToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RedactedToken(<redacted>)")
+    }
 }
 
 #[derive(Debug)]
@@ -674,6 +747,25 @@ pub(crate) enum ContractHandlerEvent {
         user_context: Option<UserSecretContext>,
     },
     DelegateResponse(Vec<OutboundDelegateMsg>),
+    /// Export a hosted user's per-user delegate secrets into an encrypted
+    /// bundle (hosted-mode export, P3-live of #4381). Carries the
+    /// connection-derived `user_context` (the forge-proof per-user namespace,
+    /// same channel as `DelegateRequest`) and the raw user `token` used as the
+    /// bundle-key material so the user can re-import with the token they hold.
+    ///
+    /// Like `DelegateRequest::user_context`, `user_context`'s `Debug` redacts
+    /// the dek_secret. The `token` is sensitive (high-value, durable
+    /// credential): it is NOT derived from `Debug`/`Display` (this struct has
+    /// neither field rendered) and must never be logged.
+    ExportUserSecrets {
+        user_context: UserSecretContext,
+        /// Raw user token bytes, redacted in `Debug` and wiped on drop; used
+        /// only to derive the bundle encryption key.
+        token: RedactedToken,
+    },
+    /// Response to an `ExportUserSecrets` request: the encrypted bundle bytes,
+    /// or an executor error.
+    ExportUserSecretsResponse(Result<Vec<u8>, ExecutorError>),
     /// Try to push/put a new value into the contract
     PutQuery {
         key: ContractKey,
@@ -892,6 +984,23 @@ impl std::fmt::Display for ContractHandlerEvent {
                     "evict contract {{ {key}, expected_generation: {expected_generation} }}"
                 )
             }
+            // `token` deliberately omitted (high-value credential). `user_id`
+            // is a non-secret namespace tag, safe to render.
+            ContractHandlerEvent::ExportUserSecrets { user_context, .. } => {
+                write!(
+                    f,
+                    "export user secrets {{ user_id: {:?} }}",
+                    user_context.user_id()
+                )
+            }
+            ContractHandlerEvent::ExportUserSecretsResponse(result) => match result {
+                Ok(bundle) => write!(
+                    f,
+                    "export user secrets response {{ {} bytes }}",
+                    bundle.len()
+                ),
+                Err(e) => write!(f, "export user secrets failed {{ {e} }}"),
+            },
         }
     }
 }
@@ -922,7 +1031,7 @@ pub mod test {
                 })
                 .await
         });
-        let (id, ev) =
+        let (id, ev, _priority) =
             tokio::time::timeout(Duration::from_millis(100), rcv_halve.recv_from_sender())
                 .await??;
 
@@ -989,7 +1098,7 @@ pub mod test {
         });
 
         // Receive the event from the handler side
-        let (id, ev) =
+        let (id, ev, _priority) =
             tokio::time::timeout(Duration::from_millis(100), rcv_halve.recv_from_sender())
                 .await??;
 
@@ -1178,7 +1287,7 @@ pub mod test {
         // try_recv should succeed
         let result = rcv_halve.try_recv_from_sender();
         assert!(result.is_ok());
-        let (id, event) = result.unwrap().expect("should have received an event");
+        let (id, event, _priority) = result.unwrap().expect("should have received an event");
         // Verify we got a valid EventId (any u64 is valid)
 
         let ContractHandlerEvent::PutQuery { state, .. } = event else {

@@ -223,6 +223,12 @@ async fn run_network_node_with_signals(
     use freenet::transport::{clear_urgent_update, get_highest_seen_version, is_urgent_update};
     use tokio::signal;
 
+    // #4549: this is the real node process (not a test / embedded use), so enable the
+    // fast-exit watchdog — a fatal network-event-listener exit will abort the process
+    // (code 42) for a prompt systemd restart + auto-update, instead of risking a hang
+    // in teardown that leaves the node network-dead and spinning.
+    freenet::enable_abort_on_fatal_listener_exit();
+
     // Set up SIGTERM handler for Unix systems
     #[cfg(unix)]
     let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
