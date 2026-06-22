@@ -401,6 +401,16 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
         run: cargo clippy --locked -- -D warnings
 
+      # Guards the opt-in `trace-ot` OpenTelemetry feature against silent
+      # rot: it is excluded from the default build, so a refactor can break
+      # its #[cfg(feature = "trace-ot")] code paths without any other CI job
+      # noticing. See #4225.
+      - name: clippy (trace-ot feature)
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: cargo clippy --locked -p freenet --features trace-ot -- -D warnings
+
   # Windows compile check - catches missing imports, feature flags, and
   # platform-specific errors that Linux CI misses. Added after #3685 where
   # PRs #3669/#3680 introduced Windows-only code that failed to compile,
