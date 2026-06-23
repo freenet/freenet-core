@@ -650,6 +650,7 @@ mod test {
         db_dir: &std::path::Path,
     ) -> SecretsStore {
         std::fs::create_dir_all(secrets_dir).unwrap();
+        std::fs::create_dir_all(db_dir).unwrap();
         let db = Storage::new(db_dir).await.expect("db");
         SecretsStore::new(secrets_dir.to_path_buf(), Default::default(), db).expect("store")
     }

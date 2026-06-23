@@ -1605,6 +1605,36 @@ impl SecretsStore {
     // from the delegate's wasm+params), so a re-installed webapp shipping the
     // same delegate yields the same key and the imported secrets line up.
 
+    /// Map `delegate-key-bytes (32) -> real CodeHash` from this store's in-memory
+    /// index for `scope`, so the on-disk enumeration can recover the real
+    /// `code_hash` of a delegate the dir name (key-only) can't carry. Best-effort:
+    /// a delegate this executor never registered simply isn't in the map (the
+    /// caller falls back to a placeholder code_hash, which is inert).
+    fn index_code_hashes_by_key(
+        &self,
+        scope: &SecretScope<'_>,
+    ) -> std::collections::HashMap<[u8; 32], CodeHash> {
+        let mut out = std::collections::HashMap::new();
+        match scope {
+            SecretScope::Local => {
+                for entry in self.key_to_secret_part.iter() {
+                    let dk = entry.key();
+                    // `DelegateKey` derefs to its 32-byte key.
+                    out.insert(**dk, *dk.code_hash());
+                }
+            }
+            SecretScope::User { id, .. } => {
+                for entry in self.user_key_to_secret_part.iter() {
+                    let (dk, user) = entry.key();
+                    if user == *id {
+                        out.insert(**dk, *dk.code_hash());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Enumerate every `(DelegateKey, secret_hash)` for `scope` by walking the
     /// on-disk `secrets_dir` (the shared source of truth) instead of this
     /// store's per-instance in-memory index.
@@ -1651,6 +1681,19 @@ impl SecretsStore {
             // base_path missing/unreadable ⇒ no secrets to export.
             return out;
         };
+        // Recover each delegate's real `code_hash` from the in-memory index when
+        // this executor knows it. The on-disk delegate dir name encodes only the
+        // 32-byte key (`DelegateKey::encode()`), NOT the code_hash — but the
+        // bundle records `code_hash`, and `DelegateKey`'s `Eq`/`Hash` cover both
+        // fields, so a placeholder would make the exported key `!=` the real one.
+        // code_hash is otherwise inert (path/DEK/read are key-only), so a secret
+        // written by ANOTHER executor for a delegate THIS executor never
+        // registered still exports + decrypts correctly under the zero
+        // placeholder; it just carries a placeholder code_hash in the bundle
+        // (inert for import). The exporting executor has almost always
+        // registered the delegate, so the real code_hash is recovered in
+        // practice.
+        let code_hashes = self.index_code_hashes_by_key(scope);
         for delegate_entry in delegate_dirs.flatten() {
             let delegate_path = delegate_entry.path();
             if !delegate_path.is_dir() {
@@ -1662,8 +1705,11 @@ impl SecretsStore {
             let Some(delegate_key_bytes) = decode_bs58_32(&delegate_name) else {
                 continue; // not a delegate dir (e.g. a stray non-bs58 name)
             };
-            // code_hash is inert for path/DEK/read; use a zero placeholder.
-            let delegate = DelegateKey::new(delegate_key_bytes, CodeHash::from(&[0u8; 32]));
+            let code_hash = code_hashes
+                .get(&delegate_key_bytes)
+                .copied()
+                .unwrap_or_else(|| CodeHash::from(&[0u8; 32]));
+            let delegate = DelegateKey::new(delegate_key_bytes, code_hash);
 
             // The directory that actually holds this scope's secret files.
             let scope_path = match scope {
@@ -5324,14 +5370,25 @@ mod test {
         store.db.store_secrets_index(delegate.key(), &[])?;
         store.key_to_secret_part.remove(delegate.key());
 
-        // Pre-condition: file present, index empty → invisible to enumeration.
+        // Pre-condition: file present, in-memory index empty.
         let file_path = secrets_dir
             .join(delegate.key().encode())
             .join(secret_id.encode());
         assert!(file_path.exists(), "secret file should still be on disk");
         assert!(
-            store.export_scope_entries(SecretScope::Local)?.is_empty(),
-            "pre-condition: unindexed secret must be invisible to enumeration"
+            store.key_to_secret_part.get(delegate.key()).is_none(),
+            "pre-condition: the in-memory index entry was dropped (crash window)"
+        );
+        // Since the export now enumerates from DISK (the shared source of truth,
+        // for cross-executor consistency — see `enumerate_scope_on_disk`), the
+        // completed on-disk secret IS already visible to export even before the
+        // index is repaired. This is the intended improvement: a backup includes
+        // every completed write regardless of in-memory index state. (It was
+        // "invisible" only under the OLD in-memory-index enumeration.)
+        assert_eq!(
+            store.export_scope_entries(SecretScope::Local)?.len(),
+            1,
+            "disk-based export sees the completed on-disk secret pre-repair"
         );
 
         // Retry the import WITHOUT overwrite. It must skip the rewrite
@@ -5403,9 +5460,21 @@ mod test {
             .user_key_to_secret_part
             .remove(&(delegate.key().clone(), *ctx.user_id()));
 
+        // In-memory index row dropped, but the disk-based export (the source of
+        // truth, for cross-executor consistency) still sees the completed
+        // on-disk secret pre-repair — the intended improvement (was "invisible"
+        // only under the OLD in-memory-index enumeration).
         assert!(
-            store.export_scope_entries(ctx.scope())?.is_empty(),
-            "pre-condition: unindexed user secret invisible"
+            store
+                .user_key_to_secret_part
+                .get(&(delegate.key().clone(), *ctx.user_id()))
+                .is_none(),
+            "pre-condition: the in-memory user-index entry was dropped"
+        );
+        assert_eq!(
+            store.export_scope_entries(ctx.scope())?.len(),
+            1,
+            "disk-based export sees the completed on-disk user secret pre-repair"
         );
 
         let wrote = store.import_secret_by_hash(
@@ -5417,6 +5486,17 @@ mod test {
         )?;
         assert!(!wrote);
 
+        // Post-condition: import repaired the ReDb + in-memory user index (for
+        // index consumers other than export, e.g. the `.keys` registry / ReDb
+        // consistency), and export still enumerates the secret.
+        assert!(
+            store
+                .user_key_to_secret_part
+                .get(&(delegate.key().clone(), *ctx.user_id()))
+                .map(|e| e.value().contains(&secret_hash))
+                .unwrap_or(false),
+            "in-memory user index must be repaired"
+        );
         let entries = store.export_scope_entries(ctx.scope())?;
         assert_eq!(
             entries.len(),
