@@ -1671,15 +1671,69 @@ impl SecretsStore {
     /// `delegate.encode()`), so the placeholder reads and decrypts the secret
     /// identically; it only ends up as a (functionally inert) 32-byte value in
     /// the exported bundle's `code_hash` field.
-    fn enumerate_scope_on_disk(&self, scope: &SecretScope<'_>) -> Vec<(DelegateKey, SecretKey)> {
+    ///
+    /// FAIL-LOUD: an UNEXPECTED I/O error (permission denied, EIO, a vanished
+    /// mount — anything other than `NotFound`) is PROPAGATED, not swallowed.
+    /// Swallowing it would let the export seal a SUCCESSFUL but silently
+    /// INCOMPLETE bundle — the same silent-incompleteness class this whole fix
+    /// removes, via a different door. `NotFound` is the one expected-absent case
+    /// (base_path or a user-scope dir simply doesn't exist ⇒ that scope has no
+    /// secrets) and is treated as empty/skip.
+    fn enumerate_scope_on_disk(
+        &self,
+        scope: &SecretScope<'_>,
+    ) -> Result<Vec<(DelegateKey, SecretKey)>, SecretStoreError> {
         let mut out = Vec::new();
+        self.walk_scope_secrets_on_disk(scope, |delegate, secret_hash| {
+            out.push((delegate, secret_hash));
+            std::ops::ControlFlow::Continue(())
+        })?;
+        Ok(out)
+    }
+
+    /// Count the secrets under `scope` on disk, STOPPING as soon as the count
+    /// reaches `stop_at`. Used for the export count-cap pre-check so an
+    /// over-limit (attacker-controlled) scope is rejected without materializing
+    /// — or even fully traversing past `stop_at` — its entries. Same disk walk /
+    /// filter as the gather, and the same fail-loud I/O semantics.
+    fn count_scope_secrets_on_disk(
+        &self,
+        scope: &SecretScope<'_>,
+        stop_at: usize,
+    ) -> Result<usize, SecretStoreError> {
+        let mut count = 0usize;
+        self.walk_scope_secrets_on_disk(scope, |_delegate, _secret_hash| {
+            count += 1;
+            if count >= stop_at {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        })?;
+        Ok(count)
+    }
+
+    /// Shared on-disk scope walk: invoke `visit` once per secret blob under
+    /// `scope`, recovering the real `code_hash` for known delegates (see
+    /// [`Self::index_code_hashes_by_key`]). `visit` returns
+    /// [`ControlFlow::Break`](std::ops::ControlFlow) to stop early (the count
+    /// cap uses this). Returns `Err` on any unexpected I/O error (fail-loud);
+    /// `NotFound` is treated as empty/skip.
+    fn walk_scope_secrets_on_disk(
+        &self,
+        scope: &SecretScope<'_>,
+        mut visit: impl FnMut(DelegateKey, SecretKey) -> std::ops::ControlFlow<()>,
+    ) -> Result<(), SecretStoreError> {
+        use std::ops::ControlFlow;
         // Iterate the delegate directories under base_path. Each is named
         // `bs58(delegate_key)`; non-directory / non-bs58 root entries
         // (`node_kek`, `kek_backend`, `kek_backend.tmp`) are skipped by the
-        // 32-byte-bs58 decode below.
-        let Ok(delegate_dirs) = fs::read_dir(&self.base_path) else {
-            // base_path missing/unreadable ⇒ no secrets to export.
-            return out;
+        // 32-byte-bs58 decode below. A missing base_path ⇒ no secrets; any other
+        // read error is unexpected ⇒ fail loud.
+        let delegate_dirs = match fs::read_dir(&self.base_path) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(SecretStoreError::IO(e)),
         };
         // Recover each delegate's real `code_hash` from the in-memory index when
         // this executor knows it. The on-disk delegate dir name encodes only the
@@ -1694,7 +1748,9 @@ impl SecretsStore {
         // registered the delegate, so the real code_hash is recovered in
         // practice.
         let code_hashes = self.index_code_hashes_by_key(scope);
-        for delegate_entry in delegate_dirs.flatten() {
+        for delegate_entry in delegate_dirs {
+            // A per-entry read error mid-iteration is unexpected ⇒ fail loud.
+            let delegate_entry = delegate_entry.map_err(SecretStoreError::IO)?;
             let delegate_path = delegate_entry.path();
             if !delegate_path.is_dir() {
                 continue;
@@ -1716,10 +1772,15 @@ impl SecretsStore {
                 SecretScope::Local => delegate_path.clone(),
                 SecretScope::User { id, .. } => delegate_path.join("users").join(id.encode()),
             };
-            let Ok(files) = fs::read_dir(&scope_path) else {
-                continue; // this delegate has no secrets for this scope
+            // A missing scope dir ⇒ this delegate has no secrets for this scope
+            // (expected). Any other read error is unexpected ⇒ fail loud.
+            let files = match fs::read_dir(&scope_path) {
+                Ok(rd) => rd,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(SecretStoreError::IO(e)),
             };
-            for file_entry in files.flatten() {
+            for file_entry in files {
+                let file_entry = file_entry.map_err(SecretStoreError::IO)?;
                 // Only regular files whose name bs58-decodes to a 32-byte hash.
                 let name = file_entry.file_name();
                 let Some(name) = name.to_str() else { continue };
@@ -1734,10 +1795,12 @@ impl SecretsStore {
                     Ok(ft) if ft.is_file() => {}
                     _ => continue,
                 }
-                out.push((delegate.clone(), secret_hash));
+                if let ControlFlow::Break(()) = visit(delegate.clone(), secret_hash) {
+                    return Ok(());
+                }
             }
         }
-        out
+        Ok(())
     }
 
     /// Read + decrypt the active secret blob named `bs58(secret_hash)` under
@@ -1784,16 +1847,34 @@ impl SecretsStore {
         }
     }
 
-    /// Number of secrets currently held under `scope`.
+    /// `true` if `scope` holds MORE than `max_count` secrets on disk, decided
+    /// WITHOUT enumerating beyond `max_count + 1` entries.
     ///
-    /// A metadata-only DISK walk (no decrypt), used by
-    /// [`super::secret_export::export_bundle`] to enforce the export count cap
-    /// BEFORE any secret is read/decrypted. Counts from disk (the shared source
-    /// of truth) for the same cross-executor-consistency reason as
-    /// [`Self::enumerate_scope_on_disk`] — so the cap is checked against the
-    /// SAME set the export will actually gather.
-    pub fn scope_entry_count(&self, scope: &SecretScope<'_>) -> usize {
-        self.enumerate_scope_on_disk(scope).len()
+    /// Used by [`super::secret_export::export_bundle`] to enforce the export
+    /// count cap BEFORE any secret is read/decrypted AND before materializing
+    /// the (attacker-controlled) entry list: the streaming count stops the
+    /// instant it has seen `max_count + 1` matching entries, so an over-limit
+    /// scope is rejected without a full traversal/allocation. Counts from disk
+    /// (the shared source of truth) for the same cross-executor-consistency
+    /// reason as [`Self::enumerate_scope_on_disk`], using the same walk/filter,
+    /// so the cap is checked against the SAME set the gather will materialize.
+    /// Returns `Err` on an unexpected I/O error (fail-loud, same as the gather).
+    pub fn scope_count_exceeds(
+        &self,
+        scope: &SecretScope<'_>,
+        max_count: usize,
+    ) -> Result<bool, SecretStoreError> {
+        // Stop after seeing max_count + 1 — enough to know we're over the cap.
+        let stop_at = max_count.saturating_add(1);
+        Ok(self.count_scope_secrets_on_disk(scope, stop_at)? > max_count)
+    }
+
+    /// Number of secrets currently held under `scope` on disk (full count, no
+    /// decrypt). Used by tests / callers that need the exact count; the export
+    /// count cap uses the streaming [`Self::scope_count_exceeds`] instead so an
+    /// over-limit scope is never fully traversed.
+    pub fn scope_entry_count(&self, scope: &SecretScope<'_>) -> Result<usize, SecretStoreError> {
+        self.count_scope_secrets_on_disk(scope, usize::MAX)
     }
 
     /// Gather every secret under `scope`, decrypted, as portable export
@@ -1841,8 +1922,9 @@ impl SecretsStore {
         // secret, so the in-memory index can be stale and miss completed
         // on-disk writes. The disk walk is the source of truth and includes
         // every committed secret regardless of which executor stored it.
-        // See `enumerate_scope_on_disk`.
-        let refs = self.enumerate_scope_on_disk(&scope);
+        // A disk I/O failure here aborts the export (fail-loud) rather than
+        // sealing a silently-partial bundle. See `enumerate_scope_on_disk`.
+        let refs = self.enumerate_scope_on_disk(&scope)?;
         let mut entries = Vec::with_capacity(refs.len());
         let mut total_bytes: usize = 0;
         for (delegate, secret_hash) in refs {

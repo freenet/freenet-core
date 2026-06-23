@@ -467,8 +467,9 @@ fn export_bundle_with_limits(
     // Defense-in-depth bound (#4381 P5): reject an over-large export so an
     // authenticated token-holder cannot coerce the node into unbounded crypto/IO
     // or memory. BOTH checks happen BEFORE/DURING the heavy work, never after:
-    //   - The count check is a cheap in-memory metadata walk (no decrypt) and
-    //     short-circuits before a single secret is read.
+    //   - The count check STREAMS the on-disk walk and stops the instant it has
+    //     seen max_count + 1 entries (no full traversal, no allocation of the
+    //     attacker-controlled entry list) — see `scope_count_exceeds`.
     //   - The byte check is enforced INCREMENTALLY inside
     //     `export_scope_entries_bounded`, which aborts the decrypt loop the
     //     instant the running plaintext total crosses the cap and drops the
@@ -476,12 +477,14 @@ fn export_bundle_with_limits(
     //     never gets multi-GiB decrypted+buffered before the rejection.
     // Both are hard rejections (never silent truncation), so no user data is
     // lost — the caller surfaces a 413 and an operator can raise the limit if a
-    // real workload ever needs it.
-    let count = store.scope_entry_count(&scope);
-    if count > max_count {
+    // real workload ever needs it. A disk I/O failure during the count
+    // propagates (fail-loud) rather than passing the cap on a partial walk.
+    if store.scope_count_exceeds(&scope, max_count)? {
         return Err(ExportError::TooLarge {
             what: "secret count",
-            actual: count,
+            // The streaming count stops at max_count + 1, so we report that as a
+            // lower bound on the true (over-cap) count rather than a full count.
+            actual: max_count + 1,
             limit: max_count,
         });
     }
@@ -1216,10 +1219,112 @@ mod test {
 
         // The count cap (scope_entry_count) must also see BOTH (it walks disk).
         assert_eq!(
-            store_b.scope_entry_count(&ctx.scope()),
+            store_b.scope_entry_count(&ctx.scope()).unwrap(),
             2,
             "scope_entry_count must count both on-disk secrets, not just B's index"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn export_fails_loud_on_unexpected_io_error() {
+        // FAIL-LOUD (#4563 P2): an unexpected I/O error during enumeration must
+        // make the export FAIL, not seal a silently-partial/empty bundle. We
+        // make the user's on-disk scope dir UNREADABLE (chmod 000) so read_dir
+        // returns PermissionDenied (not NotFound) — the export must return Err.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = new_store(tmp.path()).await;
+        let token = b"io-error-user";
+        let ctx = UserSecretContext::from_token(token);
+        let d = delegate(1);
+        let s = SecretsId::new(b"k".to_vec());
+        let _ = put_user(&mut store, &d, &ctx, &s, b"v");
+
+        // The scope dir that now holds the secret: base/<delegate>/users/<id>.
+        let scope_dir = tmp
+            .path()
+            .join("secrets")
+            .join(d.key().encode())
+            .join("users")
+            .join(ctx.user_id().encode());
+        assert!(scope_dir.is_dir(), "scope dir must exist after the write");
+
+        // Make it unreadable. If running as root (chmod 000 is bypassed), skip —
+        // the branch is also covered by the count path's identical fail-loud.
+        std::fs::set_permissions(&scope_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let still_readable = std::fs::read_dir(&scope_dir).is_ok();
+        if still_readable {
+            // root or a permissive FS: restore and skip the assertion.
+            std::fs::set_permissions(&scope_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+
+        let material = BundleKeyMaterial::Token(token);
+        let result = export_bundle(&store, ctx.scope(), &material);
+        // Restore perms so tempdir cleanup works regardless of the assertion.
+        std::fs::set_permissions(&scope_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            result.is_err(),
+            "an unreadable scope dir must make the export FAIL, not seal a partial bundle"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_of_absent_scope_is_clean_empty_not_error() {
+        // A user with NO stored secrets has no on-disk users/<id> dir → read_dir
+        // NotFound, which is EXPECTED-absent → a clean EMPTY bundle, NOT an error
+        // (must not be conflated with the fail-loud I/O-error path).
+        let tmp = tempfile::tempdir().unwrap();
+        let store = new_store(tmp.path()).await;
+        let token = b"never-stored-anything";
+        let ctx = UserSecretContext::from_token(token);
+        let material = BundleKeyMaterial::Token(token);
+        let bundle = export_bundle(&store, ctx.scope(), &material)
+            .expect("absent user scope must export a clean empty bundle, not error");
+        let payload = open_bundle(&bundle, &material).expect("open empty");
+        assert!(payload.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn count_cap_check_streams_and_stops_early() {
+        // The count-cap check must decide "over the cap" WITHOUT enumerating the
+        // whole (attacker-controlled) scope. We store 5 secrets and assert
+        // scope_count_exceeds(cap=2) is true. The streaming counter stops after
+        // seeing 3 (cap+1), so it never materializes all 5 — the gather
+        // (export_scope_entries_bounded) is never reached for an over-cap scope.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = new_store(tmp.path()).await;
+        let token = b"count-stream-user";
+        let ctx = UserSecretContext::from_token(token);
+        let d = delegate(1);
+        for i in 0..5u8 {
+            let s = SecretsId::new(vec![b'k', i]);
+            put_user(&mut store, &d, &ctx, &s, b"v");
+        }
+        // Over the cap of 2.
+        assert!(
+            store.scope_count_exceeds(&ctx.scope(), 2).unwrap(),
+            "5 secrets must exceed a cap of 2"
+        );
+        // At/under the cap is NOT exceeded (boundary: 5 with cap 5 → not over).
+        assert!(
+            !store.scope_count_exceeds(&ctx.scope(), 5).unwrap(),
+            "exactly-at-cap must NOT be flagged as exceeding"
+        );
+        assert!(
+            !store.scope_count_exceeds(&ctx.scope(), 10).unwrap(),
+            "under-cap must NOT be flagged as exceeding"
+        );
+        // And the full export of an over-cap scope is rejected as TooLarge.
+        let material = BundleKeyMaterial::Token(token);
+        let err = export_bundle_with_limits(&store, ctx.scope(), &material, 2, usize::MAX)
+            .expect_err("over-count export must be rejected");
+        let ExportError::TooLarge { what, limit, .. } = err else {
+            panic!("expected TooLarge(secret count), got {err:?}");
+        };
+        assert_eq!(what, "secret count");
+        assert_eq!(limit, 2);
     }
 
     fn read_local(store: &SecretsStore, d: &Delegate<'static>, hash: &[u8; 32]) -> Vec<u8> {
