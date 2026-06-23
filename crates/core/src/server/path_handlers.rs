@@ -2503,6 +2503,12 @@ mod tests {
             "access-key backup/restore controls missing"
         );
         assert!(hosted.contains("Export data"), "export control missing");
+        // The export button must be wired to the node export endpoint, not a
+        // placeholder. Pin the route so a refactor cannot silently revert it.
+        assert!(
+            hosted.contains("/v1/hosted/export"),
+            "export button is not wired to the export endpoint"
+        );
         // The access key is read from the shell-only token global; it is never
         // injected into the sandboxed iframe.
         assert!(
