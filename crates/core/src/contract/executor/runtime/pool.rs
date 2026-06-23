@@ -99,6 +99,150 @@ pub struct RuntimePool {
     /// `lookup_key`, `get_subscription_info`, `remove_client`
     /// (read-only / no executor checkout).
     in_flight_contracts: HashMap<ContractKey, usize>,
+    /// Bounds how many hosted-mode secret exports may run OFF-LOOP concurrently
+    /// (#4381 P5). Each admitted export holds one permit (in its `ExportJob`)
+    /// AND one pool executor for its duration. Sized to
+    /// [`effective_export_permits`] (`min(MAX_CONCURRENT_EXPORTS, pool_size-1)`)
+    /// so >=1 executor is ALWAYS reserved for normal contract ops — this is the
+    /// enforced anti-deadlock invariant (see `effective_export_permits`), not a
+    /// prose hope. `Arc` so an admitted `ExportJob` can hold an owned permit
+    /// across the spawned background task without borrowing the pool.
+    export_semaphore: Arc<Semaphore>,
+}
+
+/// Max hosted-mode secret exports allowed to run off-loop at once (#4381 P5),
+/// BEFORE the pool-size clamp in [`effective_export_permits`].
+///
+/// Small and fixed: exports are an occasional self-host-migration action, not a
+/// hot path, and each one holds a pool executor for its duration. The real cap
+/// is `min(this, pool_size - 1)` so >=1 executor is ALWAYS free for normal ops.
+/// A request that arrives while that many exports are in flight (or that can't
+/// immediately reserve an executor) is rejected with a typed busy error (HTTP
+/// 503), never queued on the contract loop.
+pub(crate) const MAX_CONCURRENT_EXPORTS: usize = 2;
+
+/// Effective off-loop export concurrency for a pool of `pool_size` executors.
+///
+/// `min(MAX_CONCURRENT_EXPORTS, pool_size - 1)` — this is the load-bearing
+/// anti-deadlock invariant, ENFORCED in code (not prose): an admitted export
+/// holds one pool executor off-loop, and the only executor-return path
+/// (`finish_export`) runs ON the contract loop. If exports could hold EVERY
+/// executor, a normal contract op would park the loop waiting for an executor
+/// that only the (now-parked) loop can return — a permanent self-deadlock.
+/// Reserving at least one executor for normal ops makes that impossible.
+///
+/// `pool_size == 1` → 0: exports are DISABLED on a single-executor node (they
+/// return the typed Busy → 503). That is correct, not a regression — a tiny
+/// 1-executor node has no spare executor to lend a deferred export anyway, and
+/// the alternative (running it on the sole executor) is exactly the inline
+/// blocking this whole change removes.
+pub(crate) fn effective_export_permits(pool_size: usize) -> usize {
+    MAX_CONCURRENT_EXPORTS.min(pool_size.saturating_sub(1))
+}
+
+/// Result of [`RuntimePool::try_begin_export`]: an admitted off-loop export job,
+/// or a rejection because too many exports are already in flight, or because
+/// this executor kind does not support export (mock executors).
+pub(crate) enum ExportAdmission {
+    /// Admitted. The contract-handling loop moves this `ExportJob` into a
+    /// background task and calls [`ExportJob::run`] there; the resulting
+    /// [`ExportDone`] comes back to the loop, which calls
+    /// [`RuntimePool::finish_export`] to return/replace the executor. Boxed: an
+    /// `ExportJob` owns a whole `Executor<Runtime>`, so keeping it inline would
+    /// make every `ExportAdmission` (incl. the zero-size `Busy`/`Unsupported`)
+    /// that large.
+    Admitted(Box<ExportJob>),
+    /// `MAX_CONCURRENT_EXPORTS` exports are already running. The caller answers
+    /// the client with a typed busy error (HTTP 503); the export is NOT queued.
+    Busy,
+    /// This executor kind keeps no on-disk secrets and cannot export (mock /
+    /// test executors). The caller answers with the not-supported error.
+    Unsupported,
+}
+
+/// An admitted hosted-mode export, owning everything it needs to run OFF the
+/// contract loop: an exclusively-checked-out pool executor, the export-
+/// concurrency permit (released when the job is consumed by `run`), and the
+/// owned inputs. Opaque to the loop, which just moves it into a background task.
+pub(crate) struct ExportJob {
+    executor: Executor<Runtime>,
+    /// Held for the lifetime of the job so the export-concurrency slot is
+    /// occupied until the work finishes; dropped at the end of `run`.
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    user_context: UserSecretContext,
+    /// Zeroized when the job drops, so the high-value token isn't left in memory.
+    token: zeroize::Zeroizing<Vec<u8>>,
+}
+
+impl ExportJob {
+    /// Run the export off the contract loop and produce an [`ExportDone`] to hand
+    /// back to the loop. The CPU/IO work (enumerate + decrypt + AEAD-seal) runs
+    /// via [`run_blocking_offloaded`], so on the production multi-thread runtime
+    /// it lands on a blocking thread; a panic there is caught and surfaced as a
+    /// lost executor (`ExportDone { executor: None, .. }`) rather than crashing.
+    ///
+    /// This is intended to be called from a spawned background task, NOT on the
+    /// contract loop — that is the whole point of the deferral (#4531/#4381 P5).
+    pub(crate) async fn run(self) -> ExportDone {
+        let ExportJob {
+            executor,
+            _permit,
+            user_context,
+            token,
+        } = self;
+        match super::run_blocking_offloaded(executor, move |executor| {
+            let result = executor.export_user_secrets(&user_context, token.as_slice());
+            (executor, result)
+        })
+        .await
+        {
+            super::OffloadOutcome::Completed(executor, result) => ExportDone {
+                executor: Some(executor),
+                result,
+            },
+            super::OffloadOutcome::Panicked => ExportDone {
+                executor: None,
+                result: Err(ExecutorError::other(anyhow::anyhow!(
+                    "secret export task panicked"
+                ))),
+            },
+        }
+        // `_permit` drops here, freeing the export-concurrency slot for the next
+        // request. The executor (when `Some`) is returned to the pool by the loop
+        // via `finish_export`.
+    }
+}
+
+/// The completed export, handed back to the contract loop. Carries the result
+/// for the client and the executor to return to the pool (`None` if the export
+/// task panicked, in which case the loop replaces the lost executor).
+pub(crate) struct ExportDone {
+    executor: Option<Executor<Runtime>>,
+    pub(crate) result: Result<Vec<u8>, ExecutorError>,
+}
+
+impl ExportDone {
+    /// An `ExportDone` for the case where the off-loop export task was dropped /
+    /// cancelled before producing a result (e.g. runtime teardown). Carries no
+    /// executor — the job owned it and is gone — so the loop's `finish_export`
+    /// treats it like the panic path (replace the lost slot) and answers the
+    /// client with an error. Delivered by `ExportGuard::drop`.
+    pub(crate) fn lost_to_drop() -> Self {
+        Self {
+            executor: None,
+            result: Err(ExecutorError::other(anyhow::anyhow!(
+                "secret export task was dropped before completion"
+            ))),
+        }
+    }
+
+    /// Consume the `ExportDone`, dropping any carried executor and returning just
+    /// the result. Used by the trait default `finish_export` (no pool to return
+    /// the executor to); the real `RuntimePool::finish_export` returns the
+    /// executor to the pool instead of dropping it.
+    pub(crate) fn into_result(self) -> Result<Vec<u8>, ExecutorError> {
+        self.result
+    }
 }
 
 impl RuntimePool {
@@ -250,6 +394,7 @@ impl RuntimePool {
             delegate_notification_tx,
             delegate_notification_rx: Some(delegate_notification_rx),
             in_flight_contracts: HashMap::new(),
+            export_semaphore: Arc::new(Semaphore::new(effective_export_permits(pool_size_usize))),
         })
     }
 
@@ -355,6 +500,36 @@ impl RuntimePool {
         // But if it does, we need to restore the checked_out count
         self.checked_out.fetch_sub(1, Ordering::SeqCst);
         unreachable!("No executors available despite semaphore permit")
+    }
+
+    /// Non-blocking executor checkout: returns `Some(executor)` only if one is
+    /// immediately available, `None` otherwise (NEVER awaits/parks the caller).
+    ///
+    /// Used by the off-loop export admission path (`try_begin_export`), which
+    /// runs ON the contract loop and therefore must not block: if no executor is
+    /// free right now, the export is rejected (Busy → 503) rather than parking
+    /// the loop. Mirrors `pop_executor`'s permit/slot accounting exactly, just
+    /// with a non-blocking `try_acquire`.
+    fn try_pop_executor(&mut self) -> Option<Executor<Runtime>> {
+        let permit = self.available.try_acquire().ok()?;
+        // Take the slot BEFORE forgetting the permit: if (impossibly, given the
+        // permit==Some-slot-count invariant) no slot is found, dropping `permit`
+        // here restores it, so we never leak a permit on the unreachable path.
+        let executor = self
+            .runtimes
+            .iter_mut()
+            .find_map(|slot| slot.take())
+            .or_else(|| {
+                tracing::error!(
+                    "try_pop_executor acquired a permit but found no executor slot \
+                     (pool invariant violated)"
+                );
+                None
+            })?;
+        // Found a slot: now consume the permit (restored in `return_executor`).
+        permit.forget();
+        self.checked_out.fetch_add(1, Ordering::SeqCst);
+        Some(executor)
     }
 
     /// Return an executor to the pool after use.
@@ -840,17 +1015,81 @@ impl ContractExecutor for RuntimePool {
         result
     }
 
-    async fn export_user_secrets(
+    fn try_begin_export(
         &mut self,
         user_context: &UserSecretContext,
         token: &[u8],
-    ) -> Result<Vec<u8>, ExecutorError> {
-        // Run on a pooled executor so the on-disk secrets redb is touched only
-        // by its single writer (all pool executors point at the same
-        // `secrets_dir`, but `pop_executor` serializes the checkout).
-        let executor = self.pop_executor().await;
-        let result = executor.export_user_secrets(user_context, token);
-        self.return_checked(executor, "export_user_secrets").await;
+    ) -> ExportAdmission {
+        // FULLY NON-BLOCKING admission — this runs ON the contract loop, so it
+        // must never await/park. Two non-blocking gates, in order:
+        //
+        // 1. Export-concurrency permit. Sized to `min(MAX_CONCURRENT_EXPORTS,
+        //    pool_size-1)` so admitted exports can never hold every executor. On
+        //    a 1-executor pool this is 0, so exports are disabled here. Over the
+        //    cap → Busy (HTTP 503), never queued.
+        let Ok(permit) = self.export_semaphore.clone().try_acquire_owned() else {
+            return ExportAdmission::Busy;
+        };
+        // 2. A pool executor, taken NON-BLOCKING. If every executor is momentarily
+        //    busy with normal ops, we do NOT await (that would park the loop, the
+        //    whole #4531 deadlock) — we reject with Busy and the permit drops
+        //    here (restoring the export slot). The pool-size-1 invariant means
+        //    this only happens under genuine concurrent normal-op load, where a
+        //    "retry shortly" 503 is the correct answer.
+        let Some(executor) = self.try_pop_executor() else {
+            return ExportAdmission::Busy;
+        };
+
+        // Own the inputs so the spawned task's closure is `'static`. The token is
+        // copied into a Zeroizing buffer wiped when the job drops it, so the
+        // high-value credential is not left in an un-zeroized Vec.
+        ExportAdmission::Admitted(Box::new(ExportJob {
+            executor,
+            _permit: permit,
+            user_context: user_context.clone(),
+            token: zeroize::Zeroizing::new(token.to_vec()),
+        }))
+    }
+
+    async fn finish_export(&mut self, done: ExportDone) -> Result<Vec<u8>, ExecutorError> {
+        let ExportDone { executor, result } = done;
+        match executor {
+            // Normal path: the export ran (success or a clean export error) and
+            // handed the executor back. Return it through the health-checked path
+            // (it stays healthy — a read-only walk runs no WASM — but this keeps
+            // the accounting identical to every other op).
+            Some(executor) => {
+                self.return_checked(executor, "export_user_secrets").await;
+            }
+            // The offloaded export task PANICKED: the executor was owned by the
+            // unwinding blocking thread and is gone. Build a replacement and
+            // return THAT so the pool's permit is restored and capacity is not
+            // permanently leaked — exactly the "health check replaces a broken
+            // executor" semantic, here for a lost-to-panic executor.
+            None => {
+                tracing::error!("export offload task panicked; replacing the lost pool executor");
+                match self.create_replacement_executor().await {
+                    // `return_executor` fills the slot the lost executor vacated
+                    // and restores the pool permit (sub checked_out, add_permits).
+                    Ok(replacement) => self.return_executor(replacement),
+                    Err(e) => {
+                        // Could not build a replacement (a serious node problem on
+                        // its own). Do NOT restore the permit: leaving the slot
+                        // empty WITHOUT a matching permit keeps the pool invariant
+                        // `available permits == count of Some(executor) slots`, so
+                        // `pop_executor` can never acquire a permit and then find
+                        // no executor (its `unreachable!`). The pool is one
+                        // executor smaller until restart; that's the safe choice
+                        // versus a latent slot/permit mismatch.
+                        tracing::error!(
+                            error = %e,
+                            "failed to replace export-panicked executor; pool capacity reduced by one"
+                        );
+                        self.checked_out.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
         result
     }
 

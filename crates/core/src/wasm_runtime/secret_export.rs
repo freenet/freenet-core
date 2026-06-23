@@ -94,6 +94,36 @@ const HEADER_LEN: usize = 4 + 1 + 1 + SALT_LEN + 24;
 /// same token.
 const TOKEN_BUNDLE_HKDF_INFO: &[u8] = b"freenet-secret-bundle-token-v1";
 
+/// Upper bound on the number of secrets a single [`export_bundle`] call will
+/// gather, checked BEFORE any secret is read/decrypted.
+///
+/// This is a defense-in-depth cap on the worst-case work of one export — even
+/// though the hosted path now runs the export off the contract loop (see
+/// `RuntimePool::export_user_secrets`), an unbounded enumerate+decrypt is still
+/// CPU/IO the node shouldn't be coerced into doing without limit by an
+/// authenticated token-holder (the hosted-export DoS surface of #4381 P5).
+///
+/// 10,000 is deliberately far above any legitimate per-user delegate-secret
+/// set: a hosted user accumulates a handful of secrets per delegate they
+/// interact with, so a real export is tens to low-hundreds of entries. A user
+/// who genuinely exceeds this is not a normal hosted user, and the request is
+/// rejected (HTTP 413) rather than silently truncated, so no data is lost — the
+/// limit can be raised by an operator follow-up if a real workload ever needs
+/// it.
+pub const MAX_EXPORT_SECRET_COUNT: usize = 10_000;
+
+/// Upper bound on the cumulative DECRYPTED plaintext bytes a single
+/// [`export_bundle`] call will gather, checked incrementally as secrets are
+/// read so the loop bails early instead of buffering an unbounded amount of
+/// plaintext in memory.
+///
+/// 256 MiB is far above any legitimate per-user secret payload (delegate
+/// secrets are keys/tokens/small blobs, kilobytes each), but bounds the
+/// in-memory `Zeroizing` plaintext buffers and the resulting bundle so a
+/// single export cannot be used to exhaust node memory. Like the count cap,
+/// exceeding it is a hard 413, never a silent truncation.
+pub const MAX_EXPORT_TOTAL_PLAINTEXT_BYTES: usize = 256 * 1024 * 1024;
+
 /// Which key-derivation function produced the bundle key. Recorded in the
 /// header so `import` derives the matching key without the user having to
 /// re-specify the method.
@@ -186,6 +216,17 @@ const PAYLOAD_SCHEMA_V1: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExportError {
+    /// The export would gather more than [`MAX_EXPORT_SECRET_COUNT`] secrets or
+    /// more than [`MAX_EXPORT_TOTAL_PLAINTEXT_BYTES`] of decrypted plaintext.
+    /// Distinct from the other variants so the hosted-export HTTP layer can map
+    /// it to a 413 (Payload Too Large) rather than a generic 500. The `limit`
+    /// and `actual` are non-secret sizes (counts/bytes), safe to surface.
+    #[error("export too large: {what} {actual} exceeds limit {limit}")]
+    TooLarge {
+        what: &'static str,
+        actual: usize,
+        limit: usize,
+    },
     #[error("secrets store error: {0}")]
     Store(#[from] super::secrets_store::SecretStoreError),
     #[error("runtime error: {0}")]
@@ -398,11 +439,82 @@ pub fn export_bundle(
     scope: SecretScope<'_>,
     material: &BundleKeyMaterial<'_>,
 ) -> Result<Vec<u8>, ExportError> {
+    export_bundle_with_limits(
+        store,
+        scope,
+        material,
+        MAX_EXPORT_SECRET_COUNT,
+        MAX_EXPORT_TOTAL_PLAINTEXT_BYTES,
+    )
+}
+
+/// [`export_bundle`] with the per-user bound made explicit, so tests can
+/// exercise the cap at small limits deterministically (the public entry point
+/// passes the production [`MAX_EXPORT_SECRET_COUNT`] /
+/// [`MAX_EXPORT_TOTAL_PLAINTEXT_BYTES`]).
+fn export_bundle_with_limits(
+    store: &SecretsStore,
+    scope: SecretScope<'_>,
+    material: &BundleKeyMaterial<'_>,
+    max_count: usize,
+    max_total_bytes: usize,
+) -> Result<Vec<u8>, ExportError> {
     let scope_label = match &scope {
         SecretScope::Local => "local",
         SecretScope::User { .. } => "user",
     };
-    let entries = store.export_scope_entries(scope)?;
+
+    // Defense-in-depth bound (#4381 P5): reject an over-large export so an
+    // authenticated token-holder cannot coerce the node into unbounded crypto/IO
+    // or memory. BOTH checks happen BEFORE/DURING the heavy work, never after:
+    //   - The count check STREAMS the on-disk walk and stops the instant it has
+    //     seen max_count + 1 entries (no full traversal, no allocation of the
+    //     attacker-controlled entry list) — see `scope_count_exceeds`.
+    //   - The byte check is enforced INCREMENTALLY inside
+    //     `export_scope_entries_bounded`, which aborts the decrypt loop the
+    //     instant the running plaintext total crosses the cap and drops the
+    //     partial buffer — so a user under the count cap but with huge secrets
+    //     never gets multi-GiB decrypted+buffered before the rejection.
+    // Both are hard rejections (never silent truncation), so no user data is
+    // lost — the caller surfaces a 413 and an operator can raise the limit if a
+    // real workload ever needs it. A disk I/O failure during the count
+    // propagates (fail-loud) rather than passing the cap on a partial walk.
+    if store.scope_count_exceeds(&scope, max_count)? {
+        return Err(ExportError::TooLarge {
+            what: "secret count",
+            // The streaming count stops at max_count + 1, so we report that as a
+            // lower bound on the true (over-cap) count rather than a full count.
+            actual: max_count + 1,
+            limit: max_count,
+        });
+    }
+
+    // The gather re-enforces BOTH caps incrementally (the count cap here is the
+    // AUTHORITATIVE one — the pre-check above is only an early-out, and a
+    // concurrent store_secret can push the scope over the cap between the two,
+    // a TOCTOU the gather closes). See `export_scope_entries_bounded`.
+    let entries = store
+        .export_scope_entries_bounded(scope, max_count, max_total_bytes)
+        .map_err(|e| match e {
+            super::secrets_store::ExportScopeError::Store(store_err) => {
+                ExportError::Store(store_err)
+            }
+            super::secrets_store::ExportScopeError::TooLarge { actual, limit } => {
+                ExportError::TooLarge {
+                    what: "total plaintext bytes",
+                    actual,
+                    limit,
+                }
+            }
+            super::secrets_store::ExportScopeError::CountTooLarge { actual, limit } => {
+                ExportError::TooLarge {
+                    what: "secret count",
+                    actual,
+                    limit,
+                }
+            }
+        })?;
+
     seal_bundle(&entries, scope_label, material)
 }
 
@@ -540,6 +652,21 @@ mod test {
         std::fs::create_dir_all(&secrets_dir).unwrap();
         let db = Storage::new(dir).await.expect("db");
         SecretsStore::new(secrets_dir, Default::default(), db).expect("store")
+    }
+
+    /// Build a `SecretsStore` over a SPECIFIC, SHARED `secrets_dir` but with its
+    /// OWN ReDb (in `db_dir`). Two such stores model two pooled executors: they
+    /// write to the same on-disk `secrets_dir` but each keeps its own in-memory
+    /// index — exactly the cross-executor divergence the disk-enumeration export
+    /// fix must tolerate.
+    async fn new_store_sharing(
+        secrets_dir: &std::path::Path,
+        db_dir: &std::path::Path,
+    ) -> SecretsStore {
+        std::fs::create_dir_all(secrets_dir).unwrap();
+        std::fs::create_dir_all(db_dir).unwrap();
+        let db = Storage::new(db_dir).await.expect("db");
+        SecretsStore::new(secrets_dir.to_path_buf(), Default::default(), db).expect("store")
     }
 
     fn delegate(code: u8) -> Delegate<'static> {
@@ -913,6 +1040,343 @@ mod test {
             Err(ExportError::AuthFailed) => {}
             other => panic!("ciphertext tamper must fail auth, got {:?}", other.err()),
         }
+    }
+
+    #[tokio::test]
+    async fn export_over_count_limit_rejected_before_decrypt() {
+        // An export gathering more secrets than the count cap is rejected with a
+        // typed `TooLarge` error (mapped to a 413 at the HTTP layer), and the
+        // check happens on the cheap metadata walk before any decrypt. Uses a
+        // tiny limit so the test is deterministic without storing 10k secrets.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = new_store(tmp.path()).await;
+        let token = b"count-limit-user";
+        let ctx = UserSecretContext::from_token(token);
+        let d = delegate(1);
+        // Three secrets for the same user; cap at 2.
+        for i in 0..3u8 {
+            let s = SecretsId::new(vec![b'k', i]);
+            put_user(&mut store, &d, &ctx, &s, b"v");
+        }
+        let material = BundleKeyMaterial::Token(token);
+        let err = export_bundle_with_limits(&store, ctx.scope(), &material, 2, usize::MAX)
+            .expect_err("over-count export must be rejected");
+        let ExportError::TooLarge {
+            what,
+            actual,
+            limit,
+        } = err
+        else {
+            panic!("expected TooLarge(secret count), got {err:?}");
+        };
+        assert_eq!(what, "secret count");
+        assert_eq!(actual, 3);
+        assert_eq!(limit, 2);
+    }
+
+    #[tokio::test]
+    async fn export_at_count_limit_succeeds() {
+        // Boundary: count exactly AT the limit still exports (the check is `>`,
+        // not `>=`), so the cap never rejects a legitimate at-capacity user.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = new_store(tmp.path()).await;
+        let token = b"at-limit-user";
+        let ctx = UserSecretContext::from_token(token);
+        let d = delegate(2);
+        for i in 0..2u8 {
+            let s = SecretsId::new(vec![b'k', i]);
+            put_user(&mut store, &d, &ctx, &s, b"v");
+        }
+        let material = BundleKeyMaterial::Token(token);
+        let bundle = export_bundle_with_limits(&store, ctx.scope(), &material, 2, usize::MAX)
+            .expect("export at the count limit must succeed");
+        let payload = open_bundle(&bundle, &material).expect("open");
+        assert_eq!(payload.entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn export_over_byte_limit_rejected() {
+        // An export whose total decrypted plaintext exceeds the byte cap is
+        // rejected with a typed `TooLarge` error. Uses a tiny byte limit and a
+        // payload that exceeds it.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = new_store(tmp.path()).await;
+        let token = b"byte-limit-user";
+        let ctx = UserSecretContext::from_token(token);
+        let d = delegate(3);
+        let s = SecretsId::new(b"big".to_vec());
+        // 100 bytes of plaintext, cap at 50.
+        put_user(&mut store, &d, &ctx, &s, &[7u8; 100]);
+        let material = BundleKeyMaterial::Token(token);
+        let err = export_bundle_with_limits(&store, ctx.scope(), &material, usize::MAX, 50)
+            .expect_err("over-byte export must be rejected");
+        let ExportError::TooLarge {
+            what,
+            actual,
+            limit,
+        } = err
+        else {
+            panic!("expected TooLarge(total plaintext bytes), got {err:?}");
+        };
+        assert_eq!(what, "total plaintext bytes");
+        assert_eq!(actual, 100);
+        assert_eq!(limit, 50);
+    }
+
+    #[tokio::test]
+    async fn export_scope_entries_bounded_bails_incrementally() {
+        // INCREMENTAL bail (#4531 P5): the byte cap aborts the decrypt loop the
+        // instant the running total crosses the limit, WITHOUT decrypting and
+        // buffering the whole scope. With three 40-byte secrets and a 50-byte
+        // cap, the bail must fire at total=80 (after the SECOND secret), i.e.
+        // before the third is ever read — the reported `actual` is 80, not 120.
+        use crate::wasm_runtime::secrets_store::ExportScopeError;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = new_store(tmp.path()).await;
+        let token = b"incremental-user";
+        let ctx = UserSecretContext::from_token(token);
+        let d = delegate(9);
+        for i in 0..3u8 {
+            let s = SecretsId::new(vec![b'b', i]);
+            put_user(&mut store, &d, &ctx, &s, &[1u8; 40]);
+        }
+        // `ExportSecretEntry` deliberately has no `Debug` (it holds decrypted
+        // plaintext), so match on the result rather than `expect_err`. No count
+        // cap here (usize::MAX) — exercise the byte bail specifically.
+        let err = match store.export_scope_entries_bounded(ctx.scope(), usize::MAX, 50) {
+            Ok(_) => panic!("over-byte gather must bail, not succeed"),
+            Err(e) => e,
+        };
+        let ExportScopeError::TooLarge { actual, limit } = err else {
+            panic!("expected ExportScopeError::TooLarge, got {err:?}");
+        };
+        assert_eq!(limit, 50);
+        // Bailed at the SECOND secret (40 + 40 = 80 > 50), NOT after buffering
+        // all three (which would be 120). This is the proof that the partial
+        // buffer was dropped mid-loop.
+        assert_eq!(
+            actual, 80,
+            "must bail the instant the running total crosses the cap, \
+             not after gathering the whole scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_under_production_limits_succeeds() {
+        // A normal small export goes through the PUBLIC entry point (which uses
+        // the production caps), so the cap never regresses a real user.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = new_store(tmp.path()).await;
+        let token = b"normal-user";
+        let ctx = UserSecretContext::from_token(token);
+        let d = delegate(4);
+        let s = SecretsId::new(b"ordinary".to_vec());
+        let h = put_user(&mut store, &d, &ctx, &s, b"ordinary-value");
+        let material = BundleKeyMaterial::Token(token);
+        let bundle = export_bundle(&store, ctx.scope(), &material).expect("normal export succeeds");
+        let payload = open_bundle(&bundle, &material).expect("open");
+        assert_eq!(payload.entries.len(), 1);
+        assert_eq!(payload.entries[0].secret_hash.as_slice(), h.as_slice());
+    }
+
+    #[tokio::test]
+    async fn export_includes_secret_written_by_a_different_executor() {
+        // THE #4 REGRESSION (cross-executor staleness): under the pooled-executor
+        // model two executors share one on-disk `secrets_dir` but each keeps its
+        // OWN in-memory index. A secret stored via executor A is NOT in executor
+        // B's index. The export — which may run on B — must still include A's
+        // secret, because it enumerates from DISK (the shared source of truth),
+        // not from B's stale in-memory index. With the old in-memory enumeration
+        // this export would silently OMIT the secret → incomplete backup.
+        let tmp = tempfile::tempdir().unwrap();
+        let shared_secrets = tmp.path().join("shared-secrets");
+        let token = b"cross-executor-user";
+        let ctx = UserSecretContext::from_token(token);
+        let d = delegate(1);
+        let s_a = SecretsId::new(b"written-by-A".to_vec());
+        let s_b = SecretsId::new(b"written-by-B".to_vec());
+
+        // Executor A's store: writes secret A to the shared dir.
+        let mut store_a = new_store_sharing(&shared_secrets, &tmp.path().join("db-a")).await;
+        let h_a = put_user(&mut store_a, &d, &ctx, &s_a, b"value-A");
+
+        // Executor B's store: a SEPARATE in-memory index over the SAME secrets
+        // dir. It only knows about the secret IT writes (B); it has never seen A.
+        let mut store_b = new_store_sharing(&shared_secrets, &tmp.path().join("db-b")).await;
+        let h_b = put_user(&mut store_b, &d, &ctx, &s_b, b"value-B");
+
+        // Export via executor B. The bundle MUST contain BOTH secrets — A's
+        // (written by the other executor, absent from B's in-memory index) and
+        // B's own. Pre-fix, A's secret would be missing.
+        let material = BundleKeyMaterial::Token(token);
+        let bundle =
+            export_bundle(&store_b, ctx.scope(), &material).expect("export via B succeeds");
+        let payload = open_bundle(&bundle, &material).expect("open");
+
+        let exported: std::collections::HashSet<Vec<u8>> = payload
+            .entries
+            .iter()
+            .map(|e| e.secret_hash.clone())
+            .collect();
+        assert!(
+            exported.contains(h_a.as_slice()),
+            "export run on executor B MUST include the secret written by executor A \
+             (disk is the source of truth, not B's stale in-memory index) — #4531/#4 fix"
+        );
+        assert!(
+            exported.contains(h_b.as_slice()),
+            "export must also include B's own secret"
+        );
+        assert_eq!(payload.entries.len(), 2, "exactly the two stored secrets");
+
+        // The count cap (scope_entry_count) must also see BOTH (it walks disk).
+        assert_eq!(
+            store_b.scope_entry_count(&ctx.scope()).unwrap(),
+            2,
+            "scope_entry_count must count both on-disk secrets, not just B's index"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn export_fails_loud_on_unexpected_io_error() {
+        // FAIL-LOUD (#4563 P2): an unexpected I/O error during enumeration must
+        // make the export FAIL, not seal a silently-partial/empty bundle. We
+        // make the user's on-disk scope dir UNREADABLE (chmod 000) so read_dir
+        // returns PermissionDenied (not NotFound) — the export must return Err.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = new_store(tmp.path()).await;
+        let token = b"io-error-user";
+        let ctx = UserSecretContext::from_token(token);
+        let d = delegate(1);
+        let s = SecretsId::new(b"k".to_vec());
+        let _ = put_user(&mut store, &d, &ctx, &s, b"v");
+
+        // The scope dir that now holds the secret: base/<delegate>/users/<id>.
+        let scope_dir = tmp
+            .path()
+            .join("secrets")
+            .join(d.key().encode())
+            .join("users")
+            .join(ctx.user_id().encode());
+        assert!(scope_dir.is_dir(), "scope dir must exist after the write");
+
+        // Make it unreadable. If running as root (chmod 000 is bypassed), skip —
+        // the branch is also covered by the count path's identical fail-loud.
+        std::fs::set_permissions(&scope_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let still_readable = std::fs::read_dir(&scope_dir).is_ok();
+        if still_readable {
+            // root or a permissive FS: restore and skip the assertion.
+            std::fs::set_permissions(&scope_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            return;
+        }
+
+        let material = BundleKeyMaterial::Token(token);
+        let result = export_bundle(&store, ctx.scope(), &material);
+        // Restore perms so tempdir cleanup works regardless of the assertion.
+        std::fs::set_permissions(&scope_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            result.is_err(),
+            "an unreadable scope dir must make the export FAIL, not seal a partial bundle"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_of_absent_scope_is_clean_empty_not_error() {
+        // A user with NO stored secrets has no on-disk users/<id> dir → read_dir
+        // NotFound, which is EXPECTED-absent → a clean EMPTY bundle, NOT an error
+        // (must not be conflated with the fail-loud I/O-error path).
+        let tmp = tempfile::tempdir().unwrap();
+        let store = new_store(tmp.path()).await;
+        let token = b"never-stored-anything";
+        let ctx = UserSecretContext::from_token(token);
+        let material = BundleKeyMaterial::Token(token);
+        let bundle = export_bundle(&store, ctx.scope(), &material)
+            .expect("absent user scope must export a clean empty bundle, not error");
+        let payload = open_bundle(&bundle, &material).expect("open empty");
+        assert!(payload.entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn count_cap_check_streams_and_stops_early() {
+        // The count-cap check must decide "over the cap" WITHOUT enumerating the
+        // whole (attacker-controlled) scope. We store 5 secrets and assert
+        // scope_count_exceeds(cap=2) is true. The streaming counter stops after
+        // seeing 3 (cap+1), so it never materializes all 5 — the gather
+        // (export_scope_entries_bounded) is never reached for an over-cap scope.
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = new_store(tmp.path()).await;
+        let token = b"count-stream-user";
+        let ctx = UserSecretContext::from_token(token);
+        let d = delegate(1);
+        for i in 0..5u8 {
+            let s = SecretsId::new(vec![b'k', i]);
+            put_user(&mut store, &d, &ctx, &s, b"v");
+        }
+        // Over the cap of 2.
+        assert!(
+            store.scope_count_exceeds(&ctx.scope(), 2).unwrap(),
+            "5 secrets must exceed a cap of 2"
+        );
+        // At/under the cap is NOT exceeded (boundary: 5 with cap 5 → not over).
+        assert!(
+            !store.scope_count_exceeds(&ctx.scope(), 5).unwrap(),
+            "exactly-at-cap must NOT be flagged as exceeding"
+        );
+        assert!(
+            !store.scope_count_exceeds(&ctx.scope(), 10).unwrap(),
+            "under-cap must NOT be flagged as exceeding"
+        );
+        // And the full export of an over-cap scope is rejected as TooLarge.
+        let material = BundleKeyMaterial::Token(token);
+        let err = export_bundle_with_limits(&store, ctx.scope(), &material, 2, usize::MAX)
+            .expect_err("over-count export must be rejected");
+        let ExportError::TooLarge { what, limit, .. } = err else {
+            panic!("expected TooLarge(secret count), got {err:?}");
+        };
+        assert_eq!(what, "secret count");
+        assert_eq!(limit, 2);
+    }
+
+    #[tokio::test]
+    async fn gather_enforces_count_cap_authoritatively() {
+        // TOCTOU (#4563 final): the count cap MUST be enforced DURING the gather,
+        // not only by the cheap pre-check — because the export runs off-loop
+        // while the loop keeps serving store_secret, so a concurrent writer can
+        // push a just-under-cap scope OVER the cap between the pre-check and the
+        // gather. We simulate "the scope crossed the cap by the time the gather
+        // ran" by driving export_scope_entries_bounded DIRECTLY (bypassing the
+        // pre-check) with a 5-secret scope and max_count = 2: the gather itself
+        // must abort with CountTooLarge, NOT seal all 5.
+        use crate::wasm_runtime::secrets_store::ExportScopeError;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = new_store(tmp.path()).await;
+        let token = b"toctou-count-user";
+        let ctx = UserSecretContext::from_token(token);
+        let d = delegate(1);
+        for i in 0..5u8 {
+            let s = SecretsId::new(vec![b'k', i]);
+            put_user(&mut store, &d, &ctx, &s, b"v");
+        }
+        // No count cap (usize::MAX) succeeds and gathers all 5 — sanity.
+        let all = store
+            .export_scope_entries_bounded(ctx.scope(), usize::MAX, usize::MAX)
+            .expect("uncapped gather succeeds");
+        assert_eq!(all.len(), 5);
+
+        // With max_count = 2 the gather ABORTS — the count is enforced in the
+        // gather pass itself, closing the TOCTOU window.
+        let err = match store.export_scope_entries_bounded(ctx.scope(), 2, usize::MAX) {
+            Ok(_) => panic!("over-count gather must abort, not seal all 5"),
+            Err(e) => e,
+        };
+        let ExportScopeError::CountTooLarge { actual, limit } = err else {
+            panic!("expected CountTooLarge, got {err:?}");
+        };
+        assert_eq!(limit, 2);
+        // Bailed at the 3rd entry (count crossed the cap), not after all 5.
+        assert_eq!(actual, 3, "must abort the instant count crosses the cap");
     }
 
     fn read_local(store: &SecretsStore, d: &Delegate<'static>, hash: &[u8; 32]) -> Vec<u8> {

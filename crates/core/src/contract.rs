@@ -16,7 +16,7 @@ pub mod storages;
 pub(crate) mod user_input;
 
 pub(crate) use executor::{
-    ContractExecutor, ExecutorTransactionStream, MAX_CREATED_DELEGATES_PER_NODE,
+    ContractExecutor, ExecutorTransactionStream, ExportBusy, MAX_CREATED_DELEGATES_PER_NODE,
     MAX_DELEGATE_CREATION_DEPTH, MAX_DELEGATE_CREATIONS_PER_CALL,
     SUBSCRIBER_NOTIFICATION_CHANNEL_SIZE, UpsertOutcome, UpsertResult, mock_runtime::MockRuntime,
 };
@@ -231,6 +231,101 @@ impl Drop for ResumeGuard {
     }
 }
 
+/// A hosted-mode export that ran OFF the contract loop, carrying its result
+/// (and the executor to return to the pool) back to the loop (#4531 / #4381 P5).
+///
+/// Built by the off-loop export task and sent back to the `contract_handling`
+/// loop via the export-resume channel; the loop returns/replaces the executor
+/// (`finish_export`) and answers the stashed client responder. Mirrors the
+/// #4391 [`DeferredResume`] flow, but the work is the export itself (not a
+/// network wait), so there is nothing to re-run on the loop — just deliver the
+/// precomputed result and reclaim the executor.
+struct ExportResume {
+    /// The completed export: the executor to return (or `None` if the export
+    /// task panicked) and the result for the client.
+    done: crate::contract::executor::runtime::ExportDone,
+    /// The parked client responder (the HTTP export handler's oneshot). `None`
+    /// only if the client disconnected before the export finished.
+    responder: Option<StashedResponder>,
+}
+
+/// RAII guard guaranteeing the off-loop export task delivers EXACTLY ONE
+/// [`ExportResume`] — whether the export completes, or the task is
+/// dropped/panics/cancelled before sending.
+///
+/// Same load-bearing invariant as the #4391 [`ResumeGuard`]: every admitted
+/// export is answered exactly once, so the parked client responder never hangs
+/// and the checked-out executor is always reclaimed. On the success path
+/// [`send`](Self::send) takes the payload (Drop becomes a no-op); on any early
+/// exit, `Drop` delivers an `ExportResume` carrying a panicked-style
+/// [`ExportDone`] (`executor: None`) so the loop replaces the lost executor and
+/// answers the client with an error.
+struct ExportGuard {
+    payload: Option<ExportGuardPayload>,
+}
+
+struct ExportGuardPayload {
+    export_resume_tx: tokio::sync::mpsc::UnboundedSender<ExportResume>,
+    responder: Option<StashedResponder>,
+}
+
+impl ExportGuard {
+    fn new(
+        export_resume_tx: tokio::sync::mpsc::UnboundedSender<ExportResume>,
+        responder: Option<StashedResponder>,
+    ) -> Self {
+        Self {
+            payload: Some(ExportGuardPayload {
+                export_resume_tx,
+                responder,
+            }),
+        }
+    }
+
+    /// Deliver the completed export. Consumes the payload so a subsequent `Drop`
+    /// is a no-op (exactly-once).
+    fn send(mut self, done: crate::contract::executor::runtime::ExportDone) {
+        if let Some(p) = self.payload.take() {
+            Self::deliver(p, done);
+        }
+    }
+
+    fn deliver(p: ExportGuardPayload, done: crate::contract::executor::runtime::ExportDone) {
+        let ExportGuardPayload {
+            export_resume_tx,
+            responder,
+        } = p;
+        // Unbounded channel, non-blocking send (channel-safety.md carve-out: the
+        // producer count is bounded by MAX_CONCURRENT_EXPORTS, the receiver is
+        // this loop which drains every iteration, and the waiter never reads what
+        // the loop produces — no cycle). A send failure means the loop is gone.
+        if export_resume_tx
+            .send(ExportResume { done, responder })
+            .is_err()
+        {
+            tracing::debug!("export resume channel closed; contract-handling loop gone");
+        }
+    }
+}
+
+impl Drop for ExportGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.payload.take() {
+            // Early exit before `send` (task dropped / panicked / cancelled).
+            // Deliver a panicked-style ExportDone so the loop replaces the lost
+            // executor and answers the parked client exactly once.
+            tracing::warn!(
+                "Off-loop export task dropped before sending — delivering an error \
+                 resume so the export terminates and the client is answered (#4531)"
+            );
+            Self::deliver(
+                p,
+                crate::contract::executor::runtime::ExportDone::lost_to_drop(),
+            );
+        }
+    }
+}
+
 /// Loop-side state for off-loading deferred related-contract fetches (#4391).
 ///
 /// Owned by `contract_handling`; passed by `&mut` into `handle_contract_event`
@@ -256,14 +351,22 @@ struct DeferralCtx {
     stashed: std::collections::HashMap<u64, StashedResponder>,
     /// Monotonic id generator for `deferral_id`.
     next_deferral_id: u64,
+    /// Off-loop export tasks send their completed [`ExportResume`]s back to the
+    /// loop here (#4531 / #4381 P5). Separate from `resume_tx` because the export
+    /// resume carries an executor + precomputed bytes, not an upsert to re-run.
+    export_resume_tx: tokio::sync::mpsc::UnboundedSender<ExportResume>,
 }
 
 impl DeferralCtx {
-    fn new(resume_tx: tokio::sync::mpsc::UnboundedSender<DeferredResume>) -> Self {
+    fn new(
+        resume_tx: tokio::sync::mpsc::UnboundedSender<DeferredResume>,
+        export_resume_tx: tokio::sync::mpsc::UnboundedSender<ExportResume>,
+    ) -> Self {
         Self {
             resume_tx,
             stashed: std::collections::HashMap::new(),
             next_deferral_id: 0,
+            export_resume_tx,
         }
     }
 
@@ -1025,7 +1128,15 @@ where
     // non-blocking `unbounded_send` (no `.await`), so it can never back-pressure
     // anything.
     let (resume_tx, mut resume_rx) = tokio::sync::mpsc::unbounded_channel::<DeferredResume>();
-    let mut deferral_ctx = DeferralCtx::new(resume_tx);
+    // Resume channel for hosted-mode EXPORTS off-loaded from this serial loop
+    // (#4531 / #4381 P5). The off-loop export task sends back the executor (to
+    // return to the pool) + the result (for the client). Unbounded for the same
+    // channel-safety carve-out as `resume_tx`: producers bounded by
+    // MAX_CONCURRENT_EXPORTS, the receiver is this loop (drains every iteration),
+    // no cycle, non-blocking `unbounded_send`.
+    let (export_resume_tx, mut export_resume_rx) =
+        tokio::sync::mpsc::unbounded_channel::<ExportResume>();
+    let mut deferral_ctx = DeferralCtx::new(resume_tx, export_resume_tx);
 
     loop {
         // Drain resumed (deferred) upserts so a completed off-loop fetch is
@@ -1037,6 +1148,19 @@ where
                 Ok(resume) => {
                     handle_deferred_resume(&mut contract_handler, &mut deferral_ctx, resume)
                         .await?;
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Drain completed off-loop EXPORTS (#4531 / #4381 P5): return/replace the
+        // executor and answer the parked client. Bounded by MAX_CONCURRENT_EXPORTS
+        // (the export semaphore), so this batch is tiny; each iteration is a pool
+        // return + a oneshot send (microseconds).
+        for _ in 0..executor::runtime::MAX_CONCURRENT_EXPORTS {
+            match export_resume_rx.try_recv() {
+                Ok(resume) => {
+                    handle_export_resume(&mut contract_handler, resume).await;
                 }
                 Err(_) => break,
             }
@@ -1122,6 +1246,9 @@ where
             Some(resume) = resume_rx.recv() => {
                 handle_deferred_resume(&mut contract_handler, &mut deferral_ctx, resume).await?;
             }
+            Some(export_resume) = export_resume_rx.recv() => {
+                handle_export_resume(&mut contract_handler, export_resume).await;
+            }
             notification = recv_delegate_notification(&mut delegate_rx) => {
                 handle_delegate_notification(&mut contract_handler, notification, &prompter).await;
             }
@@ -1144,6 +1271,53 @@ where
 /// contract's CRDT merge — there is no lost update. The client is answered
 /// exactly once via its stashed responder (the `ResumeGuard` guarantees this
 /// resume runs exactly once per deferral, even if the waiter was dropped).
+/// Send an `ExportUserSecretsResponse` to a still-waiting client inline (the
+/// rejection paths: no deferral ctx, busy, unsupported). Logs at debug if the
+/// client already disconnected.
+async fn send_export_response_inline<CH>(
+    contract_handler: &mut CH,
+    id: handler::EventId,
+    result: Result<Vec<u8>, ExecutorError>,
+) where
+    CH: ContractHandler + Send + 'static,
+{
+    if let Err(error) = contract_handler
+        .channel()
+        .send_to_sender(id, ContractHandlerEvent::ExportUserSecretsResponse(result))
+        .await
+    {
+        tracing::debug!(
+            error = %error,
+            "Failed to send EXPORT response (client may have disconnected)"
+        );
+    }
+}
+
+/// Handle a completed off-loop export (#4531 / #4381 P5): return/replace the
+/// executor in the pool and answer the parked client. Runs ON the loop (the
+/// pool return needs `&mut contract_handler`), but the work is just a pool
+/// slot-return + a oneshot send — microseconds, never the export itself.
+async fn handle_export_resume<CH>(contract_handler: &mut CH, resume: ExportResume)
+where
+    CH: ContractHandler + Send + 'static,
+{
+    let ExportResume { done, responder } = resume;
+    // Return/replace the executor and recover the result for the client.
+    let result = contract_handler.executor().finish_export(done).await;
+    // Answer the parked client. `responder` is `None` only if the client
+    // disconnected before the export finished (we still reclaimed the executor).
+    if let Some(responder) = responder {
+        if let Err(error) =
+            responder.respond(ContractHandlerEvent::ExportUserSecretsResponse(result))
+        {
+            tracing::debug!(
+                error = %error,
+                "Failed to deliver EXPORT resume response (client may have disconnected)"
+            );
+        }
+    }
+}
+
 async fn handle_deferred_resume<CH>(
     contract_handler: &mut CH,
     deferral_ctx: &mut DeferralCtx,
@@ -2152,8 +2326,17 @@ where
             user_context,
             token,
         } => {
-            // Hosted-mode export (P3-live of #4381). Runs on the executor (which
-            // owns the SecretsStore) and returns the encrypted bundle bytes.
+            // Hosted-mode export (P3-live of #4381). DEFERRED OFF this serial loop
+            // (#4531 / #4381 P5): the enumerate+decrypt+seal is potentially long,
+            // so running it inline would park the loop for its whole duration and
+            // make every queued GET/PUT/UPDATE/delegate event wait behind it —
+            // the authenticated DoS. Instead we check out a pooled executor
+            // (`try_begin_export`) and run the export on a SPAWNED background task,
+            // returning from this arm IMMEDIATELY so the loop drains the next
+            // event. The task sends its result + the executor back via the
+            // export-resume channel; the loop returns/replaces the executor and
+            // answers the client (`handle_export_resume`).
+            //
             // `user_context` is the forge-proof per-user namespace derived at the
             // connection boundary; the export reads ONLY that user's scope. Log
             // only the non-secret user_id — never the token or bundle bytes.
@@ -2161,19 +2344,50 @@ where
                 user_id = ?user_context.user_id(),
                 "Processing hosted-mode secret export request"
             );
-            let result = contract_handler
+
+            // Without a DeferralCtx (delegate-driven path / direct unit-test
+            // calls) there is no export-resume channel to off-load onto. The
+            // production hosted HTTP path always provides one; anything else
+            // cannot export. Answer with the not-supported error inline.
+            let Some(deferral) = deferral else {
+                let err = ExecutorError::other(anyhow::anyhow!(
+                    "secret export is not supported in this context"
+                ));
+                send_export_response_inline(contract_handler, id, Err(err)).await;
+                return Ok(());
+            };
+
+            match contract_handler
                 .executor()
-                .export_user_secrets(&user_context, token.expose())
-                .await;
-            if let Err(error) = contract_handler
-                .channel()
-                .send_to_sender(id, ContractHandlerEvent::ExportUserSecretsResponse(result))
-                .await
+                .try_begin_export(&user_context, token.expose())
             {
-                tracing::debug!(
-                    error = %error,
-                    "Failed to send EXPORT response (client may have disconnected)"
-                );
+                executor::runtime::ExportAdmission::Admitted(job) => {
+                    // Park the client responder so the off-loop task can answer it
+                    // later via the resume channel; the arm returns now.
+                    let responder = contract_handler.channel().take_waiting_response(&id);
+                    let guard = ExportGuard::new(deferral.export_resume_tx.clone(), responder);
+                    // Fire-and-forget background task. Bounded by
+                    // MAX_CONCURRENT_EXPORTS (the export semaphore the job holds);
+                    // the ExportGuard guarantees exactly-one resume even if the
+                    // task is dropped/panics, so the executor is always reclaimed
+                    // and the client always answered. (Same fire-and-forget shape
+                    // as the #4391 deferral spawn — short-lived, capacity-bounded.)
+                    GlobalExecutor::spawn(async move {
+                        let done = job.run().await;
+                        guard.send(done);
+                    });
+                }
+                executor::runtime::ExportAdmission::Busy => {
+                    // At MAX_CONCURRENT_EXPORTS already; do not queue on the loop.
+                    let err = ExecutorError::other(ExportBusy);
+                    send_export_response_inline(contract_handler, id, Err(err)).await;
+                }
+                executor::runtime::ExportAdmission::Unsupported => {
+                    let err = ExecutorError::other(anyhow::anyhow!(
+                        "secret export is not supported by this executor"
+                    ));
+                    send_export_response_inline(contract_handler, id, Err(err)).await;
+                }
             }
         }
         ContractHandlerEvent::RegisterSubscriberListener {
@@ -4309,7 +4523,10 @@ mod hol_4391_tests {
     #[tokio::test]
     async fn dropped_waiter_guard_answers_client_missing_related() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DeferredResume>();
-        let mut ctx = DeferralCtx::new(tx.clone());
+        // This test exercises the related-fetch resume path only; the export
+        // resume channel is unused here.
+        let (export_tx, _export_rx) = tokio::sync::mpsc::unbounded_channel::<ExportResume>();
+        let mut ctx = DeferralCtx::new(tx.clone(), export_tx);
         let mut handler =
             MockWasmContractHandler::new_test(handler::contract_handler_channel().1, None, "drop")
                 .await;

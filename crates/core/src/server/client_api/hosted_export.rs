@@ -41,24 +41,31 @@
 //! derives the storage DEK), but it means token confidentiality is the whole
 //! ballgame — hence the strict refuse-plaintext-token gate above.
 //!
-//! ## Known limitation — loop-blocking DoS (P5 follow-up)
+//! ## DoS hardening — off-loop execution + per-user bound (#4381 P5)
 //!
-//! An export enumerates AND AEAD-decrypts EVERY secret in the user's scope
-//! SYNCHRONOUSLY on the single-threaded contract-handling loop (the export runs
-//! inside the `ContractHandlerEvent::ExportUserSecrets` handler, same loop as
-//! every PUT/GET/UPDATE/delegate op), with NO per-user secret-count or
-//! bundle-size cap. So a token-holder with a large per-user secret set — or one
-//! who simply repeats the request — can block ALL other contract operations on
-//! the node for the duration of each export. The request is AUTHENTICATED (a
-//! valid token + secure connection), so this is an authenticated-DoS, not an
-//! anonymous one.
+//! An export enumerates AND AEAD-decrypts EVERY secret in the user's scope. To
+//! keep an AUTHENTICATED token-holder (valid token + secure connection) from
+//! using a large or repeated export to wedge the node, two guards are in place:
 //!
-//! This is acceptable ONLY because the endpoint ships behind the DEFAULT-OFF
-//! hosted flag and is not yet exposed on shared/public infrastructure. Before
-//! it is, a P5 (abuse/quotas) follow-up MUST add: (1) a per-user export quota
-//! (secret-count / bundle-size / rate cap), and (2) off-loop execution
-//! (`spawn_blocking` or a dedicated worker) so a single user's export cannot
-//! stall the node's contract loop. Tracked as part of P5 (#4381).
+//! 1. **Off-loop execution.** The export no longer runs synchronously on the
+//!    single-threaded contract-handling loop. The handler arm
+//!    (`ContractHandlerEvent::ExportUserSecrets`) hands off to
+//!    `RuntimePool::export_user_secrets`, which runs the synchronous
+//!    enumerate+decrypt+re-encrypt on a blocking thread (`spawn_blocking`,
+//!    runtime-flavor-gated like the WASM-compile offload of #4441). The loop is
+//!    free to drain other PUT/GET/UPDATE/delegate ops while an export runs, so a
+//!    single user's export can no longer block the node's contract loop.
+//!
+//! 2. **Per-user bound.** `secret_export::export_bundle` rejects — BEFORE the
+//!    heavy work — any export exceeding `MAX_EXPORT_SECRET_COUNT` or
+//!    `MAX_EXPORT_TOTAL_PLAINTEXT_BYTES`, bounding the worst-case work of a
+//!    single export. The rejection surfaces here as HTTP 413.
+//!
+//! What remains for the broader P5 abuse work (#4381): per-user RATE limiting
+//! across many requests over time (e.g. N exports/minute) and node-wide export
+//! concurrency caps. The two guards above remove the head-of-line blocking and
+//! bound a single request; a full quota/rate-limiting system is tracked
+//! separately and is not required for the endpoint behind the default-off flag.
 
 use axum::{
     Router,
@@ -206,12 +213,11 @@ pub(crate) fn export_user_context_or_reject(
 /// uses, and necessary because this crate builds `axum` without the feature
 /// that provides the `ConnectInfo` extractor.
 ///
-/// PERFORMANCE / DoS: the export runs SYNCHRONOUSLY on the contract-handling
-/// loop and decrypts every secret in the user's scope with no per-user cap, so
-/// an authenticated token-holder can block the node for the export's duration.
-/// Acceptable only behind the default-off hosted flag; a per-user quota +
-/// off-loop execution is a required P5 follow-up before public exposure. See the
-/// module-level "Known limitation" section.
+/// PERFORMANCE / DoS (#4381 P5): the export is bounded (per-user secret-count /
+/// byte cap, returned here as 413) AND runs OFF the contract-handling loop on a
+/// blocking thread, so a single authenticated token-holder's export can neither
+/// do unbounded work nor stall other contract ops. See the module-level
+/// "DoS hardening" section for what remains (cross-request rate limiting).
 async fn export_handler(req: axum::extract::Request) -> Response {
     // Tolerant: the standalone `as_router` composition path has no `HostedMode`
     // layer, so a missing extension means hosted-off ⇒ the gate below 403s (it
@@ -314,6 +320,26 @@ async fn run_export(
     {
         Ok(ContractHandlerEvent::ExportUserSecretsResponse(Ok(bundle))) => Ok(bundle),
         Ok(ContractHandlerEvent::ExportUserSecretsResponse(Err(e))) => {
+            // An over-limit export is a client condition, not a node fault:
+            // surface it as 413 (Payload Too Large) so the caller can tell it
+            // apart from a genuine 500. The message is non-secret (sizes only).
+            // See the per-user export bound in `secret_export` (#4381 P5).
+            if e.is_export_too_large() {
+                tracing::warn!(error = %e, "Rejected hosted export: over per-user limit");
+                return Err((
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "export exceeds the per-user size limit",
+                ));
+            }
+            // The node is at its concurrent-export cap: a transient "retry
+            // later", not a failure. 503 so the caller can distinguish it.
+            if e.is_export_busy() {
+                tracing::warn!(error = %e, "Rejected hosted export: node busy (concurrent-export cap)");
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "node is busy with other exports; retry shortly",
+                ));
+            }
             // Executor-side failure (e.g. a secret failed to decrypt). Do not
             // leak internals to the client; log the detail, return a generic 500.
             tracing::error!(error = %e, "Hosted export failed on the executor");

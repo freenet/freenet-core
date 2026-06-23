@@ -29,8 +29,8 @@ use crate::contract::storages::Storage;
 
 use super::RuntimeResult;
 use super::secret_snapshots::{
-    RestoreError, RetentionPolicy, SnapshotMetadata, list_snapshots, restore_snapshot_file,
-    snapshot_active_value, snapshot_dir_for, thin_snapshots,
+    RestoreError, RetentionPolicy, SNAPSHOTS_DIR, SnapshotMetadata, list_snapshots,
+    restore_snapshot_file, snapshot_active_value, snapshot_dir_for, thin_snapshots,
 };
 
 /// Environment variable that disables snapshot-on-write for delegate secrets.
@@ -460,6 +460,24 @@ pub(super) fn ensure_owner_only_dir(_path: &Path) -> std::io::Result<()> {
 /// unchanged. `base` itself is never touched here (it is tightened once in
 /// [`SecretsStore::new`]). Best-effort by contract of its callers: they log
 /// and continue on a chmod error rather than failing the primary write.
+/// Decode a base58 (BITCOIN alphabet) name into exactly 32 bytes, or `None` if
+/// it isn't a valid 32-byte bs58 string. Used by the on-disk export enumeration
+/// to recognize delegate-dir names and secret-blob filenames (both are
+/// `bs58(<32-byte hash>)`) while rejecting every non-secret entry (`.keys`,
+/// `*.tmp`, `node_kek`, `kek_backend`, ...), none of which decode to 32 bytes.
+fn decode_bs58_32(name: &str) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    match bs58::decode(name)
+        .with_alphabet(bs58::Alphabet::BITCOIN)
+        .onto(&mut out)
+    {
+        // `onto` fills `out` and returns the number of bytes written; require
+        // EXACTLY 32 so a shorter/longer bs58 string is rejected.
+        Ok(32) => Some(out),
+        _ => None,
+    }
+}
+
 fn ensure_owner_only_tree(base: &Path, full: &Path) -> std::io::Result<()> {
     // The relative path from base to full names exactly the segments we
     // must tighten. If `full` is not under `base` (should never happen —
@@ -1587,36 +1605,189 @@ impl SecretsStore {
     // from the delegate's wasm+params), so a re-installed webapp shipping the
     // same delegate yields the same key and the imported secrets line up.
 
-    /// Enumerate every `(DelegateKey, secret_hash)` held for `scope`.
-    ///
-    /// Reads from the in-memory index maps (kept in lock-step with ReDb), so
-    /// it reflects exactly what `get_secret` could read. For `User` scope only
-    /// the `id` field of the scope is consulted (the `dek_secret` is unused
-    /// here — enumeration is a metadata walk, not a decrypt).
-    fn enumerate_scope(&self, scope: &SecretScope<'_>) -> Vec<(DelegateKey, SecretKey)> {
-        let mut out = Vec::new();
+    /// Map `delegate-key-bytes (32) -> real CodeHash` from this store's in-memory
+    /// index for `scope`, so the on-disk enumeration can recover the real
+    /// `code_hash` of a delegate the dir name (key-only) can't carry. Best-effort:
+    /// a delegate this executor never registered simply isn't in the map (the
+    /// caller falls back to a placeholder code_hash, which is inert).
+    fn index_code_hashes_by_key(
+        &self,
+        scope: &SecretScope<'_>,
+    ) -> std::collections::HashMap<[u8; 32], CodeHash> {
+        let mut out = std::collections::HashMap::new();
         match scope {
             SecretScope::Local => {
                 for entry in self.key_to_secret_part.iter() {
-                    let delegate = entry.key().clone();
-                    for hash in entry.value() {
-                        out.push((delegate.clone(), *hash));
-                    }
+                    let dk = entry.key();
+                    // `DelegateKey` derefs to its 32-byte key.
+                    out.insert(**dk, *dk.code_hash());
                 }
             }
             SecretScope::User { id, .. } => {
                 for entry in self.user_key_to_secret_part.iter() {
-                    let (delegate, user) = entry.key();
-                    if user != *id {
-                        continue;
-                    }
-                    for hash in entry.value() {
-                        out.push((delegate.clone(), *hash));
+                    let (dk, user) = entry.key();
+                    if user == *id {
+                        out.insert(**dk, *dk.code_hash());
                     }
                 }
             }
         }
         out
+    }
+
+    /// Count the secrets under `scope` on disk, STOPPING as soon as the count
+    /// reaches `stop_at`. Used for the export count-cap pre-check so an
+    /// over-limit (attacker-controlled) scope is rejected without materializing
+    /// — or even fully traversing past `stop_at` — its entries. Same disk walk /
+    /// filter as the gather, and the same fail-loud I/O semantics.
+    fn count_scope_secrets_on_disk(
+        &self,
+        scope: &SecretScope<'_>,
+        stop_at: usize,
+    ) -> Result<usize, SecretStoreError> {
+        let mut count = 0usize;
+        self.walk_scope_secrets_on_disk(scope, |_delegate, _secret_hash| {
+            count += 1;
+            if count >= stop_at {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        })?;
+        Ok(count)
+    }
+
+    /// Shared on-disk scope walk: invoke `visit` once per secret blob under
+    /// `scope` by walking the on-disk `secrets_dir` (the shared source of truth)
+    /// instead of this store's per-instance in-memory index. `visit` returns
+    /// [`ControlFlow::Break`](std::ops::ControlFlow) to stop early. The gather
+    /// ([`Self::export_scope_entries_bounded`]) and the count
+    /// ([`Self::count_scope_secrets_on_disk`]) both stream through this one
+    /// walker, so they can never diverge in filter / scope / error handling.
+    ///
+    /// WHY (the cross-executor correctness fix): each pooled `Executor` owns its
+    /// OWN `SecretsStore` with its own in-memory index, but ALL of them write to
+    /// the SAME `secrets_dir`. A `store_secret` on executor A updates only A's
+    /// index; an export running on executor B would miss A's just-written secret
+    /// if it enumerated B's in-memory index — a silently incomplete backup once
+    /// the export runs off-loop concurrently with normal ops. Walking the disk
+    /// includes EVERY committed write regardless of which executor made it.
+    ///
+    /// Consistency: `store_secret`/`import_secret_by_hash` write each secret blob
+    /// via tmp-file + fsync + atomic `rename` into place, so a concurrent walk
+    /// only ever sees a fully-written active file (a torn read is impossible at
+    /// the active path; even so, a bad blob fails AEAD on read → a clean export
+    /// error, never silent corruption).
+    ///
+    /// On-disk layout (see [`Self::scope_dir`]):
+    /// - `Local` => `base_path/<delegate>/<bs58(secret_hash)>`
+    /// - `User`  => `base_path/<delegate>/users/<user_id>/<bs58(secret_hash)>`
+    ///
+    /// A "secret blob" is a REGULAR FILE whose name bs58-decodes to exactly 32
+    /// bytes. That positive filter inherently rejects every non-secret entry
+    /// (`.keys`, `.keys.tmp`, `<hash>.tmp`, `node_kek`, `kek_backend*` — none
+    /// bs58-decode to 32 bytes) and every directory (`.snapshots/`, `users/`,
+    /// and the delegate dirs themselves); the known non-secret names are also
+    /// skipped explicitly as belt-and-suspenders.
+    ///
+    /// The reconstructed `DelegateKey` carries the real 32-byte key (the
+    /// directory name) and the real `code_hash` recovered from the in-memory
+    /// index when known (see [`Self::index_code_hashes_by_key`]), or a ZERO
+    /// placeholder otherwise. `code_hash` is never consulted by
+    /// [`Self::scope_dir`], [`Self::derive_user_dek`], [`Self::cipher_for_read`],
+    /// or `read_secret_by_hash` (all key-only via `delegate.encode()`), so the
+    /// placeholder reads and decrypts the secret identically; it only ends up as
+    /// a (functionally inert) 32-byte value in the exported bundle's `code_hash`.
+    ///
+    /// FAIL-LOUD: an UNEXPECTED I/O error (permission denied, EIO, a vanished
+    /// mount — anything other than `NotFound`) is PROPAGATED, not swallowed.
+    /// Swallowing it would let the export seal a SUCCESSFUL but silently
+    /// INCOMPLETE bundle — the same silent-incompleteness class this whole fix
+    /// removes, via a different door. `NotFound` is the one expected-absent case
+    /// (base_path or a user-scope dir simply doesn't exist ⇒ that scope has no
+    /// secrets) and is treated as empty/skip.
+    fn walk_scope_secrets_on_disk(
+        &self,
+        scope: &SecretScope<'_>,
+        mut visit: impl FnMut(DelegateKey, SecretKey) -> std::ops::ControlFlow<()>,
+    ) -> Result<(), SecretStoreError> {
+        use std::ops::ControlFlow;
+        // Iterate the delegate directories under base_path. Each is named
+        // `bs58(delegate_key)`; non-directory / non-bs58 root entries
+        // (`node_kek`, `kek_backend`, `kek_backend.tmp`) are skipped by the
+        // 32-byte-bs58 decode below. A missing base_path ⇒ no secrets; any other
+        // read error is unexpected ⇒ fail loud.
+        let delegate_dirs = match fs::read_dir(&self.base_path) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(SecretStoreError::IO(e)),
+        };
+        // Recover each delegate's real `code_hash` from the in-memory index when
+        // this executor knows it. The on-disk delegate dir name encodes only the
+        // 32-byte key (`DelegateKey::encode()`), NOT the code_hash — but the
+        // bundle records `code_hash`, and `DelegateKey`'s `Eq`/`Hash` cover both
+        // fields, so a placeholder would make the exported key `!=` the real one.
+        // code_hash is otherwise inert (path/DEK/read are key-only), so a secret
+        // written by ANOTHER executor for a delegate THIS executor never
+        // registered still exports + decrypts correctly under the zero
+        // placeholder; it just carries a placeholder code_hash in the bundle
+        // (inert for import). The exporting executor has almost always
+        // registered the delegate, so the real code_hash is recovered in
+        // practice.
+        let code_hashes = self.index_code_hashes_by_key(scope);
+        for delegate_entry in delegate_dirs {
+            // A per-entry read error mid-iteration is unexpected ⇒ fail loud.
+            let delegate_entry = delegate_entry.map_err(SecretStoreError::IO)?;
+            let delegate_path = delegate_entry.path();
+            if !delegate_path.is_dir() {
+                continue;
+            }
+            let Some(delegate_name) = delegate_entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(delegate_key_bytes) = decode_bs58_32(&delegate_name) else {
+                continue; // not a delegate dir (e.g. a stray non-bs58 name)
+            };
+            let code_hash = code_hashes
+                .get(&delegate_key_bytes)
+                .copied()
+                .unwrap_or_else(|| CodeHash::from(&[0u8; 32]));
+            let delegate = DelegateKey::new(delegate_key_bytes, code_hash);
+
+            // The directory that actually holds this scope's secret files.
+            let scope_path = match scope {
+                SecretScope::Local => delegate_path.clone(),
+                SecretScope::User { id, .. } => delegate_path.join("users").join(id.encode()),
+            };
+            // A missing scope dir ⇒ this delegate has no secrets for this scope
+            // (expected). Any other read error is unexpected ⇒ fail loud.
+            let files = match fs::read_dir(&scope_path) {
+                Ok(rd) => rd,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(SecretStoreError::IO(e)),
+            };
+            for file_entry in files {
+                let file_entry = file_entry.map_err(SecretStoreError::IO)?;
+                // Only regular files whose name bs58-decodes to a 32-byte hash.
+                let name = file_entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if name == KEY_REGISTRY_FILE || name == SNAPSHOTS_DIR || name.ends_with(".tmp") {
+                    continue;
+                }
+                let Some(secret_hash) = decode_bs58_32(name) else {
+                    continue;
+                };
+                // Confirm it is a regular file (not a dir like `users/`).
+                match file_entry.file_type() {
+                    Ok(ft) if ft.is_file() => {}
+                    _ => continue,
+                }
+                if let ControlFlow::Break(()) = visit(delegate.clone(), secret_hash) {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Read + decrypt the active secret blob named `bs58(secret_hash)` under
@@ -1663,6 +1834,36 @@ impl SecretsStore {
         }
     }
 
+    /// `true` if `scope` holds MORE than `max_count` secrets on disk, decided
+    /// WITHOUT enumerating beyond `max_count + 1` entries.
+    ///
+    /// Used by [`super::secret_export::export_bundle`] to enforce the export
+    /// count cap BEFORE any secret is read/decrypted AND before materializing
+    /// the (attacker-controlled) entry list: the streaming count stops the
+    /// instant it has seen `max_count + 1` matching entries, so an over-limit
+    /// scope is rejected without a full traversal/allocation. Counts from disk
+    /// (the shared source of truth) for the same cross-executor-consistency
+    /// reason as [`Self::walk_scope_secrets_on_disk`], using the same walk/filter,
+    /// so the cap is checked against the SAME set the gather will materialize.
+    /// Returns `Err` on an unexpected I/O error (fail-loud, same as the gather).
+    pub fn scope_count_exceeds(
+        &self,
+        scope: &SecretScope<'_>,
+        max_count: usize,
+    ) -> Result<bool, SecretStoreError> {
+        // Stop after seeing max_count + 1 — enough to know we're over the cap.
+        let stop_at = max_count.saturating_add(1);
+        Ok(self.count_scope_secrets_on_disk(scope, stop_at)? > max_count)
+    }
+
+    /// Number of secrets currently held under `scope` on disk (full count, no
+    /// decrypt). Used by tests / callers that need the exact count; the export
+    /// count cap uses the streaming [`Self::scope_count_exceeds`] instead so an
+    /// over-limit scope is never fully traversed.
+    pub fn scope_entry_count(&self, scope: &SecretScope<'_>) -> Result<usize, SecretStoreError> {
+        self.count_scope_secrets_on_disk(scope, usize::MAX)
+    }
+
     /// Gather every secret under `scope`, decrypted, as portable export
     /// entries. The returned plaintexts live in `Zeroizing` buffers so they
     /// are wiped when the caller drops them.
@@ -1676,15 +1877,101 @@ impl SecretsStore {
         &self,
         scope: SecretScope<'_>,
     ) -> Result<Vec<ExportSecretEntry>, SecretStoreError> {
-        let refs = self.enumerate_scope(&scope);
-        let mut entries = Vec::with_capacity(refs.len());
-        for (delegate, secret_hash) in refs {
-            let plaintext = self.read_secret_by_hash(&delegate, &secret_hash, &scope)?;
+        // Unbounded gather (CLI backup / tests). The hosted-export path uses
+        // `export_scope_entries_bounded` so an authenticated token-holder cannot
+        // make the node buffer an unbounded amount of decrypted plaintext.
+        match self.export_scope_entries_bounded(scope, usize::MAX, usize::MAX) {
+            Ok(entries) => Ok(entries),
+            Err(ExportScopeError::Store(e)) => Err(e),
+            // usize::MAX caps are never exceeded.
+            Err(ExportScopeError::TooLarge { .. } | ExportScopeError::CountTooLarge { .. }) => {
+                unreachable!("count/byte caps are usize::MAX")
+            }
+        }
+    }
+
+    /// Like [`Self::export_scope_entries`] but ABORTS the instant the running
+    /// secret COUNT would exceed `max_count` OR the running plaintext total
+    /// would exceed `max_total_bytes`.
+    ///
+    /// BOTH caps are enforced INCREMENTALLY, per entry, as the scope is walked
+    /// and each plaintext decrypted:
+    /// - Count: checked BEFORE reading each entry, so an over-cap scope aborts
+    ///   without reading/decrypting past `max_count + 1` entries. This is the
+    ///   AUTHORITATIVE count enforcement: the cheap `scope_count_exceeds`
+    ///   pre-check rejects the common case before any decrypt, but the export
+    ///   runs off-loop while the contract loop keeps serving `store_secret`, so
+    ///   a concurrent writer could push a just-under-cap scope over the cap
+    ///   between the pre-check and here — enforcing it again during the gather
+    ///   closes that TOCTOU window.
+    /// - Bytes: checked after each decrypt, so an over-limit export bails after
+    ///   reading only enough to cross the threshold and drops the partial
+    ///   buffer, rather than buffering the user's entire scope first.
+    ///
+    /// On overflow returns [`ExportScopeError::CountTooLarge`] /
+    /// [`ExportScopeError::TooLarge`] carrying the running value at the bail
+    /// point (`>` the limit) and the limit. Used by the hosted-mode export DoS
+    /// bound (#4381 P5). Pass `usize::MAX` to disable either cap.
+    pub fn export_scope_entries_bounded(
+        &self,
+        scope: SecretScope<'_>,
+        max_count: usize,
+        max_total_bytes: usize,
+    ) -> Result<Vec<ExportSecretEntry>, ExportScopeError> {
+        // STREAM the shared on-disk walk (the same walk_scope_secrets_on_disk
+        // the count pre-check uses) and read+decrypt each secret in one pass —
+        // so we never materialize the full (attacker-controlled) ref list, and
+        // both caps are enforced inline. Enumerating from DISK (not this store's
+        // per-instance in-memory index) is the cross-executor correctness fix;
+        // a disk I/O failure aborts the export (fail-loud). See
+        // `walk_scope_secrets_on_disk`.
+        use std::ops::ControlFlow;
+        let mut entries: Vec<ExportSecretEntry> = Vec::new();
+        let mut total_bytes: usize = 0;
+        let mut count: usize = 0;
+        // The visit closure can't return a Result, so it stashes a terminal
+        // outcome here and Breaks; we surface it after the walk.
+        let mut bail: Option<ExportScopeError> = None;
+        self.walk_scope_secrets_on_disk(&scope, |delegate, secret_hash| {
+            // Count cap: check BEFORE reading/decrypting this entry so an
+            // over-cap scope never decrypts more than max_count + 1 entries.
+            // This is the AUTHORITATIVE count enforcement (closes the TOCTOU
+            // window vs. the cheap pre-check, since a concurrent store_secret
+            // can push the scope over the cap after that pre-check passed).
+            count += 1;
+            if count > max_count {
+                bail = Some(ExportScopeError::CountTooLarge {
+                    actual: count,
+                    limit: max_count,
+                });
+                return ControlFlow::Break(());
+            }
+            let plaintext = match self.read_secret_by_hash(&delegate, &secret_hash, &scope) {
+                Ok(p) => p,
+                Err(e) => {
+                    bail = Some(ExportScopeError::Store(e));
+                    return ControlFlow::Break(());
+                }
+            };
+            // Byte cap: check BEFORE pushing, so we never retain a buffer that
+            // crosses the cap. `plaintext` is dropped here on the bail path.
+            total_bytes = total_bytes.saturating_add(plaintext.len());
+            if total_bytes > max_total_bytes {
+                bail = Some(ExportScopeError::TooLarge {
+                    actual: total_bytes,
+                    limit: max_total_bytes,
+                });
+                return ControlFlow::Break(());
+            }
             entries.push(ExportSecretEntry {
                 delegate_key: delegate,
                 secret_hash,
                 plaintext,
             });
+            ControlFlow::Continue(())
+        })?; // a disk I/O error during the walk itself is fail-loud.
+        if let Some(err) = bail {
+            return Err(err);
         }
         Ok(entries)
     }
@@ -1796,6 +2083,26 @@ pub struct ExportSecretEntry {
     pub delegate_key: DelegateKey,
     pub secret_hash: [u8; 32],
     pub plaintext: Zeroizing<Vec<u8>>,
+}
+
+/// Error from [`SecretsStore::export_scope_entries_bounded`]: an underlying
+/// store/IO failure, or the gather hit the byte cap or the count cap.
+#[derive(Debug, thiserror::Error)]
+pub enum ExportScopeError {
+    #[error(transparent)]
+    Store(#[from] SecretStoreError),
+    /// The running decrypted-plaintext total crossed `limit` (the gather
+    /// aborted at `actual`, having dropped the partial buffer). Sizes only —
+    /// non-secret, safe to surface.
+    #[error("export plaintext total {actual} exceeds limit {limit}")]
+    TooLarge { actual: usize, limit: usize },
+    /// The running SECRET COUNT crossed `limit` mid-gather (a concurrent writer
+    /// pushed the scope over the cap after the cheap pre-check passed). The
+    /// gather aborts authoritatively here so the count cap can't be bypassed by
+    /// a TOCTOU race. `actual` is the count at the bail point (`> limit`).
+    /// Counts only — non-secret, safe to surface.
+    #[error("export secret count {actual} exceeds limit {limit}")]
+    CountTooLarge { actual: usize, limit: usize },
 }
 
 /// Decrypt an on-disk secret blob, transparently supporting every
@@ -5180,14 +5487,25 @@ mod test {
         store.db.store_secrets_index(delegate.key(), &[])?;
         store.key_to_secret_part.remove(delegate.key());
 
-        // Pre-condition: file present, index empty → invisible to enumeration.
+        // Pre-condition: file present, in-memory index empty.
         let file_path = secrets_dir
             .join(delegate.key().encode())
             .join(secret_id.encode());
         assert!(file_path.exists(), "secret file should still be on disk");
         assert!(
-            store.export_scope_entries(SecretScope::Local)?.is_empty(),
-            "pre-condition: unindexed secret must be invisible to enumeration"
+            store.key_to_secret_part.get(delegate.key()).is_none(),
+            "pre-condition: the in-memory index entry was dropped (crash window)"
+        );
+        // Since the export now enumerates from DISK (the shared source of truth,
+        // for cross-executor consistency — see `walk_scope_secrets_on_disk`), the
+        // completed on-disk secret IS already visible to export even before the
+        // index is repaired. This is the intended improvement: a backup includes
+        // every completed write regardless of in-memory index state. (It was
+        // "invisible" only under the OLD in-memory-index enumeration.)
+        assert_eq!(
+            store.export_scope_entries(SecretScope::Local)?.len(),
+            1,
+            "disk-based export sees the completed on-disk secret pre-repair"
         );
 
         // Retry the import WITHOUT overwrite. It must skip the rewrite
@@ -5259,9 +5577,21 @@ mod test {
             .user_key_to_secret_part
             .remove(&(delegate.key().clone(), *ctx.user_id()));
 
+        // In-memory index row dropped, but the disk-based export (the source of
+        // truth, for cross-executor consistency) still sees the completed
+        // on-disk secret pre-repair — the intended improvement (was "invisible"
+        // only under the OLD in-memory-index enumeration).
         assert!(
-            store.export_scope_entries(ctx.scope())?.is_empty(),
-            "pre-condition: unindexed user secret invisible"
+            store
+                .user_key_to_secret_part
+                .get(&(delegate.key().clone(), *ctx.user_id()))
+                .is_none(),
+            "pre-condition: the in-memory user-index entry was dropped"
+        );
+        assert_eq!(
+            store.export_scope_entries(ctx.scope())?.len(),
+            1,
+            "disk-based export sees the completed on-disk user secret pre-repair"
         );
 
         let wrote = store.import_secret_by_hash(
@@ -5273,6 +5603,17 @@ mod test {
         )?;
         assert!(!wrote);
 
+        // Post-condition: import repaired the ReDb + in-memory user index (for
+        // index consumers other than export, e.g. the `.keys` registry / ReDb
+        // consistency), and export still enumerates the secret.
+        assert!(
+            store
+                .user_key_to_secret_part
+                .get(&(delegate.key().clone(), *ctx.user_id()))
+                .map(|e| e.value().contains(&secret_hash))
+                .unwrap_or(false),
+            "in-memory user index must be repaired"
+        );
         let entries = store.export_scope_entries(ctx.scope())?;
         assert_eq!(
             entries.len(),

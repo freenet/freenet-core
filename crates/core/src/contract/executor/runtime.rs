@@ -11,6 +11,7 @@ use super::{
 };
 pub(crate) use contract_ops::ReclaimOutcome;
 pub use pool::RuntimePool;
+pub(crate) use pool::{ExportAdmission, ExportDone, MAX_CONCURRENT_EXPORTS};
 
 /// Maximum number of related contracts a single validation can request.
 /// Bounds worst-case first-time cost: N GETs of up to 50MB each.
@@ -99,6 +100,88 @@ use std::collections::{HashMap, HashSet};
 /// net; this flag is just the explicit production opt-in.
 fn production_offload_compilation() -> bool {
     true
+}
+
+/// Outcome of [`run_blocking_offloaded`].
+///
+/// Distinguishes the normal case (work completed, the moved-in value `T` came
+/// back) from a panic inside the offloaded closure. On panic the `spawn_blocking`
+/// thread unwound while owning `value`, so it is GONE and cannot be returned —
+/// the caller must reconcile a lost resource (for the export path: replace the
+/// lost pool executor so the permit is restored, and fail just that one export).
+pub(crate) enum OffloadOutcome<T, R> {
+    /// The closure ran to completion; `value` is returned alongside the result.
+    Completed(T, R),
+    /// The offloaded closure PANICKED. `value` was owned by the unwinding
+    /// blocking thread and is unrecoverable.
+    Panicked,
+}
+
+/// Run a synchronous, potentially-long CPU/IO closure OFF the contract-handling
+/// loop when we're on a multi-threaded runtime, or INLINE otherwise.
+///
+/// The contract-handling loop is single-threaded and processes one event at a
+/// time, so any synchronous work done inside an event handler blocks every
+/// other contract op (GET/PUT/UPDATE/delegate) for its full duration. The
+/// hosted-mode secret export (`export_user_secrets`) enumerates, decrypts, and
+/// re-encrypts every secret in a user's scope synchronously, so an authenticated
+/// token-holder with a large secret set could otherwise wedge the loop (the
+/// #4381 P5 DoS). Moving that work onto a blocking thread keeps the loop free.
+///
+/// `f` takes ownership of `value` (the checked-out executor) and returns it
+/// alongside the result, so the caller can return the executor to the pool
+/// afterwards. `value` is exclusively checked out for the whole call.
+///
+/// PANIC SAFETY: mirrors `wasmtime_engine::compile_offloaded` (#4441) — a panic
+/// inside the offloaded closure is CAUGHT (`JoinError::is_panic()`) and reported
+/// as [`OffloadOutcome::Panicked`], NOT re-raised. Re-raising would propagate the
+/// panic onto the *caller's* task; for the export caller (the contract-handling
+/// loop / a loop-spawned task) that would abort the loop and, via the node's
+/// top-level `select!`, shut down the WHOLE node — and leak the executor's pool
+/// slot. Catching it lets the caller fail just that one export and reconcile the
+/// lost slot.
+///
+/// Runtime-flavor gate: offload (multi-thread) vs inline (`current_thread` / no
+/// runtime, where `spawn_blocking` + a blocking `await` is unnecessary and the
+/// sim/test runners want a deterministic inline run). On the inline path a panic
+/// propagates normally (there is no thread boundary to catch it at), exactly as
+/// it would have without this helper.
+async fn run_blocking_offloaded<T, R>(
+    value: T,
+    f: impl FnOnce(T) -> (T, R) + Send + 'static,
+) -> OffloadOutcome<T, R>
+where
+    T: Send + 'static,
+    R: Send + 'static,
+{
+    use tokio::runtime::RuntimeFlavor;
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            match tokio::task::spawn_blocking(move || f(value)).await {
+                Ok((value, result)) => OffloadOutcome::Completed(value, result),
+                Err(e) if e.is_panic() => {
+                    // The blocking thread unwound while owning `value`; it is
+                    // lost. Report Panicked so the caller replaces the slot and
+                    // fails this one operation, rather than crashing the node.
+                    tracing::error!("offloaded export task panicked");
+                    OffloadOutcome::Panicked
+                }
+                // Cancellation: the runtime is shutting down. Treat like a panic
+                // (value gone), but this only happens at teardown.
+                Err(e) => {
+                    tracing::error!(error = %e, "offloaded export task failed (cancelled)");
+                    OffloadOutcome::Panicked
+                }
+            }
+        }
+        // current_thread runtime (sim / current_thread integration tests) or no
+        // tokio runtime: run inline. There is no thread boundary, so a panic
+        // here propagates exactly as it would without the offload.
+        _ => {
+            let (value, result) = f(value);
+            OffloadOutcome::Completed(value, result)
+        }
+    }
 }
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -199,13 +282,14 @@ impl ContractExecutor for Executor<Runtime> {
         self.delegate_request(req, origin_contract, caller_delegate, user_context)
     }
 
-    async fn export_user_secrets(
-        &mut self,
-        user_context: &UserSecretContext,
-        token: &[u8],
-    ) -> Result<Vec<u8>, ExecutorError> {
-        Executor::export_user_secrets(self, user_context, token)
-    }
+    // NOTE: `ContractExecutor::try_begin_export` / `finish_export` are NOT
+    // overridden for a bare `Executor<Runtime>` — only the pooled `RuntimePool`
+    // can admit a deferred export (it owns the executor pool + the export
+    // concurrency semaphore needed to check one out and return it). A bare
+    // executor (tests / direct use, never the production hosted path) falls
+    // through to the trait default (`ExportAdmission::Unsupported`). The inherent
+    // `Executor::export_user_secrets` (delegates.rs) remains as the work
+    // function the pool's `ExportJob::run` calls.
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo> {
         self.get_subscription_info()
@@ -934,6 +1018,176 @@ mod executor_pin_tests {
             super::production_offload_compilation(),
             "production pool must opt in to offload; the runtime-flavor check in \
              compile_offloaded keeps it safe/deterministic everywhere else"
+        );
+    }
+
+    /// `run_blocking_offloaded` under a MULTI-THREAD runtime must run the
+    /// closure on a DIFFERENT thread (the offload actually happens, so a long
+    /// export does not occupy the calling/loop thread) and round-trip both the
+    /// moved-in value and the closure's result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_blocking_offloaded_runs_off_thread_under_multithread() {
+        let caller_thread = std::thread::current().id();
+        // Move a value in, return it alongside the result.
+        let outcome =
+            super::run_blocking_offloaded(41u64, |v| (v + 1, (v * 2, std::thread::current().id())))
+                .await;
+        let super::OffloadOutcome::Completed(value, (result, ran_on)) = outcome else {
+            panic!("a non-panicking closure must complete");
+        };
+        assert_eq!(
+            value, 42,
+            "moved-in value is returned (mutated by the closure)"
+        );
+        assert_eq!(result, 82, "closure result is returned");
+        assert_ne!(
+            ran_on, caller_thread,
+            "multi-thread runtime must offload the closure to a blocking thread"
+        );
+    }
+
+    /// `run_blocking_offloaded` under a CURRENT-THREAD runtime must run INLINE
+    /// (same thread). `spawn_blocking` real threads break the simulation
+    /// runner's paused-time determinism (and the current_thread integration
+    /// tests), so the helper runs the closure inline there instead. This pins
+    /// the runtime-flavor fallback.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_blocking_offloaded_runs_inline_under_current_thread() {
+        let caller_thread = std::thread::current().id();
+        let outcome =
+            super::run_blocking_offloaded(7u64, |v| (v, std::thread::current().id())).await;
+        let super::OffloadOutcome::Completed(value, ran_on) = outcome else {
+            panic!("inline run must complete");
+        };
+        assert_eq!(value, 7);
+        assert_eq!(
+            ran_on, caller_thread,
+            "current_thread runtime must run the closure inline (no offload)"
+        );
+    }
+
+    /// PANIC SAFETY (#4531): a panic inside the offloaded closure on a
+    /// multi-thread runtime must be CAUGHT and reported as
+    /// `OffloadOutcome::Panicked` — NOT re-raised onto the caller's task (which
+    /// for the export path is the contract loop, whose abort would shut the node
+    /// down). The moved-in value is lost (the blocking thread owned it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_blocking_offloaded_catches_panic_under_multithread() {
+        let outcome = super::run_blocking_offloaded(1u64, |_v| -> (u64, ()) {
+            panic!("boom inside the offloaded closure");
+        })
+        .await;
+        assert!(
+            matches!(outcome, super::OffloadOutcome::Panicked),
+            "a panicking offload must surface as Panicked, not unwind the caller"
+        );
+    }
+
+    /// Pin (#4531 / #4381 P5): the off-loop export MUST route the synchronous
+    /// enumerate+decrypt+seal through `run_blocking_offloaded` (so the CPU work
+    /// lands on a blocking thread, not the contract loop). A future refactor that
+    /// drops the offload re-introduces the head-of-line-blocking DoS and must
+    /// fail CI here. Anchored on `ExportJob::run`, the off-loop entry point.
+    #[test]
+    fn export_job_run_offloads_blocking_work() {
+        let src = include_str!("runtime/pool.rs");
+        let body = src
+            .split("pub(crate) async fn run(self) -> ExportDone {")
+            .nth(1)
+            .expect("ExportJob::run must exist")
+            .split("\n    }\n")
+            .next()
+            .expect("end of ExportJob::run");
+        assert!(
+            body.contains("run_blocking_offloaded("),
+            "ExportJob::run must offload the synchronous export off the contract \
+             loop via run_blocking_offloaded (#4531 / #4381 P5)"
+        );
+    }
+
+    /// The anti-deadlock invariant (#4531): off-loop export concurrency is
+    /// `min(MAX_CONCURRENT_EXPORTS, pool_size - 1)`, so at least one executor is
+    /// ALWAYS reserved for normal contract ops — exports can never hold every
+    /// executor and wedge the loop. On a 1-executor pool this is 0 (exports
+    /// disabled → Busy/503). Pure-function guard for the math.
+    #[test]
+    fn effective_export_permits_always_reserves_one_executor() {
+        use super::pool::{MAX_CONCURRENT_EXPORTS, effective_export_permits};
+        // 1-executor pool: exports DISABLED (no spare executor to lend).
+        assert_eq!(effective_export_permits(1), 0);
+        // 2-executor pool: exactly one export, one executor reserved for ops.
+        assert_eq!(effective_export_permits(2), 1);
+        // Below the MAX_CONCURRENT_EXPORTS ceiling, scales with pool_size - 1.
+        assert_eq!(effective_export_permits(3), MAX_CONCURRENT_EXPORTS.min(2));
+        // Large pool: clamped to MAX_CONCURRENT_EXPORTS, never more.
+        assert_eq!(effective_export_permits(64), MAX_CONCURRENT_EXPORTS);
+        // The invariant: for any pool_size >= 1, permits <= pool_size - 1, so a
+        // spare executor always remains for normal ops.
+        for n in 1..=64usize {
+            assert!(
+                effective_export_permits(n) <= n.saturating_sub(1),
+                "must always reserve >=1 executor for normal ops (pool_size={n})"
+            );
+        }
+        // Degenerate pool_size == 0 must not panic (saturating).
+        assert_eq!(effective_export_permits(0), 0);
+    }
+
+    /// Pin (#4531): when the offloaded export task PANICS, the executor is lost
+    /// with the unwinding thread, so `RuntimePool::finish_export` MUST reconcile
+    /// the missing pool slot — build a replacement (restoring the permit) rather
+    /// than leaving the pool one short or, worse, leaking the permit. A refactor
+    /// that drops the replacement re-introduces a slow capacity leak (and risks
+    /// the `pop_executor` `unreachable!` from a permit/slot mismatch).
+    #[test]
+    fn finish_export_replaces_panicked_executor() {
+        let src = include_str!("runtime/pool.rs");
+        let body = src
+            .split("async fn finish_export(&mut self, done: ExportDone)")
+            .nth(1)
+            .expect("RuntimePool::finish_export must exist")
+            .split("\n    fn get_subscription_info(")
+            .next()
+            .expect("end of finish_export");
+        // The None (panicked) arm must build a replacement executor.
+        assert!(
+            body.contains("create_replacement_executor("),
+            "finish_export must replace a panic-lost executor (create_replacement_executor)"
+        );
+        // ...and on a successful export, return the executor to the pool.
+        assert!(
+            body.contains("return_checked("),
+            "finish_export must return a healthy executor to the pool"
+        );
+    }
+
+    /// Pin (#4531 / #4381 P5): the `ExportUserSecrets` dispatch arm MUST defer
+    /// the export onto a spawned background task (so the loop returns
+    /// immediately) rather than awaiting it inline. Anchored on the arm spawning
+    /// the job via `GlobalExecutor::spawn` and routing through `try_begin_export`
+    /// — awaiting the export inline (the previous design) re-introduces #4531.
+    #[test]
+    fn export_dispatch_arm_defers_off_loop() {
+        let src = include_str!("../../contract.rs");
+        let arm = src
+            .split("ContractHandlerEvent::ExportUserSecrets {\n            user_context,\n            token,\n        } => {")
+            .nth(1)
+            .expect("ExportUserSecrets dispatch arm must exist")
+            .split("ContractHandlerEvent::RegisterSubscriberListener")
+            .next()
+            .expect("end of ExportUserSecrets arm");
+        assert!(
+            arm.contains("try_begin_export("),
+            "the export arm must admit via try_begin_export (off-loop deferral)"
+        );
+        assert!(
+            arm.contains("GlobalExecutor::spawn("),
+            "the export arm must run the export on a spawned background task, \
+             not await it inline on the contract loop (#4531)"
+        );
+        assert!(
+            !arm.contains(".export_user_secrets("),
+            "the export arm must NOT call export_user_secrets inline on the loop"
         );
     }
 

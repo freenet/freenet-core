@@ -13,7 +13,14 @@ impl Executor<Runtime> {
     /// #4381).
     ///
     /// Runs entirely on the executor (which owns the `SecretsStore` via its
-    /// `Runtime`), so the on-disk redb is touched only by its single writer.
+    /// `Runtime`). This is a READ-ONLY walk: it enumerates the in-memory secret
+    /// index and reads + AEAD-decrypts each on-disk secret BLOB (one file per
+    /// `(delegate, secret_hash)` under the shared `secrets_dir`); it opens no
+    /// redb write transaction and mutates nothing. So it is safe to run on a
+    /// blocking thread (or concurrently with other read-only walks): a secret
+    /// file racing a concurrent write is protected by per-file FS semantics and
+    /// AEAD authentication — a torn read fails authentication and surfaces a
+    /// clean export error, never silent corruption.
     /// The bundle is scoped to `user_context.scope()` — strictly the per-user
     /// namespace, never `Local`. The `token` is the bundle-key material so the
     /// user re-imports on their own peer with the token they already hold.
@@ -25,10 +32,24 @@ impl Executor<Runtime> {
         user_context: &UserSecretContext,
         token: &[u8],
     ) -> Result<Vec<u8>, ExecutorError> {
-        use crate::wasm_runtime::secret_export::BundleKeyMaterial;
+        use crate::wasm_runtime::secret_export::{BundleKeyMaterial, ExportError};
         self.runtime
             .export_secret_bundle(user_context.scope(), &BundleKeyMaterial::Token(token))
-            .map_err(|e| ExecutorError::other(anyhow::anyhow!("secret export failed: {e}")))
+            .map_err(|e| {
+                // Preserve the over-limit case as a typed marker so the HTTP
+                // layer can map it to a 413 rather than a generic 500. The
+                // Display text is non-secret (sizes only). Everything else stays
+                // an opaque executor error. See #4381 P5. (An `if let` rather
+                // than a `match` with a wildcard arm: `ExportError` is large and
+                // a catch-all trips `clippy::wildcard_enum_match_arm`.)
+                if let ExportError::TooLarge { .. } = &e {
+                    ExecutorError::other(ExportTooLarge {
+                        message: e.to_string(),
+                    })
+                } else {
+                    ExecutorError::other(anyhow::anyhow!("secret export failed: {e}"))
+                }
+            })
     }
 
     pub fn delegate_request(

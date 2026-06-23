@@ -117,6 +117,45 @@ impl std::fmt::Display for ContractQueueFull {
 
 impl std::error::Error for ContractQueueFull {}
 
+/// Typed marker carried by an [`ExecutorError`] when a hosted-mode secret
+/// export was rejected for exceeding the per-user export bound (too many
+/// secrets, or too much total plaintext). Lets the hosted-export HTTP layer
+/// downcast and return a 413 (Payload Too Large) instead of a generic 500.
+///
+/// Constructed by `Executor::export_user_secrets` from a
+/// [`crate::wasm_runtime::secret_export::ExportError::TooLarge`]; recognized by
+/// [`ExecutorError::is_export_too_large`]. The `Display` text is non-secret
+/// (sizes only, no token / secret bytes), so it is safe to log/return. See
+/// #4381 P5.
+#[derive(Debug, Clone)]
+pub struct ExportTooLarge {
+    pub message: String,
+}
+
+impl std::fmt::Display for ExportTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ExportTooLarge {}
+
+/// Typed marker carried by an [`ExecutorError`] when a hosted-mode export was
+/// rejected because `MAX_CONCURRENT_EXPORTS` exports are already running
+/// off-loop. Lets the hosted-export HTTP layer downcast and return a 503
+/// (Service Unavailable, "retry later") rather than a generic 500 — the export
+/// was not attempted and is not queued. See #4531 / #4381 P5.
+#[derive(Debug, Clone, Copy)]
+pub struct ExportBusy;
+
+impl std::fmt::Display for ExportBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("too many concurrent exports, try again later")
+    }
+}
+
+impl std::error::Error for ExportBusy {}
+
 /// Typed marker carried by an [`ExecutorError`] when an upsert was invoked
 /// in *deferrable* mode (see [`ContractExecutor::upsert_contract_state_deferrable`])
 /// and discovered it needs to fetch related contracts from the network to
@@ -340,6 +379,27 @@ impl ExecutorError {
         match &self.inner {
             Either::Left(_) => false,
             Either::Right(err) => err.downcast_ref::<ContractQueueFull>().is_some(),
+        }
+    }
+
+    /// Returns true if this error is the typed [`ExportTooLarge`] marker (a
+    /// hosted-mode export rejected for exceeding the per-user export bound).
+    /// The hosted-export HTTP handler gates a 413 response on this. See #4381 P5.
+    pub fn is_export_too_large(&self) -> bool {
+        match &self.inner {
+            Either::Left(_) => false,
+            Either::Right(err) => err.downcast_ref::<ExportTooLarge>().is_some(),
+        }
+    }
+
+    /// Returns true if this error is the typed [`ExportBusy`] marker (a
+    /// hosted-mode export rejected because the node is at its concurrent-export
+    /// cap). The hosted-export HTTP handler gates a 503 response on this so the
+    /// caller can distinguish "retry later" from a real failure. See #4531 P5.
+    pub fn is_export_busy(&self) -> bool {
+        match &self.inner {
+            Either::Left(_) => false,
+            Either::Right(err) => err.downcast_ref::<ExportBusy>().is_some(),
         }
     }
 
@@ -609,19 +669,49 @@ pub(crate) trait ContractExecutor: Send + 'static {
     /// ([`crate::wasm_runtime::SecretScope::User`]), never the node-local
     /// (`Local`) namespace.
     ///
-    /// The default implementation rejects: only the production
-    /// `RuntimePool` / `Executor<Runtime>` (which owns a real `SecretsStore`)
-    /// supports export. Mock executors keep no on-disk secrets.
-    fn export_user_secrets(
+    /// Admit a hosted-mode export to run OFF the contract loop (#4531 / #4381
+    /// P5). Instead of running the (potentially long) enumerate+decrypt+seal
+    /// inline — which would park the single-threaded contract loop for its whole
+    /// duration, so queued GET/PUT/UPDATE/delegate events wait behind it — this
+    /// checks out a pooled executor and returns an opaque
+    /// `ExportJob`. The caller (the contract loop) moves the job into
+    /// a background task, calls `ExportJob::run` there, and hands the
+    /// resulting [`runtime::ExportDone`] back to [`Self::finish_export`] on the
+    /// loop to return/replace the executor.
+    ///
+    /// Concurrency is bounded ([`runtime::MAX_CONCURRENT_EXPORTS`]); over the cap
+    /// returns [`runtime::ExportAdmission::Busy`]. `user_context` MUST come from
+    /// the connection boundary (the forge-proof per-user namespace), never a
+    /// request body; the export reads only `user_context.scope()`, never `Local`.
+    ///
+    /// The default implementation returns
+    /// [`runtime::ExportAdmission::Unsupported`]: only the production
+    /// `RuntimePool` (which owns real `SecretsStore`-backed executors) supports
+    /// export. Mock executors keep no on-disk secrets.
+    /// NON-BLOCKING: runs on the contract loop, so it must never await/park (a
+    /// blocking executor checkout here is the #4531 deadlock). Returns `Busy`
+    /// when the node is at its export-concurrency cap OR no executor is
+    /// immediately free; the loop answers a 503 and never queues the export.
+    fn try_begin_export(
         &mut self,
         _user_context: &UserSecretContext,
         _token: &[u8],
+    ) -> runtime::ExportAdmission {
+        runtime::ExportAdmission::Unsupported
+    }
+
+    /// Return (or, on a panicked export task, replace) the executor an
+    /// `ExportJob` borrowed, and yield the export RESULT for the
+    /// client. Called on the contract loop once the background export task
+    /// delivers its [`runtime::ExportDone`]. Default returns the carried result
+    /// without touching a pool (mock executors never admit, so this is only
+    /// reached via the `ExportDone` carried in an [`runtime::ExportDone`] the
+    /// default path never builds).
+    fn finish_export(
+        &mut self,
+        done: runtime::ExportDone,
     ) -> impl Future<Output = Result<Vec<u8>, ExecutorError>> + Send {
-        async {
-            Err(ExecutorError::other(anyhow::anyhow!(
-                "secret export is not supported by this executor"
-            )))
-        }
+        async move { done.into_result() }
     }
 
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo>;
