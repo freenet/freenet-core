@@ -464,15 +464,19 @@ fn export_bundle_with_limits(
         SecretScope::User { .. } => "user",
     };
 
-    // Defense-in-depth bound (#4381 P5): reject an over-large export BEFORE
-    // doing the heavy enumerate+decrypt+re-encrypt work, so an authenticated
-    // token-holder cannot coerce the node into unbounded crypto/IO. The count
-    // check is a cheap in-memory metadata walk (no decrypt). The byte check is
-    // applied AFTER the gather but BEFORE the expensive whole-bundle AEAD seal,
-    // bounding the in-memory plaintext and the resulting bundle size. Both are
-    // hard rejections (never silent truncation), so no user data is lost — the
-    // caller surfaces a 413 and an operator can raise the limit if a real
-    // workload ever needs it.
+    // Defense-in-depth bound (#4381 P5): reject an over-large export so an
+    // authenticated token-holder cannot coerce the node into unbounded crypto/IO
+    // or memory. BOTH checks happen BEFORE/DURING the heavy work, never after:
+    //   - The count check is a cheap in-memory metadata walk (no decrypt) and
+    //     short-circuits before a single secret is read.
+    //   - The byte check is enforced INCREMENTALLY inside
+    //     `export_scope_entries_bounded`, which aborts the decrypt loop the
+    //     instant the running plaintext total crosses the cap and drops the
+    //     partial buffer — so a user under the count cap but with huge secrets
+    //     never gets multi-GiB decrypted+buffered before the rejection.
+    // Both are hard rejections (never silent truncation), so no user data is
+    // lost — the caller surfaces a 413 and an operator can raise the limit if a
+    // real workload ever needs it.
     let count = store.scope_entry_count(&scope);
     if count > max_count {
         return Err(ExportError::TooLarge {
@@ -482,16 +486,20 @@ fn export_bundle_with_limits(
         });
     }
 
-    let entries = store.export_scope_entries(scope)?;
-
-    let total_bytes: usize = entries.iter().map(|e| e.plaintext.len()).sum();
-    if total_bytes > max_total_bytes {
-        return Err(ExportError::TooLarge {
-            what: "total plaintext bytes",
-            actual: total_bytes,
-            limit: max_total_bytes,
-        });
-    }
+    let entries = store
+        .export_scope_entries_bounded(scope, max_total_bytes)
+        .map_err(|e| match e {
+            super::secrets_store::ExportScopeError::Store(store_err) => {
+                ExportError::Store(store_err)
+            }
+            super::secrets_store::ExportScopeError::TooLarge { actual, limit } => {
+                ExportError::TooLarge {
+                    what: "total plaintext bytes",
+                    actual,
+                    limit,
+                }
+            }
+        })?;
 
     seal_bundle(&entries, scope_label, material)
 }
@@ -1085,6 +1093,45 @@ mod test {
                 assert_eq!(limit, 50);
             }
             other => panic!("expected TooLarge(total plaintext bytes), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn export_scope_entries_bounded_bails_incrementally() {
+        // INCREMENTAL bail (#4531 P5): the byte cap aborts the decrypt loop the
+        // instant the running total crosses the limit, WITHOUT decrypting and
+        // buffering the whole scope. With three 40-byte secrets and a 50-byte
+        // cap, the bail must fire at total=80 (after the SECOND secret), i.e.
+        // before the third is ever read — the reported `actual` is 80, not 120.
+        use crate::wasm_runtime::secrets_store::ExportScopeError;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = new_store(tmp.path()).await;
+        let token = b"incremental-user";
+        let ctx = UserSecretContext::from_token(token);
+        let d = delegate(9);
+        for i in 0..3u8 {
+            let s = SecretsId::new(vec![b'b', i]);
+            put_user(&mut store, &d, &ctx, &s, &[1u8; 40]);
+        }
+        // `ExportSecretEntry` deliberately has no `Debug` (it holds decrypted
+        // plaintext), so match on the result rather than `expect_err`.
+        let err = match store.export_scope_entries_bounded(ctx.scope(), 50) {
+            Ok(_) => panic!("over-byte gather must bail, not succeed"),
+            Err(e) => e,
+        };
+        match err {
+            ExportScopeError::TooLarge { actual, limit } => {
+                assert_eq!(limit, 50);
+                // Bailed at the SECOND secret (40 + 40 = 80 > 50), NOT after
+                // buffering all three (which would be 120). This is the proof
+                // that the partial buffer was dropped mid-loop.
+                assert_eq!(
+                    actual, 80,
+                    "must bail the instant the running total crosses the cap, \
+                     not after gathering the whole scope"
+                );
+            }
+            other => panic!("expected ExportScopeError::TooLarge, got {other:?}"),
         }
     }
 

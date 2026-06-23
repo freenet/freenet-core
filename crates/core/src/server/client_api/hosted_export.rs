@@ -331,6 +331,15 @@ async fn run_export(
                     "export exceeds the per-user size limit",
                 ));
             }
+            // The node is at its concurrent-export cap: a transient "retry
+            // later", not a failure. 503 so the caller can distinguish it.
+            if e.is_export_busy() {
+                tracing::warn!(error = %e, "Rejected hosted export: node busy (concurrent-export cap)");
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "node is busy with other exports; retry shortly",
+                ));
+            }
             // Executor-side failure (e.g. a secret failed to decrypt). Do not
             // leak internals to the client; log the detail, return a generic 500.
             tracing::error!(error = %e, "Hosted export failed on the executor");

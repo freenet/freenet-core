@@ -1685,10 +1685,47 @@ impl SecretsStore {
         &self,
         scope: SecretScope<'_>,
     ) -> Result<Vec<ExportSecretEntry>, SecretStoreError> {
+        // Unbounded gather (CLI backup / tests). The hosted-export path uses
+        // `export_scope_entries_bounded` so an authenticated token-holder cannot
+        // make the node buffer an unbounded amount of decrypted plaintext.
+        match self.export_scope_entries_bounded(scope, usize::MAX) {
+            Ok(entries) => Ok(entries),
+            Err(ExportScopeError::Store(e)) => Err(e),
+            // usize::MAX cap is never exceeded.
+            Err(ExportScopeError::TooLarge { .. }) => unreachable!("cap is usize::MAX"),
+        }
+    }
+
+    /// Like [`Self::export_scope_entries`] but ABORTS the instant the running
+    /// plaintext total would exceed `max_total_bytes`.
+    ///
+    /// The byte cap is checked INCREMENTALLY, per entry, as each plaintext is
+    /// decrypted — so an over-limit export bails after reading only enough to
+    /// cross the threshold and drops the partial buffer, rather than decrypting
+    /// and buffering the user's entire (potentially multi-GiB) scope and only
+    /// then rejecting. On overflow it returns [`ExportScopeError::TooLarge`]
+    /// carrying the running total at the bail point (`> max_total_bytes`) and
+    /// the limit. Used by the hosted-mode export DoS bound (#4381 P5).
+    pub fn export_scope_entries_bounded(
+        &self,
+        scope: SecretScope<'_>,
+        max_total_bytes: usize,
+    ) -> Result<Vec<ExportSecretEntry>, ExportScopeError> {
         let refs = self.enumerate_scope(&scope);
         let mut entries = Vec::with_capacity(refs.len());
+        let mut total_bytes: usize = 0;
         for (delegate, secret_hash) in refs {
             let plaintext = self.read_secret_by_hash(&delegate, &secret_hash, &scope)?;
+            // Check BEFORE pushing, so we never retain a buffer that crosses the
+            // cap. `plaintext` is dropped here (its `Zeroizing` wipes it) on the
+            // bail path.
+            total_bytes = total_bytes.saturating_add(plaintext.len());
+            if total_bytes > max_total_bytes {
+                return Err(ExportScopeError::TooLarge {
+                    actual: total_bytes,
+                    limit: max_total_bytes,
+                });
+            }
             entries.push(ExportSecretEntry {
                 delegate_key: delegate,
                 secret_hash,
@@ -1805,6 +1842,19 @@ pub struct ExportSecretEntry {
     pub delegate_key: DelegateKey,
     pub secret_hash: [u8; 32],
     pub plaintext: Zeroizing<Vec<u8>>,
+}
+
+/// Error from [`SecretsStore::export_scope_entries_bounded`]: either an
+/// underlying store/IO failure, or the incremental byte cap was exceeded.
+#[derive(Debug, thiserror::Error)]
+pub enum ExportScopeError {
+    #[error(transparent)]
+    Store(#[from] SecretStoreError),
+    /// The running decrypted-plaintext total crossed `limit` (the gather
+    /// aborted at `actual`, having dropped the partial buffer). Sizes only —
+    /// non-secret, safe to surface.
+    #[error("export plaintext total {actual} exceeds limit {limit}")]
+    TooLarge { actual: usize, limit: usize },
 }
 
 /// Decrypt an on-disk secret blob, transparently supporting every

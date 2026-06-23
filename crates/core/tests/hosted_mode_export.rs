@@ -409,6 +409,84 @@ async fn hosted_export_secure_round_trip() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// DEFER (#4531 / #4381 P5): an in-flight export must NOT block the contract
+/// loop. We store several secrets (so the export does real enumerate+decrypt+
+/// seal work), then fire the HTTP export CONCURRENTLY with a WS delegate
+/// store-secret op that goes through the SAME contract loop, and require BOTH to
+/// complete. With the previous inline design the export ran ON the loop, so the
+/// concurrent delegate op could not even start until the export finished; with
+/// the deferral the loop stays free and both make progress together. Generous
+/// timeouts (this asserts non-blocking liveness + correctness, not tight
+/// timing — the strict "arm defers off-loop" guarantee is pinned by the
+/// source-scrape unit tests `export_dispatch_arm_defers_off_loop` /
+/// `export_job_run_offloads_blocking_work`).
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn export_does_not_block_concurrent_contract_ops() -> anyhow::Result<()> {
+    let node = TestNode::start(/* hosted_mode */ true).await?;
+    let port = node.ws_port;
+
+    let delegate = load_delegate(TEST_DELEGATE, Parameters::from(vec![]))?;
+    let delegate_key = delegate.key().clone();
+
+    const TOKEN: &str = "user-token-for-defer-bbbbbbbbbbbbbbbb";
+
+    let mut conn = connect_hosted(port, Some(TOKEN), true).await?;
+    register_delegate(&mut conn, &delegate, &delegate_key).await?;
+    // Store enough secrets that the export has real work to do.
+    for i in 0..64u32 {
+        let key = format!("defer-secret-{i}");
+        let value = vec![b'v'; 256];
+        store_secret(&mut conn, &delegate_key, key.as_bytes(), &value).await?;
+    }
+
+    // Open a SECOND connection for the concurrent op so it doesn't serialize
+    // behind the first connection's WS request/response framing.
+    let mut conn2 = connect_hosted(port, Some(TOKEN), true).await?;
+    register_delegate(&mut conn2, &delegate, &delegate_key).await?;
+
+    // Fire the export and a concurrent delegate store-secret op at the same
+    // time. Both route through the single contract-handling loop; both must
+    // complete. The concurrent op must NOT be starved for the export's duration.
+    let export_fut = http_export(port, Some(TOKEN), true);
+    let concurrent_op_fut = store_secret(
+        &mut conn2,
+        &delegate_key,
+        b"stored-while-export-runs",
+        b"concurrent-value",
+    );
+
+    let (export_resp, concurrent_op) = tokio::join!(
+        async { timeout(Duration::from_secs(30), export_fut).await },
+        async { timeout(Duration::from_secs(30), concurrent_op_fut).await },
+    );
+
+    // The concurrent contract op completed (was not blocked behind the export).
+    concurrent_op
+        .expect("a contract op concurrent with an export must not be starved (#4531)")
+        .expect("the concurrent store-secret op must succeed");
+
+    // The export also completed and returned a valid bundle.
+    let export_resp = export_resp
+        .expect("export must complete")
+        .expect("export HTTP request must not error");
+    assert_eq!(
+        export_resp.status(),
+        reqwest::StatusCode::OK,
+        "export must be 200 OK"
+    );
+    let bundle = export_resp.bytes().await?.to_vec();
+    assert_eq!(
+        &bundle[0..4],
+        b"FNSX",
+        "export must return a valid FNSX bundle"
+    );
+
+    drop(conn);
+    drop(conn2);
+    node.shutdown().await;
+    Ok(())
+}
+
 /// A wrong token cannot decrypt a bundle exported under the real token —
 /// confirms the bundle key is genuinely the user's token (not a fixed key).
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]

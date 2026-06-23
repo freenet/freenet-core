@@ -13,7 +13,14 @@ impl Executor<Runtime> {
     /// #4381).
     ///
     /// Runs entirely on the executor (which owns the `SecretsStore` via its
-    /// `Runtime`), so the on-disk redb is touched only by its single writer.
+    /// `Runtime`). This is a READ-ONLY walk: it enumerates the in-memory secret
+    /// index and reads + AEAD-decrypts each on-disk secret BLOB (one file per
+    /// `(delegate, secret_hash)` under the shared `secrets_dir`); it opens no
+    /// redb write transaction and mutates nothing. So it is safe to run on a
+    /// blocking thread (or concurrently with other read-only walks): a secret
+    /// file racing a concurrent write is protected by per-file FS semantics and
+    /// AEAD authentication — a torn read fails authentication and surfaces a
+    /// clean export error, never silent corruption.
     /// The bundle is scoped to `user_context.scope()` — strictly the per-user
     /// namespace, never `Local`. The `token` is the bundle-key material so the
     /// user re-imports on their own peer with the token they already hold.
