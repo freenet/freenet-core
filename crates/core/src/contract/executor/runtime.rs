@@ -1105,6 +1105,34 @@ mod executor_pin_tests {
         );
     }
 
+    /// The anti-deadlock invariant (#4531): off-loop export concurrency is
+    /// `min(MAX_CONCURRENT_EXPORTS, pool_size - 1)`, so at least one executor is
+    /// ALWAYS reserved for normal contract ops — exports can never hold every
+    /// executor and wedge the loop. On a 1-executor pool this is 0 (exports
+    /// disabled → Busy/503). Pure-function guard for the math.
+    #[test]
+    fn effective_export_permits_always_reserves_one_executor() {
+        use super::pool::{MAX_CONCURRENT_EXPORTS, effective_export_permits};
+        // 1-executor pool: exports DISABLED (no spare executor to lend).
+        assert_eq!(effective_export_permits(1), 0);
+        // 2-executor pool: exactly one export, one executor reserved for ops.
+        assert_eq!(effective_export_permits(2), 1);
+        // Below the MAX_CONCURRENT_EXPORTS ceiling, scales with pool_size - 1.
+        assert_eq!(effective_export_permits(3), MAX_CONCURRENT_EXPORTS.min(2));
+        // Large pool: clamped to MAX_CONCURRENT_EXPORTS, never more.
+        assert_eq!(effective_export_permits(64), MAX_CONCURRENT_EXPORTS);
+        // The invariant: for any pool_size >= 1, permits <= pool_size - 1, so a
+        // spare executor always remains for normal ops.
+        for n in 1..=64usize {
+            assert!(
+                effective_export_permits(n) <= n.saturating_sub(1),
+                "must always reserve >=1 executor for normal ops (pool_size={n})"
+            );
+        }
+        // Degenerate pool_size == 0 must not panic (saturating).
+        assert_eq!(effective_export_permits(0), 0);
+    }
+
     /// Pin (#4531): when the offloaded export task PANICS, the executor is lost
     /// with the unwinding thread, so `RuntimePool::finish_export` MUST reconcile
     /// the missing pool slot — build a replacement (restoring the permit) rather

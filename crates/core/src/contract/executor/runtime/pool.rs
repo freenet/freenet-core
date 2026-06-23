@@ -101,24 +101,44 @@ pub struct RuntimePool {
     in_flight_contracts: HashMap<ContractKey, usize>,
     /// Bounds how many hosted-mode secret exports may run OFF-LOOP concurrently
     /// (#4381 P5). Each admitted export holds one permit (in its `ExportJob`)
-    /// AND one pool executor for its duration. Capping at
-    /// `MAX_CONCURRENT_EXPORTS` (< pool_size) ensures exports can never drain the
-    /// whole executor pool and starve normal contract ops, and bounds the
-    /// node-wide concurrent export work regardless of how many users request at
-    /// once. `Arc` so an admitted `ExportJob` can hold an owned permit across the
-    /// spawned background task without borrowing the pool.
+    /// AND one pool executor for its duration. Sized to
+    /// [`effective_export_permits`] (`min(MAX_CONCURRENT_EXPORTS, pool_size-1)`)
+    /// so >=1 executor is ALWAYS reserved for normal contract ops — this is the
+    /// enforced anti-deadlock invariant (see `effective_export_permits`), not a
+    /// prose hope. `Arc` so an admitted `ExportJob` can hold an owned permit
+    /// across the spawned background task without borrowing the pool.
     export_semaphore: Arc<Semaphore>,
 }
 
-/// Max hosted-mode secret exports allowed to run off-loop at once (#4381 P5).
+/// Max hosted-mode secret exports allowed to run off-loop at once (#4381 P5),
+/// BEFORE the pool-size clamp in [`effective_export_permits`].
 ///
 /// Small and fixed: exports are an occasional self-host-migration action, not a
-/// hot path, and each one holds a pool executor for its duration. Keeping this
-/// well below a typical `pool_size` (CPU count) guarantees normal contract ops
-/// always have executors available. A request that arrives while this many
-/// exports are in flight is rejected with a typed busy error (HTTP 503), not
-/// queued on the contract loop.
+/// hot path, and each one holds a pool executor for its duration. The real cap
+/// is `min(this, pool_size - 1)` so >=1 executor is ALWAYS free for normal ops.
+/// A request that arrives while that many exports are in flight (or that can't
+/// immediately reserve an executor) is rejected with a typed busy error (HTTP
+/// 503), never queued on the contract loop.
 pub(crate) const MAX_CONCURRENT_EXPORTS: usize = 2;
+
+/// Effective off-loop export concurrency for a pool of `pool_size` executors.
+///
+/// `min(MAX_CONCURRENT_EXPORTS, pool_size - 1)` — this is the load-bearing
+/// anti-deadlock invariant, ENFORCED in code (not prose): an admitted export
+/// holds one pool executor off-loop, and the only executor-return path
+/// (`finish_export`) runs ON the contract loop. If exports could hold EVERY
+/// executor, a normal contract op would park the loop waiting for an executor
+/// that only the (now-parked) loop can return — a permanent self-deadlock.
+/// Reserving at least one executor for normal ops makes that impossible.
+///
+/// `pool_size == 1` → 0: exports are DISABLED on a single-executor node (they
+/// return the typed Busy → 503). That is correct, not a regression — a tiny
+/// 1-executor node has no spare executor to lend a deferred export anyway, and
+/// the alternative (running it on the sole executor) is exactly the inline
+/// blocking this whole change removes.
+pub(crate) fn effective_export_permits(pool_size: usize) -> usize {
+    MAX_CONCURRENT_EXPORTS.min(pool_size.saturating_sub(1))
+}
 
 /// Result of [`RuntimePool::try_begin_export`]: an admitted off-loop export job,
 /// or a rejection because too many exports are already in flight, or because
@@ -374,7 +394,7 @@ impl RuntimePool {
             delegate_notification_tx,
             delegate_notification_rx: Some(delegate_notification_rx),
             in_flight_contracts: HashMap::new(),
-            export_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EXPORTS)),
+            export_semaphore: Arc::new(Semaphore::new(effective_export_permits(pool_size_usize))),
         })
     }
 
@@ -480,6 +500,36 @@ impl RuntimePool {
         // But if it does, we need to restore the checked_out count
         self.checked_out.fetch_sub(1, Ordering::SeqCst);
         unreachable!("No executors available despite semaphore permit")
+    }
+
+    /// Non-blocking executor checkout: returns `Some(executor)` only if one is
+    /// immediately available, `None` otherwise (NEVER awaits/parks the caller).
+    ///
+    /// Used by the off-loop export admission path (`try_begin_export`), which
+    /// runs ON the contract loop and therefore must not block: if no executor is
+    /// free right now, the export is rejected (Busy → 503) rather than parking
+    /// the loop. Mirrors `pop_executor`'s permit/slot accounting exactly, just
+    /// with a non-blocking `try_acquire`.
+    fn try_pop_executor(&mut self) -> Option<Executor<Runtime>> {
+        let permit = self.available.try_acquire().ok()?;
+        // Take the slot BEFORE forgetting the permit: if (impossibly, given the
+        // permit==Some-slot-count invariant) no slot is found, dropping `permit`
+        // here restores it, so we never leak a permit on the unreachable path.
+        let executor = self
+            .runtimes
+            .iter_mut()
+            .find_map(|slot| slot.take())
+            .or_else(|| {
+                tracing::error!(
+                    "try_pop_executor acquired a permit but found no executor slot \
+                     (pool invariant violated)"
+                );
+                None
+            })?;
+        // Found a slot: now consume the permit (restored in `return_executor`).
+        permit.forget();
+        self.checked_out.fetch_add(1, Ordering::SeqCst);
+        Some(executor)
     }
 
     /// Return an executor to the pool after use.
@@ -965,30 +1015,34 @@ impl ContractExecutor for RuntimePool {
         result
     }
 
-    async fn try_begin_export(
+    fn try_begin_export(
         &mut self,
         user_context: &UserSecretContext,
         token: &[u8],
     ) -> ExportAdmission {
-        // Bound concurrent exports FIRST (cheap, no executor taken on rejection).
-        // `try_acquire_owned` never blocks the caller (the contract loop): if
-        // MAX_CONCURRENT_EXPORTS are already in flight, reject with Busy so the
-        // HTTP layer returns 503 — we do NOT queue exports on the loop.
+        // FULLY NON-BLOCKING admission — this runs ON the contract loop, so it
+        // must never await/park. Two non-blocking gates, in order:
+        //
+        // 1. Export-concurrency permit. Sized to `min(MAX_CONCURRENT_EXPORTS,
+        //    pool_size-1)` so admitted exports can never hold every executor. On
+        //    a 1-executor pool this is 0, so exports are disabled here. Over the
+        //    cap → Busy (HTTP 503), never queued.
         let Ok(permit) = self.export_semaphore.clone().try_acquire_owned() else {
             return ExportAdmission::Busy;
         };
+        // 2. A pool executor, taken NON-BLOCKING. If every executor is momentarily
+        //    busy with normal ops, we do NOT await (that would park the loop, the
+        //    whole #4531 deadlock) — we reject with Busy and the permit drops
+        //    here (restoring the export slot). The pool-size-1 invariant means
+        //    this only happens under genuine concurrent normal-op load, where a
+        //    "retry shortly" 503 is the correct answer.
+        let Some(executor) = self.try_pop_executor() else {
+            return ExportAdmission::Busy;
+        };
 
-        // Take an executor for the export to own off-loop. `pop_executor` awaits
-        // a pool permit; the export semaphore (< pool_size) guarantees exports
-        // alone can never exhaust the pool, so this only waits if normal contract
-        // ops momentarily hold every executor (brief, legitimate backpressure —
-        // those ops don't run unbounded work). The executor is exclusively owned
-        // by the returned job until `finish_export` returns it.
-        //
         // Own the inputs so the spawned task's closure is `'static`. The token is
         // copied into a Zeroizing buffer wiped when the job drops it, so the
         // high-value credential is not left in an un-zeroized Vec.
-        let executor = self.pop_executor().await;
         ExportAdmission::Admitted(Box::new(ExportJob {
             executor,
             _permit: permit,

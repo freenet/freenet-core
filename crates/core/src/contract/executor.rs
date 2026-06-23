@@ -688,12 +688,16 @@ pub(crate) trait ContractExecutor: Send + 'static {
     /// [`runtime::ExportAdmission::Unsupported`]: only the production
     /// `RuntimePool` (which owns real `SecretsStore`-backed executors) supports
     /// export. Mock executors keep no on-disk secrets.
+    /// NON-BLOCKING: runs on the contract loop, so it must never await/park (a
+    /// blocking executor checkout here is the #4531 deadlock). Returns `Busy`
+    /// when the node is at its export-concurrency cap OR no executor is
+    /// immediately free; the loop answers a 503 and never queues the export.
     fn try_begin_export(
         &mut self,
         _user_context: &UserSecretContext,
         _token: &[u8],
-    ) -> impl Future<Output = runtime::ExportAdmission> + Send {
-        async { runtime::ExportAdmission::Unsupported }
+    ) -> runtime::ExportAdmission {
+        runtime::ExportAdmission::Unsupported
     }
 
     /// Return (or, on a panicked export task, replace) the executor an

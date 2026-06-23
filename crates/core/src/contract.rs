@@ -2360,7 +2360,6 @@ where
             match contract_handler
                 .executor()
                 .try_begin_export(&user_context, token.expose())
-                .await
             {
                 executor::runtime::ExportAdmission::Admitted(job) => {
                     // Park the client responder so the off-loop task can answer it

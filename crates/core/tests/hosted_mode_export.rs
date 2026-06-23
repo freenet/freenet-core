@@ -335,8 +335,12 @@ async fn import_into_fresh_store(
 /// Headline: a secure export (hosted on + loopback + XFP:https + a valid token
 /// that has stored secrets) returns a non-empty FNSX bundle that round-trips
 /// via `import_bundle` back to the original secret.
+#[serial_test::serial]
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn hosted_export_secure_round_trip() -> anyhow::Result<()> {
+    // Pin a multi-executor pool so the export is admitted regardless of the CI
+    // runner's core count (a 1-core runner's default pool of 1 disables exports).
+    let _pool = PoolSizeEnv::set(4);
     let node = TestNode::start(/* hosted_mode */ true).await?;
     let port = node.ws_port;
 
@@ -420,8 +424,13 @@ async fn hosted_export_secure_round_trip() -> anyhow::Result<()> {
 /// timing — the strict "arm defers off-loop" guarantee is pinned by the
 /// source-scrape unit tests `export_dispatch_arm_defers_off_loop` /
 /// `export_job_run_offloads_blocking_work`).
+#[serial_test::serial]
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn export_does_not_block_concurrent_contract_ops() -> anyhow::Result<()> {
+    // Pin a multi-executor pool so the export is admitted (200) deterministically
+    // regardless of the CI runner's core count — on a 1-core runner the default
+    // pool would be 1, which disables exports (covered separately).
+    let _pool = PoolSizeEnv::set(4);
     let node = TestNode::start(/* hosted_mode */ true).await?;
     let port = node.ws_port;
 
@@ -489,8 +498,12 @@ async fn export_does_not_block_concurrent_contract_ops() -> anyhow::Result<()> {
 
 /// A wrong token cannot decrypt a bundle exported under the real token —
 /// confirms the bundle key is genuinely the user's token (not a fixed key).
+#[serial_test::serial]
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn hosted_export_bundle_rejects_wrong_token() -> anyhow::Result<()> {
+    // Pin a multi-executor pool so the export is admitted (this test needs a real
+    // bundle to then prove a wrong token can't decrypt it).
+    let _pool = PoolSizeEnv::set(4);
     let node = TestNode::start(true).await?;
     let port = node.ws_port;
 
@@ -525,6 +538,7 @@ async fn hosted_export_bundle_rejects_wrong_token() -> anyhow::Result<()> {
 }
 
 /// Insecure variants on a hosted node: every one must 403 and return NO bundle.
+#[serial_test::serial]
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn hosted_export_rejects_insecure_requests() -> anyhow::Result<()> {
     let node = TestNode::start(/* hosted_mode */ true).await?;
@@ -572,6 +586,7 @@ async fn hosted_export_rejects_insecure_requests() -> anyhow::Result<()> {
 
 /// Flag gate: with `hosted_mode = false`, a token + XFP export is still 403 —
 /// the whole feature is inert unless the flag is on (no user namespaces exist).
+#[serial_test::serial]
 #[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn hosted_export_flag_off_rejects() -> anyhow::Result<()> {
     let node = TestNode::start(/* hosted_mode */ false).await?;
@@ -590,6 +605,135 @@ async fn hosted_export_flag_off_rejects() -> anyhow::Result<()> {
         "must not return a bundle"
     );
 
+    node.shutdown().await;
+    Ok(())
+}
+
+/// RAII guard that sets `FREENET_RUNTIME_POOL_SIZE` for the duration of a
+/// (serialized) test and restores it on drop, so a specific pool size can be
+/// forced when the node builds its `RuntimePool`. Safe only because these tests
+/// are `#[serial]` — no other node start overlaps the env-var window.
+struct PoolSizeEnv;
+impl PoolSizeEnv {
+    fn set(n: usize) -> Self {
+        // SAFETY: serialized tests; no concurrent node start reads this var.
+        unsafe { std::env::set_var("FREENET_RUNTIME_POOL_SIZE", n.to_string()) };
+        Self
+    }
+}
+impl Drop for PoolSizeEnv {
+    fn drop(&mut self) {
+        unsafe { std::env::remove_var("FREENET_RUNTIME_POOL_SIZE") };
+    }
+}
+
+/// DEADLOCK REGRESSION (#4531, #4563 re-review): on a 2-executor pool, an export
+/// in flight must NOT wedge the contract loop. The effective export-concurrency
+/// cap is `min(MAX_CONCURRENT_EXPORTS, pool_size-1) == 1`, so an admitted export
+/// holds exactly ONE of the two executors; the loop keeps the other free for
+/// normal ops. We fire an HTTP export and a concurrent WS delegate op together
+/// and require BOTH to complete — the previous design (blocking executor
+/// checkout on the loop, no pool-size clamp) could deadlock here. Exercises the
+/// real node loop + pool, not a mock.
+#[serial_test::serial]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn export_on_small_pool_does_not_deadlock_the_loop() -> anyhow::Result<()> {
+    let _pool = PoolSizeEnv::set(2);
+    let node = TestNode::start(/* hosted_mode */ true).await?;
+    let port = node.ws_port;
+
+    let delegate = load_delegate(TEST_DELEGATE, Parameters::from(vec![]))?;
+    let delegate_key = delegate.key().clone();
+    const TOKEN: &str = "user-token-small-pool-cccccccccccccccc";
+
+    let mut conn = connect_hosted(port, Some(TOKEN), true).await?;
+    register_delegate(&mut conn, &delegate, &delegate_key).await?;
+    for i in 0..32u32 {
+        store_secret(
+            &mut conn,
+            &delegate_key,
+            format!("sp-secret-{i}").as_bytes(),
+            &vec![b'v'; 256],
+        )
+        .await?;
+    }
+
+    // Second connection for the concurrent op (independent WS framing).
+    let mut conn2 = connect_hosted(port, Some(TOKEN), true).await?;
+    register_delegate(&mut conn2, &delegate, &delegate_key).await?;
+
+    // Export (holds 1 of 2 executors off-loop) + a concurrent contract op. With
+    // pool_size=2 the loop must keep the second executor free; both must finish.
+    let export_fut = http_export(port, Some(TOKEN), true);
+    let op_fut = store_secret(
+        &mut conn2,
+        &delegate_key,
+        b"sp-stored-while-export-runs",
+        b"sp-concurrent-value",
+    );
+    let (export_resp, op) = tokio::join!(
+        async { timeout(Duration::from_secs(30), export_fut).await },
+        async { timeout(Duration::from_secs(30), op_fut).await },
+    );
+
+    op.expect("concurrent op must not be wedged behind the export on a 2-pool (#4531)")
+        .expect("the concurrent store-secret op must succeed");
+    let export_resp = export_resp
+        .expect("export must complete")
+        .expect("export HTTP request must not error");
+    // On a 2-executor pool exactly one export permit exists, so this single
+    // export is admitted and succeeds (200).
+    assert_eq!(
+        export_resp.status(),
+        reqwest::StatusCode::OK,
+        "the single export on a 2-pool must be admitted and succeed"
+    );
+
+    drop(conn);
+    drop(conn2);
+    node.shutdown().await;
+    Ok(())
+}
+
+/// On a 1-executor pool the effective export concurrency is 0, so an export is
+/// DISABLED — it returns 503 (Busy) rather than running on the sole executor
+/// (which would be the inline-blocking this change removes) or deadlocking. The
+/// node must otherwise function normally. Exercises the real node loop + pool.
+#[serial_test::serial]
+#[test_log::test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn export_disabled_on_single_executor_pool() -> anyhow::Result<()> {
+    let _pool = PoolSizeEnv::set(1);
+    let node = TestNode::start(/* hosted_mode */ true).await?;
+    let port = node.ws_port;
+
+    let delegate = load_delegate(TEST_DELEGATE, Parameters::from(vec![]))?;
+    let delegate_key = delegate.key().clone();
+    const TOKEN: &str = "user-token-single-pool-dddddddddddddddd";
+
+    // The node still works on a 1-executor pool: store a secret normally.
+    let mut conn = connect_hosted(port, Some(TOKEN), true).await?;
+    register_delegate(&mut conn, &delegate, &delegate_key).await?;
+    store_secret(&mut conn, &delegate_key, b"sole-secret", b"sole-value").await?;
+
+    // The export is disabled (0 export permits) → 503, NOT a hang and NOT a 200.
+    let resp = timeout(
+        Duration::from_secs(30),
+        http_export(port, Some(TOKEN), true),
+    )
+    .await
+    .expect("export request must return promptly (disabled, not hung)")?;
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "export must be 503 (disabled) on a single-executor pool"
+    );
+
+    // And the node still serves normal ops afterwards (loop not wedged).
+    store_secret(&mut conn, &delegate_key, b"after-export", b"after-value")
+        .await
+        .expect("node must still serve contract ops after a rejected export");
+
+    drop(conn);
     node.shutdown().await;
     Ok(())
 }
