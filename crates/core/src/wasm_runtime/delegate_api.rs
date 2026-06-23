@@ -1013,6 +1013,7 @@ mod tests {
 
     /// create_delegate_sync rejects creation when depth limit is exceeded.
     #[tokio::test]
+    #[serial_test::serial(created_delegates_count)]
     async fn test_create_delegate_depth_exceeded() {
         let mut env_holder = TestEnv::new().await;
 
@@ -1033,6 +1034,7 @@ mod tests {
 
     /// create_delegate_sync allows creation at depth just below the limit.
     #[tokio::test]
+    #[serial_test::serial(created_delegates_count)]
     async fn test_create_delegate_depth_just_under_limit() {
         let mut env_holder = TestEnv::new().await;
 
@@ -1053,6 +1055,7 @@ mod tests {
 
     /// create_delegate_sync rejects creation when per-call limit is exceeded.
     #[tokio::test]
+    #[serial_test::serial(created_delegates_count)]
     async fn test_create_delegate_per_call_limit_exceeded() {
         let mut env_holder = TestEnv::new().await;
 
@@ -1082,6 +1085,7 @@ mod tests {
     /// Superseded: WASM validation moved from creation to execution time.
     /// Replaced test_create_delegate_invalid_wasm which expected InvalidWasm error.
     #[tokio::test]
+    #[serial_test::serial(created_delegates_count)]
     async fn test_create_delegate_accepts_any_bytes_at_creation() {
         let mut env_holder = TestEnv::new().await;
 
@@ -1101,6 +1105,7 @@ mod tests {
 
     /// create_delegate_sync rejects WASM bytes exceeding the size limit.
     #[tokio::test]
+    #[serial_test::serial(created_delegates_count)]
     async fn test_create_delegate_rejects_oversized_wasm() {
         let mut env_holder = TestEnv::new().await;
 
@@ -1120,6 +1125,7 @@ mod tests {
 
     /// create_delegate_sync tracks per-call count correctly via Cell.
     #[tokio::test]
+    #[serial_test::serial(created_delegates_count)]
     async fn test_create_delegate_counter_tracks_correctly() {
         let mut env_holder = TestEnv::new().await;
 
@@ -1142,6 +1148,7 @@ mod tests {
 
     /// Child delegate inherits parent's attested contracts in DELEGATE_INHERITED_ORIGINS.
     #[tokio::test]
+    #[serial_test::serial(created_delegates_count)]
     async fn test_create_delegate_inherits_attestations() {
         use super::super::native_api::DELEGATE_INHERITED_ORIGINS;
 
@@ -1173,6 +1180,7 @@ mod tests {
     /// Child created by non-attested parent does NOT appear in DELEGATE_INHERITED_ORIGINS
     /// but still counts toward the per-node limit via CREATED_DELEGATES_COUNT.
     #[tokio::test]
+    #[serial_test::serial(created_delegates_count)]
     async fn test_create_delegate_non_attested_still_counts_toward_node_limit() {
         use super::super::native_api::{CREATED_DELEGATES_COUNT, DELEGATE_INHERITED_ORIGINS};
         use std::sync::atomic::Ordering;
