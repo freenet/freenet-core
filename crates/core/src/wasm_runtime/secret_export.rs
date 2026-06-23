@@ -1032,18 +1032,17 @@ mod test {
         let material = BundleKeyMaterial::Token(token);
         let err = export_bundle_with_limits(&store, ctx.scope(), &material, 2, usize::MAX)
             .expect_err("over-count export must be rejected");
-        match err {
-            ExportError::TooLarge {
-                what,
-                actual,
-                limit,
-            } => {
-                assert_eq!(what, "secret count");
-                assert_eq!(actual, 3);
-                assert_eq!(limit, 2);
-            }
-            other => panic!("expected TooLarge(secret count), got {other:?}"),
-        }
+        let ExportError::TooLarge {
+            what,
+            actual,
+            limit,
+        } = err
+        else {
+            panic!("expected TooLarge(secret count), got {err:?}");
+        };
+        assert_eq!(what, "secret count");
+        assert_eq!(actual, 3);
+        assert_eq!(limit, 2);
     }
 
     #[tokio::test]
@@ -1082,18 +1081,17 @@ mod test {
         let material = BundleKeyMaterial::Token(token);
         let err = export_bundle_with_limits(&store, ctx.scope(), &material, usize::MAX, 50)
             .expect_err("over-byte export must be rejected");
-        match err {
-            ExportError::TooLarge {
-                what,
-                actual,
-                limit,
-            } => {
-                assert_eq!(what, "total plaintext bytes");
-                assert_eq!(actual, 100);
-                assert_eq!(limit, 50);
-            }
-            other => panic!("expected TooLarge(total plaintext bytes), got {other:?}"),
-        }
+        let ExportError::TooLarge {
+            what,
+            actual,
+            limit,
+        } = err
+        else {
+            panic!("expected TooLarge(total plaintext bytes), got {err:?}");
+        };
+        assert_eq!(what, "total plaintext bytes");
+        assert_eq!(actual, 100);
+        assert_eq!(limit, 50);
     }
 
     #[tokio::test]
@@ -1119,20 +1117,18 @@ mod test {
             Ok(_) => panic!("over-byte gather must bail, not succeed"),
             Err(e) => e,
         };
-        match err {
-            ExportScopeError::TooLarge { actual, limit } => {
-                assert_eq!(limit, 50);
-                // Bailed at the SECOND secret (40 + 40 = 80 > 50), NOT after
-                // buffering all three (which would be 120). This is the proof
-                // that the partial buffer was dropped mid-loop.
-                assert_eq!(
-                    actual, 80,
-                    "must bail the instant the running total crosses the cap, \
-                     not after gathering the whole scope"
-                );
-            }
-            other => panic!("expected ExportScopeError::TooLarge, got {other:?}"),
-        }
+        let ExportScopeError::TooLarge { actual, limit } = err else {
+            panic!("expected ExportScopeError::TooLarge, got {err:?}");
+        };
+        assert_eq!(limit, 50);
+        // Bailed at the SECOND secret (40 + 40 = 80 > 50), NOT after buffering
+        // all three (which would be 120). This is the proof that the partial
+        // buffer was dropped mid-loop.
+        assert_eq!(
+            actual, 80,
+            "must bail the instant the running total crosses the cap, \
+             not after gathering the whole scope"
+        );
     }
 
     #[tokio::test]
