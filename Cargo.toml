@@ -114,7 +114,7 @@ wasmtime = { version = "46", default-features = false, features = [
 # PUT time (see crates/core/src/client_events.rs::contains_debug_sections).
 # Pinned to the same minor wasmtime 45 already resolves transitively so cargo
 # reuses one copy rather than locking a second wasmparser build.
-wasmparser = "0.248"
+wasmparser = "0.252"
 
 # Testing/simulation
 arbitrary = { version = "1", features = ["derive"] }
