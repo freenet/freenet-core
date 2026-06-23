@@ -640,6 +640,20 @@ mod test {
         SecretsStore::new(secrets_dir, Default::default(), db).expect("store")
     }
 
+    /// Build a `SecretsStore` over a SPECIFIC, SHARED `secrets_dir` but with its
+    /// OWN ReDb (in `db_dir`). Two such stores model two pooled executors: they
+    /// write to the same on-disk `secrets_dir` but each keeps its own in-memory
+    /// index — exactly the cross-executor divergence the disk-enumeration export
+    /// fix must tolerate.
+    async fn new_store_sharing(
+        secrets_dir: &std::path::Path,
+        db_dir: &std::path::Path,
+    ) -> SecretsStore {
+        std::fs::create_dir_all(secrets_dir).unwrap();
+        let db = Storage::new(db_dir).await.expect("db");
+        SecretsStore::new(secrets_dir.to_path_buf(), Default::default(), db).expect("store")
+    }
+
     fn delegate(code: u8) -> Delegate<'static> {
         Delegate::from((&vec![code].into(), &vec![].into()))
     }
@@ -1147,6 +1161,64 @@ mod test {
         let payload = open_bundle(&bundle, &material).expect("open");
         assert_eq!(payload.entries.len(), 1);
         assert_eq!(payload.entries[0].secret_hash.as_slice(), h.as_slice());
+    }
+
+    #[tokio::test]
+    async fn export_includes_secret_written_by_a_different_executor() {
+        // THE #4 REGRESSION (cross-executor staleness): under the pooled-executor
+        // model two executors share one on-disk `secrets_dir` but each keeps its
+        // OWN in-memory index. A secret stored via executor A is NOT in executor
+        // B's index. The export — which may run on B — must still include A's
+        // secret, because it enumerates from DISK (the shared source of truth),
+        // not from B's stale in-memory index. With the old in-memory enumeration
+        // this export would silently OMIT the secret → incomplete backup.
+        let tmp = tempfile::tempdir().unwrap();
+        let shared_secrets = tmp.path().join("shared-secrets");
+        let token = b"cross-executor-user";
+        let ctx = UserSecretContext::from_token(token);
+        let d = delegate(1);
+        let s_a = SecretsId::new(b"written-by-A".to_vec());
+        let s_b = SecretsId::new(b"written-by-B".to_vec());
+
+        // Executor A's store: writes secret A to the shared dir.
+        let mut store_a = new_store_sharing(&shared_secrets, &tmp.path().join("db-a")).await;
+        let h_a = put_user(&mut store_a, &d, &ctx, &s_a, b"value-A");
+
+        // Executor B's store: a SEPARATE in-memory index over the SAME secrets
+        // dir. It only knows about the secret IT writes (B); it has never seen A.
+        let mut store_b = new_store_sharing(&shared_secrets, &tmp.path().join("db-b")).await;
+        let h_b = put_user(&mut store_b, &d, &ctx, &s_b, b"value-B");
+
+        // Export via executor B. The bundle MUST contain BOTH secrets — A's
+        // (written by the other executor, absent from B's in-memory index) and
+        // B's own. Pre-fix, A's secret would be missing.
+        let material = BundleKeyMaterial::Token(token);
+        let bundle =
+            export_bundle(&store_b, ctx.scope(), &material).expect("export via B succeeds");
+        let payload = open_bundle(&bundle, &material).expect("open");
+
+        let exported: std::collections::HashSet<Vec<u8>> = payload
+            .entries
+            .iter()
+            .map(|e| e.secret_hash.clone())
+            .collect();
+        assert!(
+            exported.contains(h_a.as_slice()),
+            "export run on executor B MUST include the secret written by executor A \
+             (disk is the source of truth, not B's stale in-memory index) — #4531/#4 fix"
+        );
+        assert!(
+            exported.contains(h_b.as_slice()),
+            "export must also include B's own secret"
+        );
+        assert_eq!(payload.entries.len(), 2, "exactly the two stored secrets");
+
+        // The count cap (scope_entry_count) must also see BOTH (it walks disk).
+        assert_eq!(
+            store_b.scope_entry_count(&ctx.scope()),
+            2,
+            "scope_entry_count must count both on-disk secrets, not just B's index"
+        );
     }
 
     fn read_local(store: &SecretsStore, d: &Delegate<'static>, hash: &[u8; 32]) -> Vec<u8> {

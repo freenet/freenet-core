@@ -29,8 +29,8 @@ use crate::contract::storages::Storage;
 
 use super::RuntimeResult;
 use super::secret_snapshots::{
-    RestoreError, RetentionPolicy, SnapshotMetadata, list_snapshots, restore_snapshot_file,
-    snapshot_active_value, snapshot_dir_for, thin_snapshots,
+    RestoreError, RetentionPolicy, SNAPSHOTS_DIR, SnapshotMetadata, list_snapshots,
+    restore_snapshot_file, snapshot_active_value, snapshot_dir_for, thin_snapshots,
 };
 
 /// Environment variable that disables snapshot-on-write for delegate secrets.
@@ -460,6 +460,24 @@ pub(super) fn ensure_owner_only_dir(_path: &Path) -> std::io::Result<()> {
 /// unchanged. `base` itself is never touched here (it is tightened once in
 /// [`SecretsStore::new`]). Best-effort by contract of its callers: they log
 /// and continue on a chmod error rather than failing the primary write.
+/// Decode a base58 (BITCOIN alphabet) name into exactly 32 bytes, or `None` if
+/// it isn't a valid 32-byte bs58 string. Used by the on-disk export enumeration
+/// to recognize delegate-dir names and secret-blob filenames (both are
+/// `bs58(<32-byte hash>)`) while rejecting every non-secret entry (`.keys`,
+/// `*.tmp`, `node_kek`, `kek_backend`, ...), none of which decode to 32 bytes.
+fn decode_bs58_32(name: &str) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    match bs58::decode(name)
+        .with_alphabet(bs58::Alphabet::BITCOIN)
+        .onto(&mut out)
+    {
+        // `onto` fills `out` and returns the number of bytes written; require
+        // EXACTLY 32 so a shorter/longer bs58 string is rejected.
+        Ok(32) => Some(out),
+        _ => None,
+    }
+}
+
 fn ensure_owner_only_tree(base: &Path, full: &Path) -> std::io::Result<()> {
     // The relative path from base to full names exactly the segments we
     // must tighten. If `full` is not under `base` (should never happen —
@@ -1587,33 +1605,90 @@ impl SecretsStore {
     // from the delegate's wasm+params), so a re-installed webapp shipping the
     // same delegate yields the same key and the imported secrets line up.
 
-    /// Enumerate every `(DelegateKey, secret_hash)` held for `scope`.
+    /// Enumerate every `(DelegateKey, secret_hash)` for `scope` by walking the
+    /// on-disk `secrets_dir` (the shared source of truth) instead of this
+    /// store's per-instance in-memory index.
     ///
-    /// Reads from the in-memory index maps (kept in lock-step with ReDb), so
-    /// it reflects exactly what `get_secret` could read. For `User` scope only
-    /// the `id` field of the scope is consulted (the `dek_secret` is unused
-    /// here — enumeration is a metadata walk, not a decrypt).
-    fn enumerate_scope(&self, scope: &SecretScope<'_>) -> Vec<(DelegateKey, SecretKey)> {
+    /// WHY (the cross-executor correctness fix): each pooled `Executor` owns its
+    /// OWN `SecretsStore` with its own in-memory index, but ALL of them write to
+    /// the SAME `secrets_dir`. A `store_secret` on executor A updates only A's
+    /// index; an export running on executor B would miss A's just-written secret
+    /// if it enumerated B's in-memory index — a silently incomplete backup once
+    /// the export runs off-loop concurrently with normal ops. Walking the disk
+    /// includes EVERY committed write regardless of which executor made it.
+    ///
+    /// Consistency: `store_secret`/`import_secret_by_hash` write each secret blob
+    /// via tmp-file + fsync + atomic `rename` into place, so a concurrent walk
+    /// only ever sees a fully-written active file (a torn read is impossible at
+    /// the active path; even so, a bad blob fails AEAD on read → a clean export
+    /// error, never silent corruption).
+    ///
+    /// On-disk layout (see [`Self::scope_dir`]):
+    /// - `Local` => `base_path/<delegate>/<bs58(secret_hash)>`
+    /// - `User`  => `base_path/<delegate>/users/<user_id>/<bs58(secret_hash)>`
+    ///
+    /// A "secret blob" is a REGULAR FILE whose name bs58-decodes to exactly 32
+    /// bytes. That positive filter inherently rejects every non-secret entry
+    /// (`.keys`, `.keys.tmp`, `<hash>.tmp`, `node_kek`, `kek_backend*` — none
+    /// bs58-decode to 32 bytes) and every directory (`.snapshots/`, `users/`,
+    /// and the delegate dirs themselves); the known non-secret names are also
+    /// skipped explicitly as belt-and-suspenders.
+    ///
+    /// The reconstructed `DelegateKey` carries the real 32-byte key (the
+    /// directory name) and a ZERO `code_hash` placeholder. `code_hash` is never
+    /// consulted by [`Self::scope_dir`], [`Self::derive_user_dek`],
+    /// [`Self::cipher_for_read`], or `read_secret_by_hash` (all key only via
+    /// `delegate.encode()`), so the placeholder reads and decrypts the secret
+    /// identically; it only ends up as a (functionally inert) 32-byte value in
+    /// the exported bundle's `code_hash` field.
+    fn enumerate_scope_on_disk(&self, scope: &SecretScope<'_>) -> Vec<(DelegateKey, SecretKey)> {
         let mut out = Vec::new();
-        match scope {
-            SecretScope::Local => {
-                for entry in self.key_to_secret_part.iter() {
-                    let delegate = entry.key().clone();
-                    for hash in entry.value() {
-                        out.push((delegate.clone(), *hash));
-                    }
-                }
+        // Iterate the delegate directories under base_path. Each is named
+        // `bs58(delegate_key)`; non-directory / non-bs58 root entries
+        // (`node_kek`, `kek_backend`, `kek_backend.tmp`) are skipped by the
+        // 32-byte-bs58 decode below.
+        let Ok(delegate_dirs) = fs::read_dir(&self.base_path) else {
+            // base_path missing/unreadable ⇒ no secrets to export.
+            return out;
+        };
+        for delegate_entry in delegate_dirs.flatten() {
+            let delegate_path = delegate_entry.path();
+            if !delegate_path.is_dir() {
+                continue;
             }
-            SecretScope::User { id, .. } => {
-                for entry in self.user_key_to_secret_part.iter() {
-                    let (delegate, user) = entry.key();
-                    if user != *id {
-                        continue;
-                    }
-                    for hash in entry.value() {
-                        out.push((delegate.clone(), *hash));
-                    }
+            let Some(delegate_name) = delegate_entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(delegate_key_bytes) = decode_bs58_32(&delegate_name) else {
+                continue; // not a delegate dir (e.g. a stray non-bs58 name)
+            };
+            // code_hash is inert for path/DEK/read; use a zero placeholder.
+            let delegate = DelegateKey::new(delegate_key_bytes, CodeHash::from(&[0u8; 32]));
+
+            // The directory that actually holds this scope's secret files.
+            let scope_path = match scope {
+                SecretScope::Local => delegate_path.clone(),
+                SecretScope::User { id, .. } => delegate_path.join("users").join(id.encode()),
+            };
+            let Ok(files) = fs::read_dir(&scope_path) else {
+                continue; // this delegate has no secrets for this scope
+            };
+            for file_entry in files.flatten() {
+                // Only regular files whose name bs58-decodes to a 32-byte hash.
+                let name = file_entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if name == KEY_REGISTRY_FILE || name == SNAPSHOTS_DIR || name.ends_with(".tmp") {
+                    continue;
                 }
+                let Some(secret_hash) = decode_bs58_32(name) else {
+                    continue;
+                };
+                // Confirm it is a regular file (not a dir like `users/`).
+                match file_entry.file_type() {
+                    Ok(ft) if ft.is_file() => {}
+                    _ => continue,
+                }
+                out.push((delegate.clone(), secret_hash));
             }
         }
         out
@@ -1665,11 +1740,14 @@ impl SecretsStore {
 
     /// Number of secrets currently held under `scope`.
     ///
-    /// A cheap metadata walk of the in-memory index (no decrypt, no disk read),
-    /// used by [`super::secret_export::export_bundle`] to enforce the export
-    /// count cap BEFORE any secret is read/decrypted.
+    /// A metadata-only DISK walk (no decrypt), used by
+    /// [`super::secret_export::export_bundle`] to enforce the export count cap
+    /// BEFORE any secret is read/decrypted. Counts from disk (the shared source
+    /// of truth) for the same cross-executor-consistency reason as
+    /// [`Self::enumerate_scope_on_disk`] — so the cap is checked against the
+    /// SAME set the export will actually gather.
     pub fn scope_entry_count(&self, scope: &SecretScope<'_>) -> usize {
-        self.enumerate_scope(scope).len()
+        self.enumerate_scope_on_disk(scope).len()
     }
 
     /// Gather every secret under `scope`, decrypted, as portable export
@@ -1711,7 +1789,14 @@ impl SecretsStore {
         scope: SecretScope<'_>,
         max_total_bytes: usize,
     ) -> Result<Vec<ExportSecretEntry>, ExportScopeError> {
-        let refs = self.enumerate_scope(&scope);
+        // Enumerate from DISK (the shared `secrets_dir`), NOT this store's
+        // per-instance in-memory index: under the pooled-executor model the
+        // export may run on a different executor than the one that wrote a
+        // secret, so the in-memory index can be stale and miss completed
+        // on-disk writes. The disk walk is the source of truth and includes
+        // every committed secret regardless of which executor stored it.
+        // See `enumerate_scope_on_disk`.
+        let refs = self.enumerate_scope_on_disk(&scope);
         let mut entries = Vec::with_capacity(refs.len());
         let mut total_bytes: usize = 0;
         for (delegate, secret_hash) in refs {
