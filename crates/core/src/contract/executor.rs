@@ -117,6 +117,29 @@ impl std::fmt::Display for ContractQueueFull {
 
 impl std::error::Error for ContractQueueFull {}
 
+/// Typed marker carried by an [`ExecutorError`] when a hosted-mode secret
+/// export was rejected for exceeding the per-user export bound (too many
+/// secrets, or too much total plaintext). Lets the hosted-export HTTP layer
+/// downcast and return a 413 (Payload Too Large) instead of a generic 500.
+///
+/// Constructed by `Executor::export_user_secrets` from a
+/// [`crate::wasm_runtime::secret_export::ExportError::TooLarge`]; recognized by
+/// [`ExecutorError::is_export_too_large`]. The `Display` text is non-secret
+/// (sizes only, no token / secret bytes), so it is safe to log/return. See
+/// #4381 P5.
+#[derive(Debug, Clone)]
+pub struct ExportTooLarge {
+    pub message: String,
+}
+
+impl std::fmt::Display for ExportTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ExportTooLarge {}
+
 /// Typed marker carried by an [`ExecutorError`] when an upsert was invoked
 /// in *deferrable* mode (see [`ContractExecutor::upsert_contract_state_deferrable`])
 /// and discovered it needs to fetch related contracts from the network to
@@ -340,6 +363,16 @@ impl ExecutorError {
         match &self.inner {
             Either::Left(_) => false,
             Either::Right(err) => err.downcast_ref::<ContractQueueFull>().is_some(),
+        }
+    }
+
+    /// Returns true if this error is the typed [`ExportTooLarge`] marker (a
+    /// hosted-mode export rejected for exceeding the per-user export bound).
+    /// The hosted-export HTTP handler gates a 413 response on this. See #4381 P5.
+    pub fn is_export_too_large(&self) -> bool {
+        match &self.inner {
+            Either::Left(_) => false,
+            Either::Right(err) => err.downcast_ref::<ExportTooLarge>().is_some(),
         }
     }
 

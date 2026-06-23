@@ -2154,9 +2154,14 @@ where
         } => {
             // Hosted-mode export (P3-live of #4381). Runs on the executor (which
             // owns the SecretsStore) and returns the encrypted bundle bytes.
-            // `user_context` is the forge-proof per-user namespace derived at the
-            // connection boundary; the export reads ONLY that user's scope. Log
-            // only the non-secret user_id — never the token or bundle bytes.
+            // The executor's `export_user_secrets` offloads the synchronous
+            // enumerate+decrypt+re-encrypt to a blocking thread
+            // (`RuntimePool::export_user_secrets`), so awaiting it here does NOT
+            // stall this single-threaded loop for the export's duration (#4381
+            // P5). `user_context` is the forge-proof per-user namespace derived
+            // at the connection boundary; the export reads ONLY that user's
+            // scope. Log only the non-secret user_id — never the token or
+            // bundle bytes.
             tracing::debug!(
                 user_id = ?user_context.user_id(),
                 "Processing hosted-mode secret export request"

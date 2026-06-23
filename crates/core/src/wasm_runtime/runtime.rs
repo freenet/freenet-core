@@ -284,16 +284,19 @@ impl Runtime {
     /// Plaintext exists only in the `Zeroizing` buffers inside `export_bundle`;
     /// the returned bytes are encrypted at rest.
     ///
-    /// PERFORMANCE / DoS: this enumerates AND AEAD-decrypts EVERY secret in
-    /// `scope`, synchronously, and the hosted-export caller invokes it on the
-    /// single-threaded contract-handling loop with no per-user secret-count or
-    /// bundle-size cap. A large or repeated export by an authenticated
-    /// token-holder therefore blocks all other contract ops for its duration.
-    /// Acceptable only behind the default-off hosted flag; a per-user quota +
-    /// off-loop execution (`spawn_blocking`) is a required P5 follow-up before
-    /// the export endpoint is exposed on shared/public infrastructure. See the
-    /// "Known limitation" section in
-    /// `server::client_api::hosted_export`.
+    /// PERFORMANCE / DoS (#4381 P5, addressed): this enumerates AND
+    /// AEAD-decrypts EVERY secret in `scope`, synchronously. Two guards keep an
+    /// authenticated token-holder from wedging the node with it:
+    /// - **Per-user bound**: `export_bundle` rejects (before the heavy work) an
+    ///   export exceeding `MAX_EXPORT_SECRET_COUNT` /
+    ///   `MAX_EXPORT_TOTAL_PLAINTEXT_BYTES`, bounding the worst-case work.
+    /// - **Off-loop execution**: the hosted-export caller
+    ///   (`RuntimePool::export_user_secrets`) runs this on a blocking thread
+    ///   (`spawn_blocking`, runtime-flavor-gated), so it does NOT stall the
+    ///   single-threaded contract-handling loop while it runs.
+    ///
+    /// Broader per-user rate/quota limiting (repeated exports over time) remains
+    /// part of the wider P5 abuse work tracked under #4381.
     pub(crate) fn export_secret_bundle(
         &self,
         scope: super::secrets_store::SecretScope<'_>,

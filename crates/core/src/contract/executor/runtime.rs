@@ -100,6 +100,56 @@ use std::collections::{HashMap, HashSet};
 fn production_offload_compilation() -> bool {
     true
 }
+
+/// Run a synchronous, potentially-long CPU/IO closure OFF the contract-handling
+/// loop when we're on a multi-threaded runtime, or INLINE otherwise.
+///
+/// The contract-handling loop is single-threaded and processes one event at a
+/// time, so any synchronous work done inside an event handler blocks every
+/// other contract op (GET/PUT/UPDATE/delegate) for its full duration. The
+/// hosted-mode secret export (`export_user_secrets`) enumerates, decrypts, and
+/// re-encrypts every secret in a user's scope synchronously, so an authenticated
+/// token-holder with a large secret set — or one who simply repeats the request
+/// — could otherwise wedge the loop (the #4381 P5 DoS). Moving that work onto a
+/// blocking thread keeps the loop free to drain other events.
+///
+/// `f` takes ownership of `value` (the checked-out executor) and returns it
+/// alongside the result, so the caller can return the executor to the pool
+/// afterwards. `value` is exclusively checked out for the whole call, so this
+/// does NOT break the redb single-writer model or the pool's executor checkout:
+/// the executor simply runs on a blocking thread instead of the loop thread.
+///
+/// Mirrors the runtime-flavor gate in `wasmtime_engine::compile_offloaded` /
+/// `block_on_async` (#4441): `block_in_place` + `spawn_blocking` is only legal
+/// on a multi-threaded runtime and PANICS on a `current_thread` runtime, which
+/// the simulation runner and `current_thread` integration tests use — so those
+/// (and the no-runtime case) run `f` inline. Production is always multi-threaded
+/// and offloads.
+async fn run_blocking_offloaded<T, R>(
+    value: T,
+    f: impl FnOnce(T) -> (T, R) + Send + 'static,
+) -> (T, R)
+where
+    T: Send + 'static,
+    R: Send + 'static,
+{
+    use tokio::runtime::RuntimeFlavor;
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
+            tokio::task::spawn_blocking(move || f(value))
+                .await
+                // A panic inside `f` propagates as a JoinError; re-raise it so it
+                // surfaces the same way an inline panic would (the pool's
+                // post-op health check then replaces the executor). This cannot
+                // happen for the export path (no panics), but keeping the
+                // failure mode identical to inline avoids a silent divergence.
+                .expect("export offload task panicked")
+        }
+        // current_thread runtime (sim / current_thread integration tests) or no
+        // tokio runtime: run inline. `block_in_place` would panic here.
+        _ => f(value),
+    }
+}
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -934,6 +984,66 @@ mod executor_pin_tests {
             super::production_offload_compilation(),
             "production pool must opt in to offload; the runtime-flavor check in \
              compile_offloaded keeps it safe/deterministic everywhere else"
+        );
+    }
+
+    /// `run_blocking_offloaded` under a MULTI-THREAD runtime must run the
+    /// closure on a DIFFERENT thread (the offload actually happens, so a long
+    /// export does not occupy the calling/loop thread) and round-trip both the
+    /// moved-in value and the closure's result.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_blocking_offloaded_runs_off_thread_under_multithread() {
+        let caller_thread = std::thread::current().id();
+        // Move a value in, return it alongside the result.
+        let (value, (result, ran_on)) =
+            super::run_blocking_offloaded(41u64, |v| (v + 1, (v * 2, std::thread::current().id())))
+                .await;
+        assert_eq!(
+            value, 42,
+            "moved-in value is returned (mutated by the closure)"
+        );
+        assert_eq!(result, 82, "closure result is returned");
+        assert_ne!(
+            ran_on, caller_thread,
+            "multi-thread runtime must offload the closure to a blocking thread"
+        );
+    }
+
+    /// `run_blocking_offloaded` under a CURRENT-THREAD runtime must run INLINE
+    /// (same thread) — `block_in_place`/`spawn_blocking` offload would panic on
+    /// a current_thread runtime, which the simulation runner and current_thread
+    /// integration tests use. This pins the runtime-flavor fallback.
+    #[tokio::test(flavor = "current_thread")]
+    async fn run_blocking_offloaded_runs_inline_under_current_thread() {
+        let caller_thread = std::thread::current().id();
+        let (value, ran_on) =
+            super::run_blocking_offloaded(7u64, |v| (v, std::thread::current().id())).await;
+        assert_eq!(value, 7);
+        assert_eq!(
+            ran_on, caller_thread,
+            "current_thread runtime must run the closure inline (no offload)"
+        );
+    }
+
+    /// Pin (#4381 P5): `RuntimePool::export_user_secrets` MUST route the
+    /// synchronous export through `run_blocking_offloaded` so it does not run on
+    /// the single-threaded contract-handling loop. A future refactor that drops
+    /// the offload (calling `executor.export_user_secrets` directly on the loop)
+    /// re-introduces the head-of-line-blocking DoS and must fail CI here.
+    #[test]
+    fn pool_export_user_secrets_offloads_off_loop() {
+        let src = include_str!("runtime/pool.rs");
+        let body = src
+            .split("async fn export_user_secrets(")
+            .nth(1)
+            .expect("RuntimePool::export_user_secrets must exist")
+            .split("\n    fn get_subscription_info(")
+            .next()
+            .expect("end of export_user_secrets");
+        assert!(
+            body.contains("run_blocking_offloaded("),
+            "export_user_secrets must offload the synchronous export off the \
+             contract loop via run_blocking_offloaded (#4381 P5)"
         );
     }
 

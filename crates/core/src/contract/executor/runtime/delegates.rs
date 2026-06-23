@@ -25,10 +25,24 @@ impl Executor<Runtime> {
         user_context: &UserSecretContext,
         token: &[u8],
     ) -> Result<Vec<u8>, ExecutorError> {
-        use crate::wasm_runtime::secret_export::BundleKeyMaterial;
+        use crate::wasm_runtime::secret_export::{BundleKeyMaterial, ExportError};
         self.runtime
             .export_secret_bundle(user_context.scope(), &BundleKeyMaterial::Token(token))
-            .map_err(|e| ExecutorError::other(anyhow::anyhow!("secret export failed: {e}")))
+            .map_err(|e| {
+                // Preserve the over-limit case as a typed marker so the HTTP
+                // layer can map it to a 413 rather than a generic 500. The
+                // Display text is non-secret (sizes only). Everything else stays
+                // an opaque executor error. See #4381 P5. (An `if let` rather
+                // than a `match` with a wildcard arm: `ExportError` is large and
+                // a catch-all trips `clippy::wildcard_enum_match_arm`.)
+                if let ExportError::TooLarge { .. } = &e {
+                    ExecutorError::other(ExportTooLarge {
+                        message: e.to_string(),
+                    })
+                } else {
+                    ExecutorError::other(anyhow::anyhow!("secret export failed: {e}"))
+                }
+            })
     }
 
     pub fn delegate_request(

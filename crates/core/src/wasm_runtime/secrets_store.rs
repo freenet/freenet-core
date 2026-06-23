@@ -1663,6 +1663,15 @@ impl SecretsStore {
         }
     }
 
+    /// Number of secrets currently held under `scope`.
+    ///
+    /// A cheap metadata walk of the in-memory index (no decrypt, no disk read),
+    /// used by [`super::secret_export::export_bundle`] to enforce the export
+    /// count cap BEFORE any secret is read/decrypted.
+    pub fn scope_entry_count(&self, scope: &SecretScope<'_>) -> usize {
+        self.enumerate_scope(scope).len()
+    }
+
     /// Gather every secret under `scope`, decrypted, as portable export
     /// entries. The returned plaintexts live in `Zeroizing` buffers so they
     /// are wiped when the caller drops them.

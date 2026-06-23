@@ -849,7 +849,25 @@ impl ContractExecutor for RuntimePool {
         // by its single writer (all pool executors point at the same
         // `secrets_dir`, but `pop_executor` serializes the checkout).
         let executor = self.pop_executor().await;
-        let result = executor.export_user_secrets(user_context, token);
+
+        // Offload the synchronous enumerate+decrypt+re-encrypt OFF the
+        // single-threaded contract-handling loop (#4381 P5). The export is a
+        // read-only `&SecretsStore` walk (no redb write txn), and the executor
+        // is exclusively checked out for the whole call, so moving it onto a
+        // blocking thread preserves the redb single-writer model and the pool
+        // checkout — the loop is just free to drain other events meanwhile.
+        //
+        // Own the inputs so the closure is `'static`. The token is copied into
+        // a Zeroizing buffer that is wiped when the closure drops it, so the
+        // high-value credential is not left lying in an un-zeroized Vec.
+        let owned_ctx = user_context.clone();
+        let owned_token = zeroize::Zeroizing::new(token.to_vec());
+        let (executor, result) = super::run_blocking_offloaded(executor, move |executor| {
+            let result = executor.export_user_secrets(&owned_ctx, owned_token.as_slice());
+            (executor, result)
+        })
+        .await;
+
         self.return_checked(executor, "export_user_secrets").await;
         result
     }
