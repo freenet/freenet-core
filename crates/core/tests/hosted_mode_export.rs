@@ -623,6 +623,7 @@ impl PoolSizeEnv {
 }
 impl Drop for PoolSizeEnv {
     fn drop(&mut self) {
+        // SAFETY: serialized tests; no concurrent node start reads this var.
         unsafe { std::env::remove_var("FREENET_RUNTIME_POOL_SIZE") };
     }
 }

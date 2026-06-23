@@ -140,6 +140,15 @@ impl P2pConnManager {
         let msg = NetMessage::V1(NetMessageV1::SubscribeHint(
             crate::message::SubscribeHintMsg { key, holder: me },
         ));
+        // Placement-migration telemetry (#4404 follow-up): count the dispatch of
+        // this nudge. Counted here, at the point we commit to sending, so the
+        // `sent` total reflects nudges we attempted to dispatch (a bridge-full
+        // drop below is self-healing and re-tried on the next migration trigger).
+        self.bridge
+            .op_manager
+            .ring
+            .placement_migration_metrics()
+            .record_sent();
         self.bridge
             .op_manager
             .sending_transaction(&target_pkl, &msg);

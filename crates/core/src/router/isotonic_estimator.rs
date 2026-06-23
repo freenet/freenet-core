@@ -739,7 +739,7 @@ mod tests {
             result: 0.0,
         });
         assert!(
-            estimator.peer_adjustments.get(&peer).is_none(),
+            !estimator.peer_adjustments.contains_key(&peer),
             "a non-positive observation must be skipped in multiplicative mode (no adjustment entry created)"
         );
     }

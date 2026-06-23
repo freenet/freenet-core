@@ -99,6 +99,7 @@ mod location;
 pub(crate) mod peer_cache;
 mod peer_connection_backoff;
 mod peer_key_location;
+mod placement_migration_metrics;
 pub mod topology_registry;
 pub(crate) mod update_rate_limit;
 
@@ -205,6 +206,16 @@ pub(crate) struct Ring {
     /// task *reads* it. Threading the `Arc` (rather than a process-global)
     /// keeps the gauges per-node so unit tests stay isolated (#4488).
     module_cache_metrics: Arc<crate::wasm_runtime::ModuleCacheMetrics>,
+    /// Per-node placement-migration activity counters (#4404 follow-up).
+    /// Constructed once here and shared via `Arc`: the migration SEND site
+    /// (`p2p_protoc::migration`) and the two RECEIVE sites (`node::process_message`)
+    /// increment it through `op_manager.ring`, while
+    /// `emit_router_snapshot_telemetry` reads it on the snapshot cadence. Threading
+    /// the `Arc` (rather than a process-global) keeps the counters per-node so unit
+    /// tests stay isolated. Together with the placement-quality gauge it lets us
+    /// observe whether the placement migration is firing and whether it actually
+    /// pulls hosting closer to each contract's key.
+    placement_migration_metrics: Arc<placement_migration_metrics::PlacementMigrationMetrics>,
     /// Shutdown signal for the long-lived background tasks spawned in
     /// [`Ring::new`]. Triggered once on node teardown (via
     /// [`Ring::trigger_shutdown`], fired from `ShutdownTeardown::drop`).
@@ -448,6 +459,12 @@ impl Ring {
             // (the `RuntimePool` reaches it through `op_manager.ring`). See
             // the field docs and #4488.
             module_cache_metrics: Arc::new(crate::wasm_runtime::ModuleCacheMetrics::new()),
+            // One placement-migration counter sink per node, shared with the
+            // migration send/receive sites via the `Arc` (reached through
+            // `op_manager.ring`). See the field docs.
+            placement_migration_metrics: Arc::new(
+                placement_migration_metrics::PlacementMigrationMetrics::default(),
+            ),
             shutdown,
         };
 
@@ -578,6 +595,15 @@ impl Ring {
     /// this `Arc` is what replaced the old `MODULE_CACHE_METRICS` process-global.
     pub(crate) fn module_cache_metrics(&self) -> Arc<crate::wasm_runtime::ModuleCacheMetrics> {
         self.module_cache_metrics.clone()
+    }
+
+    /// Shared per-node placement-migration counter sink (#4404 follow-up). The
+    /// migration send/receive sites clone this to increment `sent` / `received`
+    /// / `acted`; the snapshot task reads it on the `router_snapshot` cadence.
+    pub(crate) fn placement_migration_metrics(
+        &self,
+    ) -> Arc<placement_migration_metrics::PlacementMigrationMetrics> {
+        self.placement_migration_metrics.clone()
     }
 
     /// Signal the long-lived background tasks (spawned in [`Ring::new`]) to
@@ -1319,6 +1345,52 @@ impl Ring {
             snapshot.refresh_router_last_success_age_secs = rr_health.last_success_age_secs;
             snapshot.refresh_router_consecutive_failures = Some(rr_health.consecutive_failures);
 
+            // Placement-quality gauge (#4404 follow-up): host-to-hosted-key
+            // ring-distance distribution. If the SubscribeHint placement
+            // migration is working, hosting drifts toward each contract's key,
+            // so this distribution tightens over time. Cheap — a few thousand
+            // distance computations at most, every 5 minutes. Skip gracefully if
+            // the node has no ring location yet (emit nothing) or hosts nothing
+            // (emit count=0, distances absent). No lock is held across an await:
+            // `hosting_contract_keys()` returns an owned `Vec` and the distance
+            // math is pure.
+            let own_location = ring
+                .connection_manager
+                .own_location()
+                .location()
+                .map(|loc| loc.as_f64());
+            if let Some(node_loc) = own_location {
+                let hosted_keys = ring.hosting_contract_keys();
+                let contract_locations: Vec<f64> = hosted_keys
+                    .iter()
+                    .map(|key| Location::from(key).as_f64())
+                    .collect();
+                if let Some(stats) =
+                    placement_migration_metrics::placement_quality(node_loc, &contract_locations)
+                {
+                    // `stats.count` equals `contract_locations.len()`; read it here
+                    // (rather than the Vec len) so the field stays live in
+                    // non-test builds.
+                    snapshot.hosted_contracts_count = Some(stats.count);
+                    snapshot.hosted_key_distance_median = Some(stats.median);
+                    snapshot.hosted_key_distance_p90 = Some(stats.p90);
+                    snapshot.hosted_key_distance_min = Some(stats.min);
+                    snapshot.hosted_key_distance_mean = Some(stats.mean);
+                    snapshot.hosted_key_distance_frac_within_0_1 = Some(stats.frac_within_0_1);
+                } else {
+                    // Node hosts nothing: count is 0, distance gauges absent.
+                    snapshot.hosted_contracts_count = Some(0);
+                }
+            }
+
+            // Placement-migration activity counters (#4404 follow-up): is the
+            // migration firing, and at what rate? Monotonic lifetime totals read
+            // from the per-node counter sink the send/receive sites publish into.
+            let pm = ring.placement_migration_metrics.snapshot();
+            snapshot.subscribe_hint_sent = Some(pm.sent);
+            snapshot.subscribe_hint_received = Some(pm.received);
+            snapshot.subscribe_hint_acted = Some(pm.acted);
+
             tracing::info!(
                 failure_events = snapshot.failure_events,
                 success_events = snapshot.success_events,
@@ -1334,6 +1406,13 @@ impl Ring {
                 broadcast_stream_failures_last_snapshot = broadcast_stream_failures_delta,
                 refresh_router_last_success_age_secs = ?rr_health.last_success_age_secs,
                 refresh_router_consecutive_failures = rr_health.consecutive_failures,
+                hosted_contracts_count = ?snapshot.hosted_contracts_count,
+                hosted_key_distance_median = ?snapshot.hosted_key_distance_median,
+                hosted_key_distance_p90 = ?snapshot.hosted_key_distance_p90,
+                hosted_key_distance_frac_within_0_1 = ?snapshot.hosted_key_distance_frac_within_0_1,
+                subscribe_hint_sent = pm.sent,
+                subscribe_hint_received = pm.received,
+                subscribe_hint_acted = pm.acted,
                 "router_snapshot"
             );
 

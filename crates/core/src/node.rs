@@ -1758,6 +1758,13 @@ where
             return Ok(());
         }
         NetMessageV1::SubscribeHint(hint) => {
+            // Placement-migration telemetry (#4404 follow-up): count every inbound
+            // hint, before any admission gate, so `received` is the true arrival
+            // rate and `received - acted` is the gated/dropped fraction.
+            op_manager
+                .ring
+                .placement_migration_metrics()
+                .record_received();
             // Placement-migration version gate. The migration is re-enabled at
             // floor `(0, 2, 80)` (#4499 made it load-safe). The SEND side
             // (`p2p_protoc::peer_supports_subscribe_hint`) gates emission on the
@@ -1865,6 +1872,11 @@ where
                 ?source_addr,
                 "Received SubscribeHint — starting directed subscribe to holder"
             );
+            // Placement-migration telemetry (#4404 follow-up): count only the
+            // hints we actually act on (all gates passed), i.e. the migrations
+            // that actually start a directed subscribe and thereby host the
+            // contract closer to its key.
+            op_manager.ring.placement_migration_metrics().record_acted();
             subscribe::start_directed_subscribe(op_manager.clone(), hint.key, hint.holder);
             return Ok(());
         }

@@ -218,6 +218,33 @@ pub(crate) struct RouterSnapshotInfo {
     /// failures since the last success.
     pub refresh_router_last_success_age_secs: Option<u64>,
     pub refresh_router_consecutive_failures: Option<u64>,
+    /// Placement-quality gauges (#4404 follow-up), populated by `Ring` on the
+    /// snapshot cadence from the contracts this node hosts. They make the
+    /// effect of the SubscribeHint placement migration observable: the migration
+    /// nudges hosting toward each contract's key, so the host-to-hosted-key
+    /// ring-distance distribution should tighten over time. `hosted_contracts_count`
+    /// is the number of contracts hosted at snapshot time; the distance fields are
+    /// the distribution of `ring_distance(this_node_location, contract_location)`
+    /// in `[0.0, 0.5]`. `hosted_key_distance_frac_within_0_1` (fraction within ring
+    /// distance 0.1) is the clearest single "are hosted contracts close" number.
+    /// The distance fields are `None` when the node hosts nothing or has no ring
+    /// location yet (`hosted_contracts_count` is then `0` / absent respectively).
+    pub hosted_contracts_count: Option<u64>,
+    pub hosted_key_distance_median: Option<f64>,
+    pub hosted_key_distance_p90: Option<f64>,
+    pub hosted_key_distance_min: Option<f64>,
+    pub hosted_key_distance_mean: Option<f64>,
+    pub hosted_key_distance_frac_within_0_1: Option<f64>,
+    /// Placement-migration activity counters (#4404 follow-up), populated by
+    /// `Ring` from the per-node `PlacementMigrationMetrics`. Monotonic lifetime
+    /// totals (the collector differences them across the cadence to derive a
+    /// rate): `sent` is hints this node dispatched, `received` is all inbound
+    /// hints (counted before the admission gates), and `acted` is the subset that
+    /// actually triggered a directed subscribe. `None` until the snapshot task
+    /// has populated them (i.e. always populated in production snapshots).
+    pub subscribe_hint_sent: Option<u64>,
+    pub subscribe_hint_received: Option<u64>,
+    pub subscribe_hint_acted: Option<u64>,
     /// Per-operation-type estimator curves, keyed by op type name (e.g., "GET").
     pub per_op_curves: HashMap<String, PerOpCurves>,
     /// Renegade predictor diagnostics. These (and `renegade_accuracy_pairs`) are
@@ -1027,6 +1054,17 @@ impl Router {
             broadcast_stream_failures_last_snapshot: None,
             refresh_router_last_success_age_secs: None,
             refresh_router_consecutive_failures: None,
+            // Placement-quality + placement-migration gauges populated by Ring on
+            // the snapshot cadence (#4404 follow-up).
+            hosted_contracts_count: None,
+            hosted_key_distance_median: None,
+            hosted_key_distance_p90: None,
+            hosted_key_distance_min: None,
+            hosted_key_distance_mean: None,
+            hosted_key_distance_frac_within_0_1: None,
+            subscribe_hint_sent: None,
+            subscribe_hint_received: None,
+            subscribe_hint_acted: None,
             // Renegade predictor diagnostics
             renegade_failure_events: self.renegade_predictor.len(),
             renegade_response_time_events: self.renegade_predictor.stage_sizes().1,
