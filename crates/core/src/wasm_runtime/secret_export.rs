@@ -489,8 +489,12 @@ fn export_bundle_with_limits(
         });
     }
 
+    // The gather re-enforces BOTH caps incrementally (the count cap here is the
+    // AUTHORITATIVE one — the pre-check above is only an early-out, and a
+    // concurrent store_secret can push the scope over the cap between the two,
+    // a TOCTOU the gather closes). See `export_scope_entries_bounded`.
     let entries = store
-        .export_scope_entries_bounded(scope, max_total_bytes)
+        .export_scope_entries_bounded(scope, max_count, max_total_bytes)
         .map_err(|e| match e {
             super::secrets_store::ExportScopeError::Store(store_err) => {
                 ExportError::Store(store_err)
@@ -498,6 +502,13 @@ fn export_bundle_with_limits(
             super::secrets_store::ExportScopeError::TooLarge { actual, limit } => {
                 ExportError::TooLarge {
                     what: "total plaintext bytes",
+                    actual,
+                    limit,
+                }
+            }
+            super::secrets_store::ExportScopeError::CountTooLarge { actual, limit } => {
+                ExportError::TooLarge {
+                    what: "secret count",
                     actual,
                     limit,
                 }
@@ -1130,8 +1141,9 @@ mod test {
             put_user(&mut store, &d, &ctx, &s, &[1u8; 40]);
         }
         // `ExportSecretEntry` deliberately has no `Debug` (it holds decrypted
-        // plaintext), so match on the result rather than `expect_err`.
-        let err = match store.export_scope_entries_bounded(ctx.scope(), 50) {
+        // plaintext), so match on the result rather than `expect_err`. No count
+        // cap here (usize::MAX) — exercise the byte bail specifically.
+        let err = match store.export_scope_entries_bounded(ctx.scope(), usize::MAX, 50) {
             Ok(_) => panic!("over-byte gather must bail, not succeed"),
             Err(e) => e,
         };
@@ -1325,6 +1337,46 @@ mod test {
         };
         assert_eq!(what, "secret count");
         assert_eq!(limit, 2);
+    }
+
+    #[tokio::test]
+    async fn gather_enforces_count_cap_authoritatively() {
+        // TOCTOU (#4563 final): the count cap MUST be enforced DURING the gather,
+        // not only by the cheap pre-check — because the export runs off-loop
+        // while the loop keeps serving store_secret, so a concurrent writer can
+        // push a just-under-cap scope OVER the cap between the pre-check and the
+        // gather. We simulate "the scope crossed the cap by the time the gather
+        // ran" by driving export_scope_entries_bounded DIRECTLY (bypassing the
+        // pre-check) with a 5-secret scope and max_count = 2: the gather itself
+        // must abort with CountTooLarge, NOT seal all 5.
+        use crate::wasm_runtime::secrets_store::ExportScopeError;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = new_store(tmp.path()).await;
+        let token = b"toctou-count-user";
+        let ctx = UserSecretContext::from_token(token);
+        let d = delegate(1);
+        for i in 0..5u8 {
+            let s = SecretsId::new(vec![b'k', i]);
+            put_user(&mut store, &d, &ctx, &s, b"v");
+        }
+        // No count cap (usize::MAX) succeeds and gathers all 5 — sanity.
+        let all = store
+            .export_scope_entries_bounded(ctx.scope(), usize::MAX, usize::MAX)
+            .expect("uncapped gather succeeds");
+        assert_eq!(all.len(), 5);
+
+        // With max_count = 2 the gather ABORTS — the count is enforced in the
+        // gather pass itself, closing the TOCTOU window.
+        let err = match store.export_scope_entries_bounded(ctx.scope(), 2, usize::MAX) {
+            Ok(_) => panic!("over-count gather must abort, not seal all 5"),
+            Err(e) => e,
+        };
+        let ExportScopeError::CountTooLarge { actual, limit } = err else {
+            panic!("expected CountTooLarge, got {err:?}");
+        };
+        assert_eq!(limit, 2);
+        // Bailed at the 3rd entry (count crossed the cap), not after all 5.
+        assert_eq!(actual, 3, "must abort the instant count crosses the cap");
     }
 
     fn read_local(store: &SecretsStore, d: &Delegate<'static>, hash: &[u8; 32]) -> Vec<u8> {

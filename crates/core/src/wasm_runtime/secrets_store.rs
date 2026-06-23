@@ -1635,9 +1635,35 @@ impl SecretsStore {
         out
     }
 
-    /// Enumerate every `(DelegateKey, secret_hash)` for `scope` by walking the
-    /// on-disk `secrets_dir` (the shared source of truth) instead of this
-    /// store's per-instance in-memory index.
+    /// Count the secrets under `scope` on disk, STOPPING as soon as the count
+    /// reaches `stop_at`. Used for the export count-cap pre-check so an
+    /// over-limit (attacker-controlled) scope is rejected without materializing
+    /// — or even fully traversing past `stop_at` — its entries. Same disk walk /
+    /// filter as the gather, and the same fail-loud I/O semantics.
+    fn count_scope_secrets_on_disk(
+        &self,
+        scope: &SecretScope<'_>,
+        stop_at: usize,
+    ) -> Result<usize, SecretStoreError> {
+        let mut count = 0usize;
+        self.walk_scope_secrets_on_disk(scope, |_delegate, _secret_hash| {
+            count += 1;
+            if count >= stop_at {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        })?;
+        Ok(count)
+    }
+
+    /// Shared on-disk scope walk: invoke `visit` once per secret blob under
+    /// `scope` by walking the on-disk `secrets_dir` (the shared source of truth)
+    /// instead of this store's per-instance in-memory index. `visit` returns
+    /// [`ControlFlow::Break`](std::ops::ControlFlow) to stop early. The gather
+    /// ([`Self::export_scope_entries_bounded`]) and the count
+    /// ([`Self::count_scope_secrets_on_disk`]) both stream through this one
+    /// walker, so they can never diverge in filter / scope / error handling.
     ///
     /// WHY (the cross-executor correctness fix): each pooled `Executor` owns its
     /// OWN `SecretsStore` with its own in-memory index, but ALL of them write to
@@ -1665,12 +1691,13 @@ impl SecretsStore {
     /// skipped explicitly as belt-and-suspenders.
     ///
     /// The reconstructed `DelegateKey` carries the real 32-byte key (the
-    /// directory name) and a ZERO `code_hash` placeholder. `code_hash` is never
-    /// consulted by [`Self::scope_dir`], [`Self::derive_user_dek`],
-    /// [`Self::cipher_for_read`], or `read_secret_by_hash` (all key only via
-    /// `delegate.encode()`), so the placeholder reads and decrypts the secret
-    /// identically; it only ends up as a (functionally inert) 32-byte value in
-    /// the exported bundle's `code_hash` field.
+    /// directory name) and the real `code_hash` recovered from the in-memory
+    /// index when known (see [`Self::index_code_hashes_by_key`]), or a ZERO
+    /// placeholder otherwise. `code_hash` is never consulted by
+    /// [`Self::scope_dir`], [`Self::derive_user_dek`], [`Self::cipher_for_read`],
+    /// or `read_secret_by_hash` (all key-only via `delegate.encode()`), so the
+    /// placeholder reads and decrypts the secret identically; it only ends up as
+    /// a (functionally inert) 32-byte value in the exported bundle's `code_hash`.
     ///
     /// FAIL-LOUD: an UNEXPECTED I/O error (permission denied, EIO, a vanished
     /// mount — anything other than `NotFound`) is PROPAGATED, not swallowed.
@@ -1679,46 +1706,6 @@ impl SecretsStore {
     /// removes, via a different door. `NotFound` is the one expected-absent case
     /// (base_path or a user-scope dir simply doesn't exist ⇒ that scope has no
     /// secrets) and is treated as empty/skip.
-    fn enumerate_scope_on_disk(
-        &self,
-        scope: &SecretScope<'_>,
-    ) -> Result<Vec<(DelegateKey, SecretKey)>, SecretStoreError> {
-        let mut out = Vec::new();
-        self.walk_scope_secrets_on_disk(scope, |delegate, secret_hash| {
-            out.push((delegate, secret_hash));
-            std::ops::ControlFlow::Continue(())
-        })?;
-        Ok(out)
-    }
-
-    /// Count the secrets under `scope` on disk, STOPPING as soon as the count
-    /// reaches `stop_at`. Used for the export count-cap pre-check so an
-    /// over-limit (attacker-controlled) scope is rejected without materializing
-    /// — or even fully traversing past `stop_at` — its entries. Same disk walk /
-    /// filter as the gather, and the same fail-loud I/O semantics.
-    fn count_scope_secrets_on_disk(
-        &self,
-        scope: &SecretScope<'_>,
-        stop_at: usize,
-    ) -> Result<usize, SecretStoreError> {
-        let mut count = 0usize;
-        self.walk_scope_secrets_on_disk(scope, |_delegate, _secret_hash| {
-            count += 1;
-            if count >= stop_at {
-                std::ops::ControlFlow::Break(())
-            } else {
-                std::ops::ControlFlow::Continue(())
-            }
-        })?;
-        Ok(count)
-    }
-
-    /// Shared on-disk scope walk: invoke `visit` once per secret blob under
-    /// `scope`, recovering the real `code_hash` for known delegates (see
-    /// [`Self::index_code_hashes_by_key`]). `visit` returns
-    /// [`ControlFlow::Break`](std::ops::ControlFlow) to stop early (the count
-    /// cap uses this). Returns `Err` on any unexpected I/O error (fail-loud);
-    /// `NotFound` is treated as empty/skip.
     fn walk_scope_secrets_on_disk(
         &self,
         scope: &SecretScope<'_>,
@@ -1856,7 +1843,7 @@ impl SecretsStore {
     /// instant it has seen `max_count + 1` matching entries, so an over-limit
     /// scope is rejected without a full traversal/allocation. Counts from disk
     /// (the shared source of truth) for the same cross-executor-consistency
-    /// reason as [`Self::enumerate_scope_on_disk`], using the same walk/filter,
+    /// reason as [`Self::walk_scope_secrets_on_disk`], using the same walk/filter,
     /// so the cap is checked against the SAME set the gather will materialize.
     /// Returns `Err` on an unexpected I/O error (fail-loud, same as the gather).
     pub fn scope_count_exceeds(
@@ -1893,57 +1880,98 @@ impl SecretsStore {
         // Unbounded gather (CLI backup / tests). The hosted-export path uses
         // `export_scope_entries_bounded` so an authenticated token-holder cannot
         // make the node buffer an unbounded amount of decrypted plaintext.
-        match self.export_scope_entries_bounded(scope, usize::MAX) {
+        match self.export_scope_entries_bounded(scope, usize::MAX, usize::MAX) {
             Ok(entries) => Ok(entries),
             Err(ExportScopeError::Store(e)) => Err(e),
-            // usize::MAX cap is never exceeded.
-            Err(ExportScopeError::TooLarge { .. }) => unreachable!("cap is usize::MAX"),
+            // usize::MAX caps are never exceeded.
+            Err(ExportScopeError::TooLarge { .. } | ExportScopeError::CountTooLarge { .. }) => {
+                unreachable!("count/byte caps are usize::MAX")
+            }
         }
     }
 
     /// Like [`Self::export_scope_entries`] but ABORTS the instant the running
-    /// plaintext total would exceed `max_total_bytes`.
+    /// secret COUNT would exceed `max_count` OR the running plaintext total
+    /// would exceed `max_total_bytes`.
     ///
-    /// The byte cap is checked INCREMENTALLY, per entry, as each plaintext is
-    /// decrypted — so an over-limit export bails after reading only enough to
-    /// cross the threshold and drops the partial buffer, rather than decrypting
-    /// and buffering the user's entire (potentially multi-GiB) scope and only
-    /// then rejecting. On overflow it returns [`ExportScopeError::TooLarge`]
-    /// carrying the running total at the bail point (`> max_total_bytes`) and
-    /// the limit. Used by the hosted-mode export DoS bound (#4381 P5).
+    /// BOTH caps are enforced INCREMENTALLY, per entry, as the scope is walked
+    /// and each plaintext decrypted:
+    /// - Count: checked BEFORE reading each entry, so an over-cap scope aborts
+    ///   without reading/decrypting past `max_count + 1` entries. This is the
+    ///   AUTHORITATIVE count enforcement: the cheap `scope_count_exceeds`
+    ///   pre-check rejects the common case before any decrypt, but the export
+    ///   runs off-loop while the contract loop keeps serving `store_secret`, so
+    ///   a concurrent writer could push a just-under-cap scope over the cap
+    ///   between the pre-check and here — enforcing it again during the gather
+    ///   closes that TOCTOU window.
+    /// - Bytes: checked after each decrypt, so an over-limit export bails after
+    ///   reading only enough to cross the threshold and drops the partial
+    ///   buffer, rather than buffering the user's entire scope first.
+    ///
+    /// On overflow returns [`ExportScopeError::CountTooLarge`] /
+    /// [`ExportScopeError::TooLarge`] carrying the running value at the bail
+    /// point (`>` the limit) and the limit. Used by the hosted-mode export DoS
+    /// bound (#4381 P5). Pass `usize::MAX` to disable either cap.
     pub fn export_scope_entries_bounded(
         &self,
         scope: SecretScope<'_>,
+        max_count: usize,
         max_total_bytes: usize,
     ) -> Result<Vec<ExportSecretEntry>, ExportScopeError> {
-        // Enumerate from DISK (the shared `secrets_dir`), NOT this store's
-        // per-instance in-memory index: under the pooled-executor model the
-        // export may run on a different executor than the one that wrote a
-        // secret, so the in-memory index can be stale and miss completed
-        // on-disk writes. The disk walk is the source of truth and includes
-        // every committed secret regardless of which executor stored it.
-        // A disk I/O failure here aborts the export (fail-loud) rather than
-        // sealing a silently-partial bundle. See `enumerate_scope_on_disk`.
-        let refs = self.enumerate_scope_on_disk(&scope)?;
-        let mut entries = Vec::with_capacity(refs.len());
+        // STREAM the shared on-disk walk (the same walk_scope_secrets_on_disk
+        // the count pre-check uses) and read+decrypt each secret in one pass —
+        // so we never materialize the full (attacker-controlled) ref list, and
+        // both caps are enforced inline. Enumerating from DISK (not this store's
+        // per-instance in-memory index) is the cross-executor correctness fix;
+        // a disk I/O failure aborts the export (fail-loud). See
+        // `walk_scope_secrets_on_disk`.
+        use std::ops::ControlFlow;
+        let mut entries: Vec<ExportSecretEntry> = Vec::new();
         let mut total_bytes: usize = 0;
-        for (delegate, secret_hash) in refs {
-            let plaintext = self.read_secret_by_hash(&delegate, &secret_hash, &scope)?;
-            // Check BEFORE pushing, so we never retain a buffer that crosses the
-            // cap. `plaintext` is dropped here (its `Zeroizing` wipes it) on the
-            // bail path.
+        let mut count: usize = 0;
+        // The visit closure can't return a Result, so it stashes a terminal
+        // outcome here and Breaks; we surface it after the walk.
+        let mut bail: Option<ExportScopeError> = None;
+        self.walk_scope_secrets_on_disk(&scope, |delegate, secret_hash| {
+            // Count cap: check BEFORE reading/decrypting this entry so an
+            // over-cap scope never decrypts more than max_count + 1 entries.
+            // This is the AUTHORITATIVE count enforcement (closes the TOCTOU
+            // window vs. the cheap pre-check, since a concurrent store_secret
+            // can push the scope over the cap after that pre-check passed).
+            count += 1;
+            if count > max_count {
+                bail = Some(ExportScopeError::CountTooLarge {
+                    actual: count,
+                    limit: max_count,
+                });
+                return ControlFlow::Break(());
+            }
+            let plaintext = match self.read_secret_by_hash(&delegate, &secret_hash, &scope) {
+                Ok(p) => p,
+                Err(e) => {
+                    bail = Some(ExportScopeError::Store(e));
+                    return ControlFlow::Break(());
+                }
+            };
+            // Byte cap: check BEFORE pushing, so we never retain a buffer that
+            // crosses the cap. `plaintext` is dropped here on the bail path.
             total_bytes = total_bytes.saturating_add(plaintext.len());
             if total_bytes > max_total_bytes {
-                return Err(ExportScopeError::TooLarge {
+                bail = Some(ExportScopeError::TooLarge {
                     actual: total_bytes,
                     limit: max_total_bytes,
                 });
+                return ControlFlow::Break(());
             }
             entries.push(ExportSecretEntry {
                 delegate_key: delegate,
                 secret_hash,
                 plaintext,
             });
+            ControlFlow::Continue(())
+        })?; // a disk I/O error during the walk itself is fail-loud.
+        if let Some(err) = bail {
+            return Err(err);
         }
         Ok(entries)
     }
@@ -2057,8 +2085,8 @@ pub struct ExportSecretEntry {
     pub plaintext: Zeroizing<Vec<u8>>,
 }
 
-/// Error from [`SecretsStore::export_scope_entries_bounded`]: either an
-/// underlying store/IO failure, or the incremental byte cap was exceeded.
+/// Error from [`SecretsStore::export_scope_entries_bounded`]: an underlying
+/// store/IO failure, or the gather hit the byte cap or the count cap.
 #[derive(Debug, thiserror::Error)]
 pub enum ExportScopeError {
     #[error(transparent)]
@@ -2068,6 +2096,13 @@ pub enum ExportScopeError {
     /// non-secret, safe to surface.
     #[error("export plaintext total {actual} exceeds limit {limit}")]
     TooLarge { actual: usize, limit: usize },
+    /// The running SECRET COUNT crossed `limit` mid-gather (a concurrent writer
+    /// pushed the scope over the cap after the cheap pre-check passed). The
+    /// gather aborts authoritatively here so the count cap can't be bypassed by
+    /// a TOCTOU race. `actual` is the count at the bail point (`> limit`).
+    /// Counts only — non-secret, safe to surface.
+    #[error("export secret count {actual} exceeds limit {limit}")]
+    CountTooLarge { actual: usize, limit: usize },
 }
 
 /// Decrypt an on-disk secret blob, transparently supporting every
@@ -5462,7 +5497,7 @@ mod test {
             "pre-condition: the in-memory index entry was dropped (crash window)"
         );
         // Since the export now enumerates from DISK (the shared source of truth,
-        // for cross-executor consistency — see `enumerate_scope_on_disk`), the
+        // for cross-executor consistency — see `walk_scope_secrets_on_disk`), the
         // completed on-disk secret IS already visible to export even before the
         // index is repaired. This is the intended improvement: a backup includes
         // every completed write regardless of in-memory index state. (It was
