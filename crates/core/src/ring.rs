@@ -1365,15 +1365,21 @@ impl Ring {
                     .iter()
                     .map(|key| Location::from(key).as_f64())
                     .collect();
-                snapshot.hosted_contracts_count = Some(contract_locations.len() as u64);
                 if let Some(stats) =
                     placement_migration_metrics::placement_quality(node_loc, &contract_locations)
                 {
+                    // `stats.count` equals `contract_locations.len()`; read it here
+                    // (rather than the Vec len) so the field stays live in
+                    // non-test builds.
+                    snapshot.hosted_contracts_count = Some(stats.count);
                     snapshot.hosted_key_distance_median = Some(stats.median);
                     snapshot.hosted_key_distance_p90 = Some(stats.p90);
                     snapshot.hosted_key_distance_min = Some(stats.min);
                     snapshot.hosted_key_distance_mean = Some(stats.mean);
                     snapshot.hosted_key_distance_frac_within_0_1 = Some(stats.frac_within_0_1);
+                } else {
+                    // Node hosts nothing: count is 0, distance gauges absent.
+                    snapshot.hosted_contracts_count = Some(0);
                 }
             }
 
