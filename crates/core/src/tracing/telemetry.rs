@@ -1878,7 +1878,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             })
         }
         EventKind::RouterSnapshot(snapshot) => {
-            serde_json::json!({
+            let mut body = serde_json::json!({
                 "type": "router_snapshot",
                 "failure_events": snapshot.failure_events,
                 "success_events": snapshot.success_events,
@@ -1918,7 +1918,52 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "refresh_router_last_success_age_secs": snapshot.refresh_router_last_success_age_secs,
                 "refresh_router_consecutive_failures": snapshot.refresh_router_consecutive_failures,
                 "per_op_curves": snapshot.per_op_curves,
-            })
+            });
+            // Placement-quality + placement-migration gauges (#4404 follow-up).
+            // Inserted AFTER the `json!` (not as inline keys) only to keep the
+            // macro under its expansion recursion limit — this body is still
+            // hand-mirrored, so a new `RouterSnapshotInfo` field is invisible to
+            // the collector unless added here. Pinned by
+            // `router_snapshot_json_includes_placement_gauges`.
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "hosted_contracts_count".to_string(),
+                    serde_json::json!(snapshot.hosted_contracts_count),
+                );
+                obj.insert(
+                    "hosted_key_distance_median".to_string(),
+                    serde_json::json!(snapshot.hosted_key_distance_median),
+                );
+                obj.insert(
+                    "hosted_key_distance_p90".to_string(),
+                    serde_json::json!(snapshot.hosted_key_distance_p90),
+                );
+                obj.insert(
+                    "hosted_key_distance_min".to_string(),
+                    serde_json::json!(snapshot.hosted_key_distance_min),
+                );
+                obj.insert(
+                    "hosted_key_distance_mean".to_string(),
+                    serde_json::json!(snapshot.hosted_key_distance_mean),
+                );
+                obj.insert(
+                    "hosted_key_distance_frac_within_0_1".to_string(),
+                    serde_json::json!(snapshot.hosted_key_distance_frac_within_0_1),
+                );
+                obj.insert(
+                    "subscribe_hint_sent".to_string(),
+                    serde_json::json!(snapshot.subscribe_hint_sent),
+                );
+                obj.insert(
+                    "subscribe_hint_received".to_string(),
+                    serde_json::json!(snapshot.subscribe_hint_received),
+                );
+                obj.insert(
+                    "subscribe_hint_acted".to_string(),
+                    serde_json::json!(snapshot.subscribe_hint_acted),
+                );
+            }
+            body
         }
     }
 }
@@ -2047,6 +2092,47 @@ mod tests {
             ("broadcast_stream_failures_last_snapshot", 43),
             ("refresh_router_last_success_age_secs", 47),
             ("refresh_router_consecutive_failures", 53),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// The placement-quality + placement-migration gauges (#4404 follow-up) must
+    /// reach the hand-mirrored OTLP `json!` body, same footgun as the gauges
+    /// above: a new `RouterSnapshotInfo` field is invisible to the collector
+    /// unless it is added to that block. These fields are exactly how we observe
+    /// whether the placement migration pulls hosting closer to each contract's
+    /// key, so a silent drop would re-blind us to it.
+    #[test]
+    fn router_snapshot_json_includes_placement_gauges() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.hosted_contracts_count = Some(5);
+        info.hosted_key_distance_median = Some(0.1);
+        info.hosted_key_distance_p90 = Some(0.4);
+        info.hosted_key_distance_min = Some(0.0);
+        info.hosted_key_distance_mean = Some(0.15);
+        info.hosted_key_distance_frac_within_0_1 = Some(0.6);
+        info.subscribe_hint_sent = Some(11);
+        info.subscribe_hint_received = Some(13);
+        info.subscribe_hint_acted = Some(7);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("hosted_contracts_count", 5u64),
+            ("subscribe_hint_sent", 11),
+            ("subscribe_hint_received", 13),
+            ("subscribe_hint_acted", 7),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+        for (key, want) in [
+            ("hosted_key_distance_median", 0.1),
+            ("hosted_key_distance_p90", 0.4),
+            ("hosted_key_distance_min", 0.0),
+            ("hosted_key_distance_mean", 0.15),
+            ("hosted_key_distance_frac_within_0_1", 0.6),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }
