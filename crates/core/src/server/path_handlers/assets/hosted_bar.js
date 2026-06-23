@@ -54,8 +54,36 @@
     }
   });
   document.getElementById('fnexport').addEventListener('click', function () {
-    alert(
-      'Export your delegate data to your own Freenet peer.\n\nThis downloads an encrypted bundle you can import on your own node with: freenet secrets import\n\n(Coming soon.)',
-    );
+    var t =
+      typeof __freenet_user_token !== 'undefined' ? __freenet_user_token : null;
+    if (!t) {
+      setOk('No key on this connection');
+      return;
+    }
+    setOk('Preparing download...');
+    // Read the token from the shell-only global and send it in the header the
+    // export endpoint requires (never a query param, so it stays out of logs).
+    // fetch->blob->download because a plain navigation cannot set the header.
+    fetch('/v1/hosted/export', { headers: { 'X-Freenet-User-Token': t } })
+      .then(function (r) {
+        if (!r.ok) {
+          throw new Error('HTTP ' + r.status);
+        }
+        return r.blob();
+      })
+      .then(function (blob) {
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement('a');
+        a.href = url;
+        a.download = 'freenet-data.fnsx';
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        setOk('Downloaded freenet-data.fnsx');
+      })
+      .catch(function (e) {
+        setOk('Export failed (' + e.message + ')');
+      });
   });
 })();
