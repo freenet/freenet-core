@@ -11,7 +11,10 @@ use super::{
 };
 pub(crate) use contract_ops::ReclaimOutcome;
 pub use pool::RuntimePool;
-pub(crate) use pool::{ExportAdmission, ExportDone, MAX_CONCURRENT_EXPORTS};
+pub(crate) use pool::{
+    ExportAdmission, ExportDone, MAX_CONCURRENT_EXPORTS, MAX_CONCURRENT_SUMMARIES,
+    SummaryAdmission, SummaryDone,
+};
 
 /// Maximum number of related contracts a single validation can request.
 /// Bounds worst-case first-time cost: N GETs of up to 50MB each.
@@ -1105,32 +1108,39 @@ mod executor_pin_tests {
         );
     }
 
-    /// The anti-deadlock invariant (#4531): off-loop export concurrency is
-    /// `min(MAX_CONCURRENT_EXPORTS, pool_size - 1)`, so at least one executor is
-    /// ALWAYS reserved for normal contract ops — exports can never hold every
-    /// executor and wedge the loop. On a 1-executor pool this is 0 (exports
-    /// disabled → Busy/503). Pure-function guard for the math.
+    /// The JOINT anti-deadlock invariant (#4531 export + #4534 summary): ALL
+    /// off-loop work draws from ONE shared budget
+    /// `min(MAX_CONCURRENT_EXPORTS + MAX_CONCURRENT_SUMMARIES, pool_size - 1)`, so
+    /// at least one executor is ALWAYS reserved for foreground ops no matter how
+    /// the budget splits between exports and summaries. This is the guard against
+    /// the small-pool deadlock window that two INDEPENDENT per-class semaphores
+    /// (each sized `pool_size-1`) would have re-opened: on `pool_size` 2–4 their
+    /// sum could reach `pool_size` and wedge the loop. Pure-function guard.
     #[test]
-    fn effective_export_permits_always_reserves_one_executor() {
-        use super::pool::{MAX_CONCURRENT_EXPORTS, effective_export_permits};
-        // 1-executor pool: exports DISABLED (no spare executor to lend).
-        assert_eq!(effective_export_permits(1), 0);
-        // 2-executor pool: exactly one export, one executor reserved for ops.
-        assert_eq!(effective_export_permits(2), 1);
-        // Below the MAX_CONCURRENT_EXPORTS ceiling, scales with pool_size - 1.
-        assert_eq!(effective_export_permits(3), MAX_CONCURRENT_EXPORTS.min(2));
-        // Large pool: clamped to MAX_CONCURRENT_EXPORTS, never more.
-        assert_eq!(effective_export_permits(64), MAX_CONCURRENT_EXPORTS);
-        // The invariant: for any pool_size >= 1, permits <= pool_size - 1, so a
-        // spare executor always remains for normal ops.
-        for n in 1..=64usize {
+    fn effective_offload_permits_always_reserves_one_executor() {
+        use super::pool::{
+            MAX_CONCURRENT_EXPORTS, MAX_CONCURRENT_SUMMARIES, effective_offload_permits,
+        };
+        let nominal = MAX_CONCURRENT_EXPORTS + MAX_CONCURRENT_SUMMARIES;
+        // 1-executor pool: ALL off-loop work DISABLED (no spare executor).
+        assert_eq!(effective_offload_permits(1), 0);
+        // 2-executor pool: exactly one off-loop slot, one executor reserved.
+        assert_eq!(effective_offload_permits(2), 1);
+        // Below the nominal ceiling, scales with pool_size - 1.
+        assert_eq!(effective_offload_permits(3), nominal.min(2));
+        assert_eq!(effective_offload_permits(4), nominal.min(3));
+        // Large pool: clamped to the nominal sum, never more.
+        assert_eq!(effective_offload_permits(64), nominal);
+        // THE invariant: for any pool_size, the TOTAL off-loop budget is
+        // <= pool_size - 1, so a spare executor always remains for foreground —
+        // exports and summaries TOGETHER can never hold every executor.
+        for n in 0..=64usize {
             assert!(
-                effective_export_permits(n) <= n.saturating_sub(1),
-                "must always reserve >=1 executor for normal ops (pool_size={n})"
+                effective_offload_permits(n) <= n.saturating_sub(1),
+                "shared off-loop budget must always reserve >=1 executor for \
+                 foreground work, jointly across exports+summaries (pool_size={n})"
             );
         }
-        // Degenerate pool_size == 0 must not panic (saturating).
-        assert_eq!(effective_export_permits(0), 0);
     }
 
     /// Pin (#4531): when the offloaded export task PANICS, the executor is lost
@@ -1188,6 +1198,64 @@ mod executor_pin_tests {
         assert!(
             !arm.contains(".export_user_secrets("),
             "the export arm must NOT call export_user_secrets inline on the loop"
+        );
+    }
+
+    /// Pin (#4534): when the off-loop summary task PANICS/is dropped, the
+    /// executor is lost with it, so `RuntimePool::finish_summarize` MUST
+    /// reconcile the missing slot — build a replacement (restoring the permit) —
+    /// and on success return the executor via `return_checked`. Same lost-slot
+    /// reconciliation as `finish_export`.
+    #[test]
+    fn finish_summarize_replaces_panicked_executor() {
+        let src = include_str!("runtime/pool.rs");
+        let body = src
+            .split("async fn finish_summarize(")
+            .nth(1)
+            .expect("RuntimePool::finish_summarize must exist")
+            .split("\n    fn get_subscription_info(")
+            .next()
+            .expect("end of finish_summarize");
+        assert!(
+            body.contains("create_replacement_executor("),
+            "finish_summarize must replace a panic-lost executor (create_replacement_executor)"
+        );
+        assert!(
+            body.contains("return_checked("),
+            "finish_summarize must return a healthy executor to the pool"
+        );
+    }
+
+    /// Pin (#4534): the `GetSummaryQuery` dispatch arm MUST off-load a
+    /// `Background` summary onto a spawned task (so the loop keeps draining)
+    /// rather than awaiting every summary inline. The interest-sync summary
+    /// burst serializing inline is the "contract queue full" incident; a
+    /// refactor that drops the off-load re-introduces it and fails CI here.
+    /// Anchored on the arm gating on `Priority::Background`, admitting via
+    /// `try_begin_summarize`, and spawning the job.
+    #[test]
+    fn get_summary_arm_offloads_background() {
+        let src = include_str!("../../contract.rs");
+        let arm = src
+            .split("ContractHandlerEvent::GetSummaryQuery { key } => {")
+            .nth(1)
+            .expect("GetSummaryQuery dispatch arm must exist")
+            .split("ContractHandlerEvent::GetDeltaQuery")
+            .next()
+            .expect("end of GetSummaryQuery arm");
+        assert!(
+            arm.contains("Priority::Background"),
+            "the summary arm must gate off-loading on Priority::Background \
+             (foreground summaries stay inline for latency)"
+        );
+        assert!(
+            arm.contains("try_begin_summarize("),
+            "the summary arm must admit Background off-load via try_begin_summarize"
+        );
+        assert!(
+            arm.contains("GlobalExecutor::spawn("),
+            "the summary arm must run the Background summary on a spawned task, \
+             not await it inline on the contract loop (#4534)"
         );
     }
 

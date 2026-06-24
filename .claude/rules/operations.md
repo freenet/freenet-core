@@ -107,6 +107,18 @@ The loop's pop() applies a bounded anti-starvation floor
 (RELAY_STARVATION_FLOOR) so sustained ClientLocal load cannot indefinitely
 starve NetworkRelay/Background — but that is a backstop, not a license to
 mis-tag.
+
+Beyond reordering, a Background GetSummaryQuery (the periodic interest-sync
+summarize) also runs OFF the serial loop on a spawned task when a pooled
+executor is free (#4534, contract.rs GetSummaryQuery arm → pool
+try_begin_summarize/finish_summarize), so a burst of them can't head-of-line
+block client work even once popped. Foreground summaries
+(NetworkRelay/ClientLocal — resync / a direct client ask) stay inline for
+latency. This is the same off-load idiom as the hosted-export deferral (#4531
+/ #4381 P5) and the related-fetch deferral (#4391, contracts.md); all
+off-loop classes share ONE pool-executor budget (effective_offload_permits =
+min(exports+summaries, pool_size-1)) so they can never jointly hold every
+executor and wedge the loop.
 ```
 
 ## Critical Invariant: Initialize-Before-Send

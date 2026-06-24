@@ -384,7 +384,11 @@ impl FairEventQueue {
     /// for client work.
     ///
     /// Returns `None` if all tiers are empty.
-    pub(super) fn pop(&mut self) -> Option<(EventId, ContractHandlerEvent)> {
+    ///
+    /// The popped event's [`Priority`] is returned alongside it so the loop can
+    /// route Background work off-loop (#4534) — e.g. a Background summary is
+    /// off-loaded while client/relay summaries stay inline for latency.
+    pub(super) fn pop(&mut self) -> Option<QueuedItem> {
         let client_nonempty = self.tiers[Priority::ClientLocal as usize].queued > 0;
         let lower_nonempty = self.tiers[Priority::NetworkRelay as usize].queued > 0
             || self.tiers[Priority::Background as usize].queued > 0;
@@ -413,7 +417,7 @@ impl FairEventQueue {
         };
 
         for priority in order {
-            if let Some((id, event, _)) = self.tiers[priority as usize].pop() {
+            if let Some((id, event, item_priority)) = self.tiers[priority as usize].pop() {
                 debug_assert!(self.total_queued > 0);
                 self.total_queued = self.total_queued.saturating_sub(1);
                 // Track the ClientLocal streak only while lower work waits — an
@@ -423,7 +427,7 @@ impl FairEventQueue {
                 } else {
                     self.client_streak = 0;
                 }
-                return Some((id, event));
+                return Some((id, event, item_priority));
             }
         }
         None
@@ -560,7 +564,7 @@ mod tests {
 
         // Pop all — should interleave: A, B, A, B, ...
         let mut results = Vec::new();
-        while let Some((_, event)) = queue.pop() {
+        while let Some((_, event, _)) = queue.pop() {
             let ContractHandlerEvent::GetQuery { instance_id, .. } = event else {
                 panic!("unexpected event type");
             };
@@ -734,7 +738,7 @@ mod tests {
 
         // Pop all and verify order matches insertion order
         let mut popped_ids = Vec::new();
-        while let Some((id, _)) = queue.pop() {
+        while let Some((id, _, _)) = queue.pop() {
             popped_ids.push(id.id);
         }
 
@@ -765,7 +769,7 @@ mod tests {
 
         // Pop all events and count per-contract
         let mut per_contract_counts: HashMap<ContractInstanceId, usize> = HashMap::new();
-        while let Some((_, event)) = queue.pop() {
+        while let Some((_, event, _)) = queue.pop() {
             let ContractHandlerEvent::GetQuery { instance_id, .. } = event else {
                 panic!("unexpected event type");
             };
@@ -815,7 +819,7 @@ mod tests {
         let mut cold_positions = Vec::new();
 
         let mut position = 0;
-        while let Some((_, event)) = queue.pop() {
+        while let Some((_, event, _)) = queue.pop() {
             let ContractHandlerEvent::GetQuery { instance_id, .. } = event else {
                 panic!("unexpected event type");
             };
@@ -924,7 +928,7 @@ mod tests {
         queue
             .try_push_default(make_event_id(0), make_get_event(a))
             .unwrap();
-        let (id0, _) = queue.pop().expect("should pop A");
+        let (id0, _, _) = queue.pop().expect("should pop A");
         assert_eq!(id0.id, 0);
 
         // Push events for B and A
@@ -937,14 +941,14 @@ mod tests {
 
         // Round-robin should give B first (B was added after A was drained,
         // so B is at front of round_robin)
-        let (id1, ev1) = queue.pop().expect("should pop B");
+        let (id1, ev1, _) = queue.pop().expect("should pop B");
         let ContractHandlerEvent::GetQuery { instance_id, .. } = ev1 else {
             panic!("unexpected event type");
         };
         assert_eq!(instance_id, b, "expected B (id={})", id1.id);
 
         // Then A
-        let (id2, ev2) = queue.pop().expect("should pop A");
+        let (id2, ev2, _) = queue.pop().expect("should pop A");
         let ContractHandlerEvent::GetQuery { instance_id, .. } = ev2 else {
             panic!("unexpected event type");
         };
@@ -978,7 +982,7 @@ mod tests {
         // Pop 3 — should be one from each (A, B, C in round-robin)
         let mut first_round = Vec::new();
         for _ in 0..3 {
-            let (_, ev) = queue.pop().unwrap();
+            let (_, ev, _) = queue.pop().unwrap();
             let ContractHandlerEvent::GetQuery { instance_id, .. } = ev else {
                 panic!("unexpected");
             };
@@ -989,7 +993,7 @@ mod tests {
         // C is now drained, so second round is A, B
         let mut second_round = Vec::new();
         for _ in 0..2 {
-            let (_, ev) = queue.pop().unwrap();
+            let (_, ev, _) = queue.pop().unwrap();
             let ContractHandlerEvent::GetQuery { instance_id, .. } = ev else {
                 panic!("unexpected");
             };
@@ -998,7 +1002,7 @@ mod tests {
         assert_eq!(second_round, vec![a, b]);
 
         // Third round: only A remains
-        let (_, ev) = queue.pop().unwrap();
+        let (_, ev, _) = queue.pop().unwrap();
         let ContractHandlerEvent::GetQuery { instance_id, .. } = ev else {
             panic!("unexpected");
         };
@@ -1204,7 +1208,7 @@ mod tests {
             .unwrap();
 
         let order: Vec<ContractInstanceId> = std::iter::from_fn(|| queue.pop())
-            .map(|(_, ev)| get_cid(ev))
+            .map(|(_, ev, _)| get_cid(ev))
             .collect();
         assert_eq!(
             order,
@@ -1321,7 +1325,7 @@ mod tests {
             .expect("ClientLocal on a Background-saturated contract must still be admitted");
 
         // And ClientLocal drains first despite being pushed last.
-        let (_, ev) = queue.pop().unwrap();
+        let (_, ev, _) = queue.pop().unwrap();
         assert_eq!(get_cid(ev), key);
         assert_eq!(queue.tier_queued(Priority::ClientLocal), 0);
         assert_eq!(
@@ -1348,7 +1352,7 @@ mod tests {
                 .unwrap();
         }
         let order: Vec<ContractInstanceId> = std::iter::from_fn(|| queue.pop())
-            .map(|(_, ev)| get_cid(ev))
+            .map(|(_, ev, _)| get_cid(ev))
             .collect();
         assert_eq!(order, vec![a, b, a, b, a, b, a, b]);
     }
@@ -1389,7 +1393,7 @@ mod tests {
         let mut max_gap = 0usize;
         let mut relay_served = 0usize;
         for _ in 0..400 {
-            let (_, ev) = queue.pop().unwrap();
+            let (_, ev, _) = queue.pop().unwrap();
             let cid = get_cid(ev);
             // relay contracts are the 2000.. series
             let is_relay = (2000..3000).any(|s| make_contract_id_u32(s) == cid);

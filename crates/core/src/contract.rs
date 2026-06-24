@@ -326,6 +326,98 @@ impl Drop for ExportGuard {
     }
 }
 
+/// Loop-side payload for a completed off-loop `Background` summary (#4534).
+/// Mirrors [`ExportResume`]: the executor + precomputed summary come back to the
+/// loop, which returns/replaces the executor (`finish_summarize`) and answers
+/// the parked client. Nothing to re-run on the loop — just deliver and reclaim.
+struct SummaryResume {
+    /// The contract whose summary was computed (needed both for the
+    /// `GetSummaryResponse` and for `finish_summarize`'s per-contract accounting).
+    key: ContractKey,
+    /// The completed summary: the executor to return (or `None` if the task
+    /// panicked/was dropped) and the result for the client.
+    done: crate::contract::executor::runtime::SummaryDone,
+    /// The parked client responder. `None` only if the client disconnected
+    /// before the summary finished.
+    responder: Option<StashedResponder>,
+}
+
+/// RAII guard guaranteeing the off-loop summary task delivers EXACTLY ONE
+/// [`SummaryResume`] — whether the summary completes or the task is
+/// dropped/panics/cancelled before sending. Same load-bearing invariant as
+/// [`ExportGuard`]: the parked client responder never hangs and the
+/// checked-out executor is always reclaimed.
+struct SummaryGuard {
+    payload: Option<SummaryGuardPayload>,
+}
+
+struct SummaryGuardPayload {
+    summary_resume_tx: tokio::sync::mpsc::UnboundedSender<SummaryResume>,
+    key: ContractKey,
+    responder: Option<StashedResponder>,
+}
+
+impl SummaryGuard {
+    fn new(
+        summary_resume_tx: tokio::sync::mpsc::UnboundedSender<SummaryResume>,
+        key: ContractKey,
+        responder: Option<StashedResponder>,
+    ) -> Self {
+        Self {
+            payload: Some(SummaryGuardPayload {
+                summary_resume_tx,
+                key,
+                responder,
+            }),
+        }
+    }
+
+    /// Deliver the completed summary. Consumes the payload so a subsequent `Drop`
+    /// is a no-op (exactly-once).
+    fn send(mut self, done: crate::contract::executor::runtime::SummaryDone) {
+        if let Some(p) = self.payload.take() {
+            Self::deliver(p, done);
+        }
+    }
+
+    fn deliver(p: SummaryGuardPayload, done: crate::contract::executor::runtime::SummaryDone) {
+        let SummaryGuardPayload {
+            summary_resume_tx,
+            key,
+            responder,
+        } = p;
+        // Unbounded channel, non-blocking send (channel-safety.md carve-out: the
+        // producer count is bounded by MAX_CONCURRENT_SUMMARIES, the receiver is
+        // this loop which drains every iteration, and the waiter never reads what
+        // the loop produces — no cycle). A send failure means the loop is gone.
+        if summary_resume_tx
+            .send(SummaryResume {
+                key,
+                done,
+                responder,
+            })
+            .is_err()
+        {
+            tracing::debug!("summary resume channel closed; contract-handling loop gone");
+        }
+    }
+}
+
+impl Drop for SummaryGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.payload.take() {
+            tracing::warn!(
+                "Off-loop summary task dropped before sending — delivering an error \
+                 resume so the summary terminates and the client is answered (#4534)"
+            );
+            Self::deliver(
+                p,
+                crate::contract::executor::runtime::SummaryDone::lost_to_drop(),
+            );
+        }
+    }
+}
+
 /// Loop-side state for off-loading deferred related-contract fetches (#4391).
 ///
 /// Owned by `contract_handling`; passed by `&mut` into `handle_contract_event`
@@ -355,18 +447,24 @@ struct DeferralCtx {
     /// loop here (#4531 / #4381 P5). Separate from `resume_tx` because the export
     /// resume carries an executor + precomputed bytes, not an upsert to re-run.
     export_resume_tx: tokio::sync::mpsc::UnboundedSender<ExportResume>,
+    /// Off-loop `Background` summary tasks send their completed [`SummaryResume`]s
+    /// back to the loop here (#4534). Separate channel for the same reason as
+    /// `export_resume_tx`: it carries an executor + precomputed summary.
+    summary_resume_tx: tokio::sync::mpsc::UnboundedSender<SummaryResume>,
 }
 
 impl DeferralCtx {
     fn new(
         resume_tx: tokio::sync::mpsc::UnboundedSender<DeferredResume>,
         export_resume_tx: tokio::sync::mpsc::UnboundedSender<ExportResume>,
+        summary_resume_tx: tokio::sync::mpsc::UnboundedSender<SummaryResume>,
     ) -> Self {
         Self {
             resume_tx,
             stashed: std::collections::HashMap::new(),
             next_deferral_id: 0,
             export_resume_tx,
+            summary_resume_tx,
         }
     }
 
@@ -1136,7 +1234,13 @@ where
     // no cycle, non-blocking `unbounded_send`.
     let (export_resume_tx, mut export_resume_rx) =
         tokio::sync::mpsc::unbounded_channel::<ExportResume>();
-    let mut deferral_ctx = DeferralCtx::new(resume_tx, export_resume_tx);
+    // Off-loop Background summary resume channel (#4534). Same channel-safety
+    // carve-out as the export channel: producers bounded by
+    // MAX_CONCURRENT_SUMMARIES, receiver is this loop (drains every iteration),
+    // no cycle, non-blocking `unbounded_send`.
+    let (summary_resume_tx, mut summary_resume_rx) =
+        tokio::sync::mpsc::unbounded_channel::<SummaryResume>();
+    let mut deferral_ctx = DeferralCtx::new(resume_tx, export_resume_tx, summary_resume_tx);
 
     loop {
         // Drain resumed (deferred) upserts so a completed off-loop fetch is
@@ -1161,6 +1265,18 @@ where
             match export_resume_rx.try_recv() {
                 Ok(resume) => {
                     handle_export_resume(&mut contract_handler, resume).await;
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Drain completed off-loop SUMMARIES (#4534): return/replace the executor
+        // and answer the parked client. Bounded by MAX_CONCURRENT_SUMMARIES, so
+        // this batch is tiny; each iteration is a pool return + a oneshot send.
+        for _ in 0..executor::runtime::MAX_CONCURRENT_SUMMARIES {
+            match summary_resume_rx.try_recv() {
+                Ok(resume) => {
+                    handle_summary_resume(&mut contract_handler, resume).await;
                 }
                 Err(_) => break,
             }
@@ -1217,11 +1333,12 @@ where
         // only on commit (its responder is parked in `deferral_ctx.stashed`), so
         // its causality is preserved; concurrent same-key ops reconcile via the
         // contract's CRDT merge on resume. This reordering is intended (#4391).
-        if let Some((id, event)) = fair_queue.pop() {
+        if let Some((id, event, priority)) = fair_queue.pop() {
             handle_contract_event(
                 &mut contract_handler,
                 id,
                 event,
+                priority,
                 &prompter,
                 Some(&mut deferral_ctx),
             )
@@ -1248,6 +1365,9 @@ where
             }
             Some(export_resume) = export_resume_rx.recv() => {
                 handle_export_resume(&mut contract_handler, export_resume).await;
+            }
+            Some(summary_resume) = summary_resume_rx.recv() => {
+                handle_summary_resume(&mut contract_handler, summary_resume).await;
             }
             notification = recv_delegate_notification(&mut delegate_rx) => {
                 handle_delegate_notification(&mut contract_handler, notification, &prompter).await;
@@ -1313,6 +1433,35 @@ where
             tracing::debug!(
                 error = %error,
                 "Failed to deliver EXPORT resume response (client may have disconnected)"
+            );
+        }
+    }
+}
+
+/// Reconcile a completed off-loop `Background` summary back onto the loop
+/// (#4534): return/replace the executor and answer the parked client with the
+/// `GetSummaryResponse`. Mirrors [`handle_export_resume`].
+async fn handle_summary_resume<CH>(contract_handler: &mut CH, resume: SummaryResume)
+where
+    CH: ContractHandler + Send + 'static,
+{
+    let SummaryResume {
+        key,
+        done,
+        responder,
+    } = resume;
+    let summary = contract_handler
+        .executor()
+        .finish_summarize(key, done)
+        .await;
+    if let Some(responder) = responder {
+        if let Err(error) =
+            responder.respond(ContractHandlerEvent::GetSummaryResponse { key, summary })
+        {
+            tracing::debug!(
+                error = %error,
+                contract = %key,
+                "Failed to deliver SUMMARY resume response (client may have disconnected)"
             );
         }
     }
@@ -1958,6 +2107,7 @@ async fn handle_contract_event<CH, P>(
     contract_handler: &mut CH,
     id: handler::EventId,
     event: ContractHandlerEvent,
+    priority: fair_queue::Priority,
     prompter: &P,
     deferral: Option<&mut DeferralCtx>,
 ) -> Result<(), ContractError>
@@ -2454,6 +2604,47 @@ where
             }
         }
         ContractHandlerEvent::GetSummaryQuery { key } => {
+            // Background summaries (the periodic InterestSync interest-exchange,
+            // by far the highest-volume summarize source) are OFF-LOADED off the
+            // serial loop when a pooled executor is free (#4534): a burst of them
+            // serializing inline is what starved client GET/PUT/UPDATE in the
+            // "contract queue full" incident. Foreground summaries
+            // (NetworkRelay/ClientLocal — resync / a client asking directly) stay
+            // INLINE for latency. Off-loading needs a DeferralCtx (the production
+            // path always has one; delegate-driven / direct unit-test calls do
+            // not) to carry the summary-resume channel; without it, run inline.
+            if priority == fair_queue::Priority::Background {
+                if let Some(deferral) = deferral.as_ref() {
+                    match contract_handler.executor().try_begin_summarize(key) {
+                        executor::runtime::SummaryAdmission::Admitted(job) => {
+                            // Park the responder so the off-loop task answers it
+                            // later via the summary-resume channel; return now so
+                            // the loop keeps draining while the summary computes.
+                            let responder = contract_handler.channel().take_waiting_response(&id);
+                            let guard = SummaryGuard::new(
+                                deferral.summary_resume_tx.clone(),
+                                key,
+                                responder,
+                            );
+                            // Fire-and-forget, bounded by MAX_CONCURRENT_SUMMARIES
+                            // (the semaphore the job holds); the SummaryGuard
+                            // guarantees exactly-one resume even if the task is
+                            // dropped/panics, so the executor is always reclaimed
+                            // and the client always answered.
+                            GlobalExecutor::spawn(async move {
+                                let done = job.run().await;
+                                guard.send(done);
+                            });
+                            return Ok(());
+                        }
+                        // At the off-loop cap, no executor free, or this executor
+                        // kind can't off-load: fall through to the inline summary.
+                        executor::runtime::SummaryAdmission::Busy
+                        | executor::runtime::SummaryAdmission::Unsupported => {}
+                    }
+                }
+            }
+
             let summary = contract_handler
                 .executor()
                 .summarize_contract_state(key)
@@ -3176,7 +3367,7 @@ mod tests {
         // so the two futures make progress cooperatively to completion.
         let send_fut = send_halve.send_to_handler(event);
         let recv_fut = async {
-            let (id, received, _priority) = handler
+            let (id, received, priority) = handler
                 .channel()
                 .recv_from_sender()
                 .await
@@ -3185,6 +3376,7 @@ mod tests {
                 handler,
                 id,
                 received,
+                priority,
                 &user_input::AutoApprovePrompter,
                 None,
             )
@@ -3213,7 +3405,7 @@ mod tests {
         };
         let send_fut = send_halve.send_to_handler(event);
         let recv_fut = async {
-            let (id, received, _priority) = handler
+            let (id, received, priority) = handler
                 .channel()
                 .recv_from_sender()
                 .await
@@ -3222,6 +3414,7 @@ mod tests {
                 handler,
                 id,
                 received,
+                priority,
                 &user_input::AutoApprovePrompter,
                 None,
             )
@@ -4524,9 +4717,10 @@ mod hol_4391_tests {
     async fn dropped_waiter_guard_answers_client_missing_related() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DeferredResume>();
         // This test exercises the related-fetch resume path only; the export
-        // resume channel is unused here.
+        // and summary resume channels are unused here.
         let (export_tx, _export_rx) = tokio::sync::mpsc::unbounded_channel::<ExportResume>();
-        let mut ctx = DeferralCtx::new(tx.clone(), export_tx);
+        let (summary_tx, _summary_rx) = tokio::sync::mpsc::unbounded_channel::<SummaryResume>();
+        let mut ctx = DeferralCtx::new(tx.clone(), export_tx, summary_tx);
         let mut handler =
             MockWasmContractHandler::new_test(handler::contract_handler_channel().1, None, "drop")
                 .await;
@@ -4613,6 +4807,93 @@ mod hol_4391_tests {
         );
         assert!(
             rx.try_recv().is_err(),
+            "exactly one resume — Drop must NOT send again after a success send"
+        );
+    }
+
+    /// (#4534, unit): the `SummaryGuard` delivers a terminal ERROR resume when the
+    /// off-loop summary task is DROPPED before sending (task cancelled / panicked).
+    /// Driving that resume through `handle_summary_resume` must answer the parked
+    /// client with a `GetSummaryResponse` error — the wedge-prevention (parked
+    /// client never hangs, executor always reclaimed) is the drop-guard's
+    /// exactly-once delivery. Mirrors `dropped_waiter_guard_answers_client_missing_related`.
+    #[tokio::test]
+    async fn dropped_summary_guard_answers_client_with_error() {
+        let (summary_tx, mut summary_rx) = tokio::sync::mpsc::unbounded_channel::<SummaryResume>();
+        let mut handler = MockWasmContractHandler::new_test(
+            handler::contract_handler_channel().1,
+            None,
+            "drop_summary",
+        )
+        .await;
+
+        let key = make_contract(b"drop_summary_k").key();
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+        let responder = StashedResponder::for_test(9, resp_tx);
+
+        // Build the off-loop summary guard and DROP it WITHOUT `send` (the task was
+        // cancelled/dropped before the summary computed).
+        {
+            let guard = SummaryGuard::new(summary_tx, key, Some(responder));
+            drop(guard);
+        }
+
+        // The guard's Drop must have delivered exactly one terminal resume,
+        // carrying a lost-to-drop SummaryDone (executor None, result Err).
+        let resume = summary_rx.try_recv().expect("Drop must deliver one resume");
+        assert_eq!(resume.key, key);
+        assert!(
+            resume.done.result.is_err(),
+            "dropped-summary resume must carry an error result"
+        );
+        assert!(
+            summary_rx.try_recv().is_err(),
+            "exactly one resume — no extra"
+        );
+
+        // Process it on the loop: the parked client is answered with a
+        // GetSummaryResponse error (mock executor's finish_summarize is the trait
+        // default, which just surfaces the carried result — no pool needed).
+        handle_summary_resume(&mut handler, resume).await;
+
+        let (_id, ev) = resp_rx.await.expect("client must be answered");
+        match ev {
+            ContractHandlerEvent::GetSummaryResponse { key: k, summary } => {
+                assert_eq!(k, key);
+                assert!(
+                    summary.is_err(),
+                    "dropped-summary must surface a summary error to the client"
+                );
+            }
+            other => panic!("expected GetSummaryResponse error, got {other}"),
+        }
+    }
+
+    /// (#4534, unit): the success path delivers EXACTLY ONE summary resume — the
+    /// explicit `send` consumes the payload, so the guard's `Drop` is a no-op
+    /// (never a double-send → never a double-return of the executor / double
+    /// client answer). Mirrors `resume_guard_success_sends_exactly_one_resume`.
+    #[tokio::test]
+    async fn summary_guard_success_sends_exactly_one_resume() {
+        let (summary_tx, mut summary_rx) = tokio::sync::mpsc::unbounded_channel::<SummaryResume>();
+        let key = make_contract(b"once_summary_k").key();
+        let (resp_tx, _resp_rx) = tokio::sync::oneshot::channel();
+
+        let guard = SummaryGuard::new(
+            summary_tx,
+            key,
+            Some(StashedResponder::for_test(4, resp_tx)),
+        );
+        // Success send (the carried SummaryDone shape is irrelevant to exactly-once;
+        // the guard forwards whatever it is). Then the guard drops at end of scope.
+        guard.send(crate::contract::executor::runtime::SummaryDone::lost_to_drop());
+
+        let resume = summary_rx
+            .try_recv()
+            .expect("success path must deliver one resume");
+        assert_eq!(resume.key, key);
+        assert!(
+            summary_rx.try_recv().is_err(),
             "exactly one resume — Drop must NOT send again after a success send"
         );
     }

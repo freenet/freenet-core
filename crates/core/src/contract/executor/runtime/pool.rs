@@ -99,45 +99,70 @@ pub struct RuntimePool {
     /// `lookup_key`, `get_subscription_info`, `remove_client`
     /// (read-only / no executor checkout).
     in_flight_contracts: HashMap<ContractKey, usize>,
-    /// Bounds how many hosted-mode secret exports may run OFF-LOOP concurrently
-    /// (#4381 P5). Each admitted export holds one permit (in its `ExportJob`)
-    /// AND one pool executor for its duration. Sized to
-    /// [`effective_export_permits`] (`min(MAX_CONCURRENT_EXPORTS, pool_size-1)`)
-    /// so >=1 executor is ALWAYS reserved for normal contract ops — this is the
-    /// enforced anti-deadlock invariant (see `effective_export_permits`), not a
-    /// prose hope. `Arc` so an admitted `ExportJob` can hold an owned permit
-    /// across the spawned background task without borrowing the pool.
-    export_semaphore: Arc<Semaphore>,
+    /// SHARED off-loop concurrency budget for ALL classes of off-loop work that
+    /// check out a pool executor and run on a spawned task — hosted-mode secret
+    /// exports (#4381 P5) AND `Background` contract-state summaries (#4534).
+    ///
+    /// One semaphore, not one per class, because the anti-deadlock invariant is
+    /// JOINT, not per-class: every off-loop job holds one pool executor for its
+    /// duration, and the only executor-return paths (`finish_export` /
+    /// `finish_summarize`) run ON the contract loop. If the off-loop classes
+    /// could TOGETHER hold every executor, a foreground op would park the loop on
+    /// `pop_executor().await` waiting for an executor that only the (now-parked)
+    /// loop can return — a permanent self-deadlock. Two independent per-class
+    /// semaphores each sized `pool_size-1` do NOT compose: on a small pool
+    /// (`pool_size` 2–4) `exports + summaries` could still sum to `pool_size` and
+    /// re-open the hang. A single budget sized [`effective_offload_permits`]
+    /// (`min(MAX_CONCURRENT_EXPORTS + MAX_CONCURRENT_SUMMARIES, pool_size-1)`)
+    /// guarantees `>=1` executor is ALWAYS reserved for foreground (client/relay)
+    /// work no matter how the off-loop budget is split between exports and
+    /// summaries. `Arc` so an admitted job can hold an owned permit across its
+    /// spawned task without borrowing the pool.
+    offload_semaphore: Arc<Semaphore>,
 }
 
-/// Max hosted-mode secret exports allowed to run off-loop at once (#4381 P5),
-/// BEFORE the pool-size clamp in [`effective_export_permits`].
-///
-/// Small and fixed: exports are an occasional self-host-migration action, not a
-/// hot path, and each one holds a pool executor for its duration. The real cap
-/// is `min(this, pool_size - 1)` so >=1 executor is ALWAYS free for normal ops.
-/// A request that arrives while that many exports are in flight (or that can't
-/// immediately reserve an executor) is rejected with a typed busy error (HTTP
-/// 503), never queued on the contract loop.
+/// Nominal share of the shared off-loop budget for hosted-mode secret exports
+/// (#4381 P5). Exports are an occasional self-host-migration action, not a hot
+/// path. This is a NOMINAL ceiling: the real bound is the SHARED
+/// [`effective_offload_permits`] budget that exports and summaries draw from
+/// together (`min(MAX_CONCURRENT_EXPORTS + MAX_CONCURRENT_SUMMARIES,
+/// pool_size-1)`), so on a small pool exports may get fewer than this when
+/// summaries are also running. Over the shared budget (or when no executor is
+/// immediately free) → typed busy error (HTTP 503), never queued on the loop.
 pub(crate) const MAX_CONCURRENT_EXPORTS: usize = 2;
 
-/// Effective off-loop export concurrency for a pool of `pool_size` executors.
+/// Nominal share of the shared off-loop budget for `Background` summaries
+/// (#4534). Like [`MAX_CONCURRENT_EXPORTS`], a nominal ceiling on top of the
+/// SHARED [`effective_offload_permits`] budget — a summary that can't reserve a
+/// shared off-loop slot (or an executor) is NOT off-loaded; the caller runs it
+/// inline on the loop, exactly as before #4534 (summaries are
+/// correctness-neutral; the only question is on- vs off-loop).
+pub(crate) const MAX_CONCURRENT_SUMMARIES: usize = 2;
+
+/// Effective SHARED off-loop concurrency for a pool of `pool_size` executors —
+/// the single budget that BOTH off-loop classes (exports #4381 P5, summaries
+/// #4534) acquire from.
 ///
-/// `min(MAX_CONCURRENT_EXPORTS, pool_size - 1)` — this is the load-bearing
-/// anti-deadlock invariant, ENFORCED in code (not prose): an admitted export
-/// holds one pool executor off-loop, and the only executor-return path
-/// (`finish_export`) runs ON the contract loop. If exports could hold EVERY
-/// executor, a normal contract op would park the loop waiting for an executor
-/// that only the (now-parked) loop can return — a permanent self-deadlock.
-/// Reserving at least one executor for normal ops makes that impossible.
+/// `min(MAX_CONCURRENT_EXPORTS + MAX_CONCURRENT_SUMMARIES, pool_size - 1)` — the
+/// load-bearing anti-deadlock invariant, ENFORCED in code (not prose): every
+/// off-loop job holds one pool executor, and the only executor-return paths
+/// (`finish_export` / `finish_summarize`) run ON the contract loop. If off-loop
+/// work could hold EVERY executor, a foreground op would park the loop on
+/// `pop_executor().await` waiting for an executor only the (now-parked) loop can
+/// return — a permanent self-deadlock.
 ///
-/// `pool_size == 1` → 0: exports are DISABLED on a single-executor node (they
-/// return the typed Busy → 503). That is correct, not a regression — a tiny
-/// 1-executor node has no spare executor to lend a deferred export anyway, and
-/// the alternative (running it on the sole executor) is exactly the inline
-/// blocking this whole change removes.
-pub(crate) fn effective_export_permits(pool_size: usize) -> usize {
-    MAX_CONCURRENT_EXPORTS.min(pool_size.saturating_sub(1))
+/// Crucially this is a JOINT budget, not per-class. Two independent per-class
+/// semaphores each sized `pool_size-1` do NOT compose: on a small pool
+/// (`pool_size` 2–4) exports + summaries could each take their own share and
+/// together hold all `pool_size` executors, re-opening the hang. Drawing both
+/// classes from ONE `pool_size-1`-capped budget reserves >=1 executor for
+/// foreground work no matter how the budget splits between exports and summaries.
+///
+/// `pool_size == 1` → 0: off-loop work is DISABLED on a single-executor node
+/// (exports return Busy → 503; summaries run inline). Correct — a 1-executor
+/// node has no spare executor to lend.
+pub(crate) fn effective_offload_permits(pool_size: usize) -> usize {
+    (MAX_CONCURRENT_EXPORTS + MAX_CONCURRENT_SUMMARIES).min(pool_size.saturating_sub(1))
 }
 
 /// Result of [`RuntimePool::try_begin_export`]: an admitted off-loop export job,
@@ -241,6 +266,98 @@ impl ExportDone {
     /// the executor to); the real `RuntimePool::finish_export` returns the
     /// executor to the pool instead of dropping it.
     pub(crate) fn into_result(self) -> Result<Vec<u8>, ExecutorError> {
+        self.result
+    }
+}
+
+/// Result of [`RuntimePool::try_begin_summarize`]: an admitted off-loop summary
+/// job, or a rejection because too many summaries are already in flight / no
+/// executor is momentarily free, or because this executor kind cannot off-load
+/// (mock / test / single-executor). On any non-`Admitted` outcome the caller
+/// summarizes INLINE on the loop — off-loading is a latency optimization, never
+/// a correctness requirement.
+pub(crate) enum SummaryAdmission {
+    /// Admitted. The contract-handling loop moves this `SummaryJob` into a
+    /// background task and calls [`SummaryJob::run`] there; the resulting
+    /// [`SummaryDone`] comes back to the loop, which calls
+    /// [`RuntimePool::finish_summarize`] to return/replace the executor. Boxed
+    /// because a `SummaryJob` owns a whole `Executor<Runtime>`.
+    Admitted(Box<SummaryJob>),
+    /// `MAX_CONCURRENT_SUMMARIES` summaries are already running, or no executor
+    /// was immediately free. The caller summarizes inline on the loop.
+    Busy,
+    /// This executor kind cannot off-load (mock / single-executor pool). The
+    /// caller summarizes inline.
+    Unsupported,
+}
+
+/// An admitted `Background` summary, owning everything it needs to run OFF the
+/// contract loop: an exclusively-checked-out pool executor, the summary-
+/// concurrency permit (released when the job is consumed by `run`), and the
+/// contract key. Opaque to the loop, which just moves it into a background task.
+pub(crate) struct SummaryJob {
+    executor: Executor<Runtime>,
+    /// Held for the lifetime of the job so the summary-concurrency slot is
+    /// occupied until the work finishes; dropped at the end of `run`.
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    key: ContractKey,
+}
+
+impl SummaryJob {
+    /// Run the summary off the contract loop and produce a [`SummaryDone`] to
+    /// hand back to the loop.
+    ///
+    /// Unlike the export job, `summarize_contract_state` is itself `async` (it
+    /// may await on the state store / related-contract bridge), so there is no
+    /// synchronous CPU body to push onto `spawn_blocking` — the off-loading is
+    /// achieved by running this whole job on a SEPARATE spawned task instead of
+    /// inline on the serial loop. A panic inside the `.await` aborts THIS task;
+    /// the `SummaryGuard` that owns the parked responder then delivers a
+    /// drop-style `SummaryDone` (executor `None`) so the loop replaces the lost
+    /// executor and answers the client — exactly the export panic semantics.
+    ///
+    /// Intended to be called from a spawned background task, NOT on the contract
+    /// loop — that is the whole point of the deferral (#4534).
+    pub(crate) async fn run(mut self) -> SummaryDone {
+        let result = self.executor.summarize_contract_state(self.key).await;
+        SummaryDone {
+            executor: Some(self.executor),
+            result,
+        }
+        // `_permit` drops here, freeing the summary-concurrency slot for the next
+        // request. The executor is returned to the pool by the loop via
+        // `finish_summarize`.
+    }
+}
+
+/// The completed summary, handed back to the contract loop. Carries the result
+/// for the client and the executor to return to the pool (`None` only on the
+/// drop/panic path, in which case the loop replaces the lost executor).
+pub(crate) struct SummaryDone {
+    executor: Option<Executor<Runtime>>,
+    pub(crate) result: Result<StateSummary<'static>, ExecutorError>,
+}
+
+impl SummaryDone {
+    /// A `SummaryDone` for the case where the off-loop summary task was dropped /
+    /// cancelled / panicked before producing a result. Carries no executor — the
+    /// job owned it and is gone — so the loop's `finish_summarize` treats it like
+    /// the export panic path (replace the lost slot) and answers the client with
+    /// an error. Delivered by `SummaryGuard::drop`.
+    pub(crate) fn lost_to_drop() -> Self {
+        Self {
+            executor: None,
+            result: Err(ExecutorError::other(anyhow::anyhow!(
+                "background summary task was dropped before completion"
+            ))),
+        }
+    }
+
+    /// Consume the `SummaryDone`, dropping any carried executor and returning just
+    /// the result. Used by the trait default `finish_summarize` (no pool to
+    /// return the executor to); the real `RuntimePool::finish_summarize` returns
+    /// the executor to the pool instead of dropping it.
+    pub(crate) fn into_result(self) -> Result<StateSummary<'static>, ExecutorError> {
         self.result
     }
 }
@@ -394,7 +511,7 @@ impl RuntimePool {
             delegate_notification_tx,
             delegate_notification_rx: Some(delegate_notification_rx),
             in_flight_contracts: HashMap::new(),
-            export_semaphore: Arc::new(Semaphore::new(effective_export_permits(pool_size_usize))),
+            offload_semaphore: Arc::new(Semaphore::new(effective_offload_permits(pool_size_usize))),
         })
     }
 
@@ -1023,11 +1140,12 @@ impl ContractExecutor for RuntimePool {
         // FULLY NON-BLOCKING admission — this runs ON the contract loop, so it
         // must never await/park. Two non-blocking gates, in order:
         //
-        // 1. Export-concurrency permit. Sized to `min(MAX_CONCURRENT_EXPORTS,
-        //    pool_size-1)` so admitted exports can never hold every executor. On
+        // 1. A SHARED off-loop permit (exports + summaries draw from the same
+        //    `effective_offload_permits` budget). Sized so the off-loop classes
+        //    can NEVER jointly hold every executor — see `offload_semaphore`. On
         //    a 1-executor pool this is 0, so exports are disabled here. Over the
-        //    cap → Busy (HTTP 503), never queued.
-        let Ok(permit) = self.export_semaphore.clone().try_acquire_owned() else {
+        //    shared budget → Busy (HTTP 503), never queued.
+        let Ok(permit) = self.offload_semaphore.clone().try_acquire_owned() else {
             return ExportAdmission::Busy;
         };
         // 2. A pool executor, taken NON-BLOCKING. If every executor is momentarily
@@ -1090,6 +1208,74 @@ impl ContractExecutor for RuntimePool {
                 }
             }
         }
+        result
+    }
+
+    /// Try to admit a `Background` summary for OFF-loop execution (#4534).
+    ///
+    /// FULLY NON-BLOCKING — this runs ON the contract loop, so it must never
+    /// await/park. Two non-blocking gates, in order, identical in shape to
+    /// `try_begin_export`:
+    ///
+    /// 1. A SHARED off-loop permit (exports + summaries draw from the same
+    ///    `effective_offload_permits` budget) so off-loop work can never jointly
+    ///    hold every executor — see `offload_semaphore`. On a 1-executor pool
+    ///    this is 0, so off-loading is disabled here.
+    /// 2. A pool executor, taken NON-BLOCKING. If every executor is momentarily
+    ///    busy, we do NOT await (that would park the loop) — we return `Busy` and
+    ///    the permit drops here (restoring the slot).
+    ///
+    /// On `Busy`/`Unsupported` the caller summarizes INLINE; nothing is lost.
+    /// `track_contract_checkout` is recorded here (mirroring the inline
+    /// `summarize_contract_state`); the matching `track_contract_return` happens
+    /// in `finish_summarize`.
+    fn try_begin_summarize(&mut self, key: ContractKey) -> SummaryAdmission {
+        let Ok(permit) = self.offload_semaphore.clone().try_acquire_owned() else {
+            return SummaryAdmission::Busy;
+        };
+        let Some(executor) = self.try_pop_executor() else {
+            return SummaryAdmission::Busy;
+        };
+        self.track_contract_checkout(&key);
+        SummaryAdmission::Admitted(Box::new(SummaryJob {
+            executor,
+            _permit: permit,
+            key,
+        }))
+    }
+
+    /// Reconcile a completed off-loop summary back onto the contract loop:
+    /// return (or replace) the executor and surface the result for the client.
+    /// Mirrors `finish_export` exactly, plus the `track_contract_return` that the
+    /// inline `summarize_contract_state` would have done.
+    async fn finish_summarize(
+        &mut self,
+        key: ContractKey,
+        done: SummaryDone,
+    ) -> Result<StateSummary<'static>, ExecutorError> {
+        let SummaryDone { executor, result } = done;
+        match executor {
+            Some(executor) => {
+                self.return_checked(executor, "summarize_contract_state")
+                    .await;
+            }
+            None => {
+                tracing::error!(
+                    "summary offload task panicked/dropped; replacing the lost pool executor"
+                );
+                match self.create_replacement_executor().await {
+                    Ok(replacement) => self.return_executor(replacement),
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "failed to replace summary-panicked executor; pool capacity reduced by one"
+                        );
+                        self.checked_out.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+        self.track_contract_return(&key);
         result
     }
 

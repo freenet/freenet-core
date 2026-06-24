@@ -714,6 +714,43 @@ pub(crate) trait ContractExecutor: Send + 'static {
         async move { done.into_result() }
     }
 
+    /// Admit a `Background` contract-state summary to run OFF the contract loop
+    /// (#4534). `summarize_contract_state` runs the contract's `summarize_state`
+    /// and can await on the state store / related-contract bridge; running it
+    /// inline parks the single-threaded loop, and a burst of interest-sync
+    /// summaries serializing there is what starved client GET/PUT/UPDATE in the
+    /// "contract queue full" incident. This checks out a pooled executor and
+    /// returns an opaque `SummaryJob`; the caller (the loop) moves it into a
+    /// background task, calls `SummaryJob::run` there, and hands the resulting
+    /// [`runtime::SummaryDone`] back to [`Self::finish_summarize`] on the loop.
+    ///
+    /// Concurrency is bounded ([`runtime::MAX_CONCURRENT_SUMMARIES`]); over the
+    /// cap, or when no executor is immediately free, returns
+    /// [`runtime::SummaryAdmission::Busy`] and the caller summarizes INLINE —
+    /// off-loading is a latency optimization, never a correctness requirement.
+    ///
+    /// The default implementation returns
+    /// [`runtime::SummaryAdmission::Unsupported`]: only the production
+    /// `RuntimePool` (multi-executor) off-loads. Mock / single-executor
+    /// executors summarize inline.
+    /// NON-BLOCKING: runs on the contract loop, so it must never await/park.
+    fn try_begin_summarize(&mut self, _key: ContractKey) -> runtime::SummaryAdmission {
+        runtime::SummaryAdmission::Unsupported
+    }
+
+    /// Return (or, on a panicked/dropped summary task, replace) the executor a
+    /// `SummaryJob` borrowed, and yield the summary RESULT for the client.
+    /// Called on the contract loop once the background summary task delivers its
+    /// [`runtime::SummaryDone`]. Default returns the carried result without
+    /// touching a pool (mock executors never admit).
+    fn finish_summarize(
+        &mut self,
+        _key: ContractKey,
+        done: runtime::SummaryDone,
+    ) -> impl Future<Output = Result<StateSummary<'static>, ExecutorError>> + Send {
+        async move { done.into_result() }
+    }
+
     fn get_subscription_info(&self) -> Vec<crate::message::SubscriptionInfo>;
 
     /// Remove all subscriptions for a disconnected client.
