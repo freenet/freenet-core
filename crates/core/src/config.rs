@@ -194,6 +194,9 @@ impl Default for ConfigArgs {
                 allowed_host: None,
                 allowed_source_cidrs: None,
                 hosted_mode: None,
+                per_user_op_rate_limit: None,
+                per_user_op_burst: None,
+                per_user_export_min_interval_secs: None,
             },
             secrets: Default::default(),
             log_level: Some(tracing::log::LevelFilter::Info),
@@ -365,6 +368,15 @@ impl ConfigArgs {
             self.ws_api
                 .hosted_mode
                 .get_or_insert(cfg.ws_api.hosted_mode);
+            self.ws_api
+                .per_user_op_rate_limit
+                .get_or_insert(cfg.ws_api.per_user_op_rate_limit);
+            self.ws_api
+                .per_user_op_burst
+                .get_or_insert(cfg.ws_api.per_user_op_burst);
+            self.ws_api
+                .per_user_export_min_interval_secs
+                .get_or_insert(cfg.ws_api.per_user_export_min_interval_secs);
             self.network_api
                 .address
                 .get_or_insert(cfg.network_api.address);
@@ -875,6 +887,18 @@ impl ConfigArgs {
                     .transpose()?
                     .unwrap_or_default(),
                 hosted_mode: self.ws_api.hosted_mode.unwrap_or(false),
+                per_user_op_rate_limit: self
+                    .ws_api
+                    .per_user_op_rate_limit
+                    .unwrap_or_else(default_per_user_op_rate_limit),
+                per_user_op_burst: self
+                    .ws_api
+                    .per_user_op_burst
+                    .unwrap_or_else(default_per_user_op_burst),
+                per_user_export_min_interval_secs: self
+                    .ws_api
+                    .per_user_export_min_interval_secs
+                    .unwrap_or_else(default_per_user_export_min_interval_secs),
             },
             secrets,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
@@ -1747,6 +1771,35 @@ pub struct WebsocketApiArgs {
     )]
     #[serde(rename = "hosted-mode", skip_serializing_if = "Option::is_none")]
     pub hosted_mode: Option<bool>,
+
+    /// Sustained per-user operation rate limit (requests/second) for HOSTED
+    /// mode (#4561, P5 of #4381). Bounds how fast a single hosted user (one
+    /// `userToken`) can issue contract operations (GET/PUT/UPDATE/SUBSCRIBE) so
+    /// one visitor cannot flood the node's executor and network. Over-rate
+    /// requests are REJECTED at the WebSocket boundary (the client retries).
+    /// Default: 10 req/sec. `0` disables operation rate limiting. Has NO effect
+    /// outside hosted mode — local single-user requests are never rate-limited.
+    #[arg(long = "per-user-op-rate-limit", env = "PER_USER_OP_RATE_LIMIT")]
+    pub per_user_op_rate_limit: Option<u64>,
+
+    /// Per-user operation burst capacity for HOSTED mode (#4561). The maximum
+    /// number of operations a user who has been idle can issue back-to-back
+    /// before being throttled to the sustained `--per-user-op-rate-limit`.
+    /// Default: 100. Paired with the rate limit above; only meaningful when
+    /// op rate limiting is enabled.
+    #[arg(long = "per-user-op-burst", env = "PER_USER_OP_BURST")]
+    pub per_user_op_burst: Option<u64>,
+
+    /// Minimum seconds between hosted-export downloads PER USER (#4561). The
+    /// export endpoint enumerates and re-encrypts every secret in the user's
+    /// scope, so it is far more expensive than a single op and gets a separate,
+    /// tighter limit. A request inside this window returns HTTP 429. Default:
+    /// 10s. `0` disables export rate limiting. Hosted-mode only.
+    #[arg(
+        long = "per-user-export-min-interval-secs",
+        env = "PER_USER_EXPORT_MIN_INTERVAL_SECS"
+    )]
+    pub per_user_export_min_interval_secs: Option<u64>,
 }
 
 /// Default telemetry endpoint (nova.locut.us OTLP collector).
@@ -1944,6 +1997,31 @@ pub struct WebsocketApiConfig {
     /// derived, so with the flag off the entire feature is inert.
     #[serde(default, rename = "hosted-mode")]
     pub hosted_mode: bool,
+
+    /// Sustained per-user operation rate limit (requests/second) for hosted
+    /// mode (#4561, P5 of #4381). Bounds how fast a single hosted user can
+    /// issue contract operations so one visitor cannot flood the node. `0`
+    /// disables op rate limiting. No effect outside hosted mode. Default 10.
+    #[serde(
+        default = "default_per_user_op_rate_limit",
+        rename = "per-user-op-rate-limit"
+    )]
+    pub per_user_op_rate_limit: u64,
+
+    /// Per-user operation burst capacity for hosted mode (#4561). Max ops a
+    /// previously-idle user may issue back-to-back before being throttled to
+    /// the sustained rate. Default 100.
+    #[serde(default = "default_per_user_op_burst", rename = "per-user-op-burst")]
+    pub per_user_op_burst: u64,
+
+    /// Minimum seconds between hosted-export downloads per user (#4561). Export
+    /// is expensive, so it gets a separate tighter limit; a request inside this
+    /// window returns HTTP 429. `0` disables export rate limiting. Default 10.
+    #[serde(
+        default = "default_per_user_export_min_interval_secs",
+        rename = "per-user-export-min-interval-secs"
+    )]
+    pub per_user_export_min_interval_secs: u64,
 }
 
 #[inline]
@@ -1956,6 +2034,26 @@ const fn default_token_cleanup_interval_seconds() -> u64 {
     300 // 5 minutes
 }
 
+/// Default sustained per-user op rate (req/sec) in hosted mode. Resolves to the
+/// single source of truth in `client_events::user_op_rate_limit` so the
+/// operator-facing default and the limiter's in-code default never drift.
+#[inline]
+const fn default_per_user_op_rate_limit() -> u64 {
+    crate::client_events::user_op_rate_limit::DEFAULT_PER_USER_OP_RATE_LIMIT
+}
+
+/// Default per-user op burst capacity in hosted mode.
+#[inline]
+const fn default_per_user_op_burst() -> u64 {
+    crate::client_events::user_op_rate_limit::DEFAULT_PER_USER_OP_BURST
+}
+
+/// Default minimum seconds between hosted exports per user.
+#[inline]
+const fn default_per_user_export_min_interval_secs() -> u64 {
+    crate::client_events::user_op_rate_limit::DEFAULT_PER_USER_EXPORT_MIN_INTERVAL_SECS
+}
+
 impl From<SocketAddr> for WebsocketApiConfig {
     fn from(addr: SocketAddr) -> Self {
         Self {
@@ -1966,6 +2064,9 @@ impl From<SocketAddr> for WebsocketApiConfig {
             allowed_hosts: Vec::new(),
             allowed_source_cidrs: Vec::new(),
             hosted_mode: false,
+            per_user_op_rate_limit: default_per_user_op_rate_limit(),
+            per_user_op_burst: default_per_user_op_burst(),
+            per_user_export_min_interval_secs: default_per_user_export_min_interval_secs(),
         }
     }
 }
@@ -1981,6 +2082,9 @@ impl Default for WebsocketApiConfig {
             allowed_hosts: Vec::new(),
             allowed_source_cidrs: Vec::new(),
             hosted_mode: false,
+            per_user_op_rate_limit: default_per_user_op_rate_limit(),
+            per_user_op_burst: default_per_user_op_burst(),
+            per_user_export_min_interval_secs: default_per_user_export_min_interval_secs(),
         }
     }
 }
@@ -3937,6 +4041,9 @@ mod tests {
                 allowed_hosts: vec!["my-host".to_string()],
                 allowed_source_cidrs: vec!["10.0.0.0/8".parse().unwrap()],
                 hosted_mode: true,
+                per_user_op_rate_limit: 33,
+                per_user_op_burst: 77,
+                per_user_export_min_interval_secs: 17,
             },
             secrets: base.secrets.clone(),
             log_level: tracing::log::LevelFilter::Debug,
@@ -4106,6 +4213,9 @@ mod tests {
             allowed_hosts,
             allowed_source_cidrs,
             hosted_mode,
+            per_user_op_rate_limit,
+            per_user_op_burst,
+            per_user_export_min_interval_secs,
         } = ws_api;
         assert_eq!(ws_address, seed.ws_api.address, "ws_api.address");
         assert_eq!(ws_port, seed.ws_api.port, "ws_api.port");
@@ -4123,6 +4233,18 @@ mod tests {
             "allowed_source_cidrs"
         );
         assert_eq!(hosted_mode, seed.ws_api.hosted_mode, "ws_api.hosted_mode");
+        assert_eq!(
+            per_user_op_rate_limit, seed.ws_api.per_user_op_rate_limit,
+            "ws_api.per_user_op_rate_limit"
+        );
+        assert_eq!(
+            per_user_op_burst, seed.ws_api.per_user_op_burst,
+            "ws_api.per_user_op_burst"
+        );
+        assert_eq!(
+            per_user_export_min_interval_secs, seed.ws_api.per_user_export_min_interval_secs,
+            "ws_api.per_user_export_min_interval_secs"
+        );
 
         let TelemetryConfig {
             enabled,

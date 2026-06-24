@@ -679,6 +679,31 @@ async fn serve_client_api_in_impl(
         );
     }
 
+    // Per-user operation + export rate limiter (#4561, P5 of #4381). Built once
+    // here (the only place the operator config is in scope) and injected as an
+    // `Extension` on BOTH the WS path (`process_client_request` consults it for
+    // contract ops) and the HTTP export handler (per-user export throttle). The
+    // SAME `Arc` is shared across every connection, so one user's many
+    // connections share their bucket; nodes don't collide because each node
+    // owns its own router Extension. Op rate limiting only ever fires for a
+    // connection that derives a `UserSecretContext` (hosted mode), so the
+    // single-user / non-hosted path is never throttled even though the
+    // Extension is present.
+    let op_rate_limiter = crate::client_events::user_op_rate_limit::UserOpRateLimitConfig {
+        op_rate: config.per_user_op_rate_limit,
+        op_burst: config.per_user_op_burst,
+        export_min_interval_secs: config.per_user_export_min_interval_secs,
+    }
+    .build();
+    if hosted_mode.0 && op_rate_limiter.op_limiting_enabled() {
+        tracing::info!(
+            op_rate = config.per_user_op_rate_limit,
+            op_burst = config.per_user_op_burst,
+            export_min_interval_secs = config.per_user_export_min_interval_secs,
+            "Hosted per-user operation rate limiting enabled"
+        );
+    }
+
     let needs_lan_filter = !config.address.is_loopback();
     let router = if needs_lan_filter {
         // Layer ordering matters: axum executes layers bottom-to-top per
@@ -695,6 +720,7 @@ async fn serve_client_api_in_impl(
         // `Extension<AllowedSourceCidrs>` for the Host-header CIDR check.
         ws_router
             .layer(Extension(hosted_mode))
+            .layer(Extension(op_rate_limiter))
             .layer(Extension(allowed_hosts))
             .layer(axum::middleware::from_fn(private_network_filter))
             .layer(Extension(allowed_source_cidrs))
@@ -705,6 +731,7 @@ async fn serve_client_api_in_impl(
         // 500 every WS upgrade.
         ws_router
             .layer(Extension(hosted_mode))
+            .layer(Extension(op_rate_limiter))
             .layer(Extension(allowed_hosts))
             .layer(Extension(allowed_source_cidrs))
             .layer(TraceLayer::new_for_http())

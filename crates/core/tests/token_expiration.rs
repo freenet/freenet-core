@@ -34,9 +34,9 @@ async fn create_test_config(
             ws_api_port: Some(ws_socket.local_addr()?.port()),
             token_ttl_seconds: Some(token_ttl_seconds),
             token_cleanup_interval_seconds: Some(cleanup_interval_seconds),
-            allowed_host: None,
-            allowed_source_cidrs: None,
-            hosted_mode: None,
+            // Remaining ws_api args default. `..Default::default()` so future
+            // ws_api fields (e.g. per-user rate limits, #4561) can't break this.
+            ..Default::default()
         },
         network_api: NetworkArgs {
             address: Some(Ipv4Addr::LOCALHOST.into()),
@@ -129,12 +129,10 @@ async fn test_default_token_configuration() -> TestResult {
                 address: Some(Ipv4Addr::LOCALHOST.into()),
                 ws_api_port: Some(ws_socket.local_addr()?.port()),
                 // Don't specify token_ttl_seconds or token_cleanup_interval_seconds
-                // to test default values
-                token_ttl_seconds: None,
-                token_cleanup_interval_seconds: None,
-                allowed_host: None,
-                allowed_source_cidrs: None,
-                hosted_mode: None,
+                // (left as their defaults) to test default values. All other
+                // ws_api args default too. `..Default::default()` so future ws_api
+                // fields (e.g. per-user rate limits, #4561) can't break this.
+                ..Default::default()
             },
             network_api: NetworkArgs {
                 address: Some(Ipv4Addr::LOCALHOST.into()),
@@ -214,9 +212,10 @@ async fn test_token_cleanup_removes_expired_tokens() -> TestResult {
             port: ws_port,
             token_ttl_seconds: TOKEN_TTL_SECS,
             token_cleanup_interval_seconds: CLEANUP_INTERVAL_SECS,
-            allowed_hosts: Vec::new(),
-            allowed_source_cidrs: Vec::new(),
-            hosted_mode: false,
+            // Remaining fields (allowlists, hosted_mode, per-user rate limits)
+            // default. `..Default::default()` so future WebsocketApiConfig fields
+            // (e.g. the per-user rate limits, #4561) can't break this test.
+            ..Default::default()
         };
 
         // Start the client API server (which spawns the cleanup task)

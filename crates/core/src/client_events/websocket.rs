@@ -129,6 +129,7 @@ use crate::{
 };
 
 use super::{ClientError, ClientEventsProxy, ClientId, HostResult, OpenRequest};
+use crate::client_events::user_op_rate_limit::UserOpRateLimiter;
 use crate::server::client_api::OriginContractMap;
 use crate::wasm_runtime::UserSecretContext;
 
@@ -1068,6 +1069,7 @@ async fn connection_info(
     next.run(req).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn websocket_commands(
     ws: WebSocketUpgrade,
     Extension(auth_token): Extension<Option<AuthToken>>,
@@ -1079,7 +1081,16 @@ async fn websocket_commands(
     // (hosted mode). `None` outside hosted mode or when no user token was
     // presented. Owned and moved into the connection task below.
     Extension(user_context): Extension<Option<UserSecretContext>>,
+    // Per-node per-user operation rate limiter (#4561, P5 of #4381). Installed
+    // as an `Extension` by `serve_client_api_in_impl` (the only path that has
+    // the operator config). OPTIONAL: the standalone `create_router` test path
+    // and `run_local_node` install no limiter, so absence ⇒ no op rate limiting.
+    // This is safe because op rate limiting only ever fires for a connection
+    // that carries a `UserSecretContext`, which only the hosted serve path
+    // (which DOES install the limiter) ever derives.
+    op_rate_limiter: Option<Extension<UserOpRateLimiter>>,
 ) -> Response {
+    let op_rate_limiter = op_rate_limiter.map(|Extension(l)| l);
     let on_upgrade = move |ws: WebSocket| async move {
         // Get the data we need from the DashMap
         // Track whether a token was provided but is invalid (stale/expired)
@@ -1137,6 +1148,7 @@ async fn websocket_commands(
             rs.clone(),
             auth_and_instance,
             user_context,
+            op_rate_limiter,
             token_is_invalid,
             encoding_protoc,
             api_version,
@@ -1186,6 +1198,7 @@ async fn notify_disconnect(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn websocket_interface(
     request_sender: WebSocketRequest,
     mut auth_token: Option<(AuthToken, ContractInstanceId)>,
@@ -1194,6 +1207,11 @@ async fn websocket_interface(
     // `ClientConnection::Request` so every request from this connection (and
     // only this connection) binds to the same user namespace.
     user_context: Option<UserSecretContext>,
+    // Per-node per-user op rate limiter (hosted mode, #4561). `None` on the
+    // standalone/local paths that install no limiter. Shared across all of a
+    // user's connections; consulted in `process_client_request` only when this
+    // connection carries a `user_context`.
+    op_rate_limiter: Option<UserOpRateLimiter>,
     token_is_invalid: bool,
     encoding_protoc: EncodingProtocol,
     api_version: ApiVersion,
@@ -1317,6 +1335,7 @@ async fn websocket_interface(
                     &mut auth_token.as_mut().map(|t| t.0.clone()),
                     auth_token.as_mut().map(|t| t.1),
                     user_context.as_ref(),
+                    op_rate_limiter.as_ref(),
                     api_version,
                     &mut delegate_rate_limiter,
                     &mut conn_state,
@@ -1574,6 +1593,34 @@ fn extract_stream_content(
     }
 }
 
+/// Which `ClientRequest`s count against the per-user operation rate limit
+/// (#4561). The rule is "does this make the node do real executor/network
+/// work that a hosted visitor could flood with?":
+///
+/// - `ContractOp` — GET/PUT/UPDATE/SUBSCRIBE on the contract loop.
+/// - `DelegateOp` — runs a delegate's WASM on the SAME serial contract loop
+///   (fresh wasmtime instance + secret-store fsync/redb txn); per-user secret
+///   ops are the whole point of hosted mode, so this is the primary flood
+///   vector. The existing `DelegateRateLimiter` only backs off a delegate KEY
+///   that is repeatedly FAILING; a successful-but-abusive delegate flood is
+///   otherwise unbounded.
+/// - `NodeQueries` — `NodeDiagnostics` clones the full connection map and the
+///   hosting-key set inline on the network event loop. We rate-limit it rather
+///   than block it: a hosted client may legitimately query diagnostics, and a
+///   public proxy that wants to forbid recon entirely should drop it at the
+///   proxy allowlist (P4), not here.
+///
+/// Everything else — `Authenticate`, `Disconnect`, `Close`, `StreamChunk`
+/// (control / reassembly, already bounded per-connection by the stdlib) — does
+/// not count, so a client can always authenticate and disconnect even while
+/// throttled.
+fn is_rate_limited_op(req: &ClientRequest<'_>) -> bool {
+    matches!(
+        req,
+        ClientRequest::ContractOp(_) | ClientRequest::DelegateOp(_) | ClientRequest::NodeQueries(_)
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_client_request(
     client_id: ClientId,
@@ -1582,6 +1629,7 @@ async fn process_client_request(
     auth_token: &mut Option<AuthToken>,
     origin_contract: Option<ContractInstanceId>,
     user_context: Option<&UserSecretContext>,
+    op_rate_limiter: Option<&UserOpRateLimiter>,
     api_version: ApiVersion,
     rate_limiter: &mut DelegateRateLimiter,
     conn_state: &mut ConnectionState,
@@ -1636,6 +1684,14 @@ async fn process_client_request(
     // freenet-stdlib 0.2.2+ automatically chunks large ClientRequest messages
     // (>512 KiB), and the server always reassembles them. Both directions
     // (client→server and server→client) chunk transparently above the threshold.
+    //
+    // TODO(#4561): StreamChunk reassembly runs BEFORE the per-user op rate limit
+    // below, and StreamChunk is intentionally NOT counted as an op (it's
+    // transport framing, not a request). Reassembly is bounded per connection by
+    // the stdlib (MAX_CONCURRENT_STREAMS = 8, STREAM_TTL eviction) but there is
+    // no per-chunk BYTE cap, so a hosted user could stream many large chunks to
+    // pressure memory without ever completing a rate-limited request. Bounding
+    // chunk bytes per user is follow-up hardening, tracked under #4561 P5.
     let req = if let ClientRequest::StreamChunk {
         stream_id,
         index,
@@ -1696,6 +1752,47 @@ async fn process_client_request(
             let error: ClientError = ErrorKind::RequestError(RequestError::DelegateError(
                 DelegateError::Missing(delegate_req.key().clone()),
             ))
+            .into();
+            let serialized = match conn_state.encoding_protoc {
+                EncodingProtocol::Flatbuffers => error
+                    .into_fbs_bytes()
+                    .map_err(|e| Some(anyhow::anyhow!("serialize error: {:?}", e)))?,
+                EncodingProtocol::Native => {
+                    bincode::serialize(&Err::<HostResponse, ClientError>(error))
+                        .map_err(|e| Some(anyhow::anyhow!("serialize error: {:?}", e)))?
+                }
+            };
+            return Ok(Some(Message::Binary(serialized.into())));
+        }
+    }
+
+    // Per-user operation rate limit (#4561, P5 of #4381). Bounds how fast a
+    // single HOSTED user can issue WORK-CAUSING operations so one visitor cannot
+    // flood the node's executor/network. See `is_rate_limited_op` for exactly
+    // which requests count — crucially this includes DelegateOp (per-user secret
+    // ops run WASM on the SAME serial contract loop and are MORE expensive than
+    // a GET/PUT; the existing `DelegateRateLimiter` only backs off FAILING keys,
+    // so successful delegate floods were entirely unthrottled) and NodeQueries
+    // (NodeDiagnostics clones the connection map + hosting-key set inline on the
+    // network loop). The check is GATED on `user_context.is_some()` — i.e.
+    // hosted mode honored a user token for this connection — so Local /
+    // non-hosted / tokenless connections are NEVER rate-limited (the "never
+    // break single-user default" invariant). Reject BEFORE forwarding to the
+    // node, so an over-rate request costs no executor/network work; the client
+    // retries shortly.
+    if let (Some(user_context), Some(limiter)) = (user_context, op_rate_limiter) {
+        if limiter.op_limiting_enabled()
+            && is_rate_limited_op(&req)
+            && !limiter.try_acquire_op(user_context.user_id())
+        {
+            tracing::debug!(
+                %client_id,
+                user_id = ?user_context.user_id(),
+                "Rejecting operation: per-user operation rate limit exceeded"
+            );
+            let error: ClientError = ErrorKind::OperationError {
+                cause: std::borrow::Cow::Borrowed("operation rate limit exceeded; retry shortly"),
+            }
             .into();
             let serialized = match conn_state.encoding_protoc {
                 EncodingProtocol::Flatbuffers => error
@@ -3645,5 +3742,273 @@ mod tests {
 
         let result: Result<HostResponse, ClientError> = Err(ErrorKind::NodeUnavailable.into());
         assert!(extract_stream_content(&result).is_none());
+    }
+
+    // ---- Per-user operation rate limit at the WS boundary (#4561) ----------
+
+    fn encode_req(req: ClientRequest<'_>) -> Message {
+        Message::Binary(bincode::serialize(&req).unwrap().into())
+    }
+
+    /// A native-encoded `Get` operation message, the cheapest contract op to
+    /// drive `process_client_request` with.
+    fn encoded_get_op() -> Message {
+        encode_req(ClientRequest::ContractOp(ContractRequest::Get {
+            key: ContractInstanceId::new([7u8; 32]),
+            return_contract_code: false,
+            subscribe: false,
+            blocking_subscribe: false,
+        }))
+    }
+
+    /// A native-encoded delegate op (`UnregisterDelegate`, the cheapest variant
+    /// to construct). Delegate ops are the primary flood vector the per-user
+    /// limit must cover (#4561 review).
+    fn encoded_delegate_op() -> Message {
+        use freenet_stdlib::prelude::{CodeHash, DelegateKey};
+        let key = DelegateKey::new([9u8; 32], CodeHash::new([0u8; 32]));
+        encode_req(ClientRequest::DelegateOp(
+            freenet_stdlib::client_api::DelegateRequest::UnregisterDelegate(key),
+        ))
+    }
+
+    /// A native-encoded node query (`ConnectedPeers`). NodeQueries reach the
+    /// network loop and must also be counted (#4561 review).
+    fn encoded_node_query() -> Message {
+        encode_req(ClientRequest::NodeQueries(
+            freenet_stdlib::client_api::NodeQuery::ConnectedPeers,
+        ))
+    }
+
+    /// Drive ONE request through `process_client_request` with the given
+    /// optional `user_context` + limiter. Returns:
+    /// - `Ok(true)`  => the request was FORWARDED to the node (no rejection),
+    /// - `Ok(false)` => the request was REJECTED with an error message,
+    ///   and asserts the error decodes to an `OperationError` (the rate-limit
+    ///   rejection variant),
+    /// and confirms forward/reject is consistent with whether anything landed
+    /// on the request channel.
+    /// Drive a GET op (the common case for most rate-limit tests).
+    async fn drive_one_op(
+        user_context: Option<&UserSecretContext>,
+        op_rate_limiter: Option<&UserOpRateLimiter>,
+    ) -> bool {
+        drive_msg(encoded_get_op(), user_context, op_rate_limiter).await
+    }
+
+    /// Drive an arbitrary already-encoded request through
+    /// `process_client_request`. See `drive_one_op` for the return contract.
+    async fn drive_msg(
+        msg: Message,
+        user_context: Option<&UserSecretContext>,
+        op_rate_limiter: Option<&UserOpRateLimiter>,
+    ) -> bool {
+        // Large channel so forwarding never blocks within the test.
+        let (tx, mut rx) = mpsc::channel::<ClientConnection>(64);
+        let mut delegate_rate_limiter = DelegateRateLimiter::new();
+        let mut conn_state = test_conn_state(EncodingProtocol::Native);
+        let mut auth_token: Option<AuthToken> = None;
+
+        let out = process_client_request(
+            ClientId::next(),
+            Ok(msg),
+            &tx,
+            &mut auth_token,
+            None,
+            user_context,
+            op_rate_limiter,
+            ApiVersion::V1,
+            &mut delegate_rate_limiter,
+            &mut conn_state,
+        )
+        .await
+        .expect("process_client_request should not error on a valid request");
+
+        match out {
+            // No message returned => forwarded to the node. Confirm something
+            // actually landed on the request channel.
+            None => {
+                let forwarded = rx.try_recv().is_ok();
+                assert!(forwarded, "forwarded op must reach the request channel");
+                true
+            }
+            // A message returned => a rejection. Confirm it's the rate-limit
+            // OperationError and that NOTHING was forwarded.
+            Some(Message::Binary(bytes)) => {
+                let decoded: Result<HostResponse, ClientError> =
+                    bincode::deserialize(&bytes).expect("rejection must be a native error frame");
+                match decoded {
+                    Err(e) => assert!(
+                        matches!(e.kind(), ErrorKind::OperationError { .. }),
+                        "rate-limit rejection must be an OperationError, got {:?}",
+                        e.kind()
+                    ),
+                    Ok(_) => panic!("rejection frame must be an Err, not Ok"),
+                }
+                assert!(
+                    rx.try_recv().is_err(),
+                    "rejected op must NOT be forwarded to the node"
+                );
+                false
+            }
+            Some(other) => panic!("unexpected non-binary response: {other:?}"),
+        }
+    }
+
+    fn test_user_context(token: &[u8]) -> UserSecretContext {
+        UserSecretContext::from_token(token)
+    }
+
+    /// Local connections (no `user_context`) are NEVER rate-limited: a flood of
+    /// ops far exceeding any burst all forward, even with an aggressive limiter
+    /// present. This is the "never break single-user default" invariant.
+    #[tokio::test]
+    async fn ws_local_flood_is_never_rate_limited() {
+        // Tiny burst, so a hosted user would be throttled almost immediately.
+        let limiter = UserOpRateLimiter::new(1, 1, 0);
+        for i in 0..50 {
+            assert!(
+                drive_one_op(None, Some(&limiter)).await,
+                "Local op {i} must always forward (no user context => no limit)"
+            );
+        }
+        assert_eq!(
+            limiter.tracked_op_users(),
+            0,
+            "Local traffic must never even touch the per-user limiter"
+        );
+    }
+
+    /// A hosted connection (with `user_context`) is throttled: with burst=3,
+    /// the first 3 ops forward and the 4th is rejected as an OperationError.
+    #[tokio::test]
+    async fn ws_hosted_burst_then_reject() {
+        let limiter = UserOpRateLimiter::new(10, 3, 0);
+        let ctx = test_user_context(b"alice");
+        for i in 0..3 {
+            assert!(
+                drive_one_op(Some(&ctx), Some(&limiter)).await,
+                "hosted op {i} within burst should forward"
+            );
+        }
+        assert!(
+            !drive_one_op(Some(&ctx), Some(&limiter)).await,
+            "hosted op beyond burst must be rejected"
+        );
+    }
+
+    /// Hosted, but op limiting DISABLED (rate 0): a hosted flood still forwards.
+    #[tokio::test]
+    async fn ws_hosted_disabled_limit_forwards_all() {
+        let limiter = UserOpRateLimiter::new(0, 3, 0);
+        let ctx = test_user_context(b"bob");
+        for i in 0..20 {
+            assert!(
+                drive_one_op(Some(&ctx), Some(&limiter)).await,
+                "with op limiting disabled, hosted op {i} should forward"
+            );
+        }
+    }
+
+    /// No limiter Extension at all (standalone/local serve path): hosted-looking
+    /// context still forwards, because absence of the limiter means "disabled".
+    #[tokio::test]
+    async fn ws_no_limiter_extension_forwards_all() {
+        let ctx = test_user_context(b"carol");
+        for i in 0..20 {
+            assert!(
+                drive_one_op(Some(&ctx), None).await,
+                "no limiter Extension => op {i} forwards (limiting off)"
+            );
+        }
+    }
+
+    /// Two distinct hosted users get independent buckets at the WS boundary:
+    /// exhausting user A's burst does not throttle user B.
+    #[tokio::test]
+    async fn ws_two_users_independent_buckets() {
+        let limiter = UserOpRateLimiter::new(10, 2, 0);
+        let a = test_user_context(b"user-a");
+        let b = test_user_context(b"user-b");
+        assert!(drive_one_op(Some(&a), Some(&limiter)).await);
+        assert!(drive_one_op(Some(&a), Some(&limiter)).await);
+        assert!(!drive_one_op(Some(&a), Some(&limiter)).await, "A exhausted");
+        // B is independent.
+        assert!(drive_one_op(Some(&b), Some(&limiter)).await);
+        assert!(drive_one_op(Some(&b), Some(&limiter)).await);
+        assert!(!drive_one_op(Some(&b), Some(&limiter)).await, "B exhausted");
+    }
+
+    /// A DelegateOp counts against the SAME per-user bucket as contract ops:
+    /// once the burst is spent (here entirely on delegate ops) the next
+    /// delegate op is rejected, NOT forwarded. Delegate ops are the primary
+    /// flood vector this fix added (#4561 review item #1).
+    #[tokio::test]
+    async fn ws_hosted_delegate_op_is_rate_limited() {
+        let limiter = UserOpRateLimiter::new(10, 2, 0);
+        let ctx = test_user_context(b"delegate-user");
+        assert!(
+            drive_msg(encoded_delegate_op(), Some(&ctx), Some(&limiter)).await,
+            "delegate op 1 within burst forwards"
+        );
+        assert!(
+            drive_msg(encoded_delegate_op(), Some(&ctx), Some(&limiter)).await,
+            "delegate op 2 within burst forwards"
+        );
+        assert!(
+            !drive_msg(encoded_delegate_op(), Some(&ctx), Some(&limiter)).await,
+            "delegate op beyond burst is rejected (not forwarded)"
+        );
+    }
+
+    /// Contract ops and delegate ops share ONE bucket: a contract op spends a
+    /// token that a delegate op then can't, proving they're not counted
+    /// separately.
+    #[tokio::test]
+    async fn ws_contract_and_delegate_share_one_bucket() {
+        let limiter = UserOpRateLimiter::new(10, 1, 0); // burst 1
+        let ctx = test_user_context(b"shared-bucket-user");
+        assert!(
+            drive_msg(encoded_get_op(), Some(&ctx), Some(&limiter)).await,
+            "the single burst token goes to the contract op"
+        );
+        assert!(
+            !drive_msg(encoded_delegate_op(), Some(&ctx), Some(&limiter)).await,
+            "delegate op rejected — it shares the now-empty bucket with the GET"
+        );
+    }
+
+    /// A NodeQuery counts against the per-user bucket too (we rate-limit rather
+    /// than block it for hosted users).
+    #[tokio::test]
+    async fn ws_hosted_node_query_is_rate_limited() {
+        let limiter = UserOpRateLimiter::new(10, 1, 0);
+        let ctx = test_user_context(b"nodequery-user");
+        assert!(
+            drive_msg(encoded_node_query(), Some(&ctx), Some(&limiter)).await,
+            "node query within burst forwards"
+        );
+        assert!(
+            !drive_msg(encoded_node_query(), Some(&ctx), Some(&limiter)).await,
+            "node query beyond burst is rejected"
+        );
+    }
+
+    /// Control messages (here Authenticate) are NOT counted: a hosted user with
+    /// an exhausted op bucket can still authenticate.
+    #[tokio::test]
+    async fn ws_control_message_not_rate_limited() {
+        let limiter = UserOpRateLimiter::new(10, 1, 0);
+        let ctx = test_user_context(b"control-user");
+        // Spend the one burst token on a contract op.
+        assert!(drive_msg(encoded_get_op(), Some(&ctx), Some(&limiter)).await);
+        // An Authenticate must still go through (it doesn't count as an op).
+        let auth = encode_req(ClientRequest::Authenticate {
+            token: "some-token".to_string(),
+        });
+        assert!(
+            drive_msg(auth, Some(&ctx), Some(&limiter)).await,
+            "Authenticate must not be rate-limited even with an empty op bucket"
+        );
     }
 }
