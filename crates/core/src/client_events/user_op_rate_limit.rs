@@ -171,9 +171,16 @@ impl TokenBucket {
             state.tokens =
                 (state.tokens + elapsed.as_secs_f64() * self.refill_per_sec).min(self.capacity);
         }
-        // "Essentially full": within one token of capacity. A bucket this full
-        // is not throttling anyone, so re-creation is a no-op for limiting.
-        let safe = state.tokens >= self.capacity - 1.0;
+        // "Essentially full" AND holding at least one whole token. Within one
+        // token of capacity means re-creation is a no-op; the `>= 1.0` clause is
+        // what makes that true even at capacity == 1, where `capacity - 1.0 == 0`
+        // would otherwise classify a DEPLETED (tokens == 0), actively-throttling
+        // bucket as evictable — dropping it would re-create a FULL bucket and let
+        // a burst==1 flooder bypass the limit. `--per-user-op-burst` is operator-
+        // configurable (floored at 1), so burst==1 is a reachable config. For
+        // cap >= 2 the `>= 1.0` clause is already implied by `>= capacity - 1.0`,
+        // so this is a no-op there.
+        let safe = state.tokens >= self.capacity - 1.0 && state.tokens >= 1.0;
         (safe, state.last_access)
     }
 }
@@ -282,6 +289,11 @@ impl Inner {
         // — i.e. too few idle buckets to drop. Not reaching the low-water-mark is
         // expected and fine (it just means the next sweep comes sooner).
         if self.op_buckets.len() > self.max_tracked_users && removed < target_removals {
+            // One-shot per process: this degraded mode (over cap, mostly active
+            // throttling) is a posture signal worth surfacing once, but re-warning
+            // on every subsequent over-cap sweep would itself be log spam under a
+            // sustained flood. Intentionally not re-armed for a later distinct
+            // episode — the metric to watch is the map size, not this line.
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if WARNED
@@ -820,6 +832,45 @@ mod tests {
         assert!(
             !limiter.try_acquire_op_at(&flooder, t_check),
             "eviction must NOT have reset the active flooder's depleted bucket"
+        );
+    }
+
+    /// burst == 1 boundary (round-4 finding): at capacity == 1, a DEPLETED
+    /// bucket has tokens == 0.0, and `tokens >= capacity - 1.0` is `0.0 >= 0.0`
+    /// == true — so without the extra `tokens >= 1.0` clause in `evictability`,
+    /// an actively-throttling burst==1 flooder would be classified evictable,
+    /// dropped, and lazily recreated FULL → limit bypass. This test pins the fix:
+    /// a depleted cap=1/burst=1 flooder stays throttled across other-user sweeps.
+    ///
+    /// All events share ONE frozen instant so the flooder sits at EXACTLY
+    /// tokens == 0.0 (no refill) — the precise boundary the bug hit. Before the
+    /// fix this FAILS (flooder evicted+recreated full → final acquire returns
+    /// true); after the fix it PASSES.
+    #[tokio::test(start_paused = true)]
+    async fn eviction_never_resets_active_flooder_burst_one() {
+        // cap = 2, burst = 1, rate 1/s (must be > 0 to enable op limiting).
+        let limiter = UserOpRateLimiter::with_cap(1, 1, 0, 2);
+        let flooder = uid(200);
+        let t0 = Instant::now();
+        // Spend the single burst token, then confirm throttled (tokens now 0.0).
+        assert!(limiter.try_acquire_op_at(&flooder, t0));
+        assert!(
+            !limiter.try_acquire_op_at(&flooder, t0),
+            "burst==1 flooder is now depleted/throttled (tokens == 0.0)"
+        );
+
+        // Parade of other users at the SAME instant t0 → zero refill, so the
+        // flooder stays at exactly tokens == 0.0 throughout the eviction sweeps.
+        for i in 0..40u8 {
+            let other = uid(i); // never 200
+            assert!(limiter.try_acquire_op_at(&other, t0));
+        }
+
+        // Still at t0 → no refill possible. If the depleted bucket had been
+        // evicted+recreated it would now be FULL and admit. It must stay throttled.
+        assert!(
+            !limiter.try_acquire_op_at(&flooder, t0),
+            "burst==1: eviction must NOT have reset the depleted flooder's bucket"
         );
     }
 
