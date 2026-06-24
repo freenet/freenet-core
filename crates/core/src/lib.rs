@@ -186,3 +186,5 @@ pub mod dev_tool {
 pub mod deadlock_detection;
 
 pub mod test_utils;
+
+// diag: trigger NAT baseline on pre-PR main (#4574, do not merge)
