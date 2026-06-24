@@ -134,6 +134,28 @@ pub struct ConfigArgs {
     #[arg(long = "per-user-secret-quota", env = "PER_USER_SECRET_QUOTA")]
     pub per_user_secret_quota_bytes: Option<u64>,
 
+    /// Inactivity TTL, in seconds, after which a HOSTED user's entire
+    /// per-user data is reclaimed by a background sweep (#4561, P5 of #4381).
+    /// Keeps a public "try Freenet" node a transient demo with bounded storage:
+    /// a visitor who walks away has their namespace reclaimed after this many
+    /// real-calendar seconds of inactivity (durable across restarts). Default:
+    /// 2_592_000 (30 days). `0` disables the sweep entirely. Has NO effect
+    /// outside hosted mode — Local single-user data is never enumerated or
+    /// reclaimed (it lives outside the `users/<id>/` tree the sweep touches).
+    #[arg(long = "per-user-inactive-ttl", env = "PER_USER_INACTIVE_TTL")]
+    pub per_user_inactive_ttl_secs: Option<u64>,
+
+    /// How often, in seconds, the inactive-user reclaim sweep runs (#4561).
+    /// Only relevant when hosted mode is on and `per-user-inactive-ttl` is
+    /// non-zero. Default: 3_600 (hourly) — far finer than the 30-day TTL, so
+    /// reclamation lag is negligible while keeping the sweep's disk-walk cost
+    /// trivial. Must be > 0; `0` is treated as the default.
+    #[arg(
+        long = "inactive-user-sweep-interval",
+        env = "INACTIVE_USER_SWEEP_INTERVAL"
+    )]
+    pub inactive_user_sweep_interval_secs: Option<u64>,
+
     /// Byte budget for the compiled-WASM **contract** module cache. The
     /// **delegate** cache gets a fraction of this value
     /// (`DELEGATE_MODULE_CACHE_BUDGET_DIVISOR`, currently 1/4), so the combined
@@ -206,6 +228,8 @@ impl Default for ConfigArgs {
             max_blocking_threads: None,
             max_hosting_storage: None,
             per_user_secret_quota_bytes: None,
+            per_user_inactive_ttl_secs: None,
+            inactive_user_sweep_interval_secs: None,
             module_cache_budget_bytes: None,
             shutdown_drain_secs: None,
             telemetry: Default::default(),
@@ -461,6 +485,10 @@ impl ConfigArgs {
                 .get_or_insert(cfg.max_hosting_storage);
             self.per_user_secret_quota_bytes
                 .get_or_insert(cfg.per_user_secret_quota_bytes);
+            self.per_user_inactive_ttl_secs
+                .get_or_insert(cfg.per_user_inactive_ttl_secs);
+            self.inactive_user_sweep_interval_secs
+                .get_or_insert(cfg.inactive_user_sweep_interval_secs);
             self.module_cache_budget_bytes
                 .get_or_insert(cfg.module_cache_budget_bytes);
             self.shutdown_drain_secs
@@ -899,6 +927,9 @@ impl ConfigArgs {
                     .ws_api
                     .per_user_export_min_interval_secs
                     .unwrap_or_else(default_per_user_export_min_interval_secs),
+                // Runtime-only: resolve the secrets dir for this mode so the WS
+                // serve layer can stamp per-user activity markers (#4561).
+                secrets_dir: config_paths.secrets_dir(mode),
             },
             secrets,
             log_level: self.log_level.unwrap_or(tracing::log::LevelFilter::Info),
@@ -915,6 +946,12 @@ impl ConfigArgs {
             per_user_secret_quota_bytes: self
                 .per_user_secret_quota_bytes
                 .unwrap_or(crate::wasm_runtime::DEFAULT_PER_USER_SECRET_QUOTA_BYTES as u64),
+            per_user_inactive_ttl_secs: self
+                .per_user_inactive_ttl_secs
+                .unwrap_or(default_per_user_inactive_ttl_secs()),
+            inactive_user_sweep_interval_secs: self
+                .inactive_user_sweep_interval_secs
+                .unwrap_or(default_inactive_user_sweep_interval_secs()),
             module_cache_budget_bytes: self
                 .module_cache_budget_bytes
                 .unwrap_or_else(crate::wasm_runtime::default_module_cache_budget_bytes),
@@ -1054,6 +1091,23 @@ pub struct Config {
         rename = "per-user-secret-quota"
     )]
     pub per_user_secret_quota_bytes: u64,
+    /// Inactivity TTL in seconds after which a HOSTED user's entire per-user
+    /// data is reclaimed by a background sweep (#4561, P5 of #4381). Durable,
+    /// real-calendar time (survives restarts). Default 2_592_000 (30 days);
+    /// `0` disables the sweep. No effect outside hosted mode — Local
+    /// single-user data is never enumerated or reclaimed.
+    #[serde(
+        default = "default_per_user_inactive_ttl_secs",
+        rename = "per-user-inactive-ttl"
+    )]
+    pub per_user_inactive_ttl_secs: u64,
+    /// How often (seconds) the inactive-user reclaim sweep runs (#4561). Only
+    /// relevant in hosted mode with a non-zero TTL. Default 3_600 (hourly).
+    #[serde(
+        default = "default_inactive_user_sweep_interval_secs",
+        rename = "inactive-user-sweep-interval"
+    )]
+    pub inactive_user_sweep_interval_secs: u64,
     /// Byte budget for the compiled-WASM **contract** module cache. The
     /// delegate cache gets a fraction of this
     /// (`DELEGATE_MODULE_CACHE_BUDGET_DIVISOR`), so the combined ceiling is
@@ -1122,6 +1176,21 @@ fn default_max_hosting_storage() -> u64 {
 /// the store's fallback never drift apart.
 fn default_per_user_secret_quota_bytes() -> u64 {
     crate::wasm_runtime::DEFAULT_PER_USER_SECRET_QUOTA_BYTES as u64
+}
+
+/// Default inactive-user TTL (30 days). Resolves to
+/// [`crate::wasm_runtime::DEFAULT_PER_USER_INACTIVE_TTL_SECS`], the single
+/// source of truth, so the operator-facing default and the sweep's fallback
+/// never drift.
+const fn default_per_user_inactive_ttl_secs() -> u64 {
+    crate::wasm_runtime::DEFAULT_PER_USER_INACTIVE_TTL_SECS
+}
+
+/// Default inactive-user sweep interval (1 hour). Far finer than the 30-day
+/// TTL, so reclamation lag is negligible while the periodic disk walk stays
+/// cheap.
+const fn default_inactive_user_sweep_interval_secs() -> u64 {
+    3_600
 }
 
 /// Default contract-module cache byte budget, scaled to system RAM
@@ -2022,6 +2091,21 @@ pub struct WebsocketApiConfig {
         rename = "per-user-export-min-interval-secs"
     )]
     pub per_user_export_min_interval_secs: u64,
+
+    /// Resolved secrets directory for this node. RUNTIME-ONLY, NOT persisted
+    /// (`#[serde(skip)]`, like `TelemetryConfig::is_test_environment`): it is
+    /// derived from the full `Config` in `build()` (`config.secrets_dir()`), so
+    /// serializing/round-tripping a `WebsocketApiConfig` standalone leaves it
+    /// empty and `build()` repopulates it.
+    ///
+    /// The WS serve layer injects it as an `Extension` so the per-user
+    /// last-activity marker (#4561, P5 of #4381, inactive-user TTL) can be
+    /// stamped at the same `<base>/users/<user_id>/.last_seen` location the
+    /// reclaim sweep reads. Empty (the default on the standalone test paths)
+    /// disables stamping, which is correct for non-hosted/test composition that
+    /// has no secrets tree to mark.
+    #[serde(skip)]
+    pub secrets_dir: std::path::PathBuf,
 }
 
 #[inline]
@@ -2067,6 +2151,7 @@ impl From<SocketAddr> for WebsocketApiConfig {
             per_user_op_rate_limit: default_per_user_op_rate_limit(),
             per_user_op_burst: default_per_user_op_burst(),
             per_user_export_min_interval_secs: default_per_user_export_min_interval_secs(),
+            secrets_dir: std::path::PathBuf::new(),
         }
     }
 }
@@ -2085,6 +2170,7 @@ impl Default for WebsocketApiConfig {
             per_user_op_rate_limit: default_per_user_op_rate_limit(),
             per_user_op_burst: default_per_user_op_burst(),
             per_user_export_min_interval_secs: default_per_user_export_min_interval_secs(),
+            secrets_dir: std::path::PathBuf::new(),
         }
     }
 }
@@ -3986,6 +4072,8 @@ mod tests {
             max_blocking_threads: None,
             max_hosting_storage: None,
             per_user_secret_quota_bytes: None,
+            per_user_inactive_ttl_secs: None,
+            inactive_user_sweep_interval_secs: None,
             module_cache_budget_bytes: None,
             shutdown_drain_secs: None,
             telemetry: Default::default(),
@@ -4044,6 +4132,9 @@ mod tests {
                 per_user_op_rate_limit: 33,
                 per_user_op_burst: 77,
                 per_user_export_min_interval_secs: 17,
+                // serde-skip runtime field; repopulated by build() and not
+                // asserted in the round-trip (bound to `_` in the destructure).
+                secrets_dir: std::path::PathBuf::new(),
             },
             secrets: base.secrets.clone(),
             log_level: tracing::log::LevelFilter::Debug,
@@ -4055,6 +4146,8 @@ mod tests {
             max_blocking_threads: 7,
             max_hosting_storage: 123_456_789,
             per_user_secret_quota_bytes: 7_654_321,
+            per_user_inactive_ttl_secs: 1_234_567,
+            inactive_user_sweep_interval_secs: 7_200,
             module_cache_budget_bytes: 987_654_321,
             telemetry: TelemetryConfig {
                 enabled: false,
@@ -4090,6 +4183,8 @@ mod tests {
             max_blocking_threads,
             max_hosting_storage,
             per_user_secret_quota_bytes,
+            per_user_inactive_ttl_secs,
+            inactive_user_sweep_interval_secs,
             module_cache_budget_bytes,
             telemetry,
             shutdown_drain_secs,
@@ -4110,6 +4205,14 @@ mod tests {
         assert_eq!(
             per_user_secret_quota_bytes, seed.per_user_secret_quota_bytes,
             "per_user_secret_quota_bytes"
+        );
+        assert_eq!(
+            per_user_inactive_ttl_secs, seed.per_user_inactive_ttl_secs,
+            "per_user_inactive_ttl_secs"
+        );
+        assert_eq!(
+            inactive_user_sweep_interval_secs, seed.inactive_user_sweep_interval_secs,
+            "inactive_user_sweep_interval_secs"
         );
         assert_eq!(
             module_cache_budget_bytes, seed.module_cache_budget_bytes,
@@ -4216,6 +4319,7 @@ mod tests {
             per_user_op_rate_limit,
             per_user_op_burst,
             per_user_export_min_interval_secs,
+            secrets_dir: _, // serde-skip runtime field, repopulated by build()
         } = ws_api;
         assert_eq!(ws_address, seed.ws_api.address, "ws_api.address");
         assert_eq!(ws_port, seed.ws_api.port, "ws_api.port");

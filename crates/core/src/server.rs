@@ -457,6 +457,17 @@ pub(crate) type AllowedHosts = Arc<HashSet<String>>;
 #[derive(Clone, Copy, Default)]
 pub(crate) struct HostedMode(pub bool);
 
+/// The node's secrets dir, injected as an axum `Extension` so the WS hook can
+/// stamp per-user last-activity markers (#4561, P5 of #4381, inactive-user
+/// TTL). `Arc<PathBuf>` so cloning it onto every connection is cheap. An EMPTY
+/// path means "no secrets tree to mark" (the standalone / non-hosted test
+/// composition) and disables stamping; the real node serve path carries the
+/// resolved `config.secrets_dir`. Stamping is additionally gated on
+/// `user_context.is_some()` in the hook, so a Local connection never writes a
+/// marker even if a path is present.
+#[derive(Clone, Default)]
+pub(crate) struct ActivitySecretsDir(pub Arc<std::path::PathBuf>);
+
 /// User-supplied source CIDRs that extend the built-in private-IP allowlist.
 ///
 /// The filter accepts a request if the source IP is private (loopback / RFC1918 /
@@ -704,6 +715,16 @@ async fn serve_client_api_in_impl(
         );
     }
 
+    // Per-user last-activity marker root (#4561, P5 of #4381, inactive-user
+    // TTL). Injected as an `Extension` so the WS hook can stamp
+    // `<secrets_dir>/users/<user_id>/.last_seen` on connect + each request,
+    // keeping the activity record the reclaim sweep reads up to date. An empty
+    // path (the standalone/test composition default) disables stamping; only
+    // the real node serve path carries a resolved `secrets_dir`. Stamping is
+    // ALSO gated on `user_context.is_some()` in the hook, so a non-hosted
+    // connection never writes a marker even if a path is present.
+    let activity_secrets_dir = ActivitySecretsDir(Arc::new(config.secrets_dir.clone()));
+
     let needs_lan_filter = !config.address.is_loopback();
     let router = if needs_lan_filter {
         // Layer ordering matters: axum executes layers bottom-to-top per
@@ -721,6 +742,7 @@ async fn serve_client_api_in_impl(
         ws_router
             .layer(Extension(hosted_mode))
             .layer(Extension(op_rate_limiter))
+            .layer(Extension(activity_secrets_dir))
             .layer(Extension(allowed_hosts))
             .layer(axum::middleware::from_fn(private_network_filter))
             .layer(Extension(allowed_source_cidrs))
@@ -732,6 +754,7 @@ async fn serve_client_api_in_impl(
         ws_router
             .layer(Extension(hosted_mode))
             .layer(Extension(op_rate_limiter))
+            .layer(Extension(activity_secrets_dir))
             .layer(Extension(allowed_hosts))
             .layer(Extension(allowed_source_cidrs))
             .layer(TraceLayer::new_for_http())
