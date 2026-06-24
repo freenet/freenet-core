@@ -73,6 +73,26 @@ pub const DEFAULT_PER_USER_EXPORT_MIN_INTERVAL_SECS: u64 = 10;
 /// never resets an actively-throttling bucket).
 const MAX_TRACKED_USERS: usize = 100_000;
 
+/// Low-water-mark divisor for eviction hysteresis. When a map exceeds its cap we
+/// evict down to `cap - cap/EVICTION_HYSTERESIS_DIVISOR` (≈90% of cap) rather
+/// than just back to `cap`. This is what bounds the eviction COST under a
+/// new-token-churn attack: without it, a map sitting exactly at cap would run a
+/// full O(n) scan on EVERY new distinct token (each insert lands at cap+1 →
+/// scan → back to cap → repeat), turning a cheap request into an ~O(cap) sweep
+/// — the rate-limiter would amplify CPU instead of bounding it. With the
+/// low-water-mark, one sweep frees ≈cap/10 slots, so the next sweep can't
+/// re-trigger until ≈cap/10 more inserts arrive; every insert in between hits
+/// the cheap `len <= cap` early-return. Net: amortized O(1) eviction work per
+/// insert regardless of how fast fresh tokens churn.
+const EVICTION_HYSTERESIS_DIVISOR: usize = 10;
+
+/// Given a cap, the post-eviction target size (low-water-mark): `cap - cap/10`,
+/// floored at 1. A single sweep evicts down to this, leaving headroom so the
+/// next ≈cap/10 inserts skip the scan entirely.
+fn eviction_low_water_mark(cap: usize) -> usize {
+    cap.saturating_sub(cap / EVICTION_HYSTERESIS_DIVISOR).max(1)
+}
+
 /// A single user's token bucket. The bucket `state` is guarded by a `Mutex` so
 /// refill+decrement is one atomic decision (no check-then-act race across
 /// concurrent connection tasks sharing this user's bucket).
@@ -183,12 +203,26 @@ struct Inner {
     /// [`MAX_TRACKED_USERS`]; lowered in tests via [`UserOpRateLimiter::with_cap`]
     /// so eviction can be exercised without inserting 100k entries.
     max_tracked_users: usize,
+    /// Count of FULL eviction sweeps actually performed (past the cheap
+    /// high-water early-return) across both maps. Used by the amortization test
+    /// to assert hysteresis bounds the number of O(n) sweeps under token churn.
+    /// Incremented on the rare sweep path only, so it's negligible in
+    /// production.
+    sweeps: std::sync::atomic::AtomicU64,
 }
 
 impl Inner {
-    /// Bound `op_buckets` to [`MAX_TRACKED_USERS`]. Called only when a new user
-    /// was just inserted (the map grew), so it is amortized O(map size) work
-    /// once per new user rather than per op.
+    /// Bound `op_buckets` to [`MAX_TRACKED_USERS`]. Called only when a NEW user
+    /// was just inserted (the map grew).
+    ///
+    /// COST / AMORTIZATION: the trigger is the high-water-mark (`len > cap`), but
+    /// when it fires we evict down to the LOW-water-mark
+    /// ([`eviction_low_water_mark`], ≈90% of cap), not just back to cap. So a
+    /// single O(n) sweep frees ≈cap/10 slots and the next ≈cap/10 inserts all hit
+    /// the cheap `len <= cap` early-return below. Without this hysteresis a map
+    /// pinned at cap would run a full O(n) scan on EVERY new distinct token —
+    /// the rate-limiter would become a CPU-amplification DoS under unvalidated
+    /// `userToken` churn. Amortized cost is therefore O(1) per insert.
     ///
     /// SAFETY OF EVICTION (the load-bearing invariant): we only ever drop
     /// buckets that are essentially FULL at `now` — i.e. users who are NOT
@@ -198,16 +232,25 @@ impl Inner {
     /// flooder's bucket and hand them a fresh burst. Among the safe-to-evict
     /// (full) buckets we drop the LEAST-RECENTLY-USED first.
     ///
-    /// If the map is over cap but NOTHING is safe to evict — i.e. EVERY tracked
-    /// user is currently being throttled, a genuine mass flood — we evict
-    /// nothing and let the map sit slightly over cap rather than weaken active
-    /// limiting. That state is self-correcting: as soon as any of those buckets
-    /// refills (the flood for that user pauses) it becomes evictable. A one-shot
-    /// warning makes the (rare) degraded mode visible to operators.
+    /// If the map is over cap but too few buckets are safe to evict — i.e. most
+    /// tracked users are currently being throttled, a genuine mass flood — we
+    /// evict only what is safe and let the map sit over cap rather than weaken
+    /// active limiting. That state is self-correcting: as soon as those buckets
+    /// refill (the flood for that user pauses) they become evictable. A one-shot
+    /// warning makes the (rare) degraded mode visible to operators. (That
+    /// degraded state is also expensive for an attacker to MAINTAIN: a
+    /// brand-new token's bucket starts full, so to keep a bucket un-evictable
+    /// the attacker must spend its whole burst — all but the first of which are
+    /// themselves rate-limited-rejected.)
     fn evict_op_buckets_if_needed(&self, now: Instant) {
-        if self.op_buckets.len() <= self.max_tracked_users {
+        let len = self.op_buckets.len();
+        if len <= self.max_tracked_users {
             return;
         }
+        self.sweeps
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Hysteresis: aim for the low-water-mark, not just back to cap.
+        let target_removals = len - eviction_low_water_mark(self.max_tracked_users);
         // Collect (key, last_access) for buckets that are SAFE to evict (full).
         // We never even consider a throttling bucket as a candidate.
         let mut candidates: Vec<(UserId, Instant)> = self
@@ -221,7 +264,6 @@ impl Inner {
         // LRU first.
         candidates.sort_by_key(|(_, last_access)| *last_access);
 
-        let target_removals = self.op_buckets.len() - self.max_tracked_users;
         let mut removed = 0;
         for (key, _) in candidates.into_iter().take(target_removals) {
             // `remove_if` re-checks evictability under the shard write lock so a
@@ -236,9 +278,10 @@ impl Inner {
                 removed += 1;
             }
         }
-        if removed < target_removals {
-            // Couldn't get back under cap purely from full buckets: the rest are
-            // actively throttling and must not be reset. Surface it once.
+        // Warn only if we couldn't even get back under the HIGH-water-mark (cap)
+        // — i.e. too few idle buckets to drop. Not reaching the low-water-mark is
+        // expected and fine (it just means the next sweep comes sooner).
+        if self.op_buckets.len() > self.max_tracked_users && removed < target_removals {
             static WARNED: std::sync::atomic::AtomicBool =
                 std::sync::atomic::AtomicBool::new(false);
             if WARNED
@@ -253,26 +296,31 @@ impl Inner {
                 tracing::warn!(
                     tracked = self.op_buckets.len(),
                     cap = self.max_tracked_users,
-                    "per-user op-rate map over cap with no idle entries to evict \
-                     (every tracked user is actively throttling). Holding over cap \
-                     rather than resetting an active limiter; self-corrects as \
-                     buckets refill. Possible distributed token flood."
+                    "per-user op-rate map over cap with too few idle entries to \
+                     evict (most tracked users are actively throttling). Holding \
+                     over cap rather than resetting an active limiter; self-corrects \
+                     as buckets refill. Possible distributed token flood."
                 );
             }
         }
     }
 
-    /// Bound `last_export` to [`MAX_TRACKED_USERS`]. An entry is safe to drop
-    /// once it is older than `min_interval` (the next export would be admitted
-    /// anyway, so re-creating it changes nothing — the same way a full op bucket
-    /// is safe). We evict the OLDEST such stale entries first. If nothing is
-    /// stale (every tracked user exported within the last `min_interval`) we
-    /// hold over cap rather than dropping an entry that is still actively
-    /// throttling that user's next export.
+    /// Bound `last_export` to [`MAX_TRACKED_USERS`]. Same high-water-trigger /
+    /// low-water-target hysteresis as [`Self::evict_op_buckets_if_needed`] so the
+    /// sweep is amortized O(1) per insert under token churn. An entry is safe to
+    /// drop once it is older than `min_interval` (the next export would be
+    /// admitted anyway, so re-creating it changes nothing — the same way a full
+    /// op bucket is safe). We evict the OLDEST such stale entries first. If too
+    /// few are stale we hold over cap rather than dropping an entry that is still
+    /// actively throttling that user's next export.
     fn evict_last_export_if_needed(&self, now: Instant, min_interval: u64) {
-        if self.last_export.len() <= self.max_tracked_users {
+        let len = self.last_export.len();
+        if len <= self.max_tracked_users {
             return;
         }
+        self.sweeps
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let target_removals = len - eviction_low_water_mark(self.max_tracked_users);
         let min = std::time::Duration::from_secs(min_interval);
         let mut candidates: Vec<(UserId, Instant)> = self
             .last_export
@@ -283,7 +331,6 @@ impl Inner {
             })
             .collect();
         candidates.sort_by_key(|(_, last)| *last);
-        let target_removals = self.last_export.len() - self.max_tracked_users;
         for (key, _) in candidates.into_iter().take(target_removals) {
             // remove_if re-checks staleness under the write lock to avoid
             // dropping an entry a concurrent export just refreshed.
@@ -326,6 +373,7 @@ impl UserOpRateLimiter {
                 export_min_interval_secs,
                 last_export: DashMap::new(),
                 max_tracked_users: max_tracked_users.max(1),
+                sweeps: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }
@@ -424,6 +472,14 @@ impl UserOpRateLimiter {
     #[cfg(test)]
     pub(crate) fn tracked_export_users(&self) -> usize {
         self.inner.last_export.len()
+    }
+
+    /// Number of full eviction sweeps performed (past the cheap high-water
+    /// early-return). The amortization test asserts hysteresis keeps this far
+    /// below the number of inserts.
+    #[cfg(test)]
+    pub(crate) fn sweeps_performed(&self) -> u64 {
+        self.inner.sweeps.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -785,5 +841,47 @@ mod tests {
                 limiter.tracked_export_users()
             );
         }
+    }
+
+    /// A 32-byte UserId from a u32, so amortization tests can mint >256 users.
+    fn uid32(n: u32) -> UserId {
+        let mut b = [0u8; 32];
+        b[..4].copy_from_slice(&n.to_le_bytes());
+        UserId::new(b)
+    }
+
+    /// AMORTIZATION (review round 3): a sustained churn of fresh tokens at the
+    /// cap must NOT trigger a full O(n) eviction sweep on every insert. With the
+    /// low-water-mark hysteresis, one sweep frees ≈cap/10 slots, so sweeps occur
+    /// at most ~once per cap/10 inserts. Here cap=100 (LWM=90, headroom 10) and
+    /// we churn 2000 fresh users: without hysteresis that would be ~1900 sweeps
+    /// (one per insert past cap); with it, ~(2000-100)/10 ≈ 190. We assert a
+    /// generous bound well below the per-insert figure, AND that the map stays
+    /// bounded throughout.
+    #[tokio::test(start_paused = true)]
+    async fn eviction_is_amortized_under_token_churn() {
+        let cap = 100;
+        let limiter = UserOpRateLimiter::with_cap(1000, 1000, 0, cap);
+        let mut now = Instant::now();
+        let inserts = 2000u32;
+        for i in 0..inserts {
+            let user = uid32(i);
+            assert!(limiter.try_acquire_op_at(&user, now));
+            now += std::time::Duration::from_millis(1);
+            assert!(
+                limiter.tracked_op_users() <= cap + 1,
+                "map must stay bounded (≤ cap+1) during churn; was {} at insert {i}",
+                limiter.tracked_op_users()
+            );
+        }
+        let sweeps = limiter.sweeps_performed();
+        // Per-insert sweeping would be ~inserts - cap ≈ 1900. Hysteresis caps it
+        // near (inserts - cap) / (cap/10) ≈ 190. Assert comfortably below the
+        // per-insert figure to prove amortization without pinning exact math.
+        assert!(
+            sweeps <= 400,
+            "hysteresis must bound sweeps far below per-insert ({sweeps} sweeps \
+             over {inserts} inserts; per-insert would be ~1900)"
+        );
     }
 }
