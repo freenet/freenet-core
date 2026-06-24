@@ -1230,6 +1230,14 @@ impl ContractExecutor for RuntimePool {
     /// `summarize_contract_state`); the matching `track_contract_return` happens
     /// in `finish_summarize`.
     fn try_begin_summarize(&mut self, key: ContractKey) -> SummaryAdmission {
+        // BISECT (diag, revert before merge): default the off-load OFF so the
+        // summary runs inline (behaviorally pre-PR). Set FREENET_OFFLOOP_SUMMARIZE=1
+        // to re-enable. Isolates whether the off-load EXECUTION is what fails NAT,
+        // independent of the rest of the refactor (shared semaphore, fair_queue
+        // tuple, plumbing) which stays active either way.
+        if std::env::var("FREENET_OFFLOOP_SUMMARIZE").as_deref() != Ok("1") {
+            return SummaryAdmission::Unsupported;
+        }
         let Ok(permit) = self.offload_semaphore.clone().try_acquire_owned() else {
             return SummaryAdmission::Busy;
         };
