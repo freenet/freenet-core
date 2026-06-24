@@ -1344,7 +1344,7 @@ pub fn spawn_inactive_user_sweep(
             // can't stall other tasks.
             let base = base_path.clone();
             let storage = db.clone();
-            let outcome = match tokio::task::spawn_blocking(move || {
+            let result = tokio::task::spawn_blocking(move || {
                 reclaim_inactive_users(
                     &base,
                     &storage,
@@ -1355,29 +1355,33 @@ pub fn spawn_inactive_user_sweep(
                     MAX_RECLAIMS_PER_SWEEP,
                 )
             })
-            .await
-            {
-                Ok(o) => o,
-                Err(e) => {
-                    tracing::warn!(error = %e, "inactive-user sweep pass panicked/cancelled");
-                    SweepOutcome::default()
-                }
-            };
-            // Advance the gap-detector baseline only when this pass actually
-            // evaluated the clock (i.e. did NOT itself skip on a suspected jump).
-            // Updating it after a skipped pass would let a *second* equally-jumped
-            // `now` look "normal" relative to the first and proceed to delete; by
-            // holding the baseline at the last TRUSTED `now`, a sustained skew
-            // keeps tripping the detector until the clock returns to a plausible
-            // range.
-            if !outcome.skipped_gap {
+            .await;
+            // Advance the gap-detector baseline ONLY for a pass that genuinely
+            // COMPLETED (`Ok`) AND did not itself skip on a suspected jump. Two
+            // cases must hold the last TRUSTED baseline instead of advancing it:
+            //   * a gap-SKIP (`skipped_gap`): advancing would let a *second*
+            //     equally-jumped `now` look "normal" vs the first and delete;
+            //   * a PANIC/cancel (`Err`): we never evaluated the clock against
+            //     the users this pass, so `now` is unverified — treat it like a
+            //     skip and hold the baseline (a panicked pass at a skewed clock
+            //     must not arm the next pass to proceed). Panic and gap-skip are
+            //     NOT conflated in the warn semantics — only in "don't advance".
+            let ran = matches!(&result, Ok(o) if !o.skipped_gap);
+            if ran {
                 prev_sweep_now = Some(now);
             }
-            if outcome.reclaimed > 0 {
-                tracing::info!(
-                    reclaimed = outcome.reclaimed,
-                    "inactive-user sweep: reclaimed abandoned users"
-                );
+            match result {
+                Ok(o) => {
+                    if o.reclaimed > 0 {
+                        tracing::info!(
+                            reclaimed = o.reclaimed,
+                            "inactive-user sweep: reclaimed abandoned users"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "inactive-user sweep pass panicked/cancelled");
+                }
             }
         }
     });
@@ -8666,6 +8670,97 @@ mod test {
         let out2 =
             reclaim_inactive_users(&secrets_dir, &db, normal_now, ttl, Some(prev), max_gap, 256);
         assert!(!out2.skipped_gap, "a normal interval gap does not skip");
+        Ok(())
+    }
+
+    /// GROUPING CORRECTNESS through the ReDb path (high-value for a destructive
+    /// op): two users A and B with secrets under the SAME delegate. A is idle
+    /// past TTL, B is freshly stamped. After a sweep, A's ReDb index row must be
+    /// GONE and B's must SURVIVE — proving the per-sweep index grouping
+    /// (`group_index_rows_by_user`) routes each `DelegateKey` to the right user's
+    /// bucket and reclaim removes EXACTLY the target user's rows, never the
+    /// survivor's. The existing on-disk assertions don't catch a mis-grouped row
+    /// because the on-disk delete keys on `user_id.encode()`, not the grouped
+    /// ReDb rows; this test exercises the grouped ReDb path specifically.
+    #[tokio::test]
+    async fn reclaim_removes_only_target_user_redb_rows() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())?;
+
+        // BOTH users write under the SAME delegate, so the user-index table holds
+        // a row for (delegate, A) and a row for (delegate, B) — the exact shape
+        // that a mis-grouping bug would cross-contaminate.
+        let delegate = Delegate::from((&vec![90].into(), &vec![].into()));
+        let (a, dek_a) = fresh_user(&secrets_dir, 0x90);
+        let (b, dek_b) = fresh_user(&secrets_dir, 0x91);
+        store_one_user_secret(
+            &mut store,
+            delegate.key(),
+            &a,
+            &dek_a,
+            &SecretsId::new(vec![1]),
+            b"a-secret",
+        );
+        store_one_user_secret(
+            &mut store,
+            delegate.key(),
+            &b,
+            &dek_b,
+            &SecretsId::new(vec![2]),
+            b"b-secret",
+        );
+
+        // Pre-conditions: BOTH users have a ReDb index row under this delegate.
+        assert!(
+            db.get_user_secrets_index(delegate.key(), a.as_bytes())?
+                .is_some(),
+            "A must have a ReDb row before reclaim"
+        );
+        assert!(
+            db.get_user_secrets_index(delegate.key(), b.as_bytes())?
+                .is_some(),
+            "B must have a ReDb row before reclaim"
+        );
+
+        let now = 30_000_000u64;
+        let ttl = 30 * 86_400u64;
+        // A idle 40 days (past TTL → reclaimed); B stamped 1h ago (spared).
+        assert!(stamp_user_last_seen(&secrets_dir, &a, now - 40 * 86_400, 0));
+        assert!(stamp_user_last_seen(&secrets_dir, &b, now - 3_600, 0));
+
+        let reclaimed = reclaim_all(&secrets_dir, &db, now, ttl);
+        assert_eq!(reclaimed, 1, "exactly the idle user A is reclaimed");
+
+        // THE ASSERTION THAT MATTERS: A's ReDb row is gone, B's SURVIVES — the
+        // grouped reclaim touched only A's rows.
+        assert!(
+            db.get_user_secrets_index(delegate.key(), a.as_bytes())?
+                .is_none(),
+            "A's ReDb index row must be removed"
+        );
+        assert!(
+            db.get_user_secrets_index(delegate.key(), b.as_bytes())?
+                .is_some(),
+            "B's ReDb index row must SURVIVE — reclaim must not touch the non-target user"
+        );
+        // And B's secret is still readable end-to-end (on-disk blob intact too).
+        assert!(
+            store
+                .get_secret(
+                    delegate.key(),
+                    &SecretsId::new(vec![2]),
+                    SecretScope::User {
+                        id: &b,
+                        dek_secret: &dek_b
+                    },
+                )
+                .is_ok(),
+            "B's secret must remain readable after A's reclaim"
+        );
         Ok(())
     }
 }
