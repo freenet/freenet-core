@@ -75,7 +75,7 @@ jobs:
       # Download baseline from merge-base commit
       - name: Download Baseline
         id: baseline-cache
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@v6
         with:
           path: target/criterion
           key: criterion-extended-main-${{ runner.os }}-${{ steps.baseline-commit.outputs.sha }}
@@ -191,7 +191,7 @@ jobs:
       # Save baseline for future comparisons (only on main)
       - name: Save Baseline
         if: github.ref == 'refs/heads/main'
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@v6
         with:
           path: target/criterion
           key: criterion-extended-main-${{ runner.os }}-${{ github.sha }}
