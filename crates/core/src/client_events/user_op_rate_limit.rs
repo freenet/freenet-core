@@ -60,9 +60,22 @@ pub const DEFAULT_PER_USER_OP_BURST: u64 = 50;
 /// disables export rate limiting.
 pub const DEFAULT_PER_USER_EXPORT_MIN_INTERVAL_SECS: u64 = 10;
 
-/// A single user's token bucket. The `(tokens, last_refill)` pair is guarded by
-/// a `Mutex` so refill+decrement is one atomic decision (no check-then-act race
-/// across concurrent connection tasks sharing this user's bucket).
+/// Hard cap on the number of distinct users tracked in EACH per-user map
+/// (`op_buckets`, `last_export`). The `userToken` is client-chosen and
+/// unvalidated (`UserSecretContext::from_token` just hashes arbitrary bytes —
+/// there is no registry), so an actor past the hosted gate can present an
+/// unbounded number of distinct tokens. Without a cap the maps would grow
+/// permanently — the limiter would be its own memory-DoS, violating the
+/// repo's "cleanup must be time-bounded / no unbounded per-key collection"
+/// rules. The cap is generous (a real public proxy serves far fewer concurrent
+/// users than this) so legitimate traffic never triggers eviction; see
+/// [`Inner::evict_op_buckets_if_needed`] for the safety property (eviction
+/// never resets an actively-throttling bucket).
+const MAX_TRACKED_USERS: usize = 100_000;
+
+/// A single user's token bucket. The bucket `state` is guarded by a `Mutex` so
+/// refill+decrement is one atomic decision (no check-then-act race across
+/// concurrent connection tasks sharing this user's bucket).
 struct TokenBucket {
     /// `capacity` (= burst) and `refill_per_sec` (= sustained rate) are fixed at
     /// construction; only `state` mutates.
@@ -76,6 +89,8 @@ struct BucketState {
     tokens: f64,
     /// When `tokens` was last refilled.
     last_refill: Instant,
+    /// When this bucket was last touched by an acquire. Drives LRU eviction.
+    last_access: Instant,
 }
 
 impl TokenBucket {
@@ -90,6 +105,7 @@ impl TokenBucket {
             state: Mutex::new(BucketState {
                 tokens: capacity,
                 last_refill: now,
+                last_access: now,
             }),
         }
     }
@@ -106,6 +122,7 @@ impl TokenBucket {
         // test clock hands back an equal instant (elapsed = 0, no refill).
         let elapsed = now.saturating_duration_since(state.last_refill);
         state.last_refill = now;
+        state.last_access = now;
         if self.refill_per_sec > 0.0 {
             state.tokens =
                 (state.tokens + elapsed.as_secs_f64() * self.refill_per_sec).min(self.capacity);
@@ -116,6 +133,28 @@ impl TokenBucket {
         } else {
             false
         }
+    }
+
+    /// A bucket is SAFE TO EVICT only when it is essentially full at `now` —
+    /// i.e. the user is NOT currently being throttled. Re-creating a full
+    /// bucket yields an identical full bucket, so dropping it changes nothing.
+    /// A depleted (actively-throttling) bucket must NEVER be evicted: dropping
+    /// it would re-create a FULL bucket and hand the flooder a fresh burst.
+    ///
+    /// Returns `(safe_to_evict, last_access)` computed under one lock, applying
+    /// the same time-based refill as `try_acquire` so "full" reflects `now`.
+    fn evictability(&self, now: Instant) -> (bool, Instant) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let elapsed = now.saturating_duration_since(state.last_refill);
+        state.last_refill = now;
+        if self.refill_per_sec > 0.0 {
+            state.tokens =
+                (state.tokens + elapsed.as_secs_f64() * self.refill_per_sec).min(self.capacity);
+        }
+        // "Essentially full": within one token of capacity. A bucket this full
+        // is not throttling anyone, so re-creation is a no-op for limiting.
+        let safe = state.tokens >= self.capacity - 1.0;
+        (safe, state.last_access)
     }
 }
 
@@ -140,12 +179,141 @@ struct Inner {
     export_min_interval_secs: u64,
     /// Last successful-export instant per user. Created on first export.
     last_export: DashMap<UserId, Instant>,
+    /// Hard cap on entries in EACH per-user map. Defaults to
+    /// [`MAX_TRACKED_USERS`]; lowered in tests via [`UserOpRateLimiter::with_cap`]
+    /// so eviction can be exercised without inserting 100k entries.
+    max_tracked_users: usize,
+}
+
+impl Inner {
+    /// Bound `op_buckets` to [`MAX_TRACKED_USERS`]. Called only when a new user
+    /// was just inserted (the map grew), so it is amortized O(map size) work
+    /// once per new user rather than per op.
+    ///
+    /// SAFETY OF EVICTION (the load-bearing invariant): we only ever drop
+    /// buckets that are essentially FULL at `now` — i.e. users who are NOT
+    /// currently being throttled (see [`TokenBucket::evictability`]). Dropping a
+    /// full bucket and lazily re-creating it later yields an identical full
+    /// bucket, so eviction can never reset a depleted, actively-throttling
+    /// flooder's bucket and hand them a fresh burst. Among the safe-to-evict
+    /// (full) buckets we drop the LEAST-RECENTLY-USED first.
+    ///
+    /// If the map is over cap but NOTHING is safe to evict — i.e. EVERY tracked
+    /// user is currently being throttled, a genuine mass flood — we evict
+    /// nothing and let the map sit slightly over cap rather than weaken active
+    /// limiting. That state is self-correcting: as soon as any of those buckets
+    /// refills (the flood for that user pauses) it becomes evictable. A one-shot
+    /// warning makes the (rare) degraded mode visible to operators.
+    fn evict_op_buckets_if_needed(&self, now: Instant) {
+        if self.op_buckets.len() <= self.max_tracked_users {
+            return;
+        }
+        // Collect (key, last_access) for buckets that are SAFE to evict (full).
+        // We never even consider a throttling bucket as a candidate.
+        let mut candidates: Vec<(UserId, Instant)> = self
+            .op_buckets
+            .iter()
+            .filter_map(|entry| {
+                let (safe, last_access) = entry.value().evictability(now);
+                safe.then(|| (*entry.key(), last_access))
+            })
+            .collect();
+        // LRU first.
+        candidates.sort_by_key(|(_, last_access)| *last_access);
+
+        let target_removals = self.op_buckets.len() - self.max_tracked_users;
+        let mut removed = 0;
+        for (key, _) in candidates.into_iter().take(target_removals) {
+            // `remove_if` re-checks evictability under the shard write lock so a
+            // bucket that started throttling between the scan and the remove is
+            // NOT dropped (would otherwise reset it). This closes the
+            // scan-then-remove race.
+            if self
+                .op_buckets
+                .remove_if(&key, |_, bucket| bucket.evictability(now).0)
+                .is_some()
+            {
+                removed += 1;
+            }
+        }
+        if removed < target_removals {
+            // Couldn't get back under cap purely from full buckets: the rest are
+            // actively throttling and must not be reset. Surface it once.
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if WARNED
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                tracing::warn!(
+                    tracked = self.op_buckets.len(),
+                    cap = self.max_tracked_users,
+                    "per-user op-rate map over cap with no idle entries to evict \
+                     (every tracked user is actively throttling). Holding over cap \
+                     rather than resetting an active limiter; self-corrects as \
+                     buckets refill. Possible distributed token flood."
+                );
+            }
+        }
+    }
+
+    /// Bound `last_export` to [`MAX_TRACKED_USERS`]. An entry is safe to drop
+    /// once it is older than `min_interval` (the next export would be admitted
+    /// anyway, so re-creating it changes nothing — the same way a full op bucket
+    /// is safe). We evict the OLDEST such stale entries first. If nothing is
+    /// stale (every tracked user exported within the last `min_interval`) we
+    /// hold over cap rather than dropping an entry that is still actively
+    /// throttling that user's next export.
+    fn evict_last_export_if_needed(&self, now: Instant, min_interval: u64) {
+        if self.last_export.len() <= self.max_tracked_users {
+            return;
+        }
+        let min = std::time::Duration::from_secs(min_interval);
+        let mut candidates: Vec<(UserId, Instant)> = self
+            .last_export
+            .iter()
+            .filter_map(|entry| {
+                let last = *entry.value();
+                (now.saturating_duration_since(last) >= min).then(|| (*entry.key(), last))
+            })
+            .collect();
+        candidates.sort_by_key(|(_, last)| *last);
+        let target_removals = self.last_export.len() - self.max_tracked_users;
+        for (key, _) in candidates.into_iter().take(target_removals) {
+            // remove_if re-checks staleness under the write lock to avoid
+            // dropping an entry a concurrent export just refreshed.
+            self.last_export
+                .remove_if(&key, |_, last| now.saturating_duration_since(*last) >= min);
+        }
+    }
 }
 
 impl UserOpRateLimiter {
     /// Build a limiter from operator config. `op_rate == 0` disables op
     /// limiting; `export_min_interval_secs == 0` disables export limiting.
     pub(crate) fn new(op_rate: u64, op_burst: u64, export_min_interval_secs: u64) -> Self {
+        Self::with_cap(
+            op_rate,
+            op_burst,
+            export_min_interval_secs,
+            MAX_TRACKED_USERS,
+        )
+    }
+
+    /// Like [`Self::new`] but with an explicit per-map entry cap. Production
+    /// always uses [`MAX_TRACKED_USERS`] via `new`; tests use a small cap so the
+    /// eviction path is exercised without inserting 100k entries.
+    fn with_cap(
+        op_rate: u64,
+        op_burst: u64,
+        export_min_interval_secs: u64,
+        max_tracked_users: usize,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 op_rate,
@@ -157,6 +325,7 @@ impl UserOpRateLimiter {
                 op_buckets: DashMap::new(),
                 export_min_interval_secs,
                 last_export: DashMap::new(),
+                max_tracked_users: max_tracked_users.max(1),
             }),
         }
     }
@@ -184,12 +353,25 @@ impl UserOpRateLimiter {
         // first-requests from the same user share one bucket rather than racing
         // to create two. The created bucket starts full, then this same call
         // immediately spends its first token below.
-        let bucket = self
-            .inner
-            .op_buckets
-            .entry(*user)
-            .or_insert_with(|| TokenBucket::new(self.inner.op_burst, self.inner.op_rate, now));
-        bucket.try_acquire(now)
+        //
+        // `is_new` tells us whether THIS call created the bucket, so we only run
+        // the (relatively expensive) eviction scan when the map actually grew —
+        // not on every op of an existing user.
+        let mut is_new = false;
+        let admitted = {
+            let bucket = self.inner.op_buckets.entry(*user).or_insert_with(|| {
+                is_new = true;
+                TokenBucket::new(self.inner.op_burst, self.inner.op_rate, now)
+            });
+            // Hold the entry guard ONLY for the acquire; it is dropped at the end
+            // of this block, BEFORE eviction touches the map. Evicting while a
+            // shard guard is held could deadlock DashMap.
+            bucket.try_acquire(now)
+        };
+        if is_new {
+            self.inner.evict_op_buckets_if_needed(now);
+        }
+        admitted
     }
 
     /// Try to admit one export for `user`. Returns `true` to allow (and records
@@ -208,18 +390,27 @@ impl UserOpRateLimiter {
         // Atomic test-and-set on the map entry so two concurrent exports from
         // one user can't both pass: whoever holds the entry guard decides, and
         // only an admitted export advances `last_export`.
-        let mut entry = self.inner.last_export.entry(*user).or_insert(
-            // Seed far enough in the past that the FIRST export is always
-            // admitted (now - min_interval), then overwritten below.
-            now - std::time::Duration::from_secs(min_interval),
-        );
-        let elapsed = now.saturating_duration_since(*entry);
-        if elapsed.as_secs() >= min_interval {
-            *entry = now;
-            true
-        } else {
-            false
+        let mut is_new = false;
+        let admitted = {
+            let mut entry = self.inner.last_export.entry(*user).or_insert_with(|| {
+                is_new = true;
+                // Seed far enough in the past that the FIRST export is always
+                // admitted (now - min_interval), then overwritten below.
+                now - std::time::Duration::from_secs(min_interval)
+            });
+            let elapsed = now.saturating_duration_since(*entry);
+            if elapsed.as_secs() >= min_interval {
+                *entry = now;
+                true
+            } else {
+                false
+            }
+            // entry guard dropped here, before eviction touches the map.
+        };
+        if is_new {
+            self.inner.evict_last_export_if_needed(now, min_interval);
         }
+        admitted
     }
 
     /// Number of distinct users currently tracked (op buckets). Test-only
@@ -227,6 +418,12 @@ impl UserOpRateLimiter {
     #[cfg(test)]
     pub(crate) fn tracked_op_users(&self) -> usize {
         self.inner.op_buckets.len()
+    }
+
+    /// Number of distinct users currently tracked in the export-interval map.
+    #[cfg(test)]
+    pub(crate) fn tracked_export_users(&self) -> usize {
+        self.inner.last_export.len()
     }
 }
 
@@ -471,5 +668,122 @@ mod tests {
             limiter.try_acquire_export_at(&b, now),
             "B's export interval is independent of A's"
         );
+    }
+
+    /// `op_burst = 0` with a non-zero rate must NOT become a deny-all: it is
+    /// clamped up to 1 so the first op of a fresh user still passes.
+    #[tokio::test(start_paused = true)]
+    async fn op_burst_zero_is_clamped_to_one() {
+        let limiter = UserOpRateLimiter::new(10, 0, 0);
+        let user = uid(50);
+        let now = Instant::now();
+        assert!(
+            limiter.try_acquire_op_at(&user, now),
+            "burst 0 must be clamped to 1 — first op passes, not deny-all"
+        );
+        assert!(
+            !limiter.try_acquire_op_at(&user, now),
+            "with clamped burst=1 the second same-instant op is rejected"
+        );
+    }
+
+    /// Export interval uses whole-second granularity (`as_secs()`): 9.5s after
+    /// an export is still under a 10s interval and must be rejected.
+    #[tokio::test(start_paused = true)]
+    async fn export_sub_second_boundary_still_rejects() {
+        let limiter = UserOpRateLimiter::new(10, 50, 10);
+        let user = uid(51);
+        let t0 = Instant::now();
+        assert!(limiter.try_acquire_export_at(&user, t0), "first export");
+        let t_95 = t0 + std::time::Duration::from_millis(9_500);
+        assert!(
+            !limiter.try_acquire_export_at(&user, t_95),
+            "9.5s < 10s interval → still rejected"
+        );
+        let t_10 = t0 + std::time::Duration::from_millis(10_000);
+        assert!(
+            limiter.try_acquire_export_at(&user, t_10),
+            "exactly 10s → allowed"
+        );
+    }
+
+    /// Map bound: admitting ops from many more distinct users than the cap keeps
+    /// the op-bucket map at or below the cap. The evicted users are the IDLE
+    /// (full) ones — so this also asserts that re-touching an old user works.
+    #[tokio::test(start_paused = true)]
+    async fn op_bucket_map_is_bounded() {
+        // cap = 4, big burst so each user's single op leaves the bucket "full"
+        // (essentially full → safe to evict). Advance time between users so
+        // last_access strictly orders them for LRU.
+        let limiter = UserOpRateLimiter::with_cap(1000, 1000, 0, 4);
+        let mut now = Instant::now();
+        for i in 0..50u8 {
+            let user = uid(i);
+            assert!(limiter.try_acquire_op_at(&user, now));
+            now += std::time::Duration::from_millis(10);
+            assert!(
+                limiter.tracked_op_users() <= 4,
+                "op-bucket map must never exceed the cap (was {} after user {i})",
+                limiter.tracked_op_users()
+            );
+        }
+    }
+
+    /// Eviction MUST NOT reset an actively-throttling (depleted) bucket. With a
+    /// tiny cap, a flooding user whose bucket is empty stays throttled even as
+    /// many other distinct users arrive and force eviction scans — the evictor
+    /// only drops the OTHER users' full/idle buckets, never the flooder's.
+    #[tokio::test(start_paused = true)]
+    async fn eviction_never_resets_active_flooder() {
+        // cap = 2, burst = 3, rate tiny so refill is negligible over the test.
+        let limiter = UserOpRateLimiter::with_cap(1, 3, 0, 2);
+        let flooder = uid(200);
+        let t0 = Instant::now();
+        // Exhaust the flooder's bucket (burst 3), then confirm it's throttled.
+        assert!(limiter.try_acquire_op_at(&flooder, t0));
+        assert!(limiter.try_acquire_op_at(&flooder, t0));
+        assert!(limiter.try_acquire_op_at(&flooder, t0));
+        assert!(
+            !limiter.try_acquire_op_at(&flooder, t0),
+            "flooder is now depleted/throttled"
+        );
+
+        // Now a parade of OTHER users arrives, each forcing an eviction scan.
+        // Their full buckets get evicted; the flooder's depleted bucket must not.
+        let mut now = t0;
+        for i in 0..40u8 {
+            now += std::time::Duration::from_millis(1);
+            let other = uid(i); // i never equals 200
+            assert!(limiter.try_acquire_op_at(&other, now));
+        }
+
+        // The flooder, if its bucket had been evicted+recreated, would be FULL
+        // again and admit. It must still be throttled (bucket preserved). Use a
+        // time barely advanced so refill (rate=1/s) hasn't yielded a token.
+        let t_check = now + std::time::Duration::from_millis(1);
+        assert!(
+            !limiter.try_acquire_op_at(&flooder, t_check),
+            "eviction must NOT have reset the active flooder's depleted bucket"
+        );
+    }
+
+    /// Export map is bounded the same way: stale (older than the interval)
+    /// entries are evicted, keeping the map at or below the cap.
+    #[tokio::test(start_paused = true)]
+    async fn export_map_is_bounded() {
+        // cap = 3, interval = 1s. Advance > interval between users so prior
+        // entries are stale (safe to evict).
+        let limiter = UserOpRateLimiter::with_cap(10, 50, 1, 3);
+        let mut now = Instant::now();
+        for i in 0..30u8 {
+            let user = uid(i);
+            assert!(limiter.try_acquire_export_at(&user, now));
+            now += std::time::Duration::from_millis(1100); // > 1s interval
+            assert!(
+                limiter.tracked_export_users() <= 3,
+                "export map must never exceed the cap (was {} after user {i})",
+                limiter.tracked_export_users()
+            );
+        }
     }
 }
