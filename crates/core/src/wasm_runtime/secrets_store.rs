@@ -262,6 +262,120 @@ pub fn user_dek_secret(token: &[u8]) -> Zeroizing<[u8; 32]> {
     Zeroizing::new(*hasher.finalize().as_bytes())
 }
 
+/// Default per-user secret-storage quota: 4 MiB of on-disk ciphertext per
+/// [`UserId`], summed across every delegate that user has secrets under
+/// (#4561, P5 of #4381). Bounds a single hosted visitor's disk footprint so
+/// they cannot fill the node's disk. Operator-overridable via
+/// `--per-user-secret-quota=BYTES` / `per-user-secret-quota` in config; `0`
+/// disables enforcement entirely.
+pub const DEFAULT_PER_USER_SECRET_QUOTA_BYTES: usize = 4 * 1024 * 1024;
+
+/// Process-wide tracker of per-[`UserId`] on-disk secret-byte totals.
+///
+/// # Why this is a process-global rather than a per-store field
+///
+/// Each pooled `Executor<Runtime>` builds its OWN [`SecretsStore`] with its
+/// own in-memory index, but they all write to the SAME `secrets_dir`. A quota
+/// counter living on one store would diverge across executors exactly the way
+/// the per-executor secret index did before the export fix walked the disk
+/// instead (see [`SecretsStore::walk_scope_secrets_on_disk`]). So the per-user
+/// totals must live in ONE structure every executor's store references. A
+/// process-global `LazyLock<DashMap>` is the established pattern in this
+/// subsystem for precisely this "shared across all pooled executors" need —
+/// see the several `LazyLock<DashMap<...>>` statics in `native_api.rs`. The
+/// `UserId` key is a globally-unique 32-byte hash, so cross-node/cross-delegate
+/// collisions are impossible and a single global namespace is correct.
+///
+/// # Concurrency
+///
+/// Delegate execution is SERIAL on the contract loop — only one `store_secret`
+/// runs at a time node-wide — so the increment/decrement are never actually
+/// contended and a plain map would suffice for correctness. The per-user value
+/// is held as an [`AtomicU64`](std::sync::atomic::AtomicU64) as cheap insurance
+/// (and so reads never need the `DashMap` write path), but no compare-and-swap
+/// is required precisely because of that serial-execution guarantee.
+///
+/// # Seeding
+///
+/// A user's entry is seeded LAZILY on first touch by summing their on-disk blob
+/// sizes (see [`SecretsStore::seeded_user_total`]); thereafter every op is O(1).
+struct QuotaTracker {
+    /// `UserId` -> total on-disk ciphertext bytes that user currently holds
+    /// across all delegates.
+    per_user_bytes: DashMap<UserId, std::sync::atomic::AtomicU64>,
+}
+
+impl QuotaTracker {
+    fn new() -> Self {
+        Self {
+            per_user_bytes: DashMap::new(),
+        }
+    }
+
+    /// Current tracked total for `user`, or `None` if the user has not been
+    /// seeded into the tracker yet.
+    fn get(&self, user: &UserId) -> Option<u64> {
+        self.per_user_bytes
+            .get(user)
+            .map(|e| e.value().load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Seed `user`'s tracked total to `bytes` only if absent. Idempotent: a
+    /// concurrent/repeat seed leaves the existing value untouched, so a
+    /// once-per-process disk walk can never clobber live accounting.
+    fn seed_if_absent(&self, user: UserId, bytes: u64) {
+        self.per_user_bytes
+            .entry(user)
+            .or_insert_with(|| std::sync::atomic::AtomicU64::new(bytes));
+    }
+
+    /// Add `delta` to `user`'s tracked total (the user MUST already be seeded).
+    fn add(&self, user: &UserId, delta: u64) {
+        if let Some(e) = self.per_user_bytes.get(user) {
+            e.value()
+                .fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Subtract `delta` from `user`'s tracked total, saturating at 0 so a
+    /// double-decrement or a removal of an untracked blob can never underflow.
+    fn sub_saturating(&self, user: &UserId, delta: u64) {
+        if let Some(e) = self.per_user_bytes.get(user) {
+            // Serial execution (one store op at a time node-wide) means this
+            // load/store pair is never racing another writer; saturating_sub
+            // is belt-and-suspenders against an accounting drift.
+            let atomic = e.value();
+            let cur = atomic.load(std::sync::atomic::Ordering::Relaxed);
+            atomic.store(
+                cur.saturating_sub(delta),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
+}
+
+/// The single process-wide quota tracker. Lazily initialized; shared by every
+/// [`SecretsStore`] in the process (production pool executors and tests alike).
+static USER_QUOTA_TRACKER: std::sync::LazyLock<QuotaTracker> =
+    std::sync::LazyLock::new(QuotaTracker::new);
+
+/// Test-only view of a user's currently-tracked total (`None` if unseeded).
+/// Lets a test observe the SHARED process-global counter directly — including
+/// confirming that a write through one [`SecretsStore`] is visible to another.
+#[cfg(test)]
+pub(crate) fn quota_tracked_total_for_test(user: &UserId) -> Option<u64> {
+    USER_QUOTA_TRACKER.get(user)
+}
+
+/// Test-only reset of a single user's tracker entry, so each quota test starts
+/// from a clean slate against the process-global tracker regardless of run
+/// order. Tests use unique `UserId`s anyway (distinct tokens), but resetting is
+/// belt-and-suspenders against a re-used token across tests in one process.
+#[cfg(test)]
+pub(crate) fn quota_reset_user_for_test(user: &UserId) {
+    USER_QUOTA_TRACKER.per_user_bytes.remove(user);
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SecretStoreError {
     #[error("encryption error: {0}")]
@@ -279,6 +393,28 @@ pub enum SecretStoreError {
     /// of a generic filesystem error.
     #[error("no snapshot for secret {key} at timestamp_ms {timestamp_ms}")]
     SnapshotNotFound { key: SecretsId, timestamp_ms: u64 },
+    /// A per-user ([`SecretScope::User`]) write was REJECTED because it would
+    /// push the user's total on-disk secret bytes over their configured quota
+    /// (#4561, P5 of #4381). Hosted mode only — [`SecretScope::Local`] is never
+    /// quota-checked, so single-user nodes can never see this.
+    ///
+    /// REJECT-on-full, never evict: per-user secrets are authoritative identity
+    /// and room keys, not a reconstructible cache, so dropping an existing one
+    /// to make room would destroy real data. The delegate sees `set_secret`
+    /// fail (mapped to `ERR_STORAGE_FAILED`) and can surface the condition to
+    /// the user.
+    ///
+    /// The three numbers are non-secret byte counts (a user's storage
+    /// footprint, their limit, and the size of the rejected blob) — they name
+    /// no key material and are safe to log/return.
+    #[error(
+        "per-user secret quota exceeded: used {used} bytes, limit {limit} bytes, attempted {attempted} more bytes"
+    )]
+    QuotaExceeded {
+        used: u64,
+        limit: u64,
+        attempted: u64,
+    },
 }
 
 #[derive(Clone)]
@@ -368,6 +504,18 @@ pub struct SecretsStore {
     /// Defaults to [`MAX_REGISTERED_KEYS_PER_SCOPE`]; lowered by tests to
     /// exercise the at-cap path without writing thousands of secrets.
     max_registered_keys_per_scope: usize,
+    /// Per-user on-disk secret-byte quota in bytes (#4561, P5 of #4381).
+    /// `0` disables enforcement (the default for [`SecretsStore::new`], so
+    /// every existing call site — and the Local-only single-user path — is
+    /// unaffected). Production wires the operator-configured value in via
+    /// [`Self::with_user_quota`]. ENFORCED ONLY for [`SecretScope::User`];
+    /// [`SecretScope::Local`] is never quota-checked.
+    ///
+    /// The limit is a per-store field (not global) because it comes from the
+    /// node's `Config`; every production store in the process reads the SAME
+    /// config so they all carry the same limit, while the per-user *counters*
+    /// they enforce it against live in the process-global [`QuotaTracker`].
+    user_quota_limit_bytes: u64,
 }
 
 /// HKDF info string for per-delegate DEK derivation. Versioned (`v1`)
@@ -600,7 +748,22 @@ impl SecretsStore {
             retention: RetentionPolicy::default(),
             snapshots_enabled: std::env::var_os(DISABLE_SNAPSHOTS_ENV).is_none(),
             max_registered_keys_per_scope: MAX_REGISTERED_KEYS_PER_SCOPE,
+            // Quota OFF by default. Production opts in via `with_user_quota`
+            // from the operator config; every other call site (tests, the CLI,
+            // the export harness) keeps enforcement disabled, so the Local
+            // single-user path is byte-for-byte unchanged.
+            user_quota_limit_bytes: 0,
         })
+    }
+
+    /// Set the per-user on-disk secret-byte quota (#4561, P5 of #4381) and
+    /// return the store. `0` disables enforcement. Builder-style so the ~50
+    /// existing `SecretsStore::new(..)` call sites need no change — only the
+    /// production construction path (`get_runtime_stores`) and the quota tests
+    /// opt in. The limit only ever governs [`SecretScope::User`] writes.
+    pub fn with_user_quota(mut self, limit_bytes: u64) -> Self {
+        self.user_quota_limit_bytes = limit_bytes;
+        self
     }
 
     /// Return the backend currently holding the node KEK. Surfaced via
@@ -764,6 +927,13 @@ impl SecretsStore {
         self.max_registered_keys_per_scope = cap;
     }
 
+    /// The per-user quota limit this store enforces (bytes; `0` = disabled).
+    /// Test/diagnostic accessor.
+    #[cfg(test)]
+    pub(crate) fn user_quota_limit_bytes(&self) -> u64 {
+        self.user_quota_limit_bytes
+    }
+
     pub fn register_delegate(
         &mut self,
         delegate: DelegateKey,
@@ -848,6 +1018,70 @@ impl SecretsStore {
         ciphertext.extend_from_slice(nonce.as_slice());
         ciphertext.extend_from_slice(&aead);
 
+        // PER-USER QUOTA (#4561, P5 of #4381). ENFORCED ONLY for the per-user
+        // scope, ONLY when a positive limit is configured, and BEFORE the
+        // filesystem write so an over-quota blob never lands on disk. Local
+        // (single-user) writes skip this entirely — the "never break the
+        // single-user default" invariant.
+        //
+        // `new_blob_size` is exactly what we are about to write (the composed
+        // ciphertext, == what `metadata().len()` will report), so the running
+        // counter agrees with the lazy disk seed. An OVERWRITE of an existing
+        // user secret REPLACES its blob, so the NET change is
+        // `new_blob_size - old_blob_size`; we admit against
+        // `current_total - old_blob_size + new_blob_size`. REJECT (never evict):
+        // per-user secrets are authoritative keys, not a reclaimable cache.
+        //
+        // We compute `(user_id, old_size, new_size)` here under the pre-write
+        // borrow, then apply the NET counter adjustment only AFTER the rename
+        // durably commits (below) — so a write that fails between this check and
+        // the rename leaves the counter unchanged.
+        let mut quota_commit: Option<(UserId, u64, u64)> = None;
+        if let SecretScope::User { id, .. } = &scope
+            && self.user_quota_limit_bytes > 0
+        {
+            let limit = self.user_quota_limit_bytes;
+            let new_blob_size = ciphertext.len() as u64;
+            // Size of the blob this write would replace (0 for a brand-new key),
+            // so an overwrite is charged only its delta, not double-counted.
+            let old_blob_size = self.on_disk_blob_size(delegate, key, &scope);
+
+            // Seed this user's total from disk on first touch (once per user per
+            // process); idempotent so a concurrent seed never clobbers a live
+            // count. Fail loud if the disk walk errors — a too-low seed would
+            // defeat the guard.
+            let current_total = match USER_QUOTA_TRACKER.get(id) {
+                Some(t) => t,
+                None => {
+                    let seeded = self.seeded_user_total(&scope)?;
+                    USER_QUOTA_TRACKER.seed_if_absent(**id, seeded);
+                    // Re-read through the tracker so we observe the canonical
+                    // value even if another path seeded it first.
+                    USER_QUOTA_TRACKER.get(id).unwrap_or(seeded)
+                }
+            };
+
+            let projected = current_total
+                .saturating_sub(old_blob_size)
+                .saturating_add(new_blob_size);
+            if projected > limit {
+                tracing::warn!(
+                    user_id = %id.encode(),
+                    used = current_total,
+                    limit,
+                    attempted = new_blob_size,
+                    "rejecting per-user secret write: would exceed quota"
+                );
+                return Err(SecretStoreError::QuotaExceeded {
+                    used: current_total,
+                    limit,
+                    attempted: new_blob_size,
+                }
+                .into());
+            }
+            quota_commit = Some((**id, old_blob_size, new_blob_size));
+        }
+
         fs::create_dir_all(&scope_path)?;
         // Tighten EVERY segment from base_path down to the leaf, not just the
         // leaf: `create_dir_all` makes the intermediate `users/<id>` (and
@@ -908,6 +1142,20 @@ impl SecretsStore {
                 );
             }
             return Err(err.into());
+        }
+
+        // The new blob is now durably at the active path. Apply the NET quota
+        // adjustment (`new_size - old_size`) for the per-user scope. Seeding
+        // (above) guarantees the user is already in the tracker, so the
+        // add/sub land on a real entry. Ordered AFTER the rename so a failed
+        // write never moves the counter; ordered BEFORE index/registry updates
+        // so the byte accounting reflects committed disk state.
+        if let Some((user_id, old_size, new_size)) = quota_commit {
+            if new_size >= old_size {
+                USER_QUOTA_TRACKER.add(&user_id, new_size - old_size);
+            } else {
+                USER_QUOTA_TRACKER.sub_saturating(&user_id, old_size - new_size);
+            }
         }
 
         // Update index in ReDb and in-memory only after the active path has
@@ -1018,6 +1266,18 @@ impl SecretsStore {
         let secret_path = scope_path.join(key.encode());
         let snap_dir = snapshot_dir_for(&scope_path, key);
 
+        // PER-USER QUOTA (#4561): read the blob's on-disk size BEFORE deleting
+        // it, so we can decrement the user's counter by exactly the bytes this
+        // removal frees — keeping it consistent with the `store_secret`
+        // increment and the lazy disk seed. Only meaningful for the per-user
+        // scope; 0 for Local or an already-absent file. We apply the decrement
+        // AFTER a successful delete (below), and only to an already-seeded user
+        // (an unseeded user will pick up the removal on its next seed walk).
+        let removed_blob_size = match &scope {
+            SecretScope::User { .. } => self.on_disk_blob_size(delegate, key, &scope),
+            SecretScope::Local => 0,
+        };
+
         // Best-effort delete of the snapshot history. Removing a secret means
         // the user no longer wants any version of that value retained.
         if snap_dir.exists() {
@@ -1030,7 +1290,16 @@ impl SecretsStore {
         }
 
         match fs::remove_file(&secret_path) {
-            Ok(()) => {}
+            Ok(()) => {
+                // The blob is gone from disk; free its bytes from the user's
+                // quota counter. `sub_saturating` is a no-op when the user is
+                // not tracked yet, and saturates at 0 against any drift.
+                if let SecretScope::User { id, .. } = &scope
+                    && removed_blob_size > 0
+                {
+                    USER_QUOTA_TRACKER.sub_saturating(id, removed_blob_size);
+                }
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
         }
@@ -1790,6 +2059,72 @@ impl SecretsStore {
         Ok(())
     }
 
+    /// Sum the on-disk ciphertext bytes a single user currently holds across
+    /// ALL delegates, by walking `<delegate>/users/<user_id>/` on disk and
+    /// adding each blob's `metadata().len()`.
+    ///
+    /// This is the quota tracker's lazy seed (#4561): it runs once per user per
+    /// process on the first `store_secret`/`remove_secret` that touches a
+    /// not-yet-seeded `UserId`; subsequent ops are O(1) atomic adjustments.
+    /// Reusing [`Self::walk_scope_secrets_on_disk`] guarantees the byte total is
+    /// summed over the SAME set of blobs the enforcement increment sizes
+    /// against (the on-disk active files — the shared cross-executor source of
+    /// truth), so the seed and the running counter can never disagree about
+    /// what counts. The walker reconstructs each blob's path from the scope dir
+    /// + `bs58(secret_hash)`; we `metadata().len()` that path.
+    ///
+    /// FAIL-LOUD on an unexpected I/O error (propagated by the walker), same as
+    /// the export count: a silently-too-low seed would let a user exceed their
+    /// quota, which is exactly the disk-exhaustion this guard prevents.
+    fn seeded_user_total(&self, scope: &SecretScope<'_>) -> Result<u64, SecretStoreError> {
+        let mut total: u64 = 0;
+        let mut walk_err: Option<SecretStoreError> = None;
+        self.walk_scope_secrets_on_disk(scope, |delegate, secret_hash| {
+            let encoded = bs58::encode(&secret_hash)
+                .with_alphabet(bs58::Alphabet::BITCOIN)
+                .into_string();
+            let path = self.scope_dir(&delegate, scope).join(&encoded);
+            match fs::metadata(&path) {
+                Ok(md) => {
+                    total = total.saturating_add(md.len());
+                    std::ops::ControlFlow::Continue(())
+                }
+                // A blob that vanished between the readdir and the metadata
+                // stat (concurrent remove) simply doesn't count — it's no
+                // longer on disk. Any OTHER stat error is unexpected: record it
+                // and stop so the seed fails loud rather than under-counting.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    std::ops::ControlFlow::Continue(())
+                }
+                Err(e) => {
+                    walk_err = Some(SecretStoreError::IO(e));
+                    std::ops::ControlFlow::Break(())
+                }
+            }
+        })?;
+        if let Some(e) = walk_err {
+            return Err(e);
+        }
+        Ok(total)
+    }
+
+    /// On-disk size (in bytes) of a stored secret blob under `scope`, or
+    /// `Ok(0)` if it is absent. Used by [`Self::remove_secret`] to learn how
+    /// many bytes a removal frees BEFORE deleting the file, so the quota
+    /// counter is decremented by exactly what the seed/increment counted.
+    fn on_disk_blob_size(
+        &self,
+        delegate: &DelegateKey,
+        key: &SecretsId,
+        scope: &SecretScope<'_>,
+    ) -> u64 {
+        let path = self.scope_dir(delegate, scope).join(key.encode());
+        match fs::metadata(&path) {
+            Ok(md) => md.len(),
+            Err(_) => 0,
+        }
+    }
+
     /// Read + decrypt the active secret blob named `bs58(secret_hash)` under
     /// `scope`. The by-hash analogue of [`Self::get_secret`]; it exists because
     /// the export enumeration only ever recovers the hash, never a `SecretsId`.
@@ -2018,6 +2353,18 @@ impl SecretsStore {
             return Ok(false);
         }
 
+        // NOTE (#4561): `import_secret_by_hash` is the P3 migration/restore path
+        // (an operator importing a user's OWN previously-exported secrets), NOT
+        // the delegate-driven `store_secret` hot path. It is deliberately NOT
+        // quota-checked: rejecting a blob mid-restore would corrupt the
+        // migration, and an import re-materializes data the user already
+        // legitimately held. The quota tracker is left untouched here; it
+        // self-corrects because it seeds lazily from disk (which now includes
+        // the imported blobs) on the next process's first `store_secret` touch
+        // for this user. Imports are infrequent and bounded by the export count
+        // cap, so the within-process window where the tracker under-counts an
+        // imported amount is acceptable.
+
         // Select / derive the scope DEK exactly as `store_secret` does so the
         // imported blob is readable by `get_secret` afterwards.
         let encryption = match &scope {
@@ -2239,6 +2586,11 @@ fn log_legacy_decrypt(key: &str, idx: usize, is_migration: bool, format: &str) {
 #[cfg(test)]
 mod test {
     use super::*;
+    // The quota tests match on the inner runtime error to confirm a
+    // `QuotaExceeded` survives the `SecretStoreError -> RuntimeInnerError`
+    // conversion (the variant `native_api::set_secret` maps to
+    // ERR_STORAGE_FAILED).
+    use crate::wasm_runtime::RuntimeInnerError;
     use crate::wasm_runtime::secret_snapshots::{RetentionBucket, RetentionPolicy};
     use aes_gcm::KeyInit;
     use std::time::Duration;
@@ -3339,7 +3691,8 @@ mod test {
             SecretStoreError::Encryption(_)
             | SecretStoreError::IO(_)
             | SecretStoreError::MissingCipher
-            | SecretStoreError::MissingSecret(_) => {
+            | SecretStoreError::MissingSecret(_)
+            | SecretStoreError::QuotaExceeded { .. } => {
                 panic!("expected SnapshotNotFound, got {err:?}");
             }
         }
@@ -5621,6 +5974,508 @@ mod test {
             "user secret must be enumerable after repair"
         );
         assert_eq!(entries[0].secret_hash, secret_hash);
+        Ok(())
+    }
+
+    // ===== #4561 / P5 of #4381: per-user secret storage quota =====
+
+    /// On-disk size of a stored blob for a `plaintext.len()` of `n`:
+    /// `[VERSION_V1][24-byte XNonce][AEAD ciphertext + 16-byte Poly1305 tag]`
+    /// => `HEADER_LEN (25) + n + 16`. The tests below pick plaintext lengths so
+    /// the resulting on-disk totals straddle the configured quota precisely.
+    fn on_disk_size(plaintext_len: usize) -> u64 {
+        (HEADER_LEN + plaintext_len + 16) as u64
+    }
+
+    /// Build a per-user scope for `id` under a fixed dek_secret. Each test uses
+    /// a UNIQUE id so they never share the process-global tracker entry; we also
+    /// reset that entry up front as belt-and-suspenders.
+    fn fresh_user(id_byte: u8) -> (UserId, Zeroizing<[u8; 32]>) {
+        let id = UserId::new([id_byte; 32]);
+        quota_reset_user_for_test(&id);
+        (id, user_dek(0xAB))
+    }
+
+    /// A user write that stays under the configured quota succeeds, and the
+    /// shared tracker reflects exactly the on-disk bytes written.
+    #[tokio::test]
+    async fn under_quota_user_write_succeeds() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        // Generous quota: 4 KiB.
+        let mut store =
+            SecretsStore::new(secrets_dir, Default::default(), db)?.with_user_quota(4096);
+
+        let delegate = Delegate::from((&vec![10].into(), &vec![].into()));
+        let (id, dek) = fresh_user(0x10);
+        let secret_id = SecretsId::new(vec![11]);
+        let plaintext = b"a modest secret".to_vec();
+        let expected = on_disk_size(plaintext.len());
+
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::User {
+                id: &id,
+                dek_secret: &dek,
+            },
+            Zeroizing::new(plaintext),
+        )?;
+
+        assert_eq!(
+            quota_tracked_total_for_test(&id),
+            Some(expected),
+            "tracker must reflect exactly the on-disk bytes written"
+        );
+        Ok(())
+    }
+
+    /// A write whose on-disk size would push the user over their quota is
+    /// REJECTED with `QuotaExceeded`, the secret is NOT written, and the tracker
+    /// is unchanged.
+    #[tokio::test]
+    async fn over_quota_user_write_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+
+        let delegate = Delegate::from((&vec![20].into(), &vec![].into()));
+        let (id, dek) = fresh_user(0x20);
+        let scope = SecretScope::User {
+            id: &id,
+            dek_secret: &dek,
+        };
+
+        // First blob: 100 bytes plaintext => 100 + 41 = 141 on-disk.
+        let first = vec![7u8; 100];
+        let first_size = on_disk_size(first.len());
+        // Quota leaves room for the first blob but not a second 100-byte blob.
+        let quota = first_size + 50;
+        let mut store =
+            SecretsStore::new(secrets_dir.clone(), Default::default(), db)?.with_user_quota(quota);
+
+        store.store_secret(
+            delegate.key(),
+            &SecretsId::new(vec![1]),
+            SecretScope::User {
+                id: &id,
+                dek_secret: &dek,
+            },
+            Zeroizing::new(first),
+        )?;
+        assert_eq!(quota_tracked_total_for_test(&id), Some(first_size));
+
+        // Second blob would bring the total to 282 > quota (191): reject.
+        let second_id = SecretsId::new(vec![2]);
+        let result = store.store_secret(
+            delegate.key(),
+            &second_id,
+            scope,
+            Zeroizing::new(vec![9u8; 100]),
+        );
+        let err = result.expect_err("over-quota write must be rejected");
+        // The error is a QuotaExceeded carrying non-secret byte counts. (At the
+        // delegate boundary this maps to ERR_STORAGE_FAILED via
+        // `native_api::set_secret`'s existing error->code path — see the
+        // dedicated mapping test below.)
+        let RuntimeInnerError::SecretStoreError(SecretStoreError::QuotaExceeded {
+            used,
+            limit,
+            attempted,
+        }) = err.deref()
+        else {
+            panic!("expected QuotaExceeded, got {:?}", err.deref());
+        };
+        assert_eq!(*used, first_size, "used = current total before the write");
+        assert_eq!(*limit, quota);
+        assert_eq!(*attempted, on_disk_size(100));
+
+        // The rejected secret must NOT be on disk and the tracker is unchanged.
+        let rejected_path = store
+            .scope_dir(
+                delegate.key(),
+                &SecretScope::User {
+                    id: &id,
+                    dek_secret: &dek,
+                },
+            )
+            .join(second_id.encode());
+        assert!(
+            !rejected_path.exists(),
+            "rejected secret must not be written to disk"
+        );
+        assert_eq!(
+            quota_tracked_total_for_test(&id),
+            Some(first_size),
+            "tracker must be unchanged after a rejected write"
+        );
+        Ok(())
+    }
+
+    /// `QuotaExceeded` from `store_secret` carries only non-secret numbers and
+    /// is the variant `native_api::set_secret` maps to `ERR_STORAGE_FAILED`.
+    /// This pins the propagation contract: the variant survives the
+    /// `SecretStoreError -> RuntimeInnerError -> ContractError` conversion that
+    /// `set_secret`'s `Err(_) => ERR_STORAGE_FAILED` arm consumes.
+    #[tokio::test]
+    async fn quota_exceeded_propagates_as_storage_failure() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        // Quota smaller than any single blob's overhead => every user write
+        // rejects.
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?.with_user_quota(1);
+
+        let delegate = Delegate::from((&vec![21].into(), &vec![].into()));
+        let (id, dek) = fresh_user(0x21);
+        let err = store
+            .store_secret(
+                delegate.key(),
+                &SecretsId::new(vec![1]),
+                SecretScope::User {
+                    id: &id,
+                    dek_secret: &dek,
+                },
+                Zeroizing::new(vec![1u8; 8]),
+            )
+            .expect_err("must reject");
+        // A RuntimeResult error converts cleanly; the inner variant is the one
+        // set_secret's catch-all Err arm turns into ERR_STORAGE_FAILED.
+        assert!(
+            matches!(
+                err.deref(),
+                RuntimeInnerError::SecretStoreError(SecretStoreError::QuotaExceeded { .. })
+            ),
+            "quota rejection must surface as a SecretStoreError storage failure"
+        );
+        Ok(())
+    }
+
+    /// Removing a user secret frees its bytes so a write that previously failed
+    /// the quota now succeeds.
+    #[tokio::test]
+    async fn remove_frees_room_for_previously_rejected_write()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+
+        let delegate = Delegate::from((&vec![30].into(), &vec![].into()));
+        let (id, dek) = fresh_user(0x30);
+        let blob_size = on_disk_size(100);
+        // Quota holds exactly ONE 100-byte blob.
+        let quota = blob_size;
+        let mut store =
+            SecretsStore::new(secrets_dir, Default::default(), db)?.with_user_quota(quota);
+
+        let id_a = SecretsId::new(vec![1]);
+        let id_b = SecretsId::new(vec![2]);
+
+        store.store_secret(
+            delegate.key(),
+            &id_a,
+            SecretScope::User {
+                id: &id,
+                dek_secret: &dek,
+            },
+            Zeroizing::new(vec![1u8; 100]),
+        )?;
+
+        // Second write rejected — no room.
+        assert!(
+            store
+                .store_secret(
+                    delegate.key(),
+                    &id_b,
+                    SecretScope::User {
+                        id: &id,
+                        dek_secret: &dek,
+                    },
+                    Zeroizing::new(vec![2u8; 100]),
+                )
+                .is_err(),
+            "second write must be rejected while the quota is full"
+        );
+
+        // Remove the first secret, freeing its bytes.
+        store.remove_secret(
+            delegate.key(),
+            &id_a,
+            SecretScope::User {
+                id: &id,
+                dek_secret: &dek,
+            },
+        )?;
+        assert_eq!(
+            quota_tracked_total_for_test(&id),
+            Some(0),
+            "removal must free the user's bytes"
+        );
+
+        // Now the previously-rejected write fits.
+        store.store_secret(
+            delegate.key(),
+            &id_b,
+            SecretScope::User {
+                id: &id,
+                dek_secret: &dek,
+            },
+            Zeroizing::new(vec![2u8; 100]),
+        )?;
+        assert_eq!(quota_tracked_total_for_test(&id), Some(blob_size));
+        Ok(())
+    }
+
+    /// The lazy disk seed sums an existing on-disk layout: a SECOND store opened
+    /// over a populated `secrets_dir` (fresh process-global entry) seeds the
+    /// user's total by walking the disk on first touch, and admits/rejects
+    /// against that seeded total.
+    #[tokio::test]
+    async fn lazy_disk_seed_matches_hand_built_layout() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+
+        let delegate = Delegate::from((&vec![40].into(), &vec![].into()));
+        let (id, dek) = fresh_user(0x40);
+
+        // Populate two user blobs with a quota-disabled store so no tracking
+        // happens during setup — this mimics secrets already on disk from a
+        // prior process.
+        {
+            let mut setup = SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())?;
+            for (i, len) in [(1u8, 100usize), (2u8, 50usize)] {
+                setup.store_secret(
+                    delegate.key(),
+                    &SecretsId::new(vec![i]),
+                    SecretScope::User {
+                        id: &id,
+                        dek_secret: &dek,
+                    },
+                    Zeroizing::new(vec![i; len]),
+                )?;
+            }
+        }
+        let expected_seed = on_disk_size(100) + on_disk_size(50);
+
+        // Reset the tracker so the next store seeds fresh from disk.
+        quota_reset_user_for_test(&id);
+
+        // New store with a quota that leaves only a few free bytes after the
+        // seed. The seed walk must find both existing blobs.
+        let quota = expected_seed + 10;
+        let mut store =
+            SecretsStore::new(secrets_dir, Default::default(), db)?.with_user_quota(quota);
+
+        // A 1-byte plaintext => 42 on-disk, which exceeds the 10 free bytes:
+        // proves the seed counted BOTH existing blobs (else there'd be room).
+        let err = store
+            .store_secret(
+                delegate.key(),
+                &SecretsId::new(vec![3]),
+                SecretScope::User {
+                    id: &id,
+                    dek_secret: &dek,
+                },
+                Zeroizing::new(vec![3u8; 1]),
+            )
+            .expect_err("seed must account for both existing blobs => over quota");
+        let RuntimeInnerError::SecretStoreError(SecretStoreError::QuotaExceeded { used, .. }) =
+            err.deref()
+        else {
+            panic!("expected QuotaExceeded, got {:?}", err.deref());
+        };
+        assert_eq!(
+            *used, expected_seed,
+            "seed must equal the summed disk bytes"
+        );
+        // And the tracker now holds the seeded total.
+        assert_eq!(quota_tracked_total_for_test(&id), Some(expected_seed));
+        Ok(())
+    }
+
+    /// THE shared-counter property: two `SecretsStore`s over the SAME
+    /// `secrets_dir` (simulating two pooled executors) see each other's
+    /// accounting through the process-global tracker. A write via store A is
+    /// reflected when store B enforces the quota.
+    #[tokio::test]
+    async fn two_stores_share_quota_accounting() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+
+        let delegate = Delegate::from((&vec![50].into(), &vec![].into()));
+        let (id, dek) = fresh_user(0x50);
+        let blob_size = on_disk_size(100);
+        let quota = blob_size; // room for exactly one blob, total across stores.
+
+        let mut store_a = SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())?
+            .with_user_quota(quota);
+        let mut store_b =
+            SecretsStore::new(secrets_dir, Default::default(), db)?.with_user_quota(quota);
+
+        // Write via A.
+        store_a.store_secret(
+            delegate.key(),
+            &SecretsId::new(vec![1]),
+            SecretScope::User {
+                id: &id,
+                dek_secret: &dek,
+            },
+            Zeroizing::new(vec![1u8; 100]),
+        )?;
+
+        // B must observe A's bytes in the shared tracker and REJECT a second
+        // blob that would exceed the shared quota.
+        let err = store_b
+            .store_secret(
+                delegate.key(),
+                &SecretsId::new(vec![2]),
+                SecretScope::User {
+                    id: &id,
+                    dek_secret: &dek,
+                },
+                Zeroizing::new(vec![2u8; 100]),
+            )
+            .expect_err("store B must see store A's accounting via the shared tracker");
+        assert!(matches!(
+            err.deref(),
+            RuntimeInnerError::SecretStoreError(SecretStoreError::QuotaExceeded { .. })
+        ));
+        assert_eq!(
+            quota_tracked_total_for_test(&id),
+            Some(blob_size),
+            "the shared tracker holds only store A's write"
+        );
+        Ok(())
+    }
+
+    /// INVARIANT: `SecretScope::Local` is NEVER quota-checked. A Local write far
+    /// past the configured limit succeeds, and the user tracker is untouched.
+    #[tokio::test]
+    async fn local_scope_never_quota_checked() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        // Tiny quota (1 byte) — would reject any User write.
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?.with_user_quota(1);
+
+        let delegate = Delegate::from((&vec![60].into(), &vec![].into()));
+        // A large Local secret, well past the 1-byte quota, must store fine.
+        store.store_secret(
+            delegate.key(),
+            &SecretsId::new(vec![1]),
+            SecretScope::Local,
+            Zeroizing::new(vec![0u8; 10_000]),
+        )?;
+        let got = store.get_secret(delegate.key(), &SecretsId::new(vec![1]), SecretScope::Local)?;
+        assert_eq!(
+            got.len(),
+            10_000,
+            "Local write must succeed regardless of quota"
+        );
+        Ok(())
+    }
+
+    /// quota = 0 disables enforcement entirely: a user write of any size
+    /// succeeds and the tracker stays empty (the seed/increment path is skipped).
+    #[tokio::test]
+    async fn quota_zero_disables_enforcement() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?.with_user_quota(0);
+        assert_eq!(store.user_quota_limit_bytes(), 0);
+
+        let delegate = Delegate::from((&vec![70].into(), &vec![].into()));
+        let (id, dek) = fresh_user(0x70);
+        store.store_secret(
+            delegate.key(),
+            &SecretsId::new(vec![1]),
+            SecretScope::User {
+                id: &id,
+                dek_secret: &dek,
+            },
+            Zeroizing::new(vec![0u8; 1_000_000]),
+        )?;
+        assert_eq!(
+            quota_tracked_total_for_test(&id),
+            None,
+            "quota=0 must skip the tracker entirely (no seed, no increment)"
+        );
+        Ok(())
+    }
+
+    /// Overwriting a user secret charges only the DELTA: replacing a blob with a
+    /// larger one adds (new - old); replacing with a smaller one frees
+    /// (old - new). Confirms the counter never double-counts an overwrite.
+    #[tokio::test]
+    async fn overwrite_charges_only_delta() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store =
+            SecretsStore::new(secrets_dir, Default::default(), db)?.with_user_quota(100_000);
+
+        let delegate = Delegate::from((&vec![80].into(), &vec![].into()));
+        let (id, dek) = fresh_user(0x80);
+        let secret_id = SecretsId::new(vec![1]);
+
+        // First write: 100 bytes.
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::User {
+                id: &id,
+                dek_secret: &dek,
+            },
+            Zeroizing::new(vec![1u8; 100]),
+        )?;
+        assert_eq!(quota_tracked_total_for_test(&id), Some(on_disk_size(100)));
+
+        // Overwrite SAME key with 300 bytes: total must be exactly the new
+        // blob's size, not first+second.
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::User {
+                id: &id,
+                dek_secret: &dek,
+            },
+            Zeroizing::new(vec![2u8; 300]),
+        )?;
+        assert_eq!(
+            quota_tracked_total_for_test(&id),
+            Some(on_disk_size(300)),
+            "overwrite must charge only the delta, not double-count"
+        );
+
+        // Overwrite again with a SMALLER blob: total shrinks accordingly.
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::User {
+                id: &id,
+                dek_secret: &dek,
+            },
+            Zeroizing::new(vec![3u8; 10]),
+        )?;
+        assert_eq!(
+            quota_tracked_total_for_test(&id),
+            Some(on_disk_size(10)),
+            "shrinking overwrite must free the freed bytes"
+        );
         Ok(())
     }
 }

@@ -49,7 +49,8 @@ pub(crate) use native_api::InheritedOriginsEntry;
 pub use runtime::{ContractExecError, Runtime};
 pub(crate) use runtime::{RuntimeConfig, SharedModuleCache};
 pub use secrets_store::{
-    ExportSecretEntry, SecretScope, SecretStoreError, SecretsStore, UserSecretContext,
+    DEFAULT_PER_USER_SECRET_QUOTA_BYTES, ExportSecretEntry, SecretScope, SecretStoreError,
+    SecretsStore, UserSecretContext,
 };
 // NOTE: InMemoryContractStore and SimulationStores are available but currently unused
 // They provide infrastructure for more sophisticated simulation scenarios
