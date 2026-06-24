@@ -390,22 +390,24 @@ impl RuntimePool {
         // pass `shared_state_store.storage()` rather than opening a second
         // database. Its abort guard is owned by the pool so node shutdown tears
         // it down (#4401 discipline).
-        let inactive_user_sweep =
-            if config.ws_api.hosted_mode && config.per_user_inactive_ttl_secs > 0 {
-                crate::wasm_runtime::spawn_inactive_user_sweep(
-                    config.secrets_dir(),
-                    shared_state_store.storage(),
-                    config.per_user_inactive_ttl_secs,
-                    config.inactive_user_sweep_interval_secs,
-                )
-                .map(|handle| {
-                    let mut guard = crate::util::AbortOnDrop::new();
-                    guard.push(handle.abort_handle());
-                    guard
-                })
-            } else {
-                None
-            };
+        let inactive_user_sweep = if crate::wasm_runtime::should_spawn_inactive_user_sweep(
+            config.ws_api.hosted_mode,
+            config.per_user_inactive_ttl_secs,
+        ) {
+            crate::wasm_runtime::spawn_inactive_user_sweep(
+                config.secrets_dir(),
+                shared_state_store.storage(),
+                config.per_user_inactive_ttl_secs,
+                config.inactive_user_sweep_interval_secs,
+            )
+            .map(|handle| {
+                let mut guard = crate::util::AbortOnDrop::new();
+                guard.push(handle.abort_handle());
+                guard
+            })
+        } else {
+            None
+        };
 
         Ok(Self {
             runtimes,

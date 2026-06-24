@@ -51,7 +51,8 @@ pub(crate) use runtime::{RuntimeConfig, SharedModuleCache};
 pub use secrets_store::{
     DEFAULT_LAST_SEEN_DEBOUNCE_SECS, DEFAULT_PER_USER_INACTIVE_TTL_SECS,
     DEFAULT_PER_USER_SECRET_QUOTA_BYTES, ExportSecretEntry, SecretScope, SecretStoreError,
-    SecretsStore, UserId, UserSecretContext, spawn_inactive_user_sweep, stamp_user_last_seen,
+    SecretsStore, UserId, UserSecretContext, should_spawn_inactive_user_sweep,
+    spawn_inactive_user_sweep, stamp_user_last_seen, wall_clock_unix_secs,
 };
 // NOTE: InMemoryContractStore and SimulationStores are available but currently unused
 // They provide infrastructure for more sophisticated simulation scenarios

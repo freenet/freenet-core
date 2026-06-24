@@ -949,9 +949,20 @@ impl ConfigArgs {
             per_user_inactive_ttl_secs: self
                 .per_user_inactive_ttl_secs
                 .unwrap_or(default_per_user_inactive_ttl_secs()),
-            inactive_user_sweep_interval_secs: self
-                .inactive_user_sweep_interval_secs
-                .unwrap_or(default_inactive_user_sweep_interval_secs()),
+            inactive_user_sweep_interval_secs: {
+                // `0` means "use the default" (an interval of 0 is meaningless —
+                // the sweep would otherwise floor it to 1s and hammer the disk).
+                // Remap here so the resolved value always reflects the documented
+                // semantics, rather than relying on a downstream `.max(1)`.
+                let v = self
+                    .inactive_user_sweep_interval_secs
+                    .unwrap_or(default_inactive_user_sweep_interval_secs());
+                if v == 0 {
+                    default_inactive_user_sweep_interval_secs()
+                } else {
+                    v
+                }
+            },
             module_cache_budget_bytes: self
                 .module_cache_budget_bytes
                 .unwrap_or_else(crate::wasm_runtime::default_module_cache_budget_bytes),

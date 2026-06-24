@@ -1646,10 +1646,9 @@ fn stamp_activity(dir: &crate::server::ActivitySecretsDir, ctx: &UserSecretConte
     if base.as_os_str().is_empty() {
         return;
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    // Single shared wall-clock source (incl. its clamp-to-0) so the stamp hook
+    // and the reclaim sweep can never drift.
+    let now = crate::wasm_runtime::wall_clock_unix_secs();
     crate::wasm_runtime::stamp_user_last_seen(
         base,
         ctx.user_id(),
