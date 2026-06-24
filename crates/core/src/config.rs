@@ -121,12 +121,16 @@ pub struct ConfigArgs {
     pub max_hosting_storage: Option<u64>,
 
     /// Per-user secret-storage quota in bytes for HOSTED mode (#4561, P5 of
-    /// #4381). Bounds the total on-disk ciphertext a single hosted user (one
-    /// `userToken`) can store in their delegate secrets, summed across every
-    /// delegate, so a visitor cannot fill the node's disk. REJECT-on-full
-    /// (never evict — secrets are authoritative identity/room keys, not a
-    /// cache). Default: 4 MiB. `0` disables enforcement. Has NO effect outside
-    /// hosted mode — local single-user secrets are never quota-checked.
+    /// #4381). Bounds a single hosted user's (one `userToken`) TOTAL on-disk
+    /// footprint under their `users/<user_id>/` tree, summed across every
+    /// delegate — both the active secret-value blobs AND the `.keys`
+    /// enumeration registry (so many/large keys are charged too) — so a visitor
+    /// cannot fill the node's disk. Per-user secret-value snapshots are disabled
+    /// (hosted users are transient and don't need overwrite history), so there
+    /// is no `.snapshots/` growth to charge. REJECT-on-full (never evict —
+    /// secrets are authoritative identity/room keys, not a cache). Default:
+    /// 4 MiB. `0` disables enforcement. Has NO effect outside hosted mode —
+    /// local single-user secrets are never quota-checked (and keep snapshots).
     #[arg(long = "per-user-secret-quota", env = "PER_USER_SECRET_QUOTA")]
     pub per_user_secret_quota_bytes: Option<u64>,
 
@@ -1015,10 +1019,12 @@ pub struct Config {
     )]
     pub max_hosting_storage: u64,
     /// Per-user secret-storage quota in bytes for hosted mode (#4561, P5 of
-    /// #4381). Bounds the total on-disk ciphertext a single hosted user can
-    /// store in their delegate secrets, summed across delegates. REJECT-on-full
-    /// (never evict). Default 4 MiB; `0` disables. No effect outside hosted
-    /// mode (local single-user secrets are never quota-checked).
+    /// #4381). Bounds a single hosted user's TOTAL on-disk footprint (active
+    /// secret-value blobs + the `.keys` enumeration registry) under their
+    /// `users/<user_id>/` tree, summed across delegates. Per-user value
+    /// snapshots are disabled, so there is no `.snapshots/` growth to charge.
+    /// REJECT-on-full (never evict). Default 4 MiB; `0` disables. No effect
+    /// outside hosted mode (local single-user secrets are never quota-checked).
     #[serde(
         default = "default_per_user_secret_quota_bytes",
         rename = "per-user-secret-quota"

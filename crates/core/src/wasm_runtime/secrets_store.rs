@@ -55,6 +55,13 @@ const VERSION_V1: u8 = 0x01;
 /// raw AEAD ciphertext: 1 version byte + 24-byte XNonce.
 const HEADER_LEN: usize = 1 + 24;
 
+/// Length of the AEAD authentication tag (Poly1305) appended to every
+/// ciphertext. XChaCha20-Poly1305's ciphertext is `plaintext.len() + TAG_LEN`,
+/// so an on-disk blob is `HEADER_LEN + plaintext.len() + TAG_LEN`. Used by the
+/// per-user quota footprint accounting (#4561) to project the `.keys` registry
+/// file's exact on-disk size after adding a key, WITHOUT re-encrypting.
+const TAG_LEN: usize = 16;
+
 type SecretKey = [u8; 32];
 
 /// File name (inside a scope directory) of the encrypted registry that maps
@@ -286,7 +293,7 @@ pub const DEFAULT_PER_USER_SECRET_QUOTA_BYTES: usize = 4 * 1024 * 1024;
 /// `UserId` key is a globally-unique 32-byte hash, so cross-node/cross-delegate
 /// collisions are impossible and a single global namespace is correct.
 ///
-/// # Concurrency
+/// # Concurrency — the no-CAS safety is NON-LOCAL
 ///
 /// Delegate execution is SERIAL on the contract loop — only one `store_secret`
 /// runs at a time node-wide — so the increment/decrement are never actually
@@ -294,6 +301,22 @@ pub const DEFAULT_PER_USER_SECRET_QUOTA_BYTES: usize = 4 * 1024 * 1024;
 /// is held as an [`AtomicU64`](std::sync::atomic::AtomicU64) as cheap insurance
 /// (and so reads never need the `DashMap` write path), but no compare-and-swap
 /// is required precisely because of that serial-execution guarantee.
+///
+/// WARNING: this safety rests on a property OUTSIDE this module. Two things
+/// would race if delegate `process()` were ever offloaded to run concurrently
+/// across pooled executors:
+///
+/// 1. the load-then-store decrement in [`Self::sub_saturating`] (lost update),
+///    and
+/// 2. the check→commit gap in `store_secret` — the quota admission check reads
+///    the total, then the counter is bumped only AFTER the rename, so two
+///    concurrent admissions could both pass against the same pre-write total
+///    and jointly exceed the limit.
+///
+/// If delegate execution ever becomes concurrent, BOTH the decrement and the
+/// admission/commit must move to a real compare-and-swap (or a per-user lock);
+/// an `AtomicU64` alone is not enough. Keep this guarantee in mind before
+/// parallelizing the contract loop.
 ///
 /// # Seeding
 ///
@@ -359,6 +382,31 @@ impl QuotaTracker {
 static USER_QUOTA_TRACKER: std::sync::LazyLock<QuotaTracker> =
     std::sync::LazyLock::new(QuotaTracker::new);
 
+/// Apply a signed byte delta to a user's tracked footprint total: positive →
+/// add, negative → saturating subtract. Used by `store_secret` to fold in the
+/// value-blob delta and the `.keys`-registry delta (either can be negative on
+/// an overwrite/registry-shrink). `i128` cannot overflow for any realistic
+/// `u64` byte size pair.
+fn apply_signed_delta(user: &UserId, delta: i128) {
+    use std::cmp::Ordering;
+    match delta.cmp(&0) {
+        Ordering::Greater => USER_QUOTA_TRACKER.add(user, delta as u64),
+        Ordering::Less => USER_QUOTA_TRACKER.sub_saturating(user, (-delta) as u64),
+        Ordering::Equal => {}
+    }
+}
+
+/// Captured under the pre-write borrow in `store_secret` and consumed after the
+/// rename + `register_key` commit to update the per-user footprint counter. We
+/// stat the value blob's old size and the `.keys` registry's old size BEFORE
+/// the write, then re-stat the real post-write sizes to fold in exact deltas.
+struct QuotaCommit {
+    user_id: UserId,
+    old_blob_size: u64,
+    new_blob_size: u64,
+    old_keys_size: u64,
+}
+
 /// Test-only view of a user's currently-tracked total (`None` if unseeded).
 /// Lets a test observe the SHARED process-global counter directly — including
 /// confirming that a write through one [`SecretsStore`] is visible to another.
@@ -394,9 +442,17 @@ pub enum SecretStoreError {
     #[error("no snapshot for secret {key} at timestamp_ms {timestamp_ms}")]
     SnapshotNotFound { key: SecretsId, timestamp_ms: u64 },
     /// A per-user ([`SecretScope::User`]) write was REJECTED because it would
-    /// push the user's total on-disk secret bytes over their configured quota
+    /// push the user's TOTAL on-disk footprint over their configured quota
     /// (#4561, P5 of #4381). Hosted mode only — [`SecretScope::Local`] is never
     /// quota-checked, so single-user nodes can never see this.
+    ///
+    /// "Total footprint" is everything a hosted user controls under their
+    /// `users/<user_id>/` tree across all delegates: the active secret-value
+    /// blobs PLUS the per-(delegate,user) `.keys` enumeration registry files.
+    /// Secret-value snapshots are DISABLED for the per-user scope (hosted users
+    /// are transient and don't need overwrite/rollback history), so there is no
+    /// `.snapshots/` growth vector to charge. Together this makes the footprint
+    /// provably bounded by `limit`.
     ///
     /// REJECT-on-full, never evict: per-user secrets are authoritative identity
     /// and room keys, not a reconstructible cache, so dropping an existing one
@@ -1020,23 +1076,31 @@ impl SecretsStore {
 
         // PER-USER QUOTA (#4561, P5 of #4381). ENFORCED ONLY for the per-user
         // scope, ONLY when a positive limit is configured, and BEFORE the
-        // filesystem write so an over-quota blob never lands on disk. Local
+        // filesystem write so an over-quota write never lands on disk. Local
         // (single-user) writes skip this entirely — the "never break the
         // single-user default" invariant.
         //
-        // `new_blob_size` is exactly what we are about to write (the composed
-        // ciphertext, == what `metadata().len()` will report), so the running
-        // counter agrees with the lazy disk seed. An OVERWRITE of an existing
-        // user secret REPLACES its blob, so the NET change is
-        // `new_blob_size - old_blob_size`; we admit against
-        // `current_total - old_blob_size + new_blob_size`. REJECT (never evict):
-        // per-user secrets are authoritative keys, not a reclaimable cache.
+        // The quota bounds the user's TOTAL on-disk footprint under
+        // `users/<user_id>/`, which has two components a hosted user controls:
+        //   - the active value blob (`new_blob_size` == the composed ciphertext,
+        //     == what `metadata().len()` will report), and
+        //   - the `.keys` enumeration registry, which `register_key` grows when
+        //     this write introduces a NEW distinct key (so many/large keys with
+        //     tiny values are charged too).
+        // `.snapshots/` is NOT a vector: per-user snapshots are disabled below.
         //
-        // We compute `(user_id, old_size, new_size)` here under the pre-write
-        // borrow, then apply the NET counter adjustment only AFTER the rename
-        // durably commits (below) — so a write that fails between this check and
-        // the rename leaves the counter unchanged.
-        let mut quota_commit: Option<(UserId, u64, u64)> = None;
+        // An OVERWRITE replaces the prior value blob and (same key) does not
+        // grow `.keys`, so the NET change is
+        // `(new_blob - old_blob) + (projected_keys - old_keys)`; we admit
+        // against `current_total + that`. REJECT (never evict): per-user secrets
+        // are authoritative keys, not a reclaimable cache.
+        //
+        // We capture `(user_id, old_blob, new_blob, old_keys)` here under the
+        // pre-write borrow, then apply the NET counter adjustment only AFTER the
+        // rename + register_key commit (below), re-stating the REAL `.keys` size
+        // so the counter stays exact — a write that fails between this check and
+        // the commit leaves the counter unchanged.
+        let mut quota_commit: Option<QuotaCommit> = None;
         if let SecretScope::User { id, .. } = &scope
             && self.user_quota_limit_bytes > 0
         {
@@ -1045,6 +1109,10 @@ impl SecretsStore {
             // Size of the blob this write would replace (0 for a brand-new key),
             // so an overwrite is charged only its delta, not double-counted.
             let old_blob_size = self.on_disk_blob_size(delegate, key, &scope);
+            // `.keys` registry size now and the projected size after this write
+            // registers the key (no growth for an already-present key / at-cap).
+            let old_keys_size = self.keys_registry_size(delegate, &scope);
+            let projected_keys_size = self.projected_keys_size_after_add(delegate, &scope, key);
 
             // Seed this user's total from disk on first touch (once per user per
             // process); idempotent so a concurrent seed never clobbers a live
@@ -1063,23 +1131,36 @@ impl SecretsStore {
 
             let projected = current_total
                 .saturating_sub(old_blob_size)
-                .saturating_add(new_blob_size);
+                .saturating_add(new_blob_size)
+                .saturating_sub(old_keys_size)
+                .saturating_add(projected_keys_size);
             if projected > limit {
+                // `attempted` reports the net footprint growth this write would
+                // add (value delta + keys delta), so a rejected many-keys write
+                // surfaces its real cost rather than just the value blob.
+                let attempted = new_blob_size
+                    .saturating_sub(old_blob_size)
+                    .saturating_add(projected_keys_size.saturating_sub(old_keys_size));
                 tracing::warn!(
                     user_id = %id.encode(),
                     used = current_total,
                     limit,
-                    attempted = new_blob_size,
-                    "rejecting per-user secret write: would exceed quota"
+                    attempted,
+                    "rejecting per-user secret write: would exceed quota (total footprint)"
                 );
                 return Err(SecretStoreError::QuotaExceeded {
                     used: current_total,
                     limit,
-                    attempted: new_blob_size,
+                    attempted,
                 }
                 .into());
             }
-            quota_commit = Some((**id, old_blob_size, new_blob_size));
+            quota_commit = Some(QuotaCommit {
+                user_id: **id,
+                old_blob_size,
+                new_blob_size,
+                old_keys_size,
+            });
         }
 
         fs::create_dir_all(&scope_path)?;
@@ -1091,6 +1172,18 @@ impl SecretsStore {
             tracing::warn!(path = %scope_path.display(), error = %e, "chmod scope dir tree failed");
         }
 
+        // Per-user secret-value snapshots are DISABLED (#4561): snapshots are an
+        // overwrite/rollback HISTORY feature (a buggy/accidental overwrite can
+        // be undone), NOT crash-recovery — crash-atomicity comes entirely from
+        // the tmp+fsync+rename below, and a snapshot failure never blocks the
+        // write (see `snapshot_active_value`'s "crash mid-snapshot loses only
+        // the snapshot" contract). Hosted users are transient (they export to
+        // their own peer and leave) and don't need that history, so we skip it
+        // for `SecretScope::User`. This also removes the `.snapshots/` on-disk
+        // growth vector from the per-user quota footprint, leaving only active
+        // blobs + `.keys` to charge. `SecretScope::Local` is unchanged.
+        let take_snapshots = self.snapshots_enabled && !matches!(scope, SecretScope::User { .. });
+
         // CRITICAL ORDER: hard-link prior value into snapshot history, write
         // new ciphertext to a tmp path, fsync, then atomically rename
         // tmp → active. This way:
@@ -1101,7 +1194,7 @@ impl SecretsStore {
         //     inode and only `rename` makes it visible at the active path,
         //   - update index AFTER the active rename so a crash between rename
         //     and index-update still gives `get_secret` the new value.
-        if self.snapshots_enabled
+        if take_snapshots
             && secret_file_path.exists()
             && let Err(e) = self.snapshot_prior_value(&scope_path, key, &secret_file_path)
         {
@@ -1144,18 +1237,18 @@ impl SecretsStore {
             return Err(err.into());
         }
 
-        // The new blob is now durably at the active path. Apply the NET quota
-        // adjustment (`new_size - old_size`) for the per-user scope. Seeding
-        // (above) guarantees the user is already in the tracker, so the
+        // The new value blob is durably at the active path. Apply the NET quota
+        // adjustment for the per-user scope: the value-blob delta now, and the
+        // `.keys` delta after `register_key` (re-stating the REAL `.keys` size
+        // so the counter is exact even if the pre-write projection differed).
+        // Seeding (above) guarantees the user is already in the tracker, so the
         // add/sub land on a real entry. Ordered AFTER the rename so a failed
-        // write never moves the counter; ordered BEFORE index/registry updates
-        // so the byte accounting reflects committed disk state.
-        if let Some((user_id, old_size, new_size)) = quota_commit {
-            if new_size >= old_size {
-                USER_QUOTA_TRACKER.add(&user_id, new_size - old_size);
-            } else {
-                USER_QUOTA_TRACKER.sub_saturating(&user_id, old_size - new_size);
-            }
+        // write never moves the counter.
+        if let Some(commit) = &quota_commit {
+            apply_signed_delta(
+                &commit.user_id,
+                commit.new_blob_size as i128 - commit.old_blob_size as i128,
+            );
         }
 
         // Update index in ReDb and in-memory only after the active path has
@@ -1170,10 +1263,24 @@ impl SecretsStore {
         // Reuses the same `encryption` (scope DEK) already derived above.
         self.register_key(delegate, &scope, &encryption, key);
 
+        // Charge the REAL `.keys` registry delta this write produced. Stat-after
+        // minus the captured stat-before; folds into the same per-user counter.
+        // Doing it from the real on-disk size (not the projection) keeps the
+        // footprint counter exact regardless of encryption padding or a
+        // best-effort `register_key` that declined to grow the file.
+        if let Some(commit) = &quota_commit {
+            let new_keys_size = self.keys_registry_size(delegate, &scope);
+            apply_signed_delta(
+                &commit.user_id,
+                new_keys_size as i128 - commit.old_keys_size as i128,
+            );
+        }
+
         // Best-effort thin of the snapshot history. Failures here only mean
         // we keep more snapshots than the policy targets, which is harmless
-        // and self-correcting on the next write.
-        if self.snapshots_enabled {
+        // and self-correcting on the next write. Skipped for the per-user scope
+        // (no snapshots are taken there — see `take_snapshots`).
+        if take_snapshots {
             let snap_dir = snapshot_dir_for(&scope_path, key);
             if snap_dir.exists() {
                 thin_snapshots(&snap_dir, &self.retention, SystemTime::now());
@@ -1348,7 +1455,21 @@ impl SecretsStore {
 
         // Drop the raw key from the enumeration registry (#4355) after the
         // value + index are gone. Best-effort, like the rest of removal.
+        // PER-USER QUOTA (#4561): the registry shrinks when its entry is dropped
+        // (or the file is removed entirely at the last key), so free those bytes
+        // from the user's footprint counter too. Stat the `.keys` file before
+        // and after, applying the real (negative) delta.
+        let keys_size_before = match &scope {
+            SecretScope::User { .. } => self.keys_registry_size(delegate, &scope),
+            SecretScope::Local => 0,
+        };
         self.deregister_key(delegate, &scope, key);
+        if let SecretScope::User { id, .. } = &scope {
+            let keys_size_after = self.keys_registry_size(delegate, &scope);
+            if keys_size_before > keys_size_after {
+                USER_QUOTA_TRACKER.sub_saturating(id, keys_size_before - keys_size_after);
+            }
+        }
 
         Ok(())
     }
@@ -2059,27 +2180,46 @@ impl SecretsStore {
         Ok(())
     }
 
-    /// Sum the on-disk ciphertext bytes a single user currently holds across
-    /// ALL delegates, by walking `<delegate>/users/<user_id>/` on disk and
-    /// adding each blob's `metadata().len()`.
+    /// Sum a single user's TOTAL on-disk footprint across ALL delegates: the
+    /// active secret-value blobs PLUS the per-(delegate,user) `.keys`
+    /// enumeration registry files. This is the quota's lazy seed (#4561).
     ///
-    /// This is the quota tracker's lazy seed (#4561): it runs once per user per
-    /// process on the first `store_secret`/`remove_secret` that touches a
-    /// not-yet-seeded `UserId`; subsequent ops are O(1) atomic adjustments.
-    /// Reusing [`Self::walk_scope_secrets_on_disk`] guarantees the byte total is
-    /// summed over the SAME set of blobs the enforcement increment sizes
-    /// against (the on-disk active files — the shared cross-executor source of
-    /// truth), so the seed and the running counter can never disagree about
-    /// what counts. The walker reconstructs each blob's path from the scope dir
-    /// + `bs58(secret_hash)`; we `metadata().len()` that path.
+    /// # What's counted (and why this is the WHOLE footprint)
     ///
-    /// FAIL-LOUD on an unexpected I/O error (propagated by the walker), same as
-    /// the export count: a silently-too-low seed would let a user exceed their
-    /// quota, which is exactly the disk-exhaustion this guard prevents.
+    /// Everything a hosted user can grow under their `users/<user_id>/` tree:
+    ///
+    /// - active secret-value blobs (`metadata().len()` each), and
+    /// - the `.keys` registry file under each delegate's user scope dir, which
+    ///   `register_key` appends to (a user with many/large distinct KEYS grows
+    ///   it even with tiny values).
+    ///
+    /// `.snapshots/` is deliberately NOT a vector here because secret-value
+    /// snapshots are DISABLED for the per-user scope (see `store_secret`), so a
+    /// per-user tree never accrues snapshot history. Counting active blobs +
+    /// `.keys` therefore covers the entire footprint, and the per-write delta
+    /// accounting tracks exactly these same two components, so the seed and the
+    /// running counter can never disagree.
+    ///
+    /// `walk_scope_secrets_on_disk` visits once PER BLOB (so a delegate recurs
+    /// for each of its blobs); we add each delegate's `.keys` file exactly once
+    /// via a seen-set so it isn't multiply counted. A delegate that has a
+    /// `.keys` file but zero active blobs for this user is a degenerate case the
+    /// walker wouldn't visit, but `register_key` only writes `.keys` AFTER a
+    /// value blob lands, so an orphan `.keys` with no active blob cannot occur
+    /// in practice; the per-write delta keeps the counter exact regardless.
+    ///
+    /// Runs once per user per process; subsequent ops are O(1) atomic
+    /// adjustments. FAIL-LOUD on an unexpected I/O error: a silently-too-low
+    /// seed would let a user exceed their quota.
     fn seeded_user_total(&self, scope: &SecretScope<'_>) -> Result<u64, SecretStoreError> {
         let mut total: u64 = 0;
         let mut walk_err: Option<SecretStoreError> = None;
+        let mut keys_counted: HashSet<DelegateKey> = HashSet::new();
         self.walk_scope_secrets_on_disk(scope, |delegate, secret_hash| {
+            // Count this delegate's `.keys` registry once.
+            if keys_counted.insert(delegate.clone()) {
+                total = total.saturating_add(self.keys_registry_size(&delegate, scope));
+            }
             let encoded = bs58::encode(&secret_hash)
                 .with_alphabet(bs58::Alphabet::BITCOIN)
                 .into_string();
@@ -2106,6 +2246,64 @@ impl SecretsStore {
             return Err(e);
         }
         Ok(total)
+    }
+
+    /// On-disk size of the `.keys` enumeration registry for `(delegate, scope)`,
+    /// or `0` if absent. Part of a per-user's quota footprint (#4561): the
+    /// registry grows as the user stores more distinct keys, so it must be
+    /// charged alongside the value blobs.
+    fn keys_registry_size(&self, delegate: &DelegateKey, scope: &SecretScope<'_>) -> u64 {
+        match fs::metadata(self.key_registry_path(delegate, scope)) {
+            Ok(md) => md.len(),
+            Err(_) => 0,
+        }
+    }
+
+    /// Project the `.keys` registry's on-disk size for `(delegate, scope)` AFTER
+    /// registering `key`, WITHOUT re-encrypting — pure arithmetic over the exact
+    /// wire format (`encode_secret_key_list`: a 4-byte LE length prefix + the
+    /// key bytes per entry; AEAD ciphertext length == plaintext length; a blob
+    /// is `HEADER_LEN + ciphertext + TAG_LEN`). Used by the quota admission
+    /// check so a write that would push the footprint over the limit via `.keys`
+    /// growth (many/large distinct keys, tiny values) is rejected BEFORE it
+    /// lands, making the footprint provably bounded.
+    ///
+    /// Mirrors `register_key`'s decisions exactly: a key already present (or at
+    /// the per-scope cap) does not grow `.keys`. The post-commit counter update
+    /// re-stats the real file, so any divergence self-corrects.
+    fn projected_keys_size_after_add(
+        &self,
+        delegate: &DelegateKey,
+        scope: &SecretScope<'_>,
+        key: &SecretsId,
+    ) -> u64 {
+        let current = self.keys_registry_size(delegate, scope);
+        // Read the registry to decide whether this key is new. On an unreadable
+        // registry, `register_key` bails without growing the file, so projecting
+        // "no growth" matches what will actually happen.
+        let existing = match self.read_key_registry(delegate, scope) {
+            Ok(keys) => keys,
+            Err(_) => return current,
+        };
+        if existing.iter().any(|k| k.as_slice() == key.key()) {
+            return current; // already registered → no growth
+        }
+        if existing.len() >= self.max_registered_keys_per_scope {
+            return current; // at cap → register_key won't add it
+        }
+        let entry_len = 4u64.saturating_add(key.key().len() as u64);
+        if current == 0 {
+            // Registry transitions absent → present: pays the one-time
+            // HEADER_LEN + TAG_LEN plus this first entry's plaintext.
+            (HEADER_LEN as u64)
+                .saturating_add(entry_len)
+                .saturating_add(TAG_LEN as u64)
+        } else {
+            // Existing registry grows by exactly the new entry's plaintext
+            // (stream-cipher ciphertext is 1:1 with plaintext; the header+tag
+            // are already in `current`).
+            current.saturating_add(entry_len)
+        }
     }
 
     /// On-disk size (in bytes) of a stored secret blob under `scope`, or
@@ -5598,12 +5796,15 @@ mod test {
         Ok(())
     }
 
-    /// Snapshot history is per-scope: a second `User` write snapshots the
-    /// prior version, which `list_snapshots(.., User)` enumerates and
-    /// `restore_snapshot(.., User)` rolls back to — all without touching a
-    /// same-`SecretsId` `Local` secret's history or active value.
+    /// Per-user secret-value snapshots are DISABLED (#4561): a second `User`
+    /// write does NOT create snapshot history (so a hosted user can't grow an
+    /// unbounded `.snapshots/` tree under the quota), while a same-`SecretsId`
+    /// `Local` secret is unaffected and still keeps its own history. This
+    /// replaces the pre-#4561 behavior where User writes also snapshotted; the
+    /// change is intentional (hosted users are transient and don't need
+    /// overwrite/rollback history — see `store_secret`'s `take_snapshots`).
     #[tokio::test]
-    async fn user_scope_second_write_creates_listable_snapshot()
+    async fn user_scope_writes_do_not_snapshot_local_still_does()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempfile::tempdir()?;
         let secrets_dir = temp_dir.path().join("secrets-store-test");
@@ -5620,16 +5821,7 @@ mod test {
             dek_secret: &alice_dek,
         };
 
-        // A Local secret with the SAME SecretsId — must be unaffected by all
-        // the User-scope writes/restore below.
-        store.store_secret(
-            delegate.key(),
-            &secret_id,
-            SecretScope::Local,
-            Zeroizing::new(b"local-untouched".to_vec()),
-        )?;
-
-        // First User write: no prior value, so no snapshot yet.
+        // First User write: no prior value, nothing to snapshot regardless.
         store.store_secret(
             delegate.key(),
             &secret_id,
@@ -5645,56 +5837,50 @@ mod test {
 
         std::thread::sleep(Duration::from_millis(5));
 
-        // Second User write (distinct value): snapshots the prior version.
+        // Second User write (distinct value): WOULD have snapshotted pre-#4561,
+        // but per-user snapshots are now disabled — still no history.
         store.store_secret(
             delegate.key(),
             &secret_id,
             user_scope(),
             Zeroizing::new(b"user-v2".to_vec()),
         )?;
-        let snaps = store.list_snapshots(delegate.key(), &secret_id, user_scope())?;
-        assert_eq!(
-            snaps.len(),
-            1,
-            "second User write must snapshot the prior version"
+        assert!(
+            store
+                .list_snapshots(delegate.key(), &secret_id, user_scope())?
+                .is_empty(),
+            "per-user overwrite must NOT snapshot (disabled for hosted users, #4561)"
         );
-
-        // Active is v2; restoring the snapshot rolls back to v1.
+        // The overwrite still applied: active value is v2.
         assert_eq!(
             store
                 .get_secret(delegate.key(), &secret_id, user_scope())?
                 .to_vec(),
-            b"user-v2".to_vec()
+            b"user-v2".to_vec(),
+            "the overwrite itself must still take effect"
         );
-        store.restore_snapshot(
+
+        // A same-SecretsId LOCAL secret still snapshots on overwrite (Local
+        // behavior is byte-for-byte unchanged).
+        store.store_secret(
             delegate.key(),
             &secret_id,
-            user_scope(),
-            snaps[0].timestamp_ms,
+            SecretScope::Local,
+            Zeroizing::new(b"local-v1".to_vec()),
+        )?;
+        std::thread::sleep(Duration::from_millis(5));
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"local-v2".to_vec()),
         )?;
         assert_eq!(
             store
-                .get_secret(delegate.key(), &secret_id, user_scope())?
-                .to_vec(),
-            b"user-v1".to_vec(),
-            "restore must put the User v1 plaintext back"
-        );
-
-        // The same-SecretsId Local secret is byte-for-byte untouched: its
-        // value is unchanged and it has no snapshot history (it was written
-        // exactly once).
-        assert_eq!(
-            store
-                .get_secret(delegate.key(), &secret_id, SecretScope::Local)?
-                .to_vec(),
-            b"local-untouched".to_vec(),
-            "User-scope writes/restore must not perturb the Local secret"
-        );
-        assert!(
-            store
                 .list_snapshots(delegate.key(), &secret_id, SecretScope::Local)?
-                .is_empty(),
-            "Local secret written once must have no snapshot history"
+                .len(),
+            1,
+            "Local overwrite must still snapshot the prior version (unchanged)"
         );
         Ok(())
     }
@@ -5984,7 +6170,28 @@ mod test {
     /// => `HEADER_LEN (25) + n + 16`. The tests below pick plaintext lengths so
     /// the resulting on-disk totals straddle the configured quota precisely.
     fn on_disk_size(plaintext_len: usize) -> u64 {
-        (HEADER_LEN + plaintext_len + 16) as u64
+        (HEADER_LEN + plaintext_len + TAG_LEN) as u64
+    }
+
+    /// On-disk size of the `.keys` enumeration registry holding `keys` (each a
+    /// raw key byte slice). Mirrors the wire format exactly: per key a 4-byte
+    /// length prefix + the key bytes, all wrapped as
+    /// `HEADER_LEN + ciphertext(== plaintext len) + TAG_LEN`. An EMPTY set means
+    /// the registry file is removed, so 0 bytes.
+    fn keys_registry_on_disk_size(keys: &[&[u8]]) -> u64 {
+        if keys.is_empty() {
+            return 0;
+        }
+        let plaintext: usize = keys.iter().map(|k| 4 + k.len()).sum();
+        (HEADER_LEN + plaintext + TAG_LEN) as u64
+    }
+
+    /// The full expected per-user footprint = sum of value blobs + the `.keys`
+    /// registry for `keys`. Tests use this so the assertions track the SAME
+    /// total the implementation now charges (value blobs + `.keys`).
+    fn expected_footprint(value_plaintext_lens: &[usize], keys: &[&[u8]]) -> u64 {
+        let values: u64 = value_plaintext_lens.iter().map(|n| on_disk_size(*n)).sum();
+        values + keys_registry_on_disk_size(keys)
     }
 
     /// Build a per-user scope for `id` under a fixed dek_secret. Each test uses
@@ -6012,7 +6219,9 @@ mod test {
         let (id, dek) = fresh_user(0x10);
         let secret_id = SecretsId::new(vec![11]);
         let plaintext = b"a modest secret".to_vec();
-        let expected = on_disk_size(plaintext.len());
+        // Footprint = the value blob + the `.keys` registry holding this one key
+        // (raw key bytes = vec![11]).
+        let expected = expected_footprint(&[plaintext.len()], &[&[11]]);
 
         store.store_secret(
             delegate.key(),
@@ -6027,7 +6236,7 @@ mod test {
         assert_eq!(
             quota_tracked_total_for_test(&id),
             Some(expected),
-            "tracker must reflect exactly the on-disk bytes written"
+            "tracker must reflect the full footprint: value blob + .keys registry"
         );
         Ok(())
     }
@@ -6049,11 +6258,13 @@ mod test {
             dek_secret: &dek,
         };
 
-        // First blob: 100 bytes plaintext => 100 + 41 = 141 on-disk.
+        // First write: 100-byte value under key vec![1]. Its full footprint is
+        // the value blob + the `.keys` registry holding that one key.
         let first = vec![7u8; 100];
-        let first_size = on_disk_size(first.len());
-        // Quota leaves room for the first blob but not a second 100-byte blob.
-        let quota = first_size + 50;
+        let first_footprint = expected_footprint(&[100], &[&[1]]);
+        // Quota leaves room for the first write's full footprint but not a
+        // second 100-byte value (+ its `.keys` growth).
+        let quota = first_footprint + 50;
         let mut store =
             SecretsStore::new(secrets_dir.clone(), Default::default(), db)?.with_user_quota(quota);
 
@@ -6066,10 +6277,14 @@ mod test {
             },
             Zeroizing::new(first),
         )?;
-        assert_eq!(quota_tracked_total_for_test(&id), Some(first_size));
+        assert_eq!(quota_tracked_total_for_test(&id), Some(first_footprint));
 
-        // Second blob would bring the total to 282 > quota (191): reject.
+        // Second write (new key vec![2], 100-byte value) would add another value
+        // blob + a new `.keys` entry, crossing the quota: reject.
         let second_id = SecretsId::new(vec![2]);
+        // Net footprint growth = the value blob + the new key's `.keys` entry
+        // (4-byte length prefix + 1 key byte).
+        let second_growth = on_disk_size(100) + (4 + 1);
         let result = store.store_secret(
             delegate.key(),
             &second_id,
@@ -6089,9 +6304,15 @@ mod test {
         else {
             panic!("expected QuotaExceeded, got {:?}", err.deref());
         };
-        assert_eq!(*used, first_size, "used = current total before the write");
+        assert_eq!(
+            *used, first_footprint,
+            "used = current total before the write"
+        );
         assert_eq!(*limit, quota);
-        assert_eq!(*attempted, on_disk_size(100));
+        assert_eq!(
+            *attempted, second_growth,
+            "attempted = net footprint growth (value blob + new .keys entry)"
+        );
 
         // The rejected secret must NOT be on disk and the tracker is unchanged.
         let rejected_path = store
@@ -6109,7 +6330,7 @@ mod test {
         );
         assert_eq!(
             quota_tracked_total_for_test(&id),
-            Some(first_size),
+            Some(first_footprint),
             "tracker must be unchanged after a rejected write"
         );
         Ok(())
@@ -6168,14 +6389,15 @@ mod test {
 
         let delegate = Delegate::from((&vec![30].into(), &vec![].into()));
         let (id, dek) = fresh_user(0x30);
-        let blob_size = on_disk_size(100);
-        // Quota holds exactly ONE 100-byte blob.
-        let quota = blob_size;
-        let mut store =
-            SecretsStore::new(secrets_dir, Default::default(), db)?.with_user_quota(quota);
-
         let id_a = SecretsId::new(vec![1]);
         let id_b = SecretsId::new(vec![2]);
+        // Both keys are 1 byte, so each write's footprint is the same: a
+        // 100-byte value blob + a 1-key `.keys` registry. Quota holds exactly
+        // ONE such write.
+        let one_write = expected_footprint(&[100], &[&[1]]);
+        let quota = one_write;
+        let mut store =
+            SecretsStore::new(secrets_dir, Default::default(), db)?.with_user_quota(quota);
 
         store.store_secret(
             delegate.key(),
@@ -6186,8 +6408,9 @@ mod test {
             },
             Zeroizing::new(vec![1u8; 100]),
         )?;
+        assert_eq!(quota_tracked_total_for_test(&id), Some(one_write));
 
-        // Second write rejected — no room.
+        // Second write rejected — no room (would add another value blob + key).
         assert!(
             store
                 .store_secret(
@@ -6203,7 +6426,8 @@ mod test {
             "second write must be rejected while the quota is full"
         );
 
-        // Remove the first secret, freeing its bytes.
+        // Remove the first secret, freeing both its value blob AND its `.keys`
+        // entry (the registry file is removed at the last key → 0 bytes).
         store.remove_secret(
             delegate.key(),
             &id_a,
@@ -6215,10 +6439,11 @@ mod test {
         assert_eq!(
             quota_tracked_total_for_test(&id),
             Some(0),
-            "removal must free the user's bytes"
+            "removal must free the user's value blob AND its .keys bytes"
         );
 
-        // Now the previously-rejected write fits.
+        // Now the previously-rejected write fits, and lands at the same
+        // single-write footprint.
         store.store_secret(
             delegate.key(),
             &id_b,
@@ -6228,7 +6453,10 @@ mod test {
             },
             Zeroizing::new(vec![2u8; 100]),
         )?;
-        assert_eq!(quota_tracked_total_for_test(&id), Some(blob_size));
+        assert_eq!(
+            quota_tracked_total_for_test(&id),
+            Some(expected_footprint(&[100], &[&[2]]))
+        );
         Ok(())
     }
 
@@ -6263,19 +6491,23 @@ mod test {
                 )?;
             }
         }
-        let expected_seed = on_disk_size(100) + on_disk_size(50);
+        // The full seed = both value blobs + the `.keys` registry holding both
+        // keys (vec![1] and vec![2]).
+        let expected_seed = expected_footprint(&[100, 50], &[&[1], &[2]]);
 
         // Reset the tracker so the next store seeds fresh from disk.
         quota_reset_user_for_test(&id);
 
         // New store with a quota that leaves only a few free bytes after the
-        // seed. The seed walk must find both existing blobs.
+        // seed. The seed walk must find both existing blobs AND the `.keys`
+        // registry.
         let quota = expected_seed + 10;
         let mut store =
             SecretsStore::new(secrets_dir, Default::default(), db)?.with_user_quota(quota);
 
-        // A 1-byte plaintext => 42 on-disk, which exceeds the 10 free bytes:
-        // proves the seed counted BOTH existing blobs (else there'd be room).
+        // A 1-byte plaintext => 42 on-disk (plus a new `.keys` entry), which
+        // exceeds the 10 free bytes: proves the seed counted BOTH existing
+        // blobs and the `.keys` registry (else there'd be room).
         let err = store
             .store_secret(
                 delegate.key(),
@@ -6286,7 +6518,7 @@ mod test {
                 },
                 Zeroizing::new(vec![3u8; 1]),
             )
-            .expect_err("seed must account for both existing blobs => over quota");
+            .expect_err("seed must account for both existing blobs + .keys => over quota");
         let RuntimeInnerError::SecretStoreError(SecretStoreError::QuotaExceeded { used, .. }) =
             err.deref()
         else {
@@ -6294,7 +6526,7 @@ mod test {
         };
         assert_eq!(
             *used, expected_seed,
-            "seed must equal the summed disk bytes"
+            "seed must equal the summed disk bytes (value blobs + .keys registry)"
         );
         // And the tracker now holds the seeded total.
         assert_eq!(quota_tracked_total_for_test(&id), Some(expected_seed));
@@ -6314,8 +6546,10 @@ mod test {
 
         let delegate = Delegate::from((&vec![50].into(), &vec![].into()));
         let (id, dek) = fresh_user(0x50);
-        let blob_size = on_disk_size(100);
-        let quota = blob_size; // room for exactly one blob, total across stores.
+        // Room for exactly ONE write's full footprint (value blob + 1-key
+        // `.keys`), total across both stores.
+        let one_write = expected_footprint(&[100], &[&[1]]);
+        let quota = one_write;
 
         let mut store_a = SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())?
             .with_user_quota(quota);
@@ -6352,8 +6586,8 @@ mod test {
         ));
         assert_eq!(
             quota_tracked_total_for_test(&id),
-            Some(blob_size),
-            "the shared tracker holds only store A's write"
+            Some(one_write),
+            "the shared tracker holds only store A's write footprint"
         );
         Ok(())
     }
@@ -6431,6 +6665,9 @@ mod test {
         let delegate = Delegate::from((&vec![80].into(), &vec![].into()));
         let (id, dek) = fresh_user(0x80);
         let secret_id = SecretsId::new(vec![1]);
+        // The key (vec![1]) is unchanged across overwrites, so the `.keys`
+        // registry size is constant — only the value blob's size changes.
+        let keys = keys_registry_on_disk_size(&[&[1]]);
 
         // First write: 100 bytes.
         store.store_secret(
@@ -6442,10 +6679,13 @@ mod test {
             },
             Zeroizing::new(vec![1u8; 100]),
         )?;
-        assert_eq!(quota_tracked_total_for_test(&id), Some(on_disk_size(100)));
+        assert_eq!(
+            quota_tracked_total_for_test(&id),
+            Some(on_disk_size(100) + keys)
+        );
 
-        // Overwrite SAME key with 300 bytes: total must be exactly the new
-        // blob's size, not first+second.
+        // Overwrite SAME key with 300 bytes: total must be the new blob's size
+        // + the (unchanged) `.keys`, not first+second.
         store.store_secret(
             delegate.key(),
             &secret_id,
@@ -6457,8 +6697,8 @@ mod test {
         )?;
         assert_eq!(
             quota_tracked_total_for_test(&id),
-            Some(on_disk_size(300)),
-            "overwrite must charge only the delta, not double-count"
+            Some(on_disk_size(300) + keys),
+            "overwrite must charge only the value delta, not double-count"
         );
 
         // Overwrite again with a SMALLER blob: total shrinks accordingly.
@@ -6473,9 +6713,263 @@ mod test {
         )?;
         assert_eq!(
             quota_tracked_total_for_test(&id),
-            Some(on_disk_size(10)),
-            "shrinking overwrite must free the freed bytes"
+            Some(on_disk_size(10) + keys),
+            "shrinking overwrite must free the freed value bytes"
         );
+        Ok(())
+    }
+
+    /// BOUNDARY: a write whose projected footprint is EXACTLY the limit is
+    /// ALLOWED (the rejection is `projected > limit`, strict). Pins the
+    /// allowed/denied edge so a future `>=` typo is caught.
+    #[tokio::test]
+    async fn projected_equals_limit_is_allowed() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+
+        let delegate = Delegate::from((&vec![90].into(), &vec![].into()));
+        let (id, dek) = fresh_user(0x90);
+        // Quota set to EXACTLY one write's footprint.
+        let exact = expected_footprint(&[100], &[&[1]]);
+        let mut store =
+            SecretsStore::new(secrets_dir, Default::default(), db)?.with_user_quota(exact);
+
+        // projected == limit → admitted.
+        store.store_secret(
+            delegate.key(),
+            &SecretsId::new(vec![1]),
+            SecretScope::User {
+                id: &id,
+                dek_secret: &dek,
+            },
+            Zeroizing::new(vec![1u8; 100]),
+        )?;
+        assert_eq!(
+            quota_tracked_total_for_test(&id),
+            Some(exact),
+            "a write landing exactly at the limit must be allowed"
+        );
+
+        // One more byte of footprint now crosses → rejected.
+        assert!(
+            store
+                .store_secret(
+                    delegate.key(),
+                    &SecretsId::new(vec![2]),
+                    SecretScope::User {
+                        id: &id,
+                        dek_secret: &dek,
+                    },
+                    Zeroizing::new(vec![2u8; 1]),
+                )
+                .is_err(),
+            "any write past the exact limit must be rejected"
+        );
+        Ok(())
+    }
+
+    /// The seed sums a user's bytes spanning TWO delegate dirs (the counter key
+    /// is the USER, across all delegates — not per-delegate).
+    #[tokio::test]
+    async fn multi_delegate_seed_spans_two_delegates() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+
+        let delegate_a = Delegate::from((&vec![0xA0].into(), &vec![].into()));
+        let delegate_b = Delegate::from((&vec![0xB0].into(), &vec![].into()));
+        let (id, dek) = fresh_user(0xA1);
+
+        // Populate one secret under EACH delegate with a quota-disabled store.
+        {
+            let mut setup = SecretsStore::new(secrets_dir.clone(), Default::default(), db.clone())?;
+            setup.store_secret(
+                delegate_a.key(),
+                &SecretsId::new(vec![1]),
+                SecretScope::User {
+                    id: &id,
+                    dek_secret: &dek,
+                },
+                Zeroizing::new(vec![1u8; 100]),
+            )?;
+            setup.store_secret(
+                delegate_b.key(),
+                &SecretsId::new(vec![2]),
+                SecretScope::User {
+                    id: &id,
+                    dek_secret: &dek,
+                },
+                Zeroizing::new(vec![2u8; 200]),
+            )?;
+        }
+        // Each delegate has its own value blob + its own 1-key `.keys` file.
+        let expected_seed = on_disk_size(100)
+            + on_disk_size(200)
+            + keys_registry_on_disk_size(&[&[1]])
+            + keys_registry_on_disk_size(&[&[2]]);
+
+        quota_reset_user_for_test(&id);
+
+        // Quota exactly the cross-delegate seed: a further write must reject,
+        // proving the seed counted BOTH delegate dirs.
+        let mut store =
+            SecretsStore::new(secrets_dir, Default::default(), db)?.with_user_quota(expected_seed);
+        let err = store
+            .store_secret(
+                delegate_a.key(),
+                &SecretsId::new(vec![3]),
+                SecretScope::User {
+                    id: &id,
+                    dek_secret: &dek,
+                },
+                Zeroizing::new(vec![3u8; 1]),
+            )
+            .expect_err("seed must span both delegate dirs => already at limit");
+        let RuntimeInnerError::SecretStoreError(SecretStoreError::QuotaExceeded { used, .. }) =
+            err.deref()
+        else {
+            panic!("expected QuotaExceeded, got {:?}", err.deref());
+        };
+        assert_eq!(
+            *used, expected_seed,
+            "seed must equal the user's bytes summed across BOTH delegates"
+        );
+        Ok(())
+    }
+
+    /// FOOTPRINT (snapshots): a per-user overwrite creates NO `.snapshots/`
+    /// directory, while a Local overwrite DOES. Confirms snapshots are disabled
+    /// for hosted users (removing that growth vector) and unchanged for Local.
+    #[tokio::test]
+    async fn user_snapshots_disabled_local_snapshots_kept() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        // Quota off so the footprint accounting doesn't interfere; snapshot
+        // behavior is independent of the quota value.
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?.with_user_quota(0);
+
+        let delegate = Delegate::from((&vec![0xC0].into(), &vec![].into()));
+        let (id, dek) = fresh_user(0xC1);
+        let secret_id = SecretsId::new(vec![1]);
+
+        // Two writes to the SAME user key (an overwrite would normally snapshot).
+        for v in [10u8, 20u8] {
+            store.store_secret(
+                delegate.key(),
+                &secret_id,
+                SecretScope::User {
+                    id: &id,
+                    dek_secret: &dek,
+                },
+                Zeroizing::new(vec![v; 32]),
+            )?;
+        }
+        let user_scope_dir = store.scope_dir(
+            delegate.key(),
+            &SecretScope::User {
+                id: &id,
+                dek_secret: &dek,
+            },
+        );
+        assert!(
+            !user_scope_dir.join(SNAPSHOTS_DIR).exists(),
+            "per-user overwrites must NOT create a .snapshots/ directory"
+        );
+
+        // Same two writes under Local: a .snapshots/ dir MUST appear.
+        for v in [10u8, 20u8] {
+            store.store_secret(
+                delegate.key(),
+                &secret_id,
+                SecretScope::Local,
+                Zeroizing::new(vec![v; 32]),
+            )?;
+        }
+        let local_scope_dir = store.scope_dir(delegate.key(), &SecretScope::Local);
+        assert!(
+            local_scope_dir.join(SNAPSHOTS_DIR).exists(),
+            "Local overwrites must still snapshot (behavior unchanged)"
+        );
+        Ok(())
+    }
+
+    /// FOOTPRINT (`.keys`): a user who stores many distinct keys with TINY
+    /// values is REJECTED once the `.keys` registry growth pushes the total
+    /// footprint over the limit — even though no single value blob is large.
+    /// This is the `.keys` growth vector the footprint accounting closes.
+    #[tokio::test]
+    async fn many_keys_rejected_when_footprint_hits_limit() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+
+        let delegate = Delegate::from((&vec![0xD0].into(), &vec![].into()));
+        let (id, dek) = fresh_user(0xD1);
+
+        // Each key is a 64-byte key with a 1-byte value. A single write's
+        // footprint is dominated by the key, not the value, so a small quota is
+        // crossed by accumulating keys, not big values.
+        let key_len = 64usize;
+        let value_len = 1usize;
+        let make_key = |n: u8| SecretsId::new(vec![n; key_len]);
+
+        // Allow exactly THREE such writes, then the fourth must be rejected by
+        // the `.keys` growth. Build the quota from the exact footprint of three
+        // distinct keys + their three value blobs.
+        let k1 = vec![1u8; key_len];
+        let k2 = vec![2u8; key_len];
+        let k3 = vec![3u8; key_len];
+        let three_writes = expected_footprint(
+            &[value_len, value_len, value_len],
+            &[k1.as_slice(), k2.as_slice(), k3.as_slice()],
+        );
+        let mut store =
+            SecretsStore::new(secrets_dir, Default::default(), db)?.with_user_quota(three_writes);
+
+        for n in 1u8..=3 {
+            store.store_secret(
+                delegate.key(),
+                &make_key(n),
+                SecretScope::User {
+                    id: &id,
+                    dek_secret: &dek,
+                },
+                Zeroizing::new(vec![0u8; value_len]),
+            )?;
+        }
+        assert_eq!(
+            quota_tracked_total_for_test(&id),
+            Some(three_writes),
+            "three key writes must land exactly at the quota"
+        );
+
+        // A fourth distinct key (tiny value) is rejected purely because the
+        // `.keys` registry (plus the small value blob) would cross the limit.
+        let err = store
+            .store_secret(
+                delegate.key(),
+                &make_key(4),
+                SecretScope::User {
+                    id: &id,
+                    dek_secret: &dek,
+                },
+                Zeroizing::new(vec![0u8; value_len]),
+            )
+            .expect_err("a fourth distinct key must be rejected by the .keys footprint");
+        assert!(matches!(
+            err.deref(),
+            RuntimeInnerError::SecretStoreError(SecretStoreError::QuotaExceeded { .. })
+        ));
+        // Footprint unchanged after the rejected write.
+        assert_eq!(quota_tracked_total_for_test(&id), Some(three_writes));
         Ok(())
     }
 }
