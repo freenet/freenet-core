@@ -120,6 +120,20 @@ pub struct ConfigArgs {
     #[arg(long, env = "MAX_HOSTING_STORAGE")]
     pub max_hosting_storage: Option<u64>,
 
+    /// Per-user secret-storage quota in bytes for HOSTED mode (#4561, P5 of
+    /// #4381). Bounds a single hosted user's (one `userToken`) TOTAL on-disk
+    /// footprint under their `users/<user_id>/` tree, summed across every
+    /// delegate — both the active secret-value blobs AND the `.keys`
+    /// enumeration registry (so many/large keys are charged too) — so a visitor
+    /// cannot fill the node's disk. Per-user secret-value snapshots are disabled
+    /// (hosted users are transient and don't need overwrite history), so there
+    /// is no `.snapshots/` growth to charge. REJECT-on-full (never evict —
+    /// secrets are authoritative identity/room keys, not a cache). Default:
+    /// 4 MiB. `0` disables enforcement. Has NO effect outside hosted mode —
+    /// local single-user secrets are never quota-checked (and keep snapshots).
+    #[arg(long = "per-user-secret-quota", env = "PER_USER_SECRET_QUOTA")]
+    pub per_user_secret_quota_bytes: Option<u64>,
+
     /// Byte budget for the compiled-WASM **contract** module cache. The
     /// **delegate** cache gets a fraction of this value
     /// (`DELEGATE_MODULE_CACHE_BUDGET_DIVISOR`, currently 1/4), so the combined
@@ -188,6 +202,7 @@ impl Default for ConfigArgs {
             version: false,
             max_blocking_threads: None,
             max_hosting_storage: None,
+            per_user_secret_quota_bytes: None,
             module_cache_budget_bytes: None,
             shutdown_drain_secs: None,
             telemetry: Default::default(),
@@ -432,6 +447,8 @@ impl ConfigArgs {
             self.log_level.get_or_insert(cfg.log_level);
             self.max_hosting_storage
                 .get_or_insert(cfg.max_hosting_storage);
+            self.per_user_secret_quota_bytes
+                .get_or_insert(cfg.per_user_secret_quota_bytes);
             self.module_cache_budget_bytes
                 .get_or_insert(cfg.module_cache_budget_bytes);
             self.shutdown_drain_secs
@@ -871,6 +888,9 @@ impl ConfigArgs {
             max_hosting_storage: self
                 .max_hosting_storage
                 .unwrap_or(crate::ring::DEFAULT_HOSTING_BUDGET_BYTES),
+            per_user_secret_quota_bytes: self
+                .per_user_secret_quota_bytes
+                .unwrap_or(crate::wasm_runtime::DEFAULT_PER_USER_SECRET_QUOTA_BYTES as u64),
             module_cache_budget_bytes: self
                 .module_cache_budget_bytes
                 .unwrap_or_else(crate::wasm_runtime::default_module_cache_budget_bytes),
@@ -998,6 +1018,18 @@ pub struct Config {
         rename = "max-hosting-storage"
     )]
     pub max_hosting_storage: u64,
+    /// Per-user secret-storage quota in bytes for hosted mode (#4561, P5 of
+    /// #4381). Bounds a single hosted user's TOTAL on-disk footprint (active
+    /// secret-value blobs + the `.keys` enumeration registry) under their
+    /// `users/<user_id>/` tree, summed across delegates. Per-user value
+    /// snapshots are disabled, so there is no `.snapshots/` growth to charge.
+    /// REJECT-on-full (never evict). Default 4 MiB; `0` disables. No effect
+    /// outside hosted mode (local single-user secrets are never quota-checked).
+    #[serde(
+        default = "default_per_user_secret_quota_bytes",
+        rename = "per-user-secret-quota"
+    )]
+    pub per_user_secret_quota_bytes: u64,
     /// Byte budget for the compiled-WASM **contract** module cache. The
     /// delegate cache gets a fraction of this
     /// (`DELEGATE_MODULE_CACHE_BUDGET_DIVISOR`), so the combined ceiling is
@@ -1058,6 +1090,14 @@ fn default_max_blocking_threads() -> usize {
 /// default and the in-code default from ever drifting apart.
 fn default_max_hosting_storage() -> u64 {
     crate::ring::DEFAULT_HOSTING_BUDGET_BYTES
+}
+
+/// Default per-user secret-storage quota (4 MiB). Resolves to
+/// [`crate::wasm_runtime::DEFAULT_PER_USER_SECRET_QUOTA_BYTES`], the single
+/// source of truth for the in-code default, so the operator-facing default and
+/// the store's fallback never drift apart.
+fn default_per_user_secret_quota_bytes() -> u64 {
+    crate::wasm_runtime::DEFAULT_PER_USER_SECRET_QUOTA_BYTES as u64
 }
 
 /// Default contract-module cache byte budget, scaled to system RAM
@@ -3841,6 +3881,7 @@ mod tests {
             version: false,
             max_blocking_threads: None,
             max_hosting_storage: None,
+            per_user_secret_quota_bytes: None,
             module_cache_budget_bytes: None,
             shutdown_drain_secs: None,
             telemetry: Default::default(),
@@ -3906,6 +3947,7 @@ mod tests {
             location: Some(0.5),
             max_blocking_threads: 7,
             max_hosting_storage: 123_456_789,
+            per_user_secret_quota_bytes: 7_654_321,
             module_cache_budget_bytes: 987_654_321,
             telemetry: TelemetryConfig {
                 enabled: false,
@@ -3940,6 +3982,7 @@ mod tests {
             location,
             max_blocking_threads,
             max_hosting_storage,
+            per_user_secret_quota_bytes,
             module_cache_budget_bytes,
             telemetry,
             shutdown_drain_secs,
@@ -3956,6 +3999,10 @@ mod tests {
         assert_eq!(
             max_hosting_storage, seed.max_hosting_storage,
             "max_hosting_storage"
+        );
+        assert_eq!(
+            per_user_secret_quota_bytes, seed.per_user_secret_quota_bytes,
+            "per_user_secret_quota_bytes"
         );
         assert_eq!(
             module_cache_budget_bytes, seed.module_cache_budget_bytes,
